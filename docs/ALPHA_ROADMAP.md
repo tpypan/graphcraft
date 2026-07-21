@@ -4,7 +4,7 @@ Status: v0.1 local alpha implemented; stable milestones remain in progress
 Last updated: July 21, 2026
 Authority: this document is the durable product and implementation plan for Graphcraft's alpha phase and its path to stable. The files under `docs/research/` provide rationale and historical research; when they conflict with this roadmap, this roadmap wins. A future phase roadmap may explicitly supersede it.
 
-Implementation snapshot: [`docs/V0.1.md`](../V0.1.md) records what the first runnable alpha proves and what remains outside its claims.
+Implementation snapshot: [`docs/V0.1.md`](V0.1.md) records what the first runnable alpha proves and what remains outside its claims.
 
 ### Current implementation boundary
 
