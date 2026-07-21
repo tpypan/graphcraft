@@ -20,8 +20,8 @@ import {
   createRun,
   discoverRepository,
   executeRun,
+  requestRunControl,
   resolveRunId,
-  stopRun,
   type RunObserver,
 } from "@graphcraft/runtime";
 
@@ -265,13 +265,8 @@ export async function handleAction(input: McpActionInput): Promise<Record<string
   if (input.action === "status") return stateView(state, contract);
   if (input.action === "inspect") return { contract, graph, state };
   if (input.action === "trace") return { events: await store.loadEvents() };
-  if (input.action === "stop") return stateView(await stopRun(store), contract);
-  if (input.action === "pause") {
-    if (!["completed", "paused", "stopped"].includes(state.status)) {
-      await store.append("user", "run.paused", { reason: "Paused by user" });
-    }
-    return stateView(await store.loadState(), contract);
-  }
+  if (input.action === "stop") return stateView(await requestRunControl(store, "stop"), contract);
+  if (input.action === "pause") return stateView(await requestRunControl(store, "pause"), contract);
   if (input.action === "resume") {
     if (state.status === "awaiting_approval" && !input.approve) {
       return { approvalRequired: true, contract: contractView(contract, graph) };

@@ -53,6 +53,7 @@ Graphcraft displays a concise run contract before doing work. Use `--yes` only w
 - Runs deterministic repository probes and classifies progress as advanced, learning, stalled, regressed, oscillating, blocked, or done.
 - Schedules one evidence-driven repair when verification fails, then stops if the changed strategy does not clear the failure.
 - Checkpoints host sessions and results during execution, resumes the same host session when safe, and falls back to repository evidence when switching hosts or native continuation is unavailable.
+- Accepts pause or stop from another CLI process, terminates the active child with bounded escalation, and records the exact cause and outcome before releasing the run lock.
 - Tracks cached, uncached, output, reasoning, and total tokens when the host exposes them.
 
 ## Commands

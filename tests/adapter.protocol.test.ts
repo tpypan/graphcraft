@@ -1,9 +1,12 @@
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { describe, expect, it } from "vitest";
 import { codexWorkerArgs } from "../packages/adapter-codex/src/index.ts";
 import { claudeWorkerArgs } from "../packages/adapter-claude/src/index.ts";
 import {
   reconcilePersistedInvocation,
+  ChildTerminationController,
   type InvocationRecord,
   type WorkerRequest,
 } from "../packages/core/src/index.ts";
@@ -87,5 +90,38 @@ describe("native host continuation protocol", () => {
         ],
       }).state,
     ).toBe("completed");
+  });
+
+  it("terminates children gracefully and escalates an unresponsive child", async () => {
+    const terminate = async (script: string, graceMs: number) => {
+      const child = spawn(process.execPath, ["-e", script], { stdio: "ignore" });
+      await once(child, "spawn");
+      const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+        (resolve) => child.once("close", (code, signal) => resolve({ code, signal })),
+      );
+      const abort = new AbortController();
+      const controller = new ChildTerminationController(child, abort.signal, graceMs);
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      abort.abort({ cause: "user_pause", reason: "test pause" });
+      const exit = await closed;
+      return controller.finish(exit.code, exit.signal);
+    };
+
+    const graceful = await terminate("setInterval(() => {}, 1000)", 500);
+    expect(graceful).toMatchObject({
+      cause: "user_pause",
+      outcome: "graceful",
+      requestedSignal: "SIGTERM",
+    });
+
+    const forced = await terminate(
+      "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)",
+      50,
+    );
+    expect(forced).toMatchObject({
+      cause: "user_pause",
+      outcome: "forced",
+      requestedSignal: "SIGKILL",
+    });
   });
 });

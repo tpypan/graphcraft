@@ -15,7 +15,7 @@ import {
   uninstallHost,
   type HostName,
 } from "./index.ts";
-import { createRun, executeRun, stopRun } from "@graphcraft/runtime";
+import { createRun, executeRun } from "@graphcraft/runtime";
 
 const program = new Command()
   .name("graphcraft")
@@ -26,6 +26,23 @@ const program = new Command()
 const hostOption = new Option("--host <host>", "coding-agent host")
   .choices(["codex", "claude"])
   .default("codex");
+
+function executionSignal(): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController();
+  const cancel = (): void =>
+    controller.abort({ cause: "cancellation", reason: "Cancelled by SIGINT" });
+  const shutdown = (): void =>
+    controller.abort({ cause: "runtime_shutdown", reason: "Runtime received SIGTERM" });
+  process.once("SIGINT", cancel);
+  process.once("SIGTERM", shutdown);
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      process.off("SIGINT", cancel);
+      process.off("SIGTERM", shutdown);
+    },
+  };
+}
 
 program
   .command("install")
@@ -105,12 +122,14 @@ program
         );
         return;
       }
+      const execution = executionSignal();
       const state = await executeRun({
         store: created.store,
         adapter,
         approve: true,
         observer: consoleObserver(options.json),
-      });
+        signal: execution.signal,
+      }).finally(execution.dispose);
       console.log(JSON.stringify(stateView(state, created.contract), null, options.json ? 0 : 2));
       if (state.status !== "completed") process.exitCode = 2;
     },
@@ -180,12 +199,14 @@ program
         );
         return;
       }
+      const execution = executionSignal();
       const resumed = await executeRun({
         store,
         adapter: createAdapter(options.host),
         approve: true,
         observer: consoleObserver(options.json),
-      });
+        signal: execution.signal,
+      }).finally(execution.dispose);
       console.log(JSON.stringify(stateView(resumed, contract), null, options.json ? 0 : 2));
       if (resumed.status !== "completed") process.exitCode = 2;
     },
@@ -212,9 +233,13 @@ program
   .argument("[run]")
   .option("-C, --cwd <path>", "repository path", process.cwd())
   .action(async (run: string | undefined, options: { cwd: string }) => {
-    const store = await storeFor(options.cwd, run);
-    const contract = await store.loadContract();
-    console.log(JSON.stringify(stateView(await stopRun(store), contract), null, 2));
+    console.log(
+      JSON.stringify(
+        await handleAction({ action: "stop", repository: options.cwd, ...(run ? { run } : {}) }),
+        null,
+        2,
+      ),
+    );
   });
 
 program

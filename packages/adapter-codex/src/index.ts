@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import {
+  ChildTerminationController,
   GraphPlanSchema,
   HostCapabilitiesSchema,
   TokenUsageSchema,
@@ -193,13 +194,11 @@ export class CodexAdapter implements HostAdapter {
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
     });
-    const exitPromise = new Promise<number>((resolve) =>
-      child.once("close", (code) => resolve(code ?? 1)),
+    const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolve) =>
+        child.once("close", (code, closeSignal) => resolve({ code, signal: closeSignal })),
     );
-    const abort = (): void => {
-      child.kill("SIGTERM");
-    };
-    signal.addEventListener("abort", abort, { once: true });
+    const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderWorkerPrompt(request.capsule));
 
     yield { type: "started", invocationId: request.invocationId };
@@ -247,22 +246,25 @@ export class CodexAdapter implements HostAdapter {
         }
       }
 
-      const exitCode = await exitPromise;
-      if (signal.aborted) {
-        yield { type: "error", message: "Codex invocation aborted" };
+      const exit = await exitPromise;
+      const termination = terminationController.finish(exit.code, exit.signal);
+      if (termination) {
+        yield { type: "terminated", termination };
         return;
       }
       const result = parseJsonResult(lastMessage);
-      if (exitCode !== 0 || !result) {
+      if (exit.code !== 0 || !result) {
         yield {
           type: "error",
-          message: stderr.trim() || `Codex exited ${exitCode} without a valid structured result`,
+          message:
+            stderr.trim() || `Codex exited ${exit.code ?? 1} without a valid structured result`,
+          cause: "host_crash",
         };
         return;
       }
       yield { type: "result", result };
     } finally {
-      signal.removeEventListener("abort", abort);
+      terminationController.dispose();
       await rm(schemaDirectory, { recursive: true, force: true });
     }
   }

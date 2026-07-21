@@ -206,6 +206,34 @@ export const HostCapabilitiesSchema = z.strictObject({
   tokenReporting: z.boolean(),
 });
 
+export const InterruptionCauseSchema = z.enum([
+  "user_pause",
+  "user_stop",
+  "cancellation",
+  "host_crash",
+  "timeout",
+  "runtime_shutdown",
+]);
+
+export const HostTerminationSchema = z.strictObject({
+  cause: InterruptionCauseSchema,
+  outcome: z.enum(["graceful", "forced", "already_exited"]),
+  requestedSignal: z.enum(["SIGTERM", "SIGKILL"]),
+  exitCode: z.number().int().nullable(),
+  exitSignal: z.string().nullable(),
+});
+
+export const RunControlRequestSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  requestId: z.uuid(),
+  runId: z.uuid(),
+  action: z.enum(["pause", "stop"]),
+  cause: z.enum(["user_pause", "user_stop"]),
+  reason: z.string().min(1),
+  requestedAt: z.iso.datetime(),
+  requestedByPid: z.number().int().positive(),
+});
+
 export const HostEventSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("started"), invocationId: z.string() }),
   z.strictObject({ type: z.literal("session"), hostSessionId: z.string().min(1) }),
@@ -213,7 +241,12 @@ export const HostEventSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("tool"), name: z.string(), summary: z.string() }),
   z.strictObject({ type: z.literal("result"), result: WorkerResultSchema }),
   z.strictObject({ type: z.literal("usage"), usage: TokenUsageSchema }),
-  z.strictObject({ type: z.literal("error"), message: z.string() }),
+  z.strictObject({ type: z.literal("terminated"), termination: HostTerminationSchema }),
+  z.strictObject({
+    type: z.literal("error"),
+    message: z.string(),
+    cause: InterruptionCauseSchema.optional(),
+  }),
 ]);
 
 export const RunEventTypeSchema = z.enum([
@@ -233,6 +266,7 @@ export const RunEventTypeSchema = z.enum([
   "invocation.session",
   "invocation.resumed",
   "invocation.finished",
+  "control.applied",
   "tokens.recorded",
   "graph.amended",
 ]);
@@ -293,6 +327,9 @@ export type TokenUsage = z.infer<typeof TokenUsageSchema>;
 export type WorkerResult = z.infer<typeof WorkerResultSchema>;
 export type ContextCapsule = z.infer<typeof ContextCapsuleSchema>;
 export type HostCapabilities = z.infer<typeof HostCapabilitiesSchema>;
+export type InterruptionCause = z.infer<typeof InterruptionCauseSchema>;
+export type HostTermination = z.infer<typeof HostTerminationSchema>;
+export type RunControlRequest = z.infer<typeof RunControlRequestSchema>;
 export type HostEvent = z.infer<typeof HostEventSchema>;
 export type RunEvent = z.infer<typeof RunEventSchema>;
 export type RunState = z.infer<typeof RunStateSchema>;

@@ -145,6 +145,7 @@ export function reduceEvents(events: RunEvent[]): RunState {
       case "invocation.session":
       case "invocation.resumed":
       case "invocation.finished":
+      case "control.applied":
         break;
       case "run.created":
         throw new Error("run.created may only appear once");

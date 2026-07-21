@@ -10,15 +10,18 @@ import {
   contentHash,
   createContextCapsule,
   evidenceSnapshot,
+  interruptionReason,
   type EvidenceSnapshot,
   type Graph,
   type GraphPlanner,
   type GraphNode,
   type HostAdapter,
   type HostEvent,
+  type HostTermination,
   type InvocationRecord,
   type ProbeResult,
   type RunContract,
+  type RunControlRequest,
   type RunState,
   type TokenUsage,
   type WorkerResult,
@@ -31,6 +34,7 @@ import {
   type ExecutedProbe,
 } from "@graphcraft/probes";
 import { RunLock } from "./lock.ts";
+import { requestRunControl, RunControlChannel } from "./control.ts";
 import {
   createAtomicCommit,
   discoverPlanningEvidence,
@@ -92,7 +96,8 @@ async function recoverableInvocation(
   const finished = events.findLast(
     ({ type, data }) => type === "invocation.finished" && data.invocationId === invocationId,
   );
-  if (finished && finished.data.success !== true) return undefined;
+  if (finished && finished.data.success !== true && finished.data.interrupted !== true)
+    return undefined;
   const session = events.findLast(
     ({ type, data }) =>
       type === "invocation.session" &&
@@ -220,7 +225,13 @@ async function executeWorker(input: {
   signal: AbortSignal;
   baseline: EvidenceSnapshot;
   resume?: InvocationRecord;
-}): Promise<{ result?: WorkerResult; error?: string }> {
+}): Promise<{
+  result?: WorkerResult;
+  error?: string;
+  errorCause?: "host_crash" | "timeout";
+  termination?: HostTermination;
+  artifact: string;
+}> {
   const capsule = createContextCapsule({
     contract: input.contract,
     node: input.node,
@@ -247,7 +258,7 @@ async function executeWorker(input: {
         { invocationId, nodeId: input.node.id, artifact, success: true, recovered: true },
         invocationId,
       );
-      return { result: WorkerResultSchema.parse(reconciliation.result) };
+      return { result: WorkerResultSchema.parse(reconciliation.result), artifact };
     }
     if (reconciliation.state === "in_progress" && input.resume.hostSessionId) {
       resumeSessionId = input.resume.hostSessionId;
@@ -283,6 +294,8 @@ async function executeWorker(input: {
   }
   let result: WorkerResult | undefined;
   let error: string | undefined;
+  let errorCause: "host_crash" | "timeout" | undefined;
+  let termination: HostTermination | undefined;
 
   let artifact = join(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
   try {
@@ -313,20 +326,39 @@ async function executeWorker(input: {
         await input.store.append("host", "tokens.recorded", { usage: event.usage }, invocationId);
       }
       if (event.type === "result") result = WorkerResultSchema.parse(event.result);
-      if (event.type === "error") error = event.message;
+      if (event.type === "terminated") termination = event.termination;
+      if (event.type === "error") {
+        error = event.message;
+        if (event.cause === "host_crash" || event.cause === "timeout") errorCause = event.cause;
+      }
     }
   } catch (cause) {
     error = cause instanceof Error ? cause.message : String(cause);
-    const event: HostEvent = { type: "error", message: error };
+    errorCause = "host_crash";
+    const event: HostEvent = { type: "error", message: error, cause: errorCause };
     artifact = await input.store.appendInvocationEvent(invocationId, event);
   }
   await input.store.append(
     "runtime",
     "invocation.finished",
-    { invocationId, nodeId: input.node.id, artifact, success: Boolean(result) && !error },
+    {
+      invocationId,
+      nodeId: input.node.id,
+      artifact,
+      success: Boolean(result) && !error && !termination,
+      interrupted: Boolean(termination),
+      ...(termination ? { termination } : {}),
+      ...(errorCause ? { errorCause } : {}),
+    },
     invocationId,
   );
-  return { ...(result ? { result } : {}), ...(error ? { error } : {}) };
+  return {
+    ...(result ? { result } : {}),
+    ...(error ? { error } : {}),
+    ...(errorCause ? { errorCause } : {}),
+    ...(termination ? { termination } : {}),
+    artifact,
+  };
 }
 
 async function captureProbes(
@@ -416,11 +448,20 @@ export async function executeRun(input: {
   observer?: RunObserver;
   signal?: AbortSignal;
 }): Promise<RunState> {
-  const signal = input.signal ?? new AbortController().signal;
+  const externalSignal = input.signal ?? new AbortController().signal;
   const contract = await input.store.loadContract();
   let graph = await input.store.loadGraph();
   const lock = new RunLock(join(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
   await lock.acquire();
+  const controlChannel = new RunControlChannel(input.store.graphcraftRoot, contract.runId);
+  const controlAbort = new AbortController();
+  let controlRequest: RunControlRequest | undefined;
+  const stopWatching = controlChannel.watch((request) => {
+    if (!controlRequest || request.action === "stop") controlRequest = request;
+    if (!controlAbort.signal.aborted)
+      controlAbort.abort({ cause: request.cause, reason: request.reason });
+  });
+  const signal = AbortSignal.any([externalSignal, controlAbort.signal]);
   try {
     let state = await input.store.loadState();
     if (state.status === "awaiting_approval") {
@@ -465,6 +506,44 @@ export async function executeRun(input: {
       workspace = await createRunWorkspace(contract);
       await input.store.writeWorkspace(workspace);
     }
+    const finishInterruption = async (
+      nodeId?: string,
+      termination?: HostTermination,
+      artifact?: string,
+    ): Promise<RunState> => {
+      const request = controlRequest;
+      const reason = request
+        ? { cause: request.cause, reason: request.reason }
+        : interruptionReason(externalSignal.reason, "runtime_shutdown");
+      const action = request?.action ?? "pause";
+      const currentState = await input.store.loadState();
+      if (action === "stop" && nodeId && currentState.nodes[nodeId]?.status === "running") {
+        await input.store.append("runtime", "node.reset", {
+          nodeId,
+          reason: "Stopped after active child reconciliation",
+        });
+      }
+      await input.store.append("runtime", "control.applied", {
+        request: request ?? null,
+        action,
+        cause: reason.cause,
+        reason: reason.reason,
+        outcome: termination?.outcome ?? "checkpointed",
+        termination: termination ?? null,
+        artifact: artifact ?? null,
+      });
+      await input.store.append(
+        request ? "user" : "runtime",
+        action === "stop" ? "run.stopped" : "run.paused",
+        {
+          reason: reason.reason,
+          cause: reason.cause,
+          ...(request ? { requestId: request.requestId } : {}),
+        },
+      );
+      if (request) await controlChannel.clear(request.requestId);
+      return await input.store.loadState();
+    };
     let recovery = interruptedNodeId
       ? await recoverableInvocation(input.store, interruptedNodeId, workspace.path)
       : undefined;
@@ -496,6 +575,7 @@ export async function executeRun(input: {
           : "Recovered from repository evidence; accepted nodes remain immutable",
       });
     }
+    if (signal.aborted) return await finishInterruption(interruptedNodeId);
     if (state.status !== "running")
       await input.store.append("runtime", "run.started", { workspace });
 
@@ -520,6 +600,7 @@ export async function executeRun(input: {
 
       input.observer?.({ type: "status", message: `${current.kind}: ${current.objective}` });
       await input.store.append("runtime", "node.started", { nodeId: current.id });
+      if (signal.aborted) return await finishInterruption(current.id);
 
       if (current.kind === "verification") {
         if (current.completionProbes.length === 0) {
@@ -540,6 +621,7 @@ export async function executeRun(input: {
           input.observer,
           signal,
         );
+        if (signal.aborted) return await finishInterruption(current.id);
         const results = executed.map(({ result }) => result);
         if (results.every(({ passed }) => passed)) {
           await input.store.append("probe", "node.progress", {
@@ -610,6 +692,7 @@ export async function executeRun(input: {
         baselineProbeResults = baseline.probeResults;
       } else {
         const baselineProbes = await runProbes(current.progressProbes, workspace.path, signal);
+        if (signal.aborted) return await finishInterruption(current.id);
         baselineProbeResults = baselineProbes.map(({ result }) => result);
         baseline = evidenceSnapshot(await workspaceDigest(workspace.path), baselineProbeResults);
       }
@@ -630,10 +713,18 @@ export async function executeRun(input: {
         ...(activeRecovery ? { resume: activeRecovery.record } : {}),
       });
       if (activeRecovery) recovery = undefined;
+      if (signal.aborted)
+        return await finishInterruption(current.id, worker.termination, worker.artifact);
       if (!worker.result || worker.error || worker.result.status !== "completed") {
-        const reason = worker.error ?? worker.result?.summary ?? "Worker did not complete the node";
-        await input.store.append("worker", "node.failed", { nodeId: current.id, reason });
-        await input.store.append("runtime", "run.blocked", { reason });
+        const detail = worker.error ?? worker.result?.summary ?? "Worker did not complete the node";
+        const cause = worker.errorCause ?? "host_crash";
+        const reason = `${cause === "timeout" ? "Host timeout" : "Host crash"}: ${detail}`;
+        await input.store.append("worker", "node.failed", {
+          nodeId: current.id,
+          reason,
+          cause,
+        });
+        await input.store.append("runtime", "run.blocked", { reason, cause });
         return await input.store.loadState();
       }
 
@@ -644,6 +735,8 @@ export async function executeRun(input: {
         input.observer,
         signal,
       );
+      if (signal.aborted)
+        return await finishInterruption(current.id, worker.termination, worker.artifact);
       const currentEvidence = evidenceSnapshot(
         await workspaceDigest(workspace.path),
         afterProbes.map(({ result }) => result),
@@ -678,17 +771,13 @@ export async function executeRun(input: {
       }
     }
 
-    await input.store.append("runtime", "run.paused", { reason: "Execution signal aborted" });
-    return await input.store.loadState();
+    return await finishInterruption((await input.store.loadState()).currentNodeId);
   } finally {
+    await stopWatching();
     await lock.release();
   }
 }
 
 export async function stopRun(store: RunStore, reason = "Stopped by user"): Promise<RunState> {
-  const state = await store.loadState();
-  if (!["completed", "stopped"].includes(state.status)) {
-    await store.append("user", "run.stopped", { reason });
-  }
-  return await store.loadState();
+  return await requestRunControl(store, "stop", reason);
 }

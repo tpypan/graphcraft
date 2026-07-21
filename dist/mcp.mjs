@@ -31243,6 +31243,31 @@ var HostCapabilitiesSchema = external_exports.strictObject({
   streamingEvents: external_exports.boolean(),
   tokenReporting: external_exports.boolean()
 });
+var InterruptionCauseSchema = external_exports.enum([
+  "user_pause",
+  "user_stop",
+  "cancellation",
+  "host_crash",
+  "timeout",
+  "runtime_shutdown"
+]);
+var HostTerminationSchema = external_exports.strictObject({
+  cause: InterruptionCauseSchema,
+  outcome: external_exports.enum(["graceful", "forced", "already_exited"]),
+  requestedSignal: external_exports.enum(["SIGTERM", "SIGKILL"]),
+  exitCode: external_exports.number().int().nullable(),
+  exitSignal: external_exports.string().nullable()
+});
+var RunControlRequestSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  requestId: external_exports.uuid(),
+  runId: external_exports.uuid(),
+  action: external_exports.enum(["pause", "stop"]),
+  cause: external_exports.enum(["user_pause", "user_stop"]),
+  reason: external_exports.string().min(1),
+  requestedAt: external_exports.iso.datetime(),
+  requestedByPid: external_exports.number().int().positive()
+});
 var HostEventSchema = external_exports.discriminatedUnion("type", [
   external_exports.strictObject({ type: external_exports.literal("started"), invocationId: external_exports.string() }),
   external_exports.strictObject({ type: external_exports.literal("session"), hostSessionId: external_exports.string().min(1) }),
@@ -31250,7 +31275,12 @@ var HostEventSchema = external_exports.discriminatedUnion("type", [
   external_exports.strictObject({ type: external_exports.literal("tool"), name: external_exports.string(), summary: external_exports.string() }),
   external_exports.strictObject({ type: external_exports.literal("result"), result: WorkerResultSchema }),
   external_exports.strictObject({ type: external_exports.literal("usage"), usage: TokenUsageSchema }),
-  external_exports.strictObject({ type: external_exports.literal("error"), message: external_exports.string() })
+  external_exports.strictObject({ type: external_exports.literal("terminated"), termination: HostTerminationSchema }),
+  external_exports.strictObject({
+    type: external_exports.literal("error"),
+    message: external_exports.string(),
+    cause: InterruptionCauseSchema.optional()
+  })
 ]);
 var RunEventTypeSchema = external_exports.enum([
   "run.created",
@@ -31269,6 +31299,7 @@ var RunEventTypeSchema = external_exports.enum([
   "invocation.session",
   "invocation.resumed",
   "invocation.finished",
+  "control.applied",
   "tokens.recorded",
   "graph.amended"
 ]);
@@ -31876,6 +31907,7 @@ function reduceEvents(events) {
       case "invocation.session":
       case "invocation.resumed":
       case "invocation.finished":
+      case "control.applied":
         break;
       case "run.created":
         throw new Error("run.created may only appear once");
@@ -31887,6 +31919,78 @@ function reduceEvents(events) {
   if (!state) throw new Error("Cannot reduce an empty event stream");
   return RunStateSchema.parse(state);
 }
+
+// packages/core/src/subprocess.ts
+function interruptionReason(value, fallback = "cancellation") {
+  if (typeof value === "object" && value !== null) {
+    const candidate = value;
+    if (typeof candidate.cause === "string" && [
+      "user_pause",
+      "user_stop",
+      "cancellation",
+      "host_crash",
+      "timeout",
+      "runtime_shutdown"
+    ].includes(candidate.cause) && typeof candidate.reason === "string" && candidate.reason.length > 0) {
+      return candidate;
+    }
+  }
+  return {
+    cause: fallback,
+    reason: value instanceof Error ? value.message : "Execution was cancelled"
+  };
+}
+var ChildTerminationController = class {
+  constructor(child, signal, graceMs = 2e3) {
+    this.child = child;
+    this.signal = signal;
+    this.graceMs = graceMs;
+    signal.addEventListener("abort", this.abort, { once: true });
+    if (signal.aborted) this.abort();
+  }
+  child;
+  signal;
+  graceMs;
+  requested = false;
+  delivered = false;
+  forced = false;
+  timer;
+  abort = () => {
+    if (this.requested) return;
+    this.requested = true;
+    try {
+      this.delivered = this.child.kill("SIGTERM");
+    } catch {
+      this.delivered = false;
+    }
+    if (this.delivered) {
+      this.timer = setTimeout(() => {
+        try {
+          this.forced = this.child.kill("SIGKILL");
+        } catch {
+          this.forced = false;
+        }
+      }, this.graceMs);
+      this.timer.unref();
+    }
+  };
+  finish(exitCode, exitSignal) {
+    this.dispose();
+    if (!this.requested) return void 0;
+    const reason = interruptionReason(this.signal.reason);
+    return {
+      cause: reason.cause,
+      outcome: this.forced ? "forced" : this.delivered ? "graceful" : "already_exited",
+      requestedSignal: this.forced ? "SIGKILL" : "SIGTERM",
+      exitCode,
+      exitSignal
+    };
+  }
+  dispose() {
+    if (this.timer) clearTimeout(this.timer);
+    this.signal.removeEventListener("abort", this.abort);
+  }
+};
 
 // packages/adapter-codex/src/index.ts
 function parseJsonResult(value) {
@@ -32053,12 +32157,9 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve3) => child.once("close", (code) => resolve3(code ?? 1))
+      (resolve3) => child.once("close", (code, closeSignal) => resolve3({ code, signal: closeSignal }))
     );
-    const abort = () => {
-      child.kill("SIGTERM");
-    };
-    signal.addEventListener("abort", abort, { once: true });
+    const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderWorkerPrompt(request.capsule));
     yield { type: "started", invocationId: request.invocationId };
     let lastMessage = "";
@@ -32103,22 +32204,24 @@ var CodexAdapter = class {
           };
         }
       }
-      const exitCode = await exitPromise;
-      if (signal.aborted) {
-        yield { type: "error", message: "Codex invocation aborted" };
+      const exit = await exitPromise;
+      const termination = terminationController.finish(exit.code, exit.signal);
+      if (termination) {
+        yield { type: "terminated", termination };
         return;
       }
       const result = parseJsonResult(lastMessage);
-      if (exitCode !== 0 || !result) {
+      if (exit.code !== 0 || !result) {
         yield {
           type: "error",
-          message: stderr.trim() || `Codex exited ${exitCode} without a valid structured result`
+          message: stderr.trim() || `Codex exited ${exit.code ?? 1} without a valid structured result`,
+          cause: "host_crash"
         };
         return;
       }
       yield { type: "result", result };
     } finally {
-      signal.removeEventListener("abort", abort);
+      terminationController.dispose();
       await rm(schemaDirectory, { recursive: true, force: true });
     }
   }
@@ -32321,12 +32424,9 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve3) => child.once("close", (code) => resolve3(code ?? 1))
+      (resolve3) => child.once("close", (code, closeSignal) => resolve3({ code, signal: closeSignal }))
     );
-    const abort = () => {
-      child.kill("SIGTERM");
-    };
-    signal.addEventListener("abort", abort, { once: true });
+    const terminationController = new ChildTerminationController(child, signal);
     yield { type: "started", invocationId: request.invocationId };
     let stderr = "";
     let finalResult;
@@ -32370,18 +32470,20 @@ var ClaudeAdapter = class {
         };
       }
     }
-    const exitCode = await exitPromise;
-    signal.removeEventListener("abort", abort);
-    if (signal.aborted) {
-      yield { type: "error", message: "Claude invocation aborted" };
-    } else if (exitCode !== 0 || !finalResult) {
+    const exit = await exitPromise;
+    const termination = terminationController.finish(exit.code, exit.signal);
+    if (termination) {
+      yield { type: "terminated", termination };
+    } else if (exit.code !== 0 || !finalResult) {
       yield {
         type: "error",
-        message: stderr.trim() || `Claude exited ${exitCode} without a valid structured result`
+        message: stderr.trim() || `Claude exited ${exit.code ?? 1} without a valid structured result`,
+        cause: "host_crash"
       };
     } else {
       yield { type: "result", result: finalResult };
     }
+    terminationController.dispose();
   }
   async reconcile(invocation) {
     return reconcilePersistedInvocation(invocation);
@@ -32409,11 +32511,31 @@ function claudeWorkerArgs(request) {
   ];
 }
 
+// packages/runtime/src/control.ts
+import { randomUUID as randomUUID4 } from "node:crypto";
+import { readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
+import { join as join2 } from "node:path";
+
+// packages/runtime/src/json.ts
+import { randomUUID as randomUUID2 } from "node:crypto";
+import { mkdir, rename, writeFile as writeFile2 } from "node:fs/promises";
+import { dirname } from "node:path";
+async function writeJsonAtomic(path, value) {
+  await mkdir(dirname(path), { recursive: true });
+  const temporaryPath = `${path}.${process.pid}.${randomUUID2()}.tmp`;
+  await writeFile2(temporaryPath, `${JSON.stringify(value, null, 2)}
+`, {
+    encoding: "utf8",
+    mode: 384
+  });
+  await rename(temporaryPath, path);
+}
+
 // packages/runtime/src/lock.ts
 import { hostname as hostname3 } from "node:os";
-import { randomUUID as randomUUID2 } from "node:crypto";
-import { mkdir, open, readFile, unlink, writeFile as writeFile2 } from "node:fs/promises";
-import { dirname } from "node:path";
+import { randomUUID as randomUUID3 } from "node:crypto";
+import { mkdir as mkdir2, open, readFile, stat, unlink } from "node:fs/promises";
+import { dirname as dirname2 } from "node:path";
 function processExists(pid) {
   try {
     process.kill(pid, 0);
@@ -32424,16 +32546,32 @@ function processExists(pid) {
 }
 var RunLock = class {
   path;
-  token = randomUUID2();
+  token = randomUUID3();
   heartbeat;
+  heartbeatWrite = Promise.resolve();
   constructor(path) {
     this.path = path;
   }
   async acquire(staleAfterMs = 3e4) {
-    await mkdir(dirname(this.path), { recursive: true });
+    await mkdir2(dirname2(this.path), { recursive: true });
     try {
       const handle = await open(this.path, "wx", 384);
-      await handle.close();
+      const acquiredAt = (/* @__PURE__ */ new Date()).toISOString();
+      try {
+        await handle.writeFile(
+          `${JSON.stringify({
+            token: this.token,
+            pid: process.pid,
+            hostname: hostname3(),
+            acquiredAt,
+            heartbeatAt: acquiredAt
+          })}
+`,
+          "utf8"
+        );
+      } finally {
+        await handle.close();
+      }
     } catch (error51) {
       if (error51.code !== "EEXIST") throw error51;
       let record2;
@@ -32441,7 +32579,7 @@ var RunLock = class {
         record2 = JSON.parse(await readFile(this.path, "utf8"));
       } catch {
       }
-      const heartbeatAge = record2 ? Date.now() - Date.parse(record2.heartbeatAt) : Number.POSITIVE_INFINITY;
+      const heartbeatAge = record2 ? Math.max(0, Date.now() - Date.parse(record2.heartbeatAt)) : await stat(this.path).then(({ mtimeMs }) => Math.max(0, Date.now() - mtimeMs)).catch(() => Number.POSITIVE_INFINITY);
       const sameHost = record2 !== void 0 && record2.hostname === hostname3();
       const liveLocalProcess = record2 !== void 0 && sameHost && processExists(record2.pid);
       if (liveLocalProcess || !sameHost && heartbeatAge < staleAfterMs)
@@ -32449,12 +32587,14 @@ var RunLock = class {
       await unlink(this.path);
       return await this.acquire(staleAfterMs);
     }
-    await this.writeRecord((/* @__PURE__ */ new Date()).toISOString());
-    this.heartbeat = setInterval(() => void this.writeRecord((/* @__PURE__ */ new Date()).toISOString()), 5e3);
+    this.heartbeat = setInterval(() => {
+      this.heartbeatWrite = this.heartbeatWrite.then(() => this.writeRecord((/* @__PURE__ */ new Date()).toISOString())).catch(() => void 0);
+    }, 5e3);
     this.heartbeat.unref();
   }
   async release() {
     if (this.heartbeat) clearInterval(this.heartbeat);
+    await this.heartbeatWrite.catch(() => void 0);
     try {
       const current = JSON.parse(await readFile(this.path, "utf8"));
       if (current.token === this.token) await unlink(this.path);
@@ -32474,17 +32614,126 @@ var RunLock = class {
       record2.acquiredAt = current.token === this.token ? current.acquiredAt : heartbeatAt;
     } catch {
     }
-    await writeFile2(this.path, `${JSON.stringify(record2)}
-`, { encoding: "utf8", mode: 384 });
+    await writeJsonAtomic(this.path, record2);
   }
 };
 
+// packages/runtime/src/control.ts
+var RunControlChannel = class {
+  constructor(graphcraftRoot, runId) {
+    this.graphcraftRoot = graphcraftRoot;
+    this.runId = runId;
+    this.path = join2(graphcraftRoot, "controls", `${runId}.json`);
+  }
+  graphcraftRoot;
+  runId;
+  path;
+  async request(action, reason) {
+    const existing = await this.read();
+    if (existing?.action === "stop" && action === "pause") return existing;
+    const request = RunControlRequestSchema.parse({
+      schemaVersion: 1,
+      requestId: randomUUID4(),
+      runId: this.runId,
+      action,
+      cause: action === "pause" ? "user_pause" : "user_stop",
+      reason,
+      requestedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      requestedByPid: process.pid
+    });
+    await writeJsonAtomic(this.path, request);
+    return request;
+  }
+  async read() {
+    try {
+      return RunControlRequestSchema.parse(JSON.parse(await readFile2(this.path, "utf8")));
+    } catch {
+      return void 0;
+    }
+  }
+  watch(onRequest, intervalMs = 100) {
+    let stopped = false;
+    let lastRequestId;
+    let inFlight = Promise.resolve();
+    const poll = () => {
+      if (stopped) return;
+      inFlight = inFlight.then(async () => {
+        const request = await this.read();
+        if (request && request.requestId !== lastRequestId) {
+          lastRequestId = request.requestId;
+          onRequest(request);
+        }
+      });
+    };
+    const timer = setInterval(poll, intervalMs);
+    timer.unref();
+    poll();
+    return async () => {
+      stopped = true;
+      clearInterval(timer);
+      await inFlight;
+    };
+  }
+  async clear(requestId) {
+    const current = await this.read();
+    if (current?.requestId !== requestId) return;
+    await unlink2(this.path).catch((error51) => {
+      if (error51.code !== "ENOENT") throw error51;
+    });
+  }
+};
+function targetReached(action, state) {
+  if (action === "pause") return ["paused", "stopped", "completed"].includes(state.status);
+  return ["stopped", "completed"].includes(state.status);
+}
+async function requestRunControl(store, action, reason = action === "pause" ? "Paused by user" : "Stopped by user", waitMs = 1e4) {
+  let state = await store.loadState();
+  if (targetReached(action, state)) return state;
+  const channel = new RunControlChannel(store.graphcraftRoot, store.runId);
+  const request = await channel.request(action, reason);
+  const lockPath = join2(store.graphcraftRoot, "locks", `${store.runId}.lock`);
+  const deadline = Date.now() + waitMs;
+  while (Date.now() <= deadline) {
+    const lock = new RunLock(lockPath);
+    try {
+      await lock.acquire();
+      try {
+        state = await store.loadState();
+        if (!targetReached(action, state)) {
+          await store.append("runtime", "control.applied", {
+            request,
+            outcome: "owner_unavailable",
+            termination: null
+          });
+          await store.append("user", action === "pause" ? "run.paused" : "run.stopped", {
+            reason,
+            requestId: request.requestId,
+            cause: request.cause
+          });
+          state = await store.loadState();
+        }
+        await channel.clear(request.requestId);
+        return state;
+      } finally {
+        await lock.release();
+      }
+    } catch (error51) {
+      if (!(error51 instanceof Error) || error51.message !== "Graphcraft run is already active")
+        throw error51;
+    }
+    await new Promise((resolve3) => setTimeout(resolve3, 50));
+  }
+  throw new Error(
+    `The active Graphcraft process did not acknowledge ${action} within ${waitMs}ms; the durable request remains pending`
+  );
+}
+
 // packages/runtime/src/repository.ts
-import { appendFile, mkdir as mkdir2, readFile as readFile3 } from "node:fs/promises";
-import { basename, dirname as dirname2, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
+import { appendFile, mkdir as mkdir3, readFile as readFile4 } from "node:fs/promises";
+import { basename, dirname as dirname3, isAbsolute as isAbsolute2, join as join3, resolve as resolve2 } from "node:path";
 
 // packages/probes/src/index.ts
-import { access, readFile as readFile2 } from "node:fs/promises";
+import { access, readFile as readFile3 } from "node:fs/promises";
 import { constants } from "node:fs";
 import { resolve } from "node:path";
 
@@ -32576,7 +32825,7 @@ async function runProbe(spec, repositoryPath, signal) {
       exists = false;
     }
     let contains = true;
-    if (exists && spec.contains) contains = (await readFile2(path, "utf8")).includes(spec.contains);
+    if (exists && spec.contains) contains = (await readFile3(path, "utf8")).includes(spec.contains);
     const passed2 = exists === spec.shouldExist && contains;
     const summary = `${spec.path} ${exists ? "exists" : "does not exist"}${spec.contains ? ` and ${contains ? "contains" : "does not contain"} the required text` : ""}`;
     return {
@@ -32634,7 +32883,7 @@ async function workspaceDigest(repositoryPath) {
 async function discoverVerificationProbes(repositoryPath) {
   const probes = [];
   try {
-    const packageJson = JSON.parse(await readFile2(`${repositoryPath}/package.json`, "utf8"));
+    const packageJson = JSON.parse(await readFile3(`${repositoryPath}/package.json`, "utf8"));
     const runner = packageJson.packageManager?.startsWith("pnpm") ? "pnpm" : "npm";
     const commandArgs = (script) => runner === "pnpm" ? [script] : ["run", script];
     for (const name of ["typecheck", "test", "build"]) {
@@ -32779,7 +33028,7 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
   ) : [];
   const taskMatches = await Promise.all(
     matchedPaths.map(async (path) => {
-      const content = await readFile3(join2(repositoryRoot, path), "utf8").catch(() => "");
+      const content = await readFile4(join3(repositoryRoot, path), "utf8").catch(() => "");
       const normalized = content.toLowerCase();
       const score = searchTerms.filter((term) => normalized.includes(term)).length;
       const pathScore = searchTerms.filter((term) => path.toLowerCase().includes(term)).length;
@@ -32804,7 +33053,7 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
   for (const path of baselinePaths) {
     if (remainingCharacters <= 0 || files.length >= 7) break;
     if (files.some((file2) => file2.path === path)) continue;
-    const content = await readFile3(join2(repositoryRoot, path), "utf8").catch(() => "");
+    const content = await readFile4(join3(repositoryRoot, path), "utf8").catch(() => "");
     const limit = Math.min(2e3, remainingCharacters);
     const selected = content.slice(0, limit);
     files.push({ path, content: selected, truncated: selected.length < content.length });
@@ -32823,9 +33072,9 @@ async function ensureGraphcraftIgnored(repositoryRoot) {
   const excludePath = isAbsolute2(rawExcludePath) ? rawExcludePath : resolve2(repositoryRoot, rawExcludePath);
   let content = "";
   try {
-    content = await readFile3(excludePath, "utf8");
+    content = await readFile4(excludePath, "utf8");
   } catch {
-    await mkdir2(dirname2(excludePath), { recursive: true });
+    await mkdir3(dirname3(excludePath), { recursive: true });
   }
   if (!content.split("\n").includes(".graphcraft/"))
     await appendFile(excludePath, "\n.graphcraft/\n", "utf8");
@@ -32835,12 +33084,12 @@ function slug(task) {
 }
 async function createRunWorkspace(contract) {
   const branch = `graphcraft/${contract.runId.slice(0, 8)}-${slug(contract.task)}`;
-  const parent = join2(
-    dirname2(contract.repository.root),
+  const parent = join3(
+    dirname3(contract.repository.root),
     `.${basename(contract.repository.root)}-graphcraft-worktrees`
   );
-  const path = join2(parent, contract.runId);
-  await mkdir2(parent, { recursive: true });
+  const path = join3(parent, contract.runId);
+  await mkdir3(parent, { recursive: true });
   const registered = await git(contract.repository.root, ["worktree", "list", "--porcelain"]);
   if (registered.includes(`worktree ${path}`)) return { path, branch, created: false };
   const branchExists = await git(contract.repository.root, [
@@ -32865,29 +33114,12 @@ async function createAtomicCommit(workspace, task) {
 }
 
 // packages/runtime/src/runner.ts
-import { randomUUID as randomUUID4 } from "node:crypto";
-import { join as join4 } from "node:path";
+import { randomUUID as randomUUID5 } from "node:crypto";
+import { join as join5 } from "node:path";
 
 // packages/runtime/src/store.ts
-import { appendFile as appendFile2, mkdir as mkdir4, readFile as readFile4, readdir, writeFile as writeFile4 } from "node:fs/promises";
-import { dirname as dirname4, join as join3 } from "node:path";
-
-// packages/runtime/src/json.ts
-import { randomUUID as randomUUID3 } from "node:crypto";
-import { mkdir as mkdir3, rename, writeFile as writeFile3 } from "node:fs/promises";
-import { dirname as dirname3 } from "node:path";
-async function writeJsonAtomic(path, value) {
-  await mkdir3(dirname3(path), { recursive: true });
-  const temporaryPath = `${path}.${process.pid}.${randomUUID3()}.tmp`;
-  await writeFile3(temporaryPath, `${JSON.stringify(value, null, 2)}
-`, {
-    encoding: "utf8",
-    mode: 384
-  });
-  await rename(temporaryPath, path);
-}
-
-// packages/runtime/src/store.ts
+import { appendFile as appendFile2, mkdir as mkdir4, readFile as readFile5, readdir, writeFile as writeFile3 } from "node:fs/promises";
+import { dirname as dirname4, join as join4 } from "node:path";
 var RunStore = class _RunStore {
   repositoryRoot;
   runId;
@@ -32896,16 +33128,16 @@ var RunStore = class _RunStore {
   constructor(repositoryRoot, runId) {
     this.repositoryRoot = repositoryRoot;
     this.runId = runId;
-    this.graphcraftRoot = join3(repositoryRoot, ".graphcraft");
-    this.runRoot = join3(this.graphcraftRoot, "runs", runId);
+    this.graphcraftRoot = join4(repositoryRoot, ".graphcraft");
+    this.runRoot = join4(this.graphcraftRoot, "runs", runId);
   }
   static async create(repositoryRoot, contract, graph) {
     const store = new _RunStore(repositoryRoot, contract.runId);
     await Promise.all([
-      mkdir4(join3(store.runRoot, "artifacts"), { recursive: true }),
-      mkdir4(join3(store.runRoot, "capsules"), { recursive: true }),
-      mkdir4(join3(store.runRoot, "reports"), { recursive: true }),
-      mkdir4(join3(store.graphcraftRoot, "locks"), { recursive: true })
+      mkdir4(join4(store.runRoot, "artifacts"), { recursive: true }),
+      mkdir4(join4(store.runRoot, "capsules"), { recursive: true }),
+      mkdir4(join4(store.runRoot, "reports"), { recursive: true }),
+      mkdir4(join4(store.graphcraftRoot, "locks"), { recursive: true })
     ]);
     await Promise.all([store.saveContract(contract), store.saveGraph(graph)]);
     const event = createRunEvent({
@@ -32915,7 +33147,7 @@ var RunStore = class _RunStore {
       type: "run.created",
       data: { contract, graph, nodeIds: graph.nodes.map(({ id }) => id) }
     });
-    await writeFile4(store.eventsPath(), `${JSON.stringify(event)}
+    await writeFile3(store.eventsPath(), `${JSON.stringify(event)}
 `, {
       encoding: "utf8",
       mode: 384
@@ -32924,30 +33156,30 @@ var RunStore = class _RunStore {
     return store;
   }
   eventsPath() {
-    return join3(this.runRoot, "events.jsonl");
+    return join4(this.runRoot, "events.jsonl");
   }
   async saveContract(contract) {
-    await writeJsonAtomic(join3(this.runRoot, "contract.json"), RunContractSchema.parse(contract));
+    await writeJsonAtomic(join4(this.runRoot, "contract.json"), RunContractSchema.parse(contract));
   }
   async loadContract() {
     return RunContractSchema.parse(
-      JSON.parse(await readFile4(join3(this.runRoot, "contract.json"), "utf8"))
+      JSON.parse(await readFile5(join4(this.runRoot, "contract.json"), "utf8"))
     );
   }
   async saveGraph(graph) {
-    await writeJsonAtomic(join3(this.runRoot, "graph.json"), GraphSchema.parse(graph));
+    await writeJsonAtomic(join4(this.runRoot, "graph.json"), GraphSchema.parse(graph));
   }
   async loadGraph() {
-    return GraphSchema.parse(JSON.parse(await readFile4(join3(this.runRoot, "graph.json"), "utf8")));
+    return GraphSchema.parse(JSON.parse(await readFile5(join4(this.runRoot, "graph.json"), "utf8")));
   }
   async loadEvents() {
-    const content = await readFile4(this.eventsPath(), "utf8");
+    const content = await readFile5(this.eventsPath(), "utf8");
     return content.split("\n").filter(Boolean).map((line) => RunEventSchema.parse(JSON.parse(line)));
   }
   async loadState() {
     try {
       return RunStateSchema.parse(
-        JSON.parse(await readFile4(join3(this.runRoot, "state.json"), "utf8"))
+        JSON.parse(await readFile5(join4(this.runRoot, "state.json"), "utf8"))
       );
     } catch {
       return await this.rebuildViews();
@@ -32980,13 +33212,13 @@ var RunStore = class _RunStore {
     return await this.materialize(events);
   }
   async writeArtifact(relativePath, value) {
-    const path = join3(this.runRoot, "artifacts", relativePath);
+    const path = join4(this.runRoot, "artifacts", relativePath);
     await mkdir4(dirname4(path), { recursive: true });
-    await writeFile4(path, value, { mode: 384 });
+    await writeFile3(path, value, { mode: 384 });
     return path;
   }
   async appendInvocationEvent(invocationId, event) {
-    const path = join3(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+    const path = join4(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
     await mkdir4(dirname4(path), { recursive: true });
     await appendFile2(path, `${JSON.stringify(HostEventSchema.parse(event))}
 `, {
@@ -32996,30 +33228,30 @@ var RunStore = class _RunStore {
     return path;
   }
   async loadInvocationEvents(invocationId) {
-    const path = join3(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
-    const content = await readFile4(path, "utf8");
+    const path = join4(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+    const content = await readFile5(path, "utf8");
     return content.split("\n").filter(Boolean).map((line) => HostEventSchema.parse(JSON.parse(line)));
   }
   async writeCapsule(hash2, value) {
-    const path = join3(this.runRoot, "capsules", `${hash2}.json`);
+    const path = join4(this.runRoot, "capsules", `${hash2}.json`);
     await writeJsonAtomic(path, value);
     return path;
   }
   async writeWorkspace(value) {
-    await writeJsonAtomic(join3(this.runRoot, "workspace.json"), value);
+    await writeJsonAtomic(join4(this.runRoot, "workspace.json"), value);
   }
   async loadWorkspace() {
-    return JSON.parse(await readFile4(join3(this.runRoot, "workspace.json"), "utf8"));
+    return JSON.parse(await readFile5(join4(this.runRoot, "workspace.json"), "utf8"));
   }
   async materialize(events) {
     const state = reduceEvents(events);
-    await writeJsonAtomic(join3(this.runRoot, "state.json"), state);
+    await writeJsonAtomic(join4(this.runRoot, "state.json"), state);
     return state;
   }
 };
 async function listRunIds(repositoryRoot) {
   try {
-    const entries = await readdir(join3(repositoryRoot, ".graphcraft", "runs"), {
+    const entries = await readdir(join4(repositoryRoot, ".graphcraft", "runs"), {
       withFileTypes: true
     });
     return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
@@ -33064,7 +33296,8 @@ async function recoverableInvocation(store, nodeId, repositoryPath) {
   const finished = events.findLast(
     ({ type, data }) => type === "invocation.finished" && data.invocationId === invocationId
   );
-  if (finished && finished.data.success !== true) return void 0;
+  if (finished && finished.data.success !== true && finished.data.interrupted !== true)
+    return void 0;
   const session = events.findLast(
     ({ type, data }) => type === "invocation.session" && data.invocationId === invocationId && typeof data.hostSessionId === "string"
   );
@@ -33165,13 +33398,13 @@ async function executeWorker(input) {
   });
   const capsuleHash = contentHash(capsule);
   await input.store.writeCapsule(capsuleHash, capsule);
-  let invocationId = input.resume?.invocationId ?? randomUUID4();
+  let invocationId = input.resume?.invocationId ?? randomUUID5();
   let resumeSessionId;
   if (input.resume) {
     await recordMissingUsage(input.store, input.resume);
     const reconciliation = await input.adapter.reconcile(input.resume);
     if (reconciliation.state === "completed" && reconciliation.result) {
-      const artifact2 = join4(
+      const artifact2 = join5(
         input.store.runRoot,
         "artifacts",
         "invocations",
@@ -33183,7 +33416,7 @@ async function executeWorker(input) {
         { invocationId, nodeId: input.node.id, artifact: artifact2, success: true, recovered: true },
         invocationId
       );
-      return { result: WorkerResultSchema.parse(reconciliation.result) };
+      return { result: WorkerResultSchema.parse(reconciliation.result), artifact: artifact2 };
     }
     if (reconciliation.state === "in_progress" && input.resume.hostSessionId) {
       resumeSessionId = input.resume.hostSessionId;
@@ -33205,7 +33438,7 @@ async function executeWorker(input) {
         },
         invocationId
       );
-      invocationId = randomUUID4();
+      invocationId = randomUUID5();
     }
   }
   if (!resumeSessionId) {
@@ -33219,7 +33452,9 @@ async function executeWorker(input) {
   }
   let result;
   let error51;
-  let artifact = join4(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+  let errorCause;
+  let termination;
+  let artifact = join5(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
   try {
     for await (const event of input.adapter.execute(
       {
@@ -33247,20 +33482,39 @@ async function executeWorker(input) {
         await input.store.append("host", "tokens.recorded", { usage: event.usage }, invocationId);
       }
       if (event.type === "result") result = WorkerResultSchema.parse(event.result);
-      if (event.type === "error") error51 = event.message;
+      if (event.type === "terminated") termination = event.termination;
+      if (event.type === "error") {
+        error51 = event.message;
+        if (event.cause === "host_crash" || event.cause === "timeout") errorCause = event.cause;
+      }
     }
   } catch (cause) {
     error51 = cause instanceof Error ? cause.message : String(cause);
-    const event = { type: "error", message: error51 };
+    errorCause = "host_crash";
+    const event = { type: "error", message: error51, cause: errorCause };
     artifact = await input.store.appendInvocationEvent(invocationId, event);
   }
   await input.store.append(
     "runtime",
     "invocation.finished",
-    { invocationId, nodeId: input.node.id, artifact, success: Boolean(result) && !error51 },
+    {
+      invocationId,
+      nodeId: input.node.id,
+      artifact,
+      success: Boolean(result) && !error51 && !termination,
+      interrupted: Boolean(termination),
+      ...termination ? { termination } : {},
+      ...errorCause ? { errorCause } : {}
+    },
     invocationId
   );
-  return { ...result ? { result } : {}, ...error51 ? { error: error51 } : {} };
+  return {
+    ...result ? { result } : {},
+    ...error51 ? { error: error51 } : {},
+    ...errorCause ? { errorCause } : {},
+    ...termination ? { termination } : {},
+    artifact
+  };
 }
 async function captureProbes(store, specs, workspace, observer, signal) {
   const executed = await runProbes(specs, workspace.path, signal);
@@ -33330,11 +33584,20 @@ function addRepairNode(graph, verification, failures) {
   });
 }
 async function executeRun(input) {
-  const signal = input.signal ?? new AbortController().signal;
+  const externalSignal = input.signal ?? new AbortController().signal;
   const contract = await input.store.loadContract();
   let graph = await input.store.loadGraph();
-  const lock = new RunLock(join4(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
+  const lock = new RunLock(join5(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
   await lock.acquire();
+  const controlChannel = new RunControlChannel(input.store.graphcraftRoot, contract.runId);
+  const controlAbort = new AbortController();
+  let controlRequest;
+  const stopWatching = controlChannel.watch((request) => {
+    if (!controlRequest || request.action === "stop") controlRequest = request;
+    if (!controlAbort.signal.aborted)
+      controlAbort.abort({ cause: request.cause, reason: request.reason });
+  });
+  const signal = AbortSignal.any([externalSignal, controlAbort.signal]);
   try {
     let state = await input.store.loadState();
     if (state.status === "awaiting_approval") {
@@ -33369,6 +33632,38 @@ async function executeRun(input) {
       workspace = await createRunWorkspace(contract);
       await input.store.writeWorkspace(workspace);
     }
+    const finishInterruption = async (nodeId, termination, artifact) => {
+      const request = controlRequest;
+      const reason = request ? { cause: request.cause, reason: request.reason } : interruptionReason(externalSignal.reason, "runtime_shutdown");
+      const action = request?.action ?? "pause";
+      const currentState = await input.store.loadState();
+      if (action === "stop" && nodeId && currentState.nodes[nodeId]?.status === "running") {
+        await input.store.append("runtime", "node.reset", {
+          nodeId,
+          reason: "Stopped after active child reconciliation"
+        });
+      }
+      await input.store.append("runtime", "control.applied", {
+        request: request ?? null,
+        action,
+        cause: reason.cause,
+        reason: reason.reason,
+        outcome: termination?.outcome ?? "checkpointed",
+        termination: termination ?? null,
+        artifact: artifact ?? null
+      });
+      await input.store.append(
+        request ? "user" : "runtime",
+        action === "stop" ? "run.stopped" : "run.paused",
+        {
+          reason: reason.reason,
+          cause: reason.cause,
+          ...request ? { requestId: request.requestId } : {}
+        }
+      );
+      if (request) await controlChannel.clear(request.requestId);
+      return await input.store.loadState();
+    };
     let recovery = interruptedNodeId ? await recoverableInvocation(input.store, interruptedNodeId, workspace.path) : void 0;
     if (recovery && (recovery.adapterId !== input.adapter.id || recovery.record.baseline === void 0)) {
       await input.store.append(
@@ -33390,6 +33685,7 @@ async function executeRun(input) {
         reason: recovery ? "Recovered an interrupted invocation for native host reconciliation" : "Recovered from repository evidence; accepted nodes remain immutable"
       });
     }
+    if (signal.aborted) return await finishInterruption(interruptedNodeId);
     if (state.status !== "running")
       await input.store.append("runtime", "run.started", { workspace });
     while (!signal.aborted) {
@@ -33412,6 +33708,7 @@ async function executeRun(input) {
       }
       input.observer?.({ type: "status", message: `${current.kind}: ${current.objective}` });
       await input.store.append("runtime", "node.started", { nodeId: current.id });
+      if (signal.aborted) return await finishInterruption(current.id);
       if (current.kind === "verification") {
         if (current.completionProbes.length === 0) {
           await input.store.append("probe", "node.failed", {
@@ -33430,6 +33727,7 @@ async function executeRun(input) {
           input.observer,
           signal
         );
+        if (signal.aborted) return await finishInterruption(current.id);
         const results = executed.map(({ result }) => result);
         if (results.every(({ passed }) => passed)) {
           await input.store.append("probe", "node.progress", {
@@ -33494,6 +33792,7 @@ async function executeRun(input) {
         baselineProbeResults = baseline.probeResults;
       } else {
         const baselineProbes = await runProbes(current.progressProbes, workspace.path, signal);
+        if (signal.aborted) return await finishInterruption(current.id);
         baselineProbeResults = baselineProbes.map(({ result }) => result);
         baseline = evidenceSnapshot(await workspaceDigest(workspace.path), baselineProbeResults);
       }
@@ -33514,10 +33813,18 @@ async function executeRun(input) {
         ...activeRecovery ? { resume: activeRecovery.record } : {}
       });
       if (activeRecovery) recovery = void 0;
+      if (signal.aborted)
+        return await finishInterruption(current.id, worker.termination, worker.artifact);
       if (!worker.result || worker.error || worker.result.status !== "completed") {
-        const reason = worker.error ?? worker.result?.summary ?? "Worker did not complete the node";
-        await input.store.append("worker", "node.failed", { nodeId: current.id, reason });
-        await input.store.append("runtime", "run.blocked", { reason });
+        const detail = worker.error ?? worker.result?.summary ?? "Worker did not complete the node";
+        const cause = worker.errorCause ?? "host_crash";
+        const reason = `${cause === "timeout" ? "Host timeout" : "Host crash"}: ${detail}`;
+        await input.store.append("worker", "node.failed", {
+          nodeId: current.id,
+          reason,
+          cause
+        });
+        await input.store.append("runtime", "run.blocked", { reason, cause });
         return await input.store.loadState();
       }
       const afterProbes = await captureProbes(
@@ -33527,6 +33834,8 @@ async function executeRun(input) {
         input.observer,
         signal
       );
+      if (signal.aborted)
+        return await finishInterruption(current.id, worker.termination, worker.artifact);
       const currentEvidence = evidenceSnapshot(
         await workspaceDigest(workspace.path),
         afterProbes.map(({ result }) => result)
@@ -33555,18 +33864,11 @@ async function executeRun(input) {
         return await input.store.loadState();
       }
     }
-    await input.store.append("runtime", "run.paused", { reason: "Execution signal aborted" });
-    return await input.store.loadState();
+    return await finishInterruption((await input.store.loadState()).currentNodeId);
   } finally {
+    await stopWatching();
     await lock.release();
   }
-}
-async function stopRun(store, reason = "Stopped by user") {
-  const state = await store.loadState();
-  if (!["completed", "stopped"].includes(state.status)) {
-    await store.append("user", "run.stopped", { reason });
-  }
-  return await store.loadState();
 }
 
 // packages/cli/src/index.ts
@@ -33679,13 +33981,8 @@ async function handleAction(input) {
   if (input.action === "status") return stateView(state, contract);
   if (input.action === "inspect") return { contract, graph, state };
   if (input.action === "trace") return { events: await store.loadEvents() };
-  if (input.action === "stop") return stateView(await stopRun(store), contract);
-  if (input.action === "pause") {
-    if (!["completed", "paused", "stopped"].includes(state.status)) {
-      await store.append("user", "run.paused", { reason: "Paused by user" });
-    }
-    return stateView(await store.loadState(), contract);
-  }
+  if (input.action === "stop") return stateView(await requestRunControl(store, "stop"), contract);
+  if (input.action === "pause") return stateView(await requestRunControl(store, "pause"), contract);
   if (input.action === "resume") {
     if (state.status === "awaiting_approval" && !input.approve) {
       return { approvalRequired: true, contract: contractView(contract, graph) };

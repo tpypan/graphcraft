@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import {
+  ChildTerminationController,
   GraphPlanSchema,
   HostCapabilitiesSchema,
   TokenUsageSchema,
@@ -190,13 +191,11 @@ export class ClaudeAdapter implements HostAdapter {
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    const exitPromise = new Promise<number>((resolve) =>
-      child.once("close", (code) => resolve(code ?? 1)),
+    const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolve) =>
+        child.once("close", (code, closeSignal) => resolve({ code, signal: closeSignal })),
     );
-    const abort = (): void => {
-      child.kill("SIGTERM");
-    };
-    signal.addEventListener("abort", abort, { once: true });
+    const terminationController = new ChildTerminationController(child, signal);
     yield { type: "started", invocationId: request.invocationId };
     let stderr = "";
     let finalResult: ReturnType<typeof WorkerResultSchema.parse> | undefined;
@@ -242,18 +241,21 @@ export class ClaudeAdapter implements HostAdapter {
       }
     }
 
-    const exitCode = await exitPromise;
-    signal.removeEventListener("abort", abort);
-    if (signal.aborted) {
-      yield { type: "error", message: "Claude invocation aborted" };
-    } else if (exitCode !== 0 || !finalResult) {
+    const exit = await exitPromise;
+    const termination = terminationController.finish(exit.code, exit.signal);
+    if (termination) {
+      yield { type: "terminated", termination };
+    } else if (exit.code !== 0 || !finalResult) {
       yield {
         type: "error",
-        message: stderr.trim() || `Claude exited ${exitCode} without a valid structured result`,
+        message:
+          stderr.trim() || `Claude exited ${exit.code ?? 1} without a valid structured result`,
+        cause: "host_crash",
       };
     } else {
       yield { type: "result", result: finalResult };
     }
+    terminationController.dispose();
   }
 
   async reconcile(invocation: InvocationRecord): Promise<ReconciliationResult> {

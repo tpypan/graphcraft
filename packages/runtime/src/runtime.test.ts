@@ -5,7 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
-import { evidenceSnapshot, reconcilePersistedInvocation } from "@graphcraft/core";
+import {
+  evidenceSnapshot,
+  interruptionReason,
+  reconcilePersistedInvocation,
+} from "@graphcraft/core";
 import type {
   HostAdapter,
   HostCapabilities,
@@ -17,11 +21,20 @@ import type {
   WorkerRequest,
 } from "@graphcraft/core";
 import { createRun, executeRun } from "./runner.ts";
+import { requestRunControl } from "./control.ts";
 import { RunLock } from "./lock.ts";
 import { createRunWorkspace, discoverPlanningEvidence } from "./repository.ts";
 
 const execFileAsync = promisify(execFile);
 const temporaryRoots: string[] = [];
+
+async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error("Timed out waiting for test condition");
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
 
 afterEach(async () => {
   await Promise.all(
@@ -63,12 +76,22 @@ class FakeAdapter implements HostAdapter {
   readonly id = "test" as const;
   readonly calls: string[] = [];
   readonly requests: WorkerRequest[] = [];
-  private readonly act: (request: WorkerRequest, call: number) => Promise<void>;
+  private readonly act: (
+    request: WorkerRequest,
+    call: number,
+    signal: AbortSignal,
+  ) => Promise<void>;
   private readonly authenticated: boolean;
+  private readonly failureCause: "host_crash" | "timeout" | undefined;
 
-  constructor(act: (request: WorkerRequest, call: number) => Promise<void>, authenticated = true) {
+  constructor(
+    act: (request: WorkerRequest, call: number, signal: AbortSignal) => Promise<void>,
+    authenticated = true,
+    failureCause?: "host_crash" | "timeout",
+  ) {
     this.act = act;
     this.authenticated = authenticated;
+    this.failureCause = failureCause;
   }
 
   async probe(): Promise<HostCapabilities> {
@@ -160,12 +183,34 @@ class FakeAdapter implements HostAdapter {
     };
   }
 
-  async *execute(request: WorkerRequest, _signal: AbortSignal): AsyncIterable<HostEvent> {
+  async *execute(request: WorkerRequest, signal: AbortSignal): AsyncIterable<HostEvent> {
     this.calls.push(request.capsule.nodeId);
     this.requests.push(request);
     yield { type: "started", invocationId: request.invocationId };
     yield { type: "session", hostSessionId: request.resumeSessionId ?? request.invocationId };
-    await this.act(request, this.calls.length);
+    if (this.failureCause) {
+      yield {
+        type: "error",
+        message: this.failureCause === "timeout" ? "host exceeded its deadline" : "host exited 1",
+        cause: this.failureCause,
+      };
+      return;
+    }
+    await this.act(request, this.calls.length, signal);
+    if (signal.aborted) {
+      const reason = interruptionReason(signal.reason);
+      yield {
+        type: "terminated",
+        termination: {
+          cause: reason.cause,
+          outcome: "graceful",
+          requestedSignal: "SIGTERM",
+          exitCode: null,
+          exitSignal: "SIGTERM",
+        },
+      };
+      return;
+    }
     yield {
       type: "usage",
       usage: { input: 10, cachedInput: 2, output: 4, reasoning: 0, total: 14 },
@@ -462,6 +507,114 @@ describe("durable runtime", () => {
     ).toBeDefined();
   });
 
+  it("coordinates an active pause, checkpoints termination, and resumes the same session", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(
+      async (_request, _call, signal) =>
+        await new Promise<void>((resolve) =>
+          signal.addEventListener("abort", () => resolve(), { once: true }),
+        ),
+    );
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    const execution = executeRun({ store: created.store, adapter, approve: true });
+    await waitFor(() => adapter.calls.length === 1);
+
+    const [requestedState, pausedState] = await Promise.all([
+      requestRunControl(created.store, "pause", "Pause from another terminal", 5_000),
+      execution,
+    ]);
+
+    expect(requestedState.status).toBe("paused");
+    expect(pausedState.status).toBe("paused");
+    expect(pausedState.nodes.implement?.status).toBe("running");
+    const pausedEvents = await created.store.loadEvents();
+    expect(
+      pausedEvents.find(
+        ({ type, data }) =>
+          type === "control.applied" &&
+          data.cause === "user_pause" &&
+          (data.termination as { outcome?: string } | undefined)?.outcome === "graceful",
+      ),
+    ).toBeDefined();
+
+    const resumeAdapter = new FakeAdapter(async (request) => {
+      await writeFile(join(request.repositoryPath, "feature.txt"), "resumed after pause\n");
+    });
+    const completed = await executeRun({ store: created.store, adapter: resumeAdapter });
+    expect(completed.status).toBe("completed");
+    expect(resumeAdapter.requests[0]?.resumeSessionId).toBeTruthy();
+  });
+
+  it("coordinates an active stop and leaves no running node state", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(
+      async (_request, _call, signal) =>
+        await new Promise<void>((resolve) =>
+          signal.addEventListener("abort", () => resolve(), { once: true }),
+        ),
+    );
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    const execution = executeRun({ store: created.store, adapter, approve: true });
+    await waitFor(() => adapter.calls.length === 1);
+
+    const [requestedState, stoppedState] = await Promise.all([
+      requestRunControl(created.store, "stop", "Stop from another terminal", 5_000),
+      execution,
+    ]);
+
+    expect(requestedState.status).toBe("stopped");
+    expect(stoppedState.status).toBe("stopped");
+    expect(stoppedState.nodes.implement?.status).toBe("pending");
+    expect(stoppedState.stopReason).toBe("Stop from another terminal");
+  });
+
+  it("distinguishes cancellation, shutdown, host crashes, and timeouts in durable state", async () => {
+    for (const cause of ["cancellation", "runtime_shutdown"] as const) {
+      const repository = await createRepository();
+      const adapter = new FakeAdapter(
+        async (_request, _call, signal) =>
+          await new Promise<void>((resolve) =>
+            signal.addEventListener("abort", () => resolve(), { once: true }),
+          ),
+      );
+      const created = await createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+      });
+      const interruption = new AbortController();
+      const executing = executeRun({
+        store: created.store,
+        adapter,
+        approve: true,
+        signal: interruption.signal,
+      });
+      await waitFor(() => adapter.calls.length === 1);
+      interruption.abort({ cause, reason: `${cause} by test` });
+      const state = await executing;
+      expect(state.status).toBe("paused");
+      expect(state.stopReason).toBe(`${cause} by test`);
+      expect(
+        (await created.store.loadEvents()).find(
+          ({ type, data }) => type === "control.applied" && data.cause === cause,
+        ),
+      ).toBeDefined();
+    }
+
+    for (const cause of ["host_crash", "timeout"] as const) {
+      const repository = await createRepository();
+      const adapter = new FakeAdapter(async () => undefined, true, cause);
+      const created = await createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+      });
+      const state = await executeRun({ store: created.store, adapter, approve: true });
+      expect(state.status).toBe("blocked");
+      expect(state.stopReason).toMatch(cause === "timeout" ? /^Host timeout:/ : /^Host crash:/);
+    }
+  }, 30_000);
+
   it("uses an exclusive recoverable run lock", async () => {
     const root = await mkdtemp(join(tmpdir(), "graphcraft-lock-test-"));
     temporaryRoots.push(root);
@@ -473,5 +626,16 @@ describe("durable runtime", () => {
     await first.release();
     await expect(second.acquire()).resolves.toBeUndefined();
     await second.release();
+  });
+
+  it("does not steal a freshly created or partially observed run lock", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-lock-race-test-"));
+    temporaryRoots.push(root);
+    const path = join(root, "run.lock");
+    await writeFile(path, "{");
+    const lock = new RunLock(path);
+    await expect(lock.acquire()).rejects.toThrow(/already active/);
+    await expect(lock.acquire(0)).resolves.toBeUndefined();
+    await lock.release();
   });
 });
