@@ -1,0 +1,6 @@
+.graphcraft
+coverage
+dist
+docs/research
+node_modules
+pnpm-lock.yaml

@@ -1,0 +1,39 @@
+{
+  "name": "graphcraft",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Progress-aware execution for durable coding agents.",
+  "type": "module",
+  "bin": {
+    "graphcraft": "./dist/graphcraft.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.15.1",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "pnpm format:check && pnpm typecheck && pnpm test && pnpm build && pnpm check:context",
+    "check:context": "node scripts/check-context-budget.mjs",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "graphcraft": "tsx packages/cli/src/bin.ts",
+    "mcp": "tsx packages/mcp/src/bin.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "commander": "15.0.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.1",
+    "esbuild": "0.28.1",
+    "prettier": "3.9.5",
+    "tsx": "4.23.1",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  }
+}

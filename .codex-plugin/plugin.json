@@ -9,21 +9,15 @@
   "homepage": "https://github.com/tpypan/graphcraft",
   "repository": "https://github.com/tpypan/graphcraft",
   "license": "MIT",
-  "keywords": [
-    "ai-agents",
-    "coding-agents",
-    "graph-engineering",
-    "long-running-agents"
-  ],
+  "mcpServers": "./.mcp.json",
+  "keywords": ["ai-agents", "coding-agents", "graph-engineering", "long-running-agents"],
   "interface": {
     "displayName": "Graphcraft",
     "shortDescription": "Keep coding agents making verified progress.",
     "longDescription": "Graphcraft is a progress-aware execution layer for durable, grounded, token-efficient coding-agent workflows.",
     "developerName": "Tony Pan",
     "category": "Productivity",
-    "capabilities": [],
-    "defaultPrompt": [
-      "Review the Graphcraft product and implementation plan."
-    ]
+    "capabilities": ["Write"],
+    "defaultPrompt": ["Use Graphcraft for this long-running repository task."]
   }
 }

@@ -1,8 +1,14 @@
 # Graphcraft product and implementation plan
 
-Status: approved foundation; implementation has not started
+Status: v0.1 local alpha implemented; stable milestones remain in progress
 Last updated: July 21, 2026
 Authority: this document is the durable product and implementation plan. The files under `docs/research/` provide rationale and historical research; when they conflict with this plan, this plan wins.
+
+Implementation snapshot: [`docs/V0.1.md`](V0.1.md) records what the first runnable alpha proves and what remains outside its claims.
+
+### Current implementation boundary
+
+Version 0.1 implements the Milestone 0 protocol foundation and a bounded portion of the Milestone 1 local execution slice: versioned contracts and graphs, hashed event replay, materialized-state recovery, worktree isolation, Codex and Claude adapters, deterministic probes, progress leases, one repair amendment, local verification and commit finish lines, CLI controls, and a single-tool MCP surface. It is an alpha, not completion of Milestones 1–5. In particular, dual-host benchmark coverage, full interruption reconciliation, GitHub finish lines, marketplace distribution, and the stable 20% token-efficiency gate remain open.
 
 ## 1. Product contract
 
