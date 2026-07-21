@@ -11,7 +11,7 @@ Graphcraft is a local execution layer for long-running coding agents. It turns a
 
 Requirements: Git, Node.js 22+, and an authenticated Codex or Claude Code CLI.
 
-The public npm package is `@tpypan/graphcraft`; the unscoped `graphcraft` name belongs to an unrelated project. Once the first npm publication is live, install it globally with either package manager:
+The public npm package is `@tpypan/graphcraft`; the unscoped `graphcraft` name belongs to an unrelated project. Install it globally with either package manager:
 
 ```bash
 npm install --global @tpypan/graphcraft
@@ -23,14 +23,14 @@ pnpm add --global @tpypan/graphcraft
 graphcraft install --host claude
 ```
 
-Until that registry publication is complete, install the same executable directly from GitHub:
+If the npm registry is unavailable, install the same executable directly from GitHub:
 
 ```bash
 npm install --global https://github.com/tpypan/graphcraft/archive/refs/heads/main.tar.gz
 graphcraft install --host codex
 ```
 
-For a one-shot installation, use `npx @tpypan/graphcraft install --host codex` or `pnpm dlx @tpypan/graphcraft install --host claude` after publication. The installer copies its MCP runtime to `~/.graphcraft/runtime/<version>/` before host registration, so clearing the package-manager cache does not break Graphcraft.
+For a one-shot installation, use `npx @tpypan/graphcraft install --host codex` or `pnpm dlx @tpypan/graphcraft install --host claude`. The installer copies its MCP runtime to `~/.graphcraft/runtime/<version>/` before host registration, so clearing the package-manager cache does not break Graphcraft.
 
 Installation registers one local MCP tool; Graphcraft does not inject a large prompt or install a skill. Start a new coding-agent session after installation.
 
