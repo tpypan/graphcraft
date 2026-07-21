@@ -183,6 +183,31 @@ export const ControlEdgeSchema = z.strictObject({
   relation: z.enum(["observes", "vetoes", "arbitrates", "owns_target"]),
 });
 
+export const ControlDecisionSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  decisionId: z.uuid(),
+  sourceId: z.string().min(1),
+  targetId: z.string().min(1),
+  verdict: z.enum(["approve", "veto"]),
+  rationale: z.string().min(1),
+  evidence: z.array(z.string()),
+  actor: z.enum(["user", "runtime", "verifier"]),
+  sticky: z.boolean(),
+  decidedAt: z.iso.datetime(),
+  replaces: z.uuid().optional(),
+});
+
+export const ControlDecisionPacketSchema = z.strictObject({
+  packetId: z.uuid(),
+  targetId: z.string().min(1),
+  invariant: z.string().min(1),
+  conflict: z.string().min(1),
+  evidence: z.array(z.string()),
+  requiredSources: z.array(z.string().min(1)).min(1),
+  choices: z.array(z.enum(["approve", "veto"])).min(1),
+  createdAt: z.iso.datetime(),
+});
+
 export const GraphSchema = z.strictObject({
   schemaVersion: z.literal(1),
   runId: z.uuid(),
@@ -314,6 +339,11 @@ export const RunEventTypeSchema = z.enum([
   "invocation.resumed",
   "invocation.finished",
   "control.applied",
+  "control.decision",
+  "control.observed",
+  "control.override",
+  "control.decision_required",
+  "control.resolved",
   "semantic.verdict",
   "tokens.recorded",
   "graph.amended",
@@ -357,6 +387,8 @@ export const RunStateSchema = z.strictObject({
   currentNodeId: z.string().optional(),
   latestProgressEvidence: z.array(z.string()),
   tokens: TokenUsageSchema,
+  controlDecisions: z.array(ControlDecisionSchema),
+  pendingDecision: ControlDecisionPacketSchema.optional(),
   stopReason: z.string().optional(),
   updatedAt: z.iso.datetime(),
 });
@@ -373,6 +405,8 @@ export type GraphNode = z.infer<typeof GraphNodeSchema>;
 export type PlannedGraphNode = z.infer<typeof PlannedGraphNodeSchema>;
 export type GraphPlan = z.infer<typeof GraphPlanSchema>;
 export type Graph = z.infer<typeof GraphSchema>;
+export type ControlDecision = z.infer<typeof ControlDecisionSchema>;
+export type ControlDecisionPacket = z.infer<typeof ControlDecisionPacketSchema>;
 export type TokenUsage = z.infer<typeof TokenUsageSchema>;
 export type WorkerResult = z.infer<typeof WorkerResultSchema>;
 export type ContextCapsule = z.infer<typeof ContextCapsuleSchema>;

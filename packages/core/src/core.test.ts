@@ -142,7 +142,14 @@ describe("run contracts and graphs", () => {
     expect(graphPlanShape(graph)).toBe("inventory → migrate → verify");
     expect(graph.anchors).toEqual(contract.acceptanceAnchors);
     expect(graph.nodes.every(({ status }) => status === "pending")).toBe(true);
-    expect(graph.controlEdges).toHaveLength(contract.acceptanceAnchors.length * 3);
+    expect(new Set(graph.controlEdges.map(({ relation }) => relation))).toEqual(
+      new Set(["observes", "vetoes", "arbitrates", "owns_target"]),
+    );
+    expect(graph.controlEdges).toContainEqual({
+      from: "user-outcome",
+      to: "verify",
+      relation: "owns_target",
+    });
   });
 
   it("rejects proposed graphs that weaken required proof or exceed local authority", () => {

@@ -53,6 +53,7 @@ Graphcraft displays a concise run contract before doing work. Use `--yes` only w
 - Infers deterministic, task-family-specific progress and completion probes from repository evidence, then lets users inspect or replace the versioned probe plan before approval.
 - Runs approved probes outside model context and classifies progress as advanced, learning, stalled, regressed, oscillating, blocked, or done.
 - Uses a fresh read-only semantic verifier only when structural probes cannot ground reported progress or completion, and persists its verdict and cost separately.
+- Enforces control edges during scheduling and acceptance: observers record evidence, vetoes block without gaining write authority, target owners must approve, and user-owned arbitrators resolve explicit conflicts through durable decision packets.
 - Schedules one evidence-driven repair when verification fails, then stops if the changed strategy does not clear the failure.
 - Checkpoints host sessions and results during execution, resumes the same host session when safe, and falls back to repository evidence when switching hosts or native continuation is unavailable.
 - Accepts pause or stop from another CLI process, terminates the active child with bounded escalation, and records the exact cause and outcome before releasing the run lock.
@@ -66,6 +67,7 @@ graphcraft run <task>
 graphcraft status [run]
 graphcraft inspect [run]
 graphcraft probes [run] [--set probe-plan.json]
+graphcraft decide [run] --source <id> --target <node> --verdict <approve|veto> --reason <text>
 graphcraft pause [run]
 graphcraft resume [run]
 graphcraft stop [run]

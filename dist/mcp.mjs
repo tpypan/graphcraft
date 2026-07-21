@@ -31219,6 +31219,29 @@ var ControlEdgeSchema = external_exports.strictObject({
   to: external_exports.string().min(1),
   relation: external_exports.enum(["observes", "vetoes", "arbitrates", "owns_target"])
 });
+var ControlDecisionSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  decisionId: external_exports.uuid(),
+  sourceId: external_exports.string().min(1),
+  targetId: external_exports.string().min(1),
+  verdict: external_exports.enum(["approve", "veto"]),
+  rationale: external_exports.string().min(1),
+  evidence: external_exports.array(external_exports.string()),
+  actor: external_exports.enum(["user", "runtime", "verifier"]),
+  sticky: external_exports.boolean(),
+  decidedAt: external_exports.iso.datetime(),
+  replaces: external_exports.uuid().optional()
+});
+var ControlDecisionPacketSchema = external_exports.strictObject({
+  packetId: external_exports.uuid(),
+  targetId: external_exports.string().min(1),
+  invariant: external_exports.string().min(1),
+  conflict: external_exports.string().min(1),
+  evidence: external_exports.array(external_exports.string()),
+  requiredSources: external_exports.array(external_exports.string().min(1)).min(1),
+  choices: external_exports.array(external_exports.enum(["approve", "veto"])).min(1),
+  createdAt: external_exports.iso.datetime()
+});
 var GraphSchema = external_exports.strictObject({
   schemaVersion: external_exports.literal(1),
   runId: external_exports.uuid(),
@@ -31339,6 +31362,11 @@ var RunEventTypeSchema = external_exports.enum([
   "invocation.resumed",
   "invocation.finished",
   "control.applied",
+  "control.decision",
+  "control.observed",
+  "control.override",
+  "control.decision_required",
+  "control.resolved",
   "semantic.verdict",
   "tokens.recorded",
   "graph.amended"
@@ -31377,6 +31405,8 @@ var RunStateSchema = external_exports.strictObject({
   currentNodeId: external_exports.string().optional(),
   latestProgressEvidence: external_exports.array(external_exports.string()),
   tokens: TokenUsageSchema,
+  controlDecisions: external_exports.array(ControlDecisionSchema),
+  pendingDecision: ControlDecisionPacketSchema.optional(),
   stopReason: external_exports.string().optional(),
   updatedAt: external_exports.iso.datetime()
 });
@@ -31480,9 +31510,49 @@ function compileRunContract(task, repository, options = {}) {
         owner: "repository",
         evidenceSource: "AGENTS.md and repository state",
         mutationPolicy: "immutable"
+      },
+      {
+        id: "runtime-verifier",
+        description: "Deterministic and isolated semantic verification may veto unsupported work",
+        owner: "held_out_eval",
+        evidenceSource: "Graphcraft probe and semantic-verdict events",
+        mutationPolicy: "immutable"
+      },
+      {
+        id: "user-arbitrator",
+        description: "The user resolves contradictory control decisions without delegating edits",
+        owner: "user",
+        evidenceSource: "Explicit durable user decision",
+        mutationPolicy: "user_approval"
       }
     ]
   });
+}
+function runtimeControlEdges(anchors, nodes) {
+  const terminal = nodes.find(
+    (candidate) => !nodes.some((other) => other.dependsOn.includes(candidate.id))
+  );
+  if (!terminal) throw new Error("The graph has no terminal control target");
+  const known = new Set(anchors.map(({ id }) => id));
+  const edges = [];
+  const add = (from, to, relation) => {
+    if (known.has(from)) edges.push({ from, to, relation });
+  };
+  for (const node2 of nodes) {
+    add("repository-policy", node2.id, "vetoes");
+    add("runtime-verifier", node2.id, "observes");
+    add("runtime-verifier", node2.id, "vetoes");
+    add("user-arbitrator", node2.id, "arbitrates");
+    for (const anchor of anchors) {
+      if (!["user-outcome", "repository-policy", "runtime-verifier", "user-arbitrator"].includes(
+        anchor.id
+      )) {
+        edges.push({ from: anchor.id, to: node2.id, relation: "vetoes" });
+      }
+    }
+  }
+  add("user-outcome", terminal.id, "owns_target");
+  return edges;
 }
 var resultShape = {
   type: "object",
@@ -31556,9 +31626,7 @@ function compileGraph(contract, verificationProbes) {
     family,
     nodes,
     anchors: contract.acceptanceAnchors,
-    controlEdges: contract.acceptanceAnchors.flatMap(
-      (anchor) => nodes.map((workNode) => ({ from: anchor.id, to: workNode.id, relation: "vetoes" }))
-    ),
+    controlEdges: runtimeControlEdges(contract.acceptanceAnchors, nodes),
     revision: 0
   });
   validateGraph(graph);
@@ -31672,24 +31740,19 @@ function validatePlannedGraphPolicy(graph, contract, requiredVerificationProbes,
 }
 function compilePlannedGraph(contract, plan, requiredVerificationProbes, approvedProbes = requiredVerificationProbes) {
   const parsedPlan = GraphPlanSchema.parse(plan);
+  const plannedNodes = parsedPlan.nodes.map(
+    (planned) => node({
+      ...planned,
+      outputSchema: resultShape
+    })
+  );
   const graph = GraphSchema.parse({
     schemaVersion: 1,
     runId: contract.runId,
     family: parsedPlan.family,
-    nodes: parsedPlan.nodes.map(
-      (planned) => node({
-        ...planned,
-        outputSchema: resultShape
-      })
-    ),
+    nodes: plannedNodes,
     anchors: contract.acceptanceAnchors,
-    controlEdges: contract.acceptanceAnchors.flatMap(
-      (anchor) => parsedPlan.nodes.map((planned) => ({
-        from: anchor.id,
-        to: planned.id,
-        relation: "vetoes"
-      }))
-    ),
+    controlEdges: runtimeControlEdges(contract.acceptanceAnchors, plannedNodes),
     revision: 0
   });
   validateGraph(graph);
@@ -31785,6 +31848,10 @@ function validateGraph(graph) {
       throw new Error(`Control edge ${edge.from} -> ${edge.to} references an unknown target`);
     const key = `${edge.from}\0${edge.to}\0${edge.relation}`;
     if (edgeKeys.has(key)) throw new Error(`Control edge ${edge.from} -> ${edge.to} is duplicated`);
+    if (!ids.has(edge.to))
+      throw new Error(`Control edge ${edge.from} -> ${edge.to} must target a work node`);
+    if (edge.from === edge.to)
+      throw new Error(`Control edge ${edge.from} -> ${edge.to} cannot control itself`);
     edgeKeys.add(key);
   }
 }
@@ -31934,6 +32001,7 @@ function reduceEvents(events) {
         ),
         latestProgressEvidence: [],
         tokens: { ...emptyTokens },
+        controlDecisions: [],
         updatedAt: event.timestamp
       };
       continue;
@@ -32024,6 +32092,28 @@ function reduceEvents(events) {
       case "invocation.finished":
       case "control.applied":
       case "semantic.verdict":
+      case "control.observed":
+      case "control.override":
+        break;
+      case "control.decision": {
+        const decision = ControlDecisionSchema.parse(data.decision);
+        if (decision.replaces) {
+          state.controlDecisions = state.controlDecisions.filter(
+            ({ decisionId }) => decisionId !== decision.replaces
+          );
+        }
+        state.controlDecisions = state.controlDecisions.filter(
+          ({ sourceId, targetId }) => sourceId !== decision.sourceId || targetId !== decision.targetId
+        );
+        state.controlDecisions.push(decision);
+        break;
+      }
+      case "control.decision_required":
+        state.pendingDecision = ControlDecisionPacketSchema.parse(data.packet);
+        break;
+      case "control.resolved":
+        if (state.pendingDecision?.targetId === requiredString(data, "targetId"))
+          state.pendingDecision = void 0;
         break;
       case "run.created":
         throw new Error("run.created may only appear once");
@@ -33023,14 +33113,398 @@ async function requestRunControl(store, action, reason = action === "pause" ? "P
   );
 }
 
+// packages/runtime/src/governance.ts
+import { randomUUID as randomUUID5 } from "node:crypto";
+import { join as join3 } from "node:path";
+function decisionFor(state, sourceId, targetId) {
+  const explicit = state.controlDecisions.findLast(
+    (decision) => decision.sourceId === sourceId && decision.targetId === targetId
+  );
+  if (explicit) return explicit;
+  const sourceState = state.nodes[sourceId];
+  if (!sourceState || !["accepted", "failed", "blocked", "stopped"].includes(sourceState.status))
+    return void 0;
+  return ControlDecisionSchema.parse({
+    schemaVersion: 1,
+    decisionId: randomUUID5(),
+    sourceId,
+    targetId,
+    verdict: sourceState.status === "accepted" ? "approve" : "veto",
+    rationale: `Control source node ${sourceId} is ${sourceState.status}`,
+    evidence: sourceState.lastSummary ? [sourceState.lastSummary] : [],
+    actor: "runtime",
+    sticky: false,
+    decidedAt: state.updatedAt
+  });
+}
+async function appendDecision(store, decision) {
+  await store.append(
+    decision.actor === "user" ? "user" : decision.actor === "verifier" ? "host" : "runtime",
+    "control.decision",
+    { decision },
+    decision.decisionId
+  );
+}
+function authorityEdge(graph, sourceId, targetId) {
+  return graph.controlEdges.some(
+    (edge) => edge.from === sourceId && edge.to === targetId && ["vetoes", "arbitrates", "owns_target"].includes(edge.relation)
+  );
+}
+async function recordRuntimeControlDecision(input) {
+  if (!authorityEdge(input.graph, input.sourceId, input.targetId))
+    throw new Error(`Control source ${input.sourceId} has no authority over ${input.targetId}`);
+  const anchor = input.graph.anchors.find(({ id }) => id === input.sourceId);
+  if (anchor?.owner === "user")
+    throw new Error(`Runtime actors cannot impersonate user-owned source ${input.sourceId}`);
+  if (input.actor === "verifier" && anchor?.owner !== "held_out_eval")
+    throw new Error(`Verifier source ${input.sourceId} is not owned by a held-out evaluator`);
+  const decision = ControlDecisionSchema.parse({
+    schemaVersion: 1,
+    decisionId: randomUUID5(),
+    sourceId: input.sourceId,
+    targetId: input.targetId,
+    verdict: input.verdict,
+    rationale: input.rationale,
+    evidence: input.evidence,
+    actor: input.actor,
+    sticky: false,
+    decidedAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+  await appendDecision(input.store, decision);
+  return decision;
+}
+async function recordRunApprovalDecisions(store, graph) {
+  const state = await store.loadState();
+  const anchors = new Map(graph.anchors.map((anchor) => [anchor.id, anchor]));
+  for (const edge of graph.controlEdges.filter(({ relation }) => relation === "owns_target")) {
+    if (anchors.get(edge.from)?.owner !== "user" || decisionFor(state, edge.from, edge.to))
+      continue;
+    await appendDecision(
+      store,
+      ControlDecisionSchema.parse({
+        schemaVersion: 1,
+        decisionId: randomUUID5(),
+        sourceId: edge.from,
+        targetId: edge.to,
+        verdict: "approve",
+        rationale: "The user approved the displayed run contract, graph, and finish line",
+        evidence: ["run.approved"],
+        actor: "user",
+        sticky: true,
+        decidedAt: (/* @__PURE__ */ new Date()).toISOString()
+      })
+    );
+  }
+}
+function packet(input) {
+  return ControlDecisionPacketSchema.parse({
+    packetId: randomUUID5(),
+    targetId: input.targetId,
+    invariant: "A controlled node cannot run or be accepted without resolved authority",
+    conflict: input.conflict,
+    evidence: input.evidence,
+    requiredSources: [...new Set(input.requiredSources)],
+    choices: ["approve", "veto"],
+    createdAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+}
+async function requireDecision(store, targetId, conflict, evidence, requiredSources) {
+  const required2 = [...new Set(requiredSources)];
+  const existing = (await store.loadState()).pendingDecision;
+  if (existing?.targetId === targetId && existing.conflict === conflict && JSON.stringify([...existing.requiredSources].sort()) === JSON.stringify([...required2].sort())) {
+    return { allowed: false, reason: conflict, packet: existing };
+  }
+  const value = packet({ targetId, conflict, evidence, requiredSources });
+  await store.append("runtime", "control.decision_required", { packet: value }, value.packetId);
+  return { allowed: false, reason: conflict, packet: value };
+}
+function decisionsFor(state, edges, targetId) {
+  return edges.map((edge) => decisionFor(state, edge.from, targetId)).filter((decision) => decision !== void 0);
+}
+function unanimousDecision(decisions) {
+  if (decisions.length === 0) return void 0;
+  if (new Set(decisions.map(({ verdict }) => verdict)).size > 1) return "conflict";
+  return decisions[0];
+}
+async function recordOverride(store, targetId, arbitrator, overridden, missingSources = []) {
+  await store.append(arbitrator.actor === "user" ? "user" : "runtime", "control.override", {
+    targetId,
+    arbitrator: arbitrator.sourceId,
+    arbitratorDecisionId: arbitrator.decisionId,
+    rationale: arbitrator.rationale,
+    overridden: overridden.map(({ sourceId }) => sourceId),
+    overriddenDecisionIds: overridden.map(({ decisionId }) => decisionId),
+    missingSources,
+    evidence: arbitrator.evidence
+  });
+}
+async function recordResolution(store, targetId, outcome, owners, evidence) {
+  await store.append("runtime", "control.resolved", {
+    targetId,
+    outcome,
+    owners: owners.map(({ sourceId }) => sourceId),
+    ownerDecisionIds: owners.map(({ decisionId }) => decisionId),
+    evidence
+  });
+}
+async function evaluateControlScheduling(store, graph, state, targetId) {
+  const owners = graph.controlEdges.filter(
+    (edge) => edge.to === targetId && edge.relation === "owns_target"
+  );
+  if (owners.length === 0) return { allowed: true };
+  const ownerDecisions = decisionsFor(state, owners, targetId);
+  const ownerApprovals = ownerDecisions.filter(({ verdict }) => verdict === "approve");
+  const ownerVetoes = ownerDecisions.filter(({ verdict }) => verdict === "veto");
+  const missing = owners.filter(
+    (edge) => !ownerDecisions.some(({ sourceId }) => sourceId === edge.from)
+  );
+  const arbitratorEdges = graph.controlEdges.filter(
+    (edge) => edge.to === targetId && edge.relation === "arbitrates"
+  );
+  const arbitrators = decisionsFor(state, arbitratorEdges, targetId);
+  const arbitrator = unanimousDecision(arbitrators);
+  if (arbitrator === "conflict") {
+    return await requireDecision(
+      store,
+      targetId,
+      `Arbitrators disagree about scheduling ${targetId}`,
+      arbitrators.flatMap(({ evidence }) => evidence),
+      arbitratorEdges.map(({ from }) => from)
+    );
+  }
+  if (missing.length > 0) {
+    if (arbitrator?.verdict === "approve") {
+      await recordOverride(
+        store,
+        targetId,
+        arbitrator,
+        ownerVetoes,
+        missing.map(({ from }) => from)
+      );
+      await recordResolution(store, targetId, "approved", ownerApprovals, arbitrator.evidence);
+      return { allowed: true };
+    }
+    if (arbitrator?.verdict === "veto") {
+      await recordResolution(store, targetId, "vetoed", ownerDecisions, arbitrator.evidence);
+      return {
+        allowed: false,
+        reason: `Arbitrator vetoed scheduling ${targetId}: ${arbitrator.sourceId}`
+      };
+    }
+    return await requireDecision(
+      store,
+      targetId,
+      `Control owners have not authorized ${targetId}`,
+      ownerDecisions.flatMap(({ evidence }) => evidence),
+      arbitratorEdges.length > 0 ? arbitratorEdges.map(({ from }) => from) : missing.map(({ from }) => from)
+    );
+  }
+  if (ownerApprovals.length > 0 && ownerVetoes.length > 0) {
+    if (arbitrator?.verdict === "approve") {
+      await recordOverride(store, targetId, arbitrator, ownerVetoes);
+      await recordResolution(store, targetId, "approved", ownerApprovals, arbitrator.evidence);
+      return { allowed: true };
+    }
+    if (arbitrator?.verdict === "veto") {
+      await recordResolution(store, targetId, "vetoed", ownerDecisions, arbitrator.evidence);
+      return {
+        allowed: false,
+        reason: `Arbitrator vetoed scheduling ${targetId}: ${arbitrator.sourceId}`
+      };
+    }
+    return await requireDecision(
+      store,
+      targetId,
+      `Control owners disagree about scheduling ${targetId}`,
+      ownerDecisions.flatMap(({ evidence }) => evidence),
+      arbitratorEdges.length > 0 ? arbitratorEdges.map(({ from }) => from) : owners.map(({ from }) => from)
+    );
+  }
+  if (ownerVetoes.length > 0) {
+    if (arbitrator?.verdict === "approve") {
+      await recordOverride(store, targetId, arbitrator, ownerVetoes);
+      await recordResolution(store, targetId, "approved", [], arbitrator.evidence);
+      return { allowed: true };
+    }
+    const reason = `Control owner vetoed ${targetId}: ${ownerVetoes.map(({ sourceId }) => sourceId).join(", ")}`;
+    await recordResolution(
+      store,
+      targetId,
+      "vetoed",
+      ownerVetoes,
+      ownerVetoes.flatMap(({ evidence }) => evidence)
+    );
+    return { allowed: false, reason };
+  }
+  return { allowed: true };
+}
+async function evaluateControlAcceptance(store, graph, state, targetId, evidence) {
+  const incoming = graph.controlEdges.filter((edge) => edge.to === targetId);
+  for (const edge of incoming.filter(({ relation }) => relation === "observes")) {
+    await store.append("runtime", "control.observed", {
+      observer: edge.from,
+      targetId,
+      evidence
+    });
+  }
+  const owners = incoming.filter(({ relation }) => relation === "owns_target");
+  const ownerDecisions = decisionsFor(state, owners, targetId);
+  const missingOwners = owners.filter(
+    (edge) => !ownerDecisions.some(({ sourceId }) => sourceId === edge.from)
+  );
+  let ownerApprovals = ownerDecisions.filter(({ verdict }) => verdict === "approve");
+  let ownerVetoes = ownerDecisions.filter(({ verdict }) => verdict === "veto");
+  const arbitratorEdges = incoming.filter(({ relation }) => relation === "arbitrates");
+  const arbitrators = decisionsFor(state, arbitratorEdges, targetId);
+  const arbitrator = unanimousDecision(arbitrators);
+  if (arbitrator === "conflict") {
+    return await requireDecision(
+      store,
+      targetId,
+      `Arbitrators disagree about ${targetId}`,
+      [...evidence, ...arbitrators.flatMap(({ evidence: value }) => value)],
+      arbitratorEdges.map(({ from }) => from)
+    );
+  }
+  if (missingOwners.length > 0) {
+    if (arbitrator?.verdict === "approve") {
+      await recordOverride(
+        store,
+        targetId,
+        arbitrator,
+        ownerVetoes,
+        missingOwners.map(({ from }) => from)
+      );
+      ownerVetoes = [];
+    } else if (arbitrator?.verdict === "veto") {
+      await recordResolution(store, targetId, "vetoed", ownerDecisions, arbitrator.evidence);
+      return { allowed: false, reason: `Arbitrator vetoed ${targetId}: ${arbitrator.sourceId}` };
+    } else {
+      return await requireDecision(
+        store,
+        targetId,
+        `Control owners have not authorized acceptance of ${targetId}`,
+        [...evidence, ...ownerDecisions.flatMap(({ evidence: value }) => value)],
+        arbitratorEdges.length > 0 ? arbitratorEdges.map(({ from }) => from) : missingOwners.map(({ from }) => from)
+      );
+    }
+  }
+  if (ownerApprovals.length > 0 && ownerVetoes.length > 0) {
+    if (!arbitrator)
+      return await requireDecision(
+        store,
+        targetId,
+        `Control owners disagree about ${targetId}`,
+        [...evidence, ...ownerDecisions.flatMap(({ evidence: value }) => value)],
+        arbitratorEdges.length > 0 ? arbitratorEdges.map(({ from }) => from) : owners.map(({ from }) => from)
+      );
+    if (arbitrator.verdict === "approve") {
+      await recordOverride(store, targetId, arbitrator, ownerVetoes);
+      ownerVetoes = [];
+    } else {
+      await recordResolution(store, targetId, "vetoed", ownerDecisions, arbitrator.evidence);
+      return { allowed: false, reason: `Arbitrator vetoed ${targetId}: ${arbitrator.sourceId}` };
+    }
+  }
+  if (ownerVetoes.length > 0) {
+    if (arbitrator?.verdict === "approve") {
+      await recordOverride(store, targetId, arbitrator, ownerVetoes);
+      ownerVetoes = [];
+      ownerApprovals = [];
+    } else if (arbitrator?.verdict === "veto") {
+      await recordResolution(store, targetId, "vetoed", ownerVetoes, arbitrator.evidence);
+      return { allowed: false, reason: `Arbitrator vetoed ${targetId}: ${arbitrator.sourceId}` };
+    }
+  }
+  if (ownerVetoes.length > 0) {
+    const reason = `Control owner vetoed ${targetId}: ${ownerVetoes.map(({ sourceId }) => sourceId).join(", ")}`;
+    await recordResolution(store, targetId, "vetoed", ownerVetoes, evidence);
+    return { allowed: false, reason };
+  }
+  const vetoes = incoming.filter(({ relation }) => relation === "vetoes").map((edge) => decisionFor(state, edge.from, targetId)).filter((decision) => decision?.verdict === "veto");
+  if (vetoes.length > 0) {
+    if (arbitrator?.verdict === "approve") {
+      await recordOverride(store, targetId, arbitrator, vetoes);
+    } else if (arbitrator?.verdict === "veto") {
+      const reason = `Arbitrator vetoed ${targetId}: ${arbitrator.sourceId}`;
+      await recordResolution(store, targetId, "vetoed", ownerApprovals, [
+        ...evidence,
+        ...arbitrator.evidence
+      ]);
+      return { allowed: false, reason };
+    } else if (ownerApprovals.length > 0) {
+      return await requireDecision(
+        store,
+        targetId,
+        `Owner approval conflicts with a veto on ${targetId}`,
+        [...evidence, ...vetoes.flatMap(({ evidence: value }) => value)],
+        arbitratorEdges.length > 0 ? arbitratorEdges.map(({ from }) => from) : owners.map(({ from }) => from)
+      );
+    } else {
+      const reason = `Control vetoed ${targetId}: ${vetoes.map(({ sourceId, rationale }) => `${sourceId} (${rationale})`).join(", ")}`;
+      await recordResolution(
+        store,
+        targetId,
+        "vetoed",
+        [],
+        [...evidence, ...vetoes.flatMap(({ evidence: value }) => value)]
+      );
+      return { allowed: false, reason };
+    }
+  }
+  await recordResolution(store, targetId, "approved", ownerApprovals, evidence);
+  return { allowed: true };
+}
+async function decideRunControl(store, input) {
+  const lock = new RunLock(join3(store.graphcraftRoot, "locks", `${store.runId}.lock`));
+  await lock.acquire();
+  try {
+    const [graph, state] = await Promise.all([store.loadGraph(), store.loadState()]);
+    const anchor = graph.anchors.find(({ id }) => id === input.sourceId);
+    if (!anchor || anchor.owner !== "user")
+      throw new Error(`Control source ${input.sourceId} is not owned by the user`);
+    if (!authorityEdge(graph, input.sourceId, input.targetId))
+      throw new Error(`Control source ${input.sourceId} has no authority over ${input.targetId}`);
+    if (state.pendingDecision?.targetId === input.targetId && !state.pendingDecision.requiredSources.includes(input.sourceId)) {
+      throw new Error(
+        `Decision for ${input.targetId} requires one of: ${state.pendingDecision.requiredSources.join(", ")}`
+      );
+    }
+    const previous = state.controlDecisions.findLast(
+      ({ sourceId, targetId }) => sourceId === input.sourceId && targetId === input.targetId
+    );
+    if (previous?.sticky && input.replaces !== previous.decisionId)
+      throw new Error(`Sticky decision ${previous.decisionId} requires explicit replacement`);
+    if (input.replaces && previous?.decisionId !== input.replaces)
+      throw new Error(`Replacement decision ${input.replaces} is not current`);
+    const decision = ControlDecisionSchema.parse({
+      schemaVersion: 1,
+      decisionId: randomUUID5(),
+      sourceId: input.sourceId,
+      targetId: input.targetId,
+      verdict: input.verdict,
+      rationale: input.rationale,
+      evidence: input.evidence ?? [],
+      actor: "user",
+      sticky: true,
+      decidedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      ...input.replaces ? { replaces: input.replaces } : {}
+    });
+    await appendDecision(store, decision);
+    return await store.loadState();
+  } finally {
+    await lock.release();
+  }
+}
+
 // packages/runtime/src/repository.ts
 import { appendFile, mkdir as mkdir3, readFile as readFile4 } from "node:fs/promises";
-import { basename, dirname as dirname4, isAbsolute as isAbsolute2, join as join4, resolve as resolve2 } from "node:path";
+import { basename, dirname as dirname4, isAbsolute as isAbsolute2, join as join5, resolve as resolve2 } from "node:path";
 
 // packages/probes/src/index.ts
 import { access, readFile as readFile3, stat as stat2 } from "node:fs/promises";
 import { constants } from "node:fs";
-import { dirname as dirname3, join as join3, resolve, sep } from "node:path";
+import { dirname as dirname3, join as join4, resolve, sep } from "node:path";
 
 // packages/probes/src/process.ts
 import { spawn as spawn3 } from "node:child_process";
@@ -33267,10 +33741,10 @@ async function packageCandidates(repositoryPath, family, terms) {
   const tracked = await runProcess("git", ["ls-files"], { cwd: repositoryPath });
   if (tracked.exitCode !== 0) return [];
   const manifests = tracked.stdout.split("\n").filter((path) => path === "package.json" || path.endsWith("/package.json")).slice(0, 100);
-  const rootManifest = manifests.includes("package.json") ? JSON.parse(await readFile3(join3(repositoryPath, "package.json"), "utf8")) : void 0;
+  const rootManifest = manifests.includes("package.json") ? JSON.parse(await readFile3(join4(repositoryPath, "package.json"), "utf8")) : void 0;
   const candidates = [];
   for (const manifestPath of manifests) {
-    const manifest = JSON.parse(await readFile3(join3(repositoryPath, manifestPath), "utf8"));
+    const manifest = JSON.parse(await readFile3(join4(repositoryPath, manifestPath), "utf8"));
     const directory = dirname3(manifestPath) === "." ? void 0 : dirname3(manifestPath);
     const relevant = !directory || terms.some(
       (term) => directory.toLowerCase().includes(term) || manifest.name?.toLowerCase().includes(term)
@@ -33382,7 +33856,7 @@ async function discoverProbePlan(repositoryPath, task, baseSha) {
     items.push(completion);
   }
   try {
-    await access(join3(repositoryPath, "pyproject.toml"));
+    await access(join4(repositoryPath, "pyproject.toml"));
     items.push({
       phase: "completion",
       purpose: "regression",
@@ -33400,7 +33874,7 @@ async function discoverProbePlan(repositoryPath, task, baseSha) {
   } catch {
   }
   try {
-    await access(join3(repositoryPath, "go.mod"));
+    await access(join4(repositoryPath, "go.mod"));
     items.push({
       phase: "completion",
       purpose: "regression",
@@ -33527,7 +34001,7 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
   ) : [];
   const taskMatches = await Promise.all(
     matchedPaths.map(async (path) => {
-      const content = await readFile4(join4(repositoryRoot, path), "utf8").catch(() => "");
+      const content = await readFile4(join5(repositoryRoot, path), "utf8").catch(() => "");
       const normalized = content.toLowerCase();
       const score = searchTerms.filter((term) => normalized.includes(term)).length;
       const pathScore = searchTerms.filter((term) => path.toLowerCase().includes(term)).length;
@@ -33552,7 +34026,7 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
   for (const path of baselinePaths) {
     if (remainingCharacters <= 0 || files.length >= 7) break;
     if (files.some((file2) => file2.path === path)) continue;
-    const content = await readFile4(join4(repositoryRoot, path), "utf8").catch(() => "");
+    const content = await readFile4(join5(repositoryRoot, path), "utf8").catch(() => "");
     const limit = Math.min(2e3, remainingCharacters);
     const selected = content.slice(0, limit);
     files.push({ path, content: selected, truncated: selected.length < content.length });
@@ -33583,11 +34057,11 @@ function slug(task) {
 }
 async function createRunWorkspace(contract) {
   const branch = `graphcraft/${contract.runId.slice(0, 8)}-${slug(contract.task)}`;
-  const parent = join4(
+  const parent = join5(
     dirname4(contract.repository.root),
     `.${basename(contract.repository.root)}-graphcraft-worktrees`
   );
-  const path = join4(parent, contract.runId);
+  const path = join5(parent, contract.runId);
   await mkdir3(parent, { recursive: true });
   const registered = await git(contract.repository.root, ["worktree", "list", "--porcelain"]);
   if (registered.includes(`worktree ${path}`)) return { path, branch, created: false };
@@ -33613,12 +34087,12 @@ async function createAtomicCommit(workspace, task) {
 }
 
 // packages/runtime/src/runner.ts
-import { randomUUID as randomUUID5 } from "node:crypto";
-import { join as join6 } from "node:path";
+import { randomUUID as randomUUID6 } from "node:crypto";
+import { join as join7 } from "node:path";
 
 // packages/runtime/src/store.ts
 import { appendFile as appendFile2, mkdir as mkdir4, readFile as readFile5, readdir, writeFile as writeFile3 } from "node:fs/promises";
-import { dirname as dirname5, join as join5 } from "node:path";
+import { dirname as dirname5, join as join6 } from "node:path";
 var RunStore = class _RunStore {
   repositoryRoot;
   runId;
@@ -33627,17 +34101,17 @@ var RunStore = class _RunStore {
   constructor(repositoryRoot, runId) {
     this.repositoryRoot = repositoryRoot;
     this.runId = runId;
-    this.graphcraftRoot = join5(repositoryRoot, ".graphcraft");
-    this.runRoot = join5(this.graphcraftRoot, "runs", runId);
+    this.graphcraftRoot = join6(repositoryRoot, ".graphcraft");
+    this.runRoot = join6(this.graphcraftRoot, "runs", runId);
   }
   static async create(repositoryRoot, contract, graph, inputProbePlan) {
     const store = new _RunStore(repositoryRoot, contract.runId);
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
     await Promise.all([
-      mkdir4(join5(store.runRoot, "artifacts"), { recursive: true }),
-      mkdir4(join5(store.runRoot, "capsules"), { recursive: true }),
-      mkdir4(join5(store.runRoot, "reports"), { recursive: true }),
-      mkdir4(join5(store.graphcraftRoot, "locks"), { recursive: true })
+      mkdir4(join6(store.runRoot, "artifacts"), { recursive: true }),
+      mkdir4(join6(store.runRoot, "capsules"), { recursive: true }),
+      mkdir4(join6(store.runRoot, "reports"), { recursive: true }),
+      mkdir4(join6(store.graphcraftRoot, "locks"), { recursive: true })
     ]);
     await Promise.all([
       store.saveContract(contract),
@@ -33660,18 +34134,18 @@ var RunStore = class _RunStore {
     return store;
   }
   eventsPath() {
-    return join5(this.runRoot, "events.jsonl");
+    return join6(this.runRoot, "events.jsonl");
   }
   async saveContract(contract) {
-    await writeJsonAtomic(join5(this.runRoot, "contract.json"), RunContractSchema.parse(contract));
+    await writeJsonAtomic(join6(this.runRoot, "contract.json"), RunContractSchema.parse(contract));
   }
   async loadContract() {
     return RunContractSchema.parse(
-      JSON.parse(await readFile5(join5(this.runRoot, "contract.json"), "utf8"))
+      JSON.parse(await readFile5(join6(this.runRoot, "contract.json"), "utf8"))
     );
   }
   async saveGraph(graph) {
-    await writeJsonAtomic(join5(this.runRoot, "graph.json"), GraphSchema.parse(graph));
+    await writeJsonAtomic(join6(this.runRoot, "graph.json"), GraphSchema.parse(graph));
   }
   async loadGraph() {
     const events = await this.loadEvents();
@@ -33680,14 +34154,14 @@ var RunStore = class _RunStore {
     )?.data.graph;
     if (eventGraph) {
       const graph = GraphSchema.parse(eventGraph);
-      const materialized = await readFile5(join5(this.runRoot, "graph.json"), "utf8").then((value) => GraphSchema.parse(JSON.parse(value))).catch(() => void 0);
+      const materialized = await readFile5(join6(this.runRoot, "graph.json"), "utf8").then((value) => GraphSchema.parse(JSON.parse(value))).catch(() => void 0);
       if (JSON.stringify(materialized) !== JSON.stringify(graph)) await this.saveGraph(graph);
       return graph;
     }
-    return GraphSchema.parse(JSON.parse(await readFile5(join5(this.runRoot, "graph.json"), "utf8")));
+    return GraphSchema.parse(JSON.parse(await readFile5(join6(this.runRoot, "graph.json"), "utf8")));
   }
   async saveProbePlan(probePlan) {
-    await writeJsonAtomic(join5(this.runRoot, "probe-plan.json"), ProbePlanSchema.parse(probePlan));
+    await writeJsonAtomic(join6(this.runRoot, "probe-plan.json"), ProbePlanSchema.parse(probePlan));
   }
   async loadProbePlan() {
     const events = await this.loadEvents();
@@ -33696,14 +34170,14 @@ var RunStore = class _RunStore {
     )?.data.probePlan;
     if (eventPlan) {
       const probePlan = ProbePlanSchema.parse(eventPlan);
-      const materialized = await readFile5(join5(this.runRoot, "probe-plan.json"), "utf8").then((value) => ProbePlanSchema.parse(JSON.parse(value))).catch(() => void 0);
+      const materialized = await readFile5(join6(this.runRoot, "probe-plan.json"), "utf8").then((value) => ProbePlanSchema.parse(JSON.parse(value))).catch(() => void 0);
       if (JSON.stringify(materialized) !== JSON.stringify(probePlan))
         await this.saveProbePlan(probePlan);
       return probePlan;
     }
     try {
       return ProbePlanSchema.parse(
-        JSON.parse(await readFile5(join5(this.runRoot, "probe-plan.json"), "utf8"))
+        JSON.parse(await readFile5(join6(this.runRoot, "probe-plan.json"), "utf8"))
       );
     } catch {
       return probePlanFromGraph(await this.loadGraph());
@@ -33716,7 +34190,7 @@ var RunStore = class _RunStore {
   async loadState() {
     try {
       return RunStateSchema.parse(
-        JSON.parse(await readFile5(join5(this.runRoot, "state.json"), "utf8"))
+        JSON.parse(await readFile5(join6(this.runRoot, "state.json"), "utf8"))
       );
     } catch {
       return await this.rebuildViews();
@@ -33752,13 +34226,13 @@ var RunStore = class _RunStore {
     return await this.materialize(events);
   }
   async writeArtifact(relativePath, value) {
-    const path = join5(this.runRoot, "artifacts", relativePath);
+    const path = join6(this.runRoot, "artifacts", relativePath);
     await mkdir4(dirname5(path), { recursive: true });
     await writeFile3(path, value, { mode: 384 });
     return path;
   }
   async appendInvocationEvent(invocationId, event) {
-    const path = join5(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+    const path = join6(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
     await mkdir4(dirname5(path), { recursive: true });
     await appendFile2(path, `${JSON.stringify(HostEventSchema.parse(event))}
 `, {
@@ -33768,30 +34242,30 @@ var RunStore = class _RunStore {
     return path;
   }
   async loadInvocationEvents(invocationId) {
-    const path = join5(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+    const path = join6(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
     const content = await readFile5(path, "utf8");
     return content.split("\n").filter(Boolean).map((line) => HostEventSchema.parse(JSON.parse(line)));
   }
   async writeCapsule(hash2, value) {
-    const path = join5(this.runRoot, "capsules", `${hash2}.json`);
+    const path = join6(this.runRoot, "capsules", `${hash2}.json`);
     await writeJsonAtomic(path, value);
     return path;
   }
   async writeWorkspace(value) {
-    await writeJsonAtomic(join5(this.runRoot, "workspace.json"), value);
+    await writeJsonAtomic(join6(this.runRoot, "workspace.json"), value);
   }
   async loadWorkspace() {
-    return JSON.parse(await readFile5(join5(this.runRoot, "workspace.json"), "utf8"));
+    return JSON.parse(await readFile5(join6(this.runRoot, "workspace.json"), "utf8"));
   }
   async materialize(events) {
     const state = reduceEvents(events);
-    await writeJsonAtomic(join5(this.runRoot, "state.json"), state);
+    await writeJsonAtomic(join6(this.runRoot, "state.json"), state);
     return state;
   }
 };
 async function listRunIds(repositoryRoot) {
   try {
-    const entries = await readdir(join5(repositoryRoot, ".graphcraft", "runs"), {
+    const entries = await readdir(join6(repositoryRoot, ".graphcraft", "runs"), {
       withFileTypes: true
     });
     return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
@@ -33934,7 +34408,7 @@ async function createRun(task, options) {
   return { contract, graph, store, probePlan };
 }
 async function configureRunProbes(store, input) {
-  const lock = new RunLock(join6(store.graphcraftRoot, "locks", `${store.runId}.lock`));
+  const lock = new RunLock(join7(store.graphcraftRoot, "locks", `${store.runId}.lock`));
   await lock.acquire();
   try {
     const state = await store.loadState();
@@ -33970,13 +34444,13 @@ async function executeWorker(input) {
   });
   const capsuleHash = contentHash(capsule);
   await input.store.writeCapsule(capsuleHash, capsule);
-  let invocationId = input.resume?.invocationId ?? randomUUID5();
+  let invocationId = input.resume?.invocationId ?? randomUUID6();
   let resumeSessionId;
   if (input.resume) {
     await recordMissingUsage(input.store, input.resume);
     const reconciliation = await input.adapter.reconcile(input.resume);
     if (reconciliation.state === "completed" && reconciliation.result) {
-      const artifact2 = join6(
+      const artifact2 = join7(
         input.store.runRoot,
         "artifacts",
         "invocations",
@@ -34010,7 +34484,7 @@ async function executeWorker(input) {
         },
         invocationId
       );
-      invocationId = randomUUID5();
+      invocationId = randomUUID6();
     }
   }
   if (!resumeSessionId) {
@@ -34026,7 +34500,7 @@ async function executeWorker(input) {
   let error51;
   let errorCause;
   let termination;
-  let artifact = join6(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+  let artifact = join7(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
   try {
     for await (const event of input.adapter.execute(
       {
@@ -34112,7 +34586,7 @@ function needsSemanticVerification(phase, probes, classification) {
   return classification === "stalled" || classification === "done";
 }
 async function runSemanticVerification(input) {
-  const invocationId = randomUUID5();
+  const invocationId = randomUUID6();
   const context = SemanticVerifierContextSchema.parse({
     schemaVersion: 1,
     phase: input.phase,
@@ -34242,14 +34716,48 @@ function addRepairNode(graph, verification, failures) {
       repair,
       { ...verification, dependsOn: [...originalDependencies, id] }
     ],
+    controlEdges: [
+      ...graph.controlEdges,
+      ...graph.controlEdges.filter((edge) => edge.to === verification.id && edge.relation !== "owns_target").map((edge) => ({ ...edge, to: id }))
+    ],
     revision: graph.revision + 1
   });
+}
+function runtimeVerifierControls(graph, targetId) {
+  return graph.controlEdges.some(
+    ({ from, to, relation }) => from === "runtime-verifier" && to === targetId && relation === "vetoes"
+  );
+}
+async function recordVerifierControl(input) {
+  if (!runtimeVerifierControls(input.graph, input.targetId)) return;
+  await recordRuntimeControlDecision({
+    ...input,
+    sourceId: "runtime-verifier",
+    actor: "verifier"
+  });
+}
+async function evaluateSuccessfulControl(input) {
+  await recordVerifierControl({
+    store: input.store,
+    graph: input.graph,
+    targetId: input.node.id,
+    verdict: "approve",
+    rationale: input.rationale,
+    evidence: input.evidence
+  });
+  return await evaluateControlAcceptance(
+    input.store,
+    input.graph,
+    await input.store.loadState(),
+    input.node.id,
+    input.evidence
+  );
 }
 async function executeRun(input) {
   const externalSignal = input.signal ?? new AbortController().signal;
   const contract = await input.store.loadContract();
   let graph = await input.store.loadGraph();
-  const lock = new RunLock(join6(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
+  const lock = new RunLock(join7(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
   await lock.acquire();
   const controlChannel = new RunControlChannel(input.store.graphcraftRoot, contract.runId);
   const controlAbort = new AbortController();
@@ -34268,6 +34776,8 @@ async function executeRun(input) {
       state = await input.store.loadState();
     }
     if (["completed", "stopped"].includes(state.status)) return state;
+    await recordRunApprovalDecisions(input.store, graph);
+    state = await input.store.loadState();
     const interruptedNodeId = state.currentNodeId && state.nodes[state.currentNodeId]?.status === "running" ? state.currentNodeId : void 0;
     if (state.status === "blocked") {
       for (const [nodeId, nodeState] of Object.entries(state.nodes)) {
@@ -34368,6 +34878,14 @@ async function executeRun(input) {
         }
         return await input.store.loadState();
       }
+      const scheduling = await evaluateControlScheduling(input.store, graph, state, current.id);
+      if (!scheduling.allowed) {
+        await input.store.append("runtime", "run.blocked", {
+          reason: scheduling.reason ?? `Control authority blocked ${current.id}`,
+          ...scheduling.packet ? { decisionPacket: scheduling.packet } : {}
+        });
+        return await input.store.loadState();
+      }
       input.observer?.({ type: "status", message: `${current.kind}: ${current.objective}` });
       await input.store.append("runtime", "node.started", { nodeId: current.id });
       if (signal.aborted) return await finishInterruption(current.id);
@@ -34393,6 +34911,7 @@ async function executeRun(input) {
         const results = executed.map(({ result }) => result);
         if (results.every(({ passed }) => passed)) {
           let semanticEvidence2 = [];
+          let completionControl;
           if (needsSemanticVerification("completion", current.completionProbes)) {
             let semanticVerdict;
             try {
@@ -34425,16 +34944,57 @@ async function executeRun(input) {
             }
             semanticEvidence2 = semanticVerdict.evidence;
             if (semanticVerdict.verdict !== "supported") {
-              const reason = `Semantic completion verdict was ${semanticVerdict.verdict}: ${semanticVerdict.rationale}`;
-              await input.store.append("host", "node.failed", { nodeId: current.id, reason });
-              await input.store.append("runtime", "run.blocked", { reason });
-              return await input.store.loadState();
+              await recordVerifierControl({
+                store: input.store,
+                graph,
+                targetId: current.id,
+                verdict: "veto",
+                rationale: semanticVerdict.rationale,
+                evidence: semanticVerdict.evidence
+              });
+              const control2 = await evaluateControlAcceptance(
+                input.store,
+                graph,
+                await input.store.loadState(),
+                current.id,
+                semanticVerdict.evidence
+              );
+              if (!control2.allowed) {
+                const reason = control2.reason ?? `Semantic completion verdict was ${semanticVerdict.verdict}: ${semanticVerdict.rationale}`;
+                await input.store.append("host", "node.failed", { nodeId: current.id, reason });
+                await input.store.append("runtime", "run.blocked", {
+                  reason,
+                  ...control2.packet ? { decisionPacket: control2.packet } : {}
+                });
+                return await input.store.loadState();
+              }
+              completionControl = control2;
             }
+          }
+          const completionEvidence = [
+            ...results.map(({ summary }) => summary),
+            ...semanticEvidence2
+          ];
+          const control = completionControl ?? await evaluateSuccessfulControl({
+            store: input.store,
+            graph,
+            node: current,
+            rationale: "Completion probes and any required semantic verification passed",
+            evidence: completionEvidence
+          });
+          if (!control.allowed) {
+            const reason = control.reason ?? `Control graph blocked acceptance of ${current.id}`;
+            await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+            await input.store.append("runtime", "run.blocked", {
+              reason,
+              ...control.packet ? { decisionPacket: control.packet } : {}
+            });
+            return await input.store.loadState();
           }
           await input.store.append("probe", "node.progress", {
             nodeId: current.id,
             classification: "done",
-            evidence: [...results.map(({ summary }) => summary), ...semanticEvidence2]
+            evidence: completionEvidence
           });
           await input.store.append("probe", "node.accepted", { nodeId: current.id });
           continue;
@@ -34447,9 +35007,26 @@ async function executeRun(input) {
           reason: results.filter(({ passed }) => !passed).map(({ summary }) => summary).join("\n")
         });
         if (existingRepairs >= 1) {
+          const failureEvidence = results.filter(({ passed }) => !passed).map(({ summary }) => summary);
+          await recordVerifierControl({
+            store: input.store,
+            graph,
+            targetId: current.id,
+            verdict: "veto",
+            rationale: "Verification still fails after a changed repair strategy",
+            evidence: failureEvidence
+          });
+          const control = await evaluateControlAcceptance(
+            input.store,
+            graph,
+            await input.store.loadState(),
+            current.id,
+            failureEvidence
+          );
           await input.store.append("runtime", "run.blocked", {
-            reason: "Verification still fails after a changed repair strategy",
-            failures: results.filter(({ passed }) => !passed)
+            reason: control.reason ?? "Verification still fails after a changed repair strategy",
+            failures: results.filter(({ passed }) => !passed),
+            ...control.packet ? { decisionPacket: control.packet } : {}
           });
           return await input.store.loadState();
         }
@@ -34472,6 +35049,22 @@ async function executeRun(input) {
         continue;
       }
       if (current.kind === "commit") {
+        const control = await evaluateSuccessfulControl({
+          store: input.store,
+          graph,
+          node: current,
+          rationale: "All dependencies were accepted before the commit side effect",
+          evidence: state.latestProgressEvidence
+        });
+        if (!control.allowed) {
+          const reason = control.reason ?? `Control graph blocked commit node ${current.id}`;
+          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+          await input.store.append("runtime", "run.blocked", {
+            reason,
+            ...control.packet ? { decisionPacket: control.packet } : {}
+          });
+          return await input.store.loadState();
+        }
         try {
           const sha = await createAtomicCommit(workspace, contract.task);
           await input.store.append("runtime", "node.accepted", { nodeId: current.id, sha });
@@ -34580,28 +35173,70 @@ async function executeRun(input) {
           semanticStopReason = `Semantic progress verdict was ${semanticVerdict.verdict}: ${semanticVerdict.rationale}`;
         }
       }
+      const progressEvidence = [
+        ...worker.result.evidence,
+        ...afterProbes.map(({ result }) => result.summary),
+        ...semanticEvidence
+      ];
       await input.store.append("probe", "node.progress", {
         nodeId: current.id,
         classification,
         summary: worker.result.summary,
-        evidence: [
-          ...worker.result.evidence,
-          ...afterProbes.map(({ result }) => result.summary),
-          ...semanticEvidence
-        ]
+        evidence: progressEvidence
       });
       if (["done", "advanced", "learning"].includes(classification)) {
+        const control = await evaluateSuccessfulControl({
+          store: input.store,
+          graph,
+          node: current,
+          rationale: `Progress was classified as ${classification}`,
+          evidence: progressEvidence
+        });
+        if (!control.allowed) {
+          const reason = control.reason ?? `Control graph blocked acceptance of ${current.id}`;
+          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+          await input.store.append("runtime", "run.blocked", {
+            reason,
+            ...control.packet ? { decisionPacket: control.packet } : {}
+          });
+          return await input.store.loadState();
+        }
         await input.store.append("runtime", "node.accepted", {
           nodeId: current.id,
           summary: worker.result.summary
         });
       } else {
+        await recordVerifierControl({
+          store: input.store,
+          graph,
+          targetId: current.id,
+          verdict: "veto",
+          rationale: semanticStopReason ?? `Progress classified as ${classification}`,
+          evidence: progressEvidence
+        });
+        const control = await evaluateControlAcceptance(
+          input.store,
+          graph,
+          await input.store.loadState(),
+          current.id,
+          progressEvidence
+        );
+        const reason = control.reason ?? semanticStopReason ?? `Stopped safely because progress was ${classification}`;
+        if (control.allowed) {
+          await input.store.append("runtime", "node.accepted", {
+            nodeId: current.id,
+            summary: worker.result.summary,
+            controlOverride: true
+          });
+          continue;
+        }
         await input.store.append("runtime", "node.failed", {
           nodeId: current.id,
-          reason: semanticStopReason ?? `Progress classified as ${classification}`
+          reason
         });
         await input.store.append("runtime", "run.blocked", {
-          reason: semanticStopReason ?? `Stopped safely because progress was ${classification}`
+          reason,
+          ...control.packet ? { decisionPacket: control.packet } : {}
         });
         return await input.store.loadState();
       }
@@ -34677,6 +35312,8 @@ function stateView(state, contract) {
     currentNode: state.currentNodeId,
     nodes: state.nodes,
     latestProgressEvidence: state.latestProgressEvidence,
+    controlDecisions: state.controlDecisions,
+    pendingDecision: state.pendingDecision,
     tokens: state.tokens,
     stopReason: state.stopReason,
     updatedAt: state.updatedAt
@@ -34747,6 +35384,23 @@ async function handleAction(input) {
     if (!input.probePlan) return { probePlan };
     return await configureRunProbes(store, input.probePlan);
   }
+  if (input.action === "decide") {
+    if (!input.controlSource || !input.controlTarget || !input.controlVerdict || !input.rationale)
+      throw new Error(
+        "controlSource, controlTarget, controlVerdict, and rationale are required for action=decide"
+      );
+    return stateView(
+      await decideRunControl(store, {
+        sourceId: input.controlSource,
+        targetId: input.controlTarget,
+        verdict: input.controlVerdict,
+        rationale: input.rationale,
+        ...input.evidence ? { evidence: input.evidence } : {},
+        ...input.replaces ? { replaces: input.replaces } : {}
+      }),
+      contract
+    );
+  }
   if (input.action === "stop") return stateView(await requestRunControl(store, "stop"), contract);
   if (input.action === "pause") return stateView(await requestRunControl(store, "pause"), contract);
   if (input.action === "resume") {
@@ -34767,10 +35421,36 @@ async function handleAction(input) {
 var tool_metadata_default = {
   name: "graphcraft",
   title: "Graphcraft",
-  description: "Run or control a durable coding-agent graph.",
-  instructions: "Use Graphcraft for durable coding runs. Show approvalRequired contracts to the user and set approve only after consent.",
-  actions: ["run", "status", "inspect", "resume", "pause", "stop", "trace", "probes", "doctor"],
-  inputs: ["task", "run", "repository", "host", "approve", "finishLine", "force", "probePlan"]
+  description: "Control a durable coding-agent graph.",
+  instructions: "Show approvalRequired contracts and set approve only after user consent.",
+  actions: [
+    "run",
+    "status",
+    "inspect",
+    "resume",
+    "pause",
+    "stop",
+    "trace",
+    "probes",
+    "decide",
+    "doctor"
+  ],
+  inputs: [
+    "task",
+    "run",
+    "repository",
+    "host",
+    "approve",
+    "finishLine",
+    "force",
+    "probePlan",
+    "controlSource",
+    "controlTarget",
+    "controlVerdict",
+    "rationale",
+    "evidence",
+    "replaces"
+  ]
 };
 
 // packages/mcp/src/index.ts
@@ -34796,6 +35476,7 @@ function createGraphcraftServer() {
           "stop",
           "trace",
           "probes",
+          "decide",
           "doctor"
         ]),
         task: external_exports.string().optional(),
@@ -34805,7 +35486,13 @@ function createGraphcraftServer() {
         approve: external_exports.boolean().optional(),
         finishLine: external_exports.enum(["local_verified", "committed"]).optional(),
         force: external_exports.boolean().optional(),
-        probePlan: ProbePlanSchema.optional()
+        probePlan: ProbePlanSchema.optional(),
+        controlSource: external_exports.string().optional(),
+        controlTarget: external_exports.string().optional(),
+        controlVerdict: external_exports.enum(["approve", "veto"]).optional(),
+        rationale: external_exports.string().optional(),
+        evidence: external_exports.array(external_exports.string()).optional(),
+        replaces: external_exports.string().uuid().optional()
       },
       outputSchema: { result: external_exports.record(external_exports.string(), external_exports.unknown()) }
     },

@@ -42,6 +42,13 @@ import {
 import { RunLock } from "./lock.ts";
 import { requestRunControl, RunControlChannel } from "./control.ts";
 import {
+  evaluateControlAcceptance,
+  evaluateControlScheduling,
+  recordRunApprovalDecisions,
+  recordRuntimeControlDecision,
+  type ControlEvaluation,
+} from "./governance.ts";
+import {
   createAtomicCommit,
   discoverPlanningEvidence,
   createRunWorkspace,
@@ -588,8 +595,61 @@ function addRepairNode(graph: Graph, verification: GraphNode, failures: ProbeRes
       repair,
       { ...verification, dependsOn: [...originalDependencies, id] },
     ],
+    controlEdges: [
+      ...graph.controlEdges,
+      ...graph.controlEdges
+        .filter((edge) => edge.to === verification.id && edge.relation !== "owns_target")
+        .map((edge) => ({ ...edge, to: id })),
+    ],
     revision: graph.revision + 1,
   });
+}
+
+function runtimeVerifierControls(graph: Graph, targetId: string): boolean {
+  return graph.controlEdges.some(
+    ({ from, to, relation }) =>
+      from === "runtime-verifier" && to === targetId && relation === "vetoes",
+  );
+}
+
+async function recordVerifierControl(input: {
+  store: RunStore;
+  graph: Graph;
+  targetId: string;
+  verdict: "approve" | "veto";
+  rationale: string;
+  evidence: string[];
+}): Promise<void> {
+  if (!runtimeVerifierControls(input.graph, input.targetId)) return;
+  await recordRuntimeControlDecision({
+    ...input,
+    sourceId: "runtime-verifier",
+    actor: "verifier",
+  });
+}
+
+async function evaluateSuccessfulControl(input: {
+  store: RunStore;
+  graph: Graph;
+  node: GraphNode;
+  rationale: string;
+  evidence: string[];
+}): Promise<ControlEvaluation> {
+  await recordVerifierControl({
+    store: input.store,
+    graph: input.graph,
+    targetId: input.node.id,
+    verdict: "approve",
+    rationale: input.rationale,
+    evidence: input.evidence,
+  });
+  return await evaluateControlAcceptance(
+    input.store,
+    input.graph,
+    await input.store.loadState(),
+    input.node.id,
+    input.evidence,
+  );
 }
 
 export async function executeRun(input: {
@@ -621,6 +681,8 @@ export async function executeRun(input: {
       state = await input.store.loadState();
     }
     if (["completed", "stopped"].includes(state.status)) return state;
+    await recordRunApprovalDecisions(input.store, graph);
+    state = await input.store.loadState();
     const interruptedNodeId =
       state.currentNodeId && state.nodes[state.currentNodeId]?.status === "running"
         ? state.currentNodeId
@@ -749,6 +811,15 @@ export async function executeRun(input: {
         return await input.store.loadState();
       }
 
+      const scheduling = await evaluateControlScheduling(input.store, graph, state, current.id);
+      if (!scheduling.allowed) {
+        await input.store.append("runtime", "run.blocked", {
+          reason: scheduling.reason ?? `Control authority blocked ${current.id}`,
+          ...(scheduling.packet ? { decisionPacket: scheduling.packet } : {}),
+        });
+        return await input.store.loadState();
+      }
+
       input.observer?.({ type: "status", message: `${current.kind}: ${current.objective}` });
       await input.store.append("runtime", "node.started", { nodeId: current.id });
       if (signal.aborted) return await finishInterruption(current.id);
@@ -776,6 +847,7 @@ export async function executeRun(input: {
         const results = executed.map(({ result }) => result);
         if (results.every(({ passed }) => passed)) {
           let semanticEvidence: string[] = [];
+          let completionControl: ControlEvaluation | undefined;
           if (needsSemanticVerification("completion", current.completionProbes)) {
             let semanticVerdict: SemanticVerdict;
             try {
@@ -808,16 +880,61 @@ export async function executeRun(input: {
             }
             semanticEvidence = semanticVerdict.evidence;
             if (semanticVerdict.verdict !== "supported") {
-              const reason = `Semantic completion verdict was ${semanticVerdict.verdict}: ${semanticVerdict.rationale}`;
-              await input.store.append("host", "node.failed", { nodeId: current.id, reason });
-              await input.store.append("runtime", "run.blocked", { reason });
-              return await input.store.loadState();
+              await recordVerifierControl({
+                store: input.store,
+                graph,
+                targetId: current.id,
+                verdict: "veto",
+                rationale: semanticVerdict.rationale,
+                evidence: semanticVerdict.evidence,
+              });
+              const control = await evaluateControlAcceptance(
+                input.store,
+                graph,
+                await input.store.loadState(),
+                current.id,
+                semanticVerdict.evidence,
+              );
+              if (!control.allowed) {
+                const reason =
+                  control.reason ??
+                  `Semantic completion verdict was ${semanticVerdict.verdict}: ${semanticVerdict.rationale}`;
+                await input.store.append("host", "node.failed", { nodeId: current.id, reason });
+                await input.store.append("runtime", "run.blocked", {
+                  reason,
+                  ...(control.packet ? { decisionPacket: control.packet } : {}),
+                });
+                return await input.store.loadState();
+              }
+              completionControl = control;
             }
+          }
+          const completionEvidence = [
+            ...results.map(({ summary }) => summary),
+            ...semanticEvidence,
+          ];
+          const control =
+            completionControl ??
+            (await evaluateSuccessfulControl({
+              store: input.store,
+              graph,
+              node: current,
+              rationale: "Completion probes and any required semantic verification passed",
+              evidence: completionEvidence,
+            }));
+          if (!control.allowed) {
+            const reason = control.reason ?? `Control graph blocked acceptance of ${current.id}`;
+            await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+            await input.store.append("runtime", "run.blocked", {
+              reason,
+              ...(control.packet ? { decisionPacket: control.packet } : {}),
+            });
+            return await input.store.loadState();
           }
           await input.store.append("probe", "node.progress", {
             nodeId: current.id,
             classification: "done",
-            evidence: [...results.map(({ summary }) => summary), ...semanticEvidence],
+            evidence: completionEvidence,
           });
           await input.store.append("probe", "node.accepted", { nodeId: current.id });
           continue;
@@ -834,9 +951,28 @@ export async function executeRun(input: {
             .join("\n"),
         });
         if (existingRepairs >= 1) {
+          const failureEvidence = results
+            .filter(({ passed }) => !passed)
+            .map(({ summary }) => summary);
+          await recordVerifierControl({
+            store: input.store,
+            graph,
+            targetId: current.id,
+            verdict: "veto",
+            rationale: "Verification still fails after a changed repair strategy",
+            evidence: failureEvidence,
+          });
+          const control = await evaluateControlAcceptance(
+            input.store,
+            graph,
+            await input.store.loadState(),
+            current.id,
+            failureEvidence,
+          );
           await input.store.append("runtime", "run.blocked", {
-            reason: "Verification still fails after a changed repair strategy",
+            reason: control.reason ?? "Verification still fails after a changed repair strategy",
             failures: results.filter(({ passed }) => !passed),
+            ...(control.packet ? { decisionPacket: control.packet } : {}),
           });
           return await input.store.loadState();
         }
@@ -860,6 +996,22 @@ export async function executeRun(input: {
       }
 
       if (current.kind === "commit") {
+        const control = await evaluateSuccessfulControl({
+          store: input.store,
+          graph,
+          node: current,
+          rationale: "All dependencies were accepted before the commit side effect",
+          evidence: state.latestProgressEvidence,
+        });
+        if (!control.allowed) {
+          const reason = control.reason ?? `Control graph blocked commit node ${current.id}`;
+          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+          await input.store.append("runtime", "run.blocked", {
+            reason,
+            ...(control.packet ? { decisionPacket: control.packet } : {}),
+          });
+          return await input.store.loadState();
+        }
         try {
           const sha = await createAtomicCommit(workspace, contract.task);
           await input.store.append("runtime", "node.accepted", { nodeId: current.id, sha });
@@ -974,28 +1126,73 @@ export async function executeRun(input: {
           semanticStopReason = `Semantic progress verdict was ${semanticVerdict.verdict}: ${semanticVerdict.rationale}`;
         }
       }
+      const progressEvidence = [
+        ...worker.result.evidence,
+        ...afterProbes.map(({ result }) => result.summary),
+        ...semanticEvidence,
+      ];
       await input.store.append("probe", "node.progress", {
         nodeId: current.id,
         classification,
         summary: worker.result.summary,
-        evidence: [
-          ...worker.result.evidence,
-          ...afterProbes.map(({ result }) => result.summary),
-          ...semanticEvidence,
-        ],
+        evidence: progressEvidence,
       });
       if (["done", "advanced", "learning"].includes(classification)) {
+        const control = await evaluateSuccessfulControl({
+          store: input.store,
+          graph,
+          node: current,
+          rationale: `Progress was classified as ${classification}`,
+          evidence: progressEvidence,
+        });
+        if (!control.allowed) {
+          const reason = control.reason ?? `Control graph blocked acceptance of ${current.id}`;
+          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+          await input.store.append("runtime", "run.blocked", {
+            reason,
+            ...(control.packet ? { decisionPacket: control.packet } : {}),
+          });
+          return await input.store.loadState();
+        }
         await input.store.append("runtime", "node.accepted", {
           nodeId: current.id,
           summary: worker.result.summary,
         });
       } else {
+        await recordVerifierControl({
+          store: input.store,
+          graph,
+          targetId: current.id,
+          verdict: "veto",
+          rationale: semanticStopReason ?? `Progress classified as ${classification}`,
+          evidence: progressEvidence,
+        });
+        const control = await evaluateControlAcceptance(
+          input.store,
+          graph,
+          await input.store.loadState(),
+          current.id,
+          progressEvidence,
+        );
+        const reason =
+          control.reason ??
+          semanticStopReason ??
+          `Stopped safely because progress was ${classification}`;
+        if (control.allowed) {
+          await input.store.append("runtime", "node.accepted", {
+            nodeId: current.id,
+            summary: worker.result.summary,
+            controlOverride: true,
+          });
+          continue;
+        }
         await input.store.append("runtime", "node.failed", {
           nodeId: current.id,
-          reason: semanticStopReason ?? `Progress classified as ${classification}`,
+          reason,
         });
         await input.store.append("runtime", "run.blocked", {
-          reason: semanticStopReason ?? `Stopped safely because progress was ${classification}`,
+          reason,
+          ...(control.packet ? { decisionPacket: control.packet } : {}),
         });
         return await input.store.loadState();
       }

@@ -24,6 +24,11 @@ import type {
 } from "@graphcraft/core";
 import { configureRunProbes, createRun, executeRun } from "./runner.ts";
 import { requestRunControl } from "./control.ts";
+import {
+  decideRunControl,
+  recordRunApprovalDecisions,
+  recordRuntimeControlDecision,
+} from "./governance.ts";
 import { RunLock } from "./lock.ts";
 import { createRunWorkspace, discoverPlanningEvidence } from "./repository.ts";
 
@@ -398,9 +403,296 @@ describe("durable runtime", () => {
     expect(adapter.semanticRequests).toHaveLength(0);
     expect((await created.store.loadEvents()).map(({ type }) => type)).toContain("run.completed");
 
+    const eventCount = (await created.store.loadEvents()).length;
     const resumed = await executeRun({ store: created.store, adapter, approve: true });
     expect(resumed.status).toBe("completed");
     expect(adapter.calls).toEqual(["implement"]);
+    expect(await created.store.loadEvents()).toHaveLength(eventCount);
+  });
+
+  it("enforces sticky owner decisions before scheduling the owned target", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async (request) => {
+      await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+    });
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    await created.store.append("user", "run.approved", { approved: true });
+    await recordRunApprovalDecisions(created.store, created.graph);
+    const approval = (await created.store.loadState()).controlDecisions.find(
+      ({ sourceId, targetId }) => sourceId === "user-outcome" && targetId === "verify",
+    )!;
+    const vetoed = await decideRunControl(created.store, {
+      sourceId: "user-outcome",
+      targetId: "verify",
+      verdict: "veto",
+      rationale: "Do not schedule finish-line verification yet",
+      replaces: approval.decisionId,
+    });
+    const veto = vetoed.controlDecisions.find(
+      ({ sourceId, targetId }) => sourceId === "user-outcome" && targetId === "verify",
+    )!;
+
+    const blocked = await executeRun({ store: created.store, adapter });
+
+    expect(blocked.status).toBe("blocked");
+    expect(blocked.stopReason).toMatch(/Control owner vetoed verify/);
+    expect(blocked.nodes.verify?.attempts).toBe(0);
+    expect(adapter.calls).toEqual(["implement"]);
+    await expect(
+      decideRunControl(created.store, {
+        sourceId: "user-outcome",
+        targetId: "verify",
+        verdict: "approve",
+        rationale: "Proceed now",
+      }),
+    ).rejects.toThrow(/requires explicit replacement/);
+
+    await decideRunControl(created.store, {
+      sourceId: "user-outcome",
+      targetId: "verify",
+      verdict: "approve",
+      rationale: "Proceed after reviewing the implementation evidence",
+      evidence: ["implementation node accepted"],
+      replaces: veto.decisionId,
+    });
+    expect((await executeRun({ store: created.store, adapter })).status).toBe("completed");
+  });
+
+  it("emits a durable conflict packet and honors an explicit verifier-veto override", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(
+      async (request) => {
+        await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+      },
+      true,
+      undefined,
+      async () => ({
+        verdict: {
+          verdict: "unsupported",
+          evidence: ["The semantic completion claim is not grounded"],
+          rationale: "Selected evidence does not establish the requested behavior",
+          uncertainty: 0.05,
+        },
+      }),
+    );
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    const inventory = created.probePlan.items.find(
+      ({ phase, purpose }) => phase === "progress" && purpose === "inventory",
+    )!;
+    await configureRunProbes(created.store, {
+      ...created.probePlan,
+      items: [
+        ...created.probePlan.items.filter(({ phase }) => phase === "progress"),
+        { ...inventory, phase: "completion" },
+      ],
+    });
+
+    const blocked = await executeRun({ store: created.store, adapter, approve: true });
+
+    expect(blocked.status).toBe("blocked");
+    expect(blocked.pendingDecision).toMatchObject({
+      targetId: "verify",
+      requiredSources: ["user-arbitrator"],
+      choices: ["approve", "veto"],
+    });
+    expect(blocked.controlDecisions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ sourceId: "user-outcome", verdict: "approve", sticky: true }),
+        expect.objectContaining({
+          sourceId: "runtime-verifier",
+          verdict: "veto",
+          actor: "verifier",
+          sticky: false,
+        }),
+      ]),
+    );
+    expect(adapter.semanticRequests).toHaveLength(1);
+    expect(adapter.semanticRequests[0]).not.toHaveProperty("allowedTools");
+    expect(adapter.requests[0]?.allowedTools).toEqual(["read", "write", "shell"]);
+    await expect(
+      recordRuntimeControlDecision({
+        store: created.store,
+        graph: await created.store.loadGraph(),
+        sourceId: "user-outcome",
+        targetId: "verify",
+        verdict: "approve",
+        rationale: "Runtime impersonation must fail",
+        evidence: [],
+        actor: "runtime",
+      }),
+    ).rejects.toThrow(/cannot impersonate/);
+    await expect(
+      decideRunControl(created.store, {
+        sourceId: "user-outcome",
+        targetId: "verify",
+        verdict: "veto",
+        rationale: "Wrong decision source",
+        replaces: blocked.controlDecisions.find(({ sourceId }) => sourceId === "user-outcome")!
+          .decisionId,
+      }),
+    ).rejects.toThrow(/requires one of: user-arbitrator/);
+
+    await decideRunControl(created.store, {
+      sourceId: "user-arbitrator",
+      targetId: "verify",
+      verdict: "approve",
+      rationale: "Accept the deterministic completion evidence despite semantic uncertainty",
+      evidence: ["Deterministic completion probe passed"],
+    });
+    const completed = await executeRun({ store: created.store, adapter });
+    const events = await created.store.loadEvents();
+
+    expect(completed.status).toBe("completed");
+    expect(completed.pendingDecision).toBeUndefined();
+    expect(adapter.calls).toEqual(["implement"]);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "control.observed",
+          data: expect.objectContaining({ observer: "runtime-verifier", targetId: "verify" }),
+        }),
+        expect.objectContaining({
+          type: "control.override",
+          data: expect.objectContaining({
+            arbitrator: "user-arbitrator",
+            overridden: ["runtime-verifier"],
+            evidence: ["Deterministic completion probe passed"],
+          }),
+        }),
+        expect.objectContaining({
+          type: "control.resolved",
+          data: expect.objectContaining({
+            targetId: "verify",
+            outcome: "approved",
+            owners: ["user-outcome"],
+          }),
+        }),
+      ]),
+    );
+  });
+
+  it("keeps a verifier conflict blocked when the user arbitrator vetoes", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(
+      async (request) => {
+        await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+      },
+      true,
+      undefined,
+      async () => ({
+        verdict: {
+          verdict: "unsupported",
+          evidence: ["Semantic evidence remains unsupported"],
+          rationale: "The acceptance claim is not grounded",
+          uncertainty: 0,
+        },
+      }),
+    );
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    const inventory = created.probePlan.items.find(
+      ({ phase, purpose }) => phase === "progress" && purpose === "inventory",
+    )!;
+    await configureRunProbes(created.store, {
+      ...created.probePlan,
+      items: [
+        ...created.probePlan.items.filter(({ phase }) => phase === "progress"),
+        { ...inventory, phase: "completion" },
+      ],
+    });
+    expect((await executeRun({ store: created.store, adapter, approve: true })).status).toBe(
+      "blocked",
+    );
+    await decideRunControl(created.store, {
+      sourceId: "user-arbitrator",
+      targetId: "verify",
+      verdict: "veto",
+      rationale: "Keep the unsupported completion blocked",
+      evidence: ["Semantic verifier veto reviewed"],
+    });
+
+    const blocked = await executeRun({ store: created.store, adapter });
+
+    expect(blocked.status).toBe("blocked");
+    expect(blocked.stopReason).toMatch(/Arbitrator vetoed verify: user-arbitrator/);
+    expect(blocked.pendingDecision).toBeUndefined();
+    expect(adapter.semanticRequests).toHaveLength(2);
+  });
+
+  it("turns a work-dependency ownership cycle into a resolvable user decision", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async (request) => {
+      await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+    });
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    const graph = {
+      ...created.graph,
+      revision: created.graph.revision + 1,
+      controlEdges: [
+        ...created.graph.controlEdges,
+        { from: "verify", to: "implement", relation: "owns_target" as const },
+      ],
+    };
+    await created.store.append("runtime", "graph.amended", {
+      graph,
+      addedNodeIds: [],
+      rationale: "Acceptance fixture adds a control ownership cycle",
+    });
+
+    const blocked = await executeRun({ store: created.store, adapter, approve: true });
+
+    expect(blocked.status).toBe("blocked");
+    expect(blocked.pendingDecision).toMatchObject({
+      targetId: "implement",
+      requiredSources: ["user-arbitrator"],
+    });
+    expect(adapter.calls).toHaveLength(0);
+
+    await decideRunControl(created.store, {
+      sourceId: "user-arbitrator",
+      targetId: "implement",
+      verdict: "approve",
+      rationale: "Break the ownership cycle without changing work dependencies",
+      evidence: ["verify depends on implement while verify owns implement"],
+    });
+    const completed = await executeRun({ store: created.store, adapter });
+
+    expect(completed.status).toBe("completed");
+    expect(completed.pendingDecision).toBeUndefined();
+    expect(adapter.calls).toEqual(["implement"]);
+    expect(
+      (await created.store.loadEvents()).find(
+        ({ type, data }) =>
+          type === "control.override" &&
+          data.targetId === "implement" &&
+          Array.isArray(data.missingSources) &&
+          data.missingSources.includes("verify"),
+      ),
+    ).toBeDefined();
+  });
+
+  it("does not add approval decisions when a stopped run is inspected through execution", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async () => undefined);
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    await created.store.append("user", "run.approved", { approved: true });
+    await created.store.append("user", "run.stopped", { reason: "Stopped before execution" });
+    const eventCount = (await created.store.loadEvents()).length;
+
+    const state = await executeRun({ store: created.store, adapter });
+
+    expect(state.status).toBe("stopped");
+    expect(state.controlDecisions).toEqual([]);
+    expect(await created.store.loadEvents()).toHaveLength(eventCount);
   });
 
   it("uses semantic completion only when deterministic completion proof is structural", async () => {

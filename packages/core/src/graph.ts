@@ -5,6 +5,7 @@ import type {
   GraphNode,
   GraphPlan,
   Permission,
+  AcceptanceAnchor,
   ProbePlan,
   ProbeSpec,
   RunContract,
@@ -81,8 +82,54 @@ export function compileRunContract(
         evidenceSource: "AGENTS.md and repository state",
         mutationPolicy: "immutable",
       },
+      {
+        id: "runtime-verifier",
+        description: "Deterministic and isolated semantic verification may veto unsupported work",
+        owner: "held_out_eval",
+        evidenceSource: "Graphcraft probe and semantic-verdict events",
+        mutationPolicy: "immutable",
+      },
+      {
+        id: "user-arbitrator",
+        description: "The user resolves contradictory control decisions without delegating edits",
+        owner: "user",
+        evidenceSource: "Explicit durable user decision",
+        mutationPolicy: "user_approval",
+      },
     ],
   });
+}
+
+function runtimeControlEdges(
+  anchors: AcceptanceAnchor[],
+  nodes: GraphNode[],
+): Graph["controlEdges"] {
+  const terminal = nodes.find(
+    (candidate) => !nodes.some((other) => other.dependsOn.includes(candidate.id)),
+  );
+  if (!terminal) throw new Error("The graph has no terminal control target");
+  const known = new Set(anchors.map(({ id }) => id));
+  const edges: Graph["controlEdges"] = [];
+  const add = (from: string, to: string, relation: Graph["controlEdges"][number]["relation"]) => {
+    if (known.has(from)) edges.push({ from, to, relation });
+  };
+  for (const node of nodes) {
+    add("repository-policy", node.id, "vetoes");
+    add("runtime-verifier", node.id, "observes");
+    add("runtime-verifier", node.id, "vetoes");
+    add("user-arbitrator", node.id, "arbitrates");
+    for (const anchor of anchors) {
+      if (
+        !["user-outcome", "repository-policy", "runtime-verifier", "user-arbitrator"].includes(
+          anchor.id,
+        )
+      ) {
+        edges.push({ from: anchor.id, to: node.id, relation: "vetoes" });
+      }
+    }
+  }
+  add("user-outcome", terminal.id, "owns_target");
+  return edges;
 }
 
 const resultShape = {
@@ -161,9 +208,7 @@ export function compileGraph(contract: RunContract, verificationProbes: ProbeSpe
     family,
     nodes,
     anchors: contract.acceptanceAnchors,
-    controlEdges: contract.acceptanceAnchors.flatMap((anchor) =>
-      nodes.map((workNode) => ({ from: anchor.id, to: workNode.id, relation: "vetoes" as const })),
-    ),
+    controlEdges: runtimeControlEdges(contract.acceptanceAnchors, nodes),
     revision: 0,
   });
   validateGraph(graph);
@@ -335,24 +380,19 @@ export function compilePlannedGraph(
   approvedProbes: ProbeSpec[] = requiredVerificationProbes,
 ): Graph {
   const parsedPlan = GraphPlanSchema.parse(plan);
+  const plannedNodes = parsedPlan.nodes.map((planned) =>
+    node({
+      ...planned,
+      outputSchema: resultShape,
+    }),
+  );
   const graph = GraphSchema.parse({
     schemaVersion: 1,
     runId: contract.runId,
     family: parsedPlan.family,
-    nodes: parsedPlan.nodes.map((planned) =>
-      node({
-        ...planned,
-        outputSchema: resultShape,
-      }),
-    ),
+    nodes: plannedNodes,
     anchors: contract.acceptanceAnchors,
-    controlEdges: contract.acceptanceAnchors.flatMap((anchor) =>
-      parsedPlan.nodes.map((planned) => ({
-        from: anchor.id,
-        to: planned.id,
-        relation: "vetoes" as const,
-      })),
-    ),
+    controlEdges: runtimeControlEdges(contract.acceptanceAnchors, plannedNodes),
     revision: 0,
   });
   validateGraph(graph);
@@ -465,6 +505,10 @@ export function validateGraph(graph: Graph): void {
       throw new Error(`Control edge ${edge.from} -> ${edge.to} references an unknown target`);
     const key = `${edge.from}\0${edge.to}\0${edge.relation}`;
     if (edgeKeys.has(key)) throw new Error(`Control edge ${edge.from} -> ${edge.to} is duplicated`);
+    if (!ids.has(edge.to))
+      throw new Error(`Control edge ${edge.from} -> ${edge.to} must target a work node`);
+    if (edge.from === edge.to)
+      throw new Error(`Control edge ${edge.from} -> ${edge.to} cannot control itself`);
     edgeKeys.add(key);
   }
 }

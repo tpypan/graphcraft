@@ -1,5 +1,11 @@
 import type { RunContract, RunEvent, RunState, TokenUsage } from "./schemas.ts";
-import { RunContractSchema, RunStateSchema, TokenUsageSchema } from "./schemas.ts";
+import {
+  ControlDecisionPacketSchema,
+  ControlDecisionSchema,
+  RunContractSchema,
+  RunStateSchema,
+  TokenUsageSchema,
+} from "./schemas.ts";
 import { verifyRunEvent } from "./events.ts";
 
 const emptyTokens: TokenUsage = { input: 0, cachedInput: 0, output: 0, reasoning: 0, total: 0 };
@@ -50,6 +56,7 @@ export function reduceEvents(events: RunEvent[]): RunState {
         ),
         latestProgressEvidence: [],
         tokens: { ...emptyTokens },
+        controlDecisions: [],
         updatedAt: event.timestamp,
       };
       continue;
@@ -147,6 +154,29 @@ export function reduceEvents(events: RunEvent[]): RunState {
       case "invocation.finished":
       case "control.applied":
       case "semantic.verdict":
+      case "control.observed":
+      case "control.override":
+        break;
+      case "control.decision": {
+        const decision = ControlDecisionSchema.parse(data.decision);
+        if (decision.replaces) {
+          state.controlDecisions = state.controlDecisions.filter(
+            ({ decisionId }) => decisionId !== decision.replaces,
+          );
+        }
+        state.controlDecisions = state.controlDecisions.filter(
+          ({ sourceId, targetId }) =>
+            sourceId !== decision.sourceId || targetId !== decision.targetId,
+        );
+        state.controlDecisions.push(decision);
+        break;
+      }
+      case "control.decision_required":
+        state.pendingDecision = ControlDecisionPacketSchema.parse(data.packet);
+        break;
+      case "control.resolved":
+        if (state.pendingDecision?.targetId === requiredString(data, "targetId"))
+          state.pendingDecision = undefined;
         break;
       case "run.created":
         throw new Error("run.created may only appear once");

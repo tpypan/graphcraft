@@ -192,6 +192,54 @@ program
   });
 
 program
+  .command("decide")
+  .description("Resolve a durable control decision as an authorized user-owned source")
+  .argument("[run]")
+  .option("-C, --cwd <path>", "repository path", process.cwd())
+  .requiredOption("--source <id>", "user-owned control source")
+  .requiredOption("--target <id>", "controlled node")
+  .addOption(
+    new Option("--verdict <verdict>", "decision")
+      .choices(["approve", "veto"])
+      .makeOptionMandatory(),
+  )
+  .requiredOption("--reason <reason>", "decision rationale")
+  .option("--evidence <text...>", "supporting evidence")
+  .option("--replace <decision>", "explicitly replace a sticky decision")
+  .action(
+    async (
+      run: string | undefined,
+      options: {
+        cwd: string;
+        source: string;
+        target: string;
+        verdict: "approve" | "veto";
+        reason: string;
+        evidence?: string[];
+        replace?: string;
+      },
+    ) => {
+      console.log(
+        JSON.stringify(
+          await handleAction({
+            action: "decide",
+            repository: options.cwd,
+            ...(run ? { run } : {}),
+            controlSource: options.source,
+            controlTarget: options.target,
+            controlVerdict: options.verdict,
+            rationale: options.reason,
+            ...(options.evidence ? { evidence: options.evidence } : {}),
+            ...(options.replace ? { replaces: options.replace } : {}),
+          }),
+          null,
+          2,
+        ),
+      );
+    },
+  );
+
+program
   .command("resume")
   .description("Resume a checkpointed run without repeating accepted nodes")
   .argument("[run]")

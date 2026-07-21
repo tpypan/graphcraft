@@ -1,8 +1,34 @@
 {
   "name": "graphcraft",
   "title": "Graphcraft",
-  "description": "Run or control a durable coding-agent graph.",
-  "instructions": "Use Graphcraft for durable coding runs. Show approvalRequired contracts to the user and set approve only after consent.",
-  "actions": ["run", "status", "inspect", "resume", "pause", "stop", "trace", "probes", "doctor"],
-  "inputs": ["task", "run", "repository", "host", "approve", "finishLine", "force", "probePlan"]
+  "description": "Control a durable coding-agent graph.",
+  "instructions": "Show approvalRequired contracts and set approve only after user consent.",
+  "actions": [
+    "run",
+    "status",
+    "inspect",
+    "resume",
+    "pause",
+    "stop",
+    "trace",
+    "probes",
+    "decide",
+    "doctor"
+  ],
+  "inputs": [
+    "task",
+    "run",
+    "repository",
+    "host",
+    "approve",
+    "finishLine",
+    "force",
+    "probePlan",
+    "controlSource",
+    "controlTarget",
+    "controlVerdict",
+    "rationale",
+    "evidence",
+    "replaces"
+  ]
 }

@@ -21,6 +21,7 @@ import {
   RunStore,
   configureRunProbes,
   createRun,
+  decideRunControl,
   discoverRepository,
   executeRun,
   requestRunControl,
@@ -183,6 +184,8 @@ export function stateView(state: RunState, contract: RunContract): Record<string
     currentNode: state.currentNodeId,
     nodes: state.nodes,
     latestProgressEvidence: state.latestProgressEvidence,
+    controlDecisions: state.controlDecisions,
+    pendingDecision: state.pendingDecision,
     tokens: state.tokens,
     stopReason: state.stopReason,
     updatedAt: state.updatedAt,
@@ -236,7 +239,16 @@ export async function storeFor(cwd: string, runReference?: string): Promise<RunS
 
 export interface McpActionInput {
   action:
-    "run" | "status" | "inspect" | "resume" | "pause" | "stop" | "trace" | "probes" | "doctor";
+    | "run"
+    | "status"
+    | "inspect"
+    | "resume"
+    | "pause"
+    | "stop"
+    | "trace"
+    | "probes"
+    | "decide"
+    | "doctor";
   task?: string | undefined;
   run?: string | undefined;
   repository?: string | undefined;
@@ -245,6 +257,12 @@ export interface McpActionInput {
   finishLine?: "local_verified" | "committed" | undefined;
   force?: boolean | undefined;
   probePlan?: ProbePlan | undefined;
+  controlSource?: string | undefined;
+  controlTarget?: string | undefined;
+  controlVerdict?: "approve" | "veto" | undefined;
+  rationale?: string | undefined;
+  evidence?: string[] | undefined;
+  replaces?: string | undefined;
 }
 
 export async function handleAction(input: McpActionInput): Promise<Record<string, unknown>> {
@@ -308,6 +326,23 @@ export async function handleAction(input: McpActionInput): Promise<Record<string
   if (input.action === "probes") {
     if (!input.probePlan) return { probePlan };
     return await configureRunProbes(store, input.probePlan);
+  }
+  if (input.action === "decide") {
+    if (!input.controlSource || !input.controlTarget || !input.controlVerdict || !input.rationale)
+      throw new Error(
+        "controlSource, controlTarget, controlVerdict, and rationale are required for action=decide",
+      );
+    return stateView(
+      await decideRunControl(store, {
+        sourceId: input.controlSource,
+        targetId: input.controlTarget,
+        verdict: input.controlVerdict,
+        rationale: input.rationale,
+        ...(input.evidence ? { evidence: input.evidence } : {}),
+        ...(input.replaces ? { replaces: input.replaces } : {}),
+      }),
+      contract,
+    );
   }
   if (input.action === "stop") return stateView(await requestRunControl(store, "stop"), contract);
   if (input.action === "pause") return stateView(await requestRunControl(store, "pause"), contract);
