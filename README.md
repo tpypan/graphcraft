@@ -74,7 +74,7 @@ Small localized tasks bypass Graphcraft by default. Pass `--force` when you deli
 
 ## Evidence and scope
 
-The [v0.1 implementation report](docs/V0.1.md) records the acceptance boundary, architecture, tests, real-host dogfood, and known gaps. The [product plan](docs/PLAN.md) remains authoritative for the path to stable. Research and competitive rationale live under [docs/research](docs/research).
+The [v0.1 implementation report](docs/V0.1.md) records the acceptance boundary, architecture, tests, real-host dogfood, and known gaps. The [alpha roadmap](docs/plans/ALPHA_ROADMAP.md) remains authoritative for the current path to stable. Research and competitive rationale live under [docs/research](docs/research).
 
 Graphcraft does not yet claim the stable plan's reliability or 20% token-savings gate. Those require the matched multi-task, dual-host benchmark described in the plan.
 

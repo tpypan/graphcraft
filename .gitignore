@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 .graphcraft/
+/docs/local-plans/
 coverage/
 node_modules/
 *.log
