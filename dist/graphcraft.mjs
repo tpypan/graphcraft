@@ -3409,7 +3409,7 @@ var package_default = {
   ],
   type: "module",
   bin: {
-    graphcraft: "./dist/graphcraft.mjs"
+    graphcraft: "dist/graphcraft.mjs"
   },
   files: [
     "dist/graphcraft.mjs",
