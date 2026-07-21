@@ -16,7 +16,12 @@ if (packageMetadata.publishConfig?.access !== "public") {
   throw new Error("The scoped package must publish with public access");
 }
 
-const { stdout } = await execFileAsync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
+const windows = process.platform === "win32";
+const npmCommand = windows ? (process.env.ComSpec ?? "cmd.exe") : "npm";
+const npmArguments = windows
+  ? ["/d", "/s", "/c", "npm pack --dry-run --json --ignore-scripts"]
+  : ["pack", "--dry-run", "--json", "--ignore-scripts"];
+const { stdout } = await execFileAsync(npmCommand, npmArguments, {
   maxBuffer: 10 * 1024 * 1024,
 });
 const [pack] = JSON.parse(stdout);
