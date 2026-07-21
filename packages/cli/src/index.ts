@@ -10,13 +10,16 @@ import { CodexAdapter } from "@graphcraft/adapter-codex";
 import { ClaudeAdapter } from "@graphcraft/adapter-claude";
 import {
   graphPlanShape,
+  probePlanFromGraph,
   type Graph,
   type HostAdapter,
+  type ProbePlan,
   type RunContract,
   type RunState,
 } from "@graphcraft/core";
 import {
   RunStore,
+  configureRunProbes,
   createRun,
   discoverRepository,
   executeRun,
@@ -115,18 +118,43 @@ export function shouldBypassGraph(task: string): boolean {
   return words <= 8 && !durableSignal;
 }
 
-export function contractView(contract: RunContract, graph?: Graph): Record<string, unknown> {
-  const completionProbes = graph?.nodes.flatMap((node) =>
-    node.completionProbes.map((probe) => ({
-      id: probe.id,
-      kind: probe.kind,
-      ...(probe.kind === "command"
-        ? { command: [probe.command, ...probe.args].join(" "), cwd: probe.cwd ?? "." }
-        : {}),
-      ...(probe.kind === "file" ? { path: probe.path } : {}),
-      ...(probe.kind === "git_diff" ? { baseSha: probe.baseSha } : {}),
-    })),
+function probeView(item: ProbePlan["items"][number]): Record<string, unknown> {
+  const probe = item.probe;
+  return {
+    id: probe.id,
+    purpose: item.purpose,
+    source: item.source,
+    kind: probe.kind,
+    ...(probe.kind === "command"
+      ? {
+          command: [probe.command, ...probe.args].join(" "),
+          cwd: probe.cwd ?? ".",
+          timeoutMs: probe.timeoutMs,
+          platforms: probe.platforms ?? ["all"],
+        }
+      : {}),
+    ...(probe.kind === "file" ? { path: probe.path } : {}),
+    ...(probe.kind === "git_diff" ? { baseSha: probe.baseSha } : {}),
+    ...(probe.kind === "repository_inventory" ? { paths: probe.paths, terms: probe.terms } : {}),
+  };
+}
+
+export function contractView(
+  contract: RunContract,
+  graph?: Graph,
+  inputProbePlan?: ProbePlan,
+): Record<string, unknown> {
+  const hasGraphProbes = graph?.nodes.some(
+    (node) => node.progressProbes.length > 0 || node.completionProbes.length > 0,
   );
+  const probePlan =
+    inputProbePlan ?? (graph && hasGraphProbes ? probePlanFromGraph(graph) : undefined);
+  const completionProbes = probePlan?.items
+    .filter(({ phase }) => phase === "completion")
+    .map((item) => probeView(item));
+  const progressProbes = probePlan?.items
+    .filter(({ phase }) => phase === "progress")
+    .map((item) => probeView(item));
   return {
     runId: contract.runId,
     outcome: contract.outcome,
@@ -140,6 +168,7 @@ export function contractView(contract: RunContract, graph?: Graph): Record<strin
       owner,
     })),
     ...(graph ? { planShape: graphPlanShape(graph) } : {}),
+    ...(progressProbes ? { progressProbes } : {}),
     ...(completionProbes ? { completionProbes } : {}),
     recovery: "Checkpoint after every event; accepted nodes are never repeated",
   };
@@ -160,27 +189,32 @@ export function stateView(state: RunState, contract: RunContract): Record<string
   };
 }
 
-export function renderContract(contract: RunContract, graph: Graph): string {
-  const view = contractView(contract, graph);
+export function renderContract(contract: RunContract, graph: Graph, probePlan?: ProbePlan): string {
+  const view = contractView(contract, graph, probePlan);
   return [
     `Run            ${contract.runId}`,
     `Outcome        ${view.outcome}`,
     `Finish line    ${view.finishLine}`,
     `Repository     ${view.repository}`,
     `Permissions    ${contract.permissions.join(", ")}`,
-    `Proof          ${graph.nodes
-      .flatMap((node) => node.completionProbes.map((probe) => probe.id))
-      .join(", ")}`,
+    `Progress       ${(view.progressProbes as Array<{ id: string }> | undefined)?.map(({ id }) => id).join(", ") ?? "none"}`,
+    `Completion     ${(view.completionProbes as Array<{ id: string }> | undefined)?.map(({ id }) => id).join(", ") ?? "none"}`,
     `Recovery       ${view.recovery}`,
     `Plan           ${view.planShape}`,
   ].join("\n");
 }
 
-export async function askForApproval(contract: RunContract, graph: Graph): Promise<boolean> {
+export async function askForApproval(
+  contract: RunContract,
+  graph: Graph,
+  probePlan?: ProbePlan,
+): Promise<boolean> {
   if (!stdin.isTTY || !stdout.isTTY) return false;
   const prompt = createInterface({ input: stdin, output: stdout });
   try {
-    const answer = await prompt.question(`${renderContract(contract, graph)}\n\nStart? [Y/n] `);
+    const answer = await prompt.question(
+      `${renderContract(contract, graph, probePlan)}\n\nStart? [Y/n] `,
+    );
     return !/^n(?:o)?$/i.test(answer.trim());
   } finally {
     prompt.close();
@@ -201,7 +235,8 @@ export async function storeFor(cwd: string, runReference?: string): Promise<RunS
 }
 
 export interface McpActionInput {
-  action: "run" | "status" | "inspect" | "resume" | "pause" | "stop" | "trace" | "doctor";
+  action:
+    "run" | "status" | "inspect" | "resume" | "pause" | "stop" | "trace" | "probes" | "doctor";
   task?: string | undefined;
   run?: string | undefined;
   repository?: string | undefined;
@@ -209,6 +244,7 @@ export interface McpActionInput {
   approve?: boolean | undefined;
   finishLine?: "local_verified" | "committed" | undefined;
   force?: boolean | undefined;
+  probePlan?: ProbePlan | undefined;
 }
 
 export async function handleAction(input: McpActionInput): Promise<Record<string, unknown>> {
@@ -247,7 +283,10 @@ export async function handleAction(input: McpActionInput): Promise<Record<string
       ...(input.finishLine ? { finishLine: input.finishLine } : {}),
     });
     if (!input.approve)
-      return { approvalRequired: true, contract: contractView(created.contract, created.graph) };
+      return {
+        approvalRequired: true,
+        contract: contractView(created.contract, created.graph, created.probePlan),
+      };
     const state = await executeRun({
       store: created.store,
       adapter,
@@ -257,19 +296,24 @@ export async function handleAction(input: McpActionInput): Promise<Record<string
   }
 
   const store = await storeFor(cwd, input.run);
-  const [contract, graph, state] = await Promise.all([
+  const [contract, graph, state, probePlan] = await Promise.all([
     store.loadContract(),
     store.loadGraph(),
     store.loadState(),
+    store.loadProbePlan(),
   ]);
   if (input.action === "status") return stateView(state, contract);
-  if (input.action === "inspect") return { contract, graph, state };
+  if (input.action === "inspect") return { contract, graph, probePlan, state };
   if (input.action === "trace") return { events: await store.loadEvents() };
+  if (input.action === "probes") {
+    if (!input.probePlan) return { probePlan };
+    return await configureRunProbes(store, input.probePlan);
+  }
   if (input.action === "stop") return stateView(await requestRunControl(store, "stop"), contract);
   if (input.action === "pause") return stateView(await requestRunControl(store, "pause"), contract);
   if (input.action === "resume") {
     if (state.status === "awaiting_approval" && !input.approve) {
-      return { approvalRequired: true, contract: contractView(contract, graph) };
+      return { approvalRequired: true, contract: contractView(contract, graph, probePlan) };
     }
     const resumed = await executeRun({
       store,

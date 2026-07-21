@@ -20,7 +20,7 @@ import type {
   ReconciliationResult,
   WorkerRequest,
 } from "@graphcraft/core";
-import { createRun, executeRun } from "./runner.ts";
+import { configureRunProbes, createRun, executeRun } from "./runner.ts";
 import { requestRunControl } from "./control.ts";
 import { RunLock } from "./lock.ts";
 import { createRunWorkspace, discoverPlanningEvidence } from "./repository.ts";
@@ -271,7 +271,7 @@ describe("durable runtime", () => {
     const state = await executeRun({ store: created.store, adapter, approve: true });
 
     expect(state.status).toBe("completed");
-    expect(state.nodes.investigate?.lastProgress).toBe("learning");
+    expect(state.nodes.investigate?.lastProgress).toBe("done");
     expect(adapter.calls).toEqual(["investigate", "implement"]);
     expect(adapter.requests[1]?.capsule.predecessorEvidence).toEqual([
       "investigate: Completed investigate",
@@ -372,6 +372,54 @@ describe("durable runtime", () => {
     expect(JSON.parse(await readFile(join(created.store.runRoot, "state.json"), "utf8"))).toEqual(
       state,
     );
+  });
+
+  it("persists a validated user-edited probe plan before approval", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    const edited = {
+      ...created.probePlan,
+      items: created.probePlan.items.map((item) =>
+        item.phase === "completion"
+          ? {
+              ...item,
+              source: "User-approved direct acceptance scenario",
+              probe: {
+                id: "fixture-acceptance",
+                kind: "command" as const,
+                command: process.execPath,
+                args: ["verify.mjs"],
+                expectedExitCode: 0,
+                timeoutMs: 30_000,
+                platforms: [process.platform] as Array<"darwin" | "linux" | "win32">,
+              },
+            }
+          : item,
+      ),
+    };
+
+    const configured = await configureRunProbes(created.store, edited);
+    expect(configured.graph.revision).toBe(1);
+    expect(
+      configured.graph.nodes.flatMap(({ completionProbes }) =>
+        completionProbes.map(({ id }) => id),
+      ),
+    ).toEqual(["fixture-acceptance"]);
+    expect((await created.store.loadProbePlan()).items).toEqual(edited.items);
+    expect((await created.store.loadEvents()).at(-1)).toMatchObject({
+      actor: "user",
+      type: "graph.amended",
+      data: { rationale: "User edited the deterministic probe plan before approval" },
+    });
+    await writeFile(join(created.store.runRoot, "graph.json"), "not-json\n");
+    await writeFile(join(created.store.runRoot, "probe-plan.json"), "not-json\n");
+    expect((await created.store.loadGraph()).revision).toBe(1);
+    expect((await created.store.loadProbePlan()).items).toEqual(edited.items);
+
+    await created.store.append("user", "run.approved", { approved: true });
+    await expect(configureRunProbes(created.store, edited)).rejects.toThrow(/before.*approved/);
   });
 
   it("fails closed before creating a workspace when the selected host is not authenticated", async () => {

@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { handleAction } from "@graphcraft/cli";
+import { ProbePlanSchema } from "@graphcraft/core";
 import metadata from "../tool-metadata.json" with { type: "json" };
 
 export function createGraphcraftServer(): McpServer {
@@ -16,7 +17,17 @@ export function createGraphcraftServer(): McpServer {
       title: metadata.title,
       description: metadata.description,
       inputSchema: {
-        action: z.enum(["run", "status", "inspect", "resume", "pause", "stop", "trace", "doctor"]),
+        action: z.enum([
+          "run",
+          "status",
+          "inspect",
+          "resume",
+          "pause",
+          "stop",
+          "trace",
+          "probes",
+          "doctor",
+        ]),
         task: z.string().optional(),
         run: z.string().optional(),
         repository: z.string().optional(),
@@ -24,6 +35,7 @@ export function createGraphcraftServer(): McpServer {
         approve: z.boolean().optional(),
         finishLine: z.enum(["local_verified", "committed"]).optional(),
         force: z.boolean().optional(),
+        probePlan: ProbePlanSchema.optional(),
       },
       outputSchema: { result: z.record(z.string(), z.unknown()) },
     },

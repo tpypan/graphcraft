@@ -1,7 +1,15 @@
-import { access, readFile } from "node:fs/promises";
+import { access, readFile, stat } from "node:fs/promises";
 import { constants } from "node:fs";
-import { resolve } from "node:path";
-import { contentHash, type ProbeResult, type ProbeSpec } from "@graphcraft/core";
+import { dirname, join, resolve, sep } from "node:path";
+import {
+  ProbePlanSchema,
+  classifyTask,
+  contentHash,
+  type ProbePlan,
+  type ProbePlanItem,
+  type ProbeResult,
+  type ProbeSpec,
+} from "@graphcraft/core";
 import { runProcess, type ProcessResult } from "./process.ts";
 
 export interface ExecutedProbe {
@@ -71,6 +79,32 @@ export async function runProbe(
     };
   }
 
+  if (spec.kind === "repository_inventory") {
+    const args = ["grep", "-l", "-I", "-F"];
+    for (const term of spec.terms) args.push("-e", term);
+    args.push("--", ...spec.paths);
+    const inventory = await runProcess("git", args, {
+      cwd: repositoryPath,
+      ...(signal ? { signal } : {}),
+    });
+    const matches = inventory.stdout.split("\n").filter(Boolean);
+    const passed = inventory.exitCode === 0 || inventory.exitCode === 1;
+    const summary = matches.length
+      ? `${matches.length} tracked files match ${spec.terms.join(", ")}: ${matches.slice(0, 20).join(", ")}`
+      : `No tracked files match ${spec.terms.join(", ")}`;
+    return {
+      result: {
+        probeId: spec.id,
+        kind: spec.kind,
+        passed,
+        signature: contentHash({ matches, terms: spec.terms }),
+        summary,
+        durationMs: inventory.durationMs,
+      },
+      output: inventory.stdout,
+    };
+  }
+
   const diff = await runProcess(
     "git",
     ["diff", "--no-ext-diff", "--name-status", spec.baseSha, "--"],
@@ -119,63 +153,318 @@ export async function workspaceDigest(repositoryPath: string): Promise<string> {
   return contentHash({ status: status.stdout, diff: diff.stdout });
 }
 
-export async function discoverVerificationProbes(repositoryPath: string): Promise<ProbeSpec[]> {
-  const probes: ProbeSpec[] = [];
-  try {
-    const packageJson = JSON.parse(await readFile(`${repositoryPath}/package.json`, "utf8")) as {
-      scripts?: Record<string, string>;
+const probeStopWords = new Set([
+  "across",
+  "add",
+  "and",
+  "audit",
+  "bug",
+  "every",
+  "feature",
+  "files",
+  "fix",
+  "from",
+  "implement",
+  "investigate",
+  "migration",
+  "refactor",
+  "repository",
+  "review",
+  "that",
+  "the",
+  "this",
+  "verify",
+  "with",
+]);
+
+function taskTerms(task: string): string[] {
+  const quoted = [...task.matchAll(/[`"']([^`"']{2,40})[`"']/g)].map((match) => match[1]!);
+  const words = task.toLowerCase().match(/[a-z0-9][a-z0-9._/-]{2,}/g) ?? [];
+  return [
+    ...new Set(
+      [...quoted, ...words]
+        .map((value) => value.toLowerCase())
+        .filter((value) => !probeStopWords.has(value)),
+    ),
+  ].slice(0, 10);
+}
+
+function stableId(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 64);
+}
+
+function packageCommand(
+  packageManager: string | undefined,
+  script: string,
+): Pick<Extract<ProbeSpec, { kind: "command" }>, "command" | "args" | "platforms"> {
+  const manager = packageManager?.split("@")[0] ?? "npm";
+  const direct = manager === "pnpm" || manager === "yarn" ? "corepack" : manager;
+  const directArgs = [
+    ...(direct === "corepack" ? [manager] : []),
+    ...(manager === "npm" ? ["run"] : []),
+    script,
+  ];
+  if (process.platform !== "win32") {
+    return { command: direct, args: directArgs, platforms: ["darwin", "linux"] };
+  }
+  return {
+    command: process.env.ComSpec ?? "cmd.exe",
+    args: ["/d", "/s", "/c", [direct, ...directArgs].join(" ")],
+    platforms: ["win32"],
+  };
+}
+
+function familyScriptPurpose(
+  family: ProbePlan["family"],
+  name: string,
+  terms: string[],
+): "focused" | "acceptance" | "regression" | undefined {
+  const normalized = name.toLowerCase();
+  if (!/test|check|lint|typecheck|build|verify|validate|audit/.test(normalized)) return undefined;
+  if (/fix|write|update|generate|deploy|publish|release/.test(normalized)) return undefined;
+  if (terms.some((term) => term.length >= 3 && normalized.includes(stableId(term))))
+    return "focused";
+  if (family === "feature" && /accept|integration|e2e|scenario/.test(normalized))
+    return "acceptance";
+  const matchedFamily =
+    (family === "bug" && /unit|regression|focused/.test(normalized)) ||
+    (family === "migration" && /migrat|upgrade|compat/.test(normalized)) ||
+    (family === "refactor" && /unit|structur|typecheck/.test(normalized)) ||
+    (family === "audit" && /audit|lint|static|typecheck/.test(normalized));
+  if (matchedFamily) return "focused";
+  if (["check", "test", "typecheck", "lint", "build"].includes(normalized)) return "regression";
+  return undefined;
+}
+
+interface Candidate {
+  item: ProbePlanItem;
+  root: boolean;
+}
+
+async function packageCandidates(
+  repositoryPath: string,
+  family: ProbePlan["family"],
+  terms: string[],
+): Promise<Candidate[]> {
+  const tracked = await runProcess("git", ["ls-files"], { cwd: repositoryPath });
+  if (tracked.exitCode !== 0) return [];
+  const manifests = tracked.stdout
+    .split("\n")
+    .filter((path) => path === "package.json" || path.endsWith("/package.json"))
+    .slice(0, 100);
+  const rootManifest = manifests.includes("package.json")
+    ? (JSON.parse(await readFile(join(repositoryPath, "package.json"), "utf8")) as {
+        packageManager?: string;
+      })
+    : undefined;
+  const candidates: Candidate[] = [];
+  for (const manifestPath of manifests) {
+    const manifest = JSON.parse(await readFile(join(repositoryPath, manifestPath), "utf8")) as {
+      name?: string;
       packageManager?: string;
+      scripts?: Record<string, string>;
     };
-    const runner = packageJson.packageManager?.startsWith("pnpm") ? "pnpm" : "npm";
-    const commandArgs = (script: string): string[] =>
-      runner === "pnpm" ? [script] : ["run", script];
-    for (const name of ["typecheck", "test", "build"] as const) {
-      if (packageJson.scripts?.[name]) {
-        const packageArgs = commandArgs(name);
-        const windows = process.platform === "win32";
-        probes.push({
-          id: `package-${name}`,
-          kind: "command",
-          command: windows ? (process.env.ComSpec ?? "cmd.exe") : runner,
-          args: windows ? ["/d", "/s", "/c", `${runner} ${packageArgs.join(" ")}`] : packageArgs,
-          expectedExitCode: 0,
-          timeoutMs: name === "test" ? 300_000 : 180_000,
-        });
-      }
+    const directory = dirname(manifestPath) === "." ? undefined : dirname(manifestPath);
+    const relevant =
+      !directory ||
+      terms.some(
+        (term) =>
+          directory.toLowerCase().includes(term) || manifest.name?.toLowerCase().includes(term),
+      );
+    if (!relevant) continue;
+    for (const name of Object.keys(manifest.scripts ?? {}).sort()) {
+      const purpose = familyScriptPurpose(family, name, terms);
+      if (!purpose) continue;
+      const command = packageCommand(manifest.packageManager ?? rootManifest?.packageManager, name);
+      candidates.push({
+        root: !directory,
+        item: {
+          phase: "completion",
+          purpose,
+          source: `${manifestPath} script ${name}`,
+          probe: {
+            id: stableId(`package-${directory ?? "root"}-${name}`),
+            kind: "command",
+            ...command,
+            ...(directory ? { cwd: directory } : {}),
+            expectedExitCode: 0,
+            timeoutMs: /test|e2e|integration/.test(name) ? 300_000 : 180_000,
+          },
+        },
+      });
     }
-  } catch {
-    // Non-Node repositories continue through language-specific discovery.
+  }
+  return candidates;
+}
+
+function selectPackageCandidates(candidates: Candidate[]): ProbePlanItem[] {
+  const focused = candidates
+    .filter(({ item }) => item.purpose !== "regression")
+    .sort((left, right) => Number(right.root) - Number(left.root))
+    .slice(0, 2)
+    .map(({ item }) => item);
+  const rootCheck = candidates.find(
+    ({ root, item }) => root && item.purpose === "regression" && item.probe.id.endsWith("-check"),
+  );
+  const regression = (
+    rootCheck
+      ? [rootCheck]
+      : candidates.filter(({ item }) => item.purpose === "regression").slice(0, 3)
+  ).map(({ item }) => item);
+  return [...focused, ...regression].filter(
+    (item, index, items) => items.findIndex(({ probe }) => probe.id === item.probe.id) === index,
+  );
+}
+
+function withinRepository(repositoryPath: string, candidate: string): boolean {
+  const root = resolve(repositoryPath);
+  const path = resolve(repositoryPath, candidate);
+  return path === root || path.startsWith(`${root}${sep}`);
+}
+
+export async function validateProbePlan(
+  input: ProbePlan,
+  repositoryPath: string,
+): Promise<ProbePlan> {
+  const plan = ProbePlanSchema.parse(input);
+  if (!plan.items.some(({ phase }) => phase === "completion"))
+    throw new Error("A probe plan must contain at least one completion probe");
+  const keys = new Set<string>();
+  for (const item of plan.items) {
+    const key = `${item.phase}:${item.probe.id}`;
+    if (keys.has(key)) throw new Error(`Duplicate ${item.phase} probe ID ${item.probe.id}`);
+    keys.add(key);
+    if (item.probe.kind === "command") {
+      if (item.probe.timeoutMs > 1_800_000)
+        throw new Error(`Probe ${item.probe.id} exceeds the 30 minute timeout limit`);
+      if (item.probe.platforms && !item.probe.platforms.includes(process.platform as never))
+        throw new Error(`Probe ${item.probe.id} does not support ${process.platform}`);
+      const cwd = item.probe.cwd ?? ".";
+      if (!withinRepository(repositoryPath, cwd))
+        throw new Error(`Probe ${item.probe.id} escapes the repository working directory`);
+      const directory = await stat(resolve(repositoryPath, cwd)).catch(() => undefined);
+      if (!directory?.isDirectory())
+        throw new Error(`Probe ${item.probe.id} uses missing working directory ${cwd}`);
+    }
+    if (item.probe.kind === "file" && !withinRepository(repositoryPath, item.probe.path)) {
+      throw new Error(`Probe ${item.probe.id} escapes the repository`);
+    }
+    if (
+      item.probe.kind === "repository_inventory" &&
+      item.probe.paths.some((path) => !withinRepository(repositoryPath, path))
+    ) {
+      throw new Error(`Probe ${item.probe.id} escapes the repository inventory scope`);
+    }
+  }
+  return plan;
+}
+
+export async function discoverProbePlan(
+  repositoryPath: string,
+  task: string,
+  baseSha: string,
+): Promise<ProbePlan> {
+  const family = classifyTask(task);
+  const terms = taskTerms(task);
+  const inventoryTerms = terms.length ? terms : [family];
+  const inventory: Extract<ProbeSpec, { kind: "repository_inventory" }> = {
+    id: `${family}-task-inventory`,
+    kind: "repository_inventory",
+    paths: ["."],
+    terms: inventoryTerms,
+  };
+  const items: ProbePlanItem[] = [
+    {
+      phase: "progress",
+      purpose: "inventory",
+      source: "Task terms matched against tracked repository files",
+      probe: inventory,
+    },
+    {
+      phase: "progress",
+      purpose: "focused",
+      source: "Approved base SHA workspace delta",
+      probe: {
+        id: "workspace-diff",
+        kind: "git_diff",
+        baseSha,
+        requireChanges: family !== "audit",
+      },
+    },
+  ];
+
+  const selected = selectPackageCandidates(
+    await packageCandidates(repositoryPath, family, inventoryTerms),
+  );
+  for (const completion of selected) {
+    if (completion.purpose !== "regression") items.push({ ...completion, phase: "progress" });
+    items.push(completion);
   }
 
   try {
-    await access(`${repositoryPath}/pyproject.toml`);
-    probes.push({
-      id: "python-tests",
-      kind: "command",
-      command: "python",
-      args: ["-m", "pytest", "-q"],
-      expectedExitCode: 0,
-      timeoutMs: 300_000,
+    await access(join(repositoryPath, "pyproject.toml"));
+    items.push({
+      phase: "completion",
+      purpose: "regression",
+      source: "pyproject.toml",
+      probe: {
+        id: "python-tests",
+        kind: "command",
+        command: "python",
+        args: ["-m", "pytest", "-q"],
+        expectedExitCode: 0,
+        timeoutMs: 300_000,
+        platforms: ["darwin", "linux", "win32"],
+      },
     });
   } catch {
     // Not a Python repository.
   }
 
   try {
-    await access(`${repositoryPath}/go.mod`);
-    probes.push({
-      id: "go-tests",
-      kind: "command",
-      command: "go",
-      args: ["test", "./..."],
-      expectedExitCode: 0,
-      timeoutMs: 300_000,
+    await access(join(repositoryPath, "go.mod"));
+    items.push({
+      phase: "completion",
+      purpose: "regression",
+      source: "go.mod",
+      probe: {
+        id: "go-tests",
+        kind: "command",
+        command: "go",
+        args: ["test", "./..."],
+        expectedExitCode: 0,
+        timeoutMs: 300_000,
+        platforms: ["darwin", "linux", "win32"],
+      },
     });
   } catch {
     // Not a Go repository.
   }
 
-  return probes;
+  if (family === "audit" || !items.some(({ phase }) => phase === "completion")) {
+    items.push({
+      phase: "completion",
+      purpose: "inventory",
+      source: "Task-term coverage across tracked repository files",
+      probe: inventory,
+    });
+  }
+
+  return await validateProbePlan({ schemaVersion: 1, family, items }, repositoryPath);
+}
+
+export async function discoverVerificationProbes(repositoryPath: string): Promise<ProbeSpec[]> {
+  const head = await runProcess("git", ["rev-parse", "HEAD"], { cwd: repositoryPath });
+  const plan = await discoverProbePlan(
+    repositoryPath,
+    "Verify the repository with its declared checks",
+    head.stdout.trim() || "HEAD",
+  );
+  return plan.items.filter(({ phase }) => phase === "completion").map(({ probe }) => probe);
 }
 
 export { runProcess, type ProcessResult } from "./process.ts";

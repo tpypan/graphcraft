@@ -3,13 +3,16 @@ import { dirname, join } from "node:path";
 import {
   GraphSchema,
   HostEventSchema,
+  ProbePlanSchema,
   RunContractSchema,
   RunEventSchema,
   RunStateSchema,
   createRunEvent,
+  probePlanFromGraph,
   reduceEvents,
   type Graph,
   type HostEvent,
+  type ProbePlan,
   type RunContract,
   type RunEvent,
   type RunState,
@@ -33,21 +36,27 @@ export class RunStore {
     repositoryRoot: string,
     contract: RunContract,
     graph: Graph,
+    inputProbePlan?: ProbePlan,
   ): Promise<RunStore> {
     const store = new RunStore(repositoryRoot, contract.runId);
+    const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
     await Promise.all([
       mkdir(join(store.runRoot, "artifacts"), { recursive: true }),
       mkdir(join(store.runRoot, "capsules"), { recursive: true }),
       mkdir(join(store.runRoot, "reports"), { recursive: true }),
       mkdir(join(store.graphcraftRoot, "locks"), { recursive: true }),
     ]);
-    await Promise.all([store.saveContract(contract), store.saveGraph(graph)]);
+    await Promise.all([
+      store.saveContract(contract),
+      store.saveGraph(graph),
+      store.saveProbePlan(probePlan),
+    ]);
     const event = createRunEvent({
       sequence: 1,
       actor: "runtime",
       causationId: contract.runId,
       type: "run.created",
-      data: { contract, graph, nodeIds: graph.nodes.map(({ id }) => id) },
+      data: { contract, graph, probePlan, nodeIds: graph.nodes.map(({ id }) => id) },
     });
     await writeFile(store.eventsPath(), `${JSON.stringify(event)}\n`, {
       encoding: "utf8",
@@ -76,7 +85,48 @@ export class RunStore {
   }
 
   async loadGraph(): Promise<Graph> {
+    const events = await this.loadEvents();
+    const eventGraph = events.findLast(
+      (event) =>
+        (event.type === "run.created" || event.type === "graph.amended") && event.data.graph,
+    )?.data.graph;
+    if (eventGraph) {
+      const graph = GraphSchema.parse(eventGraph);
+      const materialized = await readFile(join(this.runRoot, "graph.json"), "utf8")
+        .then((value) => GraphSchema.parse(JSON.parse(value)))
+        .catch(() => undefined);
+      if (JSON.stringify(materialized) !== JSON.stringify(graph)) await this.saveGraph(graph);
+      return graph;
+    }
     return GraphSchema.parse(JSON.parse(await readFile(join(this.runRoot, "graph.json"), "utf8")));
+  }
+
+  async saveProbePlan(probePlan: ProbePlan): Promise<void> {
+    await writeJsonAtomic(join(this.runRoot, "probe-plan.json"), ProbePlanSchema.parse(probePlan));
+  }
+
+  async loadProbePlan(): Promise<ProbePlan> {
+    const events = await this.loadEvents();
+    const eventPlan = events.findLast(
+      (event) =>
+        (event.type === "run.created" || event.type === "graph.amended") && event.data.probePlan,
+    )?.data.probePlan;
+    if (eventPlan) {
+      const probePlan = ProbePlanSchema.parse(eventPlan);
+      const materialized = await readFile(join(this.runRoot, "probe-plan.json"), "utf8")
+        .then((value) => ProbePlanSchema.parse(JSON.parse(value)))
+        .catch(() => undefined);
+      if (JSON.stringify(materialized) !== JSON.stringify(probePlan))
+        await this.saveProbePlan(probePlan);
+      return probePlan;
+    }
+    try {
+      return ProbePlanSchema.parse(
+        JSON.parse(await readFile(join(this.runRoot, "probe-plan.json"), "utf8")),
+      );
+    } catch {
+      return probePlanFromGraph(await this.loadGraph());
+    }
   }
 
   async loadEvents(): Promise<RunEvent[]> {
@@ -121,11 +171,16 @@ export class RunStore {
     const events = await this.loadEvents();
     const createdGraph = GraphSchema.parse(events[0]?.data.graph);
     let graph = createdGraph;
+    let probePlan = events[0]?.data.probePlan
+      ? ProbePlanSchema.parse(events[0].data.probePlan)
+      : probePlanFromGraph(createdGraph);
     for (const event of events) {
-      if (event.type === "graph.amended" && event.data.graph)
+      if (event.type === "graph.amended" && event.data.graph) {
         graph = GraphSchema.parse(event.data.graph);
+        if (event.data.probePlan) probePlan = ProbePlanSchema.parse(event.data.probePlan);
+      }
     }
-    await this.saveGraph(graph);
+    await Promise.all([this.saveGraph(graph), this.saveProbePlan(probePlan)]);
     return await this.materialize(events);
   }
 

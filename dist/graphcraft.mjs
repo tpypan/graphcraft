@@ -3373,13 +3373,16 @@ function useColor() {
 // node_modules/.pnpm/commander@15.0.0/node_modules/commander/index.js
 var program = new Command();
 
+// packages/cli/src/bin.ts
+import { readFile as readFile6 } from "node:fs/promises";
+
 // packages/cli/src/index.ts
 import { createInterface as createInterface3 } from "node:readline/promises";
 import { spawn as spawn4 } from "node:child_process";
 import { access as access2, chmod, copyFile, mkdir as mkdir5 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname as dirname5, join as join6, resolve as resolve3 } from "node:path";
+import { dirname as dirname6, join as join7, resolve as resolve3 } from "node:path";
 import { stdin, stdout } from "node:process";
 
 // package.json
@@ -18057,7 +18060,8 @@ var CommandProbeSchema = external_exports.strictObject({
   args: external_exports.array(external_exports.string()).default([]),
   cwd: external_exports.string().optional(),
   expectedExitCode: external_exports.number().int().default(0),
-  timeoutMs: external_exports.number().int().positive().default(12e4)
+  timeoutMs: external_exports.number().int().positive().default(12e4),
+  platforms: external_exports.array(external_exports.enum(["darwin", "linux", "win32"])).min(1).optional()
 });
 var FileProbeSchema = external_exports.strictObject({
   id: external_exports.string().min(1),
@@ -18072,14 +18076,32 @@ var GitDiffProbeSchema = external_exports.strictObject({
   baseSha: external_exports.string().min(1),
   requireChanges: external_exports.boolean().default(true)
 });
+var RepositoryInventoryProbeSchema = external_exports.strictObject({
+  id: external_exports.string().min(1),
+  kind: external_exports.literal("repository_inventory"),
+  paths: external_exports.array(external_exports.string().min(1)).min(1),
+  terms: external_exports.array(external_exports.string().min(1)).min(1)
+});
 var ProbeSpecSchema = external_exports.discriminatedUnion("kind", [
   CommandProbeSchema,
   FileProbeSchema,
-  GitDiffProbeSchema
+  GitDiffProbeSchema,
+  RepositoryInventoryProbeSchema
 ]);
+var ProbePlanItemSchema = external_exports.strictObject({
+  phase: external_exports.enum(["progress", "completion"]),
+  purpose: external_exports.enum(["inventory", "focused", "acceptance", "regression"]),
+  source: external_exports.string().min(1),
+  probe: ProbeSpecSchema
+});
+var ProbePlanSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  family: external_exports.enum(["bug", "feature", "migration", "refactor", "audit"]),
+  items: external_exports.array(ProbePlanItemSchema).min(1)
+});
 var ProbeResultSchema = external_exports.strictObject({
   probeId: external_exports.string().min(1),
-  kind: external_exports.enum(["command", "file", "git_diff"]),
+  kind: external_exports.enum(["command", "file", "git_diff", "repository_inventory"]),
   passed: external_exports.boolean(),
   signature: external_exports.string().min(1),
   summary: external_exports.string(),
@@ -18469,7 +18491,24 @@ function patternWithin(candidate, boundary) {
   const prefix = normalizedBoundary.slice(0, -3).replace(/\/$/, "");
   return normalizedCandidate === prefix || normalizedCandidate.startsWith(`${prefix}/`);
 }
-function validatePlannedGraphPolicy(graph, contract, requiredVerificationProbes) {
+function sameProbe(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+function validateProbePolicy(probe, contract, approvedProbes) {
+  if (probe.kind === "git_diff" && probe.baseSha !== contract.repository.baseSha)
+    throw new Error(`Probe ${probe.id} is not bound to the approved base SHA`);
+  if (probe.kind === "file" && !safeRelativePattern(probe.path))
+    throw new Error(`Probe ${probe.id} contains an unsafe file path`);
+  if (probe.kind === "command" && probe.cwd && !safeRelativePattern(probe.cwd))
+    throw new Error(`Probe ${probe.id} contains an unsafe working directory`);
+  if (probe.kind === "repository_inventory" && probe.paths.some((path2) => !safeRelativePattern(path2))) {
+    throw new Error(`Probe ${probe.id} contains an unsafe inventory path`);
+  }
+  if ((probe.kind === "command" || probe.kind === "repository_inventory") && !approvedProbes.some((allowed) => sameProbe(allowed, probe))) {
+    throw new Error(`Probe ${probe.id} is not an approved deterministic probe`);
+  }
+}
+function validatePlannedGraphPolicy(graph, contract, requiredVerificationProbes, approvedProbes = requiredVerificationProbes) {
   if (graph.family !== classifyTask(contract.task))
     throw new Error("The planned graph changed the runtime-selected task family");
   const terminalNodes = graph.nodes.filter(
@@ -18497,9 +18536,7 @@ function validatePlannedGraphPolicy(graph, contract, requiredVerificationProbes)
   if (!finalVerification || finalVerification.completionProbes.length === 0)
     throw new Error("The terminal verification node must contain executable completion probes");
   for (const required2 of requiredVerificationProbes) {
-    if (!finalVerification.completionProbes.some(
-      (candidate) => JSON.stringify(candidate) === JSON.stringify(required2)
-    )) {
+    if (!finalVerification.completionProbes.some((candidate) => sameProbe(candidate, required2))) {
       throw new Error(`The planned graph omitted required verification probe ${required2.id}`);
     }
   }
@@ -18540,24 +18577,14 @@ function validatePlannedGraphPolicy(graph, contract, requiredVerificationProbes)
     if (item.kind !== "verification" && item.completionProbes.length > 0)
       throw new Error(`Only verification nodes may contain completion probes`);
     for (const probe of [...item.progressProbes, ...item.completionProbes]) {
-      if (probe.kind === "git_diff" && probe.baseSha !== contract.repository.baseSha)
-        throw new Error(`Probe ${probe.id} is not bound to the approved base SHA`);
-      if (probe.kind === "file" && !safeRelativePattern(probe.path))
-        throw new Error(`Probe ${probe.id} contains an unsafe file path`);
-      if (probe.kind === "command" && probe.cwd && !safeRelativePattern(probe.cwd))
-        throw new Error(`Probe ${probe.id} contains an unsafe working directory`);
-      if (probe.kind === "command" && !requiredVerificationProbes.some(
-        (allowed) => allowed.kind === "command" && JSON.stringify(allowed) === JSON.stringify(probe)
-      )) {
-        throw new Error(`Probe ${probe.id} is not an approved repository command`);
-      }
+      validateProbePolicy(probe, contract, approvedProbes);
     }
   }
   if (graph.family !== "audit" && !graph.nodes.some((candidate) => candidate.sideEffectClass === "workspace_write")) {
     throw new Error("A write-capable task plan must contain a workspace-write node");
   }
 }
-function compilePlannedGraph(contract, plan, requiredVerificationProbes) {
+function compilePlannedGraph(contract, plan, requiredVerificationProbes, approvedProbes = requiredVerificationProbes) {
   const parsedPlan = GraphPlanSchema.parse(plan);
   const graph = GraphSchema.parse({
     schemaVersion: 1,
@@ -18580,8 +18607,64 @@ function compilePlannedGraph(contract, plan, requiredVerificationProbes) {
     revision: 0
   });
   validateGraph(graph);
-  validatePlannedGraphPolicy(graph, contract, requiredVerificationProbes);
+  validatePlannedGraphPolicy(graph, contract, requiredVerificationProbes, approvedProbes);
   return graph;
+}
+function verificationNode(graph) {
+  const terminal = graph.nodes.find(
+    (candidate) => !graph.nodes.some((other) => other.dependsOn.includes(candidate.id))
+  );
+  const verification = terminal?.kind === "verification" ? terminal : graph.nodes.find(
+    (candidate) => candidate.kind === "verification" && terminal?.dependsOn.includes(candidate.id)
+  );
+  if (!verification) throw new Error("The graph has no finish-line verification node");
+  return verification;
+}
+function applyProbePlan(graph, contract, input) {
+  const plan = ProbePlanSchema.parse(input);
+  if (plan.family !== graph.family || plan.family !== classifyTask(contract.task))
+    throw new Error("The probe plan does not match the runtime-selected task family");
+  const completion = plan.items.filter(({ phase }) => phase === "completion");
+  if (completion.length === 0) throw new Error("A probe plan must contain completion evidence");
+  const targetVerificationId = verificationNode(graph).id;
+  const nodes = graph.nodes.map((item) => ({
+    ...item,
+    progressProbes: [],
+    completionProbes: item.id === targetVerificationId ? completion.map(({ probe }) => probe) : []
+  }));
+  for (const item of plan.items.filter(({ phase }) => phase === "progress")) {
+    const preferred = item.purpose === "inventory" ? nodes.find((node2) => ["investigation", "decision", "diagnostic"].includes(node2.kind)) : nodes.find((node2) => node2.sideEffectClass === "workspace_write");
+    const target = preferred ?? nodes.find((node2) => !["verification", "commit"].includes(node2.kind));
+    if (!target) throw new Error(`No executable node can own progress probe ${item.probe.id}`);
+    target.progressProbes.push(item.probe);
+  }
+  const updated = GraphSchema.parse({ ...graph, nodes });
+  const approved = plan.items.map(({ probe }) => probe);
+  for (const item of updated.nodes)
+    for (const probe of [...item.progressProbes, ...item.completionProbes])
+      validateProbePolicy(probe, contract, approved);
+  validateGraph(updated);
+  return updated;
+}
+function probePlanFromGraph(graph) {
+  return ProbePlanSchema.parse({
+    schemaVersion: 1,
+    family: graph.family,
+    items: graph.nodes.flatMap((node2) => [
+      ...node2.progressProbes.map((probe) => ({
+        phase: "progress",
+        purpose: probe.kind === "repository_inventory" ? "inventory" : "focused",
+        source: `Recovered from graph node ${node2.id}`,
+        probe
+      })),
+      ...node2.completionProbes.map((probe) => ({
+        phase: "completion",
+        purpose: "regression",
+        source: `Recovered from graph node ${node2.id}`,
+        probe
+      }))
+    ])
+  });
 }
 function validateGraph(graph) {
   GraphSchema.parse(graph);
@@ -18684,17 +18767,16 @@ function renderPlannerPrompt(request) {
     "A node may select predecessorResults only from its direct dependsOn list; do not repeat transitive predecessors.",
     "Select at least one existing tracked repository path for every non-commit node. Every relevantPaths value must be copied exactly from repositoryEvidence.trackedPaths; relevant paths are evidence inputs, not files the worker might create.",
     "Investigation, decision, and verification nodes must use sideEffectClass none. Implementation and repair/diagnostic nodes that edit files use workspace_write. Commit nodes alone use git_commit.",
-    "Do not weaken or replace the supplied verification probes; assign them to the terminal verification node.",
+    "Use the supplied probe plan exactly: assign completion probes to the terminal verification node and progress probes to the node where they measure change.",
     "Only the terminal verification node may contain completionProbes. Every other node must have an empty completionProbes array.",
-    "Put evidence used to measure implementation, investigation, or diagnostic progress in progressProbes, including base-SHA-bound Git diff probes.",
-    "Do not invent command probes. You may add task-specific file and base-SHA-bound Git diff probes.",
+    "Do not invent, weaken, omit, or replace probes. Graphcraft will deterministically reattach the approved probe plan after validating the topology.",
     "Keep node IDs short, stable, lowercase, and unique. Return only the required structured plan.",
     "",
     canonicalJson({
       contract: request.contract,
       taskFamily: classifyTask(request.contract.task),
       repositoryEvidence: request.repositoryEvidence,
-      discoveredVerificationProbes: request.verificationProbes
+      probePlan: request.probePlan
     })
   ].join("\n");
 }
@@ -19665,12 +19747,12 @@ async function requestRunControl(store, action, reason = action === "pause" ? "P
 
 // packages/runtime/src/repository.ts
 import { appendFile, mkdir as mkdir3, readFile as readFile4 } from "node:fs/promises";
-import { basename, dirname as dirname3, isAbsolute as isAbsolute2, join as join3, resolve as resolve2 } from "node:path";
+import { basename, dirname as dirname4, isAbsolute as isAbsolute2, join as join4, resolve as resolve2 } from "node:path";
 
 // packages/probes/src/index.ts
-import { access, readFile as readFile3 } from "node:fs/promises";
+import { access, readFile as readFile3, stat as stat2 } from "node:fs/promises";
 import { constants } from "node:fs";
-import { resolve } from "node:path";
+import { dirname as dirname3, join as join3, resolve, sep } from "node:path";
 
 // packages/probes/src/process.ts
 import { spawn as spawn3 } from "node:child_process";
@@ -19775,6 +19857,29 @@ async function runProbe(spec, repositoryPath, signal) {
       output: summary
     };
   }
+  if (spec.kind === "repository_inventory") {
+    const args = ["grep", "-l", "-I", "-F"];
+    for (const term of spec.terms) args.push("-e", term);
+    args.push("--", ...spec.paths);
+    const inventory = await runProcess("git", args, {
+      cwd: repositoryPath,
+      ...signal ? { signal } : {}
+    });
+    const matches = inventory.stdout.split("\n").filter(Boolean);
+    const passed2 = inventory.exitCode === 0 || inventory.exitCode === 1;
+    const summary = matches.length ? `${matches.length} tracked files match ${spec.terms.join(", ")}: ${matches.slice(0, 20).join(", ")}` : `No tracked files match ${spec.terms.join(", ")}`;
+    return {
+      result: {
+        probeId: spec.id,
+        kind: spec.kind,
+        passed: passed2,
+        signature: contentHash({ matches, terms: spec.terms }),
+        summary,
+        durationMs: inventory.durationMs
+      },
+      output: inventory.stdout
+    };
+  }
   const diff = await runProcess(
     "git",
     ["diff", "--no-ext-diff", "--name-status", spec.baseSha, "--"],
@@ -19815,53 +19920,234 @@ async function workspaceDigest(repositoryPath) {
     throw new Error("Unable to capture repository state");
   return contentHash({ status: status.stdout, diff: diff.stdout });
 }
-async function discoverVerificationProbes(repositoryPath) {
-  const probes = [];
-  try {
-    const packageJson = JSON.parse(await readFile3(`${repositoryPath}/package.json`, "utf8"));
-    const runner = packageJson.packageManager?.startsWith("pnpm") ? "pnpm" : "npm";
-    const commandArgs = (script) => runner === "pnpm" ? [script] : ["run", script];
-    for (const name of ["typecheck", "test", "build"]) {
-      if (packageJson.scripts?.[name]) {
-        const packageArgs = commandArgs(name);
-        const windows = process.platform === "win32";
-        probes.push({
-          id: `package-${name}`,
-          kind: "command",
-          command: windows ? process.env.ComSpec ?? "cmd.exe" : runner,
-          args: windows ? ["/d", "/s", "/c", `${runner} ${packageArgs.join(" ")}`] : packageArgs,
-          expectedExitCode: 0,
-          timeoutMs: name === "test" ? 3e5 : 18e4
-        });
+var probeStopWords = /* @__PURE__ */ new Set([
+  "across",
+  "add",
+  "and",
+  "audit",
+  "bug",
+  "every",
+  "feature",
+  "files",
+  "fix",
+  "from",
+  "implement",
+  "investigate",
+  "migration",
+  "refactor",
+  "repository",
+  "review",
+  "that",
+  "the",
+  "this",
+  "verify",
+  "with"
+]);
+function taskTerms(task) {
+  const quoted = [...task.matchAll(/[`"']([^`"']{2,40})[`"']/g)].map((match) => match[1]);
+  const words = task.toLowerCase().match(/[a-z0-9][a-z0-9._/-]{2,}/g) ?? [];
+  return [
+    ...new Set(
+      [...quoted, ...words].map((value) => value.toLowerCase()).filter((value) => !probeStopWords.has(value))
+    )
+  ].slice(0, 10);
+}
+function stableId(value) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 64);
+}
+function packageCommand(packageManager, script) {
+  const manager = packageManager?.split("@")[0] ?? "npm";
+  const direct = manager === "pnpm" || manager === "yarn" ? "corepack" : manager;
+  const directArgs = [
+    ...direct === "corepack" ? [manager] : [],
+    ...manager === "npm" ? ["run"] : [],
+    script
+  ];
+  if (process.platform !== "win32") {
+    return { command: direct, args: directArgs, platforms: ["darwin", "linux"] };
+  }
+  return {
+    command: process.env.ComSpec ?? "cmd.exe",
+    args: ["/d", "/s", "/c", [direct, ...directArgs].join(" ")],
+    platforms: ["win32"]
+  };
+}
+function familyScriptPurpose(family, name, terms) {
+  const normalized = name.toLowerCase();
+  if (!/test|check|lint|typecheck|build|verify|validate|audit/.test(normalized)) return void 0;
+  if (/fix|write|update|generate|deploy|publish|release/.test(normalized)) return void 0;
+  if (terms.some((term) => term.length >= 3 && normalized.includes(stableId(term))))
+    return "focused";
+  if (family === "feature" && /accept|integration|e2e|scenario/.test(normalized))
+    return "acceptance";
+  const matchedFamily = family === "bug" && /unit|regression|focused/.test(normalized) || family === "migration" && /migrat|upgrade|compat/.test(normalized) || family === "refactor" && /unit|structur|typecheck/.test(normalized) || family === "audit" && /audit|lint|static|typecheck/.test(normalized);
+  if (matchedFamily) return "focused";
+  if (["check", "test", "typecheck", "lint", "build"].includes(normalized)) return "regression";
+  return void 0;
+}
+async function packageCandidates(repositoryPath, family, terms) {
+  const tracked = await runProcess("git", ["ls-files"], { cwd: repositoryPath });
+  if (tracked.exitCode !== 0) return [];
+  const manifests = tracked.stdout.split("\n").filter((path2) => path2 === "package.json" || path2.endsWith("/package.json")).slice(0, 100);
+  const rootManifest = manifests.includes("package.json") ? JSON.parse(await readFile3(join3(repositoryPath, "package.json"), "utf8")) : void 0;
+  const candidates = [];
+  for (const manifestPath of manifests) {
+    const manifest = JSON.parse(await readFile3(join3(repositoryPath, manifestPath), "utf8"));
+    const directory = dirname3(manifestPath) === "." ? void 0 : dirname3(manifestPath);
+    const relevant = !directory || terms.some(
+      (term) => directory.toLowerCase().includes(term) || manifest.name?.toLowerCase().includes(term)
+    );
+    if (!relevant) continue;
+    for (const name of Object.keys(manifest.scripts ?? {}).sort()) {
+      const purpose = familyScriptPurpose(family, name, terms);
+      if (!purpose) continue;
+      const command = packageCommand(manifest.packageManager ?? rootManifest?.packageManager, name);
+      candidates.push({
+        root: !directory,
+        item: {
+          phase: "completion",
+          purpose,
+          source: `${manifestPath} script ${name}`,
+          probe: {
+            id: stableId(`package-${directory ?? "root"}-${name}`),
+            kind: "command",
+            ...command,
+            ...directory ? { cwd: directory } : {},
+            expectedExitCode: 0,
+            timeoutMs: /test|e2e|integration/.test(name) ? 3e5 : 18e4
+          }
+        }
+      });
+    }
+  }
+  return candidates;
+}
+function selectPackageCandidates(candidates) {
+  const focused = candidates.filter(({ item }) => item.purpose !== "regression").sort((left, right) => Number(right.root) - Number(left.root)).slice(0, 2).map(({ item }) => item);
+  const rootCheck = candidates.find(
+    ({ root, item }) => root && item.purpose === "regression" && item.probe.id.endsWith("-check")
+  );
+  const regression = (rootCheck ? [rootCheck] : candidates.filter(({ item }) => item.purpose === "regression").slice(0, 3)).map(({ item }) => item);
+  return [...focused, ...regression].filter(
+    (item, index, items) => items.findIndex(({ probe }) => probe.id === item.probe.id) === index
+  );
+}
+function withinRepository(repositoryPath, candidate) {
+  const root = resolve(repositoryPath);
+  const path2 = resolve(repositoryPath, candidate);
+  return path2 === root || path2.startsWith(`${root}${sep}`);
+}
+async function validateProbePlan(input, repositoryPath) {
+  const plan = ProbePlanSchema.parse(input);
+  if (!plan.items.some(({ phase }) => phase === "completion"))
+    throw new Error("A probe plan must contain at least one completion probe");
+  const keys = /* @__PURE__ */ new Set();
+  for (const item of plan.items) {
+    const key = `${item.phase}:${item.probe.id}`;
+    if (keys.has(key)) throw new Error(`Duplicate ${item.phase} probe ID ${item.probe.id}`);
+    keys.add(key);
+    if (item.probe.kind === "command") {
+      if (item.probe.timeoutMs > 18e5)
+        throw new Error(`Probe ${item.probe.id} exceeds the 30 minute timeout limit`);
+      if (item.probe.platforms && !item.probe.platforms.includes(process.platform))
+        throw new Error(`Probe ${item.probe.id} does not support ${process.platform}`);
+      const cwd = item.probe.cwd ?? ".";
+      if (!withinRepository(repositoryPath, cwd))
+        throw new Error(`Probe ${item.probe.id} escapes the repository working directory`);
+      const directory = await stat2(resolve(repositoryPath, cwd)).catch(() => void 0);
+      if (!directory?.isDirectory())
+        throw new Error(`Probe ${item.probe.id} uses missing working directory ${cwd}`);
+    }
+    if (item.probe.kind === "file" && !withinRepository(repositoryPath, item.probe.path)) {
+      throw new Error(`Probe ${item.probe.id} escapes the repository`);
+    }
+    if (item.probe.kind === "repository_inventory" && item.probe.paths.some((path2) => !withinRepository(repositoryPath, path2))) {
+      throw new Error(`Probe ${item.probe.id} escapes the repository inventory scope`);
+    }
+  }
+  return plan;
+}
+async function discoverProbePlan(repositoryPath, task, baseSha) {
+  const family = classifyTask(task);
+  const terms = taskTerms(task);
+  const inventoryTerms = terms.length ? terms : [family];
+  const inventory = {
+    id: `${family}-task-inventory`,
+    kind: "repository_inventory",
+    paths: ["."],
+    terms: inventoryTerms
+  };
+  const items = [
+    {
+      phase: "progress",
+      purpose: "inventory",
+      source: "Task terms matched against tracked repository files",
+      probe: inventory
+    },
+    {
+      phase: "progress",
+      purpose: "focused",
+      source: "Approved base SHA workspace delta",
+      probe: {
+        id: "workspace-diff",
+        kind: "git_diff",
+        baseSha,
+        requireChanges: family !== "audit"
       }
     }
-  } catch {
+  ];
+  const selected = selectPackageCandidates(
+    await packageCandidates(repositoryPath, family, inventoryTerms)
+  );
+  for (const completion of selected) {
+    if (completion.purpose !== "regression") items.push({ ...completion, phase: "progress" });
+    items.push(completion);
   }
   try {
-    await access(`${repositoryPath}/pyproject.toml`);
-    probes.push({
-      id: "python-tests",
-      kind: "command",
-      command: "python",
-      args: ["-m", "pytest", "-q"],
-      expectedExitCode: 0,
-      timeoutMs: 3e5
+    await access(join3(repositoryPath, "pyproject.toml"));
+    items.push({
+      phase: "completion",
+      purpose: "regression",
+      source: "pyproject.toml",
+      probe: {
+        id: "python-tests",
+        kind: "command",
+        command: "python",
+        args: ["-m", "pytest", "-q"],
+        expectedExitCode: 0,
+        timeoutMs: 3e5,
+        platforms: ["darwin", "linux", "win32"]
+      }
     });
   } catch {
   }
   try {
-    await access(`${repositoryPath}/go.mod`);
-    probes.push({
-      id: "go-tests",
-      kind: "command",
-      command: "go",
-      args: ["test", "./..."],
-      expectedExitCode: 0,
-      timeoutMs: 3e5
+    await access(join3(repositoryPath, "go.mod"));
+    items.push({
+      phase: "completion",
+      purpose: "regression",
+      source: "go.mod",
+      probe: {
+        id: "go-tests",
+        kind: "command",
+        command: "go",
+        args: ["test", "./..."],
+        expectedExitCode: 0,
+        timeoutMs: 3e5,
+        platforms: ["darwin", "linux", "win32"]
+      }
     });
   } catch {
   }
-  return probes;
+  if (family === "audit" || !items.some(({ phase }) => phase === "completion")) {
+    items.push({
+      phase: "completion",
+      purpose: "inventory",
+      source: "Task-term coverage across tracked repository files",
+      probe: inventory
+    });
+  }
+  return await validateProbePlan({ schemaVersion: 1, family, items }, repositoryPath);
 }
 
 // packages/runtime/src/repository.ts
@@ -19963,7 +20249,7 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
   ) : [];
   const taskMatches = await Promise.all(
     matchedPaths.map(async (path2) => {
-      const content = await readFile4(join3(repositoryRoot, path2), "utf8").catch(() => "");
+      const content = await readFile4(join4(repositoryRoot, path2), "utf8").catch(() => "");
       const normalized = content.toLowerCase();
       const score = searchTerms.filter((term) => normalized.includes(term)).length;
       const pathScore = searchTerms.filter((term) => path2.toLowerCase().includes(term)).length;
@@ -19988,7 +20274,7 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
   for (const path2 of baselinePaths) {
     if (remainingCharacters <= 0 || files.length >= 7) break;
     if (files.some((file2) => file2.path === path2)) continue;
-    const content = await readFile4(join3(repositoryRoot, path2), "utf8").catch(() => "");
+    const content = await readFile4(join4(repositoryRoot, path2), "utf8").catch(() => "");
     const limit = Math.min(2e3, remainingCharacters);
     const selected = content.slice(0, limit);
     files.push({ path: path2, content: selected, truncated: selected.length < content.length });
@@ -20009,7 +20295,7 @@ async function ensureGraphcraftIgnored(repositoryRoot) {
   try {
     content = await readFile4(excludePath, "utf8");
   } catch {
-    await mkdir3(dirname3(excludePath), { recursive: true });
+    await mkdir3(dirname4(excludePath), { recursive: true });
   }
   if (!content.split("\n").includes(".graphcraft/"))
     await appendFile(excludePath, "\n.graphcraft/\n", "utf8");
@@ -20019,11 +20305,11 @@ function slug(task) {
 }
 async function createRunWorkspace(contract) {
   const branch = `graphcraft/${contract.runId.slice(0, 8)}-${slug(contract.task)}`;
-  const parent = join3(
-    dirname3(contract.repository.root),
+  const parent = join4(
+    dirname4(contract.repository.root),
     `.${basename(contract.repository.root)}-graphcraft-worktrees`
   );
-  const path2 = join3(parent, contract.runId);
+  const path2 = join4(parent, contract.runId);
   await mkdir3(parent, { recursive: true });
   const registered = await git(contract.repository.root, ["worktree", "list", "--porcelain"]);
   if (registered.includes(`worktree ${path2}`)) return { path: path2, branch, created: false };
@@ -20050,11 +20336,11 @@ async function createAtomicCommit(workspace, task) {
 
 // packages/runtime/src/runner.ts
 import { randomUUID as randomUUID5 } from "node:crypto";
-import { join as join5 } from "node:path";
+import { join as join6 } from "node:path";
 
 // packages/runtime/src/store.ts
 import { appendFile as appendFile2, mkdir as mkdir4, readFile as readFile5, readdir, writeFile as writeFile3 } from "node:fs/promises";
-import { dirname as dirname4, join as join4 } from "node:path";
+import { dirname as dirname5, join as join5 } from "node:path";
 var RunStore = class _RunStore {
   repositoryRoot;
   runId;
@@ -20063,24 +20349,29 @@ var RunStore = class _RunStore {
   constructor(repositoryRoot, runId) {
     this.repositoryRoot = repositoryRoot;
     this.runId = runId;
-    this.graphcraftRoot = join4(repositoryRoot, ".graphcraft");
-    this.runRoot = join4(this.graphcraftRoot, "runs", runId);
+    this.graphcraftRoot = join5(repositoryRoot, ".graphcraft");
+    this.runRoot = join5(this.graphcraftRoot, "runs", runId);
   }
-  static async create(repositoryRoot, contract, graph) {
+  static async create(repositoryRoot, contract, graph, inputProbePlan) {
     const store = new _RunStore(repositoryRoot, contract.runId);
+    const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
     await Promise.all([
-      mkdir4(join4(store.runRoot, "artifacts"), { recursive: true }),
-      mkdir4(join4(store.runRoot, "capsules"), { recursive: true }),
-      mkdir4(join4(store.runRoot, "reports"), { recursive: true }),
-      mkdir4(join4(store.graphcraftRoot, "locks"), { recursive: true })
+      mkdir4(join5(store.runRoot, "artifacts"), { recursive: true }),
+      mkdir4(join5(store.runRoot, "capsules"), { recursive: true }),
+      mkdir4(join5(store.runRoot, "reports"), { recursive: true }),
+      mkdir4(join5(store.graphcraftRoot, "locks"), { recursive: true })
     ]);
-    await Promise.all([store.saveContract(contract), store.saveGraph(graph)]);
+    await Promise.all([
+      store.saveContract(contract),
+      store.saveGraph(graph),
+      store.saveProbePlan(probePlan)
+    ]);
     const event = createRunEvent({
       sequence: 1,
       actor: "runtime",
       causationId: contract.runId,
       type: "run.created",
-      data: { contract, graph, nodeIds: graph.nodes.map(({ id }) => id) }
+      data: { contract, graph, probePlan, nodeIds: graph.nodes.map(({ id }) => id) }
     });
     await writeFile3(store.eventsPath(), `${JSON.stringify(event)}
 `, {
@@ -20091,21 +20382,54 @@ var RunStore = class _RunStore {
     return store;
   }
   eventsPath() {
-    return join4(this.runRoot, "events.jsonl");
+    return join5(this.runRoot, "events.jsonl");
   }
   async saveContract(contract) {
-    await writeJsonAtomic(join4(this.runRoot, "contract.json"), RunContractSchema.parse(contract));
+    await writeJsonAtomic(join5(this.runRoot, "contract.json"), RunContractSchema.parse(contract));
   }
   async loadContract() {
     return RunContractSchema.parse(
-      JSON.parse(await readFile5(join4(this.runRoot, "contract.json"), "utf8"))
+      JSON.parse(await readFile5(join5(this.runRoot, "contract.json"), "utf8"))
     );
   }
   async saveGraph(graph) {
-    await writeJsonAtomic(join4(this.runRoot, "graph.json"), GraphSchema.parse(graph));
+    await writeJsonAtomic(join5(this.runRoot, "graph.json"), GraphSchema.parse(graph));
   }
   async loadGraph() {
-    return GraphSchema.parse(JSON.parse(await readFile5(join4(this.runRoot, "graph.json"), "utf8")));
+    const events = await this.loadEvents();
+    const eventGraph = events.findLast(
+      (event) => (event.type === "run.created" || event.type === "graph.amended") && event.data.graph
+    )?.data.graph;
+    if (eventGraph) {
+      const graph = GraphSchema.parse(eventGraph);
+      const materialized = await readFile5(join5(this.runRoot, "graph.json"), "utf8").then((value) => GraphSchema.parse(JSON.parse(value))).catch(() => void 0);
+      if (JSON.stringify(materialized) !== JSON.stringify(graph)) await this.saveGraph(graph);
+      return graph;
+    }
+    return GraphSchema.parse(JSON.parse(await readFile5(join5(this.runRoot, "graph.json"), "utf8")));
+  }
+  async saveProbePlan(probePlan) {
+    await writeJsonAtomic(join5(this.runRoot, "probe-plan.json"), ProbePlanSchema.parse(probePlan));
+  }
+  async loadProbePlan() {
+    const events = await this.loadEvents();
+    const eventPlan = events.findLast(
+      (event) => (event.type === "run.created" || event.type === "graph.amended") && event.data.probePlan
+    )?.data.probePlan;
+    if (eventPlan) {
+      const probePlan = ProbePlanSchema.parse(eventPlan);
+      const materialized = await readFile5(join5(this.runRoot, "probe-plan.json"), "utf8").then((value) => ProbePlanSchema.parse(JSON.parse(value))).catch(() => void 0);
+      if (JSON.stringify(materialized) !== JSON.stringify(probePlan))
+        await this.saveProbePlan(probePlan);
+      return probePlan;
+    }
+    try {
+      return ProbePlanSchema.parse(
+        JSON.parse(await readFile5(join5(this.runRoot, "probe-plan.json"), "utf8"))
+      );
+    } catch {
+      return probePlanFromGraph(await this.loadGraph());
+    }
   }
   async loadEvents() {
     const content = await readFile5(this.eventsPath(), "utf8");
@@ -20114,7 +20438,7 @@ var RunStore = class _RunStore {
   async loadState() {
     try {
       return RunStateSchema.parse(
-        JSON.parse(await readFile5(join4(this.runRoot, "state.json"), "utf8"))
+        JSON.parse(await readFile5(join5(this.runRoot, "state.json"), "utf8"))
       );
     } catch {
       return await this.rebuildViews();
@@ -20139,22 +20463,25 @@ var RunStore = class _RunStore {
     const events = await this.loadEvents();
     const createdGraph = GraphSchema.parse(events[0]?.data.graph);
     let graph = createdGraph;
+    let probePlan = events[0]?.data.probePlan ? ProbePlanSchema.parse(events[0].data.probePlan) : probePlanFromGraph(createdGraph);
     for (const event of events) {
-      if (event.type === "graph.amended" && event.data.graph)
+      if (event.type === "graph.amended" && event.data.graph) {
         graph = GraphSchema.parse(event.data.graph);
+        if (event.data.probePlan) probePlan = ProbePlanSchema.parse(event.data.probePlan);
+      }
     }
-    await this.saveGraph(graph);
+    await Promise.all([this.saveGraph(graph), this.saveProbePlan(probePlan)]);
     return await this.materialize(events);
   }
   async writeArtifact(relativePath, value) {
-    const path2 = join4(this.runRoot, "artifacts", relativePath);
-    await mkdir4(dirname4(path2), { recursive: true });
+    const path2 = join5(this.runRoot, "artifacts", relativePath);
+    await mkdir4(dirname5(path2), { recursive: true });
     await writeFile3(path2, value, { mode: 384 });
     return path2;
   }
   async appendInvocationEvent(invocationId, event) {
-    const path2 = join4(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
-    await mkdir4(dirname4(path2), { recursive: true });
+    const path2 = join5(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+    await mkdir4(dirname5(path2), { recursive: true });
     await appendFile2(path2, `${JSON.stringify(HostEventSchema.parse(event))}
 `, {
       encoding: "utf8",
@@ -20163,30 +20490,30 @@ var RunStore = class _RunStore {
     return path2;
   }
   async loadInvocationEvents(invocationId) {
-    const path2 = join4(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+    const path2 = join5(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
     const content = await readFile5(path2, "utf8");
     return content.split("\n").filter(Boolean).map((line) => HostEventSchema.parse(JSON.parse(line)));
   }
   async writeCapsule(hash2, value) {
-    const path2 = join4(this.runRoot, "capsules", `${hash2}.json`);
+    const path2 = join5(this.runRoot, "capsules", `${hash2}.json`);
     await writeJsonAtomic(path2, value);
     return path2;
   }
   async writeWorkspace(value) {
-    await writeJsonAtomic(join4(this.runRoot, "workspace.json"), value);
+    await writeJsonAtomic(join5(this.runRoot, "workspace.json"), value);
   }
   async loadWorkspace() {
-    return JSON.parse(await readFile5(join4(this.runRoot, "workspace.json"), "utf8"));
+    return JSON.parse(await readFile5(join5(this.runRoot, "workspace.json"), "utf8"));
   }
   async materialize(events) {
     const state = reduceEvents(events);
-    await writeJsonAtomic(join4(this.runRoot, "state.json"), state);
+    await writeJsonAtomic(join5(this.runRoot, "state.json"), state);
     return state;
   }
 };
 async function listRunIds(repositoryRoot) {
   try {
-    const entries = await readdir(join4(repositoryRoot, ".graphcraft", "runs"), {
+    const entries = await readdir(join5(repositoryRoot, ".graphcraft", "runs"), {
       withFileTypes: true
     });
     return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
@@ -20288,10 +20615,12 @@ async function validatePlannedContext(graph, repositoryPath) {
 }
 async function createRun(task, options) {
   const repository = await discoverRepository(options.cwd);
-  const [probes, repositoryEvidence] = await Promise.all([
-    discoverVerificationProbes(repository.root),
+  const [probePlan, repositoryEvidence] = await Promise.all([
+    discoverProbePlan(repository.root, task, repository.baseSha),
     discoverPlanningEvidence(repository.root, task)
   ]);
+  const completionProbes = probePlan.items.filter(({ phase }) => phase === "completion").map(({ probe }) => probe);
+  const approvedProbes = probePlan.items.map(({ probe }) => probe);
   const contract = compileRunContract(task, repository, {
     ...options.finishLine ? { finishLine: options.finishLine } : {}
   });
@@ -20309,20 +20638,50 @@ async function createRun(task, options) {
         contract,
         repositoryPath: repository.root,
         repositoryEvidence,
-        verificationProbes: probes
+        probePlan,
+        verificationProbes: completionProbes
       },
       options.signal ?? new AbortController().signal
     );
-    graph = compilePlannedGraph(contract, planned.plan, probes);
+    graph = compilePlannedGraph(contract, planned.plan, completionProbes, approvedProbes);
     await validatePlannedContext(graph, repository.root);
     planningUsage = planned.usage;
   } else {
-    graph = compileGraph(contract, probes);
+    graph = compileGraph(contract, completionProbes);
   }
-  const store = await RunStore.create(repository.root, contract, graph);
+  graph = applyProbePlan(graph, contract, probePlan);
+  const store = await RunStore.create(repository.root, contract, graph, probePlan);
   if (planningUsage)
     await store.append("host", "tokens.recorded", { usage: planningUsage, phase: "planning" });
-  return { contract, graph, store };
+  return { contract, graph, store, probePlan };
+}
+async function configureRunProbes(store, input) {
+  const lock = new RunLock(join6(store.graphcraftRoot, "locks", `${store.runId}.lock`));
+  await lock.acquire();
+  try {
+    const state = await store.loadState();
+    if (state.status !== "awaiting_approval")
+      throw new Error("Probes can only be edited before the run contract is approved");
+    const [contract, existingGraph] = await Promise.all([store.loadContract(), store.loadGraph()]);
+    const probePlan = await validateProbePlan(input, store.repositoryRoot);
+    const graph = applyProbePlan(
+      { ...existingGraph, revision: existingGraph.revision + 1 },
+      contract,
+      probePlan
+    );
+    await store.append("user", "graph.amended", {
+      graph,
+      probePlan,
+      addedNodeIds: [],
+      rationale: "User edited the deterministic probe plan before approval",
+      previousProbePlanHash: contentHash(await store.loadProbePlan()),
+      probePlanHash: contentHash(probePlan)
+    });
+    await Promise.all([store.saveGraph(graph), store.saveProbePlan(probePlan)]);
+    return { graph, probePlan };
+  } finally {
+    await lock.release();
+  }
 }
 async function executeWorker(input) {
   const capsule = createContextCapsule({
@@ -20339,7 +20698,7 @@ async function executeWorker(input) {
     await recordMissingUsage(input.store, input.resume);
     const reconciliation = await input.adapter.reconcile(input.resume);
     if (reconciliation.state === "completed" && reconciliation.result) {
-      const artifact2 = join5(
+      const artifact2 = join6(
         input.store.runRoot,
         "artifacts",
         "invocations",
@@ -20389,7 +20748,7 @@ async function executeWorker(input) {
   let error51;
   let errorCause;
   let termination;
-  let artifact = join5(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+  let artifact = join6(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
   try {
     for await (const event of input.adapter.execute(
       {
@@ -20522,7 +20881,7 @@ async function executeRun(input) {
   const externalSignal = input.signal ?? new AbortController().signal;
   const contract = await input.store.loadContract();
   let graph = await input.store.loadGraph();
-  const lock = new RunLock(join5(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
+  const lock = new RunLock(join6(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
   await lock.acquire();
   const controlChannel = new RunControlChannel(input.store.graphcraftRoot, contract.runId);
   const controlAbort = new AbortController();
@@ -20821,9 +21180,9 @@ async function runHostCommand(command, args, allowFailure = false) {
     throw new Error(`${command} ${args.join(" ")} exited ${exitCode}`);
 }
 async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
-  const moduleDirectory = dirname5(fileURLToPath(moduleUrl));
+  const moduleDirectory = dirname6(fileURLToPath(moduleUrl));
   const candidates = [
-    join6(moduleDirectory, "mcp.mjs"),
+    join7(moduleDirectory, "mcp.mjs"),
     resolve3(moduleDirectory, "../../../dist/mcp.mjs"),
     resolve3(process.cwd(), "dist/mcp.mjs")
   ];
@@ -20837,11 +21196,11 @@ async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
   throw new Error("dist/mcp.mjs is missing; run pnpm build before installing Graphcraft");
 }
 function resolveGraphcraftHome(configuredHome = process.env.GRAPHCRAFT_HOME) {
-  return configuredHome?.trim() ? resolve3(configuredHome) : join6(homedir(), ".graphcraft");
+  return configuredHome?.trim() ? resolve3(configuredHome) : join7(homedir(), ".graphcraft");
 }
 async function stageBundledMcp(sourcePath, graphcraftHome = resolveGraphcraftHome()) {
-  const runtimeDirectory = join6(graphcraftHome, "runtime", GRAPHCRAFT_VERSION);
-  const runtimePath = join6(runtimeDirectory, "mcp.mjs");
+  const runtimeDirectory = join7(graphcraftHome, "runtime", GRAPHCRAFT_VERSION);
+  const runtimePath = join7(runtimeDirectory, "mcp.mjs");
   await mkdir5(runtimeDirectory, { recursive: true });
   if (resolve3(sourcePath) !== resolve3(runtimePath)) await copyFile(sourcePath, runtimePath);
   await chmod(runtimePath, 493);
@@ -20878,16 +21237,31 @@ function shouldBypassGraph(task) {
   );
   return words <= 8 && !durableSignal;
 }
-function contractView(contract, graph) {
-  const completionProbes = graph?.nodes.flatMap(
-    (node2) => node2.completionProbes.map((probe) => ({
-      id: probe.id,
-      kind: probe.kind,
-      ...probe.kind === "command" ? { command: [probe.command, ...probe.args].join(" "), cwd: probe.cwd ?? "." } : {},
-      ...probe.kind === "file" ? { path: probe.path } : {},
-      ...probe.kind === "git_diff" ? { baseSha: probe.baseSha } : {}
-    }))
+function probeView(item) {
+  const probe = item.probe;
+  return {
+    id: probe.id,
+    purpose: item.purpose,
+    source: item.source,
+    kind: probe.kind,
+    ...probe.kind === "command" ? {
+      command: [probe.command, ...probe.args].join(" "),
+      cwd: probe.cwd ?? ".",
+      timeoutMs: probe.timeoutMs,
+      platforms: probe.platforms ?? ["all"]
+    } : {},
+    ...probe.kind === "file" ? { path: probe.path } : {},
+    ...probe.kind === "git_diff" ? { baseSha: probe.baseSha } : {},
+    ...probe.kind === "repository_inventory" ? { paths: probe.paths, terms: probe.terms } : {}
+  };
+}
+function contractView(contract, graph, inputProbePlan) {
+  const hasGraphProbes = graph?.nodes.some(
+    (node2) => node2.progressProbes.length > 0 || node2.completionProbes.length > 0
   );
+  const probePlan = inputProbePlan ?? (graph && hasGraphProbes ? probePlanFromGraph(graph) : void 0);
+  const completionProbes = probePlan?.items.filter(({ phase }) => phase === "completion").map((item) => probeView(item));
+  const progressProbes = probePlan?.items.filter(({ phase }) => phase === "progress").map((item) => probeView(item));
   return {
     runId: contract.runId,
     outcome: contract.outcome,
@@ -20901,6 +21275,7 @@ function contractView(contract, graph) {
       owner
     })),
     ...graph ? { planShape: graphPlanShape(graph) } : {},
+    ...progressProbes ? { progressProbes } : {},
     ...completionProbes ? { completionProbes } : {},
     recovery: "Checkpoint after every event; accepted nodes are never repeated"
   };
@@ -20919,26 +21294,29 @@ function stateView(state, contract) {
     updatedAt: state.updatedAt
   };
 }
-function renderContract(contract, graph) {
-  const view = contractView(contract, graph);
+function renderContract(contract, graph, probePlan) {
+  const view = contractView(contract, graph, probePlan);
   return [
     `Run            ${contract.runId}`,
     `Outcome        ${view.outcome}`,
     `Finish line    ${view.finishLine}`,
     `Repository     ${view.repository}`,
     `Permissions    ${contract.permissions.join(", ")}`,
-    `Proof          ${graph.nodes.flatMap((node2) => node2.completionProbes.map((probe) => probe.id)).join(", ")}`,
+    `Progress       ${view.progressProbes?.map(({ id }) => id).join(", ") ?? "none"}`,
+    `Completion     ${view.completionProbes?.map(({ id }) => id).join(", ") ?? "none"}`,
     `Recovery       ${view.recovery}`,
     `Plan           ${view.planShape}`
   ].join("\n");
 }
-async function askForApproval(contract, graph) {
+async function askForApproval(contract, graph, probePlan) {
   if (!stdin.isTTY || !stdout.isTTY) return false;
   const prompt = createInterface3({ input: stdin, output: stdout });
   try {
-    const answer = await prompt.question(`${renderContract(contract, graph)}
+    const answer = await prompt.question(
+      `${renderContract(contract, graph, probePlan)}
 
-Start? [Y/n] `);
+Start? [Y/n] `
+    );
     return !/^n(?:o)?$/i.test(answer.trim());
   } finally {
     prompt.close();
@@ -20990,7 +21368,10 @@ async function handleAction(input) {
       ...input.finishLine ? { finishLine: input.finishLine } : {}
     });
     if (!input.approve)
-      return { approvalRequired: true, contract: contractView(created.contract, created.graph) };
+      return {
+        approvalRequired: true,
+        contract: contractView(created.contract, created.graph, created.probePlan)
+      };
     const state2 = await executeRun({
       store: created.store,
       adapter,
@@ -20999,19 +21380,24 @@ async function handleAction(input) {
     return stateView(state2, created.contract);
   }
   const store = await storeFor(cwd, input.run);
-  const [contract, graph, state] = await Promise.all([
+  const [contract, graph, state, probePlan] = await Promise.all([
     store.loadContract(),
     store.loadGraph(),
-    store.loadState()
+    store.loadState(),
+    store.loadProbePlan()
   ]);
   if (input.action === "status") return stateView(state, contract);
-  if (input.action === "inspect") return { contract, graph, state };
+  if (input.action === "inspect") return { contract, graph, probePlan, state };
   if (input.action === "trace") return { events: await store.loadEvents() };
+  if (input.action === "probes") {
+    if (!input.probePlan) return { probePlan };
+    return await configureRunProbes(store, input.probePlan);
+  }
   if (input.action === "stop") return stateView(await requestRunControl(store, "stop"), contract);
   if (input.action === "pause") return stateView(await requestRunControl(store, "pause"), contract);
   if (input.action === "resume") {
     if (state.status === "awaiting_approval" && !input.approve) {
-      return { approvalRequired: true, contract: contractView(contract, graph) };
+      return { approvalRequired: true, contract: contractView(contract, graph, probePlan) };
     }
     const resumed = await executeRun({
       store,
@@ -21076,9 +21462,9 @@ program2.command("run").description("Compile and execute a durable task graph").
       planner: adapter,
       ...options.finishLine ? { finishLine: options.finishLine } : {}
     });
-    const approved = options.yes || await askForApproval(created.contract, created.graph);
+    const approved = options.yes || await askForApproval(created.contract, created.graph, created.probePlan);
     if (!approved) {
-      console.log(renderContract(created.contract, created.graph));
+      console.log(renderContract(created.contract, created.graph, created.probePlan));
       console.log(
         `Run saved for approval. Resume with: graphcraft resume ${created.contract.runId}`
       );
@@ -21109,6 +21495,7 @@ program2.command("inspect").description("Show the contract, graph, anchors, and 
       {
         contract: await store.loadContract(),
         graph: await store.loadGraph(),
+        probePlan: await store.loadProbePlan(),
         state: await store.loadState()
       },
       null,
@@ -21116,17 +21503,28 @@ program2.command("inspect").description("Show the contract, graph, anchors, and 
     )
   );
 });
+program2.command("probes").description("Show or replace the deterministic probe plan before approval").argument("[run]").option("-C, --cwd <path>", "repository path", process.cwd()).option("--set <file>", "replace the probe plan from a JSON file").action(async (run, options) => {
+  const probePlan = options.set ? JSON.parse(await readFile6(options.set, "utf8")) : void 0;
+  const result = await handleAction({
+    action: "probes",
+    repository: options.cwd,
+    ...run ? { run } : {},
+    ...probePlan ? { probePlan } : {}
+  });
+  console.log(JSON.stringify(options.set ? result : result.probePlan, null, 2));
+});
 program2.command("resume").description("Resume a checkpointed run without repeating accepted nodes").argument("[run]").option("-C, --cwd <path>", "repository path", process.cwd()).option("-y, --yes", "approve a pending contract").option("--json", "emit machine-readable progress").addOption(hostOption).action(
   async (run, options) => {
     const store = await storeFor(options.cwd, run);
     const contract = await store.loadContract();
     const graph = await store.loadGraph();
+    const probePlan = await store.loadProbePlan();
     const state = await store.loadState();
-    const approved = state.status !== "awaiting_approval" || options.yes || await askForApproval(contract, graph);
+    const approved = state.status !== "awaiting_approval" || options.yes || await askForApproval(contract, graph, probePlan);
     if (!approved) {
       console.log(
         JSON.stringify(
-          { approvalRequired: true, contract: contractView(contract, graph) },
+          { approvalRequired: true, contract: contractView(contract, graph, probePlan) },
           null,
           2
         )

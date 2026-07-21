@@ -6,6 +6,7 @@
   "exports": "./src/index.ts",
   "dependencies": {
     "@graphcraft/cli": "workspace:^",
+    "@graphcraft/core": "workspace:^",
     "@modelcontextprotocol/sdk": "1.29.0",
     "zod": "4.4.3"
   }

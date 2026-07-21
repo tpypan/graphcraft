@@ -1,7 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
-import type { Graph, GraphNode, GraphPlan, Permission, ProbeSpec, RunContract } from "./schemas.ts";
-import { GraphPlanSchema, GraphSchema, RunContractSchema } from "./schemas.ts";
+import type {
+  Graph,
+  GraphNode,
+  GraphPlan,
+  Permission,
+  ProbePlan,
+  ProbeSpec,
+  RunContract,
+} from "./schemas.ts";
+import { GraphPlanSchema, GraphSchema, ProbePlanSchema, RunContractSchema } from "./schemas.ts";
 
 export type TaskFamily = Graph["family"];
 
@@ -183,10 +191,40 @@ function patternWithin(candidate: string, boundary: string): boolean {
   return normalizedCandidate === prefix || normalizedCandidate.startsWith(`${prefix}/`);
 }
 
+function sameProbe(left: ProbeSpec, right: ProbeSpec): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function validateProbePolicy(
+  probe: ProbeSpec,
+  contract: RunContract,
+  approvedProbes: ProbeSpec[],
+): void {
+  if (probe.kind === "git_diff" && probe.baseSha !== contract.repository.baseSha)
+    throw new Error(`Probe ${probe.id} is not bound to the approved base SHA`);
+  if (probe.kind === "file" && !safeRelativePattern(probe.path))
+    throw new Error(`Probe ${probe.id} contains an unsafe file path`);
+  if (probe.kind === "command" && probe.cwd && !safeRelativePattern(probe.cwd))
+    throw new Error(`Probe ${probe.id} contains an unsafe working directory`);
+  if (
+    probe.kind === "repository_inventory" &&
+    probe.paths.some((path) => !safeRelativePattern(path))
+  ) {
+    throw new Error(`Probe ${probe.id} contains an unsafe inventory path`);
+  }
+  if (
+    (probe.kind === "command" || probe.kind === "repository_inventory") &&
+    !approvedProbes.some((allowed) => sameProbe(allowed, probe))
+  ) {
+    throw new Error(`Probe ${probe.id} is not an approved deterministic probe`);
+  }
+}
+
 function validatePlannedGraphPolicy(
   graph: Graph,
   contract: RunContract,
   requiredVerificationProbes: ProbeSpec[],
+  approvedProbes: ProbeSpec[] = requiredVerificationProbes,
 ): void {
   if (graph.family !== classifyTask(contract.task))
     throw new Error("The planned graph changed the runtime-selected task family");
@@ -224,11 +262,7 @@ function validatePlannedGraphPolicy(
   if (!finalVerification || finalVerification.completionProbes.length === 0)
     throw new Error("The terminal verification node must contain executable completion probes");
   for (const required of requiredVerificationProbes) {
-    if (
-      !finalVerification.completionProbes.some(
-        (candidate) => JSON.stringify(candidate) === JSON.stringify(required),
-      )
-    ) {
+    if (!finalVerification.completionProbes.some((candidate) => sameProbe(candidate, required))) {
       throw new Error(`The planned graph omitted required verification probe ${required.id}`);
     }
   }
@@ -283,21 +317,7 @@ function validatePlannedGraphPolicy(
     if (item.kind !== "verification" && item.completionProbes.length > 0)
       throw new Error(`Only verification nodes may contain completion probes`);
     for (const probe of [...item.progressProbes, ...item.completionProbes]) {
-      if (probe.kind === "git_diff" && probe.baseSha !== contract.repository.baseSha)
-        throw new Error(`Probe ${probe.id} is not bound to the approved base SHA`);
-      if (probe.kind === "file" && !safeRelativePattern(probe.path))
-        throw new Error(`Probe ${probe.id} contains an unsafe file path`);
-      if (probe.kind === "command" && probe.cwd && !safeRelativePattern(probe.cwd))
-        throw new Error(`Probe ${probe.id} contains an unsafe working directory`);
-      if (
-        probe.kind === "command" &&
-        !requiredVerificationProbes.some(
-          (allowed) =>
-            allowed.kind === "command" && JSON.stringify(allowed) === JSON.stringify(probe),
-        )
-      ) {
-        throw new Error(`Probe ${probe.id} is not an approved repository command`);
-      }
+      validateProbePolicy(probe, contract, approvedProbes);
     }
   }
   if (
@@ -312,6 +332,7 @@ export function compilePlannedGraph(
   contract: RunContract,
   plan: GraphPlan,
   requiredVerificationProbes: ProbeSpec[],
+  approvedProbes: ProbeSpec[] = requiredVerificationProbes,
 ): Graph {
   const parsedPlan = GraphPlanSchema.parse(plan);
   const graph = GraphSchema.parse({
@@ -335,8 +356,78 @@ export function compilePlannedGraph(
     revision: 0,
   });
   validateGraph(graph);
-  validatePlannedGraphPolicy(graph, contract, requiredVerificationProbes);
+  validatePlannedGraphPolicy(graph, contract, requiredVerificationProbes, approvedProbes);
   return graph;
+}
+
+function verificationNode(graph: Graph): GraphNode {
+  const terminal = graph.nodes.find(
+    (candidate) => !graph.nodes.some((other) => other.dependsOn.includes(candidate.id)),
+  );
+  const verification =
+    terminal?.kind === "verification"
+      ? terminal
+      : graph.nodes.find(
+          (candidate) =>
+            candidate.kind === "verification" && terminal?.dependsOn.includes(candidate.id),
+        );
+  if (!verification) throw new Error("The graph has no finish-line verification node");
+  return verification;
+}
+
+export function applyProbePlan(graph: Graph, contract: RunContract, input: ProbePlan): Graph {
+  const plan = ProbePlanSchema.parse(input);
+  if (plan.family !== graph.family || plan.family !== classifyTask(contract.task))
+    throw new Error("The probe plan does not match the runtime-selected task family");
+  const completion = plan.items.filter(({ phase }) => phase === "completion");
+  if (completion.length === 0) throw new Error("A probe plan must contain completion evidence");
+
+  const targetVerificationId = verificationNode(graph).id;
+  const nodes: GraphNode[] = graph.nodes.map((item) => ({
+    ...item,
+    progressProbes: [],
+    completionProbes: item.id === targetVerificationId ? completion.map(({ probe }) => probe) : [],
+  }));
+  for (const item of plan.items.filter(({ phase }) => phase === "progress")) {
+    const preferred =
+      item.purpose === "inventory"
+        ? nodes.find((node) => ["investigation", "decision", "diagnostic"].includes(node.kind))
+        : nodes.find((node) => node.sideEffectClass === "workspace_write");
+    const target =
+      preferred ?? nodes.find((node) => !["verification", "commit"].includes(node.kind));
+    if (!target) throw new Error(`No executable node can own progress probe ${item.probe.id}`);
+    target.progressProbes.push(item.probe);
+  }
+
+  const updated = GraphSchema.parse({ ...graph, nodes });
+  const approved = plan.items.map(({ probe }) => probe);
+  for (const item of updated.nodes)
+    for (const probe of [...item.progressProbes, ...item.completionProbes])
+      validateProbePolicy(probe, contract, approved);
+  validateGraph(updated);
+  return updated;
+}
+
+export function probePlanFromGraph(graph: Graph): ProbePlan {
+  return ProbePlanSchema.parse({
+    schemaVersion: 1,
+    family: graph.family,
+    items: graph.nodes.flatMap((node) => [
+      ...node.progressProbes.map((probe) => ({
+        phase: "progress" as const,
+        purpose:
+          probe.kind === "repository_inventory" ? ("inventory" as const) : ("focused" as const),
+        source: `Recovered from graph node ${node.id}`,
+        probe,
+      })),
+      ...node.completionProbes.map((probe) => ({
+        phase: "completion" as const,
+        purpose: "regression" as const,
+        source: `Recovered from graph node ${node.id}`,
+        probe,
+      })),
+    ]),
+  });
 }
 
 export function validateGraph(graph: Graph): void {

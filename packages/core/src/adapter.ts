@@ -3,6 +3,7 @@ import type {
   GraphPlan,
   HostCapabilities,
   HostEvent,
+  ProbePlan,
   ProbeSpec,
   RunContract,
   TokenUsage,
@@ -14,6 +15,7 @@ export interface PlanningRequest {
   contract: RunContract;
   repositoryPath: string;
   repositoryEvidence: RepositoryPlanningEvidence;
+  probePlan: ProbePlan;
   verificationProbes: ProbeSpec[];
 }
 

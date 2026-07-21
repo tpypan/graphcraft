@@ -64,6 +64,6 @@ describe("run approval", () => {
       planShape: "implement → verify",
       completionProbes: [{ id: "tests", command: "pnpm test" }],
     });
-    expect(renderContract(contract, graph)).toContain("Proof          tests");
+    expect(renderContract(contract, graph)).toContain("Completion     tests");
   });
 });

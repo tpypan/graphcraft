@@ -70,6 +70,10 @@ export const CommandProbeSchema = z.strictObject({
   cwd: z.string().optional(),
   expectedExitCode: z.number().int().default(0),
   timeoutMs: z.number().int().positive().default(120_000),
+  platforms: z
+    .array(z.enum(["darwin", "linux", "win32"]))
+    .min(1)
+    .optional(),
 });
 
 export const FileProbeSchema = z.strictObject({
@@ -87,15 +91,36 @@ export const GitDiffProbeSchema = z.strictObject({
   requireChanges: z.boolean().default(true),
 });
 
+export const RepositoryInventoryProbeSchema = z.strictObject({
+  id: z.string().min(1),
+  kind: z.literal("repository_inventory"),
+  paths: z.array(z.string().min(1)).min(1),
+  terms: z.array(z.string().min(1)).min(1),
+});
+
 export const ProbeSpecSchema = z.discriminatedUnion("kind", [
   CommandProbeSchema,
   FileProbeSchema,
   GitDiffProbeSchema,
+  RepositoryInventoryProbeSchema,
 ]);
+
+export const ProbePlanItemSchema = z.strictObject({
+  phase: z.enum(["progress", "completion"]),
+  purpose: z.enum(["inventory", "focused", "acceptance", "regression"]),
+  source: z.string().min(1),
+  probe: ProbeSpecSchema,
+});
+
+export const ProbePlanSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  family: z.enum(["bug", "feature", "migration", "refactor", "audit"]),
+  items: z.array(ProbePlanItemSchema).min(1),
+});
 
 export const ProbeResultSchema = z.strictObject({
   probeId: z.string().min(1),
-  kind: z.enum(["command", "file", "git_diff"]),
+  kind: z.enum(["command", "file", "git_diff", "repository_inventory"]),
   passed: z.boolean(),
   signature: z.string().min(1),
   summary: z.string(),
@@ -318,6 +343,8 @@ export type Permission = z.infer<typeof PermissionSchema>;
 export type AcceptanceAnchor = z.infer<typeof AcceptanceAnchorSchema>;
 export type RunContract = z.infer<typeof RunContractSchema>;
 export type ProbeSpec = z.infer<typeof ProbeSpecSchema>;
+export type ProbePlan = z.infer<typeof ProbePlanSchema>;
+export type ProbePlanItem = z.infer<typeof ProbePlanItemSchema>;
 export type ProbeResult = z.infer<typeof ProbeResultSchema>;
 export type GraphNode = z.infer<typeof GraphNodeSchema>;
 export type PlannedGraphNode = z.infer<typeof PlannedGraphNodeSchema>;

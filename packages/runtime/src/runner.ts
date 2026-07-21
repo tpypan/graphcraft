@@ -3,6 +3,7 @@ import { join } from "node:path";
 import {
   GraphSchema,
   WorkerResultSchema,
+  applyProbePlan,
   classifyProgress,
   compileGraph,
   compilePlannedGraph,
@@ -20,6 +21,7 @@ import {
   type HostTermination,
   type InvocationRecord,
   type ProbeResult,
+  type ProbePlan,
   type RunContract,
   type RunControlRequest,
   type RunState,
@@ -27,9 +29,10 @@ import {
   type WorkerResult,
 } from "@graphcraft/core";
 import {
-  discoverVerificationProbes,
+  discoverProbePlan,
   runProcess,
   runProbes,
+  validateProbePlan,
   workspaceDigest,
   type ExecutedProbe,
 } from "@graphcraft/probes";
@@ -169,12 +172,17 @@ export async function createRun(
   contract: RunContract;
   graph: Graph;
   store: RunStore;
+  probePlan: ProbePlan;
 }> {
   const repository = await discoverRepository(options.cwd);
-  const [probes, repositoryEvidence] = await Promise.all([
-    discoverVerificationProbes(repository.root),
+  const [probePlan, repositoryEvidence] = await Promise.all([
+    discoverProbePlan(repository.root, task, repository.baseSha),
     discoverPlanningEvidence(repository.root, task),
   ]);
+  const completionProbes = probePlan.items
+    .filter(({ phase }) => phase === "completion")
+    .map(({ probe }) => probe);
+  const approvedProbes = probePlan.items.map(({ probe }) => probe);
   const contract = compileRunContract(task, repository, {
     ...(options.finishLine ? { finishLine: options.finishLine } : {}),
   });
@@ -197,20 +205,54 @@ export async function createRun(
         contract,
         repositoryPath: repository.root,
         repositoryEvidence,
-        verificationProbes: probes,
+        probePlan,
+        verificationProbes: completionProbes,
       },
       options.signal ?? new AbortController().signal,
     );
-    graph = compilePlannedGraph(contract, planned.plan, probes);
+    graph = compilePlannedGraph(contract, planned.plan, completionProbes, approvedProbes);
     await validatePlannedContext(graph, repository.root);
     planningUsage = planned.usage;
   } else {
-    graph = compileGraph(contract, probes);
+    graph = compileGraph(contract, completionProbes);
   }
-  const store = await RunStore.create(repository.root, contract, graph);
+  graph = applyProbePlan(graph, contract, probePlan);
+  const store = await RunStore.create(repository.root, contract, graph, probePlan);
   if (planningUsage)
     await store.append("host", "tokens.recorded", { usage: planningUsage, phase: "planning" });
-  return { contract, graph, store };
+  return { contract, graph, store, probePlan };
+}
+
+export async function configureRunProbes(
+  store: RunStore,
+  input: ProbePlan,
+): Promise<{ graph: Graph; probePlan: ProbePlan }> {
+  const lock = new RunLock(join(store.graphcraftRoot, "locks", `${store.runId}.lock`));
+  await lock.acquire();
+  try {
+    const state = await store.loadState();
+    if (state.status !== "awaiting_approval")
+      throw new Error("Probes can only be edited before the run contract is approved");
+    const [contract, existingGraph] = await Promise.all([store.loadContract(), store.loadGraph()]);
+    const probePlan = await validateProbePlan(input, store.repositoryRoot);
+    const graph = applyProbePlan(
+      { ...existingGraph, revision: existingGraph.revision + 1 },
+      contract,
+      probePlan,
+    );
+    await store.append("user", "graph.amended", {
+      graph,
+      probePlan,
+      addedNodeIds: [],
+      rationale: "User edited the deterministic probe plan before approval",
+      previousProbePlanHash: contentHash(await store.loadProbePlan()),
+      probePlanHash: contentHash(probePlan),
+    });
+    await Promise.all([store.saveGraph(graph), store.saveProbePlan(probePlan)]);
+    return { graph, probePlan };
+  } finally {
+    await lock.release();
+  }
 }
 
 async function executeWorker(input: {

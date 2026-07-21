@@ -50,7 +50,8 @@ Graphcraft displays a concise run contract before doing work. Use `--yes` only w
 - Creates an isolated Git worktree without stashing, cleaning, or resetting the current checkout.
 - Stores a hashed append-only event log and rebuildable state under the repository's local `.graphcraft/` directory.
 - Gives each worker a small context capsule instead of replaying raw transcripts.
-- Runs deterministic repository probes and classifies progress as advanced, learning, stalled, regressed, oscillating, blocked, or done.
+- Infers deterministic, task-family-specific progress and completion probes from repository evidence, then lets users inspect or replace the versioned probe plan before approval.
+- Runs approved probes outside model context and classifies progress as advanced, learning, stalled, regressed, oscillating, blocked, or done.
 - Schedules one evidence-driven repair when verification fails, then stops if the changed strategy does not clear the failure.
 - Checkpoints host sessions and results during execution, resumes the same host session when safe, and falls back to repository evidence when switching hosts or native continuation is unavailable.
 - Accepts pause or stop from another CLI process, terminates the active child with bounded escalation, and records the exact cause and outcome before releasing the run lock.
@@ -63,6 +64,7 @@ graphcraft install --host <codex|claude>
 graphcraft run <task>
 graphcraft status [run]
 graphcraft inspect [run]
+graphcraft probes [run] [--set probe-plan.json]
 graphcraft pause [run]
 graphcraft resume [run]
 graphcraft stop [run]

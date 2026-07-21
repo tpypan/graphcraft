@@ -7,12 +7,13 @@ import {
   classifyTask,
   compilePlannedGraph,
   compileRunContract,
+  applyProbePlan,
   graphPlanShape,
   type Graph,
   type GraphPlanner,
   type TaskFamily,
 } from "../packages/core/src/index.ts";
-import { discoverVerificationProbes } from "../packages/probes/src/index.ts";
+import { discoverProbePlan } from "../packages/probes/src/index.ts";
 import { discoverRepository } from "../packages/runtime/src/repository.ts";
 import { discoverPlanningEvidence } from "../packages/runtime/src/repository.ts";
 
@@ -77,7 +78,6 @@ describe.skipIf(configuredHosts.length === 0)("live host graph planning", () => 
       `${host} produces distinct valid repository-grounded plans for every task family`,
       async () => {
         const repository = await discoverRepository(process.cwd());
-        const verificationProbes = await discoverVerificationProbes(repository.root);
         const adapter = adapterFor(host);
         const capabilities = await adapter.probe();
         expect(capabilities).toMatchObject({
@@ -92,6 +92,14 @@ describe.skipIf(configuredHosts.length === 0)("live host graph planning", () => 
         for (const fixture of selectedTasks) {
           expect(classifyTask(fixture.task)).toBe(fixture.family);
           const contract = compileRunContract(fixture.task, repository);
+          const probePlan = await discoverProbePlan(
+            repository.root,
+            fixture.task,
+            repository.baseSha,
+          );
+          const verificationProbes = probePlan.items
+            .filter(({ phase }) => phase === "completion")
+            .map(({ probe }) => probe);
           const repositoryEvidence = await discoverPlanningEvidence(repository.root, fixture.task);
           for (const expectedPath of fixture.expectedPaths)
             expect(repositoryEvidence.files.map(({ path }) => path)).toContain(expectedPath);
@@ -100,13 +108,23 @@ describe.skipIf(configuredHosts.length === 0)("live host graph planning", () => 
               contract,
               repositoryPath: repository.root,
               repositoryEvidence,
+              probePlan,
               verificationProbes,
             },
             new AbortController().signal,
           );
           let graph: Graph;
           try {
-            graph = compilePlannedGraph(contract, result.plan, verificationProbes);
+            graph = applyProbePlan(
+              compilePlannedGraph(
+                contract,
+                result.plan,
+                verificationProbes,
+                probePlan.items.map(({ probe }) => probe),
+              ),
+              contract,
+              probePlan,
+            );
           } catch (error) {
             console.error(
               JSON.stringify({ host, family: fixture.family, plan: result.plan }, null, 2),

@@ -21,17 +21,16 @@ export function renderPlannerPrompt(request: PlanningRequest): string {
     "A node may select predecessorResults only from its direct dependsOn list; do not repeat transitive predecessors.",
     "Select at least one existing tracked repository path for every non-commit node. Every relevantPaths value must be copied exactly from repositoryEvidence.trackedPaths; relevant paths are evidence inputs, not files the worker might create.",
     "Investigation, decision, and verification nodes must use sideEffectClass none. Implementation and repair/diagnostic nodes that edit files use workspace_write. Commit nodes alone use git_commit.",
-    "Do not weaken or replace the supplied verification probes; assign them to the terminal verification node.",
+    "Use the supplied probe plan exactly: assign completion probes to the terminal verification node and progress probes to the node where they measure change.",
     "Only the terminal verification node may contain completionProbes. Every other node must have an empty completionProbes array.",
-    "Put evidence used to measure implementation, investigation, or diagnostic progress in progressProbes, including base-SHA-bound Git diff probes.",
-    "Do not invent command probes. You may add task-specific file and base-SHA-bound Git diff probes.",
+    "Do not invent, weaken, omit, or replace probes. Graphcraft will deterministically reattach the approved probe plan after validating the topology.",
     "Keep node IDs short, stable, lowercase, and unique. Return only the required structured plan.",
     "",
     canonicalJson({
       contract: request.contract,
       taskFamily: classifyTask(request.contract.task),
       repositoryEvidence: request.repositoryEvidence,
-      discoveredVerificationProbes: request.verificationProbes,
+      probePlan: request.probePlan,
     }),
   ].join("\n");
 }

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { Command, Option } from "commander";
+import { readFile } from "node:fs/promises";
 import {
   askForApproval,
   consoleObserver,
@@ -16,6 +17,7 @@ import {
   type HostName,
 } from "./index.ts";
 import { createRun, executeRun } from "@graphcraft/runtime";
+import type { ProbePlan } from "@graphcraft/core";
 
 const program = new Command()
   .name("graphcraft")
@@ -114,9 +116,10 @@ program
         planner: adapter,
         ...(options.finishLine ? { finishLine: options.finishLine } : {}),
       });
-      const approved = options.yes || (await askForApproval(created.contract, created.graph));
+      const approved =
+        options.yes || (await askForApproval(created.contract, created.graph, created.probePlan));
       if (!approved) {
-        console.log(renderContract(created.contract, created.graph));
+        console.log(renderContract(created.contract, created.graph, created.probePlan));
         console.log(
           `Run saved for approval. Resume with: graphcraft resume ${created.contract.runId}`,
         );
@@ -160,12 +163,32 @@ program
         {
           contract: await store.loadContract(),
           graph: await store.loadGraph(),
+          probePlan: await store.loadProbePlan(),
           state: await store.loadState(),
         },
         null,
         2,
       ),
     );
+  });
+
+program
+  .command("probes")
+  .description("Show or replace the deterministic probe plan before approval")
+  .argument("[run]")
+  .option("-C, --cwd <path>", "repository path", process.cwd())
+  .option("--set <file>", "replace the probe plan from a JSON file")
+  .action(async (run: string | undefined, options: { cwd: string; set?: string }) => {
+    const probePlan = options.set
+      ? (JSON.parse(await readFile(options.set, "utf8")) as ProbePlan)
+      : undefined;
+    const result = await handleAction({
+      action: "probes",
+      repository: options.cwd,
+      ...(run ? { run } : {}),
+      ...(probePlan ? { probePlan } : {}),
+    });
+    console.log(JSON.stringify(options.set ? result : result.probePlan, null, 2));
   });
 
 program
@@ -184,15 +207,16 @@ program
       const store = await storeFor(options.cwd, run);
       const contract = await store.loadContract();
       const graph = await store.loadGraph();
+      const probePlan = await store.loadProbePlan();
       const state = await store.loadState();
       const approved =
         state.status !== "awaiting_approval" ||
         options.yes ||
-        (await askForApproval(contract, graph));
+        (await askForApproval(contract, graph, probePlan));
       if (!approved) {
         console.log(
           JSON.stringify(
-            { approvalRequired: true, contract: contractView(contract, graph) },
+            { approvalRequired: true, contract: contractView(contract, graph, probePlan) },
             null,
             2,
           ),
