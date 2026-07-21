@@ -18,6 +18,8 @@ import type {
   PlanningRequest,
   PlanningResult,
   ReconciliationResult,
+  SemanticVerificationRequest,
+  SemanticVerificationResult,
   WorkerRequest,
 } from "@graphcraft/core";
 import { configureRunProbes, createRun, executeRun } from "./runner.ts";
@@ -34,6 +36,13 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<voi
     if (Date.now() > deadline) throw new Error("Timed out waiting for test condition");
     await new Promise<void>((resolve) => setTimeout(resolve, 10));
   }
+}
+
+async function waitForAbort(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return;
+  await new Promise<void>((resolve) =>
+    signal.addEventListener("abort", () => resolve(), { once: true }),
+  );
 }
 
 afterEach(async () => {
@@ -76,6 +85,7 @@ class FakeAdapter implements HostAdapter {
   readonly id = "test" as const;
   readonly calls: string[] = [];
   readonly requests: WorkerRequest[] = [];
+  readonly semanticRequests: SemanticVerificationRequest[] = [];
   private readonly act: (
     request: WorkerRequest,
     call: number,
@@ -83,15 +93,19 @@ class FakeAdapter implements HostAdapter {
   ) => Promise<void>;
   private readonly authenticated: boolean;
   private readonly failureCause: "host_crash" | "timeout" | undefined;
+  private readonly semanticAct:
+    ((request: SemanticVerificationRequest) => Promise<SemanticVerificationResult>) | undefined;
 
   constructor(
     act: (request: WorkerRequest, call: number, signal: AbortSignal) => Promise<void>,
     authenticated = true,
     failureCause?: "host_crash" | "timeout",
+    semanticAct?: (request: SemanticVerificationRequest) => Promise<SemanticVerificationResult>,
   ) {
     this.act = act;
     this.authenticated = authenticated;
     this.failureCause = failureCause;
+    this.semanticAct = semanticAct;
   }
 
   async probe(): Promise<HostCapabilities> {
@@ -229,6 +243,20 @@ class FakeAdapter implements HostAdapter {
   async reconcile(invocation: InvocationRecord): Promise<ReconciliationResult> {
     return reconcilePersistedInvocation(invocation);
   }
+
+  async verify(request: SemanticVerificationRequest): Promise<SemanticVerificationResult> {
+    this.semanticRequests.push(request);
+    if (this.semanticAct) return await this.semanticAct(request);
+    return {
+      verdict: {
+        verdict: "supported",
+        evidence: ["Repository evidence supports meaningful read-only progress"],
+        rationale: "The worker returned concrete evidence tied to the requested objective",
+        uncertainty: 0.1,
+      },
+      usage: { input: 2, cachedInput: 0, output: 1, reasoning: 0, total: 3 },
+    };
+  }
 }
 
 describe("durable runtime", () => {
@@ -271,14 +299,85 @@ describe("durable runtime", () => {
     const state = await executeRun({ store: created.store, adapter, approve: true });
 
     expect(state.status).toBe("completed");
-    expect(state.nodes.investigate?.lastProgress).toBe("done");
+    expect(state.nodes.investigate?.lastProgress).toBe("learning");
     expect(adapter.calls).toEqual(["investigate", "implement"]);
     expect(adapter.requests[1]?.capsule.predecessorEvidence).toEqual([
       "investigate: Completed investigate",
     ]);
     expect(adapter.requests[0]?.allowedTools).toEqual(["read"]);
     expect(adapter.requests[1]?.allowedTools).toEqual(["read", "write", "shell"]);
-    expect(state.tokens.total).toBe(35);
+    expect(state.tokens.total).toBe(38);
+    expect(adapter.semanticRequests).toHaveLength(1);
+    expect(adapter.semanticRequests[0]).toMatchObject({
+      context: { phase: "progress", nodeId: "investigate" },
+    });
+    expect((await created.store.loadEvents()).map(({ type }) => type)).toContain(
+      "semantic.verdict",
+    );
+  });
+
+  it("stops on an unsupported isolated semantic progress verdict", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(
+      async () => undefined,
+      true,
+      undefined,
+      async () => ({
+        verdict: {
+          verdict: "unsupported",
+          evidence: ["The reported finding is not present in the selected paths"],
+          rationale: "The worker evidence cannot be corroborated",
+          uncertainty: 0.05,
+        },
+      }),
+    );
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+      planner: adapter,
+    });
+
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toMatch(/Semantic progress verdict was unsupported/);
+    expect(adapter.calls).toEqual(["investigate"]);
+    expect(adapter.semanticRequests).toHaveLength(1);
+    expect(adapter.semanticRequests[0]?.context).not.toHaveProperty("graph");
+    expect(
+      (await created.store.loadEvents()).find(({ type }) => type === "semantic.verdict"),
+    ).toMatchObject({ data: { usage: null, policyViolation: false } });
+  });
+
+  it("blocks if a semantic verifier mutates its read-only workspace", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(
+      async () => undefined,
+      true,
+      undefined,
+      async (request) => {
+        await writeFile(join(request.repositoryPath, "verifier-write.txt"), "not allowed\n");
+        return {
+          verdict: {
+            verdict: "supported",
+            evidence: ["invalid"],
+            rationale: "invalid verifier mutation",
+            uncertainty: 0,
+          },
+        };
+      },
+    );
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+      planner: adapter,
+    });
+
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toMatch(/read-only semantic verifier changed/);
+    expect(
+      (await created.store.loadEvents()).find(({ type }) => type === "semantic.verdict"),
+    ).toMatchObject({ data: { policyViolation: true } });
   });
 
   it("completes a local run in an isolated worktree and records tokens", async () => {
@@ -296,11 +395,40 @@ describe("durable runtime", () => {
     expect(state.nodes.implement?.status).toBe("accepted");
     expect(state.nodes.verify?.status).toBe("accepted");
     expect(adapter.calls).toEqual(["implement"]);
+    expect(adapter.semanticRequests).toHaveLength(0);
     expect((await created.store.loadEvents()).map(({ type }) => type)).toContain("run.completed");
 
     const resumed = await executeRun({ store: created.store, adapter, approve: true });
     expect(resumed.status).toBe("completed");
     expect(adapter.calls).toEqual(["implement"]);
+  });
+
+  it("uses semantic completion only when deterministic completion proof is structural", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async (request) => {
+      await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+    });
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    const inventory = created.probePlan.items.find(
+      ({ phase, purpose }) => phase === "progress" && purpose === "inventory",
+    )!;
+    await configureRunProbes(created.store, {
+      ...created.probePlan,
+      items: [
+        ...created.probePlan.items.filter(({ phase }) => phase === "progress"),
+        { ...inventory, phase: "completion" },
+      ],
+    });
+
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+
+    expect(state.status).toBe("completed");
+    expect(adapter.semanticRequests).toHaveLength(1);
+    expect(adapter.semanticRequests[0]).toMatchObject({
+      context: { phase: "completion", nodeId: "verify" },
+    });
   });
 
   it("amends the graph once and repairs a deterministic failure", async () => {
@@ -557,12 +685,7 @@ describe("durable runtime", () => {
 
   it("coordinates an active pause, checkpoints termination, and resumes the same session", async () => {
     const repository = await createRepository();
-    const adapter = new FakeAdapter(
-      async (_request, _call, signal) =>
-        await new Promise<void>((resolve) =>
-          signal.addEventListener("abort", () => resolve(), { once: true }),
-        ),
-    );
+    const adapter = new FakeAdapter(async (_request, _call, signal) => await waitForAbort(signal));
     const created = await createRun("Implement a substantial feature across the fixture", {
       cwd: repository,
     });
@@ -597,12 +720,7 @@ describe("durable runtime", () => {
 
   it("coordinates an active stop and leaves no running node state", async () => {
     const repository = await createRepository();
-    const adapter = new FakeAdapter(
-      async (_request, _call, signal) =>
-        await new Promise<void>((resolve) =>
-          signal.addEventListener("abort", () => resolve(), { once: true }),
-        ),
-    );
+    const adapter = new FakeAdapter(async (_request, _call, signal) => await waitForAbort(signal));
     const created = await createRun("Implement a substantial feature across the fixture", {
       cwd: repository,
     });
@@ -624,10 +742,7 @@ describe("durable runtime", () => {
     for (const cause of ["cancellation", "runtime_shutdown"] as const) {
       const repository = await createRepository();
       const adapter = new FakeAdapter(
-        async (_request, _call, signal) =>
-          await new Promise<void>((resolve) =>
-            signal.addEventListener("abort", () => resolve(), { once: true }),
-          ),
+        async (_request, _call, signal) => await waitForAbort(signal),
       );
       const created = await createRun("Implement a substantial feature across the fixture", {
         cwd: repository,

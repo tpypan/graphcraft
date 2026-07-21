@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import {
   GraphSchema,
+  HostTerminationError,
+  SemanticVerifierContextSchema,
   WorkerResultSchema,
   applyProbePlan,
   classifyProgress,
@@ -26,6 +28,7 @@ import {
   type RunControlRequest,
   type RunState,
   type TokenUsage,
+  type SemanticVerdict,
   type WorkerResult,
 } from "@graphcraft/core";
 import {
@@ -427,6 +430,112 @@ async function captureProbes(
   return executed;
 }
 
+function needsSemanticVerification(
+  phase: "progress" | "completion",
+  probes: GraphNode["progressProbes"],
+  classification?: ReturnType<typeof classifyProgress>,
+): boolean {
+  const lacksCommandProof = probes.every(({ kind }) => kind !== "command");
+  if (!lacksCommandProof) return false;
+  if (phase === "completion") return true;
+  return classification === "stalled" || classification === "done";
+}
+
+async function runSemanticVerification(input: {
+  phase: "progress" | "completion";
+  adapter: HostAdapter;
+  store: RunStore;
+  contract: RunContract;
+  node: GraphNode;
+  workspace: RunWorkspace;
+  workerSummary: string;
+  workerEvidence: string[];
+  baselineProbeEvidence: ProbeResult[];
+  currentProbeEvidence: ProbeResult[];
+  signal: AbortSignal;
+}): Promise<SemanticVerdict> {
+  const invocationId = randomUUID();
+  const context = SemanticVerifierContextSchema.parse({
+    schemaVersion: 1,
+    phase: input.phase,
+    runId: input.contract.runId,
+    nodeId: input.node.id,
+    objective: input.node.objective,
+    finishLine: input.contract.finishLine,
+    acceptanceAnchors: input.contract.acceptanceAnchors,
+    relevantPaths: input.node.contextSelector.relevantPaths,
+    workerSummary: input.workerSummary,
+    workerEvidence: input.workerEvidence,
+    baselineProbeEvidence: input.baselineProbeEvidence,
+    currentProbeEvidence: input.currentProbeEvidence,
+  });
+  const beforeDigest = await workspaceDigest(input.workspace.path);
+  let verdictPersisted = false;
+  try {
+    const result = await input.adapter.verify(
+      {
+        invocationId,
+        repositoryPath: input.workspace.path,
+        context,
+      },
+      input.signal,
+    );
+    const afterDigest = await workspaceDigest(input.workspace.path);
+    const policyViolation = beforeDigest !== afterDigest;
+    const artifact = await input.store.writeArtifact(
+      `semantic/${invocationId}.json`,
+      `${JSON.stringify({ schemaVersion: 1, host: input.adapter.id, context, result, beforeDigest, afterDigest }, null, 2)}\n`,
+    );
+    await input.store.append(
+      "host",
+      "semantic.verdict",
+      {
+        invocationId,
+        nodeId: input.node.id,
+        phase: input.phase,
+        host: input.adapter.id,
+        verdict: result.verdict,
+        usage: result.usage ?? null,
+        artifact,
+        policyViolation,
+      },
+      invocationId,
+    );
+    verdictPersisted = true;
+    if (result.usage)
+      await input.store.append(
+        "host",
+        "tokens.recorded",
+        { usage: result.usage, phase: "semantic_verification", nodeId: input.node.id },
+        invocationId,
+      );
+    if (policyViolation)
+      throw new Error("The read-only semantic verifier changed the repository workspace");
+    return result.verdict;
+  } catch (error) {
+    if (error instanceof HostTerminationError) throw error;
+    if (verdictPersisted) throw error;
+    const artifact = await input.store.writeArtifact(
+      `semantic/${invocationId}-error.json`,
+      `${JSON.stringify({ schemaVersion: 1, host: input.adapter.id, context, error: (error as Error).message }, null, 2)}\n`,
+    );
+    await input.store.append(
+      "host",
+      "semantic.verdict",
+      {
+        invocationId,
+        nodeId: input.node.id,
+        phase: input.phase,
+        host: input.adapter.id,
+        error: (error as Error).message,
+        artifact,
+      },
+      invocationId,
+    );
+    throw error;
+  }
+}
+
 function acceptedNodeIds(state: RunState): Set<string> {
   return new Set(
     Object.entries(state.nodes)
@@ -666,10 +775,49 @@ export async function executeRun(input: {
         if (signal.aborted) return await finishInterruption(current.id);
         const results = executed.map(({ result }) => result);
         if (results.every(({ passed }) => passed)) {
+          let semanticEvidence: string[] = [];
+          if (needsSemanticVerification("completion", current.completionProbes)) {
+            let semanticVerdict: SemanticVerdict;
+            try {
+              semanticVerdict = await runSemanticVerification({
+                phase: "completion",
+                adapter: input.adapter,
+                store: input.store,
+                contract,
+                node: current,
+                workspace,
+                workerSummary: "Deterministic completion probes passed",
+                workerEvidence: current.dependsOn.flatMap((nodeId) => {
+                  const predecessor = state.nodes[nodeId];
+                  return predecessor?.lastSummary ? [`${nodeId}: ${predecessor.lastSummary}`] : [];
+                }),
+                baselineProbeEvidence: [],
+                currentProbeEvidence: results,
+                signal,
+              });
+            } catch (error) {
+              if (signal.aborted)
+                return await finishInterruption(
+                  current.id,
+                  error instanceof HostTerminationError ? error.termination : undefined,
+                );
+              const reason = `Semantic completion verification failed: ${(error as Error).message}`;
+              await input.store.append("host", "node.failed", { nodeId: current.id, reason });
+              await input.store.append("runtime", "run.blocked", { reason });
+              return await input.store.loadState();
+            }
+            semanticEvidence = semanticVerdict.evidence;
+            if (semanticVerdict.verdict !== "supported") {
+              const reason = `Semantic completion verdict was ${semanticVerdict.verdict}: ${semanticVerdict.rationale}`;
+              await input.store.append("host", "node.failed", { nodeId: current.id, reason });
+              await input.store.append("runtime", "run.blocked", { reason });
+              return await input.store.loadState();
+            }
+          }
           await input.store.append("probe", "node.progress", {
             nodeId: current.id,
             classification: "done",
-            evidence: results.map(({ summary }) => summary),
+            evidence: [...results.map(({ summary }) => summary), ...semanticEvidence],
           });
           await input.store.append("probe", "node.accepted", { nodeId: current.id });
           continue;
@@ -784,17 +932,57 @@ export async function executeRun(input: {
         afterProbes.map(({ result }) => result),
       );
       const measuredClassification = classifyProgress(baseline, currentEvidence);
-      const classification =
-        measuredClassification === "stalled" &&
+      let classification = measuredClassification;
+      let semanticEvidence: string[] = [];
+      let semanticStopReason: string | undefined;
+      if (
         current.sideEffectClass === "none" &&
-        worker.result.evidence.length > 0
-          ? "learning"
-          : measuredClassification;
+        worker.result.evidence.length > 0 &&
+        needsSemanticVerification("progress", current.progressProbes, measuredClassification)
+      ) {
+        let semanticVerdict: SemanticVerdict;
+        try {
+          semanticVerdict = await runSemanticVerification({
+            phase: "progress",
+            adapter: input.adapter,
+            store: input.store,
+            contract,
+            node: current,
+            workspace,
+            workerSummary: worker.result.summary,
+            workerEvidence: worker.result.evidence,
+            baselineProbeEvidence: baselineProbeResults,
+            currentProbeEvidence: afterProbes.map(({ result }) => result),
+            signal,
+          });
+        } catch (error) {
+          if (signal.aborted)
+            return await finishInterruption(
+              current.id,
+              error instanceof HostTerminationError ? error.termination : worker.termination,
+              worker.artifact,
+            );
+          const reason = `Semantic progress verification failed: ${(error as Error).message}`;
+          await input.store.append("host", "node.failed", { nodeId: current.id, reason });
+          await input.store.append("runtime", "run.blocked", { reason });
+          return await input.store.loadState();
+        }
+        semanticEvidence = semanticVerdict.evidence;
+        if (semanticVerdict.verdict === "supported") classification = "learning";
+        else {
+          classification = semanticVerdict.verdict === "unsupported" ? "stalled" : "blocked";
+          semanticStopReason = `Semantic progress verdict was ${semanticVerdict.verdict}: ${semanticVerdict.rationale}`;
+        }
+      }
       await input.store.append("probe", "node.progress", {
         nodeId: current.id,
         classification,
         summary: worker.result.summary,
-        evidence: [...worker.result.evidence, ...afterProbes.map(({ result }) => result.summary)],
+        evidence: [
+          ...worker.result.evidence,
+          ...afterProbes.map(({ result }) => result.summary),
+          ...semanticEvidence,
+        ],
       });
       if (["done", "advanced", "learning"].includes(classification)) {
         await input.store.append("runtime", "node.accepted", {
@@ -804,10 +992,10 @@ export async function executeRun(input: {
       } else {
         await input.store.append("runtime", "node.failed", {
           nodeId: current.id,
-          reason: `Progress classified as ${classification}`,
+          reason: semanticStopReason ?? `Progress classified as ${classification}`,
         });
         await input.store.append("runtime", "run.blocked", {
-          reason: `Stopped safely because progress was ${classification}`,
+          reason: semanticStopReason ?? `Stopped safely because progress was ${classification}`,
         });
         return await input.store.loadState();
       }

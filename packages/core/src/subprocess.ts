@@ -6,6 +6,13 @@ export interface InterruptionReason {
   reason: string;
 }
 
+export class HostTerminationError extends Error {
+  constructor(readonly termination: HostTermination) {
+    super(`Host child terminated after ${termination.cause}`);
+    this.name = "HostTerminationError";
+  }
+}
+
 export function interruptionReason(
   value: unknown,
   fallback: InterruptionCause = "cancellation",

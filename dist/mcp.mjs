@@ -31254,6 +31254,26 @@ var ContextCapsuleSchema = external_exports.strictObject({
   relevantPaths: external_exports.array(external_exports.string()),
   probeEvidence: external_exports.array(external_exports.string())
 });
+var SemanticVerifierContextSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  phase: external_exports.enum(["progress", "completion"]),
+  runId: external_exports.uuid(),
+  nodeId: external_exports.string().min(1),
+  objective: external_exports.string().min(1),
+  finishLine: FinishLineSchema,
+  acceptanceAnchors: external_exports.array(AcceptanceAnchorSchema),
+  relevantPaths: external_exports.array(external_exports.string()),
+  workerSummary: external_exports.string(),
+  workerEvidence: external_exports.array(external_exports.string()),
+  baselineProbeEvidence: external_exports.array(ProbeResultSchema),
+  currentProbeEvidence: external_exports.array(ProbeResultSchema)
+});
+var SemanticVerdictSchema = external_exports.strictObject({
+  verdict: external_exports.enum(["supported", "unsupported", "uncertain"]),
+  evidence: external_exports.array(external_exports.string()),
+  rationale: external_exports.string().min(1),
+  uncertainty: external_exports.number().min(0).max(1)
+});
 var HostCapabilitiesSchema = external_exports.strictObject({
   installed: external_exports.boolean(),
   authenticated: external_exports.boolean(),
@@ -31319,6 +31339,7 @@ var RunEventTypeSchema = external_exports.enum([
   "invocation.resumed",
   "invocation.finished",
   "control.applied",
+  "semantic.verdict",
   "tokens.recorded",
   "graph.amended"
 ]);
@@ -31361,6 +31382,9 @@ var RunStateSchema = external_exports.strictObject({
 });
 var workerResultJsonSchema = external_exports.toJSONSchema(WorkerResultSchema, { target: "draft-7" });
 var graphPlanJsonSchema = external_exports.toJSONSchema(GraphPlanSchema, { target: "draft-7" });
+var semanticVerdictJsonSchema = external_exports.toJSONSchema(SemanticVerdictSchema, {
+  target: "draft-7"
+});
 
 // packages/core/src/capsule.ts
 function createContextCapsule(input) {
@@ -31855,6 +31879,18 @@ function renderWorkerPrompt(capsule) {
     canonicalJson(capsule)
   ].join("\n");
 }
+function renderSemanticVerifierPrompt(context) {
+  return [
+    "You are an isolated read-only semantic verifier inside a Graphcraft run.",
+    `Judge only whether the supplied evidence supports the claimed ${context.phase}.`,
+    "Inspect only the listed relevant paths when the evidence needs corroboration.",
+    "You cannot repair files, amend the graph, change probes, redefine acceptance anchors, or broaden the finish line.",
+    "Return supported only when concrete repository evidence justifies it; otherwise return unsupported or uncertain.",
+    "Report uncertainty from 0 (none) to 1 (maximal). Return only the required structured verdict.",
+    "",
+    canonicalJson(context)
+  ].join("\n");
+}
 
 // packages/core/src/reducer.ts
 var emptyTokens = { input: 0, cachedInput: 0, output: 0, reasoning: 0, total: 0 };
@@ -31987,6 +32023,7 @@ function reduceEvents(events) {
       case "invocation.resumed":
       case "invocation.finished":
       case "control.applied":
+      case "semantic.verdict":
         break;
       case "run.created":
         throw new Error("run.created may only appear once");
@@ -32000,6 +32037,14 @@ function reduceEvents(events) {
 }
 
 // packages/core/src/subprocess.ts
+var HostTerminationError = class extends Error {
+  constructor(termination) {
+    super(`Host child terminated after ${termination.cause}`);
+    this.termination = termination;
+    this.name = "HostTerminationError";
+  }
+  termination;
+};
 function interruptionReason(value, fallback = "cancellation") {
   if (typeof value === "object" && value !== null) {
     const candidate = value;
@@ -32092,6 +32137,18 @@ function parseGraphPlan(value) {
   if (typeof value !== "string") return void 0;
   try {
     return GraphPlanSchema.parse(JSON.parse(value));
+  } catch {
+    return void 0;
+  }
+}
+function parseSemanticVerdict(value) {
+  if (typeof value === "object" && value !== null) {
+    const parsed = SemanticVerdictSchema.safeParse(value);
+    if (parsed.success) return parsed.data;
+  }
+  if (typeof value !== "string") return void 0;
+  try {
+    return SemanticVerdictSchema.parse(JSON.parse(value));
   } catch {
     return void 0;
   }
@@ -32224,6 +32281,58 @@ var CodexAdapter = class {
       await rm(schemaDirectory, { recursive: true, force: true });
     }
   }
+  async verify(request, signal) {
+    const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-verify-"));
+    const schemaPath = join(schemaDirectory, "semantic-verdict.schema.json");
+    await writeFile(schemaPath, JSON.stringify(semanticVerdictJsonSchema), "utf8");
+    const child = spawn("codex", codexSemanticVerifierArgs(request, schemaPath), {
+      cwd: request.repositoryPath,
+      env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    const exitPromise = new Promise(
+      (resolve3) => child.once("close", (code, closeSignal) => resolve3({ code, signal: closeSignal }))
+    );
+    const terminationController = new ChildTerminationController(child, signal);
+    child.stdin.end(renderSemanticVerifierPrompt(request.context));
+    let lastMessage = "";
+    let stderr = "";
+    let usage;
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    try {
+      const lines = createInterface({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
+      for await (const line of lines) {
+        if (!line.trim()) continue;
+        let event;
+        try {
+          event = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        const item = event.item;
+        if (event.type === "item.completed" && item?.type === "agent_message")
+          lastMessage = String(item.text ?? "");
+        if (event.type === "turn.completed") usage = codexUsage(event.usage);
+      }
+      const exit = await exitPromise;
+      const termination = terminationController.finish(exit.code, exit.signal);
+      if (termination) throw new HostTerminationError(termination);
+      const verdict = parseSemanticVerdict(lastMessage);
+      if (exit.code !== 0 || !verdict) {
+        throw new Error(
+          stderr.trim() || `Codex exited ${exit.code ?? 1} without a valid semantic verdict`
+        );
+      }
+      return { verdict, ...usage ? { usage } : {} };
+    } finally {
+      terminationController.dispose();
+      await rm(schemaDirectory, { recursive: true, force: true });
+    }
+  }
   async *execute(request, signal) {
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-"));
     const schemaPath = join(schemaDirectory, "worker-result.schema.json");
@@ -32334,6 +32443,21 @@ function codexWorkerArgs(request, schemaPath) {
     "-"
   ];
 }
+function codexSemanticVerifierArgs(request, schemaPath) {
+  return [
+    "exec",
+    "--json",
+    "--ephemeral",
+    "--ignore-user-config",
+    "-C",
+    request.repositoryPath,
+    "-s",
+    "read-only",
+    "--output-schema",
+    schemaPath,
+    "-"
+  ];
+}
 
 // packages/adapter-claude/src/index.ts
 import { spawn as spawn2 } from "node:child_process";
@@ -32358,6 +32482,18 @@ function parsePlan(value) {
   if (typeof value !== "string") return void 0;
   try {
     return GraphPlanSchema.parse(JSON.parse(value));
+  } catch {
+    return void 0;
+  }
+}
+function parseSemanticVerdict2(value) {
+  if (typeof value === "object" && value !== null) {
+    const parsed = SemanticVerdictSchema.safeParse(value);
+    if (parsed.success) return parsed.data;
+  }
+  if (typeof value !== "string") return void 0;
+  try {
+    return SemanticVerdictSchema.parse(JSON.parse(value));
   } catch {
     return void 0;
   }
@@ -32494,6 +32630,52 @@ var ClaudeAdapter = class {
       signal.removeEventListener("abort", abort);
     }
   }
+  async verify(request, signal) {
+    const child = spawn2("claude", claudeSemanticVerifierArgs(request), {
+      cwd: request.repositoryPath,
+      env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    const exitPromise = new Promise(
+      (resolve3) => child.once("close", (code, closeSignal) => resolve3({ code, signal: closeSignal }))
+    );
+    const terminationController = new ChildTerminationController(child, signal);
+    let stderr = "";
+    let verdict;
+    let usage;
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    try {
+      const lines = createInterface2({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
+      for await (const line of lines) {
+        if (!line.trim()) continue;
+        let event;
+        try {
+          event = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (event.type === "result") {
+          verdict = parseSemanticVerdict2(event.structured_output ?? event.result);
+          usage = claudeUsage(event.usage);
+        }
+      }
+      const exit = await exitPromise;
+      const termination = terminationController.finish(exit.code, exit.signal);
+      if (termination) throw new HostTerminationError(termination);
+      if (exit.code !== 0 || !verdict) {
+        throw new Error(
+          stderr.trim() || `Claude exited ${exit.code ?? 1} without a valid semantic verdict`
+        );
+      }
+      return { verdict, ...usage ? { usage } : {} };
+    } finally {
+      terminationController.dispose();
+    }
+  }
   async *execute(request, signal) {
     const args = claudeWorkerArgs(request);
     const child = spawn2("claude", args, {
@@ -32589,6 +32771,29 @@ function claudeWorkerArgs(request) {
     renderWorkerPrompt(request.capsule)
   ];
 }
+function claudeSemanticVerifierArgs(request) {
+  return [
+    "--print",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--permission-mode",
+    "dontAsk",
+    "--effort",
+    "low",
+    "--tools",
+    "Read,Glob,Grep",
+    "--allowedTools",
+    "Read,Glob,Grep",
+    "--disable-slash-commands",
+    "--strict-mcp-config",
+    "--mcp-config",
+    '{"mcpServers":{}}',
+    "--json-schema",
+    JSON.stringify(semanticVerdictJsonSchema),
+    renderSemanticVerifierPrompt(request.context)
+  ];
+}
 
 // packages/runtime/src/control.ts
 import { randomUUID as randomUUID4 } from "node:crypto";
@@ -32654,8 +32859,10 @@ var RunLock = class {
     } catch (error51) {
       if (error51.code !== "EEXIST") throw error51;
       let record2;
+      let observed = "";
       try {
-        record2 = JSON.parse(await readFile(this.path, "utf8"));
+        observed = await readFile(this.path, "utf8");
+        record2 = JSON.parse(observed);
       } catch {
       }
       const heartbeatAge = record2 ? Math.max(0, Date.now() - Date.parse(record2.heartbeatAt)) : await stat(this.path).then(({ mtimeMs }) => Math.max(0, Date.now() - mtimeMs)).catch(() => Number.POSITIVE_INFINITY);
@@ -32663,7 +32870,16 @@ var RunLock = class {
       const liveLocalProcess = record2 !== void 0 && sameHost && processExists(record2.pid);
       if (liveLocalProcess || !sameHost && heartbeatAge < staleAfterMs)
         throw new Error("Graphcraft run is already active");
-      await unlink(this.path);
+      const current = await readFile(this.path, "utf8").catch(
+        (readError) => {
+          if (readError.code === "ENOENT") return void 0;
+          throw readError;
+        }
+      );
+      if (current !== void 0 && current !== observed) return await this.acquire(staleAfterMs);
+      await unlink(this.path).catch((unlinkError) => {
+        if (unlinkError.code !== "ENOENT") throw unlinkError;
+      });
       return await this.acquire(staleAfterMs);
     }
     this.heartbeat = setInterval(() => {
@@ -33889,6 +34105,96 @@ async function captureProbes(store, specs, workspace, observer, signal) {
   }
   return executed;
 }
+function needsSemanticVerification(phase, probes, classification) {
+  const lacksCommandProof = probes.every(({ kind }) => kind !== "command");
+  if (!lacksCommandProof) return false;
+  if (phase === "completion") return true;
+  return classification === "stalled" || classification === "done";
+}
+async function runSemanticVerification(input) {
+  const invocationId = randomUUID5();
+  const context = SemanticVerifierContextSchema.parse({
+    schemaVersion: 1,
+    phase: input.phase,
+    runId: input.contract.runId,
+    nodeId: input.node.id,
+    objective: input.node.objective,
+    finishLine: input.contract.finishLine,
+    acceptanceAnchors: input.contract.acceptanceAnchors,
+    relevantPaths: input.node.contextSelector.relevantPaths,
+    workerSummary: input.workerSummary,
+    workerEvidence: input.workerEvidence,
+    baselineProbeEvidence: input.baselineProbeEvidence,
+    currentProbeEvidence: input.currentProbeEvidence
+  });
+  const beforeDigest = await workspaceDigest(input.workspace.path);
+  let verdictPersisted = false;
+  try {
+    const result = await input.adapter.verify(
+      {
+        invocationId,
+        repositoryPath: input.workspace.path,
+        context
+      },
+      input.signal
+    );
+    const afterDigest = await workspaceDigest(input.workspace.path);
+    const policyViolation = beforeDigest !== afterDigest;
+    const artifact = await input.store.writeArtifact(
+      `semantic/${invocationId}.json`,
+      `${JSON.stringify({ schemaVersion: 1, host: input.adapter.id, context, result, beforeDigest, afterDigest }, null, 2)}
+`
+    );
+    await input.store.append(
+      "host",
+      "semantic.verdict",
+      {
+        invocationId,
+        nodeId: input.node.id,
+        phase: input.phase,
+        host: input.adapter.id,
+        verdict: result.verdict,
+        usage: result.usage ?? null,
+        artifact,
+        policyViolation
+      },
+      invocationId
+    );
+    verdictPersisted = true;
+    if (result.usage)
+      await input.store.append(
+        "host",
+        "tokens.recorded",
+        { usage: result.usage, phase: "semantic_verification", nodeId: input.node.id },
+        invocationId
+      );
+    if (policyViolation)
+      throw new Error("The read-only semantic verifier changed the repository workspace");
+    return result.verdict;
+  } catch (error51) {
+    if (error51 instanceof HostTerminationError) throw error51;
+    if (verdictPersisted) throw error51;
+    const artifact = await input.store.writeArtifact(
+      `semantic/${invocationId}-error.json`,
+      `${JSON.stringify({ schemaVersion: 1, host: input.adapter.id, context, error: error51.message }, null, 2)}
+`
+    );
+    await input.store.append(
+      "host",
+      "semantic.verdict",
+      {
+        invocationId,
+        nodeId: input.node.id,
+        phase: input.phase,
+        host: input.adapter.id,
+        error: error51.message,
+        artifact
+      },
+      invocationId
+    );
+    throw error51;
+  }
+}
 function acceptedNodeIds(state) {
   return new Set(
     Object.entries(state.nodes).filter(([, value]) => value.status === "accepted").map(([id]) => id)
@@ -34086,10 +34392,49 @@ async function executeRun(input) {
         if (signal.aborted) return await finishInterruption(current.id);
         const results = executed.map(({ result }) => result);
         if (results.every(({ passed }) => passed)) {
+          let semanticEvidence2 = [];
+          if (needsSemanticVerification("completion", current.completionProbes)) {
+            let semanticVerdict;
+            try {
+              semanticVerdict = await runSemanticVerification({
+                phase: "completion",
+                adapter: input.adapter,
+                store: input.store,
+                contract,
+                node: current,
+                workspace,
+                workerSummary: "Deterministic completion probes passed",
+                workerEvidence: current.dependsOn.flatMap((nodeId) => {
+                  const predecessor = state.nodes[nodeId];
+                  return predecessor?.lastSummary ? [`${nodeId}: ${predecessor.lastSummary}`] : [];
+                }),
+                baselineProbeEvidence: [],
+                currentProbeEvidence: results,
+                signal
+              });
+            } catch (error51) {
+              if (signal.aborted)
+                return await finishInterruption(
+                  current.id,
+                  error51 instanceof HostTerminationError ? error51.termination : void 0
+                );
+              const reason = `Semantic completion verification failed: ${error51.message}`;
+              await input.store.append("host", "node.failed", { nodeId: current.id, reason });
+              await input.store.append("runtime", "run.blocked", { reason });
+              return await input.store.loadState();
+            }
+            semanticEvidence2 = semanticVerdict.evidence;
+            if (semanticVerdict.verdict !== "supported") {
+              const reason = `Semantic completion verdict was ${semanticVerdict.verdict}: ${semanticVerdict.rationale}`;
+              await input.store.append("host", "node.failed", { nodeId: current.id, reason });
+              await input.store.append("runtime", "run.blocked", { reason });
+              return await input.store.loadState();
+            }
+          }
           await input.store.append("probe", "node.progress", {
             nodeId: current.id,
             classification: "done",
-            evidence: results.map(({ summary }) => summary)
+            evidence: [...results.map(({ summary }) => summary), ...semanticEvidence2]
           });
           await input.store.append("probe", "node.accepted", { nodeId: current.id });
           continue;
@@ -34197,12 +34542,53 @@ async function executeRun(input) {
         afterProbes.map(({ result }) => result)
       );
       const measuredClassification = classifyProgress(baseline, currentEvidence);
-      const classification = measuredClassification === "stalled" && current.sideEffectClass === "none" && worker.result.evidence.length > 0 ? "learning" : measuredClassification;
+      let classification = measuredClassification;
+      let semanticEvidence = [];
+      let semanticStopReason;
+      if (current.sideEffectClass === "none" && worker.result.evidence.length > 0 && needsSemanticVerification("progress", current.progressProbes, measuredClassification)) {
+        let semanticVerdict;
+        try {
+          semanticVerdict = await runSemanticVerification({
+            phase: "progress",
+            adapter: input.adapter,
+            store: input.store,
+            contract,
+            node: current,
+            workspace,
+            workerSummary: worker.result.summary,
+            workerEvidence: worker.result.evidence,
+            baselineProbeEvidence: baselineProbeResults,
+            currentProbeEvidence: afterProbes.map(({ result }) => result),
+            signal
+          });
+        } catch (error51) {
+          if (signal.aborted)
+            return await finishInterruption(
+              current.id,
+              error51 instanceof HostTerminationError ? error51.termination : worker.termination,
+              worker.artifact
+            );
+          const reason = `Semantic progress verification failed: ${error51.message}`;
+          await input.store.append("host", "node.failed", { nodeId: current.id, reason });
+          await input.store.append("runtime", "run.blocked", { reason });
+          return await input.store.loadState();
+        }
+        semanticEvidence = semanticVerdict.evidence;
+        if (semanticVerdict.verdict === "supported") classification = "learning";
+        else {
+          classification = semanticVerdict.verdict === "unsupported" ? "stalled" : "blocked";
+          semanticStopReason = `Semantic progress verdict was ${semanticVerdict.verdict}: ${semanticVerdict.rationale}`;
+        }
+      }
       await input.store.append("probe", "node.progress", {
         nodeId: current.id,
         classification,
         summary: worker.result.summary,
-        evidence: [...worker.result.evidence, ...afterProbes.map(({ result }) => result.summary)]
+        evidence: [
+          ...worker.result.evidence,
+          ...afterProbes.map(({ result }) => result.summary),
+          ...semanticEvidence
+        ]
       });
       if (["done", "advanced", "learning"].includes(classification)) {
         await input.store.append("runtime", "node.accepted", {
@@ -34212,10 +34598,10 @@ async function executeRun(input) {
       } else {
         await input.store.append("runtime", "node.failed", {
           nodeId: current.id,
-          reason: `Progress classified as ${classification}`
+          reason: semanticStopReason ?? `Progress classified as ${classification}`
         });
         await input.store.append("runtime", "run.blocked", {
-          reason: `Stopped safely because progress was ${classification}`
+          reason: semanticStopReason ?? `Stopped safely because progress was ${classification}`
         });
         return await input.store.loadState();
       }

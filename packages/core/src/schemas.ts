@@ -222,6 +222,28 @@ export const ContextCapsuleSchema = z.strictObject({
   probeEvidence: z.array(z.string()),
 });
 
+export const SemanticVerifierContextSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  phase: z.enum(["progress", "completion"]),
+  runId: z.uuid(),
+  nodeId: z.string().min(1),
+  objective: z.string().min(1),
+  finishLine: FinishLineSchema,
+  acceptanceAnchors: z.array(AcceptanceAnchorSchema),
+  relevantPaths: z.array(z.string()),
+  workerSummary: z.string(),
+  workerEvidence: z.array(z.string()),
+  baselineProbeEvidence: z.array(ProbeResultSchema),
+  currentProbeEvidence: z.array(ProbeResultSchema),
+});
+
+export const SemanticVerdictSchema = z.strictObject({
+  verdict: z.enum(["supported", "unsupported", "uncertain"]),
+  evidence: z.array(z.string()),
+  rationale: z.string().min(1),
+  uncertainty: z.number().min(0).max(1),
+});
+
 export const HostCapabilitiesSchema = z.strictObject({
   installed: z.boolean(),
   authenticated: z.boolean(),
@@ -292,6 +314,7 @@ export const RunEventTypeSchema = z.enum([
   "invocation.resumed",
   "invocation.finished",
   "control.applied",
+  "semantic.verdict",
   "tokens.recorded",
   "graph.amended",
 ]);
@@ -353,6 +376,8 @@ export type Graph = z.infer<typeof GraphSchema>;
 export type TokenUsage = z.infer<typeof TokenUsageSchema>;
 export type WorkerResult = z.infer<typeof WorkerResultSchema>;
 export type ContextCapsule = z.infer<typeof ContextCapsuleSchema>;
+export type SemanticVerifierContext = z.infer<typeof SemanticVerifierContextSchema>;
+export type SemanticVerdict = z.infer<typeof SemanticVerdictSchema>;
 export type HostCapabilities = z.infer<typeof HostCapabilitiesSchema>;
 export type InterruptionCause = z.infer<typeof InterruptionCauseSchema>;
 export type HostTermination = z.infer<typeof HostTerminationSchema>;
@@ -363,3 +388,6 @@ export type RunState = z.infer<typeof RunStateSchema>;
 
 export const workerResultJsonSchema = z.toJSONSchema(WorkerResultSchema, { target: "draft-7" });
 export const graphPlanJsonSchema = z.toJSONSchema(GraphPlanSchema, { target: "draft-7" });
+export const semanticVerdictJsonSchema = z.toJSONSchema(SemanticVerdictSchema, {
+  target: "draft-7",
+});

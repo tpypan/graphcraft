@@ -53,8 +53,10 @@ export class RunLock {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       let record: LockRecord | undefined;
+      let observed = "";
       try {
-        record = JSON.parse(await readFile(this.path, "utf8")) as LockRecord;
+        observed = await readFile(this.path, "utf8");
+        record = JSON.parse(observed) as LockRecord;
       } catch {
         // A malformed lock is only recoverable after the stale window.
       }
@@ -67,7 +69,16 @@ export class RunLock {
       const liveLocalProcess = record !== undefined && sameHost && processExists(record.pid);
       if (liveLocalProcess || (!sameHost && heartbeatAge < staleAfterMs))
         throw new Error("Graphcraft run is already active");
-      await unlink(this.path);
+      const current = await readFile(this.path, "utf8").catch(
+        (readError: NodeJS.ErrnoException) => {
+          if (readError.code === "ENOENT") return undefined;
+          throw readError;
+        },
+      );
+      if (current !== undefined && current !== observed) return await this.acquire(staleAfterMs);
+      await unlink(this.path).catch((unlinkError: NodeJS.ErrnoException) => {
+        if (unlinkError.code !== "ENOENT") throw unlinkError;
+      });
       return await this.acquire(staleAfterMs);
     }
     this.heartbeat = setInterval(() => {

@@ -3,20 +3,26 @@ import { createInterface } from "node:readline";
 import {
   ChildTerminationController,
   GraphPlanSchema,
+  HostTerminationError,
   HostCapabilitiesSchema,
+  SemanticVerdictSchema,
   TokenUsageSchema,
   WorkerResultSchema,
   graphPlanJsonSchema,
   reconcilePersistedInvocation,
   renderPlannerPrompt,
+  renderSemanticVerifierPrompt,
   renderWorkerPrompt,
   workerResultJsonSchema,
+  semanticVerdictJsonSchema,
   type HostAdapter,
   type HostEvent,
   type InvocationRecord,
   type PlanningRequest,
   type PlanningResult,
   type ReconciliationResult,
+  type SemanticVerificationRequest,
+  type SemanticVerificationResult,
   type WorkerRequest,
 } from "@graphcraft/core";
 
@@ -41,6 +47,19 @@ function parsePlan(value: unknown) {
   if (typeof value !== "string") return undefined;
   try {
     return GraphPlanSchema.parse(JSON.parse(value));
+  } catch {
+    return undefined;
+  }
+}
+
+function parseSemanticVerdict(value: unknown) {
+  if (typeof value === "object" && value !== null) {
+    const parsed = SemanticVerdictSchema.safeParse(value);
+    if (parsed.success) return parsed.data;
+  }
+  if (typeof value !== "string") return undefined;
+  try {
+    return SemanticVerdictSchema.parse(JSON.parse(value));
   } catch {
     return undefined;
   }
@@ -183,6 +202,57 @@ export class ClaudeAdapter implements HostAdapter {
     }
   }
 
+  async verify(
+    request: SemanticVerificationRequest,
+    signal: AbortSignal,
+  ): Promise<SemanticVerificationResult> {
+    const child = spawn("claude", claudeSemanticVerifierArgs(request), {
+      cwd: request.repositoryPath,
+      env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolve) =>
+        child.once("close", (code, closeSignal) => resolve({ code, signal: closeSignal })),
+    );
+    const terminationController = new ChildTerminationController(child, signal);
+    let stderr = "";
+    let verdict: ReturnType<typeof SemanticVerdictSchema.parse> | undefined;
+    let usage: ReturnType<typeof TokenUsageSchema.parse> | undefined;
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    try {
+      const lines = createInterface({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
+      for await (const line of lines) {
+        if (!line.trim()) continue;
+        let event: Record<string, unknown>;
+        try {
+          event = JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          continue;
+        }
+        if (event.type === "result") {
+          verdict = parseSemanticVerdict(event.structured_output ?? event.result);
+          usage = claudeUsage(event.usage);
+        }
+      }
+      const exit = await exitPromise;
+      const termination = terminationController.finish(exit.code, exit.signal);
+      if (termination) throw new HostTerminationError(termination);
+      if (exit.code !== 0 || !verdict) {
+        throw new Error(
+          stderr.trim() || `Claude exited ${exit.code ?? 1} without a valid semantic verdict`,
+        );
+      }
+      return { verdict, ...(usage ? { usage } : {}) };
+    } finally {
+      terminationController.dispose();
+    }
+  }
+
   async *execute(request: WorkerRequest, signal: AbortSignal): AsyncIterable<HostEvent> {
     const args = claudeWorkerArgs(request);
     const child = spawn("claude", args, {
@@ -284,5 +354,29 @@ export function claudeWorkerArgs(request: WorkerRequest): string[] {
     "--json-schema",
     JSON.stringify(workerResultJsonSchema),
     renderWorkerPrompt(request.capsule),
+  ];
+}
+
+export function claudeSemanticVerifierArgs(request: SemanticVerificationRequest): string[] {
+  return [
+    "--print",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--permission-mode",
+    "dontAsk",
+    "--effort",
+    "low",
+    "--tools",
+    "Read,Glob,Grep",
+    "--allowedTools",
+    "Read,Glob,Grep",
+    "--disable-slash-commands",
+    "--strict-mcp-config",
+    "--mcp-config",
+    '{"mcpServers":{}}',
+    "--json-schema",
+    JSON.stringify(semanticVerdictJsonSchema),
+    renderSemanticVerifierPrompt(request.context),
   ];
 }

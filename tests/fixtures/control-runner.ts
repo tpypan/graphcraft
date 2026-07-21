@@ -12,6 +12,8 @@ import {
   type PlanningRequest,
   type PlanningResult,
   type ReconciliationResult,
+  type SemanticVerificationRequest,
+  type SemanticVerificationResult,
   type WorkerRequest,
 } from "../../packages/core/src/index.ts";
 import {
@@ -80,6 +82,10 @@ class ControlFixtureAdapter implements HostAdapter {
 
   async reconcile(invocation: InvocationRecord): Promise<ReconciliationResult> {
     return reconcilePersistedInvocation(invocation);
+  }
+
+  async verify(_request: SemanticVerificationRequest): Promise<SemanticVerificationResult> {
+    throw new Error("The control fixture does not perform semantic verification");
   }
 }
 

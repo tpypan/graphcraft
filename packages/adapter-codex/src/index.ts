@@ -6,20 +6,26 @@ import { createInterface } from "node:readline";
 import {
   ChildTerminationController,
   GraphPlanSchema,
+  HostTerminationError,
   HostCapabilitiesSchema,
+  SemanticVerdictSchema,
   TokenUsageSchema,
   WorkerResultSchema,
   graphPlanJsonSchema,
   reconcilePersistedInvocation,
   renderPlannerPrompt,
+  renderSemanticVerifierPrompt,
   renderWorkerPrompt,
   workerResultJsonSchema,
+  semanticVerdictJsonSchema,
   type HostAdapter,
   type HostEvent,
   type InvocationRecord,
   type PlanningRequest,
   type PlanningResult,
   type ReconciliationResult,
+  type SemanticVerificationRequest,
+  type SemanticVerificationResult,
   type WorkerRequest,
 } from "@graphcraft/core";
 
@@ -44,6 +50,21 @@ function parseGraphPlan(value: unknown): ReturnType<typeof GraphPlanSchema.parse
   if (typeof value !== "string") return undefined;
   try {
     return GraphPlanSchema.parse(JSON.parse(value));
+  } catch {
+    return undefined;
+  }
+}
+
+function parseSemanticVerdict(
+  value: unknown,
+): ReturnType<typeof SemanticVerdictSchema.parse> | undefined {
+  if (typeof value === "object" && value !== null) {
+    const parsed = SemanticVerdictSchema.safeParse(value);
+    if (parsed.success) return parsed.data;
+  }
+  if (typeof value !== "string") return undefined;
+  try {
+    return SemanticVerdictSchema.parse(JSON.parse(value));
   } catch {
     return undefined;
   }
@@ -183,6 +204,63 @@ export class CodexAdapter implements HostAdapter {
     }
   }
 
+  async verify(
+    request: SemanticVerificationRequest,
+    signal: AbortSignal,
+  ): Promise<SemanticVerificationResult> {
+    const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-verify-"));
+    const schemaPath = join(schemaDirectory, "semantic-verdict.schema.json");
+    await writeFile(schemaPath, JSON.stringify(semanticVerdictJsonSchema), "utf8");
+    const child = spawn("codex", codexSemanticVerifierArgs(request, schemaPath), {
+      cwd: request.repositoryPath,
+      env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolve) =>
+        child.once("close", (code, closeSignal) => resolve({ code, signal: closeSignal })),
+    );
+    const terminationController = new ChildTerminationController(child, signal);
+    child.stdin.end(renderSemanticVerifierPrompt(request.context));
+    let lastMessage = "";
+    let stderr = "";
+    let usage: ReturnType<typeof TokenUsageSchema.parse> | undefined;
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    try {
+      const lines = createInterface({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
+      for await (const line of lines) {
+        if (!line.trim()) continue;
+        let event: Record<string, unknown>;
+        try {
+          event = JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          continue;
+        }
+        const item = event.item as Record<string, unknown> | undefined;
+        if (event.type === "item.completed" && item?.type === "agent_message")
+          lastMessage = String(item.text ?? "");
+        if (event.type === "turn.completed") usage = codexUsage(event.usage);
+      }
+      const exit = await exitPromise;
+      const termination = terminationController.finish(exit.code, exit.signal);
+      if (termination) throw new HostTerminationError(termination);
+      const verdict = parseSemanticVerdict(lastMessage);
+      if (exit.code !== 0 || !verdict) {
+        throw new Error(
+          stderr.trim() || `Codex exited ${exit.code ?? 1} without a valid semantic verdict`,
+        );
+      }
+      return { verdict, ...(usage ? { usage } : {}) };
+    } finally {
+      terminationController.dispose();
+      await rm(schemaDirectory, { recursive: true, force: true });
+    }
+  }
+
   async *execute(request: WorkerRequest, signal: AbortSignal): AsyncIterable<HostEvent> {
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-"));
     const schemaPath = join(schemaDirectory, "worker-result.schema.json");
@@ -295,6 +373,25 @@ export function codexWorkerArgs(request: WorkerRequest, schemaPath: string): str
     request.repositoryPath,
     "-s",
     request.allowedTools.includes("write") ? "workspace-write" : "read-only",
+    "--output-schema",
+    schemaPath,
+    "-",
+  ];
+}
+
+export function codexSemanticVerifierArgs(
+  request: SemanticVerificationRequest,
+  schemaPath: string,
+): string[] {
+  return [
+    "exec",
+    "--json",
+    "--ephemeral",
+    "--ignore-user-config",
+    "-C",
+    request.repositoryPath,
+    "-s",
+    "read-only",
     "--output-schema",
     schemaPath,
     "-",

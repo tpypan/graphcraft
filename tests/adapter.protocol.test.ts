@@ -2,12 +2,16 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { describe, expect, it } from "vitest";
-import { codexWorkerArgs } from "../packages/adapter-codex/src/index.ts";
-import { claudeWorkerArgs } from "../packages/adapter-claude/src/index.ts";
+import { codexSemanticVerifierArgs, codexWorkerArgs } from "../packages/adapter-codex/src/index.ts";
+import {
+  claudeSemanticVerifierArgs,
+  claudeWorkerArgs,
+} from "../packages/adapter-claude/src/index.ts";
 import {
   reconcilePersistedInvocation,
   ChildTerminationController,
   type InvocationRecord,
+  type SemanticVerificationRequest,
   type WorkerRequest,
 } from "../packages/core/src/index.ts";
 
@@ -21,6 +25,14 @@ function request(
     capsule: {} as WorkerRequest["capsule"],
     allowedTools,
     ...(resumeSessionId ? { resumeSessionId } : {}),
+  };
+}
+
+function semanticRequest(): SemanticVerificationRequest {
+  return {
+    invocationId: randomUUID(),
+    repositoryPath: "/tmp/graphcraft fixture",
+    context: {} as SemanticVerificationRequest["context"],
   };
 }
 
@@ -61,6 +73,18 @@ describe("native host continuation protocol", () => {
       claude.slice(claude.indexOf("--permission-mode"), claude.indexOf("--permission-mode") + 2),
     ).toEqual(["--permission-mode", "dontAsk"]);
     expect(claude[claude.indexOf("--allowedTools") + 1]).toBe("Read,Glob,Grep");
+  });
+
+  it("uses fresh read-only profiles for isolated semantic verification", () => {
+    const codex = codexSemanticVerifierArgs(semanticRequest(), "/tmp/verdict.schema.json");
+    expect(codex).toContain("--ephemeral");
+    expect(codex.slice(codex.indexOf("-s"), codex.indexOf("-s") + 2)).toEqual(["-s", "read-only"]);
+    expect(codex).not.toContain("resume");
+
+    const claude = claudeSemanticVerifierArgs(semanticRequest());
+    expect(claude[claude.indexOf("--tools") + 1]).toBe("Read,Glob,Grep");
+    expect(claude[claude.indexOf("--allowedTools") + 1]).toBe("Read,Glob,Grep");
+    expect(claude.join(" ")).not.toMatch(/Bash|Edit|Write|--resume|--session-id/);
   });
 
   it("reconciles durable results before resumable or repository-recovery states", () => {

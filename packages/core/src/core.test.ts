@@ -9,6 +9,7 @@ import {
   evidenceSnapshot,
   graphPlanShape,
   reduceEvents,
+  semanticVerdictJsonSchema,
   validateGraph,
   verifyRunEvent,
   workerResultJsonSchema,
@@ -61,6 +62,10 @@ describe("run contracts and graphs", () => {
 
   it("exports a strict worker JSON schema", () => {
     expect(workerResultJsonSchema).toMatchObject({ type: "object", additionalProperties: false });
+    expect(semanticVerdictJsonSchema).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+    });
   });
 
   it("compiles a host-proposed graph without ceding contract or finish-line control", () => {

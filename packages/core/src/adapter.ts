@@ -6,6 +6,8 @@ import type {
   ProbePlan,
   ProbeSpec,
   RunContract,
+  SemanticVerifierContext,
+  SemanticVerdict,
   TokenUsage,
   WorkerResult,
 } from "./schemas.ts";
@@ -51,6 +53,17 @@ export interface WorkerRequest {
   resumeSessionId?: string;
 }
 
+export interface SemanticVerificationRequest {
+  invocationId: string;
+  repositoryPath: string;
+  context: SemanticVerifierContext;
+}
+
+export interface SemanticVerificationResult {
+  verdict: SemanticVerdict;
+  usage?: TokenUsage;
+}
+
 export interface InvocationRecord {
   invocationId: string;
   repositoryPath: string;
@@ -67,6 +80,10 @@ export interface ReconciliationResult {
 
 export interface HostAdapter extends GraphPlanner {
   execute(request: WorkerRequest, signal: AbortSignal): AsyncIterable<HostEvent>;
+  verify(
+    request: SemanticVerificationRequest,
+    signal: AbortSignal,
+  ): Promise<SemanticVerificationResult>;
   reconcile(invocation: InvocationRecord): Promise<ReconciliationResult>;
 }
 
