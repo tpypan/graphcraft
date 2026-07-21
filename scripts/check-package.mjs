@@ -9,7 +9,7 @@ if (packageMetadata.name !== "@tpypan/graphcraft") {
   throw new Error("The public package name must remain @tpypan/graphcraft");
 }
 if (packageMetadata.private === true) throw new Error("The public package cannot be private");
-if (packageMetadata.bin?.graphcraft !== "./dist/graphcraft.mjs") {
+if (packageMetadata.bin?.graphcraft !== "dist/graphcraft.mjs") {
   throw new Error("The package must expose the graphcraft executable");
 }
 if (packageMetadata.publishConfig?.access !== "public") {
