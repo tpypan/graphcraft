@@ -19087,11 +19087,13 @@ async function discoverVerificationProbes(repositoryPath) {
     const commandArgs = (script) => runner === "pnpm" ? [script] : ["run", script];
     for (const name of ["typecheck", "test", "build"]) {
       if (packageJson.scripts?.[name]) {
+        const packageArgs = commandArgs(name);
+        const windows = process.platform === "win32";
         probes.push({
           id: `package-${name}`,
           kind: "command",
-          command: runner,
-          args: commandArgs(name),
+          command: windows ? process.env.ComSpec ?? "cmd.exe" : runner,
+          args: windows ? ["/d", "/s", "/c", `${runner} ${packageArgs.join(" ")}`] : packageArgs,
           expectedExitCode: 0,
           timeoutMs: name === "test" ? 3e5 : 18e4
         });

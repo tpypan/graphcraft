@@ -131,11 +131,13 @@ export async function discoverVerificationProbes(repositoryPath: string): Promis
       runner === "pnpm" ? [script] : ["run", script];
     for (const name of ["typecheck", "test", "build"] as const) {
       if (packageJson.scripts?.[name]) {
+        const packageArgs = commandArgs(name);
+        const windows = process.platform === "win32";
         probes.push({
           id: `package-${name}`,
           kind: "command",
-          command: runner,
-          args: commandArgs(name),
+          command: windows ? (process.env.ComSpec ?? "cmd.exe") : runner,
+          args: windows ? ["/d", "/s", "/c", `${runner} ${packageArgs.join(" ")}`] : packageArgs,
           expectedExitCode: 0,
           timeoutMs: name === "test" ? 300_000 : 180_000,
         });
