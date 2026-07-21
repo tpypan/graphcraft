@@ -1,0 +1,9 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.graphcraft/
+coverage/
+dist/
+node_modules/
+*.log

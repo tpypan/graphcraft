@@ -1,0 +1,29 @@
+{
+  "name": "graphcraft",
+  "version": "0.1.0",
+  "description": "Progress-aware execution for long-running coding agents.",
+  "author": {
+    "name": "Tony Pan",
+    "url": "https://github.com/tpypan"
+  },
+  "homepage": "https://github.com/tpypan/graphcraft",
+  "repository": "https://github.com/tpypan/graphcraft",
+  "license": "MIT",
+  "keywords": [
+    "ai-agents",
+    "coding-agents",
+    "graph-engineering",
+    "long-running-agents"
+  ],
+  "interface": {
+    "displayName": "Graphcraft",
+    "shortDescription": "Keep coding agents making verified progress.",
+    "longDescription": "Graphcraft is a progress-aware execution layer for durable, grounded, token-efficient coding-agent workflows.",
+    "developerName": "Tony Pan",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": [
+      "Review the Graphcraft product and implementation plan."
+    ]
+  }
+}
