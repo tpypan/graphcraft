@@ -30961,6 +30961,70 @@ var EMPTY_COMPLETION_RESULT = {
 // packages/cli/src/index.ts
 import { createInterface as createInterface3 } from "node:readline/promises";
 
+// package.json
+var package_default = {
+  name: "@tpypan/graphcraft",
+  version: "0.1.1",
+  description: "Progress-aware execution for durable coding agents.",
+  license: "MIT",
+  author: {
+    name: "Tony Pan",
+    url: "https://github.com/tpypan"
+  },
+  homepage: "https://github.com/tpypan/graphcraft#readme",
+  repository: {
+    type: "git",
+    url: "git+https://github.com/tpypan/graphcraft.git"
+  },
+  bugs: {
+    url: "https://github.com/tpypan/graphcraft/issues"
+  },
+  keywords: [
+    "ai-agents",
+    "coding-agents",
+    "graph-engineering",
+    "long-running-agents",
+    "mcp"
+  ],
+  type: "module",
+  bin: {
+    graphcraft: "./dist/graphcraft.mjs"
+  },
+  files: [
+    "dist/graphcraft.mjs",
+    "dist/mcp.mjs"
+  ],
+  engines: {
+    node: ">=22"
+  },
+  publishConfig: {
+    access: "public"
+  },
+  packageManager: "pnpm@11.15.1",
+  scripts: {
+    build: "node scripts/build.mjs",
+    check: "pnpm format:check && pnpm typecheck && pnpm test && pnpm build && pnpm check:context && pnpm check:package",
+    "check:context": "node scripts/check-context-budget.mjs",
+    "check:package": "node scripts/check-package.mjs",
+    format: "prettier --write .",
+    "format:check": "prettier --check .",
+    graphcraft: "tsx packages/cli/src/bin.ts",
+    mcp: "tsx packages/mcp/src/bin.ts",
+    prepack: "node scripts/build.mjs",
+    test: "vitest run",
+    "test:watch": "vitest",
+    typecheck: "tsc --noEmit"
+  },
+  devDependencies: {
+    "@types/node": "26.1.1",
+    esbuild: "0.28.1",
+    prettier: "3.9.5",
+    tsx: "4.23.1",
+    typescript: "7.0.2",
+    vitest: "4.1.10"
+  }
+};
+
 // packages/adapter-codex/src/index.ts
 import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -32761,6 +32825,7 @@ async function stopRun(store, reason = "Stopped by user") {
 }
 
 // packages/cli/src/index.ts
+var GRAPHCRAFT_VERSION = package_default.version;
 function createAdapter(host) {
   return host === "claude" ? new ClaudeAdapter() : new CodexAdapter();
 }

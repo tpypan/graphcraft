@@ -5,6 +5,7 @@ import {
   consoleObserver,
   contractView,
   createAdapter,
+  GRAPHCRAFT_VERSION,
   handleAction,
   installHost,
   renderContract,
@@ -19,7 +20,7 @@ import { createRun, executeRun, stopRun } from "@graphcraft/runtime";
 const program = new Command()
   .name("graphcraft")
   .description("Progress-aware execution for durable coding agents")
-  .version("0.1.0")
+  .version(GRAPHCRAFT_VERSION)
   .showSuggestionAfterError();
 
 const hostOption = new Option("--host <host>", "coding-agent host")

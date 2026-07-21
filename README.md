@@ -11,18 +11,33 @@ Graphcraft is a local execution layer for long-running coding agents. It turns a
 
 Requirements: Git, Node.js 22+, and an authenticated Codex or Claude Code CLI.
 
+The public npm package is `@tpypan/graphcraft`; the unscoped `graphcraft` name belongs to an unrelated project. Once the first npm publication is live, install it globally with either package manager:
+
 ```bash
-git clone https://github.com/tpypan/graphcraft.git
-cd graphcraft
-node dist/graphcraft.mjs install --host claude
+npm install --global @tpypan/graphcraft
+graphcraft install --host codex
 ```
 
-Use `--host codex` for Codex. The repository includes the bundled runtime, so users do not need to install JavaScript dependencies. Installation registers one local MCP tool; Graphcraft does not inject a large prompt or install a skill. Start a new coding-agent session after installation.
+```bash
+pnpm add --global @tpypan/graphcraft
+graphcraft install --host claude
+```
+
+Until that registry publication is complete, install the same executable directly from GitHub:
+
+```bash
+npm install --global github:tpypan/graphcraft
+graphcraft install --host codex
+```
+
+For a one-shot installation, use `npx @tpypan/graphcraft install --host codex` or `pnpm dlx @tpypan/graphcraft install --host claude` after publication. The installer copies its MCP runtime to `~/.graphcraft/runtime/<version>/` before host registration, so clearing the package-manager cache does not break Graphcraft.
+
+Installation registers one local MCP tool; Graphcraft does not inject a large prompt or install a skill. Start a new coding-agent session after installation.
 
 You can also run Graphcraft directly:
 
 ```bash
-node dist/graphcraft.mjs run --host claude \
+graphcraft run --host claude \
   "migrate every v2 client call to v3 and verify the repository"
 ```
 
@@ -70,7 +85,7 @@ pnpm install
 pnpm check
 ```
 
-`pnpm check` formats, typechecks, tests, bundles both executables, and enforces the plugin discovery-context limit.
+`pnpm check` formats, typechecks, tests, bundles both executables, enforces the plugin discovery-context limit, and verifies the exact npm tarball contents.
 
 ## License
 

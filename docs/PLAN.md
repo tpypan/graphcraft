@@ -8,7 +8,7 @@ Implementation snapshot: [`docs/V0.1.md`](V0.1.md) records what the first runnab
 
 ### Current implementation boundary
 
-Version 0.1 implements the Milestone 0 protocol foundation and a bounded portion of the Milestone 1 local execution slice: versioned contracts and graphs, hashed event replay, materialized-state recovery, worktree isolation, Codex and Claude adapters, deterministic probes, progress leases, one repair amendment, local verification and commit finish lines, CLI controls, and a single-tool MCP surface. It is an alpha, not completion of Milestones 1–5. In particular, dual-host benchmark coverage, full interruption reconciliation, GitHub finish lines, marketplace distribution, and the stable 20% token-efficiency gate remain open.
+Version 0.1 implements the Milestone 0 protocol foundation and a bounded portion of the Milestone 1 local execution slice: versioned contracts and graphs, hashed event replay, materialized-state recovery, worktree isolation, Codex and Claude adapters, deterministic probes, progress leases, one repair amendment, local verification and commit finish lines, CLI controls, a single-tool MCP surface, and a package-manager-safe installer. It is an alpha, not completion of Milestones 1–5. In particular, dual-host benchmark coverage, full interruption reconciliation, GitHub finish lines, npm and marketplace publication, and the stable 20% token-efficiency gate remain open.
 
 ## 1. Product contract
 
@@ -64,13 +64,14 @@ The first stable release must:
 
 ### Installation and first value
 
-The target distribution order is:
+The public distribution layers are:
 
-1. official Codex and Claude plugin marketplaces;
-2. a guided Node installer for local development and unsupported marketplace states;
-3. manual installation only for contributors.
+1. the public npm package `@tpypan/graphcraft`, exposing the `graphcraft` executable;
+2. official Codex and Claude plugin marketplaces when their submission gates are met;
+3. direct GitHub package installation as the pre-publication and fallback path; and
+4. clone-and-build installation only for contributors.
 
-The installer detects the host, supports global or repository-local installation, is idempotent, and has explicit update and uninstall commands. It does not ask users to configure models, graph syntax, concurrency, or budgets before the first run.
+The unscoped npm name `graphcraft` is already owned by an unrelated GraphQL package, so the scoped package is the canonical identity while the user-facing command remains `graphcraft`. The installer accepts an explicit host, is idempotent, and has explicit update and uninstall commands. It copies the bundled MCP runtime to `~/.graphcraft/runtime/<version>/` before host registration; this makes `npx` and `pnpm dlx` safe even after their temporary caches are removed. It does not ask users to configure models, graph syntax, concurrency, or budgets before the first run.
 
 ### Starting a run
 
@@ -144,7 +145,7 @@ Before graph compilation, Graphcraft classifies whether the request benefits fro
 - No native extensions in the stable path; filesystem, process, locking, and Git operations use portable Node APIs and explicit subprocess argument arrays.
 - Zod schemas at untrusted and persisted boundaries, with JSON Schema exports for host structured output.
 - Vitest for unit and integration tests; a separate real-host evaluation harness for behavioral tests.
-- The executable is `graphcraft`. Package naming is deferred until publication credentials and namespace ownership are verified; internal workspace package names remain private until then.
+- The public package is `@tpypan/graphcraft` and its executable is `graphcraft`. Internal workspace package names remain private.
 
 Planned package boundaries:
 
@@ -344,7 +345,8 @@ Review fixes precede CI repair for the same head. After any push, stale CI and r
 
 ### Milestone 5 — stable distribution
 
-- Package native Codex and Claude plugins, guided installer, update, uninstall, and doctor flows.
+- Publish `@tpypan/graphcraft`, then continuously verify global npm/pnpm and one-shot npx/pnpm-dlx installation against clean user homes.
+- Package native Codex and Claude plugins plus update, uninstall, and doctor flows.
 - Publish a first-project tutorial and the migration demonstration.
 - Complete security review, threat model, privacy statement, contribution guide, and support policy.
 - Apply for official marketplaces.

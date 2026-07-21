@@ -1,6 +1,6 @@
 {
   "name": "graphcraft",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Progress-aware execution for long-running coding agents.",
   "author": {
     "name": "Tony Pan",

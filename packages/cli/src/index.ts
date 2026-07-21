@@ -1,9 +1,11 @@
 import { createInterface } from "node:readline/promises";
 import { spawn } from "node:child_process";
-import { access } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir } from "node:fs/promises";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { stdin, stdout } from "node:process";
+import packageMetadata from "../../../package.json" with { type: "json" };
 import { CodexAdapter } from "@graphcraft/adapter-codex";
 import { ClaudeAdapter } from "@graphcraft/adapter-claude";
 import type { HostAdapter, RunContract, RunState } from "@graphcraft/core";
@@ -18,6 +20,7 @@ import {
 } from "@graphcraft/runtime";
 
 export type HostName = "codex" | "claude";
+export const GRAPHCRAFT_VERSION = packageMetadata.version;
 
 export function createAdapter(host: HostName): HostAdapter {
   return host === "claude" ? new ClaudeAdapter() : new CodexAdapter();
@@ -55,8 +58,25 @@ export async function resolveBundledMcpPath(moduleUrl = import.meta.url): Promis
   throw new Error("dist/mcp.mjs is missing; run pnpm build before installing Graphcraft");
 }
 
+export function resolveGraphcraftHome(configuredHome = process.env.GRAPHCRAFT_HOME): string {
+  return configuredHome?.trim() ? resolve(configuredHome) : join(homedir(), ".graphcraft");
+}
+
+export async function stageBundledMcp(
+  sourcePath: string,
+  graphcraftHome = resolveGraphcraftHome(),
+): Promise<string> {
+  const runtimeDirectory = join(graphcraftHome, "runtime", GRAPHCRAFT_VERSION);
+  const runtimePath = join(runtimeDirectory, "mcp.mjs");
+  await mkdir(runtimeDirectory, { recursive: true });
+  if (resolve(sourcePath) !== resolve(runtimePath)) await copyFile(sourcePath, runtimePath);
+  await chmod(runtimePath, 0o755);
+  return runtimePath;
+}
+
 export async function installHost(host: HostName, mcpPath?: string): Promise<void> {
-  const resolvedMcpPath = mcpPath ?? (await resolveBundledMcpPath());
+  const bundledMcpPath = mcpPath ?? (await resolveBundledMcpPath());
+  const resolvedMcpPath = await stageBundledMcp(bundledMcpPath);
   if (host === "codex") {
     await runHostCommand("codex", ["mcp", "remove", "graphcraft"], true);
     await runHostCommand("codex", ["mcp", "add", "graphcraft", "--", "node", resolvedMcpPath]);
