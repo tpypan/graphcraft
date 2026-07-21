@@ -287,6 +287,34 @@ describe("durable runtime", () => {
     expect(evidence.files.map(({ path }) => path)).toContain("package.json");
   });
 
+  it("prioritizes task identifiers and acronyms over incidental planning prose", async () => {
+    const repository = await createRepository();
+    await mkdir(join(repository, "packages", "cli", "src"), { recursive: true });
+    await mkdir(join(repository, "packages", "core", "src"), { recursive: true });
+    await mkdir(join(repository, "tests"), { recursive: true });
+    await writeFile(
+      join(repository, "packages", "cli", "src", "index.ts"),
+      "export function renderContract() { return 'graph shape and completion proof'; }\n",
+    );
+    await writeFile(
+      join(repository, "packages", "core", "src", "graph.ts"),
+      "export const report = 'human readable graph shape with completion proof';\n",
+    );
+    await writeFile(
+      join(repository, "tests", "planner.live.test.ts"),
+      "const task = 'Extend the CLI renderContract report with human-readable graph shape and completion proof';\n",
+    );
+    await git(repository, "add", ".");
+    await git(repository, "commit", "-m", "add planning fixtures");
+
+    const evidence = await discoverPlanningEvidence(
+      repository,
+      "Extend the CLI renderContract report with human-readable graph shape and completion proof",
+    );
+
+    expect(evidence.files.map(({ path }) => path)).toContain("packages/cli/src/index.ts");
+  });
+
   it("persists and executes a validated host-planned graph with selected predecessor evidence", async () => {
     const repository = await createRepository();
     const adapter = new FakeAdapter(async (request) => {

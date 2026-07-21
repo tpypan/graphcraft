@@ -18082,7 +18082,7 @@ var RepositoryInventoryProbeSchema = external_exports.strictObject({
   paths: external_exports.array(external_exports.string().min(1)).min(1),
   terms: external_exports.array(external_exports.string().min(1)).min(1)
 });
-var ProbeSpecSchema = external_exports.discriminatedUnion("kind", [
+var ProbeSpecSchema = external_exports.union([
   CommandProbeSchema,
   FileProbeSchema,
   GitDiffProbeSchema,
@@ -18353,6 +18353,55 @@ var graphPlanJsonSchema = external_exports.toJSONSchema(GraphPlanSchema, { targe
 var semanticVerdictJsonSchema = external_exports.toJSONSchema(SemanticVerdictSchema, {
   target: "draft-7"
 });
+var unsupportedCodexSchemaKeywords = /* @__PURE__ */ new Set([
+  "$schema",
+  "default",
+  "exclusiveMaximum",
+  "exclusiveMinimum",
+  "format",
+  "maxItems",
+  "maxLength",
+  "maximum",
+  "minItems",
+  "minLength",
+  "minimum",
+  "multipleOf",
+  "pattern",
+  "uniqueItems"
+]);
+function codexStrictSchema(value) {
+  if (Array.isArray(value)) return value.map((item) => codexStrictSchema(item));
+  if (typeof value !== "object" || value === null) return value;
+  const source = value;
+  const output = {};
+  for (const [key, item] of Object.entries(source)) {
+    if (unsupportedCodexSchemaKeywords.has(key) || key === "properties" || key === "required")
+      continue;
+    if (key === "oneOf") output.anyOf = codexStrictSchema(item);
+    else if (key === "const") output.enum = [item];
+    else output[key] = codexStrictSchema(item);
+  }
+  if (source.properties && typeof source.properties === "object") {
+    const properties = source.properties;
+    const originallyRequired = new Set(
+      Array.isArray(source.required) ? source.required.map((item) => String(item)) : []
+    );
+    output.properties = Object.fromEntries(
+      Object.entries(properties).map(([key, schema]) => {
+        const transformed = codexStrictSchema(schema);
+        return [
+          key,
+          originallyRequired.has(key) ? transformed : { anyOf: [transformed, { type: "null" }] }
+        ];
+      })
+    );
+    output.required = Object.keys(properties);
+  }
+  return output;
+}
+var codexWorkerResultJsonSchema = codexStrictSchema(workerResultJsonSchema);
+var codexGraphPlanJsonSchema = codexStrictSchema(graphPlanJsonSchema);
+var codexSemanticVerdictJsonSchema = codexStrictSchema(semanticVerdictJsonSchema);
 
 // packages/core/src/capsule.ts
 function createContextCapsule(input) {
@@ -19145,26 +19194,33 @@ var ChildTerminationController = class {
 };
 
 // packages/adapter-codex/src/index.ts
+function omitNullObjectProperties(value) {
+  if (Array.isArray(value)) return value.map((item) => omitNullObjectProperties(item));
+  if (typeof value !== "object" || value === null) return value;
+  return Object.fromEntries(
+    Object.entries(value).filter(([, item]) => item !== null).map(([key, item]) => [key, omitNullObjectProperties(item)])
+  );
+}
 function parseJsonResult(value) {
   if (typeof value === "object" && value !== null) {
-    const parsed = WorkerResultSchema.safeParse(value);
+    const parsed = WorkerResultSchema.safeParse(omitNullObjectProperties(value));
     if (parsed.success) return parsed.data;
   }
   if (typeof value !== "string") return void 0;
   try {
-    return WorkerResultSchema.parse(JSON.parse(value));
+    return WorkerResultSchema.parse(omitNullObjectProperties(JSON.parse(value)));
   } catch {
     return void 0;
   }
 }
 function parseGraphPlan(value) {
   if (typeof value === "object" && value !== null) {
-    const parsed = GraphPlanSchema.safeParse(value);
+    const parsed = GraphPlanSchema.safeParse(omitNullObjectProperties(value));
     if (parsed.success) return parsed.data;
   }
   if (typeof value !== "string") return void 0;
   try {
-    return GraphPlanSchema.parse(JSON.parse(value));
+    return GraphPlanSchema.parse(omitNullObjectProperties(JSON.parse(value)));
   } catch {
     return void 0;
   }
@@ -19242,7 +19298,7 @@ var CodexAdapter = class {
   async plan(request, signal) {
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-plan-"));
     const schemaPath = join(schemaDirectory, "graph-plan.schema.json");
-    await writeFile(schemaPath, JSON.stringify(graphPlanJsonSchema), "utf8");
+    await writeFile(schemaPath, JSON.stringify(codexGraphPlanJsonSchema), "utf8");
     const child = spawn(
       "codex",
       [
@@ -19312,7 +19368,7 @@ var CodexAdapter = class {
   async verify(request, signal) {
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-verify-"));
     const schemaPath = join(schemaDirectory, "semantic-verdict.schema.json");
-    await writeFile(schemaPath, JSON.stringify(semanticVerdictJsonSchema), "utf8");
+    await writeFile(schemaPath, JSON.stringify(codexSemanticVerdictJsonSchema), "utf8");
     const child = spawn("codex", codexSemanticVerifierArgs(request, schemaPath), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -19364,7 +19420,7 @@ var CodexAdapter = class {
   async *execute(request, signal) {
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-"));
     const schemaPath = join(schemaDirectory, "worker-result.schema.json");
-    await writeFile(schemaPath, JSON.stringify(workerResultJsonSchema), "utf8");
+    await writeFile(schemaPath, JSON.stringify(codexWorkerResultJsonSchema), "utf8");
     const args = codexWorkerArgs(request, schemaPath);
     const child = spawn("codex", args, {
       cwd: request.repositoryPath,
@@ -20899,14 +20955,17 @@ var planningSearchStopWords = /* @__PURE__ */ new Set([
   "without"
 ]);
 function planningSearchTerms(task) {
+  const taskTokens = task.match(/[A-Za-z0-9]+/g) ?? [];
+  const identifiers = taskTokens.filter((word) => /[a-z][A-Z]/.test(word) || /^[A-Z0-9]{2,}$/.test(word)).map((word) => word.toLowerCase()).filter((word) => word.length >= 3 && !planningSearchStopWords.has(word));
   return [
-    ...new Set(
-      (task.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase().match(/[a-z0-9]+/g) ?? []).filter((word) => word.length >= 4 && !planningSearchStopWords.has(word)).map((word) => {
+    .../* @__PURE__ */ new Set([
+      ...identifiers,
+      ...(task.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase().match(/[a-z0-9]+/g) ?? []).filter((word) => word.length >= 4 && !planningSearchStopWords.has(word)).map((word) => {
         if (word.length >= 8 && word.endsWith("ing")) return word.slice(0, -3);
         if (word.length >= 8 && word.endsWith("ed")) return word.slice(0, -2);
         return word.length >= 8 ? word.slice(0, 6) : word;
       })
-    )
+    ])
   ].slice(0, 12);
 }
 function taskSnippet(content, terms, maximumCharacters) {

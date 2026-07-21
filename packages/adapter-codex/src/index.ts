@@ -11,13 +11,13 @@ import {
   SemanticVerdictSchema,
   TokenUsageSchema,
   WorkerResultSchema,
-  graphPlanJsonSchema,
+  codexGraphPlanJsonSchema,
+  codexSemanticVerdictJsonSchema,
+  codexWorkerResultJsonSchema,
   reconcilePersistedInvocation,
   renderPlannerPrompt,
   renderSemanticVerifierPrompt,
   renderWorkerPrompt,
-  workerResultJsonSchema,
-  semanticVerdictJsonSchema,
   type HostAdapter,
   type HostEvent,
   type InvocationRecord,
@@ -29,14 +29,24 @@ import {
   type WorkerRequest,
 } from "@graphcraft/core";
 
+function omitNullObjectProperties(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => omitNullObjectProperties(item));
+  if (typeof value !== "object" || value === null) return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([, item]) => item !== null)
+      .map(([key, item]) => [key, omitNullObjectProperties(item)]),
+  );
+}
+
 function parseJsonResult(value: unknown): ReturnType<typeof WorkerResultSchema.parse> | undefined {
   if (typeof value === "object" && value !== null) {
-    const parsed = WorkerResultSchema.safeParse(value);
+    const parsed = WorkerResultSchema.safeParse(omitNullObjectProperties(value));
     if (parsed.success) return parsed.data;
   }
   if (typeof value !== "string") return undefined;
   try {
-    return WorkerResultSchema.parse(JSON.parse(value));
+    return WorkerResultSchema.parse(omitNullObjectProperties(JSON.parse(value)));
   } catch {
     return undefined;
   }
@@ -44,12 +54,12 @@ function parseJsonResult(value: unknown): ReturnType<typeof WorkerResultSchema.p
 
 function parseGraphPlan(value: unknown): ReturnType<typeof GraphPlanSchema.parse> | undefined {
   if (typeof value === "object" && value !== null) {
-    const parsed = GraphPlanSchema.safeParse(value);
+    const parsed = GraphPlanSchema.safeParse(omitNullObjectProperties(value));
     if (parsed.success) return parsed.data;
   }
   if (typeof value !== "string") return undefined;
   try {
-    return GraphPlanSchema.parse(JSON.parse(value));
+    return GraphPlanSchema.parse(omitNullObjectProperties(JSON.parse(value)));
   } catch {
     return undefined;
   }
@@ -135,7 +145,7 @@ export class CodexAdapter implements HostAdapter {
   async plan(request: PlanningRequest, signal: AbortSignal): Promise<PlanningResult> {
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-plan-"));
     const schemaPath = join(schemaDirectory, "graph-plan.schema.json");
-    await writeFile(schemaPath, JSON.stringify(graphPlanJsonSchema), "utf8");
+    await writeFile(schemaPath, JSON.stringify(codexGraphPlanJsonSchema), "utf8");
     const child = spawn(
       "codex",
       [
@@ -210,7 +220,7 @@ export class CodexAdapter implements HostAdapter {
   ): Promise<SemanticVerificationResult> {
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-verify-"));
     const schemaPath = join(schemaDirectory, "semantic-verdict.schema.json");
-    await writeFile(schemaPath, JSON.stringify(semanticVerdictJsonSchema), "utf8");
+    await writeFile(schemaPath, JSON.stringify(codexSemanticVerdictJsonSchema), "utf8");
     const child = spawn("codex", codexSemanticVerifierArgs(request, schemaPath), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -264,7 +274,7 @@ export class CodexAdapter implements HostAdapter {
   async *execute(request: WorkerRequest, signal: AbortSignal): AsyncIterable<HostEvent> {
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-"));
     const schemaPath = join(schemaDirectory, "worker-result.schema.json");
-    await writeFile(schemaPath, JSON.stringify(workerResultJsonSchema), "utf8");
+    await writeFile(schemaPath, JSON.stringify(codexWorkerResultJsonSchema), "utf8");
     const args = codexWorkerArgs(request, schemaPath);
     const child = spawn("codex", args, {
       cwd: request.repositoryPath,

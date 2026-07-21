@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   classifyProgress,
   classifyTask,
+  codexGraphPlanJsonSchema,
+  codexSemanticVerdictJsonSchema,
+  codexWorkerResultJsonSchema,
   compileGraph,
   compilePlannedGraph,
   compileRunContract,
@@ -65,6 +68,41 @@ describe("run contracts and graphs", () => {
     expect(semanticVerdictJsonSchema).toMatchObject({
       type: "object",
       additionalProperties: false,
+    });
+  });
+
+  it("exports Codex-compatible strict output schemas", () => {
+    const assertRequiredProperties = (value: unknown): void => {
+      if (Array.isArray(value)) {
+        for (const item of value) assertRequiredProperties(item);
+        return;
+      }
+      if (typeof value !== "object" || value === null) return;
+      const record = value as Record<string, unknown>;
+      if (record.properties && typeof record.properties === "object") {
+        expect(new Set(record.required as string[])).toEqual(
+          new Set(Object.keys(record.properties as Record<string, unknown>)),
+        );
+      }
+      for (const item of Object.values(record)) assertRequiredProperties(item);
+    };
+    for (const schema of [
+      codexGraphPlanJsonSchema,
+      codexWorkerResultJsonSchema,
+      codexSemanticVerdictJsonSchema,
+    ]) {
+      const serialized = JSON.stringify(schema);
+      expect(serialized).not.toMatch(
+        /"(?:oneOf|default|format|maximum|minimum|minItems|minLength|pattern)"/,
+      );
+      assertRequiredProperties(schema);
+    }
+    expect(codexWorkerResultJsonSchema).toMatchObject({
+      properties: {
+        nextSuggestedObjective: {
+          anyOf: [{ type: "string" }, { type: "null" }],
+        },
+      },
     });
   });
 

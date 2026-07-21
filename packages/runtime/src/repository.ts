@@ -66,9 +66,15 @@ const planningSearchStopWords = new Set([
 ]);
 
 function planningSearchTerms(task: string): string[] {
+  const taskTokens = task.match(/[A-Za-z0-9]+/g) ?? [];
+  const identifiers = taskTokens
+    .filter((word) => /[a-z][A-Z]/.test(word) || /^[A-Z0-9]{2,}$/.test(word))
+    .map((word) => word.toLowerCase())
+    .filter((word) => word.length >= 3 && !planningSearchStopWords.has(word));
   return [
-    ...new Set(
-      (
+    ...new Set([
+      ...identifiers,
+      ...(
         task
           .replace(/([a-z])([A-Z])/g, "$1 $2")
           .toLowerCase()
@@ -80,7 +86,7 @@ function planningSearchTerms(task: string): string[] {
           if (word.length >= 8 && word.endsWith("ed")) return word.slice(0, -2);
           return word.length >= 8 ? word.slice(0, 6) : word;
         }),
-    ),
+    ]),
   ].slice(0, 12);
 }
 

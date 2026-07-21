@@ -98,7 +98,7 @@ export const RepositoryInventoryProbeSchema = z.strictObject({
   terms: z.array(z.string().min(1)).min(1),
 });
 
-export const ProbeSpecSchema = z.discriminatedUnion("kind", [
+export const ProbeSpecSchema = z.union([
   CommandProbeSchema,
   FileProbeSchema,
   GitDiffProbeSchema,
@@ -425,3 +425,55 @@ export const graphPlanJsonSchema = z.toJSONSchema(GraphPlanSchema, { target: "dr
 export const semanticVerdictJsonSchema = z.toJSONSchema(SemanticVerdictSchema, {
   target: "draft-7",
 });
+
+const unsupportedCodexSchemaKeywords = new Set([
+  "$schema",
+  "default",
+  "exclusiveMaximum",
+  "exclusiveMinimum",
+  "format",
+  "maxItems",
+  "maxLength",
+  "maximum",
+  "minItems",
+  "minLength",
+  "minimum",
+  "multipleOf",
+  "pattern",
+  "uniqueItems",
+]);
+
+function codexStrictSchema(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => codexStrictSchema(item));
+  if (typeof value !== "object" || value === null) return value;
+  const source = value as Record<string, unknown>;
+  const output: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(source)) {
+    if (unsupportedCodexSchemaKeywords.has(key) || key === "properties" || key === "required")
+      continue;
+    if (key === "oneOf") output.anyOf = codexStrictSchema(item);
+    else if (key === "const") output.enum = [item];
+    else output[key] = codexStrictSchema(item);
+  }
+  if (source.properties && typeof source.properties === "object") {
+    const properties = source.properties as Record<string, unknown>;
+    const originallyRequired = new Set(
+      Array.isArray(source.required) ? source.required.map((item) => String(item)) : [],
+    );
+    output.properties = Object.fromEntries(
+      Object.entries(properties).map(([key, schema]) => {
+        const transformed = codexStrictSchema(schema);
+        return [
+          key,
+          originallyRequired.has(key) ? transformed : { anyOf: [transformed, { type: "null" }] },
+        ];
+      }),
+    );
+    output.required = Object.keys(properties);
+  }
+  return output;
+}
+
+export const codexWorkerResultJsonSchema = codexStrictSchema(workerResultJsonSchema);
+export const codexGraphPlanJsonSchema = codexStrictSchema(graphPlanJsonSchema);
+export const codexSemanticVerdictJsonSchema = codexStrictSchema(semanticVerdictJsonSchema);
