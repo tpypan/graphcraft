@@ -4,6 +4,10 @@
 !.env.example
 .graphcraft/
 /docs/plans/
+/docs/CURRENT.md
+/docs/ALPHA_ROADMAP.md
+/docs/REMAINING_GAPS.md
+/docs/PROJECT_BRIEF.md
 coverage/
 node_modules/
 *.log

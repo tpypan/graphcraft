@@ -141,6 +141,17 @@ export const GraphNodeSchema = z.strictObject({
   status: NodeStatusSchema,
 });
 
+export const PlannedGraphNodeSchema = GraphNodeSchema.omit({
+  outputSchema: true,
+  status: true,
+});
+
+export const GraphPlanSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  family: z.enum(["bug", "feature", "migration", "refactor", "audit"]),
+  nodes: z.array(PlannedGraphNodeSchema).min(1),
+});
+
 export const ControlEdgeSchema = z.strictObject({
   from: z.string().min(1),
   to: z.string().min(1),
@@ -197,6 +208,7 @@ export const HostCapabilitiesSchema = z.strictObject({
 
 export const HostEventSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("started"), invocationId: z.string() }),
+  z.strictObject({ type: z.literal("session"), hostSessionId: z.string().min(1) }),
   z.strictObject({ type: z.literal("message"), text: z.string() }),
   z.strictObject({ type: z.literal("tool"), name: z.string(), summary: z.string() }),
   z.strictObject({ type: z.literal("result"), result: WorkerResultSchema }),
@@ -218,6 +230,8 @@ export const RunEventTypeSchema = z.enum([
   "node.failed",
   "node.reset",
   "invocation.started",
+  "invocation.session",
+  "invocation.resumed",
   "invocation.finished",
   "tokens.recorded",
   "graph.amended",
@@ -272,6 +286,8 @@ export type RunContract = z.infer<typeof RunContractSchema>;
 export type ProbeSpec = z.infer<typeof ProbeSpecSchema>;
 export type ProbeResult = z.infer<typeof ProbeResultSchema>;
 export type GraphNode = z.infer<typeof GraphNodeSchema>;
+export type PlannedGraphNode = z.infer<typeof PlannedGraphNodeSchema>;
+export type GraphPlan = z.infer<typeof GraphPlanSchema>;
 export type Graph = z.infer<typeof GraphSchema>;
 export type TokenUsage = z.infer<typeof TokenUsageSchema>;
 export type WorkerResult = z.infer<typeof WorkerResultSchema>;
@@ -282,3 +298,4 @@ export type RunEvent = z.infer<typeof RunEventSchema>;
 export type RunState = z.infer<typeof RunStateSchema>;
 
 export const workerResultJsonSchema = z.toJSONSchema(WorkerResultSchema, { target: "draft-7" });
+export const graphPlanJsonSchema = z.toJSONSchema(GraphPlanSchema, { target: "draft-7" });

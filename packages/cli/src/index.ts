@@ -8,7 +8,13 @@ import { stdin, stdout } from "node:process";
 import packageMetadata from "../../../package.json" with { type: "json" };
 import { CodexAdapter } from "@graphcraft/adapter-codex";
 import { ClaudeAdapter } from "@graphcraft/adapter-claude";
-import type { HostAdapter, RunContract, RunState } from "@graphcraft/core";
+import {
+  graphPlanShape,
+  type Graph,
+  type HostAdapter,
+  type RunContract,
+  type RunState,
+} from "@graphcraft/core";
 import {
   RunStore,
   createRun,
@@ -109,7 +115,18 @@ export function shouldBypassGraph(task: string): boolean {
   return words <= 8 && !durableSignal;
 }
 
-export function contractView(contract: RunContract): Record<string, unknown> {
+export function contractView(contract: RunContract, graph?: Graph): Record<string, unknown> {
+  const completionProbes = graph?.nodes.flatMap((node) =>
+    node.completionProbes.map((probe) => ({
+      id: probe.id,
+      kind: probe.kind,
+      ...(probe.kind === "command"
+        ? { command: [probe.command, ...probe.args].join(" "), cwd: probe.cwd ?? "." }
+        : {}),
+      ...(probe.kind === "file" ? { path: probe.path } : {}),
+      ...(probe.kind === "git_diff" ? { baseSha: probe.baseSha } : {}),
+    })),
+  );
   return {
     runId: contract.runId,
     outcome: contract.outcome,
@@ -122,6 +139,8 @@ export function contractView(contract: RunContract): Record<string, unknown> {
       description,
       owner,
     })),
+    ...(graph ? { planShape: graphPlanShape(graph) } : {}),
+    ...(completionProbes ? { completionProbes } : {}),
     recovery: "Checkpoint after every event; accepted nodes are never repeated",
   };
 }
@@ -141,25 +160,27 @@ export function stateView(state: RunState, contract: RunContract): Record<string
   };
 }
 
-export function renderContract(contract: RunContract): string {
-  const view = contractView(contract);
+export function renderContract(contract: RunContract, graph: Graph): string {
+  const view = contractView(contract, graph);
   return [
     `Run            ${contract.runId}`,
     `Outcome        ${view.outcome}`,
     `Finish line    ${view.finishLine}`,
     `Repository     ${view.repository}`,
     `Permissions    ${contract.permissions.join(", ")}`,
+    `Proof          ${graph.nodes
+      .flatMap((node) => node.completionProbes.map((probe) => probe.id))
+      .join(", ")}`,
     `Recovery       ${view.recovery}`,
-    "Plan           implement → verify" +
-      (contract.finishLine.kind === "committed" ? " → commit" : ""),
+    `Plan           ${view.planShape}`,
   ].join("\n");
 }
 
-export async function askForApproval(contract: RunContract): Promise<boolean> {
+export async function askForApproval(contract: RunContract, graph: Graph): Promise<boolean> {
   if (!stdin.isTTY || !stdout.isTTY) return false;
   const prompt = createInterface({ input: stdin, output: stdout });
   try {
-    const answer = await prompt.question(`${renderContract(contract)}\n\nStart? [Y/n] `);
+    const answer = await prompt.question(`${renderContract(contract, graph)}\n\nStart? [Y/n] `);
     return !/^n(?:o)?$/i.test(answer.trim());
   } finally {
     prompt.close();
@@ -219,14 +240,17 @@ export async function handleAction(input: McpActionInput): Promise<Record<string
         "Graphcraft v0.1 supports local_verified and committed finish lines. It will not silently narrow a requested remote finish line.",
       );
     }
+    const adapter = createAdapter(input.host ?? "codex");
     const created = await createRun(input.task, {
       cwd,
+      planner: adapter,
       ...(input.finishLine ? { finishLine: input.finishLine } : {}),
     });
-    if (!input.approve) return { approvalRequired: true, contract: contractView(created.contract) };
+    if (!input.approve)
+      return { approvalRequired: true, contract: contractView(created.contract, created.graph) };
     const state = await executeRun({
       store: created.store,
-      adapter: createAdapter(input.host ?? "codex"),
+      adapter,
       approve: true,
     });
     return stateView(state, created.contract);
@@ -250,7 +274,7 @@ export async function handleAction(input: McpActionInput): Promise<Record<string
   }
   if (input.action === "resume") {
     if (state.status === "awaiting_approval" && !input.approve) {
-      return { approvalRequired: true, contract: contractView(contract) };
+      return { approvalRequired: true, contract: contractView(contract, graph) };
     }
     const resumed = await executeRun({
       store,

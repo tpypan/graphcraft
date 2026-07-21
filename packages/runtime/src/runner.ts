@@ -5,21 +5,27 @@ import {
   WorkerResultSchema,
   classifyProgress,
   compileGraph,
+  compilePlannedGraph,
   compileRunContract,
   contentHash,
   createContextCapsule,
   evidenceSnapshot,
+  type EvidenceSnapshot,
   type Graph,
+  type GraphPlanner,
   type GraphNode,
   type HostAdapter,
   type HostEvent,
+  type InvocationRecord,
   type ProbeResult,
   type RunContract,
   type RunState,
+  type TokenUsage,
   type WorkerResult,
 } from "@graphcraft/core";
 import {
   discoverVerificationProbes,
+  runProcess,
   runProbes,
   workspaceDigest,
   type ExecutedProbe,
@@ -27,6 +33,7 @@ import {
 import { RunLock } from "./lock.ts";
 import {
   createAtomicCommit,
+  discoverPlanningEvidence,
   createRunWorkspace,
   discoverRepository,
   type RunWorkspace,
@@ -36,6 +43,8 @@ import { RunStore } from "./store.ts";
 export interface CreateRunOptions {
   cwd: string;
   finishLine?: "local_verified" | "committed";
+  planner?: GraphPlanner;
+  signal?: AbortSignal;
 }
 
 export interface RunObserverEvent {
@@ -44,6 +53,109 @@ export interface RunObserverEvent {
 }
 
 export type RunObserver = (event: RunObserverEvent) => void;
+
+interface RecoverableInvocation {
+  adapterId: string;
+  nodeId: string;
+  record: InvocationRecord;
+}
+
+function persistedBaseline(value: unknown): EvidenceSnapshot | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const candidate = value as Partial<EvidenceSnapshot>;
+  if (
+    typeof candidate.digest !== "string" ||
+    typeof candidate.workspaceDigest !== "string" ||
+    typeof candidate.passed !== "number" ||
+    typeof candidate.failed !== "number" ||
+    typeof candidate.failureSignature !== "string" ||
+    !Array.isArray(candidate.probeResults)
+  )
+    return undefined;
+  return candidate as EvidenceSnapshot;
+}
+
+async function recoverableInvocation(
+  store: RunStore,
+  nodeId: string,
+  repositoryPath: string,
+): Promise<RecoverableInvocation | undefined> {
+  const events = await store.loadEvents();
+  const started = events.findLast(
+    ({ type, data }) =>
+      type === "invocation.started" &&
+      data.nodeId === nodeId &&
+      typeof data.invocationId === "string",
+  );
+  if (!started) return undefined;
+  const invocationId = String(started.data.invocationId);
+  const finished = events.findLast(
+    ({ type, data }) => type === "invocation.finished" && data.invocationId === invocationId,
+  );
+  if (finished && finished.data.success !== true) return undefined;
+  const session = events.findLast(
+    ({ type, data }) =>
+      type === "invocation.session" &&
+      data.invocationId === invocationId &&
+      typeof data.hostSessionId === "string",
+  );
+  const transcript = await store.loadInvocationEvents(invocationId).catch(() => []);
+  const transcriptSession = transcript.findLast((event) => event.type === "session");
+  const hostSessionId = session
+    ? String(session.data.hostSessionId)
+    : transcriptSession?.type === "session"
+      ? transcriptSession.hostSessionId
+      : undefined;
+  const baseline = persistedBaseline(started.data.baseline);
+  return {
+    adapterId: String(started.data.adapter ?? ""),
+    nodeId,
+    record: {
+      invocationId,
+      repositoryPath,
+      startedAt: started.timestamp,
+      ...(hostSessionId ? { hostSessionId } : {}),
+      ...(baseline ? { baseline } : {}),
+      transcript,
+    },
+  };
+}
+
+async function recordMissingUsage(store: RunStore, invocation: InvocationRecord): Promise<void> {
+  const transcriptUsage = (invocation.transcript ?? []).filter(
+    (event): event is Extract<HostEvent, { type: "usage" }> => event.type === "usage",
+  );
+  const events = await store.loadEvents();
+  const recordedCount = events.filter(
+    ({ type, causationId }) =>
+      type === "tokens.recorded" && causationId === invocation.invocationId,
+  ).length;
+  for (const event of transcriptUsage.slice(recordedCount))
+    await store.append(
+      "host",
+      "tokens.recorded",
+      { usage: event.usage, recovered: true },
+      invocation.invocationId,
+    );
+}
+
+async function validatePlannedContext(graph: Graph, repositoryPath: string): Promise<void> {
+  for (const node of graph.nodes) {
+    if (node.kind === "commit") continue;
+    if (node.contextSelector.relevantPaths.length === 0)
+      throw new Error(`Planned node ${node.id} did not select repository evidence`);
+    for (const relevantPath of node.contextSelector.relevantPaths) {
+      const result = await runProcess("git", ["ls-files", "--", relevantPath], {
+        cwd: repositoryPath,
+        timeoutMs: 30_000,
+      });
+      if (result.exitCode !== 0 || result.stdout.trim().length === 0)
+        throw new Error(
+          `Planned node ${node.id} selected nonexistent or untracked context path ${relevantPath}`,
+        );
+    }
+  }
+}
 
 export async function createRun(
   task: string,
@@ -54,12 +166,45 @@ export async function createRun(
   store: RunStore;
 }> {
   const repository = await discoverRepository(options.cwd);
-  const probes = await discoverVerificationProbes(repository.root);
+  const [probes, repositoryEvidence] = await Promise.all([
+    discoverVerificationProbes(repository.root),
+    discoverPlanningEvidence(repository.root, task),
+  ]);
   const contract = compileRunContract(task, repository, {
     ...(options.finishLine ? { finishLine: options.finishLine } : {}),
   });
-  const graph = compileGraph(contract, probes);
+  let graph: Graph;
+  let planningUsage: TokenUsage | undefined;
+  if (options.planner) {
+    const capabilities = await options.planner.probe();
+    if (
+      !capabilities.installed ||
+      !capabilities.authenticated ||
+      !capabilities.structuredOutput ||
+      !capabilities.streamingEvents
+    ) {
+      throw new Error(
+        `${options.planner.id} is not authenticated or does not provide the required structured unattended interface`,
+      );
+    }
+    const planned = await options.planner.plan(
+      {
+        contract,
+        repositoryPath: repository.root,
+        repositoryEvidence,
+        verificationProbes: probes,
+      },
+      options.signal ?? new AbortController().signal,
+    );
+    graph = compilePlannedGraph(contract, planned.plan, probes);
+    await validatePlannedContext(graph, repository.root);
+    planningUsage = planned.usage;
+  } else {
+    graph = compileGraph(contract, probes);
+  }
   const store = await RunStore.create(repository.root, contract, graph);
+  if (planningUsage)
+    await store.append("host", "tokens.recorded", { usage: planningUsage, phase: "planning" });
   return { contract, graph, store };
 }
 
@@ -69,51 +214,112 @@ async function executeWorker(input: {
   contract: RunContract;
   node: GraphNode;
   workspace: RunWorkspace;
+  predecessorEvidence?: string[];
   probeResults?: ProbeResult[];
   observer?: RunObserver;
   signal: AbortSignal;
+  baseline: EvidenceSnapshot;
+  resume?: InvocationRecord;
 }): Promise<{ result?: WorkerResult; error?: string }> {
   const capsule = createContextCapsule({
     contract: input.contract,
     node: input.node,
+    ...(input.predecessorEvidence ? { predecessorEvidence: input.predecessorEvidence } : {}),
     ...(input.probeResults ? { probeResults: input.probeResults } : {}),
   });
   const capsuleHash = contentHash(capsule);
   await input.store.writeCapsule(capsuleHash, capsule);
-  const invocationId = randomUUID();
-  await input.store.append("runtime", "invocation.started", {
-    invocationId,
-    nodeId: input.node.id,
-    adapter: input.adapter.id,
-    capsuleHash,
-  });
-  const transcript: HostEvent[] = [];
+  let invocationId = input.resume?.invocationId ?? randomUUID();
+  let resumeSessionId: string | undefined;
+  if (input.resume) {
+    await recordMissingUsage(input.store, input.resume);
+    const reconciliation = await input.adapter.reconcile(input.resume);
+    if (reconciliation.state === "completed" && reconciliation.result) {
+      const artifact = join(
+        input.store.runRoot,
+        "artifacts",
+        "invocations",
+        `${invocationId}.jsonl`,
+      );
+      await input.store.append(
+        "runtime",
+        "invocation.finished",
+        { invocationId, nodeId: input.node.id, artifact, success: true, recovered: true },
+        invocationId,
+      );
+      return { result: WorkerResultSchema.parse(reconciliation.result) };
+    }
+    if (reconciliation.state === "in_progress" && input.resume.hostSessionId) {
+      resumeSessionId = input.resume.hostSessionId;
+      await input.store.append(
+        "runtime",
+        "invocation.resumed",
+        { invocationId, nodeId: input.node.id, hostSessionId: resumeSessionId },
+        invocationId,
+      );
+    } else {
+      await input.store.append(
+        "runtime",
+        "invocation.finished",
+        {
+          invocationId,
+          nodeId: input.node.id,
+          success: false,
+          reason: "Native host continuation was unavailable; using repository recovery",
+        },
+        invocationId,
+      );
+      invocationId = randomUUID();
+    }
+  }
+  if (!resumeSessionId) {
+    await input.store.append("runtime", "invocation.started", {
+      invocationId,
+      nodeId: input.node.id,
+      adapter: input.adapter.id,
+      capsuleHash,
+      baseline: input.baseline,
+    });
+  }
   let result: WorkerResult | undefined;
   let error: string | undefined;
 
-  for await (const event of input.adapter.execute(
-    {
-      invocationId,
-      repositoryPath: input.workspace.path,
-      capsule,
-      allowedTools: ["read", "write", "shell"],
-    },
-    input.signal,
-  )) {
-    transcript.push(event);
-    if (event.type === "message") input.observer?.({ type: "host", message: event.text });
-    if (event.type === "tool")
-      input.observer?.({ type: "host", message: `${event.name} ${event.summary}`.trim() });
-    if (event.type === "usage") {
-      await input.store.append("host", "tokens.recorded", { usage: event.usage }, invocationId);
+  let artifact = join(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+  try {
+    for await (const event of input.adapter.execute(
+      {
+        invocationId,
+        repositoryPath: input.workspace.path,
+        capsule,
+        allowedTools:
+          input.node.sideEffectClass === "workspace_write" ? ["read", "write", "shell"] : ["read"],
+        ...(resumeSessionId ? { resumeSessionId } : {}),
+      },
+      input.signal,
+    )) {
+      artifact = await input.store.appendInvocationEvent(invocationId, event);
+      if (event.type === "session") {
+        await input.store.append(
+          "host",
+          "invocation.session",
+          { invocationId, nodeId: input.node.id, hostSessionId: event.hostSessionId },
+          invocationId,
+        );
+      }
+      if (event.type === "message") input.observer?.({ type: "host", message: event.text });
+      if (event.type === "tool")
+        input.observer?.({ type: "host", message: `${event.name} ${event.summary}`.trim() });
+      if (event.type === "usage") {
+        await input.store.append("host", "tokens.recorded", { usage: event.usage }, invocationId);
+      }
+      if (event.type === "result") result = WorkerResultSchema.parse(event.result);
+      if (event.type === "error") error = event.message;
     }
-    if (event.type === "result") result = WorkerResultSchema.parse(event.result);
-    if (event.type === "error") error = event.message;
+  } catch (cause) {
+    error = cause instanceof Error ? cause.message : String(cause);
+    const event: HostEvent = { type: "error", message: error };
+    artifact = await input.store.appendInvocationEvent(invocationId, event);
   }
-  const artifact = await input.store.writeArtifact(
-    `invocations/${invocationId}.jsonl`,
-    `${transcript.map((event) => JSON.stringify(event)).join("\n")}\n`,
-  );
   await input.store.append(
     "runtime",
     "invocation.finished",
@@ -223,12 +429,10 @@ export async function executeRun(input: {
       state = await input.store.loadState();
     }
     if (["completed", "stopped"].includes(state.status)) return state;
-    if (state.currentNodeId && state.nodes[state.currentNodeId]?.status === "running") {
-      await input.store.append("runtime", "node.reset", {
-        nodeId: state.currentNodeId,
-        reason: "Recovered an interrupted invocation; accepted nodes remain immutable",
-      });
-    }
+    const interruptedNodeId =
+      state.currentNodeId && state.nodes[state.currentNodeId]?.status === "running"
+        ? state.currentNodeId
+        : undefined;
     if (state.status === "blocked") {
       for (const [nodeId, nodeState] of Object.entries(state.nodes)) {
         if (nodeState.status === "failed") {
@@ -260,6 +464,37 @@ export async function executeRun(input: {
     } catch {
       workspace = await createRunWorkspace(contract);
       await input.store.writeWorkspace(workspace);
+    }
+    let recovery = interruptedNodeId
+      ? await recoverableInvocation(input.store, interruptedNodeId, workspace.path)
+      : undefined;
+    if (
+      recovery &&
+      (recovery.adapterId !== input.adapter.id || recovery.record.baseline === undefined)
+    ) {
+      await input.store.append(
+        "runtime",
+        "invocation.finished",
+        {
+          invocationId: recovery.record.invocationId,
+          nodeId: recovery.nodeId,
+          success: false,
+          reason:
+            recovery.adapterId !== input.adapter.id
+              ? "Selected host changed; using repository recovery"
+              : "The interrupted invocation predates durable progress baselines",
+        },
+        recovery.record.invocationId,
+      );
+      recovery = undefined;
+    }
+    if (interruptedNodeId) {
+      await input.store.append("runtime", "node.reset", {
+        nodeId: interruptedNodeId,
+        reason: recovery
+          ? "Recovered an interrupted invocation for native host reconciliation"
+          : "Recovered from repository evidence; accepted nodes remain immutable",
+      });
     }
     if (state.status !== "running")
       await input.store.append("runtime", "run.started", { workspace });
@@ -367,24 +602,34 @@ export async function executeRun(input: {
         continue;
       }
 
-      const beforeDigest = await workspaceDigest(workspace.path);
-      const baselineProbes = await runProbes(current.progressProbes, workspace.path, signal);
-      const baseline = evidenceSnapshot(
-        beforeDigest,
-        baselineProbes.map(({ result }) => result),
-      );
+      const activeRecovery = recovery?.nodeId === current.id ? recovery : undefined;
+      let baseline: EvidenceSnapshot;
+      let baselineProbeResults: ProbeResult[];
+      if (activeRecovery?.record.baseline) {
+        baseline = activeRecovery.record.baseline;
+        baselineProbeResults = baseline.probeResults;
+      } else {
+        const baselineProbes = await runProbes(current.progressProbes, workspace.path, signal);
+        baselineProbeResults = baselineProbes.map(({ result }) => result);
+        baseline = evidenceSnapshot(await workspaceDigest(workspace.path), baselineProbeResults);
+      }
       const worker = await executeWorker({
         adapter: input.adapter,
         store: input.store,
         contract,
         node: current,
         workspace,
-        ...(baselineProbes.length
-          ? { probeResults: baselineProbes.map(({ result }) => result) }
-          : {}),
+        predecessorEvidence: current.contextSelector.predecessorResults.flatMap((nodeId) => {
+          const predecessor = state.nodes[nodeId];
+          return predecessor?.lastSummary ? [`${nodeId}: ${predecessor.lastSummary}`] : [];
+        }),
+        ...(baselineProbeResults.length ? { probeResults: baselineProbeResults } : {}),
         ...(input.observer ? { observer: input.observer } : {}),
         signal,
+        baseline,
+        ...(activeRecovery ? { resume: activeRecovery.record } : {}),
       });
+      if (activeRecovery) recovery = undefined;
       if (!worker.result || worker.error || worker.result.status !== "completed") {
         const reason = worker.error ?? worker.result?.summary ?? "Worker did not complete the node";
         await input.store.append("worker", "node.failed", { nodeId: current.id, reason });
@@ -403,14 +648,20 @@ export async function executeRun(input: {
         await workspaceDigest(workspace.path),
         afterProbes.map(({ result }) => result),
       );
-      const classification = classifyProgress(baseline, currentEvidence);
+      const measuredClassification = classifyProgress(baseline, currentEvidence);
+      const classification =
+        measuredClassification === "stalled" &&
+        current.sideEffectClass === "none" &&
+        worker.result.evidence.length > 0
+          ? "learning"
+          : measuredClassification;
       await input.store.append("probe", "node.progress", {
         nodeId: current.id,
         classification,
         summary: worker.result.summary,
         evidence: [...worker.result.evidence, ...afterProbes.map(({ result }) => result.summary)],
       });
-      if (["done", "advanced", "learning"].includes(classification) || graph.family === "audit") {
+      if (["done", "advanced", "learning"].includes(classification)) {
         await input.store.append("runtime", "node.accepted", {
           nodeId: current.id,
           summary: worker.result.summary,

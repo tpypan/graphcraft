@@ -142,6 +142,8 @@ export function reduceEvents(events: RunEvent[]): RunState {
         break;
       }
       case "invocation.started":
+      case "invocation.session":
+      case "invocation.resumed":
       case "invocation.finished":
         break;
       case "run.created":

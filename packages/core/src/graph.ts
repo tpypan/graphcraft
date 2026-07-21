@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import type { Graph, GraphNode, Permission, ProbeSpec, RunContract } from "./schemas.ts";
-import { GraphSchema, RunContractSchema } from "./schemas.ts";
+import { isAbsolute } from "node:path";
+import type { Graph, GraphNode, GraphPlan, Permission, ProbeSpec, RunContract } from "./schemas.ts";
+import { GraphPlanSchema, GraphSchema, RunContractSchema } from "./schemas.ts";
 
 export type TaskFamily = Graph["family"];
 
@@ -20,7 +21,8 @@ export interface ContractOptions {
 export function classifyTask(task: string): TaskFamily {
   const value = task.toLowerCase();
   if (/migrat|upgrade|replace all|deprecat/.test(value)) return "migration";
-  if (/bug|fix|regression|broken|error|fail/.test(value)) return "bug";
+  if (/\b(?:bug|fix(?:e[sd]?|ing)?|regression|broken|errors?|fail(?:ed|ing|ure|s)?)\b/.test(value))
+    return "bug";
   if (/refactor|restructur|cleanup|simplif/.test(value)) return "refactor";
   if (/audit|review|investigat|assess/.test(value)) return "audit";
   return "feature";
@@ -160,10 +162,191 @@ export function compileGraph(contract: RunContract, verificationProbes: ProbeSpe
   return graph;
 }
 
+function safeRelativePattern(value: string): boolean {
+  const normalized = value.replaceAll("\\", "/");
+  return (
+    value.length > 0 &&
+    !isAbsolute(value) &&
+    !/^[a-z]:\//i.test(normalized) &&
+    !normalized.split("/").includes("..") &&
+    !normalized.split("/").some((part) => part === ".git" || part === ".graphcraft")
+  );
+}
+
+function patternWithin(candidate: string, boundary: string): boolean {
+  const normalizedCandidate = candidate.replaceAll("\\", "/").replace(/^\.\//, "");
+  const normalizedBoundary = boundary.replaceAll("\\", "/").replace(/^\.\//, "");
+  if (["**", "**/*"].includes(normalizedBoundary)) return true;
+  if (normalizedCandidate === normalizedBoundary) return true;
+  if (!normalizedBoundary.endsWith("/**")) return false;
+  const prefix = normalizedBoundary.slice(0, -3).replace(/\/$/, "");
+  return normalizedCandidate === prefix || normalizedCandidate.startsWith(`${prefix}/`);
+}
+
+function validatePlannedGraphPolicy(
+  graph: Graph,
+  contract: RunContract,
+  requiredVerificationProbes: ProbeSpec[],
+): void {
+  if (graph.family !== classifyTask(contract.task))
+    throw new Error("The planned graph changed the runtime-selected task family");
+  const terminalNodes = graph.nodes.filter(
+    (candidate) => !graph.nodes.some((other) => other.dependsOn.includes(candidate.id)),
+  );
+  if (terminalNodes.length !== 1)
+    throw new Error("A planned graph must converge on exactly one finish-line node");
+
+  const terminal = terminalNodes[0]!;
+  const commitNodes = graph.nodes.filter((candidate) => candidate.kind === "commit");
+  if (contract.finishLine.kind === "local_verified") {
+    if (commitNodes.length > 0)
+      throw new Error("A local_verified plan cannot contain commit nodes");
+    if (terminal.kind !== "verification")
+      throw new Error("A local_verified plan must end in a verification node");
+  } else if (contract.finishLine.kind === "committed") {
+    if (commitNodes.length !== 1 || terminal.kind !== "commit")
+      throw new Error("A committed plan must end in exactly one commit node");
+    if (
+      terminal.dependsOn.length !== 1 ||
+      graph.nodes.find((candidate) => candidate.id === terminal.dependsOn[0])?.kind !==
+        "verification"
+    ) {
+      throw new Error("The terminal commit node must directly depend on one verification node");
+    }
+  } else {
+    throw new Error(`Finish line ${contract.finishLine.kind} is not executable locally`);
+  }
+
+  const finalVerification =
+    terminal.kind === "verification"
+      ? terminal
+      : graph.nodes.find((candidate) => candidate.id === terminal.dependsOn[0]);
+  if (!finalVerification || finalVerification.completionProbes.length === 0)
+    throw new Error("The terminal verification node must contain executable completion probes");
+  for (const required of requiredVerificationProbes) {
+    if (
+      !finalVerification.completionProbes.some(
+        (candidate) => JSON.stringify(candidate) === JSON.stringify(required),
+      )
+    ) {
+      throw new Error(`The planned graph omitted required verification probe ${required.id}`);
+    }
+  }
+
+  for (const item of graph.nodes) {
+    if (!/^[a-z][a-z0-9-]*$/.test(item.id))
+      throw new Error(`Planned node ID ${item.id} must be lowercase and stable`);
+    if (item.kind === "wait")
+      throw new Error("Wait nodes are not executable in the local runtime yet");
+    if (!item.contextSelector.includeRepositoryInstructions)
+      throw new Error(`Planned node ${item.id} attempted to omit repository instructions`);
+    if (item.sideEffectClass === "external")
+      throw new Error(`Planned node ${item.id} requests unsupported external side effects`);
+    if (
+      item.sideEffectClass === "workspace_write" &&
+      !contract.permissions.includes("write_repository")
+    )
+      throw new Error(`Planned node ${item.id} exceeds repository write permissions`);
+    if (item.sideEffectClass === "git_commit" && !contract.permissions.includes("commit"))
+      throw new Error(`Planned node ${item.id} exceeds commit permissions`);
+    if (item.kind === "verification" && item.sideEffectClass !== "none")
+      throw new Error(`Verification node ${item.id} must be read-only`);
+    if (item.kind === "commit" && item.sideEffectClass !== "git_commit")
+      throw new Error(`Commit node ${item.id} must use the git_commit side-effect class`);
+    if (item.scope.length === 0 || item.scope.some((pattern) => !safeRelativePattern(pattern)))
+      throw new Error(`Planned node ${item.id} contains an unsafe repository scope`);
+    if (
+      item.scope.some(
+        (pattern) =>
+          !contract.scope.include.some((included) => patternWithin(pattern, included)) ||
+          contract.scope.exclude.some((excluded) => patternWithin(pattern, excluded)),
+      )
+    ) {
+      throw new Error(`Planned node ${item.id} exceeds the approved repository scope`);
+    }
+    if (
+      item.contextSelector.relevantPaths.some(
+        (path) =>
+          !safeRelativePattern(path) ||
+          contract.scope.exclude.some((excluded) => patternWithin(path, excluded)),
+      )
+    ) {
+      throw new Error(`Planned node ${item.id} selects an unsafe context path`);
+    }
+    if (
+      item.contextSelector.predecessorResults.some(
+        (predecessor) => !item.dependsOn.includes(predecessor),
+      )
+    ) {
+      throw new Error(`Planned node ${item.id} selects evidence outside its dependencies`);
+    }
+    if (item.kind !== "verification" && item.completionProbes.length > 0)
+      throw new Error(`Only verification nodes may contain completion probes`);
+    for (const probe of [...item.progressProbes, ...item.completionProbes]) {
+      if (probe.kind === "git_diff" && probe.baseSha !== contract.repository.baseSha)
+        throw new Error(`Probe ${probe.id} is not bound to the approved base SHA`);
+      if (probe.kind === "file" && !safeRelativePattern(probe.path))
+        throw new Error(`Probe ${probe.id} contains an unsafe file path`);
+      if (probe.kind === "command" && probe.cwd && !safeRelativePattern(probe.cwd))
+        throw new Error(`Probe ${probe.id} contains an unsafe working directory`);
+      if (
+        probe.kind === "command" &&
+        !requiredVerificationProbes.some(
+          (allowed) =>
+            allowed.kind === "command" && JSON.stringify(allowed) === JSON.stringify(probe),
+        )
+      ) {
+        throw new Error(`Probe ${probe.id} is not an approved repository command`);
+      }
+    }
+  }
+  if (
+    graph.family !== "audit" &&
+    !graph.nodes.some((candidate) => candidate.sideEffectClass === "workspace_write")
+  ) {
+    throw new Error("A write-capable task plan must contain a workspace-write node");
+  }
+}
+
+export function compilePlannedGraph(
+  contract: RunContract,
+  plan: GraphPlan,
+  requiredVerificationProbes: ProbeSpec[],
+): Graph {
+  const parsedPlan = GraphPlanSchema.parse(plan);
+  const graph = GraphSchema.parse({
+    schemaVersion: 1,
+    runId: contract.runId,
+    family: parsedPlan.family,
+    nodes: parsedPlan.nodes.map((planned) =>
+      node({
+        ...planned,
+        outputSchema: resultShape,
+      }),
+    ),
+    anchors: contract.acceptanceAnchors,
+    controlEdges: contract.acceptanceAnchors.flatMap((anchor) =>
+      parsedPlan.nodes.map((planned) => ({
+        from: anchor.id,
+        to: planned.id,
+        relation: "vetoes" as const,
+      })),
+    ),
+    revision: 0,
+  });
+  validateGraph(graph);
+  validatePlannedGraphPolicy(graph, contract, requiredVerificationProbes);
+  return graph;
+}
+
 export function validateGraph(graph: Graph): void {
   GraphSchema.parse(graph);
   const ids = new Set(graph.nodes.map(({ id }) => id));
   if (ids.size !== graph.nodes.length) throw new Error("Graph node IDs must be unique");
+  const anchorIds = new Set(graph.anchors.map(({ id }) => id));
+  if (anchorIds.size !== graph.anchors.length) throw new Error("Graph anchor IDs must be unique");
+  if ([...ids].some((id) => anchorIds.has(id)))
+    throw new Error("Graph node and anchor IDs must not overlap");
   for (const item of graph.nodes) {
     for (const dependency of item.dependsOn) {
       if (!ids.has(dependency))
@@ -183,6 +366,35 @@ export function validateGraph(graph: Graph): void {
     visited.add(id);
   };
   for (const id of ids) visit(id);
+
+  const targets = new Set([...ids, ...anchorIds]);
+  const edgeKeys = new Set<string>();
+  for (const edge of graph.controlEdges) {
+    if (!targets.has(edge.from) || !targets.has(edge.to))
+      throw new Error(`Control edge ${edge.from} -> ${edge.to} references an unknown target`);
+    const key = `${edge.from}\0${edge.to}\0${edge.relation}`;
+    if (edgeKeys.has(key)) throw new Error(`Control edge ${edge.from} -> ${edge.to} is duplicated`);
+    edgeKeys.add(key);
+  }
+}
+
+export function graphPlanShape(graph: Graph): string {
+  const remaining = new Map(graph.nodes.map((item) => [item.id, item]));
+  const emitted = new Set<string>();
+  const layers: string[] = [];
+  while (remaining.size > 0) {
+    const ready = [...remaining.values()].filter((item) =>
+      item.dependsOn.every((dependency) => emitted.has(dependency)),
+    );
+    if (ready.length === 0) throw new Error("Cannot render a cyclic graph plan");
+    const labels = ready.map(({ id }) => id);
+    layers.push(labels.length === 1 ? labels[0]! : `(${labels.join(" + ")})`);
+    for (const item of ready) {
+      emitted.add(item.id);
+      remaining.delete(item.id);
+    }
+  }
+  return layers.join(" → ");
 }
 
 export function readyNodes(graph: Graph, accepted: Set<string>): GraphNode[] {

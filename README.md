@@ -45,14 +45,14 @@ Graphcraft displays a concise run contract before doing work. Use `--yes` only w
 
 ## What v0.1 does
 
-- Compiles a user request into linked execution and governance graphs.
+- Lets the selected host propose a task-specific execution graph from bounded repository evidence, then validates and displays the actual plan before approval.
 - Keeps the finish line, permissions, repository policy, and acceptance anchors outside worker control.
 - Creates an isolated Git worktree without stashing, cleaning, or resetting the current checkout.
 - Stores a hashed append-only event log and rebuildable state under the repository's local `.graphcraft/` directory.
 - Gives each worker a small context capsule instead of replaying raw transcripts.
 - Runs deterministic repository probes and classifies progress as advanced, learning, stalled, regressed, oscillating, blocked, or done.
 - Schedules one evidence-driven repair when verification fails, then stops if the changed strategy does not clear the failure.
-- Resumes interrupted runs without repeating accepted nodes and can switch between Codex and Claude Code.
+- Checkpoints host sessions and results during execution, resumes the same host session when safe, and falls back to repository evidence when switching hosts or native continuation is unavailable.
 - Tracks cached, uncached, output, reasoning, and total tokens when the host exposes them.
 
 ## Commands
@@ -74,9 +74,9 @@ Small localized tasks bypass Graphcraft by default. Pass `--force` when you deli
 
 ## Evidence and scope
 
-The [v0.1 implementation report](docs/V0.1.md) records the acceptance boundary, architecture, tests, real-host dogfood, and known gaps. The [alpha roadmap](docs/ALPHA_ROADMAP.md) remains authoritative for the current path to stable. Research and competitive rationale live under [docs/research](docs/research).
+The [v0.1 implementation report](docs/V0.1.md) records the acceptance boundary, architecture, tests, real-host dogfood, and known gaps. Research and competitive rationale live under [docs/research](docs/research).
 
-Graphcraft does not yet claim the stable plan's reliability or 20% token-savings gate. Those require the matched multi-task, dual-host benchmark described in the plan.
+Graphcraft does not yet claim stable reliability or a 20% token-savings gate. Those require a future matched multi-task, dual-host benchmark.
 
 ## Development
 

@@ -2,12 +2,14 @@ import { appendFile, mkdir, readFile, readdir, writeFile } from "node:fs/promise
 import { dirname, join } from "node:path";
 import {
   GraphSchema,
+  HostEventSchema,
   RunContractSchema,
   RunEventSchema,
   RunStateSchema,
   createRunEvent,
   reduceEvents,
   type Graph,
+  type HostEvent,
   type RunContract,
   type RunEvent,
   type RunState,
@@ -132,6 +134,25 @@ export class RunStore {
     await mkdir(dirname(path), { recursive: true });
     await writeFile(path, value, { mode: 0o600 });
     return path;
+  }
+
+  async appendInvocationEvent(invocationId: string, event: HostEvent): Promise<string> {
+    const path = join(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+    await mkdir(dirname(path), { recursive: true });
+    await appendFile(path, `${JSON.stringify(HostEventSchema.parse(event))}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    return path;
+  }
+
+  async loadInvocationEvents(invocationId: string): Promise<HostEvent[]> {
+    const path = join(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+    const content = await readFile(path, "utf8");
+    return content
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => HostEventSchema.parse(JSON.parse(line)));
   }
 
   async writeCapsule(hash: string, value: unknown): Promise<string> {

@@ -31032,6 +31032,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
+// packages/core/src/adapter.ts
+function reconcilePersistedInvocation(invocation) {
+  const result = invocation.transcript?.findLast((event) => event.type === "result");
+  if (result?.type === "result") return { state: "completed", result: result.result };
+  if (invocation.hostSessionId) return { state: "in_progress" };
+  return { state: "not_started" };
+}
+
 // packages/core/src/canonical.ts
 import { createHash } from "node:crypto";
 function sortValue(value) {
@@ -31178,6 +31186,15 @@ var GraphNodeSchema = external_exports.strictObject({
   sideEffectClass: external_exports.enum(["none", "workspace_write", "git_commit", "external"]),
   status: NodeStatusSchema
 });
+var PlannedGraphNodeSchema = GraphNodeSchema.omit({
+  outputSchema: true,
+  status: true
+});
+var GraphPlanSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  family: external_exports.enum(["bug", "feature", "migration", "refactor", "audit"]),
+  nodes: external_exports.array(PlannedGraphNodeSchema).min(1)
+});
 var ControlEdgeSchema = external_exports.strictObject({
   from: external_exports.string().min(1),
   to: external_exports.string().min(1),
@@ -31228,6 +31245,7 @@ var HostCapabilitiesSchema = external_exports.strictObject({
 });
 var HostEventSchema = external_exports.discriminatedUnion("type", [
   external_exports.strictObject({ type: external_exports.literal("started"), invocationId: external_exports.string() }),
+  external_exports.strictObject({ type: external_exports.literal("session"), hostSessionId: external_exports.string().min(1) }),
   external_exports.strictObject({ type: external_exports.literal("message"), text: external_exports.string() }),
   external_exports.strictObject({ type: external_exports.literal("tool"), name: external_exports.string(), summary: external_exports.string() }),
   external_exports.strictObject({ type: external_exports.literal("result"), result: WorkerResultSchema }),
@@ -31248,6 +31266,8 @@ var RunEventTypeSchema = external_exports.enum([
   "node.failed",
   "node.reset",
   "invocation.started",
+  "invocation.session",
+  "invocation.resumed",
   "invocation.finished",
   "tokens.recorded",
   "graph.amended"
@@ -31290,6 +31310,7 @@ var RunStateSchema = external_exports.strictObject({
   updatedAt: external_exports.iso.datetime()
 });
 var workerResultJsonSchema = external_exports.toJSONSchema(WorkerResultSchema, { target: "draft-7" });
+var graphPlanJsonSchema = external_exports.toJSONSchema(GraphPlanSchema, { target: "draft-7" });
 
 // packages/core/src/capsule.ts
 function createContextCapsule(input) {
@@ -31337,10 +31358,12 @@ function verifyRunEvent(event) {
 
 // packages/core/src/graph.ts
 import { randomUUID } from "node:crypto";
+import { isAbsolute } from "node:path";
 function classifyTask(task) {
   const value = task.toLowerCase();
   if (/migrat|upgrade|replace all|deprecat/.test(value)) return "migration";
-  if (/bug|fix|regression|broken|error|fail/.test(value)) return "bug";
+  if (/\b(?:bug|fix(?:e[sd]?|ing)?|regression|broken|errors?|fail(?:ed|ing|ure|s)?)\b/.test(value))
+    return "bug";
   if (/refactor|restructur|cleanup|simplif/.test(value)) return "refactor";
   if (/audit|review|investigat|assess/.test(value)) return "audit";
   return "feature";
@@ -31467,10 +31490,141 @@ function compileGraph(contract, verificationProbes) {
   validateGraph(graph);
   return graph;
 }
+function safeRelativePattern(value) {
+  const normalized = value.replaceAll("\\", "/");
+  return value.length > 0 && !isAbsolute(value) && !/^[a-z]:\//i.test(normalized) && !normalized.split("/").includes("..") && !normalized.split("/").some((part) => part === ".git" || part === ".graphcraft");
+}
+function patternWithin(candidate, boundary) {
+  const normalizedCandidate = candidate.replaceAll("\\", "/").replace(/^\.\//, "");
+  const normalizedBoundary = boundary.replaceAll("\\", "/").replace(/^\.\//, "");
+  if (["**", "**/*"].includes(normalizedBoundary)) return true;
+  if (normalizedCandidate === normalizedBoundary) return true;
+  if (!normalizedBoundary.endsWith("/**")) return false;
+  const prefix = normalizedBoundary.slice(0, -3).replace(/\/$/, "");
+  return normalizedCandidate === prefix || normalizedCandidate.startsWith(`${prefix}/`);
+}
+function validatePlannedGraphPolicy(graph, contract, requiredVerificationProbes) {
+  if (graph.family !== classifyTask(contract.task))
+    throw new Error("The planned graph changed the runtime-selected task family");
+  const terminalNodes = graph.nodes.filter(
+    (candidate) => !graph.nodes.some((other) => other.dependsOn.includes(candidate.id))
+  );
+  if (terminalNodes.length !== 1)
+    throw new Error("A planned graph must converge on exactly one finish-line node");
+  const terminal = terminalNodes[0];
+  const commitNodes = graph.nodes.filter((candidate) => candidate.kind === "commit");
+  if (contract.finishLine.kind === "local_verified") {
+    if (commitNodes.length > 0)
+      throw new Error("A local_verified plan cannot contain commit nodes");
+    if (terminal.kind !== "verification")
+      throw new Error("A local_verified plan must end in a verification node");
+  } else if (contract.finishLine.kind === "committed") {
+    if (commitNodes.length !== 1 || terminal.kind !== "commit")
+      throw new Error("A committed plan must end in exactly one commit node");
+    if (terminal.dependsOn.length !== 1 || graph.nodes.find((candidate) => candidate.id === terminal.dependsOn[0])?.kind !== "verification") {
+      throw new Error("The terminal commit node must directly depend on one verification node");
+    }
+  } else {
+    throw new Error(`Finish line ${contract.finishLine.kind} is not executable locally`);
+  }
+  const finalVerification = terminal.kind === "verification" ? terminal : graph.nodes.find((candidate) => candidate.id === terminal.dependsOn[0]);
+  if (!finalVerification || finalVerification.completionProbes.length === 0)
+    throw new Error("The terminal verification node must contain executable completion probes");
+  for (const required2 of requiredVerificationProbes) {
+    if (!finalVerification.completionProbes.some(
+      (candidate) => JSON.stringify(candidate) === JSON.stringify(required2)
+    )) {
+      throw new Error(`The planned graph omitted required verification probe ${required2.id}`);
+    }
+  }
+  for (const item of graph.nodes) {
+    if (!/^[a-z][a-z0-9-]*$/.test(item.id))
+      throw new Error(`Planned node ID ${item.id} must be lowercase and stable`);
+    if (item.kind === "wait")
+      throw new Error("Wait nodes are not executable in the local runtime yet");
+    if (!item.contextSelector.includeRepositoryInstructions)
+      throw new Error(`Planned node ${item.id} attempted to omit repository instructions`);
+    if (item.sideEffectClass === "external")
+      throw new Error(`Planned node ${item.id} requests unsupported external side effects`);
+    if (item.sideEffectClass === "workspace_write" && !contract.permissions.includes("write_repository"))
+      throw new Error(`Planned node ${item.id} exceeds repository write permissions`);
+    if (item.sideEffectClass === "git_commit" && !contract.permissions.includes("commit"))
+      throw new Error(`Planned node ${item.id} exceeds commit permissions`);
+    if (item.kind === "verification" && item.sideEffectClass !== "none")
+      throw new Error(`Verification node ${item.id} must be read-only`);
+    if (item.kind === "commit" && item.sideEffectClass !== "git_commit")
+      throw new Error(`Commit node ${item.id} must use the git_commit side-effect class`);
+    if (item.scope.length === 0 || item.scope.some((pattern) => !safeRelativePattern(pattern)))
+      throw new Error(`Planned node ${item.id} contains an unsafe repository scope`);
+    if (item.scope.some(
+      (pattern) => !contract.scope.include.some((included) => patternWithin(pattern, included)) || contract.scope.exclude.some((excluded) => patternWithin(pattern, excluded))
+    )) {
+      throw new Error(`Planned node ${item.id} exceeds the approved repository scope`);
+    }
+    if (item.contextSelector.relevantPaths.some(
+      (path) => !safeRelativePattern(path) || contract.scope.exclude.some((excluded) => patternWithin(path, excluded))
+    )) {
+      throw new Error(`Planned node ${item.id} selects an unsafe context path`);
+    }
+    if (item.contextSelector.predecessorResults.some(
+      (predecessor) => !item.dependsOn.includes(predecessor)
+    )) {
+      throw new Error(`Planned node ${item.id} selects evidence outside its dependencies`);
+    }
+    if (item.kind !== "verification" && item.completionProbes.length > 0)
+      throw new Error(`Only verification nodes may contain completion probes`);
+    for (const probe of [...item.progressProbes, ...item.completionProbes]) {
+      if (probe.kind === "git_diff" && probe.baseSha !== contract.repository.baseSha)
+        throw new Error(`Probe ${probe.id} is not bound to the approved base SHA`);
+      if (probe.kind === "file" && !safeRelativePattern(probe.path))
+        throw new Error(`Probe ${probe.id} contains an unsafe file path`);
+      if (probe.kind === "command" && probe.cwd && !safeRelativePattern(probe.cwd))
+        throw new Error(`Probe ${probe.id} contains an unsafe working directory`);
+      if (probe.kind === "command" && !requiredVerificationProbes.some(
+        (allowed) => allowed.kind === "command" && JSON.stringify(allowed) === JSON.stringify(probe)
+      )) {
+        throw new Error(`Probe ${probe.id} is not an approved repository command`);
+      }
+    }
+  }
+  if (graph.family !== "audit" && !graph.nodes.some((candidate) => candidate.sideEffectClass === "workspace_write")) {
+    throw new Error("A write-capable task plan must contain a workspace-write node");
+  }
+}
+function compilePlannedGraph(contract, plan, requiredVerificationProbes) {
+  const parsedPlan = GraphPlanSchema.parse(plan);
+  const graph = GraphSchema.parse({
+    schemaVersion: 1,
+    runId: contract.runId,
+    family: parsedPlan.family,
+    nodes: parsedPlan.nodes.map(
+      (planned) => node({
+        ...planned,
+        outputSchema: resultShape
+      })
+    ),
+    anchors: contract.acceptanceAnchors,
+    controlEdges: contract.acceptanceAnchors.flatMap(
+      (anchor) => parsedPlan.nodes.map((planned) => ({
+        from: anchor.id,
+        to: planned.id,
+        relation: "vetoes"
+      }))
+    ),
+    revision: 0
+  });
+  validateGraph(graph);
+  validatePlannedGraphPolicy(graph, contract, requiredVerificationProbes);
+  return graph;
+}
 function validateGraph(graph) {
   GraphSchema.parse(graph);
   const ids = new Set(graph.nodes.map(({ id }) => id));
   if (ids.size !== graph.nodes.length) throw new Error("Graph node IDs must be unique");
+  const anchorIds = new Set(graph.anchors.map(({ id }) => id));
+  if (anchorIds.size !== graph.anchors.length) throw new Error("Graph anchor IDs must be unique");
+  if ([...ids].some((id) => anchorIds.has(id)))
+    throw new Error("Graph node and anchor IDs must not overlap");
   for (const item of graph.nodes) {
     for (const dependency of item.dependsOn) {
       if (!ids.has(dependency))
@@ -31489,6 +31643,33 @@ function validateGraph(graph) {
     visited.add(id);
   };
   for (const id of ids) visit(id);
+  const targets = /* @__PURE__ */ new Set([...ids, ...anchorIds]);
+  const edgeKeys = /* @__PURE__ */ new Set();
+  for (const edge of graph.controlEdges) {
+    if (!targets.has(edge.from) || !targets.has(edge.to))
+      throw new Error(`Control edge ${edge.from} -> ${edge.to} references an unknown target`);
+    const key = `${edge.from}\0${edge.to}\0${edge.relation}`;
+    if (edgeKeys.has(key)) throw new Error(`Control edge ${edge.from} -> ${edge.to} is duplicated`);
+    edgeKeys.add(key);
+  }
+}
+function graphPlanShape(graph) {
+  const remaining = new Map(graph.nodes.map((item) => [item.id, item]));
+  const emitted = /* @__PURE__ */ new Set();
+  const layers = [];
+  while (remaining.size > 0) {
+    const ready = [...remaining.values()].filter(
+      (item) => item.dependsOn.every((dependency) => emitted.has(dependency))
+    );
+    if (ready.length === 0) throw new Error("Cannot render a cyclic graph plan");
+    const labels = ready.map(({ id }) => id);
+    layers.push(labels.length === 1 ? labels[0] : `(${labels.join(" + ")})`);
+    for (const item of ready) {
+      emitted.add(item.id);
+      remaining.delete(item.id);
+    }
+  }
+  return layers.join(" \u2192 ");
 }
 
 // packages/core/src/leases.ts
@@ -31515,6 +31696,41 @@ function classifyProgress(baseline, current, history = []) {
   }
   if (current.failureSignature !== baseline.failureSignature) return "learning";
   return "stalled";
+}
+
+// packages/core/src/planner.ts
+function renderPlannerPrompt(request) {
+  return [
+    "You are the read-only planning phase of a Graphcraft run.",
+    "Graphcraft has already inspected the repository. Use only the bounded repository evidence below and do not assume unlisted files exist.",
+    "Return a task-specific, dependency-complete graph for the approved contract below.",
+    "Make the topology and node kinds meaningfully task-specific; do not reuse one generic investigate/implement/verify chain for every task family.",
+    "For bugs, localize the failure from reproduction or regression evidence before a repair and terminal verification.",
+    "For features, establish the acceptance or interface decision before implementation and terminal verification.",
+    "For migrations, inventory authoritative old usage before scoped migration work converges on terminal verification.",
+    "For refactors, capture a behavior-preservation and structural baseline before the change and terminal verification.",
+    "For audits, remain read-only, gather independently scoped evidence where possible, and converge on a terminal verification of coverage and unresolved unknowns.",
+    "Use investigation nodes when repository evidence must be gathered before writes.",
+    "End local_verified work in one verification node with executable completion probes.",
+    "End committed work in one commit node that directly depends on a verification node.",
+    "Use only repository-relative scopes. Never propose external side effects or wait nodes.",
+    "Use the supplied task family. Every node must keep repository instructions enabled.",
+    "A node may select predecessorResults only from its direct dependsOn list; do not repeat transitive predecessors.",
+    "Select at least one existing tracked repository path for every non-commit node. Every relevantPaths value must be copied exactly from repositoryEvidence.trackedPaths; relevant paths are evidence inputs, not files the worker might create.",
+    "Investigation, decision, and verification nodes must use sideEffectClass none. Implementation and repair/diagnostic nodes that edit files use workspace_write. Commit nodes alone use git_commit.",
+    "Do not weaken or replace the supplied verification probes; assign them to the terminal verification node.",
+    "Only the terminal verification node may contain completionProbes. Every other node must have an empty completionProbes array.",
+    "Put evidence used to measure implementation, investigation, or diagnostic progress in progressProbes, including base-SHA-bound Git diff probes.",
+    "Do not invent command probes. You may add task-specific file and base-SHA-bound Git diff probes.",
+    "Keep node IDs short, stable, lowercase, and unique. Return only the required structured plan.",
+    "",
+    canonicalJson({
+      contract: request.contract,
+      taskFamily: classifyTask(request.contract.task),
+      repositoryEvidence: request.repositoryEvidence,
+      discoveredVerificationProbes: request.verificationProbes
+    })
+  ].join("\n");
 }
 
 // packages/core/src/prompt.ts
@@ -31657,6 +31873,8 @@ function reduceEvents(events) {
         break;
       }
       case "invocation.started":
+      case "invocation.session":
+      case "invocation.resumed":
       case "invocation.finished":
         break;
       case "run.created":
@@ -31682,6 +31900,32 @@ function parseJsonResult(value) {
   } catch {
     return void 0;
   }
+}
+function parseGraphPlan(value) {
+  if (typeof value === "object" && value !== null) {
+    const parsed = GraphPlanSchema.safeParse(value);
+    if (parsed.success) return parsed.data;
+  }
+  if (typeof value !== "string") return void 0;
+  try {
+    return GraphPlanSchema.parse(JSON.parse(value));
+  } catch {
+    return void 0;
+  }
+}
+function codexUsage(value) {
+  const usage = value ?? {};
+  const input = Number(usage.input_tokens ?? 0);
+  const cachedInput = Number(usage.cached_input_tokens ?? 0);
+  const output = Number(usage.output_tokens ?? 0);
+  const reasoning = Number(usage.reasoning_output_tokens ?? 0);
+  return TokenUsageSchema.parse({
+    input,
+    cachedInput,
+    output,
+    reasoning,
+    total: input + output
+  });
 }
 async function commandVersion(command) {
   return await new Promise((resolve3) => {
@@ -31727,23 +31971,81 @@ var CodexAdapter = class {
       tokenReporting: result.installed
     });
   }
+  async plan(request, signal) {
+    const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-plan-"));
+    const schemaPath = join(schemaDirectory, "graph-plan.schema.json");
+    await writeFile(schemaPath, JSON.stringify(graphPlanJsonSchema), "utf8");
+    const child = spawn(
+      "codex",
+      [
+        "exec",
+        "--json",
+        "--ephemeral",
+        "--ignore-user-config",
+        "-C",
+        request.repositoryPath,
+        "-s",
+        "read-only",
+        "--output-schema",
+        schemaPath,
+        "-"
+      ],
+      {
+        cwd: request.repositoryPath,
+        env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
+        shell: false,
+        stdio: ["pipe", "pipe", "pipe"]
+      }
+    );
+    const exitPromise = new Promise(
+      (resolve3) => child.once("close", (code) => resolve3(code ?? 1))
+    );
+    const abort = () => {
+      child.kill("SIGTERM");
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    child.stdin.end(renderPlannerPrompt(request));
+    let lastMessage = "";
+    let stderr = "";
+    let usage;
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    try {
+      const lines = createInterface({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
+      for await (const line of lines) {
+        if (!line.trim()) continue;
+        let event;
+        try {
+          event = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        const item = event.item;
+        if (event.type === "item.completed" && item?.type === "agent_message")
+          lastMessage = String(item.text ?? "");
+        if (event.type === "turn.completed") usage = codexUsage(event.usage);
+      }
+      const exitCode = await exitPromise;
+      if (signal.aborted) throw new Error("Codex planning invocation aborted");
+      const plan = parseGraphPlan(lastMessage);
+      if (exitCode !== 0 || !plan) {
+        throw new Error(
+          stderr.trim() || `Codex exited ${exitCode} without a valid structured graph plan`
+        );
+      }
+      return { plan, ...usage ? { usage } : {} };
+    } finally {
+      signal.removeEventListener("abort", abort);
+      await rm(schemaDirectory, { recursive: true, force: true });
+    }
+  }
   async *execute(request, signal) {
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-"));
     const schemaPath = join(schemaDirectory, "worker-result.schema.json");
     await writeFile(schemaPath, JSON.stringify(workerResultJsonSchema), "utf8");
-    const args = [
-      "exec",
-      "--json",
-      "--ephemeral",
-      "--ignore-user-config",
-      "-C",
-      request.repositoryPath,
-      "-s",
-      "workspace-write",
-      "--output-schema",
-      schemaPath,
-      "-"
-    ];
+    const args = codexWorkerArgs(request, schemaPath);
     const child = spawn("codex", args, {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -31761,6 +32063,8 @@ var CodexAdapter = class {
     yield { type: "started", invocationId: request.invocationId };
     let lastMessage = "";
     let stderr = "";
+    let observedSessionId;
+    let sessionReported = false;
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk) => {
       stderr += chunk;
@@ -31777,6 +32081,12 @@ var CodexAdapter = class {
         }
         const type = String(event.type ?? "");
         const item = event.item;
+        if (type === "thread.started" && typeof event.thread_id === "string")
+          observedSessionId = event.thread_id;
+        if (!sessionReported && observedSessionId && type.startsWith("item.")) {
+          sessionReported = true;
+          yield { type: "session", hostSessionId: observedSessionId };
+        }
         if (type === "item.completed" && item?.type === "agent_message") {
           lastMessage = String(item.text ?? "");
           yield { type: "message", text: lastMessage };
@@ -31787,20 +32097,9 @@ var CodexAdapter = class {
             summary: String(item.command ?? item.name ?? "")
           };
         } else if (type === "turn.completed") {
-          const usage = event.usage ?? {};
-          const input = Number(usage.input_tokens ?? 0);
-          const cachedInput = Number(usage.cached_input_tokens ?? 0);
-          const output = Number(usage.output_tokens ?? 0);
-          const reasoning = Number(usage.reasoning_output_tokens ?? 0);
           yield {
             type: "usage",
-            usage: TokenUsageSchema.parse({
-              input,
-              cachedInput,
-              output,
-              reasoning,
-              total: input + output
-            })
+            usage: codexUsage(event.usage)
           };
         }
       }
@@ -31823,10 +32122,36 @@ var CodexAdapter = class {
       await rm(schemaDirectory, { recursive: true, force: true });
     }
   }
-  async reconcile(_invocation) {
-    return { state: "unknown" };
+  async reconcile(invocation) {
+    return reconcilePersistedInvocation(invocation);
   }
 };
+function codexWorkerArgs(request, schemaPath) {
+  if (request.resumeSessionId) {
+    return [
+      "exec",
+      "resume",
+      "--json",
+      "--ignore-user-config",
+      "--output-schema",
+      schemaPath,
+      request.resumeSessionId,
+      "-"
+    ];
+  }
+  return [
+    "exec",
+    "--json",
+    "--ignore-user-config",
+    "-C",
+    request.repositoryPath,
+    "-s",
+    request.allowedTools.includes("write") ? "workspace-write" : "read-only",
+    "--output-schema",
+    schemaPath,
+    "-"
+  ];
+}
 
 // packages/adapter-claude/src/index.ts
 import { spawn as spawn2 } from "node:child_process";
@@ -31842,6 +32167,31 @@ function parseResult(value) {
   } catch {
     return void 0;
   }
+}
+function parsePlan(value) {
+  if (typeof value === "object" && value !== null) {
+    const parsed = GraphPlanSchema.safeParse(value);
+    if (parsed.success) return parsed.data;
+  }
+  if (typeof value !== "string") return void 0;
+  try {
+    return GraphPlanSchema.parse(JSON.parse(value));
+  } catch {
+    return void 0;
+  }
+}
+function claudeUsage(value) {
+  const usage = value ?? {};
+  const input = Number(usage.input_tokens ?? 0);
+  const cachedInput = Number(usage.cache_read_input_tokens ?? 0);
+  const output = Number(usage.output_tokens ?? 0);
+  return TokenUsageSchema.parse({
+    input,
+    cachedInput,
+    output,
+    reasoning: 0,
+    total: input + output
+  });
 }
 async function claudeVersion() {
   return await new Promise((resolve3) => {
@@ -31892,24 +32242,78 @@ var ClaudeAdapter = class {
       tokenReporting: result.installed
     });
   }
+  async plan(request, signal) {
+    const child = spawn2(
+      "claude",
+      [
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--permission-mode",
+        "dontAsk",
+        "--effort",
+        "low",
+        "--tools",
+        "",
+        "--disable-slash-commands",
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+        "--json-schema",
+        JSON.stringify(graphPlanJsonSchema),
+        renderPlannerPrompt(request)
+      ],
+      {
+        cwd: request.repositoryPath,
+        env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"]
+      }
+    );
+    const exitPromise = new Promise(
+      (resolve3) => child.once("close", (code) => resolve3(code ?? 1))
+    );
+    const abort = () => {
+      child.kill("SIGTERM");
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    let stderr = "";
+    let plan;
+    let usage;
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    try {
+      const lines = createInterface2({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
+      for await (const line of lines) {
+        if (!line.trim()) continue;
+        let event;
+        try {
+          event = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (event.type === "result") {
+          plan = parsePlan(event.structured_output ?? event.result);
+          usage = claudeUsage(event.usage);
+        }
+      }
+      const exitCode = await exitPromise;
+      if (signal.aborted) throw new Error("Claude planning invocation aborted");
+      if (exitCode !== 0 || !plan) {
+        throw new Error(
+          stderr.trim() || `Claude exited ${exitCode} without a valid structured graph plan`
+        );
+      }
+      return { plan, ...usage ? { usage } : {} };
+    } finally {
+      signal.removeEventListener("abort", abort);
+    }
+  }
   async *execute(request, signal) {
-    const args = [
-      "--print",
-      "--output-format",
-      "stream-json",
-      "--verbose",
-      "--permission-mode",
-      "acceptEdits",
-      "--allowedTools",
-      "Bash(*),Edit,Write,Read,Glob,Grep",
-      "--disable-slash-commands",
-      "--strict-mcp-config",
-      "--mcp-config",
-      '{"mcpServers":{}}',
-      "--json-schema",
-      JSON.stringify(workerResultJsonSchema),
-      renderWorkerPrompt(request.capsule)
-    ];
+    const args = claudeWorkerArgs(request);
     const child = spawn2("claude", args, {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -31926,6 +32330,8 @@ var ClaudeAdapter = class {
     yield { type: "started", invocationId: request.invocationId };
     let stderr = "";
     let finalResult;
+    let observedSessionId;
+    let sessionReported = false;
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk) => {
       stderr += chunk;
@@ -31940,6 +32346,11 @@ var ClaudeAdapter = class {
         continue;
       }
       const type = String(event.type ?? "");
+      if (typeof event.session_id === "string") observedSessionId = event.session_id;
+      if (!sessionReported && observedSessionId && (type === "assistant" || type === "result")) {
+        sessionReported = true;
+        yield { type: "session", hostSessionId: observedSessionId };
+      }
       if (type === "assistant") {
         const message = event.message;
         const blocks = Array.isArray(message?.content) ? message.content : [];
@@ -31953,19 +32364,9 @@ var ClaudeAdapter = class {
       }
       if (type === "result") {
         finalResult = parseResult(event.structured_output ?? event.result);
-        const usage = event.usage ?? {};
-        const input = Number(usage.input_tokens ?? 0);
-        const cachedInput = Number(usage.cache_read_input_tokens ?? 0);
-        const output = Number(usage.output_tokens ?? 0);
         yield {
           type: "usage",
-          usage: TokenUsageSchema.parse({
-            input,
-            cachedInput,
-            output,
-            reasoning: 0,
-            total: input + output
-          })
+          usage: claudeUsage(event.usage)
         };
       }
     }
@@ -31982,10 +32383,31 @@ var ClaudeAdapter = class {
       yield { type: "result", result: finalResult };
     }
   }
-  async reconcile(_invocation) {
-    return { state: "unknown" };
+  async reconcile(invocation) {
+    return reconcilePersistedInvocation(invocation);
   }
 };
+function claudeWorkerArgs(request) {
+  const writable = request.allowedTools.includes("write");
+  return [
+    "--print",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--permission-mode",
+    writable ? "acceptEdits" : "dontAsk",
+    "--allowedTools",
+    writable ? "Bash(*),Edit,Write,Read,Glob,Grep" : "Read,Glob,Grep",
+    "--disable-slash-commands",
+    "--strict-mcp-config",
+    "--mcp-config",
+    '{"mcpServers":{}}',
+    ...request.resumeSessionId ? ["--resume", request.resumeSessionId] : ["--session-id", request.invocationId],
+    "--json-schema",
+    JSON.stringify(workerResultJsonSchema),
+    renderWorkerPrompt(request.capsule)
+  ];
+}
 
 // packages/runtime/src/lock.ts
 import { hostname as hostname3 } from "node:os";
@@ -32059,7 +32481,7 @@ var RunLock = class {
 
 // packages/runtime/src/repository.ts
 import { appendFile, mkdir as mkdir2, readFile as readFile3 } from "node:fs/promises";
-import { basename, dirname as dirname2, isAbsolute, join as join2, resolve as resolve2 } from "node:path";
+import { basename, dirname as dirname2, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
 
 // packages/probes/src/index.ts
 import { access, readFile as readFile2 } from "node:fs/promises";
@@ -32272,9 +32694,133 @@ async function discoverRepository(cwd) {
   await ensureGraphcraftIgnored(root);
   return { root, baseRef, baseSha, ...remote ? { remote } : {} };
 }
+var planningEvidenceNames = /* @__PURE__ */ new Set([
+  "AGENTS.md",
+  "Cargo.toml",
+  "Makefile",
+  "README.md",
+  "go.mod",
+  "package.json",
+  "pnpm-workspace.yaml",
+  "pyproject.toml",
+  "tsconfig.json"
+]);
+var planningSearchStopWords = /* @__PURE__ */ new Set([
+  "across",
+  "adapter",
+  "adapters",
+  "add",
+  "and",
+  "audit",
+  "changing",
+  "code",
+  "every",
+  "file",
+  "files",
+  "fix",
+  "for",
+  "from",
+  "identify",
+  "implementation",
+  "into",
+  "migrate",
+  "package",
+  "path",
+  "paths",
+  "refactor",
+  "repository",
+  "results",
+  "shared",
+  "that",
+  "the",
+  "their",
+  "this",
+  "verify",
+  "without"
+]);
+function planningSearchTerms(task) {
+  return [
+    ...new Set(
+      (task.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase().match(/[a-z0-9]+/g) ?? []).filter((word) => word.length >= 4 && !planningSearchStopWords.has(word)).map((word) => {
+        if (word.length >= 8 && word.endsWith("ing")) return word.slice(0, -3);
+        if (word.length >= 8 && word.endsWith("ed")) return word.slice(0, -2);
+        return word.length >= 8 ? word.slice(0, 6) : word;
+      })
+    )
+  ].slice(0, 12);
+}
+function taskSnippet(content, terms, maximumCharacters) {
+  const lines = content.split("\n");
+  const matchingLines = lines.flatMap(
+    (line, index) => terms.some((term) => line.toLowerCase().includes(term)) ? [index] : []
+  );
+  const ranges = [];
+  for (const index of matchingLines.slice(0, 8)) {
+    const start = Math.max(0, index - 6);
+    const end = Math.min(lines.length, index + 7);
+    const previous = ranges.at(-1);
+    if (previous && start <= previous[1]) previous[1] = Math.max(previous[1], end);
+    else ranges.push([start, end]);
+  }
+  const snippet = ranges.map(([start, end]) => `[lines ${start + 1}-${end}]
+${lines.slice(start, end).join("\n")}`).join("\n\n");
+  return snippet.slice(0, maximumCharacters);
+}
+async function discoverPlanningEvidence(repositoryRoot, task) {
+  const trackedPaths = (await git(repositoryRoot, ["ls-files"])).split("\n").filter(Boolean);
+  const files = [];
+  let remainingCharacters = 24e3;
+  const searchTerms = planningSearchTerms(task);
+  const searchPattern = searchTerms.join("|");
+  const matchedPaths = searchPattern ? (await git(repositoryRoot, ["grep", "-l", "-I", "-i", "-E", searchPattern, "--"]).catch(
+    () => ""
+  )).split("\n").filter(
+    (path) => path.length > 0 && !path.startsWith("dist/") && !path.endsWith(".map") && !path.endsWith(".lock")
+  ) : [];
+  const taskMatches = await Promise.all(
+    matchedPaths.map(async (path) => {
+      const content = await readFile3(join2(repositoryRoot, path), "utf8").catch(() => "");
+      const normalized = content.toLowerCase();
+      const score = searchTerms.filter((term) => normalized.includes(term)).length;
+      const pathScore = searchTerms.filter((term) => path.toLowerCase().includes(term)).length;
+      const source = /(?:^|\/)(?:src|test|tests)\//.test(path) ? 1 : 0;
+      return { path, content, score, pathScore, source };
+    })
+  );
+  taskMatches.sort(
+    (left, right) => right.source - left.source || right.pathScore - left.pathScore || right.score - left.score || left.path.localeCompare(right.path)
+  );
+  for (const { path, content } of taskMatches.slice(0, 3)) {
+    const selected = taskSnippet(content, searchTerms, Math.min(3e3, remainingCharacters));
+    if (!selected) continue;
+    files.push({ path, content: selected, truncated: selected.length < content.length });
+    remainingCharacters -= selected.length;
+  }
+  const baselinePaths = trackedPaths.filter((path) => planningEvidenceNames.has(path.split("/").at(-1) ?? "")).sort((left, right) => {
+    const leftDepth = left.split("/").length;
+    const rightDepth = right.split("/").length;
+    return leftDepth - rightDepth || left.localeCompare(right);
+  });
+  for (const path of baselinePaths) {
+    if (remainingCharacters <= 0 || files.length >= 7) break;
+    if (files.some((file2) => file2.path === path)) continue;
+    const content = await readFile3(join2(repositoryRoot, path), "utf8").catch(() => "");
+    const limit = Math.min(2e3, remainingCharacters);
+    const selected = content.slice(0, limit);
+    files.push({ path, content: selected, truncated: selected.length < content.length });
+    remainingCharacters -= selected.length;
+  }
+  const trackedPathLimit = 2e3;
+  return {
+    trackedPathCount: trackedPaths.length,
+    trackedPaths: trackedPaths.slice(0, trackedPathLimit),
+    trackedPathsTruncated: trackedPaths.length > trackedPathLimit,
+    files
+  };
+}
 async function ensureGraphcraftIgnored(repositoryRoot) {
   const rawExcludePath = await git(repositoryRoot, ["rev-parse", "--git-path", "info/exclude"]);
-  const excludePath = isAbsolute(rawExcludePath) ? rawExcludePath : resolve2(repositoryRoot, rawExcludePath);
+  const excludePath = isAbsolute2(rawExcludePath) ? rawExcludePath : resolve2(repositoryRoot, rawExcludePath);
   let content = "";
   try {
     content = await readFile3(excludePath, "utf8");
@@ -32439,6 +32985,21 @@ var RunStore = class _RunStore {
     await writeFile4(path, value, { mode: 384 });
     return path;
   }
+  async appendInvocationEvent(invocationId, event) {
+    const path = join3(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+    await mkdir4(dirname4(path), { recursive: true });
+    await appendFile2(path, `${JSON.stringify(HostEventSchema.parse(event))}
+`, {
+      encoding: "utf8",
+      mode: 384
+    });
+    return path;
+  }
+  async loadInvocationEvents(invocationId) {
+    const path = join3(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+    const content = await readFile4(path, "utf8");
+    return content.split("\n").filter(Boolean).map((line) => HostEventSchema.parse(JSON.parse(line)));
+  }
   async writeCapsule(hash2, value) {
     const path = join3(this.runRoot, "capsules", `${hash2}.json`);
     await writeJsonAtomic(path, value);
@@ -32486,58 +33047,213 @@ async function resolveRunId(repositoryRoot, reference) {
 }
 
 // packages/runtime/src/runner.ts
+function persistedBaseline(value) {
+  if (typeof value !== "object" || value === null) return void 0;
+  const candidate = value;
+  if (typeof candidate.digest !== "string" || typeof candidate.workspaceDigest !== "string" || typeof candidate.passed !== "number" || typeof candidate.failed !== "number" || typeof candidate.failureSignature !== "string" || !Array.isArray(candidate.probeResults))
+    return void 0;
+  return candidate;
+}
+async function recoverableInvocation(store, nodeId, repositoryPath) {
+  const events = await store.loadEvents();
+  const started = events.findLast(
+    ({ type, data }) => type === "invocation.started" && data.nodeId === nodeId && typeof data.invocationId === "string"
+  );
+  if (!started) return void 0;
+  const invocationId = String(started.data.invocationId);
+  const finished = events.findLast(
+    ({ type, data }) => type === "invocation.finished" && data.invocationId === invocationId
+  );
+  if (finished && finished.data.success !== true) return void 0;
+  const session = events.findLast(
+    ({ type, data }) => type === "invocation.session" && data.invocationId === invocationId && typeof data.hostSessionId === "string"
+  );
+  const transcript = await store.loadInvocationEvents(invocationId).catch(() => []);
+  const transcriptSession = transcript.findLast((event) => event.type === "session");
+  const hostSessionId = session ? String(session.data.hostSessionId) : transcriptSession?.type === "session" ? transcriptSession.hostSessionId : void 0;
+  const baseline = persistedBaseline(started.data.baseline);
+  return {
+    adapterId: String(started.data.adapter ?? ""),
+    nodeId,
+    record: {
+      invocationId,
+      repositoryPath,
+      startedAt: started.timestamp,
+      ...hostSessionId ? { hostSessionId } : {},
+      ...baseline ? { baseline } : {},
+      transcript
+    }
+  };
+}
+async function recordMissingUsage(store, invocation) {
+  const transcriptUsage = (invocation.transcript ?? []).filter(
+    (event) => event.type === "usage"
+  );
+  const events = await store.loadEvents();
+  const recordedCount = events.filter(
+    ({ type, causationId }) => type === "tokens.recorded" && causationId === invocation.invocationId
+  ).length;
+  for (const event of transcriptUsage.slice(recordedCount))
+    await store.append(
+      "host",
+      "tokens.recorded",
+      { usage: event.usage, recovered: true },
+      invocation.invocationId
+    );
+}
+async function validatePlannedContext(graph, repositoryPath) {
+  for (const node2 of graph.nodes) {
+    if (node2.kind === "commit") continue;
+    if (node2.contextSelector.relevantPaths.length === 0)
+      throw new Error(`Planned node ${node2.id} did not select repository evidence`);
+    for (const relevantPath of node2.contextSelector.relevantPaths) {
+      const result = await runProcess("git", ["ls-files", "--", relevantPath], {
+        cwd: repositoryPath,
+        timeoutMs: 3e4
+      });
+      if (result.exitCode !== 0 || result.stdout.trim().length === 0)
+        throw new Error(
+          `Planned node ${node2.id} selected nonexistent or untracked context path ${relevantPath}`
+        );
+    }
+  }
+}
 async function createRun(task, options) {
   const repository = await discoverRepository(options.cwd);
-  const probes = await discoverVerificationProbes(repository.root);
+  const [probes, repositoryEvidence] = await Promise.all([
+    discoverVerificationProbes(repository.root),
+    discoverPlanningEvidence(repository.root, task)
+  ]);
   const contract = compileRunContract(task, repository, {
     ...options.finishLine ? { finishLine: options.finishLine } : {}
   });
-  const graph = compileGraph(contract, probes);
+  let graph;
+  let planningUsage;
+  if (options.planner) {
+    const capabilities = await options.planner.probe();
+    if (!capabilities.installed || !capabilities.authenticated || !capabilities.structuredOutput || !capabilities.streamingEvents) {
+      throw new Error(
+        `${options.planner.id} is not authenticated or does not provide the required structured unattended interface`
+      );
+    }
+    const planned = await options.planner.plan(
+      {
+        contract,
+        repositoryPath: repository.root,
+        repositoryEvidence,
+        verificationProbes: probes
+      },
+      options.signal ?? new AbortController().signal
+    );
+    graph = compilePlannedGraph(contract, planned.plan, probes);
+    await validatePlannedContext(graph, repository.root);
+    planningUsage = planned.usage;
+  } else {
+    graph = compileGraph(contract, probes);
+  }
   const store = await RunStore.create(repository.root, contract, graph);
+  if (planningUsage)
+    await store.append("host", "tokens.recorded", { usage: planningUsage, phase: "planning" });
   return { contract, graph, store };
 }
 async function executeWorker(input) {
   const capsule = createContextCapsule({
     contract: input.contract,
     node: input.node,
+    ...input.predecessorEvidence ? { predecessorEvidence: input.predecessorEvidence } : {},
     ...input.probeResults ? { probeResults: input.probeResults } : {}
   });
   const capsuleHash = contentHash(capsule);
   await input.store.writeCapsule(capsuleHash, capsule);
-  const invocationId = randomUUID4();
-  await input.store.append("runtime", "invocation.started", {
-    invocationId,
-    nodeId: input.node.id,
-    adapter: input.adapter.id,
-    capsuleHash
-  });
-  const transcript = [];
+  let invocationId = input.resume?.invocationId ?? randomUUID4();
+  let resumeSessionId;
+  if (input.resume) {
+    await recordMissingUsage(input.store, input.resume);
+    const reconciliation = await input.adapter.reconcile(input.resume);
+    if (reconciliation.state === "completed" && reconciliation.result) {
+      const artifact2 = join4(
+        input.store.runRoot,
+        "artifacts",
+        "invocations",
+        `${invocationId}.jsonl`
+      );
+      await input.store.append(
+        "runtime",
+        "invocation.finished",
+        { invocationId, nodeId: input.node.id, artifact: artifact2, success: true, recovered: true },
+        invocationId
+      );
+      return { result: WorkerResultSchema.parse(reconciliation.result) };
+    }
+    if (reconciliation.state === "in_progress" && input.resume.hostSessionId) {
+      resumeSessionId = input.resume.hostSessionId;
+      await input.store.append(
+        "runtime",
+        "invocation.resumed",
+        { invocationId, nodeId: input.node.id, hostSessionId: resumeSessionId },
+        invocationId
+      );
+    } else {
+      await input.store.append(
+        "runtime",
+        "invocation.finished",
+        {
+          invocationId,
+          nodeId: input.node.id,
+          success: false,
+          reason: "Native host continuation was unavailable; using repository recovery"
+        },
+        invocationId
+      );
+      invocationId = randomUUID4();
+    }
+  }
+  if (!resumeSessionId) {
+    await input.store.append("runtime", "invocation.started", {
+      invocationId,
+      nodeId: input.node.id,
+      adapter: input.adapter.id,
+      capsuleHash,
+      baseline: input.baseline
+    });
+  }
   let result;
   let error51;
-  for await (const event of input.adapter.execute(
-    {
-      invocationId,
-      repositoryPath: input.workspace.path,
-      capsule,
-      allowedTools: ["read", "write", "shell"]
-    },
-    input.signal
-  )) {
-    transcript.push(event);
-    if (event.type === "message") input.observer?.({ type: "host", message: event.text });
-    if (event.type === "tool")
-      input.observer?.({ type: "host", message: `${event.name} ${event.summary}`.trim() });
-    if (event.type === "usage") {
-      await input.store.append("host", "tokens.recorded", { usage: event.usage }, invocationId);
+  let artifact = join4(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+  try {
+    for await (const event of input.adapter.execute(
+      {
+        invocationId,
+        repositoryPath: input.workspace.path,
+        capsule,
+        allowedTools: input.node.sideEffectClass === "workspace_write" ? ["read", "write", "shell"] : ["read"],
+        ...resumeSessionId ? { resumeSessionId } : {}
+      },
+      input.signal
+    )) {
+      artifact = await input.store.appendInvocationEvent(invocationId, event);
+      if (event.type === "session") {
+        await input.store.append(
+          "host",
+          "invocation.session",
+          { invocationId, nodeId: input.node.id, hostSessionId: event.hostSessionId },
+          invocationId
+        );
+      }
+      if (event.type === "message") input.observer?.({ type: "host", message: event.text });
+      if (event.type === "tool")
+        input.observer?.({ type: "host", message: `${event.name} ${event.summary}`.trim() });
+      if (event.type === "usage") {
+        await input.store.append("host", "tokens.recorded", { usage: event.usage }, invocationId);
+      }
+      if (event.type === "result") result = WorkerResultSchema.parse(event.result);
+      if (event.type === "error") error51 = event.message;
     }
-    if (event.type === "result") result = WorkerResultSchema.parse(event.result);
-    if (event.type === "error") error51 = event.message;
+  } catch (cause) {
+    error51 = cause instanceof Error ? cause.message : String(cause);
+    const event = { type: "error", message: error51 };
+    artifact = await input.store.appendInvocationEvent(invocationId, event);
   }
-  const artifact = await input.store.writeArtifact(
-    `invocations/${invocationId}.jsonl`,
-    `${transcript.map((event) => JSON.stringify(event)).join("\n")}
-`
-  );
   await input.store.append(
     "runtime",
     "invocation.finished",
@@ -32627,12 +33343,7 @@ async function executeRun(input) {
       state = await input.store.loadState();
     }
     if (["completed", "stopped"].includes(state.status)) return state;
-    if (state.currentNodeId && state.nodes[state.currentNodeId]?.status === "running") {
-      await input.store.append("runtime", "node.reset", {
-        nodeId: state.currentNodeId,
-        reason: "Recovered an interrupted invocation; accepted nodes remain immutable"
-      });
-    }
+    const interruptedNodeId = state.currentNodeId && state.nodes[state.currentNodeId]?.status === "running" ? state.currentNodeId : void 0;
     if (state.status === "blocked") {
       for (const [nodeId, nodeState] of Object.entries(state.nodes)) {
         if (nodeState.status === "failed") {
@@ -32657,6 +33368,27 @@ async function executeRun(input) {
     } catch {
       workspace = await createRunWorkspace(contract);
       await input.store.writeWorkspace(workspace);
+    }
+    let recovery = interruptedNodeId ? await recoverableInvocation(input.store, interruptedNodeId, workspace.path) : void 0;
+    if (recovery && (recovery.adapterId !== input.adapter.id || recovery.record.baseline === void 0)) {
+      await input.store.append(
+        "runtime",
+        "invocation.finished",
+        {
+          invocationId: recovery.record.invocationId,
+          nodeId: recovery.nodeId,
+          success: false,
+          reason: recovery.adapterId !== input.adapter.id ? "Selected host changed; using repository recovery" : "The interrupted invocation predates durable progress baselines"
+        },
+        recovery.record.invocationId
+      );
+      recovery = void 0;
+    }
+    if (interruptedNodeId) {
+      await input.store.append("runtime", "node.reset", {
+        nodeId: interruptedNodeId,
+        reason: recovery ? "Recovered an interrupted invocation for native host reconciliation" : "Recovered from repository evidence; accepted nodes remain immutable"
+      });
     }
     if (state.status !== "running")
       await input.store.append("runtime", "run.started", { workspace });
@@ -32754,22 +33486,34 @@ async function executeRun(input) {
         }
         continue;
       }
-      const beforeDigest = await workspaceDigest(workspace.path);
-      const baselineProbes = await runProbes(current.progressProbes, workspace.path, signal);
-      const baseline = evidenceSnapshot(
-        beforeDigest,
-        baselineProbes.map(({ result }) => result)
-      );
+      const activeRecovery = recovery?.nodeId === current.id ? recovery : void 0;
+      let baseline;
+      let baselineProbeResults;
+      if (activeRecovery?.record.baseline) {
+        baseline = activeRecovery.record.baseline;
+        baselineProbeResults = baseline.probeResults;
+      } else {
+        const baselineProbes = await runProbes(current.progressProbes, workspace.path, signal);
+        baselineProbeResults = baselineProbes.map(({ result }) => result);
+        baseline = evidenceSnapshot(await workspaceDigest(workspace.path), baselineProbeResults);
+      }
       const worker = await executeWorker({
         adapter: input.adapter,
         store: input.store,
         contract,
         node: current,
         workspace,
-        ...baselineProbes.length ? { probeResults: baselineProbes.map(({ result }) => result) } : {},
+        predecessorEvidence: current.contextSelector.predecessorResults.flatMap((nodeId) => {
+          const predecessor = state.nodes[nodeId];
+          return predecessor?.lastSummary ? [`${nodeId}: ${predecessor.lastSummary}`] : [];
+        }),
+        ...baselineProbeResults.length ? { probeResults: baselineProbeResults } : {},
         ...input.observer ? { observer: input.observer } : {},
-        signal
+        signal,
+        baseline,
+        ...activeRecovery ? { resume: activeRecovery.record } : {}
       });
+      if (activeRecovery) recovery = void 0;
       if (!worker.result || worker.error || worker.result.status !== "completed") {
         const reason = worker.error ?? worker.result?.summary ?? "Worker did not complete the node";
         await input.store.append("worker", "node.failed", { nodeId: current.id, reason });
@@ -32787,14 +33531,15 @@ async function executeRun(input) {
         await workspaceDigest(workspace.path),
         afterProbes.map(({ result }) => result)
       );
-      const classification = classifyProgress(baseline, currentEvidence);
+      const measuredClassification = classifyProgress(baseline, currentEvidence);
+      const classification = measuredClassification === "stalled" && current.sideEffectClass === "none" && worker.result.evidence.length > 0 ? "learning" : measuredClassification;
       await input.store.append("probe", "node.progress", {
         nodeId: current.id,
         classification,
         summary: worker.result.summary,
         evidence: [...worker.result.evidence, ...afterProbes.map(({ result }) => result.summary)]
       });
-      if (["done", "advanced", "learning"].includes(classification) || graph.family === "audit") {
+      if (["done", "advanced", "learning"].includes(classification)) {
         await input.store.append("runtime", "node.accepted", {
           nodeId: current.id,
           summary: worker.result.summary
@@ -32836,7 +33581,16 @@ function shouldBypassGraph(task) {
   );
   return words <= 8 && !durableSignal;
 }
-function contractView(contract) {
+function contractView(contract, graph) {
+  const completionProbes = graph?.nodes.flatMap(
+    (node2) => node2.completionProbes.map((probe) => ({
+      id: probe.id,
+      kind: probe.kind,
+      ...probe.kind === "command" ? { command: [probe.command, ...probe.args].join(" "), cwd: probe.cwd ?? "." } : {},
+      ...probe.kind === "file" ? { path: probe.path } : {},
+      ...probe.kind === "git_diff" ? { baseSha: probe.baseSha } : {}
+    }))
+  );
   return {
     runId: contract.runId,
     outcome: contract.outcome,
@@ -32849,6 +33603,8 @@ function contractView(contract) {
       description,
       owner
     })),
+    ...graph ? { planShape: graphPlanShape(graph) } : {},
+    ...completionProbes ? { completionProbes } : {},
     recovery: "Checkpoint after every event; accepted nodes are never repeated"
   };
 }
@@ -32899,14 +33655,17 @@ async function handleAction(input) {
         "Graphcraft v0.1 supports local_verified and committed finish lines. It will not silently narrow a requested remote finish line."
       );
     }
+    const adapter = createAdapter(input.host ?? "codex");
     const created = await createRun(input.task, {
       cwd,
+      planner: adapter,
       ...input.finishLine ? { finishLine: input.finishLine } : {}
     });
-    if (!input.approve) return { approvalRequired: true, contract: contractView(created.contract) };
+    if (!input.approve)
+      return { approvalRequired: true, contract: contractView(created.contract, created.graph) };
     const state2 = await executeRun({
       store: created.store,
-      adapter: createAdapter(input.host ?? "codex"),
+      adapter,
       approve: true
     });
     return stateView(state2, created.contract);
@@ -32929,7 +33688,7 @@ async function handleAction(input) {
   }
   if (input.action === "resume") {
     if (state.status === "awaiting_approval" && !input.approve) {
-      return { approvalRequired: true, contract: contractView(contract) };
+      return { approvalRequired: true, contract: contractView(contract, graph) };
     }
     const resumed = await executeRun({
       store,

@@ -91,13 +91,15 @@ program
           "Graphcraft v0.1 supports local_verified and committed finish lines and will not narrow this remote request.",
         );
       }
+      const adapter = createAdapter(options.host);
       const created = await createRun(task, {
         cwd: options.cwd,
+        planner: adapter,
         ...(options.finishLine ? { finishLine: options.finishLine } : {}),
       });
-      const approved = options.yes || (await askForApproval(created.contract));
+      const approved = options.yes || (await askForApproval(created.contract, created.graph));
       if (!approved) {
-        console.log(renderContract(created.contract));
+        console.log(renderContract(created.contract, created.graph));
         console.log(
           `Run saved for approval. Resume with: graphcraft resume ${created.contract.runId}`,
         );
@@ -105,7 +107,7 @@ program
       }
       const state = await executeRun({
         store: created.store,
-        adapter: createAdapter(options.host),
+        adapter,
         approve: true,
         observer: consoleObserver(options.json),
       });
@@ -162,12 +164,19 @@ program
     ) => {
       const store = await storeFor(options.cwd, run);
       const contract = await store.loadContract();
+      const graph = await store.loadGraph();
       const state = await store.loadState();
       const approved =
-        state.status !== "awaiting_approval" || options.yes || (await askForApproval(contract));
+        state.status !== "awaiting_approval" ||
+        options.yes ||
+        (await askForApproval(contract, graph));
       if (!approved) {
         console.log(
-          JSON.stringify({ approvalRequired: true, contract: contractView(contract) }, null, 2),
+          JSON.stringify(
+            { approvalRequired: true, contract: contractView(contract, graph) },
+            null,
+            2,
+          ),
         );
         return;
       }

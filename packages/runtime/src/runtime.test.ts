@@ -1,20 +1,24 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
+import { evidenceSnapshot, reconcilePersistedInvocation } from "@graphcraft/core";
 import type {
   HostAdapter,
   HostCapabilities,
   HostEvent,
   InvocationRecord,
+  PlanningRequest,
+  PlanningResult,
   ReconciliationResult,
   WorkerRequest,
 } from "@graphcraft/core";
 import { createRun, executeRun } from "./runner.ts";
 import { RunLock } from "./lock.ts";
-import { createRunWorkspace } from "./repository.ts";
+import { createRunWorkspace, discoverPlanningEvidence } from "./repository.ts";
 
 const execFileAsync = promisify(execFile);
 const temporaryRoots: string[] = [];
@@ -37,6 +41,7 @@ async function createRepository(requiredFile = "feature.txt"): Promise<string> {
   await git(repository, "init", "-b", "main");
   await git(repository, "config", "user.name", "Graphcraft Test");
   await git(repository, "config", "user.email", "graphcraft@example.test");
+  await git(repository, "config", "commit.gpgSign", "false");
   await writeFile(
     join(repository, "package.json"),
     JSON.stringify({
@@ -57,6 +62,7 @@ async function createRepository(requiredFile = "feature.txt"): Promise<string> {
 class FakeAdapter implements HostAdapter {
   readonly id = "test" as const;
   readonly calls: string[] = [];
+  readonly requests: WorkerRequest[] = [];
   private readonly act: (request: WorkerRequest, call: number) => Promise<void>;
   private readonly authenticated: boolean;
 
@@ -76,9 +82,89 @@ class FakeAdapter implements HostAdapter {
     };
   }
 
+  async plan(request: PlanningRequest, _signal: AbortSignal): Promise<PlanningResult> {
+    const nodes: PlanningResult["plan"]["nodes"] = [
+      {
+        id: "investigate",
+        kind: "investigation",
+        objective: "Inspect repository evidence and identify the implementation boundary",
+        dependsOn: [],
+        scope: ["**/*"],
+        contextSelector: {
+          includeRepositoryInstructions: true,
+          predecessorResults: [],
+          relevantPaths: ["package.json", "verify.mjs"],
+        },
+        progressProbes: [],
+        completionProbes: [],
+        sideEffectClass: "none",
+      },
+      {
+        id: "implement",
+        kind: "implementation",
+        objective: request.contract.outcome,
+        dependsOn: ["investigate"],
+        scope: ["**/*"],
+        contextSelector: {
+          includeRepositoryInstructions: true,
+          predecessorResults: ["investigate"],
+          relevantPaths: ["package.json"],
+        },
+        progressProbes: [
+          {
+            id: "workspace-diff",
+            kind: "git_diff",
+            baseSha: request.contract.repository.baseSha,
+            requireChanges: true,
+          },
+        ],
+        completionProbes: [],
+        sideEffectClass: "workspace_write",
+      },
+      {
+        id: "verify",
+        kind: "verification",
+        objective: `Verify the approved outcome: ${request.contract.outcome}`,
+        dependsOn: ["implement"],
+        scope: ["**/*"],
+        contextSelector: {
+          includeRepositoryInstructions: true,
+          predecessorResults: ["implement"],
+          relevantPaths: ["package.json", "verify.mjs"],
+        },
+        progressProbes: [],
+        completionProbes: request.verificationProbes,
+        sideEffectClass: "none",
+      },
+    ];
+    if (request.contract.finishLine.kind === "committed") {
+      nodes.push({
+        id: "commit",
+        kind: "commit",
+        objective: "Commit the accepted run changes",
+        dependsOn: ["verify"],
+        scope: ["**/*"],
+        contextSelector: {
+          includeRepositoryInstructions: true,
+          predecessorResults: ["verify"],
+          relevantPaths: [],
+        },
+        progressProbes: [],
+        completionProbes: [],
+        sideEffectClass: "git_commit",
+      });
+    }
+    return {
+      plan: { schemaVersion: 1, family: "feature", nodes },
+      usage: { input: 5, cachedInput: 1, output: 2, reasoning: 0, total: 7 },
+    };
+  }
+
   async *execute(request: WorkerRequest, _signal: AbortSignal): AsyncIterable<HostEvent> {
     this.calls.push(request.capsule.nodeId);
+    this.requests.push(request);
     yield { type: "started", invocationId: request.invocationId };
+    yield { type: "session", hostSessionId: request.resumeSessionId ?? request.invocationId };
     await this.act(request, this.calls.length);
     yield {
       type: "usage",
@@ -95,12 +181,61 @@ class FakeAdapter implements HostAdapter {
     };
   }
 
-  async reconcile(_invocation: InvocationRecord): Promise<ReconciliationResult> {
-    return { state: "unknown" };
+  async reconcile(invocation: InvocationRecord): Promise<ReconciliationResult> {
+    return reconcilePersistedInvocation(invocation);
   }
 }
 
 describe("durable runtime", () => {
+  it("selects bounded task-matched source snippets for planning evidence", async () => {
+    const repository = await createRepository();
+    await mkdir(join(repository, "src"));
+    await writeFile(
+      join(repository, "src", "graph.ts"),
+      "export function classifyTask(task: string) { return task.includes('fix') ? 'bug' : 'feature'; }\n",
+    );
+    await git(repository, "add", "src/graph.ts");
+    await git(repository, "commit", "-m", "add classifier");
+
+    const evidence = await discoverPlanningEvidence(
+      repository,
+      "Fix task classification without matching fixture path substrings",
+    );
+
+    expect(evidence.files.map(({ path }) => path)).toContain("src/graph.ts");
+    expect(evidence.files.find(({ path }) => path === "src/graph.ts")?.content).toContain(
+      "classifyTask",
+    );
+    expect(evidence.files.map(({ path }) => path)).toContain("package.json");
+  });
+
+  it("persists and executes a validated host-planned graph with selected predecessor evidence", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+    });
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+      planner: adapter,
+    });
+
+    expect(created.graph.nodes.map(({ id }) => id)).toEqual(["investigate", "implement", "verify"]);
+    expect((await created.store.loadState()).tokens.total).toBe(7);
+
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+
+    expect(state.status).toBe("completed");
+    expect(state.nodes.investigate?.lastProgress).toBe("learning");
+    expect(adapter.calls).toEqual(["investigate", "implement"]);
+    expect(adapter.requests[1]?.capsule.predecessorEvidence).toEqual([
+      "investigate: Completed investigate",
+    ]);
+    expect(adapter.requests[0]?.allowedTools).toEqual(["read"]);
+    expect(adapter.requests[1]?.allowedTools).toEqual(["read", "write", "shell"]);
+    expect(state.tokens.total).toBe(35);
+  });
+
   it("completes a local run in an isolated worktree and records tokens", async () => {
     const repository = await createRepository();
     const adapter = new FakeAdapter(async (request) => {
@@ -225,6 +360,106 @@ describe("durable runtime", () => {
     expect(state.status).toBe("completed");
     expect(state.nodes.implement?.attempts).toBe(2);
     expect((await created.store.loadEvents()).map(({ type }) => type)).toContain("node.reset");
+  });
+
+  it("resumes one persisted native host session with its original progress baseline", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async (request) => {
+      await writeFile(join(request.repositoryPath, "feature.txt"), "resumed\n");
+    });
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    await created.store.append("user", "run.approved", { approved: true });
+    const workspace = await createRunWorkspace(created.contract);
+    await created.store.writeWorkspace(workspace);
+    await created.store.append("runtime", "node.started", { nodeId: "implement" });
+    const invocationId = randomUUID();
+    const hostSessionId = randomUUID();
+    const baseline = evidenceSnapshot("before-interruption", []);
+    await created.store.append("runtime", "invocation.started", {
+      invocationId,
+      nodeId: "implement",
+      adapter: "test",
+      capsuleHash: "persisted-capsule",
+      baseline,
+    });
+    await created.store.appendInvocationEvent(invocationId, {
+      type: "started",
+      invocationId,
+    });
+    await created.store.appendInvocationEvent(invocationId, { type: "session", hostSessionId });
+    await writeFile(join(workspace.path, "feature.txt"), "partial\n");
+
+    const state = await executeRun({ store: created.store, adapter });
+
+    expect(state.status).toBe("completed");
+    expect(adapter.calls).toEqual(["implement"]);
+    expect(adapter.requests[0]?.resumeSessionId).toBe(hostSessionId);
+    expect((await created.store.loadEvents()).map(({ type }) => type)).toContain(
+      "invocation.resumed",
+    );
+  });
+
+  it("reuses a durably returned result after takeover without another model call", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async () => {
+      throw new Error("the completed invocation must not execute again");
+    });
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    await created.store.append("user", "run.approved", { approved: true });
+    const workspace = await createRunWorkspace(created.contract);
+    await created.store.writeWorkspace(workspace);
+    await created.store.append("runtime", "node.started", { nodeId: "implement" });
+    const invocationId = randomUUID();
+    const hostSessionId = randomUUID();
+    const baseline = evidenceSnapshot("before-interruption", []);
+    await created.store.append("runtime", "invocation.started", {
+      invocationId,
+      nodeId: "implement",
+      adapter: "test",
+      capsuleHash: "persisted-capsule",
+      baseline,
+    });
+    await created.store.append(
+      "host",
+      "invocation.session",
+      { invocationId, nodeId: "implement", hostSessionId },
+      invocationId,
+    );
+    await created.store.appendInvocationEvent(invocationId, {
+      type: "usage",
+      usage: { input: 10, cachedInput: 2, output: 4, reasoning: 0, total: 14 },
+    });
+    await created.store.appendInvocationEvent(invocationId, {
+      type: "result",
+      result: {
+        status: "completed",
+        summary: "Completed before the runtime was terminated",
+        changedPaths: ["feature.txt"],
+        evidence: ["durable result"],
+      },
+    });
+    await created.store.append(
+      "runtime",
+      "invocation.finished",
+      { invocationId, nodeId: "implement", success: true },
+      invocationId,
+    );
+    await writeFile(join(workspace.path, "feature.txt"), "completed\n");
+
+    const state = await executeRun({ store: created.store, adapter });
+
+    expect(state.status).toBe("completed");
+    expect(adapter.calls).toEqual([]);
+    expect(state.tokens.total).toBe(14);
+    expect(
+      (await created.store.loadEvents()).find(
+        ({ type, data }) => type === "invocation.finished" && data.recovered === true,
+      ),
+    ).toBeDefined();
   });
 
   it("uses an exclusive recoverable run lock", async () => {
