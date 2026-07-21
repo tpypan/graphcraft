@@ -26,7 +26,7 @@ graphcraft install --host claude
 Until that registry publication is complete, install the same executable directly from GitHub:
 
 ```bash
-npm install --global github:tpypan/graphcraft
+npm install --global https://github.com/tpypan/graphcraft/archive/refs/heads/main.tar.gz
 graphcraft install --host codex
 ```
 
