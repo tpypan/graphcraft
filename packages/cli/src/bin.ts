@@ -82,6 +82,11 @@ program
   .option("-y, --yes", "approve the displayed contract non-interactively")
   .option("--force", "force Graphcraft for a small task")
   .option("--json", "emit machine-readable progress")
+  .addOption(
+    new Option("--max-workers <count>", "maximum concurrent read-only workers")
+      .choices(["1", "2"])
+      .default("1"),
+  )
   .addOption(hostOption)
   .addOption(
     new Option("--finish-line <finish-line>", "finish line").choices([
@@ -98,6 +103,7 @@ program
         force?: boolean;
         json?: boolean;
         host: HostName;
+        maxWorkers: "1" | "2";
         finishLine?: "local_verified" | "committed";
       },
     ) => {
@@ -132,6 +138,7 @@ program
         approve: true,
         observer: consoleObserver(options.json),
         signal: execution.signal,
+        maxWorkers: Number(options.maxWorkers) as 1 | 2,
       }).finally(execution.dispose);
       console.log(JSON.stringify(stateView(state, created.contract), null, options.json ? 0 : 2));
       if (state.status !== "completed") process.exitCode = 2;
@@ -273,11 +280,22 @@ program
   .option("-C, --cwd <path>", "repository path", process.cwd())
   .option("-y, --yes", "approve a pending contract")
   .option("--json", "emit machine-readable progress")
+  .addOption(
+    new Option("--max-workers <count>", "maximum concurrent read-only workers")
+      .choices(["1", "2"])
+      .default("1"),
+  )
   .addOption(hostOption)
   .action(
     async (
       run: string | undefined,
-      options: { cwd: string; yes?: boolean; json?: boolean; host: HostName },
+      options: {
+        cwd: string;
+        yes?: boolean;
+        json?: boolean;
+        host: HostName;
+        maxWorkers: "1" | "2";
+      },
     ) => {
       const store = await storeFor(options.cwd, run);
       const contract = await store.loadContract();
@@ -305,6 +323,7 @@ program
         approve: true,
         observer: consoleObserver(options.json),
         signal: execution.signal,
+        maxWorkers: Number(options.maxWorkers) as 1 | 2,
       }).finally(execution.dispose);
       console.log(JSON.stringify(stateView(resumed, contract), null, options.json ? 0 : 2));
       if (resumed.status !== "completed") process.exitCode = 2;

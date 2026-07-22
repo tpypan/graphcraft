@@ -27,6 +27,7 @@ export class RunStore {
   readonly runId: string;
   readonly graphcraftRoot: string;
   readonly runRoot: string;
+  private appendTail: Promise<void> = Promise.resolve();
 
   constructor(repositoryRoot: string, runId: string) {
     this.repositoryRoot = repositoryRoot;
@@ -156,18 +157,25 @@ export class RunStore {
     data: Record<string, unknown>,
     causationId = this.runId,
   ): Promise<RunEvent> {
-    const events = await this.loadEvents();
-    const event = createRunEvent({
-      sequence: events.length + 1,
-      actor,
-      causationId,
-      type,
-      data,
+    const operation = this.appendTail.then(async () => {
+      const events = await this.loadEvents();
+      const event = createRunEvent({
+        sequence: events.length + 1,
+        actor,
+        causationId,
+        type,
+        data,
+      });
+      await appendFile(this.eventsPath(), `${JSON.stringify(event)}\n`, "utf8");
+      events.push(event);
+      await this.materialize(events);
+      return event;
     });
-    await appendFile(this.eventsPath(), `${JSON.stringify(event)}\n`, "utf8");
-    events.push(event);
-    await this.materialize(events);
-    return event;
+    this.appendTail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return await operation;
   }
 
   async rebuildViews(): Promise<RunState> {

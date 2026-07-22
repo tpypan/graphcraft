@@ -16,6 +16,7 @@ import type {
   HostEvent,
   InvocationRecord,
   GraphAmendment,
+  Graph,
   PlanningRequest,
   PlanningResult,
   ReconciliationResult,
@@ -341,6 +342,62 @@ class FaultInjectingRunStore extends RunStore {
     this.armed = false;
     throw new Error(`Injected process termination after ${this.faultPoint}`);
   }
+}
+
+function splitParallelBranches(graph: Graph): GraphAmendment {
+  const investigation = graph.nodes.find(({ id }) => id === "investigate")!;
+  const implementation = graph.nodes.find(({ id }) => id === "implement")!;
+  const planned = (
+    source: typeof investigation,
+    id: string,
+    objective: string,
+    dependsOn: string[],
+  ) => ({
+    id,
+    kind: source.kind,
+    objective,
+    dependsOn,
+    scope: source.scope,
+    contextSelector: {
+      ...source.contextSelector,
+      predecessorResults: dependsOn,
+    },
+    progressProbes: source.progressProbes,
+    completionProbes: source.completionProbes,
+    sideEffectClass: source.sideEffectClass,
+  });
+  return {
+    schemaVersion: 1,
+    amendmentId: randomUUID(),
+    operations: [
+      {
+        operation: "split",
+        targetId: investigation.id,
+        replacements: [
+          planned(investigation, "inspect-a", "Inspect the first independent boundary", []),
+          planned(investigation, "inspect-b", "Inspect the second independent boundary", []),
+        ],
+      },
+      {
+        operation: "split",
+        targetId: implementation.id,
+        replacements: [
+          planned(implementation, "write-a", "Implement the feature file", [
+            "inspect-a",
+            "inspect-b",
+          ]),
+          planned(implementation, "write-b", "Implement the supporting proof", [
+            "inspect-a",
+            "inspect-b",
+          ]),
+        ],
+      },
+    ],
+    evidence: ["The two investigations are read-only and the write scopes share one worktree"],
+    rationale: "Independent discovery can fan out while mutable work must remain serialized",
+    changedStrategy: "Inspect two branches concurrently, then join before sequential writes",
+    falsifiableExpectation: "Reads overlap, writes do not, and verification passes once",
+  };
 }
 
 describe("durable runtime", () => {
@@ -996,6 +1053,186 @@ describe("durable runtime", () => {
     expect((await created.store.loadGraphHistory()).map(({ amendment }) => amendment)).toEqual([
       amended.amendment,
     ]);
+  });
+
+  it("fans out independent reads but serializes all shared-worktree writes", async () => {
+    const repository = await createRepository();
+    let activeReads = 0;
+    let maximumReads = 0;
+    let activeWrites = 0;
+    let maximumWrites = 0;
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId.startsWith("inspect-")) {
+        activeReads += 1;
+        maximumReads = Math.max(maximumReads, activeReads);
+        await new Promise<void>((resolve) => setTimeout(resolve, 40));
+        activeReads -= 1;
+      }
+      if (request.capsule.nodeId.startsWith("write-")) {
+        activeWrites += 1;
+        maximumWrites = Math.max(maximumWrites, activeWrites);
+        await new Promise<void>((resolve) => setTimeout(resolve, 40));
+        await writeFile(
+          join(
+            request.repositoryPath,
+            request.capsule.nodeId === "write-a" ? "feature.txt" : "proof.txt",
+          ),
+          "implemented\n",
+        );
+        activeWrites -= 1;
+      }
+    });
+    const created = await createRun("Implement a substantial parallel fixture feature", {
+      cwd: repository,
+      planner: adapter,
+    });
+    await created.store.append("user", "run.approved", { approved: true });
+    await amendRunGraph(created.store, splitParallelBranches(created.graph), "runtime");
+
+    const state = await executeRun({ store: created.store, adapter, maxWorkers: 2 });
+    const events = await created.store.loadEvents();
+    const readStarts = events.filter(
+      ({ type, data }) =>
+        type === "node.started" && ["inspect-a", "inspect-b"].includes(String(data.nodeId)),
+    );
+    const writeStarts = events.filter(
+      ({ type, data }) =>
+        type === "node.started" && ["write-a", "write-b"].includes(String(data.nodeId)),
+    );
+
+    expect(state.status).toBe("completed");
+    expect(maximumReads).toBe(2);
+    expect(maximumWrites).toBe(1);
+    expect(new Set(readStarts.map(({ data }) => data.batchId)).size).toBe(1);
+    expect(readStarts.every(({ data }) => data.batchSize === 2)).toBe(true);
+    expect(writeStarts.every(({ data }) => data.batchSize === 1)).toBe(true);
+    expect(
+      adapter.requests.find(({ capsule }) => capsule.nodeId === "write-a")?.capsule,
+    ).toMatchObject({
+      predecessorEvidence: ["inspect-a: Completed inspect-a", "inspect-b: Completed inspect-b"],
+    });
+    expect(events.map(({ sequence }) => sequence)).toEqual(
+      Array.from({ length: events.length }, (_, index) => index + 1),
+    );
+  });
+
+  it("keeps independent branches sequential by default", async () => {
+    const repository = await createRepository();
+    let activeReads = 0;
+    let maximumReads = 0;
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId.startsWith("inspect-")) {
+        activeReads += 1;
+        maximumReads = Math.max(maximumReads, activeReads);
+        await new Promise<void>((resolve) => setTimeout(resolve, 30));
+        activeReads -= 1;
+      }
+      if (request.capsule.nodeId === "write-a")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+      if (request.capsule.nodeId === "write-b")
+        await writeFile(join(request.repositoryPath, "proof.txt"), "implemented\n");
+    });
+    const created = await createRun("Implement a default sequential fixture feature", {
+      cwd: repository,
+      planner: adapter,
+    });
+    await created.store.append("user", "run.approved", { approved: true });
+    await amendRunGraph(created.store, splitParallelBranches(created.graph), "runtime");
+
+    const state = await executeRun({ store: created.store, adapter });
+
+    expect(state.status).toBe("completed");
+    expect(maximumReads).toBe(1);
+    expect(
+      (await created.store.loadEvents())
+        .filter(({ type }) => type === "node.started")
+        .every(({ data }) => data.batchSize === 1 && data.maxWorkers === 1),
+    ).toBe(true);
+  });
+
+  it("cancels and quarantines a sibling when a parallel read violates its authority", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async (request, _call, signal) => {
+      if (request.capsule.nodeId === "inspect-a")
+        await writeFile(join(request.repositoryPath, "unauthorized.txt"), "mutation\n");
+      if (request.capsule.nodeId === "inspect-b") await waitForAbort(signal);
+    });
+    const created = await createRun("Implement a safely quarantined parallel feature", {
+      cwd: repository,
+      planner: adapter,
+    });
+    await created.store.append("user", "run.approved", { approved: true });
+    await amendRunGraph(created.store, splitParallelBranches(created.graph), "runtime");
+
+    const state = await executeRun({ store: created.store, adapter, maxWorkers: 2 });
+    const blockedEvent = (await created.store.loadEvents()).find(
+      ({ type }) => type === "run.blocked",
+    );
+
+    expect(state.status).toBe("blocked");
+    expect(state.nodes["inspect-a"]?.status).toBe("failed");
+    expect(state.nodes["inspect-b"]?.status).toBe("running");
+    expect(blockedEvent).toMatchObject({
+      data: { quarantinedSiblingIds: ["inspect-b"] },
+    });
+    expect(adapter.calls).not.toContain("write-a");
+    expect(adapter.calls).not.toContain("write-b");
+  });
+
+  it("resumes only the unfinished branch after a parallel interruption", async () => {
+    const repository = await createRepository();
+    const firstAdapter = new FakeAdapter(async (request, _call, signal) => {
+      if (request.capsule.nodeId === "inspect-b") await waitForAbort(signal);
+    });
+    const created = await createRun("Implement a substantial resumable parallel feature", {
+      cwd: repository,
+      planner: firstAdapter,
+    });
+    await created.store.append("user", "run.approved", { approved: true });
+    await amendRunGraph(created.store, splitParallelBranches(created.graph), "runtime");
+    const interruption = new AbortController();
+    const execution = executeRun({
+      store: created.store,
+      adapter: firstAdapter,
+      maxWorkers: 2,
+      signal: interruption.signal,
+    });
+    const deadline = Date.now() + 5_000;
+    while ((await created.store.loadState()).nodes["inspect-a"]?.status !== "accepted") {
+      if (Date.now() > deadline) throw new Error("Timed out waiting for the accepted sibling");
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    interruption.abort({ cause: "runtime_shutdown", reason: "parallel interruption test" });
+    const paused = await execution;
+
+    expect(paused.status).toBe("paused");
+    expect(paused.nodes["inspect-a"]?.status).toBe("accepted");
+    expect(paused.nodes["inspect-b"]?.status).toBe("running");
+    const interruptedRequest = firstAdapter.requests.find(
+      ({ capsule }) => capsule.nodeId === "inspect-b",
+    )!;
+    const resumeAdapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "write-a")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+      if (request.capsule.nodeId === "write-b")
+        await writeFile(join(request.repositoryPath, "proof.txt"), "implemented\n");
+    });
+    const completed = await executeRun({
+      store: created.store,
+      adapter: resumeAdapter,
+      maxWorkers: 2,
+    });
+
+    expect(completed.status).toBe("completed");
+    expect(resumeAdapter.calls).not.toContain("inspect-a");
+    expect(
+      resumeAdapter.requests.find(({ capsule }) => capsule.nodeId === "inspect-b")?.resumeSessionId,
+    ).toBe(interruptedRequest.invocationId);
+    expect(
+      (await created.store.loadEvents()).filter(
+        ({ type, data }) => type === "node.accepted" && data.nodeId === "inspect-a",
+      ),
+    ).toHaveLength(1);
   });
 
   it("stops safely when a write task makes no measurable progress", async () => {

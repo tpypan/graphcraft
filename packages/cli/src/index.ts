@@ -184,6 +184,9 @@ export function stateView(state: RunState, contract: RunContract): Record<string
     finishLine: contract.finishLine.kind,
     status: state.status,
     currentNode: state.currentNodeId,
+    runningNodes: Object.entries(state.nodes)
+      .filter(([, nodeState]) => nodeState.status === "running")
+      .map(([nodeId]) => nodeId),
     nodes: state.nodes,
     latestProgressEvidence: state.latestProgressEvidence,
     controlDecisions: state.controlDecisions,
@@ -259,6 +262,7 @@ export interface McpActionInput {
   approve?: boolean | undefined;
   finishLine?: "local_verified" | "committed" | undefined;
   force?: boolean | undefined;
+  maxWorkers?: 1 | 2 | undefined;
   probePlan?: ProbePlan | undefined;
   amendment?: GraphAmendment | undefined;
   controlSource?: string | undefined;
@@ -313,6 +317,7 @@ export async function handleAction(input: McpActionInput): Promise<Record<string
       store: created.store,
       adapter,
       approve: true,
+      maxWorkers: input.maxWorkers ?? 1,
     });
     return stateView(state, created.contract);
   }
@@ -368,6 +373,7 @@ export async function handleAction(input: McpActionInput): Promise<Record<string
       store,
       adapter: createAdapter(input.host ?? "codex"),
       approve: input.approve ?? false,
+      maxWorkers: input.maxWorkers ?? 1,
     });
     return stateView(resumed, contract);
   }

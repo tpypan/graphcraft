@@ -560,12 +560,69 @@ function acceptedNodeIds(state: RunState): Set<string> {
   );
 }
 
-function nextReadyNode(graph: Graph, state: RunState): GraphNode | undefined {
+function readyRuntimeNodes(graph: Graph, state: RunState): GraphNode[] {
   const accepted = acceptedNodeIds(state);
-  return graph.nodes.find(
+  return graph.nodes.filter(
     (node) =>
       state.nodes[node.id]?.status === "pending" && node.dependsOn.every((id) => accepted.has(id)),
   );
+}
+
+function scopeRoot(pattern: string): string {
+  return pattern
+    .replaceAll("\\", "/")
+    .split(/[*?[{]/, 1)[0]!
+    .replace(/\/$/, "");
+}
+
+function scopesOverlap(left: GraphNode, right: GraphNode): boolean {
+  return left.scope.some((leftPattern) =>
+    right.scope.some((rightPattern) => {
+      const leftRoot = scopeRoot(leftPattern);
+      const rightRoot = scopeRoot(rightPattern);
+      return (
+        leftRoot.length === 0 ||
+        rightRoot.length === 0 ||
+        leftRoot === rightRoot ||
+        leftRoot.startsWith(`${rightRoot}/`) ||
+        rightRoot.startsWith(`${leftRoot}/`)
+      );
+    }),
+  );
+}
+
+function concurrencyConflict(
+  graph: Graph,
+  left: GraphNode,
+  right: GraphNode,
+): "control_edge" | "overlapping_scope" | "shared_worktree" | "git_side_effect" | undefined {
+  if (
+    graph.controlEdges.some(
+      ({ from, to }) =>
+        (from === left.id && to === right.id) || (from === right.id && to === left.id),
+    )
+  )
+    return "control_edge";
+  if (left.sideEffectClass === "git_commit" || right.sideEffectClass === "git_commit")
+    return "git_side_effect";
+  if (left.sideEffectClass !== "none" || right.sideEffectClass !== "none")
+    return scopesOverlap(left, right) ? "overlapping_scope" : "shared_worktree";
+  return undefined;
+}
+
+function readyBatch(graph: Graph, state: RunState, maxWorkers: 1 | 2): GraphNode[] {
+  const ready = readyRuntimeNodes(graph, state);
+  const first = ready[0];
+  if (!first || maxWorkers === 1 || ["verification", "commit", "wait"].includes(first.kind))
+    return first ? [first] : [];
+  const second = ready
+    .slice(1)
+    .find(
+      (candidate) =>
+        !["verification", "commit", "wait"].includes(candidate.kind) &&
+        !concurrencyConflict(graph, first, candidate),
+    );
+  return second ? [first, second] : [first];
 }
 
 function repairAmendment(
@@ -675,12 +732,234 @@ async function evaluateSuccessfulControl(input: {
   );
 }
 
+type WorkNodeOutcome =
+  | { status: "accepted"; nodeId: string }
+  | {
+      status: "failed";
+      nodeId: string;
+      reason: string;
+      cause?: "host_crash" | "timeout";
+      packet?: ControlEvaluation["packet"];
+    }
+  | {
+      status: "interrupted";
+      nodeId: string;
+      termination?: HostTermination;
+      artifact: string;
+    };
+
+async function executeWorkNode(input: {
+  store: RunStore;
+  adapter: HostAdapter;
+  contract: RunContract;
+  graph: Graph;
+  node: GraphNode;
+  state: RunState;
+  workspace: RunWorkspace;
+  observer?: RunObserver;
+  signal: AbortSignal;
+  recovery?: InvocationRecord;
+}): Promise<WorkNodeOutcome> {
+  let baseline: EvidenceSnapshot;
+  let baselineProbeResults: ProbeResult[];
+  if (input.recovery?.baseline) {
+    baseline = input.recovery.baseline;
+    baselineProbeResults = baseline.probeResults;
+  } else {
+    const baselineProbes = await runProbes(
+      input.node.progressProbes,
+      input.workspace.path,
+      input.signal,
+    );
+    if (input.signal.aborted) return { status: "interrupted", nodeId: input.node.id, artifact: "" };
+    baselineProbeResults = baselineProbes.map(({ result }) => result);
+    baseline = evidenceSnapshot(await workspaceDigest(input.workspace.path), baselineProbeResults);
+  }
+  const worker = await executeWorker({
+    adapter: input.adapter,
+    store: input.store,
+    contract: input.contract,
+    node: input.node,
+    workspace: input.workspace,
+    predecessorEvidence: input.node.contextSelector.predecessorResults.flatMap((nodeId) => {
+      const predecessor = input.state.nodes[nodeId];
+      return predecessor?.lastSummary ? [`${nodeId}: ${predecessor.lastSummary}`] : [];
+    }),
+    ...(baselineProbeResults.length ? { probeResults: baselineProbeResults } : {}),
+    ...(input.observer ? { observer: input.observer } : {}),
+    signal: input.signal,
+    baseline,
+    ...(input.recovery ? { resume: input.recovery } : {}),
+  });
+  if (input.signal.aborted)
+    return {
+      status: "interrupted",
+      nodeId: input.node.id,
+      ...(worker.termination ? { termination: worker.termination } : {}),
+      artifact: worker.artifact,
+    };
+  if (!worker.result || worker.error || worker.result.status !== "completed") {
+    const detail = worker.error ?? worker.result?.summary ?? "Worker did not complete the node";
+    const cause = worker.errorCause ?? "host_crash";
+    const reason = `${cause === "timeout" ? "Host timeout" : "Host crash"}: ${detail}`;
+    await input.store.append("worker", "node.failed", {
+      nodeId: input.node.id,
+      reason,
+      cause,
+    });
+    return { status: "failed", nodeId: input.node.id, reason, cause };
+  }
+
+  const afterProbes = await captureProbes(
+    input.store,
+    input.node.progressProbes,
+    input.workspace,
+    input.observer,
+    input.signal,
+  );
+  if (input.signal.aborted)
+    return {
+      status: "interrupted",
+      nodeId: input.node.id,
+      ...(worker.termination ? { termination: worker.termination } : {}),
+      artifact: worker.artifact,
+    };
+  const currentEvidence = evidenceSnapshot(
+    await workspaceDigest(input.workspace.path),
+    afterProbes.map(({ result }) => result),
+  );
+  if (
+    input.node.sideEffectClass === "none" &&
+    currentEvidence.workspaceDigest !== baseline.workspaceDigest
+  ) {
+    const reason = `Read-only node ${input.node.id} mutated the shared run workspace`;
+    await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason });
+    return { status: "failed", nodeId: input.node.id, reason };
+  }
+  const measuredClassification = classifyProgress(baseline, currentEvidence);
+  let classification = measuredClassification;
+  let semanticEvidence: string[] = [];
+  let semanticStopReason: string | undefined;
+  if (
+    input.node.sideEffectClass === "none" &&
+    worker.result.evidence.length > 0 &&
+    needsSemanticVerification("progress", input.node.progressProbes, measuredClassification)
+  ) {
+    let semanticVerdict: SemanticVerdict;
+    try {
+      semanticVerdict = await runSemanticVerification({
+        phase: "progress",
+        adapter: input.adapter,
+        store: input.store,
+        contract: input.contract,
+        node: input.node,
+        workspace: input.workspace,
+        workerSummary: worker.result.summary,
+        workerEvidence: worker.result.evidence,
+        baselineProbeEvidence: baselineProbeResults,
+        currentProbeEvidence: afterProbes.map(({ result }) => result),
+        signal: input.signal,
+      });
+    } catch (error) {
+      if (input.signal.aborted)
+        return {
+          status: "interrupted",
+          nodeId: input.node.id,
+          ...(error instanceof HostTerminationError
+            ? { termination: error.termination }
+            : worker.termination
+              ? { termination: worker.termination }
+              : {}),
+          artifact: worker.artifact,
+        };
+      const reason = `Semantic progress verification failed: ${(error as Error).message}`;
+      await input.store.append("host", "node.failed", { nodeId: input.node.id, reason });
+      return { status: "failed", nodeId: input.node.id, reason };
+    }
+    semanticEvidence = semanticVerdict.evidence;
+    if (semanticVerdict.verdict === "supported") classification = "learning";
+    else {
+      classification = semanticVerdict.verdict === "unsupported" ? "stalled" : "blocked";
+      semanticStopReason = `Semantic progress verdict was ${semanticVerdict.verdict}: ${semanticVerdict.rationale}`;
+    }
+  }
+  const progressEvidence = [
+    ...worker.result.evidence,
+    ...afterProbes.map(({ result }) => result.summary),
+    ...semanticEvidence,
+  ];
+  await input.store.append("probe", "node.progress", {
+    nodeId: input.node.id,
+    classification,
+    summary: worker.result.summary,
+    evidence: progressEvidence,
+  });
+  if (["done", "advanced", "learning"].includes(classification)) {
+    const control = await evaluateSuccessfulControl({
+      store: input.store,
+      graph: input.graph,
+      node: input.node,
+      rationale: `Progress was classified as ${classification}`,
+      evidence: progressEvidence,
+    });
+    if (!control.allowed) {
+      const reason = control.reason ?? `Control graph blocked acceptance of ${input.node.id}`;
+      await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason });
+      return {
+        status: "failed",
+        nodeId: input.node.id,
+        reason,
+        ...(control.packet ? { packet: control.packet } : {}),
+      };
+    }
+    await input.store.append("runtime", "node.accepted", {
+      nodeId: input.node.id,
+      summary: worker.result.summary,
+    });
+    return { status: "accepted", nodeId: input.node.id };
+  }
+
+  await recordVerifierControl({
+    store: input.store,
+    graph: input.graph,
+    targetId: input.node.id,
+    verdict: "veto",
+    rationale: semanticStopReason ?? `Progress classified as ${classification}`,
+    evidence: progressEvidence,
+  });
+  const control = await evaluateControlAcceptance(
+    input.store,
+    input.graph,
+    await input.store.loadState(),
+    input.node.id,
+    progressEvidence,
+  );
+  const reason =
+    control.reason ?? semanticStopReason ?? `Stopped safely because progress was ${classification}`;
+  if (control.allowed) {
+    await input.store.append("runtime", "node.accepted", {
+      nodeId: input.node.id,
+      summary: worker.result.summary,
+      controlOverride: true,
+    });
+    return { status: "accepted", nodeId: input.node.id };
+  }
+  await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason });
+  return {
+    status: "failed",
+    nodeId: input.node.id,
+    reason,
+    ...(control.packet ? { packet: control.packet } : {}),
+  };
+}
+
 export async function executeRun(input: {
   store: RunStore;
   adapter: HostAdapter;
   approve?: boolean;
   observer?: RunObserver;
   signal?: AbortSignal;
+  maxWorkers?: 1 | 2;
 }): Promise<RunState> {
   const externalSignal = input.signal ?? new AbortController().signal;
   const contract = await input.store.loadContract();
@@ -706,10 +985,9 @@ export async function executeRun(input: {
     if (["completed", "stopped"].includes(state.status)) return state;
     await recordRunApprovalDecisions(input.store, graph);
     state = await input.store.loadState();
-    const interruptedNodeId =
-      state.currentNodeId && state.nodes[state.currentNodeId]?.status === "running"
-        ? state.currentNodeId
-        : undefined;
+    const interruptedNodeIds = Object.entries(state.nodes)
+      .filter(([, nodeState]) => nodeState.status === "running")
+      .map(([nodeId]) => nodeId);
     if (state.status === "blocked") {
       for (const [nodeId, nodeState] of Object.entries(state.nodes)) {
         if (nodeState.status === "failed") {
@@ -743,22 +1021,24 @@ export async function executeRun(input: {
       await input.store.writeWorkspace(workspace);
     }
     const finishInterruption = async (
-      nodeId?: string,
+      nodeIds?: string | string[],
       termination?: HostTermination,
       artifact?: string,
     ): Promise<RunState> => {
+      const activeNodeIds = nodeIds ? (Array.isArray(nodeIds) ? nodeIds : [nodeIds]) : [];
       const request = controlRequest;
       const reason = request
         ? { cause: request.cause, reason: request.reason }
         : interruptionReason(externalSignal.reason, "runtime_shutdown");
       const action = request?.action ?? "pause";
       const currentState = await input.store.loadState();
-      if (action === "stop" && nodeId && currentState.nodes[nodeId]?.status === "running") {
-        await input.store.append("runtime", "node.reset", {
-          nodeId,
-          reason: "Stopped after active child reconciliation",
-        });
-      }
+      if (action === "stop")
+        for (const nodeId of activeNodeIds)
+          if (currentState.nodes[nodeId]?.status === "running")
+            await input.store.append("runtime", "node.reset", {
+              nodeId,
+              reason: "Stopped after active child reconciliation",
+            });
       await input.store.append("runtime", "control.applied", {
         request: request ?? null,
         action,
@@ -767,6 +1047,7 @@ export async function executeRun(input: {
         outcome: termination?.outcome ?? "checkpointed",
         termination: termination ?? null,
         artifact: artifact ?? null,
+        nodeIds: activeNodeIds,
       });
       await input.store.append(
         request ? "user" : "runtime",
@@ -780,38 +1061,36 @@ export async function executeRun(input: {
       if (request) await controlChannel.clear(request.requestId);
       return await input.store.loadState();
     };
-    let recovery = interruptedNodeId
-      ? await recoverableInvocation(input.store, interruptedNodeId, workspace.path)
-      : undefined;
-    if (
-      recovery &&
-      (recovery.adapterId !== input.adapter.id || recovery.record.baseline === undefined)
-    ) {
-      await input.store.append(
-        "runtime",
-        "invocation.finished",
-        {
-          invocationId: recovery.record.invocationId,
-          nodeId: recovery.nodeId,
-          success: false,
-          reason:
-            recovery.adapterId !== input.adapter.id
-              ? "Selected host changed; using repository recovery"
-              : "The interrupted invocation predates durable progress baselines",
-        },
-        recovery.record.invocationId,
-      );
-      recovery = undefined;
-    }
-    if (interruptedNodeId) {
+    const recoveries = new Map<string, RecoverableInvocation>();
+    for (const interruptedNodeId of interruptedNodeIds) {
+      const recovery = await recoverableInvocation(input.store, interruptedNodeId, workspace.path);
+      if (
+        recovery &&
+        (recovery.adapterId !== input.adapter.id || recovery.record.baseline === undefined)
+      ) {
+        await input.store.append(
+          "runtime",
+          "invocation.finished",
+          {
+            invocationId: recovery.record.invocationId,
+            nodeId: recovery.nodeId,
+            success: false,
+            reason:
+              recovery.adapterId !== input.adapter.id
+                ? "Selected host changed; using repository recovery"
+                : "The interrupted invocation predates durable progress baselines",
+          },
+          recovery.record.invocationId,
+        );
+      } else if (recovery) recoveries.set(interruptedNodeId, recovery);
       await input.store.append("runtime", "node.reset", {
         nodeId: interruptedNodeId,
-        reason: recovery
+        reason: recoveries.has(interruptedNodeId)
           ? "Recovered an interrupted invocation for native host reconciliation"
           : "Recovered from repository evidence; accepted nodes remain immutable",
       });
     }
-    if (signal.aborted) return await finishInterruption(interruptedNodeId);
+    if (signal.aborted) return await finishInterruption(interruptedNodeIds);
     if (state.status !== "running")
       await input.store.append("runtime", "run.started", { workspace });
 
@@ -820,8 +1099,8 @@ export async function executeRun(input: {
       graph = await input.store.loadGraph();
       if (["paused", "stopped", "blocked", "failed", "completed"].includes(state.status))
         return state;
-      const current = nextReadyNode(graph, state);
-      if (!current) {
+      const batch = readyBatch(graph, state, input.maxWorkers ?? 1);
+      if (batch.length === 0) {
         const allAccepted = graph.nodes.every(
           (node) => state.nodes[node.id]?.status === "accepted",
         );
@@ -834,18 +1113,100 @@ export async function executeRun(input: {
         return await input.store.loadState();
       }
 
-      const scheduling = await evaluateControlScheduling(input.store, graph, state, current.id);
-      if (!scheduling.allowed) {
-        await input.store.append("runtime", "run.blocked", {
-          reason: scheduling.reason ?? `Control authority blocked ${current.id}`,
-          ...(scheduling.packet ? { decisionPacket: scheduling.packet } : {}),
-        });
-        return await input.store.loadState();
+      for (const candidate of batch) {
+        const scheduling = await evaluateControlScheduling(input.store, graph, state, candidate.id);
+        if (!scheduling.allowed) {
+          await input.store.append("runtime", "run.blocked", {
+            reason: scheduling.reason ?? `Control authority blocked ${candidate.id}`,
+            ...(scheduling.packet ? { decisionPacket: scheduling.packet } : {}),
+          });
+          return await input.store.loadState();
+        }
       }
 
-      input.observer?.({ type: "status", message: `${current.kind}: ${current.objective}` });
-      await input.store.append("runtime", "node.started", { nodeId: current.id });
-      if (signal.aborted) return await finishInterruption(current.id);
+      const batchId = randomUUID();
+      for (const candidate of batch) {
+        input.observer?.({
+          type: "status",
+          message: `${candidate.kind}: ${candidate.objective}`,
+        });
+        await input.store.append("runtime", "node.started", {
+          nodeId: candidate.id,
+          batchId,
+          batchSize: batch.length,
+          maxWorkers: input.maxWorkers ?? 1,
+        });
+      }
+      if (signal.aborted) return await finishInterruption(batch.map(({ id }) => id));
+
+      if (batch.length > 1) {
+        const batchAbort = new AbortController();
+        const batchSignal = AbortSignal.any([signal, batchAbort.signal]);
+        const outcomes = await Promise.all(
+          batch.map(async (candidate) => {
+            const outcome = await executeWorkNode({
+              store: input.store,
+              adapter: input.adapter,
+              contract,
+              graph,
+              node: candidate,
+              state,
+              workspace,
+              ...(input.observer ? { observer: input.observer } : {}),
+              signal: batchSignal,
+              ...(recoveries.get(candidate.id)
+                ? { recovery: recoveries.get(candidate.id)!.record }
+                : {}),
+            });
+            if (outcome.status === "failed" && !batchAbort.signal.aborted)
+              batchAbort.abort({
+                cause: "cancellation",
+                reason: `Sibling ${candidate.id} failed; quarantine the remaining batch`,
+              });
+            recoveries.delete(candidate.id);
+            return outcome;
+          }),
+        );
+        const interrupted = outcomes.find(
+          (outcome): outcome is Extract<WorkNodeOutcome, { status: "interrupted" }> =>
+            outcome.status === "interrupted",
+        );
+        if (signal.aborted)
+          return await finishInterruption(
+            batch.map(({ id }) => id),
+            interrupted?.termination,
+            interrupted?.artifact,
+          );
+        const failed = outcomes.find(({ status }) => status === "failed");
+        if (failed?.status === "failed") {
+          const quarantinedSiblingIds = outcomes
+            .filter(
+              (outcome): outcome is Extract<WorkNodeOutcome, { status: "interrupted" }> =>
+                outcome.status === "interrupted",
+            )
+            .map(({ nodeId }) => nodeId);
+          await input.store.append("runtime", "run.blocked", {
+            reason: failed.reason,
+            ...(failed.cause ? { cause: failed.cause } : {}),
+            ...(failed.packet ? { decisionPacket: failed.packet } : {}),
+            batchId,
+            acceptedSiblingIds: outcomes
+              .filter(({ status }) => status === "accepted")
+              .map(({ nodeId }) => nodeId),
+            quarantinedSiblingIds,
+          });
+          return await input.store.loadState();
+        }
+        if (interrupted)
+          return await finishInterruption(
+            batch.map(({ id }) => id),
+            interrupted.termination,
+            interrupted.artifact,
+          );
+        continue;
+      }
+
+      const current = batch[0]!;
 
       if (current.kind === "verification") {
         if (current.completionProbes.length === 0) {
@@ -1058,179 +1419,37 @@ export async function executeRun(input: {
         continue;
       }
 
-      const activeRecovery = recovery?.nodeId === current.id ? recovery : undefined;
-      let baseline: EvidenceSnapshot;
-      let baselineProbeResults: ProbeResult[];
-      if (activeRecovery?.record.baseline) {
-        baseline = activeRecovery.record.baseline;
-        baselineProbeResults = baseline.probeResults;
-      } else {
-        const baselineProbes = await runProbes(current.progressProbes, workspace.path, signal);
-        if (signal.aborted) return await finishInterruption(current.id);
-        baselineProbeResults = baselineProbes.map(({ result }) => result);
-        baseline = evidenceSnapshot(await workspaceDigest(workspace.path), baselineProbeResults);
-      }
-      const worker = await executeWorker({
-        adapter: input.adapter,
+      const outcome = await executeWorkNode({
         store: input.store,
+        adapter: input.adapter,
         contract,
+        graph,
         node: current,
+        state,
         workspace,
-        predecessorEvidence: current.contextSelector.predecessorResults.flatMap((nodeId) => {
-          const predecessor = state.nodes[nodeId];
-          return predecessor?.lastSummary ? [`${nodeId}: ${predecessor.lastSummary}`] : [];
-        }),
-        ...(baselineProbeResults.length ? { probeResults: baselineProbeResults } : {}),
         ...(input.observer ? { observer: input.observer } : {}),
         signal,
-        baseline,
-        ...(activeRecovery ? { resume: activeRecovery.record } : {}),
+        ...(recoveries.get(current.id) ? { recovery: recoveries.get(current.id)!.record } : {}),
       });
-      if (activeRecovery) recovery = undefined;
-      if (signal.aborted)
-        return await finishInterruption(current.id, worker.termination, worker.artifact);
-      if (!worker.result || worker.error || worker.result.status !== "completed") {
-        const detail = worker.error ?? worker.result?.summary ?? "Worker did not complete the node";
-        const cause = worker.errorCause ?? "host_crash";
-        const reason = `${cause === "timeout" ? "Host timeout" : "Host crash"}: ${detail}`;
-        await input.store.append("worker", "node.failed", {
-          nodeId: current.id,
-          reason,
-          cause,
-        });
-        await input.store.append("runtime", "run.blocked", { reason, cause });
-        return await input.store.loadState();
-      }
-
-      const afterProbes = await captureProbes(
-        input.store,
-        current.progressProbes,
-        workspace,
-        input.observer,
-        signal,
-      );
-      if (signal.aborted)
-        return await finishInterruption(current.id, worker.termination, worker.artifact);
-      const currentEvidence = evidenceSnapshot(
-        await workspaceDigest(workspace.path),
-        afterProbes.map(({ result }) => result),
-      );
-      const measuredClassification = classifyProgress(baseline, currentEvidence);
-      let classification = measuredClassification;
-      let semanticEvidence: string[] = [];
-      let semanticStopReason: string | undefined;
-      if (
-        current.sideEffectClass === "none" &&
-        worker.result.evidence.length > 0 &&
-        needsSemanticVerification("progress", current.progressProbes, measuredClassification)
-      ) {
-        let semanticVerdict: SemanticVerdict;
-        try {
-          semanticVerdict = await runSemanticVerification({
-            phase: "progress",
-            adapter: input.adapter,
-            store: input.store,
-            contract,
-            node: current,
-            workspace,
-            workerSummary: worker.result.summary,
-            workerEvidence: worker.result.evidence,
-            baselineProbeEvidence: baselineProbeResults,
-            currentProbeEvidence: afterProbes.map(({ result }) => result),
-            signal,
-          });
-        } catch (error) {
-          if (signal.aborted)
-            return await finishInterruption(
-              current.id,
-              error instanceof HostTerminationError ? error.termination : worker.termination,
-              worker.artifact,
-            );
-          const reason = `Semantic progress verification failed: ${(error as Error).message}`;
-          await input.store.append("host", "node.failed", { nodeId: current.id, reason });
-          await input.store.append("runtime", "run.blocked", { reason });
-          return await input.store.loadState();
-        }
-        semanticEvidence = semanticVerdict.evidence;
-        if (semanticVerdict.verdict === "supported") classification = "learning";
-        else {
-          classification = semanticVerdict.verdict === "unsupported" ? "stalled" : "blocked";
-          semanticStopReason = `Semantic progress verdict was ${semanticVerdict.verdict}: ${semanticVerdict.rationale}`;
-        }
-      }
-      const progressEvidence = [
-        ...worker.result.evidence,
-        ...afterProbes.map(({ result }) => result.summary),
-        ...semanticEvidence,
-      ];
-      await input.store.append("probe", "node.progress", {
-        nodeId: current.id,
-        classification,
-        summary: worker.result.summary,
-        evidence: progressEvidence,
-      });
-      if (["done", "advanced", "learning"].includes(classification)) {
-        const control = await evaluateSuccessfulControl({
-          store: input.store,
-          graph,
-          node: current,
-          rationale: `Progress was classified as ${classification}`,
-          evidence: progressEvidence,
-        });
-        if (!control.allowed) {
-          const reason = control.reason ?? `Control graph blocked acceptance of ${current.id}`;
-          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
-          await input.store.append("runtime", "run.blocked", {
-            reason,
-            ...(control.packet ? { decisionPacket: control.packet } : {}),
-          });
-          return await input.store.loadState();
-        }
-        await input.store.append("runtime", "node.accepted", {
-          nodeId: current.id,
-          summary: worker.result.summary,
-        });
-      } else {
-        await recordVerifierControl({
-          store: input.store,
-          graph,
-          targetId: current.id,
-          verdict: "veto",
-          rationale: semanticStopReason ?? `Progress classified as ${classification}`,
-          evidence: progressEvidence,
-        });
-        const control = await evaluateControlAcceptance(
-          input.store,
-          graph,
-          await input.store.loadState(),
-          current.id,
-          progressEvidence,
-        );
-        const reason =
-          control.reason ??
-          semanticStopReason ??
-          `Stopped safely because progress was ${classification}`;
-        if (control.allowed) {
-          await input.store.append("runtime", "node.accepted", {
-            nodeId: current.id,
-            summary: worker.result.summary,
-            controlOverride: true,
-          });
-          continue;
-        }
-        await input.store.append("runtime", "node.failed", {
-          nodeId: current.id,
-          reason,
-        });
+      recoveries.delete(current.id);
+      if (outcome.status === "interrupted")
+        return await finishInterruption(current.id, outcome.termination, outcome.artifact);
+      if (outcome.status === "failed") {
         await input.store.append("runtime", "run.blocked", {
-          reason,
-          ...(control.packet ? { decisionPacket: control.packet } : {}),
+          reason: outcome.reason,
+          ...(outcome.cause ? { cause: outcome.cause } : {}),
+          ...(outcome.packet ? { decisionPacket: outcome.packet } : {}),
         });
         return await input.store.loadState();
       }
     }
 
-    return await finishInterruption((await input.store.loadState()).currentNodeId);
+    const finalState = await input.store.loadState();
+    return await finishInterruption(
+      Object.entries(finalState.nodes)
+        .filter(([, nodeState]) => nodeState.status === "running")
+        .map(([nodeId]) => nodeId),
+    );
   } finally {
     await stopWatching();
     await lock.release();

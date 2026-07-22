@@ -55,6 +55,7 @@ Graphcraft displays a concise run contract before doing work. Use `--yes` only w
 - Uses a fresh read-only semantic verifier only when structural probes cannot ground reported progress or completion, and persists its verdict and cost separately.
 - Enforces control edges during scheduling and acceptance: observers record evidence, vetoes block without gaining write authority, target owners must approve, and user-owned arbitrators resolve explicit conflicts through durable decision packets.
 - Applies evidence-backed add, supersede, split, fuse, and dependency amendments only to unfinished work, preserves governance anchors and completion probes, and stops repeated repair signatures.
+- Runs sequentially by default and can overlap at most two independent read-only branches; all shared-worktree writes and Git side effects remain sequential.
 - Checkpoints host sessions and results during execution, resumes the same host session when safe, and falls back to repository evidence when switching hosts or native continuation is unavailable.
 - Accepts pause or stop from another CLI process, terminates the active child with bounded escalation, and records the exact cause and outcome before releasing the run lock.
 - Tracks cached, uncached, output, reasoning, and total tokens when the host exposes them.
@@ -63,7 +64,7 @@ Graphcraft displays a concise run contract before doing work. Use `--yes` only w
 
 ```text
 graphcraft install --host <codex|claude>
-graphcraft run <task>
+graphcraft run <task> [--max-workers 2]
 graphcraft status [run]
 graphcraft inspect [run]
 graphcraft probes [run] [--set probe-plan.json]

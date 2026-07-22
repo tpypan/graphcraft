@@ -37,6 +37,7 @@ export function createGraphcraftServer(): McpServer {
         approve: z.boolean().optional(),
         finishLine: z.enum(["local_verified", "committed"]).optional(),
         force: z.boolean().optional(),
+        maxWorkers: z.union([z.literal(1), z.literal(2)]).optional(),
         probePlan: ProbePlanSchema.optional(),
         amendment: GraphAmendmentSchema.optional(),
         controlSource: z.string().optional(),
