@@ -1,0 +1,251 @@
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { compileGraph, compileRunContract, createRunEvent, type RunEvent } from "@graphcraft/core";
+import { createViewerSnapshot } from "./viewer.ts";
+import {
+  RUN_BLOCKED_EVENT_RESERVE_BYTES,
+  RunStore,
+  RunStoreEventLogCorruptionError,
+  RunStoreLimitError,
+} from "./store.ts";
+
+const temporaryRoots: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryRoots.splice(0).map(async (path) => await rm(path, { recursive: true, force: true })),
+  );
+});
+
+async function createStoreFixture(): Promise<{ root: string; store: RunStore; event: RunEvent }> {
+  const root = await mkdtemp(join(tmpdir(), "graphcraft-store-test-"));
+  temporaryRoots.push(root);
+  const contract = compileRunContract(
+    "Exercise durable event-tail recovery",
+    { root, baseRef: "main", baseSha: "a".repeat(40) },
+    { finishLine: "local_verified" },
+  );
+  const graph = compileGraph(contract, [
+    { id: "verification-file", kind: "file", path: "verified.txt", shouldExist: true },
+  ]);
+  const store = await RunStore.create(root, contract, graph);
+  const [event] = await store.loadEvents();
+  if (!event) throw new Error("Expected the run-created fixture event");
+  return { root, store, event };
+}
+
+function serializedEvent(event: RunEvent): Buffer {
+  return Buffer.from(`${JSON.stringify(event)}\n`);
+}
+
+describe("durable event log tails", () => {
+  it("reads a valid unterminated event without mutation and repays the delimiter on append", async () => {
+    const { root, store } = await createStoreFixture();
+    const eventsPath = store.eventsPath();
+    const statePath = join(store.runRoot, "state.json");
+    const original = await readFile(eventsPath);
+    const unterminated = original.subarray(0, -1);
+    const stateBefore = await readFile(statePath);
+    await writeFile(eventsPath, unterminated);
+
+    const reopened = new RunStore(root, store.runId);
+    expect(await reopened.loadEvents()).toHaveLength(1);
+    await reopened.loadState();
+    await createViewerSnapshot(reopened);
+    expect(await readFile(eventsPath)).toEqual(unterminated);
+    expect(await readFile(statePath)).toEqual(stateBefore);
+
+    await reopened.append("runtime", "run.paused", { reason: "delimiter recovery" });
+    const recovered = await readFile(eventsPath);
+    expect(recovered.subarray(0, unterminated.byteLength + 1)).toEqual(
+      Buffer.concat([unterminated, Buffer.from("\n")]),
+    );
+    expect(recovered.toString("utf8").split("\n").filter(Boolean)).toHaveLength(2);
+    expect(
+      (await new RunStore(root, store.runId).loadEvents()).map(({ sequence }) => sequence),
+    ).toEqual([1, 2]);
+  });
+
+  it("rebuilds stale state from a complete unterminated event before the next append", async () => {
+    const { root, store, event } = await createStoreFixture();
+    const eventsPath = store.eventsPath();
+    const original = await readFile(eventsPath);
+    const next = createRunEvent({
+      sequence: 2,
+      timestamp: "2026-07-22T00:00:00.000Z",
+      actor: "runtime",
+      causationId: event.causationId,
+      type: "run.paused",
+      data: { reason: "crash after event bytes before delimiter and state" },
+    });
+    const interrupted = Buffer.concat([original, serializedEvent(next).subarray(0, -1)]);
+    await writeFile(eventsPath, interrupted);
+
+    const reopened = new RunStore(root, store.runId);
+    expect((await reopened.loadEvents()).map(({ sequence }) => sequence)).toEqual([1, 2]);
+    expect(await readFile(eventsPath)).toEqual(interrupted);
+    expect((await reopened.loadState()).lastEventSequence).toBe(2);
+    expect(await readFile(eventsPath)).toEqual(interrupted);
+
+    await reopened.append("runtime", "run.started", { reason: "resume after projection rebuild" });
+    const recovered = await readFile(eventsPath);
+    expect(recovered.toString("utf8").split("\n").filter(Boolean)).toHaveLength(3);
+    expect((await reopened.loadEvents()).map(({ sequence }) => sequence)).toEqual([1, 2, 3]);
+  });
+
+  it("serializes same-store appends while repaying exactly one delimiter", async () => {
+    const { store } = await createStoreFixture();
+    const original = await readFile(store.eventsPath());
+    const unterminated = original.subarray(0, -1);
+    await writeFile(store.eventsPath(), unterminated);
+
+    const appended = await Promise.all([
+      store.append("runtime", "run.paused", { reason: "first concurrent append" }),
+      store.append("runtime", "run.paused", { reason: "second concurrent append" }),
+    ]);
+
+    expect(appended.map(({ sequence }) => sequence).sort()).toEqual([2, 3]);
+    const recovered = await readFile(store.eventsPath());
+    expect(recovered.subarray(unterminated.byteLength, unterminated.byteLength + 2)).not.toEqual(
+      Buffer.from("\n\n"),
+    );
+    expect(recovered.toString("utf8").split("\n").filter(Boolean)).toHaveLength(3);
+  });
+
+  it.each([
+    {
+      name: "invalid UTF-8",
+      expected: /invalid UTF-8/u,
+      bytes: () => Buffer.concat([Buffer.from('{"marker":"'), Buffer.from([0xf0, 0x9f])]),
+    },
+    {
+      name: "invalid JSON",
+      expected: /invalid JSON/u,
+      bytes: () => Buffer.from('{"marker":"tail-secret-must-not-leak"'),
+    },
+    {
+      name: "unexpected UTF-8 BOM",
+      expected: /invalid JSON/u,
+      bytes: (event: RunEvent) =>
+        Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), serializedEvent(event)]),
+    },
+    {
+      name: "invalid schema",
+      expected: /invalid event schema/u,
+      bytes: () => Buffer.from('{"schemaVersion":1}\n'),
+    },
+    {
+      name: "invalid hash",
+      expected: /invalid event hash/u,
+      bytes: (event: RunEvent) => serializedEvent({ ...event, hash: "0".repeat(64) }),
+    },
+    {
+      name: "invalid sequence",
+      expected: /invalid event sequence/u,
+      bytes: (event: RunEvent) =>
+        serializedEvent(
+          createRunEvent({
+            sequence: 2,
+            timestamp: event.timestamp,
+            actor: event.actor,
+            causationId: event.causationId,
+            type: event.type,
+            data: event.data,
+          }),
+        ),
+    },
+  ])("fails closed on $name without leaking or changing durable files", async (fixture) => {
+    const { root, store, event } = await createStoreFixture();
+    const eventsPath = store.eventsPath();
+    const statePath = join(store.runRoot, "state.json");
+    const corrupted = fixture.bytes(event);
+    const stateBefore = await readFile(statePath);
+    await writeFile(eventsPath, corrupted);
+
+    const operations = [
+      async (candidate: RunStore) => await candidate.loadEvents(),
+      async (candidate: RunStore) => await candidate.loadState(),
+      async (candidate: RunStore) =>
+        await candidate.append("runtime", "run.paused", { reason: "must not append" }),
+      async (candidate: RunStore) => await createViewerSnapshot(candidate),
+    ];
+    for (const operation of operations) {
+      const error = await operation(new RunStore(root, store.runId)).catch((caught) => caught);
+      expect(error).toBeInstanceOf(RunStoreEventLogCorruptionError);
+      expect((error as Error).message).toMatch(fixture.expected);
+      expect((error as Error).message).toContain("event log bytes were left unchanged");
+      expect((error as Error).message).not.toContain("durable run files");
+      expect((error as Error).message).not.toContain("tail-secret-must-not-leak");
+      expect(await readFile(eventsPath)).toEqual(corrupted);
+      expect(await readFile(statePath)).toEqual(stateBefore);
+    }
+  });
+
+  it("preserves valid records before a secret-bearing corrupt trailing append", async () => {
+    const { root, store } = await createStoreFixture();
+    const eventsPath = store.eventsPath();
+    const statePath = join(store.runRoot, "state.json");
+    const validPrefix = await readFile(eventsPath);
+    const corrupted = Buffer.concat([
+      validPrefix,
+      Buffer.from('{"marker":"trailing-secret-must-not-leak"'),
+    ]);
+    const stateBefore = await readFile(statePath);
+    await writeFile(eventsPath, corrupted);
+
+    for (const operation of [
+      async (candidate: RunStore) => await candidate.loadEvents(),
+      async (candidate: RunStore) =>
+        await candidate.append("runtime", "run.paused", { reason: "must not append" }),
+    ]) {
+      const error = await operation(new RunStore(root, store.runId)).catch((caught) => caught);
+      expect(error).toBeInstanceOf(RunStoreEventLogCorruptionError);
+      if (!(error instanceof RunStoreEventLogCorruptionError))
+        throw new Error("Expected event-log corruption");
+      expect(error).toMatchObject({
+        record: 2,
+        offsetBytes: validPrefix.byteLength,
+        trailing: true,
+      });
+      expect(error.message).not.toContain("trailing-secret-must-not-leak");
+      expect(await readFile(eventsPath)).toEqual(corrupted);
+      expect(await readFile(statePath)).toEqual(stateBefore);
+    }
+  });
+
+  it("counts delimiter debt at the exact normal-log capacity boundary", async () => {
+    const { root, store } = await createStoreFixture();
+    const original = await readFile(store.eventsPath());
+    const unterminated = original.subarray(0, -1);
+    await writeFile(store.eventsPath(), unterminated);
+    const data = { reason: "capacity boundary" };
+    const candidate = createRunEvent({
+      sequence: 2,
+      timestamp: "2026-07-22T00:00:00.000Z",
+      actor: "runtime",
+      causationId: store.runId,
+      type: "run.paused",
+      data,
+    });
+    const maxEventLogBytes =
+      unterminated.byteLength +
+      serializedEvent(candidate).byteLength +
+      RUN_BLOCKED_EVENT_RESERVE_BYTES;
+    const bounded = new RunStore(root, store.runId, { maxEventLogBytes });
+
+    let error: unknown;
+    try {
+      await bounded.append("runtime", "run.paused", data);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(RunStoreLimitError);
+    if (!(error instanceof RunStoreLimitError)) throw new Error("Expected a run-store limit error");
+    expect(error.kind).toBe("event_log");
+    expect(error.blockerPersisted).toBe(true);
+    const events = await new RunStore(root, store.runId).loadEvents();
+    expect(events.map(({ type }) => type)).toEqual(["run.created", "run.blocked"]);
+  });
+});

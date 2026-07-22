@@ -161,8 +161,20 @@ export async function evaluateWaitNode(input: {
     return { status: "timed_out", evidence };
   }
   const wakeAt = nextWakeAt(wait.condition, now);
-  if (observation.signature && wait.lastSignature === observation.signature)
+  if (observation.signature && wait.lastSignature === observation.signature) {
+    await input.store.append(
+      "runtime",
+      "wait.rearmed",
+      {
+        nodeId: input.node.id,
+        nextWakeAt: wakeAt,
+        evidence: observation.evidence,
+        signature: observation.signature,
+      },
+      input.node.id,
+    );
     return { status: "waiting", nextWakeAt: wakeAt, evidence: observation.evidence };
+  }
   await input.store.append(
     "runtime",
     "wait.observed",

@@ -1,6 +1,7 @@
 import { constants as fsConstants, type BigIntStats } from "node:fs";
 import { lstat, open, readdir } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
+import { TextDecoder } from "node:util";
 import {
   ArtifactInventorySchema,
   GraphSchema,
@@ -69,6 +70,31 @@ export class RunStoreLimitError extends Error {
       `Run ${kind.replace("_", " ")} would require ${attemptedBytes} serialized bytes, exceeding the ${limitBytes}-byte limit`,
     );
     this.name = "RunStoreLimitError";
+  }
+}
+
+export class RunStoreEventLogCorruptionError extends Error {
+  constructor(
+    readonly record: number,
+    readonly offsetBytes: number,
+    readonly trailing: boolean,
+    reason: "encoding" | "json" | "schema" | "hash" | "sequence",
+  ) {
+    const location = trailing ? "trailing record" : `record ${record}`;
+    const problem =
+      reason === "encoding"
+        ? "invalid UTF-8"
+        : reason === "json"
+          ? "invalid JSON"
+          : reason === "schema"
+            ? "an invalid event schema"
+            : reason === "hash"
+              ? "an invalid event hash"
+              : "an invalid event sequence";
+    super(
+      `Run event log has ${problem} in ${location} at byte ${offsetBytes}; event log bytes were left unchanged`,
+    );
+    this.name = "RunStoreEventLogCorruptionError";
   }
 }
 
@@ -533,7 +559,11 @@ export class RunStore {
     );
   }
 
-  private async loadEventLog(): Promise<{ events: RunEvent[]; bytes: number }> {
+  private async loadEventLog(): Promise<{
+    events: RunEvent[];
+    bytes: number;
+    needsDelimiter: boolean;
+  }> {
     await this.ensureStorage();
     await validatePrivatePath(this.runRoot, "events.jsonl");
     let contentBytes: Buffer;
@@ -563,20 +593,52 @@ export class RunStore {
       }
     }
     const bytes = contentBytes.byteLength;
-    const content = contentBytes.toString("utf8");
-    const lines = content.split("\n").filter(Boolean);
-    const events = lines.map((line) => {
-      const lineBytes = Buffer.byteLength(`${line}\n`);
+    const needsDelimiter = bytes > 0 && contentBytes.at(-1) !== 0x0a;
+    const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+    const events: RunEvent[] = [];
+    let offset = 0;
+    while (offset < bytes) {
+      const newline = contentBytes.indexOf(0x0a, offset);
+      const end = newline === -1 ? bytes : newline;
+      const recordBytes = contentBytes.subarray(offset, end);
+      if (recordBytes.byteLength === 0) {
+        if (newline === -1) break;
+        offset = newline + 1;
+        continue;
+      }
+      const record = events.length + 1;
+      const trailing = newline === -1;
+      const lineBytes = recordBytes.byteLength + 1;
       if (lineBytes > this.limits.maxEventBytes)
         throw new RunStoreLimitError("event", lineBytes, this.limits.maxEventBytes);
-      return RunEventSchema.parse(JSON.parse(line));
-    });
-    for (const [index, event] of events.entries()) {
-      verifyRunEvent(event);
-      if (event.sequence !== index + 1)
-        throw new Error(`Expected event sequence ${index + 1}, received ${event.sequence}`);
+      let decoded: string;
+      try {
+        decoded = decoder.decode(recordBytes);
+      } catch {
+        throw new RunStoreEventLogCorruptionError(record, offset, trailing, "encoding");
+      }
+      let value: unknown;
+      try {
+        value = JSON.parse(decoded);
+      } catch {
+        throw new RunStoreEventLogCorruptionError(record, offset, trailing, "json");
+      }
+      const parsed = RunEventSchema.safeParse(value);
+      if (!parsed.success)
+        throw new RunStoreEventLogCorruptionError(record, offset, trailing, "schema");
+      try {
+        verifyRunEvent(parsed.data);
+      } catch {
+        throw new RunStoreEventLogCorruptionError(record, offset, trailing, "hash");
+      }
+      const event = parsed.data;
+      if (event.sequence !== record)
+        throw new RunStoreEventLogCorruptionError(record, offset, trailing, "sequence");
+      events.push(event);
+      if (newline === -1) break;
+      offset = newline + 1;
     }
-    return { events, bytes };
+    return { events, bytes, needsDelimiter };
   }
 
   async loadEvents(): Promise<RunEvent[]> {
@@ -627,7 +689,7 @@ export class RunStore {
   ): Promise<RunEvent> {
     await this.ensureStorage();
     const operation = this.appendTail.then(async () => {
-      const { events, bytes: currentLogBytes } = await this.loadEventLog();
+      const { events, bytes: currentLogBytes, needsDelimiter } = await this.loadEventLog();
       const previous = events.at(-1);
       if (isPersistenceLimitBlocker(previous)) {
         const kind = String(previous?.data.persistenceLimit) as RunStoreLimitKind;
@@ -651,15 +713,15 @@ export class RunStore {
       const eventLine = serializedEvent(event);
       let state: RunState;
       try {
-        this.assertNormalEventCapacity(currentLogBytes, eventLine);
+        this.assertNormalEventCapacity(currentLogBytes + (needsDelimiter ? 1 : 0), eventLine);
         state = RunStateSchema.parse(reduceEvents([...events, event]));
         this.assertNormalStateCapacity(state, event.sequence + 1);
       } catch (error) {
         if (!(error instanceof RunStoreLimitError)) throw error;
-        await this.persistPersistenceLimitBlocker(events, currentLogBytes, error);
+        await this.persistPersistenceLimitBlocker(events, currentLogBytes, error, needsDelimiter);
         throw error;
       }
-      await this.appendEventLine(eventLine, currentLogBytes);
+      await this.appendEventLine(`${needsDelimiter ? "\n" : ""}${eventLine}`, currentLogBytes);
       await this.writeMaterializedState(state);
       return event;
     });
@@ -674,6 +736,7 @@ export class RunStore {
     events: RunEvent[],
     currentLogBytes: number,
     limitError: RunStoreLimitError,
+    needsDelimiter: boolean,
   ): Promise<void> {
     const previous = events.at(-1);
     if (isPersistenceLimitBlocker(previous)) {
@@ -684,14 +747,14 @@ export class RunStore {
     const blockerLine = serializedEvent(blocker);
     this.assertBlockerEventFits(blockerLine);
     const blockerBytes = Buffer.byteLength(blockerLine);
-    const blockedLogBytes = currentLogBytes + blockerBytes;
+    const blockedLogBytes = currentLogBytes + (needsDelimiter ? 1 : 0) + blockerBytes;
     if (blockedLogBytes > this.limits.maxEventLogBytes)
       throw new RunStoreLimitError("event_log", blockedLogBytes, this.limits.maxEventLogBytes);
     const state = RunStateSchema.parse(reduceEvents([...events, blocker]));
     const stateBytes = serializedStateBytes(state);
     if (stateBytes > this.limits.maxStateBytes)
       throw new RunStoreLimitError("state", stateBytes, this.limits.maxStateBytes);
-    await this.appendEventLine(blockerLine, currentLogBytes);
+    await this.appendEventLine(`${needsDelimiter ? "\n" : ""}${blockerLine}`, currentLogBytes);
     limitError.blockerPersisted = true;
     await this.writeMaterializedState(state);
   }

@@ -323,6 +323,20 @@ export function reduceEvents(events: RunEvent[]): RunState {
         wait.updatedAt = event.timestamp;
         break;
       }
+      case "wait.rearmed": {
+        const nodeId = requiredString(data, "nodeId");
+        const wait = state.waits.find((candidate) => candidate.nodeId === nodeId);
+        if (!wait) throw new Error(`Unknown wait node ${nodeId}`);
+        const signature = requiredString(data, "signature");
+        if (wait.lastSignature !== signature)
+          throw new Error(`Wait node ${nodeId} cannot rearm an unobserved signature`);
+        wait.nextWakeAt = requiredString(data, "nextWakeAt");
+        wait.evidence = Array.isArray(data.evidence)
+          ? data.evidence.map((value) => String(value))
+          : wait.evidence;
+        wait.updatedAt = event.timestamp;
+        break;
+      }
       case "wait.satisfied": {
         const nodeId = requiredString(data, "nodeId");
         const wait = state.waits.find((candidate) => candidate.nodeId === nodeId);
