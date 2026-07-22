@@ -7,6 +7,7 @@ import {
   GRAPHCRAFT_VERSION,
   assessTaskShape,
   contractView,
+  prepareFinishLine,
   renderContract,
   resolveGraphcraftHome,
   stageBundledMcp,
@@ -76,6 +77,16 @@ describe("run approval", () => {
     });
   });
 
+  it("does not silently narrow an explicit push outcome", async () => {
+    await expect(
+      prepareFinishLine(
+        "Implement the feature and push the verified changes",
+        "/tmp/unused",
+        "committed",
+      ),
+    ).rejects.toThrow(/will not silently narrow/);
+  });
+
   it("shows the persisted graph shape and executable completion proof", () => {
     const contract = compileRunContract("Implement a substantial feature", {
       root: "/tmp/example",
@@ -98,6 +109,32 @@ describe("run approval", () => {
       completionProbes: [{ id: "tests", command: "pnpm test" }],
     });
     expect(renderContract(contract, graph)).toContain("Completion     tests");
+  });
+
+  it("shows pushed as a distinct permissioned finish line", () => {
+    const contract = compileRunContract(
+      "Implement the feature and push the verified changes",
+      { root: "/tmp/example", baseRef: "main", baseSha: "abc123" },
+      { finishLine: "pushed" },
+    );
+    const graph = compileGraph(contract, [
+      {
+        id: "tests",
+        kind: "command",
+        command: "pnpm",
+        args: ["test"],
+        expectedExitCode: 0,
+        timeoutMs: 1_000,
+      },
+    ]);
+    const rendered = renderContract(contract, graph);
+
+    expect(rendered).toContain("Finish line    pushed");
+    expect(rendered).toContain("push");
+    expect(rendered).toContain("github_write");
+    expect(contractView(contract, graph)).toMatchObject({
+      planShape: "implement → verify → commit → push",
+    });
   });
 
   it("exposes whole-run, phase, and node token costs in status output", () => {

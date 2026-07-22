@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  assertGitHubPushCapability,
   assertGitHubSnapshotCurrent,
   captureGitHubPullRequestSnapshot,
   probeGitHub,
@@ -302,6 +303,16 @@ describe("GitHub capability and snapshot layer", () => {
       canRead: false,
       canWrite: false,
       errors: [expect.stringMatching(/no readable repository permission/)],
+    });
+
+    const readOnly = await fakeGitHub({ permission: "TRIAGE", protected: false });
+    await expect(assertGitHubPushCapability(readOnly)).rejects.toThrow(
+      /does not have repository write permission/,
+    );
+    const writable = await fakeGitHub({ permission: "WRITE", protected: false });
+    await expect(assertGitHubPushCapability(writable)).resolves.toMatchObject({
+      canWrite: true,
+      readyForSnapshot: true,
     });
   });
 });

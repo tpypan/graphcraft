@@ -97,7 +97,7 @@ export async function prepareWorkerContext(input: {
   const relevantPaths = input.node.contextSelector.relevantPaths.length
     ? input.node.contextSelector.relevantPaths
     : groundedRelevantPaths(repositoryPaths, input.node.objective);
-  if (input.node.kind !== "commit" && relevantPaths.length === 0)
+  if (input.node.kind !== "commit" && input.node.kind !== "push" && relevantPaths.length === 0)
     throw new Error(`Node ${input.node.id} has no grounded repository context`);
   const node: GraphNode = {
     ...input.node,

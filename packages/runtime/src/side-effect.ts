@@ -28,6 +28,7 @@ export interface ExecuteSideEffectInput {
   reconcile: (claim: SideEffectClaim) => Promise<SideEffectReconciliation>;
   act: (claim: SideEffectClaim) => Promise<Record<string, unknown>>;
   boundary?: (point: SideEffectBoundary) => void | Promise<void>;
+  revalidateConfirmed?: boolean;
 }
 
 export class SideEffectBoundaryInterruption extends Error {
@@ -130,7 +131,17 @@ export async function executeSideEffect(
   claim = entry.claim;
   if (entry.status === "confirmed") {
     if (!entry.result) throw new Error(`Confirmed side effect ${claim.actionId} has no result`);
-    return entry.result;
+    if (!input.revalidateConfirmed) return entry.result;
+    const confirmed = await reconcileAndRecord(input, claim, "after_precondition_reconcile");
+    if (confirmed.status === "applied") return confirmed.result;
+    const reason = `Confirmed ${claim.kind} ${claim.actionId} no longer matches external truth`;
+    await input.store.append(
+      "runtime",
+      "side_effect.failed",
+      { actionId: claim.actionId, reason, retryable: false, uncertain: true },
+      claim.actionId,
+    );
+    throw new Error(reason);
   }
 
   const before = await reconcileAndRecord(input, claim, "after_precondition_reconcile");

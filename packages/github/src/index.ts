@@ -413,6 +413,20 @@ export async function probeGitHub(
   });
 }
 
+export async function assertGitHubPushCapability(
+  options: GitHubCommandOptions & { baseBranch?: string },
+): Promise<GitHubCapabilityReport> {
+  const report = await probeGitHub(options);
+  const errors = [...report.errors];
+  if (!report.canWrite)
+    errors.push("The authenticated account does not have repository write permission");
+  if (!report.readyForSnapshot && errors.length === 0)
+    errors.push("GitHub repository and branch-protection preflight is incomplete");
+  if (!report.readyForSnapshot || !report.canWrite)
+    throw new Error(`GitHub push preflight failed: ${errors.join("; ")}`);
+  return report;
+}
+
 const RateLimitSchema = z.strictObject({
   cost: z.number().int().nonnegative(),
   remaining: z.number().int().nonnegative(),

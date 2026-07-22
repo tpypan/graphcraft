@@ -31263,7 +31263,8 @@ var NodeKindSchema = external_exports.enum([
   "diagnostic",
   "decision",
   "wait",
-  "commit"
+  "commit",
+  "push"
 ]);
 var NodeStatusSchema = external_exports.enum([
   "pending",
@@ -32035,6 +32036,10 @@ function classifyTask(task) {
   return "feature";
 }
 function inferFinishLine(task) {
+  if (/\bpush(?:ed|ing)?\s+(?:(?:the|this)\s+)?(?:(?:verified|accepted)\s+)?(?:branch|commit|changes|result)\b|\bpush(?:ed|ing)?\s+to\s+(?:origin|github|the remote)\b/i.test(
+    task
+  ))
+    return "pushed";
   return /\bcommit(?:ted)?\b/i.test(task) ? "committed" : "local_verified";
 }
 function compileRunContract(task, repository, options = {}) {
@@ -32045,7 +32050,8 @@ function compileRunContract(task, repository, options = {}) {
     "run_commands",
     "create_worktree"
   ];
-  if (finishKind === "committed") permissions.push("commit");
+  if (finishKind === "committed" || finishKind === "pushed") permissions.push("commit");
+  if (finishKind === "pushed") permissions.push("push", "github_read", "github_write");
   return RunContractSchema.parse({
     schemaVersion: 1,
     runId: randomUUID(),
@@ -32172,7 +32178,7 @@ function compileGraph(contract, verificationProbes) {
       completionProbes: verificationProbes
     })
   ];
-  if (contract.finishLine.kind === "committed") {
+  if (contract.finishLine.kind === "committed" || contract.finishLine.kind === "pushed") {
     nodes.push(
       node({
         id: "commit",
@@ -32180,6 +32186,17 @@ function compileGraph(contract, verificationProbes) {
         objective: "Create one atomic commit containing only the accepted Graphcraft run changes",
         dependsOn: ["verify"],
         sideEffectClass: "git_commit"
+      })
+    );
+  }
+  if (contract.finishLine.kind === "pushed") {
+    nodes.push(
+      node({
+        id: "push",
+        kind: "push",
+        objective: "Push the accepted commit to the run's approved remote branch without force",
+        dependsOn: ["commit"],
+        sideEffectClass: "external"
       })
     );
   }
@@ -32235,21 +32252,30 @@ function validateGraphPolicy(graph, contract, requiredVerificationProbes, approv
     throw new Error("A planned graph must converge on exactly one finish-line node");
   const terminal = terminalNodes[0];
   const commitNodes = graph.nodes.filter((candidate) => candidate.kind === "commit");
+  const pushNodes = graph.nodes.filter((candidate) => candidate.kind === "push");
   if (contract.finishLine.kind === "local_verified") {
-    if (commitNodes.length > 0)
-      throw new Error("A local_verified plan cannot contain commit nodes");
+    if (commitNodes.length > 0 || pushNodes.length > 0)
+      throw new Error("A local_verified plan cannot contain commit or push nodes");
     if (terminal.kind !== "verification")
       throw new Error("A local_verified plan must end in a verification node");
   } else if (contract.finishLine.kind === "committed") {
-    if (commitNodes.length !== 1 || terminal.kind !== "commit")
+    if (commitNodes.length !== 1 || pushNodes.length > 0 || terminal.kind !== "commit")
       throw new Error("A committed plan must end in exactly one commit node");
     if (terminal.dependsOn.length !== 1 || graph.nodes.find((candidate) => candidate.id === terminal.dependsOn[0])?.kind !== "verification") {
       throw new Error("The terminal commit node must directly depend on one verification node");
     }
+  } else if (contract.finishLine.kind === "pushed") {
+    if (commitNodes.length !== 1 || pushNodes.length !== 1 || terminal.kind !== "push")
+      throw new Error("A pushed plan must end in exactly one push after one commit");
+    const commit = commitNodes[0];
+    if (terminal.dependsOn.length !== 1 || terminal.dependsOn[0] !== commit.id)
+      throw new Error("The terminal push node must directly depend on the commit node");
+    if (commit.dependsOn.length !== 1 || graph.nodes.find((candidate) => candidate.id === commit.dependsOn[0])?.kind !== "verification")
+      throw new Error("The pushed commit node must directly depend on one verification node");
   } else {
     throw new Error(`Finish line ${contract.finishLine.kind} is not executable locally`);
   }
-  const finalVerification = terminal.kind === "verification" ? terminal : graph.nodes.find((candidate) => candidate.id === terminal.dependsOn[0]);
+  const finalVerification = terminal.kind === "verification" ? terminal : terminal.kind === "commit" ? graph.nodes.find((candidate) => candidate.id === terminal.dependsOn[0]) : graph.nodes.find((candidate) => candidate.id === commitNodes[0]?.dependsOn[0]);
   if (!finalVerification || finalVerification.completionProbes.length === 0)
     throw new Error("The terminal verification node must contain executable completion probes");
   for (const required2 of requiredVerificationProbes) {
@@ -32274,7 +32300,7 @@ function validateGraphPolicy(graph, contract, requiredVerificationProbes, approv
     }
     if (!item.contextSelector.includeRepositoryInstructions)
       throw new Error(`Planned node ${item.id} attempted to omit repository instructions`);
-    if (item.sideEffectClass === "external")
+    if (item.sideEffectClass === "external" && (item.kind !== "push" || !contract.permissions.includes("push") || !contract.permissions.includes("github_write")))
       throw new Error(`Planned node ${item.id} requests unsupported external side effects`);
     if (item.sideEffectClass === "workspace_write" && !contract.permissions.includes("write_repository"))
       throw new Error(`Planned node ${item.id} exceeds repository write permissions`);
@@ -32284,6 +32310,8 @@ function validateGraphPolicy(graph, contract, requiredVerificationProbes, approv
       throw new Error(`Verification node ${item.id} must be read-only`);
     if (item.kind === "commit" && item.sideEffectClass !== "git_commit")
       throw new Error(`Commit node ${item.id} must use the git_commit side-effect class`);
+    if (item.kind === "push" && item.sideEffectClass !== "external")
+      throw new Error(`Push node ${item.id} must use the external side-effect class`);
     if (item.scope.length === 0 || item.scope.some((pattern) => !safeRelativePattern(pattern)))
       throw new Error(`Planned node ${item.id} contains an unsafe repository scope`);
     if (item.scope.some(
@@ -32430,7 +32458,7 @@ function fuseReadOnlyPair(nodes) {
         (path) => consumer.contextSelector.relevantPaths.includes(path)
       );
       if (producer.sideEffectClass !== "none" || consumer.sideEffectClass !== "none" || [producer.kind, consumer.kind].some(
-        (kind) => ["verification", "commit", "wait"].includes(kind)
+        (kind) => ["verification", "commit", "push", "wait"].includes(kind)
       ) || dependents.length !== 1 || !overlappingContext || relevantPaths.length > 6 || scopes.length > 4 || producer.objective.length + consumer.objective.length > 4e3 || producer.completionProbes.length + consumer.completionProbes.length > 0)
         continue;
       const dependsOn = unique([
@@ -32731,14 +32759,14 @@ function applyGraphAmendment(input) {
   return { graph, diff: { addedNodeIds, removedNodeIds, changedNodeIds } };
 }
 function verificationNode(graph) {
-  const terminal = graph.nodes.find(
-    (candidate) => !graph.nodes.some((other) => other.dependsOn.includes(candidate.id))
+  let candidate = graph.nodes.find(
+    (candidate2) => !graph.nodes.some((other) => other.dependsOn.includes(candidate2.id))
   );
-  const verification = terminal?.kind === "verification" ? terminal : graph.nodes.find(
-    (candidate) => candidate.kind === "verification" && terminal?.dependsOn.includes(candidate.id)
-  );
-  if (!verification) throw new Error("The graph has no finish-line verification node");
-  return verification;
+  while (candidate && (candidate.kind === "commit" || candidate.kind === "push") && candidate.dependsOn.length === 1)
+    candidate = graph.nodes.find((node2) => node2.id === candidate.dependsOn[0]);
+  if (candidate?.kind !== "verification")
+    throw new Error("The graph has no finish-line verification node");
+  return candidate;
 }
 function applyProbePlan(graph, contract, input) {
   const plan = ProbePlanSchema.parse(input);
@@ -32754,7 +32782,7 @@ function applyProbePlan(graph, contract, input) {
   }));
   for (const item of plan.items.filter(({ phase }) => phase === "progress")) {
     const preferred = item.purpose === "inventory" ? nodes.find((node2) => ["investigation", "decision", "diagnostic"].includes(node2.kind)) : nodes.find((node2) => node2.sideEffectClass === "workspace_write");
-    const target = preferred ?? nodes.find((node2) => !["verification", "commit", "wait"].includes(node2.kind));
+    const target = preferred ?? nodes.find((node2) => !["verification", "commit", "push", "wait"].includes(node2.kind));
     if (!target) throw new Error(`No executable node can own progress probe ${item.probe.id}`);
     target.progressProbes.push(item.probe);
   }
@@ -33025,12 +33053,13 @@ function renderPlannerPrompt(request) {
     "Use investigation nodes when repository evidence must be gathered before writes.",
     "End local_verified work in one verification node with executable completion probes.",
     "End committed work in one commit node that directly depends on a verification node.",
-    "Use only repository-relative scopes. Never propose external side effects.",
+    "End pushed work in one push node that directly depends on a commit node, which directly depends on a verification node.",
+    "Use only repository-relative scopes. Never propose external side effects except the terminal push required by an explicitly pushed finish line.",
     "Use a wait node only when the task explicitly requires time or filesystem state before downstream reasoning. Wait nodes must be read-only, have no probes, and declare one time, file_exists, or file_changed condition. Use a bounded 250-300000ms polling interval for filesystem conditions and an explicit timeout when the request provides one.",
     "Use the supplied task family. Every node must keep repository instructions enabled.",
     "A node may select predecessorResults only from its direct dependsOn list; do not repeat transitive predecessors.",
-    "Select at least one existing tracked repository path for every non-commit node. Every relevantPaths value must be copied exactly from repositoryEvidence.trackedPaths; relevant paths are evidence inputs, not files the worker might create. A wait-condition path may identify a future repository-relative file even when it is not yet tracked.",
-    "Investigation, decision, verification, and wait nodes must use sideEffectClass none. Implementation and repair/diagnostic nodes that edit files use workspace_write. Commit nodes alone use git_commit.",
+    "Select at least one existing tracked repository path for every node except commit and push. Every relevantPaths value must be copied exactly from repositoryEvidence.trackedPaths; relevant paths are evidence inputs, not files the worker might create. A wait-condition path may identify a future repository-relative file even when it is not yet tracked.",
+    "Investigation, decision, verification, and wait nodes must use sideEffectClass none. Implementation and repair/diagnostic nodes that edit files use workspace_write. Commit nodes alone use git_commit. A terminal push node uses external.",
     "Use the supplied probe plan exactly: assign completion probes to the terminal verification node and progress probes to the node where they measure change.",
     "Only the terminal verification node may contain completionProbes. Every other node must have an empty completionProbes array.",
     "Do not invent, weaken, omit, or replace probes. Graphcraft will deterministically reattach the approved probe plan after validating the topology.",
@@ -33405,7 +33434,7 @@ function reduceEvents(events) {
         if (!["applied", "not_applied", "unknown"].includes(outcome))
           throw new Error(`Unsupported side-effect reconciliation outcome ${outcome}`);
         entry.reconciliationAttempts += 1;
-        entry.status = outcome === "unknown" ? "uncertain" : "claimed";
+        entry.status = entry.status === "confirmed" && outcome === "applied" ? "confirmed" : outcome === "unknown" ? "uncertain" : "claimed";
         entry.evidence = Array.isArray(data.evidence) ? data.evidence.map((value) => String(value)) : [];
         entry.updatedAt = event.timestamp;
         break;
@@ -34636,6 +34665,17 @@ async function probeGitHub(options) {
     branchProtection,
     errors
   });
+}
+async function assertGitHubPushCapability(options) {
+  const report = await probeGitHub(options);
+  const errors = [...report.errors];
+  if (!report.canWrite)
+    errors.push("The authenticated account does not have repository write permission");
+  if (!report.readyForSnapshot && errors.length === 0)
+    errors.push("GitHub repository and branch-protection preflight is incomplete");
+  if (!report.readyForSnapshot || !report.canWrite)
+    throw new Error(`GitHub push preflight failed: ${errors.join("; ")}`);
+  return report;
 }
 var RateLimitSchema = external_exports.strictObject({
   cost: external_exports.number().int().nonnegative(),
@@ -35980,7 +36020,17 @@ async function executeSideEffect(input) {
   claim = entry.claim;
   if (entry.status === "confirmed") {
     if (!entry.result) throw new Error(`Confirmed side effect ${claim.actionId} has no result`);
-    return entry.result;
+    if (!input.revalidateConfirmed) return entry.result;
+    const confirmed = await reconcileAndRecord(input, claim, "after_precondition_reconcile");
+    if (confirmed.status === "applied") return confirmed.result;
+    const reason2 = `Confirmed ${claim.kind} ${claim.actionId} no longer matches external truth`;
+    await input.store.append(
+      "runtime",
+      "side_effect.failed",
+      { actionId: claim.actionId, reason: reason2, retryable: false, uncertain: true },
+      claim.actionId
+    );
+    throw new Error(reason2);
   }
   const before = await reconcileAndRecord(input, claim, "after_precondition_reconcile");
   if (before.status === "applied") return await confirm(input, claim, before);
@@ -36334,6 +36384,118 @@ async function reconcileAtomicCommit(workspace, claim) {
     status: "unknown",
     evidence: [
       `HEAD moved from ${expected.expectedHead} to ${currentHead} without the claimed commit identity`
+    ]
+  };
+}
+async function remoteBranchSha(repositoryPath, remote, branch) {
+  const ref = `refs/heads/${branch}`;
+  const result = await runProcess("git", ["ls-remote", "--exit-code", "--refs", remote, ref], {
+    cwd: repositoryPath,
+    timeoutMs: 12e4
+  });
+  if (result.exitCode === 2 && result.stdout.trim().length === 0) return null;
+  if (result.exitCode !== 0)
+    throw new Error(result.stderr.trim() || `Unable to read ${remote}/${branch}`);
+  const matches = result.stdout.trim().split("\n").filter(Boolean).map((line) => line.split(/\s+/, 2)).filter(([, observedRef]) => observedRef === ref);
+  if (matches.length !== 1 || !matches[0]?.[0])
+    throw new Error(`Remote ${remote}/${branch} did not resolve to exactly one SHA`);
+  return matches[0][0];
+}
+async function capturePushPrecondition(workspace, remote = "origin") {
+  const [remoteUrl, branch, localSha] = await Promise.all([
+    git(workspace.path, ["remote", "get-url", remote]),
+    git(workspace.path, ["branch", "--show-current"]),
+    git(workspace.path, ["rev-parse", "HEAD"])
+  ]);
+  if (!branch) throw new Error("The Graphcraft worktree is not on a named branch");
+  const expectedRemoteSha = await remoteBranchSha(workspace.path, remote, branch);
+  return { remote, remoteUrl, branch, localSha, expectedRemoteSha };
+}
+function pushPrecondition(claim) {
+  const remote = claim.precondition.remote;
+  const remoteUrl = claim.precondition.remoteUrl;
+  const branch = claim.precondition.branch;
+  const localSha = claim.precondition.localSha;
+  const expectedRemoteSha = claim.precondition.expectedRemoteSha;
+  if (typeof remote !== "string" || typeof remoteUrl !== "string" || typeof branch !== "string" || typeof localSha !== "string" || expectedRemoteSha !== null && typeof expectedRemoteSha !== "string")
+    throw new Error(`Push claim ${claim.actionId} has an invalid precondition`);
+  return { remote, remoteUrl, branch, localSha, expectedRemoteSha };
+}
+async function createAtomicPushClaim(workspace, runId, nodeId) {
+  const precondition = await capturePushPrecondition(workspace);
+  const actionId = contentHash({ schemaVersion: 1, runId, nodeId, kind: "git_push" });
+  return SideEffectClaimSchema.parse({
+    schemaVersion: 1,
+    actionId,
+    idempotencyKey: `graphcraft-${actionId}`,
+    nodeId,
+    kind: "git_push",
+    target: `${precondition.remote}/${precondition.branch}`,
+    precondition,
+    claimedAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+}
+async function performAtomicPush(workspace, claim, boundary) {
+  if (claim.kind !== "git_push") throw new Error(`Side effect ${claim.actionId} is not a push`);
+  const expected = pushPrecondition(claim);
+  const current = await capturePushPrecondition(workspace, expected.remote);
+  if (current.remoteUrl !== expected.remoteUrl || current.branch !== expected.branch || current.localSha !== expected.localSha || current.expectedRemoteSha !== expected.expectedRemoteSha)
+    throw new Error(`Push precondition changed for side effect ${claim.actionId}`);
+  await crossSideEffectBoundary(boundary, "after_action_prepare");
+  await gitRaw(workspace.path, [
+    "push",
+    "--porcelain",
+    expected.remote,
+    `${expected.branch}:refs/heads/${expected.branch}`
+  ]);
+  await crossSideEffectBoundary(boundary, "after_action_command");
+  return {
+    remote: expected.remote,
+    remoteUrl: expected.remoteUrl,
+    branch: expected.branch,
+    sha: expected.localSha
+  };
+}
+async function reconcileAtomicPush(workspace, claim) {
+  if (claim.kind !== "git_push") throw new Error(`Side effect ${claim.actionId} is not a push`);
+  const expected = pushPrecondition(claim);
+  const [currentRemoteUrl, currentBranch, currentHead, currentRemoteSha] = await Promise.all([
+    git(workspace.path, ["remote", "get-url", expected.remote]),
+    git(workspace.path, ["branch", "--show-current"]),
+    git(workspace.path, ["rev-parse", "HEAD"]),
+    remoteBranchSha(workspace.path, expected.remote, expected.branch)
+  ]);
+  if (currentRemoteUrl !== expected.remoteUrl || currentBranch !== expected.branch || currentHead !== expected.localSha)
+    return {
+      status: "unknown",
+      evidence: [
+        `Push preconditions moved: expected ${expected.remoteUrl} ${expected.branch} ${expected.localSha}; observed ${currentRemoteUrl} ${currentBranch || "detached HEAD"} ${currentHead}`
+      ]
+    };
+  if (currentRemoteSha === expected.localSha)
+    return {
+      status: "applied",
+      result: {
+        remote: expected.remote,
+        remoteUrl: expected.remoteUrl,
+        branch: expected.branch,
+        sha: expected.localSha
+      },
+      evidence: [
+        `Remote ${expected.remote}/${expected.branch} resolves to the claimed SHA ${expected.localSha}`
+      ]
+    };
+  if (currentRemoteSha === expected.expectedRemoteSha)
+    return {
+      status: "not_applied",
+      evidence: [
+        currentRemoteSha ? `Remote ${expected.remote}/${expected.branch} remains at ${currentRemoteSha}` : `Remote ${expected.remote}/${expected.branch} remains absent`
+      ]
+    };
+  return {
+    status: "unknown",
+    evidence: [
+      `Remote ${expected.remote}/${expected.branch} moved from ${expected.expectedRemoteSha ?? "absent"} to ${currentRemoteSha ?? "absent"} without the claimed push`
     ]
   };
 }
@@ -36843,7 +37005,7 @@ async function prepareWorkerContext(input) {
 `
   );
   const relevantPaths = input.node.contextSelector.relevantPaths.length ? input.node.contextSelector.relevantPaths : groundedRelevantPaths(repositoryPaths, input.node.objective);
-  if (input.node.kind !== "commit" && relevantPaths.length === 0)
+  if (input.node.kind !== "commit" && input.node.kind !== "push" && relevantPaths.length === 0)
     throw new Error(`Node ${input.node.id} has no grounded repository context`);
   const node2 = {
     ...input.node,
@@ -37267,7 +37429,7 @@ function populateMissingGraphContext(graph, repositoryEvidence) {
   return {
     ...graph,
     nodes: graph.nodes.map(
-      (node2) => node2.kind === "commit" || node2.contextSelector.relevantPaths.length > 0 ? node2 : {
+      (node2) => node2.kind === "commit" || node2.kind === "push" || node2.contextSelector.relevantPaths.length > 0 ? node2 : {
         ...node2,
         contextSelector: {
           ...node2.contextSelector,
@@ -37360,7 +37522,7 @@ async function recordMissingUsage(store, invocation, node2, host) {
 }
 async function validatePlannedContext(graph, repositoryPath) {
   for (const node2 of graph.nodes) {
-    if (node2.kind === "commit") continue;
+    if (node2.kind === "commit" || node2.kind === "push") continue;
     if (node2.contextSelector.relevantPaths.length === 0)
       throw new Error(`Planned node ${node2.id} did not select repository evidence`);
     for (const relevantPath of node2.contextSelector.relevantPaths) {
@@ -37828,7 +37990,7 @@ function readyBatch(graph, state, maxWorkers) {
         costBasis: "deterministic_static"
       })
     };
-  if (["verification", "commit", "wait"].includes(first.kind))
+  if (["verification", "commit", "push", "wait"].includes(first.kind))
     return {
       nodes: [first],
       decision: runtimeOptimizationDecision({
@@ -37842,7 +38004,7 @@ function readyBatch(graph, state, maxWorkers) {
       })
     };
   const second = ready.slice(1).find(
-    (candidate) => !["verification", "commit", "wait"].includes(candidate.kind) && !concurrencyConflict(graph, first, candidate)
+    (candidate) => !["verification", "commit", "push", "wait"].includes(candidate.kind) && !concurrencyConflict(graph, first, candidate)
   );
   if (!second)
     return {
@@ -37880,7 +38042,7 @@ async function hostContextOptimization(store, graph, node2, adapterId) {
     source.contextSelector.relevantPaths.length,
     node2.contextSelector.relevantPaths.length
   ) : 0;
-  const eligible = source !== void 0 && source.sideEffectClass === node2.sideEffectClass && !["verification", "commit", "wait"].includes(source.kind) && !["verification", "commit", "wait"].includes(node2.kind) && minimumContext > 0 && sharedPaths.length / minimumContext >= 0.5;
+  const eligible = source !== void 0 && source.sideEffectClass === node2.sideEffectClass && !["verification", "commit", "push", "wait"].includes(source.kind) && !["verification", "commit", "push", "wait"].includes(node2.kind) && minimumContext > 0 && sharedPaths.length / minimumContext >= 0.5;
   const events = eligible ? await store.loadEvents() : [];
   const sourceUsage = eligible ? (await store.loadState()).tokenLedger.filter(
     (entry) => entry.nodeId === sourceNodeId && !entry.missing && ["reported", "derived"].includes(entry.usage.availability.total)
@@ -38410,7 +38572,7 @@ async function executeRun(input) {
         return await input.store.loadState();
       const reuseSessions = /* @__PURE__ */ new Map();
       for (const candidate of batch) {
-        if (["verification", "commit", "wait"].includes(candidate.kind) || recoveries.has(candidate.id))
+        if (["verification", "commit", "push", "wait"].includes(candidate.kind) || recoveries.has(candidate.id))
           continue;
         const contextOptimization = await hostContextOptimization(
           input.store,
@@ -38812,6 +38974,52 @@ async function executeRun(input) {
         }
         continue;
       }
+      if (current.kind === "push") {
+        const control = await evaluateSuccessfulControl({
+          store: input.store,
+          graph,
+          node: current,
+          rationale: "The accepted commit is ready for the approved normal push",
+          evidence: state.latestProgressEvidence
+        });
+        if (!control.allowed) {
+          const reason = control.reason ?? `Control graph blocked push node ${current.id}`;
+          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+          await input.store.append("runtime", "run.blocked", {
+            reason,
+            ...control.packet ? { decisionPacket: control.packet } : {}
+          });
+          return await input.store.loadState();
+        }
+        try {
+          const proposedClaim = await createAtomicPushClaim(workspace, contract.runId, current.id);
+          const result = await executeSideEffect({
+            store: input.store,
+            claim: proposedClaim,
+            reconcile: async (claim) => await reconcileAtomicPush(workspace, claim),
+            act: async (claim) => await performAtomicPush(workspace, claim, input.sideEffectBoundary),
+            revalidateConfirmed: true,
+            ...input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}
+          });
+          await input.store.append("runtime", "node.accepted", {
+            nodeId: current.id,
+            sha: result.sha,
+            remote: result.remote,
+            branch: result.branch,
+            sideEffectActionId: proposedClaim.actionId
+          });
+          await crossSideEffectBoundary(input.sideEffectBoundary, "after_node_acceptance");
+        } catch (error51) {
+          if (error51 instanceof SideEffectBoundaryInterruption) throw error51;
+          await input.store.append("runtime", "node.failed", {
+            nodeId: current.id,
+            reason: error51.message
+          });
+          await input.store.append("runtime", "run.blocked", { reason: error51.message });
+          return await input.store.loadState();
+        }
+        continue;
+      }
       const outcome = await executeWorkNode({
         store: input.store,
         adapter: input.adapter,
@@ -38936,6 +39144,20 @@ function assessTaskShape(task) {
     }
   };
 }
+async function prepareFinishLine(task, cwd, requested) {
+  if (/\b(open (?:a )?pr|pull request|pr green|merge|deploy)\b/i.test(task))
+    throw new Error(
+      "Graphcraft supports local_verified, committed, and pushed finish lines. It will not silently narrow a requested PR, merge, or deployment outcome."
+    );
+  const inferred = inferFinishLine(task);
+  if (inferred === "pushed" && requested && requested !== "pushed")
+    throw new Error(
+      "The requested task includes a push outcome, so Graphcraft will not silently narrow it to a local finish line."
+    );
+  const finishLine = requested ?? inferred;
+  if (finishLine === "pushed") await assertGitHubPushCapability({ cwd });
+  return finishLine;
+}
 function probeView(item) {
   const probe = item.probe;
   return {
@@ -39049,16 +39271,12 @@ async function handleAction(input) {
         taskShape
       };
     }
-    if (/\b(push|open (?:a )?pr|pull request|pr green|merge|deploy)\b/i.test(input.task)) {
-      throw new Error(
-        "Graphcraft v0.1 supports local_verified and committed finish lines. It will not silently narrow a requested remote finish line."
-      );
-    }
+    const finishLine = await prepareFinishLine(input.task, cwd, input.finishLine);
     const adapter = createAdapter(input.host ?? "codex");
     const created = await createRun(input.task, {
       cwd,
       planner: adapter,
-      ...input.finishLine ? { finishLine: input.finishLine } : {}
+      finishLine
     });
     if (!input.approve)
       return {
@@ -39141,6 +39359,8 @@ async function handleAction(input) {
     if (state.status === "awaiting_approval" && !input.approve) {
       return { approvalRequired: true, contract: contractView(contract, graph, probePlan) };
     }
+    if (state.status === "awaiting_approval" && contract.finishLine.kind === "pushed")
+      await assertGitHubPushCapability({ cwd: store.repositoryRoot });
     const resumed = await executeRun({
       store,
       adapter: createAdapter(input.host ?? "codex"),
@@ -39223,7 +39443,7 @@ function createGraphcraftServer() {
         repository: external_exports.string().optional(),
         host: external_exports.enum(["codex", "claude"]).optional(),
         approve: external_exports.boolean().optional(),
-        finishLine: external_exports.enum(["local_verified", "committed"]).optional(),
+        finishLine: external_exports.enum(["local_verified", "committed", "pushed"]).optional(),
         force: external_exports.boolean().optional(),
         maxWorkers: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).optional(),
         probePlan: ProbePlanSchema.optional(),

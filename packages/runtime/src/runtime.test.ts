@@ -161,6 +161,15 @@ async function createRepository(
   return repository;
 }
 
+async function createRepositoryWithRemote(): Promise<{ repository: string; remote: string }> {
+  const repository = await createRepository();
+  const remote = join(repository, "..", "remote.git");
+  await git(repository, "init", "--bare", remote);
+  await git(repository, "remote", "add", "origin", remote);
+  await git(repository, "push", "origin", "main");
+  return { repository, remote };
+}
+
 class FakeAdapter implements HostAdapter {
   readonly id: HostAdapter["id"];
   readonly calls: string[] = [];
@@ -261,7 +270,10 @@ class FakeAdapter implements HostAdapter {
         sideEffectClass: "none",
       },
     ];
-    if (request.contract.finishLine.kind === "committed") {
+    if (
+      request.contract.finishLine.kind === "committed" ||
+      request.contract.finishLine.kind === "pushed"
+    ) {
       nodes.push({
         id: "commit",
         kind: "commit",
@@ -276,6 +288,23 @@ class FakeAdapter implements HostAdapter {
         progressProbes: [],
         completionProbes: [],
         sideEffectClass: "git_commit",
+      });
+    }
+    if (request.contract.finishLine.kind === "pushed") {
+      nodes.push({
+        id: "push",
+        kind: "push",
+        objective: "Push the accepted commit without force",
+        dependsOn: ["commit"],
+        scope: ["**/*"],
+        contextSelector: {
+          includeRepositoryInstructions: true,
+          predecessorResults: ["commit"],
+          relevantPaths: [],
+        },
+        progressProbes: [],
+        completionProbes: [],
+        sideEffectClass: "external",
       });
     }
     return {
@@ -2271,6 +2300,242 @@ process.stdin.on("end", () => {
     expect(state.sideEffects).toMatchObject([{ status: "uncertain", retryable: false }]);
     expect(message).toContain("unrelated external commit");
     expect(message).not.toContain("Graphcraft-Action:");
+  });
+
+  it("pushes the accepted commit once with exact remote evidence", async () => {
+    const { repository, remote } = await createRepositoryWithRemote();
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "pushed\n");
+    });
+    const created = await createRun("Implement the feature and push the verified changes", {
+      cwd: repository,
+      finishLine: "pushed",
+      planner: adapter,
+    });
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+    const workspace = await created.store.loadWorkspace<{ path: string; branch: string }>();
+    const { stdout: localHead } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+      cwd: workspace.path,
+    });
+    const { stdout: remoteHead } = await execFileAsync(
+      "git",
+      ["--git-dir", remote, "rev-parse", `refs/heads/${workspace.branch}`],
+      { cwd: repository },
+    );
+
+    expect(state.status).toBe("completed");
+    expect(state.nodes.push?.status).toBe("accepted");
+    expect(state.sideEffects).toMatchObject([
+      { status: "confirmed", claim: { kind: "git_commit", nodeId: "commit" } },
+      {
+        status: "confirmed",
+        claim: {
+          kind: "git_push",
+          nodeId: "push",
+          target: `origin/${workspace.branch}`,
+          precondition: { expectedRemoteSha: null, localSha: localHead.trim() },
+        },
+        result: { branch: workspace.branch, remote: "origin", sha: localHead.trim() },
+      },
+    ]);
+    expect(remoteHead.trim()).toBe(localHead.trim());
+  });
+
+  it("reconciles one normal push across every remote claim-act-confirm boundary", async () => {
+    const faultPoints: SideEffectBoundary[] = [
+      "before_claim",
+      "after_claim",
+      "after_precondition_reconcile",
+      "before_act",
+      "after_action_prepare",
+      "after_action_command",
+      "after_act",
+      "after_confirmation_reconcile",
+      "after_confirm",
+      "after_node_acceptance",
+    ];
+
+    for (const faultPoint of faultPoints) {
+      const { repository, remote } = await createRepositoryWithRemote();
+      const adapter = new FakeAdapter(async (request) => {
+        if (request.capsule.nodeId === "implement")
+          await writeFile(join(request.repositoryPath, "feature.txt"), "pushed\n");
+      });
+      const created = await createRun("Implement the feature and push the verified changes", {
+        cwd: repository,
+        finishLine: "pushed",
+      });
+      const pushBoundaries: SideEffectBoundary[] = [];
+      let armed = true;
+      const boundary = async (point: SideEffectBoundary): Promise<void> => {
+        const state = await created.store.loadState();
+        const pushClaimed = state.sideEffects.some(({ claim }) => claim.kind === "git_push");
+        const atPush =
+          pushClaimed ||
+          (point === "before_claim" && state.nodes.commit?.status === "accepted" && !pushClaimed);
+        if (!atPush) return;
+        pushBoundaries.push(point);
+        if (armed && point === faultPoint) {
+          armed = false;
+          throw new Error(`Injected push termination at ${point}`);
+        }
+      };
+      await expect(
+        executeRun({
+          store: created.store,
+          adapter,
+          approve: true,
+          sideEffectBoundary: boundary,
+        }),
+        faultPoint,
+      ).rejects.toThrow(`Side-effect execution interrupted after ${faultPoint}`);
+      expect(armed, faultPoint).toBe(false);
+
+      const completed = await executeRun({
+        store: created.store,
+        adapter,
+        sideEffectBoundary: boundary,
+      });
+      const workspace = await created.store.loadWorkspace<{ path: string; branch: string }>();
+      const events = await created.store.loadEvents();
+      const { stdout: localHead } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+        cwd: workspace.path,
+      });
+      const { stdout: remoteHead } = await execFileAsync(
+        "git",
+        ["--git-dir", remote, "rev-parse", `refs/heads/${workspace.branch}`],
+        { cwd: repository },
+      );
+
+      expect(completed.status, faultPoint).toBe("completed");
+      expect(remoteHead.trim(), faultPoint).toBe(localHead.trim());
+      expect(
+        completed.sideEffects.filter(({ claim }) => claim.kind === "git_push"),
+        faultPoint,
+      ).toMatchObject([{ status: "confirmed" }]);
+      expect(
+        events.filter(
+          ({ type, data }) =>
+            type === "side_effect.claimed" &&
+            (data.claim as { kind?: string } | undefined)?.kind === "git_push",
+        ),
+        faultPoint,
+      ).toHaveLength(1);
+      expect(
+        events.filter(
+          ({ type, data }) =>
+            type === "side_effect.confirmed" &&
+            data.actionId ===
+              completed.sideEffects.find(({ claim }) => claim.kind === "git_push")?.claim.actionId,
+        ),
+        faultPoint,
+      ).toHaveLength(1);
+      expect(
+        events.filter(({ type, data }) => type === "node.accepted" && data.nodeId === "push"),
+        faultPoint,
+      ).toHaveLength(1);
+      expect(
+        pushBoundaries.filter((point) => point === "after_action_command"),
+        faultPoint,
+      ).toHaveLength(1);
+    }
+  }, 120_000);
+
+  it.each(["after_claim", "after_confirm"] as const)(
+    "refuses a push retry when the remote moves after %s",
+    async (faultPoint) => {
+      const { repository, remote } = await createRepositoryWithRemote();
+      const adapter = new FakeAdapter(async (request) => {
+        if (request.capsule.nodeId === "implement")
+          await writeFile(join(request.repositoryPath, "feature.txt"), "pushed\n");
+      });
+      const created = await createRun("Implement the feature and push the verified changes", {
+        cwd: repository,
+        finishLine: "pushed",
+      });
+      let armed = true;
+      await expect(
+        executeRun({
+          store: created.store,
+          adapter,
+          approve: true,
+          sideEffectBoundary: async (point) => {
+            const state = await created.store.loadState();
+            const atPush = state.sideEffects.some(({ claim }) => claim.kind === "git_push");
+            if (armed && atPush && point === faultPoint) {
+              armed = false;
+              throw new Error(`Injected push termination at ${point}`);
+            }
+          },
+        }),
+      ).rejects.toThrow(`Side-effect execution interrupted after ${faultPoint}`);
+      const workspace = await created.store.loadWorkspace<{ branch: string }>();
+      const contract = await created.store.loadContract();
+      await execFileAsync(
+        "git",
+        [
+          "--git-dir",
+          remote,
+          "update-ref",
+          `refs/heads/${workspace.branch}`,
+          contract.repository.baseSha,
+        ],
+        { cwd: repository },
+      );
+
+      const state = await executeRun({ store: created.store, adapter });
+      const { stdout: remoteHead } = await execFileAsync(
+        "git",
+        ["--git-dir", remote, "rev-parse", `refs/heads/${workspace.branch}`],
+        { cwd: repository },
+      );
+      const push = state.sideEffects.find(({ claim }) => claim.kind === "git_push");
+
+      expect(state.status).toBe("blocked");
+      expect(state.nodes.push?.status).toBe("failed");
+      expect(push).toMatchObject({ status: "uncertain", retryable: false });
+      expect(remoteHead.trim()).toBe(contract.repository.baseSha);
+    },
+  );
+
+  it("preserves a divergent existing remote branch instead of force-pushing", async () => {
+    const { repository, remote } = await createRepositoryWithRemote();
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "pushed\n");
+    });
+    const created = await createRun("Implement the feature and push the verified changes", {
+      cwd: repository,
+      finishLine: "pushed",
+    });
+    const branch = `graphcraft/${created.contract.runId.slice(0, 8)}-implement-the-feature-and-push-t`;
+    await git(repository, "checkout", "-b", "divergent-remote");
+    await writeFile(join(repository, "remote-only.txt"), "divergent\n");
+    await git(repository, "add", "remote-only.txt");
+    await git(repository, "commit", "-m", "divergent remote commit");
+    const { stdout: divergentHead } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+      cwd: repository,
+    });
+    await git(repository, "push", "origin", `HEAD:refs/heads/${branch}`);
+    await git(repository, "checkout", "main");
+
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+    const workspace = await created.store.loadWorkspace<{ branch: string }>();
+    const { stdout: remoteHead } = await execFileAsync(
+      "git",
+      ["--git-dir", remote, "rev-parse", `refs/heads/${workspace.branch}`],
+      { cwd: repository },
+    );
+
+    expect(workspace.branch).toBe(branch);
+    expect(state.status).toBe("blocked");
+    expect(state.nodes.push?.status).toBe("failed");
+    expect(remoteHead.trim()).toBe(divergentHead.trim());
+    expect(state.sideEffects.find(({ claim }) => claim.kind === "git_push")).toMatchObject({
+      status: "failed",
+      retryable: true,
+    });
   });
 
   it("rebuilds a corrupted materialized state from hashed events", async () => {

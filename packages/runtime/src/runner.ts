@@ -62,11 +62,14 @@ import {
 } from "./governance.ts";
 import {
   createAtomicCommitClaim,
+  createAtomicPushClaim,
   discoverPlanningEvidence,
   createRunWorkspace,
   discoverRepository,
   performAtomicCommit,
+  performAtomicPush,
   reconcileAtomicCommit,
+  reconcileAtomicPush,
   type RunWorkspace,
 } from "./repository.ts";
 import {
@@ -87,7 +90,7 @@ import { assessRunProgress, createProgressDecisionPacket } from "./trajectory.ts
 
 export interface CreateRunOptions {
   cwd: string;
-  finishLine?: "local_verified" | "committed";
+  finishLine?: "local_verified" | "committed" | "pushed";
   planner?: GraphPlanner;
   signal?: AbortSignal;
 }
@@ -107,7 +110,9 @@ function populateMissingGraphContext(
   return {
     ...graph,
     nodes: graph.nodes.map((node) =>
-      node.kind === "commit" || node.contextSelector.relevantPaths.length > 0
+      node.kind === "commit" ||
+      node.kind === "push" ||
+      node.contextSelector.relevantPaths.length > 0
         ? node
         : {
             ...node,
@@ -249,7 +254,7 @@ async function recordMissingUsage(
 
 async function validatePlannedContext(graph: Graph, repositoryPath: string): Promise<void> {
   for (const node of graph.nodes) {
-    if (node.kind === "commit") continue;
+    if (node.kind === "commit" || node.kind === "push") continue;
     if (node.contextSelector.relevantPaths.length === 0)
       throw new Error(`Planned node ${node.id} did not select repository evidence`);
     for (const relevantPath of node.contextSelector.relevantPaths) {
@@ -819,7 +824,7 @@ function readyBatch(
         costBasis: "deterministic_static",
       }),
     };
-  if (["verification", "commit", "wait"].includes(first.kind))
+  if (["verification", "commit", "push", "wait"].includes(first.kind))
     return {
       nodes: [first],
       decision: runtimeOptimizationDecision({
@@ -837,7 +842,7 @@ function readyBatch(
     .slice(1)
     .find(
       (candidate) =>
-        !["verification", "commit", "wait"].includes(candidate.kind) &&
+        !["verification", "commit", "push", "wait"].includes(candidate.kind) &&
         !concurrencyConflict(graph, first, candidate),
     );
   if (!second)
@@ -899,8 +904,8 @@ async function hostContextOptimization(
   const eligible =
     source !== undefined &&
     source.sideEffectClass === node.sideEffectClass &&
-    !["verification", "commit", "wait"].includes(source.kind) &&
-    !["verification", "commit", "wait"].includes(node.kind) &&
+    !["verification", "commit", "push", "wait"].includes(source.kind) &&
+    !["verification", "commit", "push", "wait"].includes(node.kind) &&
     minimumContext > 0 &&
     sharedPaths.length / minimumContext >= 0.5;
   const events = eligible ? await store.loadEvents() : [];
@@ -1591,7 +1596,7 @@ export async function executeRun(input: {
       const reuseSessions = new Map<string, { hostSessionId: string; sourceNodeId: string }>();
       for (const candidate of batch) {
         if (
-          ["verification", "commit", "wait"].includes(candidate.kind) ||
+          ["verification", "commit", "push", "wait"].includes(candidate.kind) ||
           recoveries.has(candidate.id)
         )
           continue;
@@ -2029,6 +2034,54 @@ export async function executeRun(input: {
           await input.store.append("runtime", "node.accepted", {
             nodeId: current.id,
             sha: result.sha,
+            sideEffectActionId: proposedClaim.actionId,
+          });
+          await crossSideEffectBoundary(input.sideEffectBoundary, "after_node_acceptance");
+        } catch (error) {
+          if (error instanceof SideEffectBoundaryInterruption) throw error;
+          await input.store.append("runtime", "node.failed", {
+            nodeId: current.id,
+            reason: (error as Error).message,
+          });
+          await input.store.append("runtime", "run.blocked", { reason: (error as Error).message });
+          return await input.store.loadState();
+        }
+        continue;
+      }
+
+      if (current.kind === "push") {
+        const control = await evaluateSuccessfulControl({
+          store: input.store,
+          graph,
+          node: current,
+          rationale: "The accepted commit is ready for the approved normal push",
+          evidence: state.latestProgressEvidence,
+        });
+        if (!control.allowed) {
+          const reason = control.reason ?? `Control graph blocked push node ${current.id}`;
+          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+          await input.store.append("runtime", "run.blocked", {
+            reason,
+            ...(control.packet ? { decisionPacket: control.packet } : {}),
+          });
+          return await input.store.loadState();
+        }
+        try {
+          const proposedClaim = await createAtomicPushClaim(workspace, contract.runId, current.id);
+          const result = await executeSideEffect({
+            store: input.store,
+            claim: proposedClaim,
+            reconcile: async (claim) => await reconcileAtomicPush(workspace, claim),
+            act: async (claim) =>
+              await performAtomicPush(workspace, claim, input.sideEffectBoundary),
+            revalidateConfirmed: true,
+            ...(input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}),
+          });
+          await input.store.append("runtime", "node.accepted", {
+            nodeId: current.id,
+            sha: result.sha,
+            remote: result.remote,
+            branch: result.branch,
             sideEffectActionId: proposedClaim.actionId,
           });
           await crossSideEffectBoundary(input.sideEffectBoundary, "after_node_acceptance");

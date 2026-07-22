@@ -12,12 +12,14 @@ import {
   GRAPHCRAFT_VERSION,
   handleAction,
   installHost,
+  prepareFinishLine,
   renderContract,
   stateView,
   storeFor,
   supervisorView,
   uninstallHost,
   type HostName,
+  type ExecutableFinishLine,
 } from "./index.ts";
 import {
   createRun,
@@ -222,6 +224,7 @@ program
     new Option("--finish-line <finish-line>", "finish line").choices([
       "local_verified",
       "committed",
+      "pushed",
     ]),
   )
   .action(
@@ -235,7 +238,7 @@ program
         background?: boolean;
         host: HostName;
         maxWorkers: "1" | "2";
-        finishLine?: "local_verified" | "committed";
+        finishLine?: ExecutableFinishLine;
       },
     ) => {
       const taskShape = assessTaskShape(task);
@@ -245,16 +248,12 @@ program
         );
         return;
       }
-      if (/\b(push|open (?:a )?pr|pull request|pr green|merge|deploy)\b/i.test(task)) {
-        throw new Error(
-          "Graphcraft v0.1 supports local_verified and committed finish lines and will not narrow this remote request.",
-        );
-      }
+      const finishLine = await prepareFinishLine(task, options.cwd, options.finishLine);
       const adapter = createAdapter(options.host);
       const created = await createRun(task, {
         cwd: options.cwd,
         planner: adapter,
-        ...(options.finishLine ? { finishLine: options.finishLine } : {}),
+        finishLine,
       });
       const approved =
         options.yes || (await askForApproval(created.contract, created.graph, created.probePlan));
@@ -449,6 +448,8 @@ program
       const graph = await store.loadGraph();
       const probePlan = await store.loadProbePlan();
       const state = await store.loadState();
+      if (state.status === "awaiting_approval" && contract.finishLine.kind === "pushed")
+        await prepareFinishLine(contract.task, store.repositoryRoot, "pushed");
       const approved =
         state.status !== "awaiting_approval" ||
         options.yes ||

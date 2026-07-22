@@ -8,10 +8,11 @@ import { stdin, stdout } from "node:process";
 import packageMetadata from "../../../package.json" with { type: "json" };
 import { CodexAdapter } from "@graphcraft/adapter-codex";
 import { ClaudeAdapter } from "@graphcraft/adapter-claude";
-import { probeGitHub } from "@graphcraft/github";
+import { assertGitHubPushCapability, probeGitHub } from "@graphcraft/github";
 import {
   ContextSelectionReceiptSchema,
   graphPlanShape,
+  inferFinishLine,
   probePlanFromGraph,
   tokenCostReport,
   type Graph,
@@ -193,6 +194,27 @@ export function shouldBypassGraph(task: string): boolean {
   return assessTaskShape(task).bypass;
 }
 
+export type ExecutableFinishLine = "local_verified" | "committed" | "pushed";
+
+export async function prepareFinishLine(
+  task: string,
+  cwd: string,
+  requested?: ExecutableFinishLine,
+): Promise<ExecutableFinishLine> {
+  if (/\b(open (?:a )?pr|pull request|pr green|merge|deploy)\b/i.test(task))
+    throw new Error(
+      "Graphcraft supports local_verified, committed, and pushed finish lines. It will not silently narrow a requested PR, merge, or deployment outcome.",
+    );
+  const inferred = inferFinishLine(task);
+  if (inferred === "pushed" && requested && requested !== "pushed")
+    throw new Error(
+      "The requested task includes a push outcome, so Graphcraft will not silently narrow it to a local finish line.",
+    );
+  const finishLine = requested ?? inferred;
+  if (finishLine === "pushed") await assertGitHubPushCapability({ cwd });
+  return finishLine;
+}
+
 function probeView(item: ProbePlan["items"][number]): Record<string, unknown> {
   const probe = item.probe;
   return {
@@ -355,7 +377,7 @@ export interface McpActionInput {
   repository?: string | undefined;
   host?: HostName | undefined;
   approve?: boolean | undefined;
-  finishLine?: "local_verified" | "committed" | undefined;
+  finishLine?: ExecutableFinishLine | undefined;
   force?: boolean | undefined;
   maxWorkers?: 1 | 2 | undefined;
   probePlan?: ProbePlan | undefined;
@@ -395,16 +417,12 @@ export async function handleAction(input: McpActionInput): Promise<Record<string
         taskShape,
       };
     }
-    if (/\b(push|open (?:a )?pr|pull request|pr green|merge|deploy)\b/i.test(input.task)) {
-      throw new Error(
-        "Graphcraft v0.1 supports local_verified and committed finish lines. It will not silently narrow a requested remote finish line.",
-      );
-    }
+    const finishLine = await prepareFinishLine(input.task, cwd, input.finishLine);
     const adapter = createAdapter(input.host ?? "codex");
     const created = await createRun(input.task, {
       cwd,
       planner: adapter,
-      ...(input.finishLine ? { finishLine: input.finishLine } : {}),
+      finishLine,
     });
     if (!input.approve)
       return {
@@ -490,6 +508,8 @@ export async function handleAction(input: McpActionInput): Promise<Record<string
     if (state.status === "awaiting_approval" && !input.approve) {
       return { approvalRequired: true, contract: contractView(contract, graph, probePlan) };
     }
+    if (state.status === "awaiting_approval" && contract.finishLine.kind === "pushed")
+      await assertGitHubPushCapability({ cwd: store.repositoryRoot });
     const resumed = await executeRun({
       store,
       adapter: createAdapter(input.host ?? "codex"),

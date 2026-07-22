@@ -210,7 +210,12 @@ export function reduceEvents(events: RunEvent[]): RunState {
         if (!["applied", "not_applied", "unknown"].includes(outcome))
           throw new Error(`Unsupported side-effect reconciliation outcome ${outcome}`);
         entry.reconciliationAttempts += 1;
-        entry.status = outcome === "unknown" ? "uncertain" : "claimed";
+        entry.status =
+          entry.status === "confirmed" && outcome === "applied"
+            ? "confirmed"
+            : outcome === "unknown"
+              ? "uncertain"
+              : "claimed";
         entry.evidence = Array.isArray(data.evidence)
           ? data.evidence.map((value) => String(value))
           : [];

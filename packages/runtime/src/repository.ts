@@ -417,3 +417,169 @@ export async function reconcileAtomicCommit(
     ],
   };
 }
+
+interface PushPrecondition {
+  remote: string;
+  remoteUrl: string;
+  branch: string;
+  localSha: string;
+  expectedRemoteSha: string | null;
+}
+
+async function remoteBranchSha(
+  repositoryPath: string,
+  remote: string,
+  branch: string,
+): Promise<string | null> {
+  const ref = `refs/heads/${branch}`;
+  const result = await runProcess("git", ["ls-remote", "--exit-code", "--refs", remote, ref], {
+    cwd: repositoryPath,
+    timeoutMs: 120_000,
+  });
+  if (result.exitCode === 2 && result.stdout.trim().length === 0) return null;
+  if (result.exitCode !== 0)
+    throw new Error(result.stderr.trim() || `Unable to read ${remote}/${branch}`);
+  const matches = result.stdout
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => line.split(/\s+/, 2))
+    .filter(([, observedRef]) => observedRef === ref);
+  if (matches.length !== 1 || !matches[0]?.[0])
+    throw new Error(`Remote ${remote}/${branch} did not resolve to exactly one SHA`);
+  return matches[0][0];
+}
+
+async function capturePushPrecondition(
+  workspace: RunWorkspace,
+  remote = "origin",
+): Promise<PushPrecondition> {
+  const [remoteUrl, branch, localSha] = await Promise.all([
+    git(workspace.path, ["remote", "get-url", remote]),
+    git(workspace.path, ["branch", "--show-current"]),
+    git(workspace.path, ["rev-parse", "HEAD"]),
+  ]);
+  if (!branch) throw new Error("The Graphcraft worktree is not on a named branch");
+  const expectedRemoteSha = await remoteBranchSha(workspace.path, remote, branch);
+  return { remote, remoteUrl, branch, localSha, expectedRemoteSha };
+}
+
+function pushPrecondition(claim: SideEffectClaim): PushPrecondition {
+  const remote = claim.precondition.remote;
+  const remoteUrl = claim.precondition.remoteUrl;
+  const branch = claim.precondition.branch;
+  const localSha = claim.precondition.localSha;
+  const expectedRemoteSha = claim.precondition.expectedRemoteSha;
+  if (
+    typeof remote !== "string" ||
+    typeof remoteUrl !== "string" ||
+    typeof branch !== "string" ||
+    typeof localSha !== "string" ||
+    (expectedRemoteSha !== null && typeof expectedRemoteSha !== "string")
+  )
+    throw new Error(`Push claim ${claim.actionId} has an invalid precondition`);
+  return { remote, remoteUrl, branch, localSha, expectedRemoteSha };
+}
+
+export async function createAtomicPushClaim(
+  workspace: RunWorkspace,
+  runId: string,
+  nodeId: string,
+): Promise<SideEffectClaim> {
+  const precondition = await capturePushPrecondition(workspace);
+  const actionId = contentHash({ schemaVersion: 1, runId, nodeId, kind: "git_push" });
+  return SideEffectClaimSchema.parse({
+    schemaVersion: 1,
+    actionId,
+    idempotencyKey: `graphcraft-${actionId}`,
+    nodeId,
+    kind: "git_push",
+    target: `${precondition.remote}/${precondition.branch}`,
+    precondition,
+    claimedAt: new Date().toISOString(),
+  });
+}
+
+export async function performAtomicPush(
+  workspace: RunWorkspace,
+  claim: SideEffectClaim,
+  boundary?: (point: SideEffectBoundary) => void | Promise<void>,
+): Promise<Record<string, unknown>> {
+  if (claim.kind !== "git_push") throw new Error(`Side effect ${claim.actionId} is not a push`);
+  const expected = pushPrecondition(claim);
+  const current = await capturePushPrecondition(workspace, expected.remote);
+  if (
+    current.remoteUrl !== expected.remoteUrl ||
+    current.branch !== expected.branch ||
+    current.localSha !== expected.localSha ||
+    current.expectedRemoteSha !== expected.expectedRemoteSha
+  )
+    throw new Error(`Push precondition changed for side effect ${claim.actionId}`);
+  await crossSideEffectBoundary(boundary, "after_action_prepare");
+  await gitRaw(workspace.path, [
+    "push",
+    "--porcelain",
+    expected.remote,
+    `${expected.branch}:refs/heads/${expected.branch}`,
+  ]);
+  await crossSideEffectBoundary(boundary, "after_action_command");
+  return {
+    remote: expected.remote,
+    remoteUrl: expected.remoteUrl,
+    branch: expected.branch,
+    sha: expected.localSha,
+  };
+}
+
+export async function reconcileAtomicPush(
+  workspace: RunWorkspace,
+  claim: SideEffectClaim,
+): Promise<SideEffectReconciliation> {
+  if (claim.kind !== "git_push") throw new Error(`Side effect ${claim.actionId} is not a push`);
+  const expected = pushPrecondition(claim);
+  const [currentRemoteUrl, currentBranch, currentHead, currentRemoteSha] = await Promise.all([
+    git(workspace.path, ["remote", "get-url", expected.remote]),
+    git(workspace.path, ["branch", "--show-current"]),
+    git(workspace.path, ["rev-parse", "HEAD"]),
+    remoteBranchSha(workspace.path, expected.remote, expected.branch),
+  ]);
+  if (
+    currentRemoteUrl !== expected.remoteUrl ||
+    currentBranch !== expected.branch ||
+    currentHead !== expected.localSha
+  )
+    return {
+      status: "unknown",
+      evidence: [
+        `Push preconditions moved: expected ${expected.remoteUrl} ${expected.branch} ${expected.localSha}; observed ${currentRemoteUrl} ${currentBranch || "detached HEAD"} ${currentHead}`,
+      ],
+    };
+  if (currentRemoteSha === expected.localSha)
+    return {
+      status: "applied",
+      result: {
+        remote: expected.remote,
+        remoteUrl: expected.remoteUrl,
+        branch: expected.branch,
+        sha: expected.localSha,
+      },
+      evidence: [
+        `Remote ${expected.remote}/${expected.branch} resolves to the claimed SHA ${expected.localSha}`,
+      ],
+    };
+  if (currentRemoteSha === expected.expectedRemoteSha)
+    return {
+      status: "not_applied",
+      evidence: [
+        currentRemoteSha
+          ? `Remote ${expected.remote}/${expected.branch} remains at ${currentRemoteSha}`
+          : `Remote ${expected.remote}/${expected.branch} remains absent`,
+      ],
+    };
+  return {
+    status: "unknown",
+    evidence: [
+      `Remote ${expected.remote}/${expected.branch} moved from ${expected.expectedRemoteSha ?? "absent"} to ${currentRemoteSha ?? "absent"} without the claimed push`,
+    ],
+  };
+}

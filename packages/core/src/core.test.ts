@@ -44,6 +44,9 @@ describe("run contracts and graphs", () => {
   it("classifies task families without matching keyword substrings", () => {
     expect(classifyTask("Implement a substantial feature across the fixture")).toBe("feature");
     expect(classifyTask("Fix the failing feature")).toBe("bug");
+    expect(compileRunContract("Implement Web Push notifications", repository).finishLine.kind).toBe(
+      "local_verified",
+    );
   });
 
   it("infers an immutable committed contract and a dependency-safe graph", () => {
@@ -67,6 +70,34 @@ describe("run contracts and graphs", () => {
     expect(graph.family).toBe("migration");
     expect(graph.nodes.map(({ id }) => id)).toEqual(["implement", "verify", "commit"]);
     expect(() => validateGraph(graph)).not.toThrow();
+  });
+
+  it("infers a pushed contract with explicit remote permissions and a terminal push", () => {
+    const contract = compileRunContract(
+      "Implement the migration and push the verified changes",
+      repository,
+    );
+    const graph = compileGraph(contract, [
+      {
+        id: "tests",
+        kind: "command",
+        command: "npm",
+        args: ["test"],
+        expectedExitCode: 0,
+        timeoutMs: 1_000,
+      },
+    ]);
+
+    expect(contract.finishLine.kind).toBe("pushed");
+    expect(contract.permissions).toEqual(
+      expect.arrayContaining(["commit", "push", "github_read", "github_write"]),
+    );
+    expect(graph.nodes.map(({ id }) => id)).toEqual(["implement", "verify", "commit", "push"]);
+    expect(graph.nodes.at(-1)).toMatchObject({
+      kind: "push",
+      dependsOn: ["commit"],
+      sideEffectClass: "external",
+    });
   });
 
   it("replaces held-out scoring implementations with integrity-bound graph references", () => {

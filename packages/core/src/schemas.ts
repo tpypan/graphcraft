@@ -233,6 +233,7 @@ export const NodeKindSchema = z.enum([
   "decision",
   "wait",
   "commit",
+  "push",
 ]);
 
 export const NodeStatusSchema = z.enum([

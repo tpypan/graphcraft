@@ -32,7 +32,7 @@ export interface RepositoryIdentity {
 }
 
 export interface ContractOptions {
-  finishLine?: "local_verified" | "committed";
+  finishLine?: "local_verified" | "committed" | "pushed";
   include?: string[];
   exclude?: string[];
 }
@@ -47,7 +47,13 @@ export function classifyTask(task: string): TaskFamily {
   return "feature";
 }
 
-export function inferFinishLine(task: string): "local_verified" | "committed" {
+export function inferFinishLine(task: string): "local_verified" | "committed" | "pushed" {
+  if (
+    /\bpush(?:ed|ing)?\s+(?:(?:the|this)\s+)?(?:(?:verified|accepted)\s+)?(?:branch|commit|changes|result)\b|\bpush(?:ed|ing)?\s+to\s+(?:origin|github|the remote)\b/i.test(
+      task,
+    )
+  )
+    return "pushed";
   return /\bcommit(?:ted)?\b/i.test(task) ? "committed" : "local_verified";
 }
 
@@ -63,7 +69,8 @@ export function compileRunContract(
     "run_commands",
     "create_worktree",
   ];
-  if (finishKind === "committed") permissions.push("commit");
+  if (finishKind === "committed" || finishKind === "pushed") permissions.push("commit");
+  if (finishKind === "pushed") permissions.push("push", "github_read", "github_write");
 
   return RunContractSchema.parse({
     schemaVersion: 1,
@@ -201,7 +208,7 @@ export function compileGraph(contract: RunContract, verificationProbes: ProbeSpe
     }),
   ];
 
-  if (contract.finishLine.kind === "committed") {
+  if (contract.finishLine.kind === "committed" || contract.finishLine.kind === "pushed") {
     nodes.push(
       node({
         id: "commit",
@@ -209,6 +216,18 @@ export function compileGraph(contract: RunContract, verificationProbes: ProbeSpe
         objective: "Create one atomic commit containing only the accepted Graphcraft run changes",
         dependsOn: ["verify"],
         sideEffectClass: "git_commit",
+      }),
+    );
+  }
+
+  if (contract.finishLine.kind === "pushed") {
+    nodes.push(
+      node({
+        id: "push",
+        kind: "push",
+        objective: "Push the accepted commit to the run's approved remote branch without force",
+        dependsOn: ["commit"],
+        sideEffectClass: "external",
       }),
     );
   }
@@ -294,13 +313,14 @@ export function validateGraphPolicy(
 
   const terminal = terminalNodes[0]!;
   const commitNodes = graph.nodes.filter((candidate) => candidate.kind === "commit");
+  const pushNodes = graph.nodes.filter((candidate) => candidate.kind === "push");
   if (contract.finishLine.kind === "local_verified") {
-    if (commitNodes.length > 0)
-      throw new Error("A local_verified plan cannot contain commit nodes");
+    if (commitNodes.length > 0 || pushNodes.length > 0)
+      throw new Error("A local_verified plan cannot contain commit or push nodes");
     if (terminal.kind !== "verification")
       throw new Error("A local_verified plan must end in a verification node");
   } else if (contract.finishLine.kind === "committed") {
-    if (commitNodes.length !== 1 || terminal.kind !== "commit")
+    if (commitNodes.length !== 1 || pushNodes.length > 0 || terminal.kind !== "commit")
       throw new Error("A committed plan must end in exactly one commit node");
     if (
       terminal.dependsOn.length !== 1 ||
@@ -309,6 +329,17 @@ export function validateGraphPolicy(
     ) {
       throw new Error("The terminal commit node must directly depend on one verification node");
     }
+  } else if (contract.finishLine.kind === "pushed") {
+    if (commitNodes.length !== 1 || pushNodes.length !== 1 || terminal.kind !== "push")
+      throw new Error("A pushed plan must end in exactly one push after one commit");
+    const commit = commitNodes[0]!;
+    if (terminal.dependsOn.length !== 1 || terminal.dependsOn[0] !== commit.id)
+      throw new Error("The terminal push node must directly depend on the commit node");
+    if (
+      commit.dependsOn.length !== 1 ||
+      graph.nodes.find((candidate) => candidate.id === commit.dependsOn[0])?.kind !== "verification"
+    )
+      throw new Error("The pushed commit node must directly depend on one verification node");
   } else {
     throw new Error(`Finish line ${contract.finishLine.kind} is not executable locally`);
   }
@@ -316,7 +347,9 @@ export function validateGraphPolicy(
   const finalVerification =
     terminal.kind === "verification"
       ? terminal
-      : graph.nodes.find((candidate) => candidate.id === terminal.dependsOn[0]);
+      : terminal.kind === "commit"
+        ? graph.nodes.find((candidate) => candidate.id === terminal.dependsOn[0])
+        : graph.nodes.find((candidate) => candidate.id === commitNodes[0]?.dependsOn[0]);
   if (!finalVerification || finalVerification.completionProbes.length === 0)
     throw new Error("The terminal verification node must contain executable completion probes");
   for (const required of requiredVerificationProbes) {
@@ -348,7 +381,12 @@ export function validateGraphPolicy(
     }
     if (!item.contextSelector.includeRepositoryInstructions)
       throw new Error(`Planned node ${item.id} attempted to omit repository instructions`);
-    if (item.sideEffectClass === "external")
+    if (
+      item.sideEffectClass === "external" &&
+      (item.kind !== "push" ||
+        !contract.permissions.includes("push") ||
+        !contract.permissions.includes("github_write"))
+    )
       throw new Error(`Planned node ${item.id} requests unsupported external side effects`);
     if (
       item.sideEffectClass === "workspace_write" &&
@@ -361,6 +399,8 @@ export function validateGraphPolicy(
       throw new Error(`Verification node ${item.id} must be read-only`);
     if (item.kind === "commit" && item.sideEffectClass !== "git_commit")
       throw new Error(`Commit node ${item.id} must use the git_commit side-effect class`);
+    if (item.kind === "push" && item.sideEffectClass !== "external")
+      throw new Error(`Push node ${item.id} must use the external side-effect class`);
     if (item.scope.length === 0 || item.scope.some((pattern) => !safeRelativePattern(pattern)))
       throw new Error(`Planned node ${item.id} contains an unsafe repository scope`);
     if (
@@ -548,7 +588,7 @@ function fuseReadOnlyPair(nodes: GraphNode[]): {
         producer.sideEffectClass !== "none" ||
         consumer.sideEffectClass !== "none" ||
         [producer.kind, consumer.kind].some((kind) =>
-          ["verification", "commit", "wait"].includes(kind),
+          ["verification", "commit", "push", "wait"].includes(kind),
         ) ||
         dependents.length !== 1 ||
         !overlappingContext ||
@@ -912,18 +952,18 @@ export function applyGraphAmendment(input: {
 }
 
 function verificationNode(graph: Graph): GraphNode {
-  const terminal = graph.nodes.find(
+  let candidate = graph.nodes.find(
     (candidate) => !graph.nodes.some((other) => other.dependsOn.includes(candidate.id)),
   );
-  const verification =
-    terminal?.kind === "verification"
-      ? terminal
-      : graph.nodes.find(
-          (candidate) =>
-            candidate.kind === "verification" && terminal?.dependsOn.includes(candidate.id),
-        );
-  if (!verification) throw new Error("The graph has no finish-line verification node");
-  return verification;
+  while (
+    candidate &&
+    (candidate.kind === "commit" || candidate.kind === "push") &&
+    candidate.dependsOn.length === 1
+  )
+    candidate = graph.nodes.find((node) => node.id === candidate!.dependsOn[0]);
+  if (candidate?.kind !== "verification")
+    throw new Error("The graph has no finish-line verification node");
+  return candidate;
 }
 
 export function applyProbePlan(graph: Graph, contract: RunContract, input: ProbePlan): Graph {
@@ -945,7 +985,8 @@ export function applyProbePlan(graph: Graph, contract: RunContract, input: Probe
         ? nodes.find((node) => ["investigation", "decision", "diagnostic"].includes(node.kind))
         : nodes.find((node) => node.sideEffectClass === "workspace_write");
     const target =
-      preferred ?? nodes.find((node) => !["verification", "commit", "wait"].includes(node.kind));
+      preferred ??
+      nodes.find((node) => !["verification", "commit", "push", "wait"].includes(node.kind));
     if (!target) throw new Error(`No executable node can own progress probe ${item.probe.id}`);
     target.progressProbes.push(item.probe);
   }
