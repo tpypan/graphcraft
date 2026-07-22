@@ -144,16 +144,26 @@ function sameFileSnapshot(left: BigIntStats, right: BigIntStats): boolean {
   );
 }
 
+function sameFileContentSnapshot(left: BigIntStats, right: BigIntStats): boolean {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs
+  );
+}
+
 function assertPrivateRegularFile(
   path: string,
   status: Pick<BigIntStats, "nlink"> & {
     isSymbolicLink(): boolean;
     isFile(): boolean;
   },
+  allowMultipleLinks = false,
 ): void {
   if (status.isSymbolicLink()) rejectSymbolicLink(path);
   if (!status.isFile()) throw new Error(`Private file path is not a regular file: ${path}`);
-  if (status.nlink > 1n) rejectMultiplyLinkedFile(path);
+  if (!allowMultipleLinks && status.nlink > 1n) rejectMultiplyLinkedFile(path);
 }
 
 function rejectSymbolicLink(path: string): never {
@@ -478,34 +488,29 @@ export async function validatePrivatePath(
   return absolute;
 }
 
-/**
- * Read one private regular file through the descriptor that was validated.
- * The explicit cap is checked before allocation and the descriptor identity is
- * rechecked after the read so path replacement cannot silently change bytes.
- */
-export async function readPrivateFileBounded(
+async function readBoundedRegularFile(
   path: string,
   maximumBytes: number,
-  ownedRoot?: string,
+  options: { allowMultipleLinks: boolean; ownedRoot?: string },
 ): Promise<Buffer> {
   if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0)
     throw new Error("Private file read limit must be a non-negative safe integer");
 
   const absolute = resolve(path);
-  if (ownedRoot !== undefined)
-    await validatePrivatePath(ownedRoot, relative(resolve(ownedRoot), absolute));
+  if (options.ownedRoot !== undefined)
+    await validatePrivatePath(options.ownedRoot, relative(resolve(options.ownedRoot), absolute));
   const noFollow = process.platform === "win32" ? 0 : fsConstants.O_NOFOLLOW;
   for (let replacementAttempt = 0; ; replacementAttempt += 1) {
     try {
       const observed = await lstat(absolute, { bigint: true });
-      assertPrivateRegularFile(absolute, observed);
+      assertPrivateRegularFile(absolute, observed, options.allowMultipleLinks);
       if (observed.size > BigInt(maximumBytes))
         throw new Error(`Private file exceeds its ${maximumBytes}-byte bounded read limit`);
 
       const handle = await open(absolute, fsConstants.O_RDONLY | noFollow);
       try {
         const before = await handle.stat({ bigint: true });
-        assertPrivateRegularFile(absolute, before);
+        assertPrivateRegularFile(absolute, before, options.allowMultipleLinks);
         if (!sameFileSnapshot(observed, before))
           throw new Error("Private file changed before its bounded read");
         if (before.size > BigInt(maximumBytes))
@@ -520,7 +525,12 @@ export async function readPrivateFileBounded(
           offset += bytesRead;
         }
         const after = await handle.stat({ bigint: true });
-        if (offset !== expectedBytes || !sameFileSnapshot(before, after))
+        // Another reader may enforce owner-only mode or remove a macOS ACL on
+        // this same descriptor while bytes are being read. Those metadata-only
+        // operations change ctime, but not the coherent content snapshot. Keep
+        // inode, size, and mtime checks so writes still fail closed while
+        // allowing concurrent hardening of an atomically published projection.
+        if (offset !== expectedBytes || !sameFileContentSnapshot(before, after))
           throw new Error("Private file changed during its bounded read");
         return bytes;
       } finally {
@@ -536,6 +546,32 @@ export async function readPrivateFileBounded(
       await new Promise<void>((resolveRetry) => setImmediate(resolveRetry));
     }
   }
+}
+
+/**
+ * Read one external regular file through the descriptor that was validated.
+ * Package managers may legitimately hard-link immutable package files, so this
+ * boundary permits multiple links while retaining no-follow, size, identity,
+ * and coherent-content checks. It does not establish private-state ownership.
+ */
+export async function readRegularFileBounded(path: string, maximumBytes: number): Promise<Buffer> {
+  return await readBoundedRegularFile(path, maximumBytes, { allowMultipleLinks: true });
+}
+
+/**
+ * Read one private regular file through the descriptor that was validated.
+ * The explicit cap is checked before allocation and the descriptor identity is
+ * rechecked after the read so path replacement cannot silently change bytes.
+ */
+export async function readPrivateFileBounded(
+  path: string,
+  maximumBytes: number,
+  ownedRoot?: string,
+): Promise<Buffer> {
+  return await readBoundedRegularFile(path, maximumBytes, {
+    allowMultipleLinks: false,
+    ...(ownedRoot === undefined ? {} : { ownedRoot }),
+  });
 }
 
 /** Create a Graphcraft-owned directory and enforce owner-only access. */

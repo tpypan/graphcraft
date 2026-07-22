@@ -19,6 +19,7 @@ import {
   hardenPrivateFile,
   hardenPrivateTree,
   readPrivateFileBounded,
+  readRegularFileBounded,
   validatePrivatePath,
 } from "./secure-fs.ts";
 
@@ -159,6 +160,7 @@ describe("secure filesystem permissions", () => {
     await expect(readPrivateFileBounded(hard, 1024, root)).rejects.toThrow(
       "Refusing to harden multiply linked file",
     );
+    await expect(readRegularFileBounded(hard, 1024)).resolves.toEqual(Buffer.from("shared\n"));
   });
 
   it.skipIf(process.platform === "win32")(

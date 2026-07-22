@@ -353,6 +353,9 @@ describe("run approval", () => {
       "graphcraft doctor",
     );
     expect(recoveryHint("Future storage version 999 is unsupported")).toContain("left unchanged");
+    expect(recoveryHint("Run event log has invalid JSON in trailing record at byte 42")).toContain(
+      "known-good copy",
+    );
     expect(recoveryHint("The worktree is locked by another supervisor")).toContain(
       "graphcraft supervisors",
     );

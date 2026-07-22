@@ -24,6 +24,8 @@ import {
   storeFor,
   supervisorView,
   uninstallHost,
+  updateHost,
+  validateLocalViewerUrl,
   type HostName,
   type ExecutableFinishLine,
 } from "./index.ts";
@@ -96,9 +98,10 @@ function currentSupervisorLauncher(): SupervisorLauncher {
 }
 
 async function openLocalUrl(url: string): Promise<void> {
+  const localUrl = validateLocalViewerUrl(url);
   const command =
     process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
-  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  const args = process.platform === "win32" ? ["/c", "start", "", localUrl] : [localUrl];
   const child = spawn(command, args, { detached: true, shell: false, stdio: "ignore" });
   await new Promise<void>((resolveOpen, reject) => {
     child.once("error", reject);
@@ -196,6 +199,7 @@ program
         hosts,
         adapters,
         policies,
+        graphcraftVersion: GRAPHCRAFT_VERSION,
         seed: options.seed,
         ...(repetitions ? { repetitions } : {}),
         outputPath,
@@ -233,6 +237,21 @@ program
   .action(async (options: { host: HostName }) => {
     await uninstallHost(options.host);
     console.log(`Graphcraft was removed from ${options.host}.`);
+  });
+
+program
+  .command("update")
+  .description("Replace the registered Graphcraft MCP runtime with this package version")
+  .addOption(
+    new Option("--host <host>", "host to configure")
+      .choices(["codex", "claude"])
+      .makeOptionMandatory(),
+  )
+  .action(async (options: { host: HostName }) => {
+    const result = await updateHost(options.host);
+    console.log(
+      `Graphcraft ${result.graphcraftVersion} is registered with ${options.host}. Start a new agent session to use it.`,
+    );
   });
 
 program
