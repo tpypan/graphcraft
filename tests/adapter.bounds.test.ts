@@ -2,11 +2,13 @@ import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const spawnMock = vi.hoisted(() => vi.fn());
 
-vi.mock("node:child_process", () => ({ spawn: spawnMock }));
+vi.mock("cross-spawn", () => ({
+  default: Object.assign(spawnMock, { spawn: spawnMock, sync: vi.fn() }),
+}));
 
 import { ClaudeAdapter } from "../packages/adapter-claude/src/index.ts";
 import {
@@ -29,6 +31,13 @@ import type {
   SemanticVerificationRequest,
   WorkerRequest,
 } from "../packages/core/src/index.ts";
+import {
+  HOST_CAPABILITY_PROBE_SETTLE_GRACE_MS,
+  HOST_CAPABILITY_PROBE_TIMEOUT_MS,
+  HOST_TERMINATION_GRACE_MS,
+  HOST_TERMINATION_SETTLE_GRACE_MS,
+  terminateChildProcessTree,
+} from "../packages/core/src/index.ts";
 
 class FakeChild extends EventEmitter {
   readonly stdin = new Writable({
@@ -38,7 +47,7 @@ class FakeChild extends EventEmitter {
   });
   readonly stdout = new PassThrough();
   readonly stderr = new PassThrough();
-  readonly kill = vi.fn(() => true);
+  readonly kill = vi.fn((_signal?: NodeJS.Signals | number) => true);
 }
 
 interface FakeChildOutput {
@@ -60,6 +69,26 @@ function queueChild(output: FakeChildOutput): FakeChild {
   return child;
 }
 
+function queueTerminatingChild(): FakeChild {
+  const child = new FakeChild();
+  child.kill.mockImplementation((signal?: NodeJS.Signals | number) => {
+    queueMicrotask(() => {
+      child.stdout.end();
+      child.stderr.end();
+      child.emit("close", null, typeof signal === "string" ? signal : null);
+    });
+    return true;
+  });
+  spawnMock.mockImplementationOnce(() => child as unknown as ChildProcess);
+  return child;
+}
+
+function queueNeverClosingChild(): FakeChild {
+  const child = new FakeChild();
+  spawnMock.mockImplementationOnce(() => child as unknown as ChildProcess);
+  return child;
+}
+
 async function collectEvents(iterable: AsyncIterable<HostEvent>): Promise<HostEvent[]> {
   const events: HostEvent[] = [];
   for await (const event of iterable) events.push(event);
@@ -71,6 +100,7 @@ function planningRequest(): PlanningRequest {
     repositoryPath: process.cwd(),
     contract: { task: "Implement the bounded adapter fixture" } as PlanningRequest["contract"],
     repositoryEvidence: {
+      contentTrust: "untrusted_repository",
       trackedPathCount: 1,
       trackedPaths: ["fixture.ts"],
       trackedPathsTruncated: false,
@@ -130,6 +160,7 @@ function adapters(): AdapterFixture[] {
 
 describe("bounded adapter streams", () => {
   beforeEach(() => spawnMock.mockReset());
+  afterEach(() => vi.useRealTimers());
 
   it("retains no oversized protocol line and continues draining later lines", async () => {
     expect(CODEX_PROTOCOL_LINE_LIMIT_BYTES).toBe(CLAUDE_PROTOCOL_LINE_LIMIT_BYTES);
@@ -270,6 +301,116 @@ describe("bounded adapter streams", () => {
         structuredOutput: true,
       });
     }
+  });
+
+  it("bounds hanging capability probes and terminates their process tree", async () => {
+    vi.useFakeTimers();
+    for (const { adapter } of adapters()) {
+      const child = queueTerminatingChild();
+      const probing = adapter.probe();
+      await vi.advanceTimersByTimeAsync(HOST_CAPABILITY_PROBE_TIMEOUT_MS);
+      await expect(probing).resolves.toMatchObject({
+        installed: false,
+        authenticated: false,
+        structuredOutput: false,
+      });
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    }
+  });
+
+  it("settles capability probes even when a child never emits close", async () => {
+    vi.useFakeTimers();
+    for (const { adapter } of adapters()) {
+      const child = queueNeverClosingChild();
+      const probing = adapter.probe();
+      await vi.advanceTimersByTimeAsync(
+        HOST_CAPABILITY_PROBE_TIMEOUT_MS + HOST_CAPABILITY_PROBE_SETTLE_GRACE_MS,
+      );
+      await expect(probing).resolves.toMatchObject({
+        installed: false,
+        authenticated: false,
+        structuredOutput: false,
+      });
+      expect(child.kill).toHaveBeenNthCalledWith(1, "SIGTERM");
+      expect(child.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
+      expect(child.stdout.destroyed).toBe(true);
+    }
+  });
+
+  it("terminates planner process trees through the shared cancellation controller", async () => {
+    for (const { adapter } of adapters()) {
+      const child = queueTerminatingChild();
+      const abort = new AbortController();
+      const planning = adapter.plan(planningRequest(), abort.signal);
+      while (spawnMock.mock.results.at(-1)?.value !== child) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      const rejected = expect(planning).rejects.toMatchObject({
+        name: "HostTerminationError",
+        termination: expect.objectContaining({
+          cause: "user_pause",
+          requestedSignal: "SIGTERM",
+        }),
+      });
+      abort.abort({ cause: "user_pause", reason: "bounded planner cancellation" });
+      await rejected;
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    }
+  });
+
+  it("settles operational adapter cancellation when a child never emits close", async () => {
+    for (const { adapter } of adapters()) {
+      const child = queueNeverClosingChild();
+      const abort = new AbortController();
+      const planning = adapter.plan(planningRequest(), abort.signal);
+      while (spawnMock.mock.results.at(-1)?.value !== child) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      const rejected = expect(planning).rejects.toMatchObject({
+        name: "HostTerminationError",
+        termination: expect.objectContaining({
+          cause: "user_pause",
+          outcome: "forced",
+          requestedSignal: "SIGKILL",
+        }),
+      });
+      vi.useFakeTimers();
+      abort.abort({ cause: "user_pause", reason: "bounded planner cancellation" });
+      await vi.advanceTimersByTimeAsync(
+        HOST_TERMINATION_GRACE_MS + HOST_TERMINATION_SETTLE_GRACE_MS + 1,
+      );
+      await rejected;
+      expect(child.kill).toHaveBeenNthCalledWith(1, "SIGTERM");
+      expect(child.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
+      expect(child.stdout.destroyed).toBe(true);
+      vi.useRealTimers();
+    }
+  });
+
+  it("falls back when Windows taskkill exits nonzero", () => {
+    const killer = Object.assign(new EventEmitter(), { unref: vi.fn() });
+    const child = {
+      pid: 42,
+      kill: vi.fn((_signal?: NodeJS.Signals | number) => true),
+    } as unknown as ChildProcess;
+    const spawnProcess = vi.fn(() => killer as never);
+
+    expect(
+      terminateChildProcessTree(child, "SIGKILL", {
+        platform: "win32",
+        environment: { SystemRoot: "C:\\Windows" },
+        spawnProcess: spawnProcess as never,
+      }),
+    ).toBe(true);
+    killer.emit("close", 1, null);
+
+    expect(spawnProcess).toHaveBeenCalledWith(
+      "C:\\Windows\\System32\\taskkill.exe",
+      ["/pid", "42", "/t", "/f"],
+      expect.objectContaining({ shell: false, windowsHide: true }),
+    );
+    expect(child.kill).toHaveBeenCalledOnce();
+    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
   });
 
   it("still accepts exact small structured worker results", async () => {

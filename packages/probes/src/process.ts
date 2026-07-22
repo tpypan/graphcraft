@@ -1,10 +1,13 @@
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import crossSpawn from "cross-spawn";
+import { resolveTrustedExecutable, terminateChildProcessTree } from "@graphcraft/core";
 
 const MIB = 1024 * 1024;
 
 export const DEFAULT_PROCESS_OUTPUT_BYTES_PER_STREAM = 8 * MIB;
 export const DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM = MIB;
+export const PROCESS_TERMINATION_GRACE_MS = 2_000;
+export const PROCESS_SETTLEMENT_GRACE_MS = 2_000;
 
 export type ProcessOutputOverflow = "reject" | "truncate";
 
@@ -122,6 +125,11 @@ export async function runProcess(
   args: string[],
   options: RunProcessOptions,
 ): Promise<ProcessResult> {
+  if (command.trim().length === 0) throw new Error("Subprocess command must not be empty");
+  if (command.includes("\0")) throw new Error("Subprocess command must not contain NUL bytes");
+  const nulArgument = args.findIndex((argument) => argument.includes("\0"));
+  if (nulArgument !== -1)
+    throw new Error(`Subprocess argument ${nulArgument} must not contain NUL bytes`);
   const started = performance.now();
   const timeoutMs = options.timeoutMs ?? 120_000;
   const maxOutputBytesPerStream =
@@ -129,11 +137,16 @@ export async function runProcess(
   const outputOverflow = options.outputOverflow ?? "reject";
   if (!Number.isSafeInteger(maxOutputBytesPerStream) || maxOutputBytesPerStream <= 0)
     throw new Error("Subprocess output capture limit must be a positive safe integer");
+  const environment = { ...process.env, ...options.env, NO_COLOR: "1", FORCE_COLOR: "0" };
+  const executable = await resolveTrustedExecutable(command, {
+    environment,
+    untrustedCwd: options.cwd,
+  });
 
   return await new Promise<ProcessResult>((resolve, reject) => {
-    const child = spawn(command, args, {
+    const child = crossSpawn.spawn(executable, args, {
       cwd: options.cwd,
-      env: { ...process.env, ...options.env, NO_COLOR: "1", FORCE_COLOR: "0" },
+      env: environment,
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -142,12 +155,29 @@ export async function runProcess(
     let timedOut = false;
     let overflowStream: "stdout" | "stderr" | undefined;
     let settled = false;
+    let terminationStarted = false;
     let escalationTimer: NodeJS.Timeout | undefined;
+    let settlementTimer: NodeJS.Timeout | undefined;
+    let timer: NodeJS.Timeout | undefined;
 
     const terminateWithEscalation = (): void => {
-      child.kill("SIGTERM");
-      if (escalationTimer) return;
-      escalationTimer = setTimeout(() => child.kill("SIGKILL"), 2_000);
+      if (terminationStarted || settled) return;
+      terminationStarted = true;
+      if (timer) clearTimeout(timer);
+      try {
+        terminateChildProcessTree(child, "SIGTERM");
+      } catch {
+        // Escalation and bounded settlement still apply when graceful delivery fails.
+      }
+      escalationTimer = setTimeout(() => {
+        try {
+          terminateChildProcessTree(child, "SIGKILL");
+        } catch {
+          // Bounded settlement below prevents an unresponsive child from hanging the caller.
+        }
+        settlementTimer = setTimeout(() => complete(null), PROCESS_SETTLEMENT_GRACE_MS);
+        settlementTimer.unref();
+      }, PROCESS_TERMINATION_GRACE_MS);
       escalationTimer.unref();
     };
     const capture = (
@@ -164,35 +194,37 @@ export async function runProcess(
     child.stdout.on("data", (chunk: Buffer) => capture("stdout", stdoutCapture, chunk));
     child.stderr.on("data", (chunk: Buffer) => capture("stderr", stderrCapture, chunk));
 
-    const abort = (): void => {
-      child.kill("SIGTERM");
-    };
+    const abort = (): void => terminateWithEscalation();
     options.signal?.addEventListener("abort", abort, { once: true });
-    if (options.signal?.aborted) abort();
 
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       timedOut = true;
       terminateWithEscalation();
     }, timeoutMs);
     timer.unref();
 
     const cleanup = (): void => {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       if (escalationTimer) clearTimeout(escalationTimer);
+      if (settlementTimer) clearTimeout(settlementTimer);
       options.signal?.removeEventListener("abort", abort);
     };
 
-    child.once("error", (error) => {
+    const complete = (code: number | null, error?: Error): void => {
       if (settled) return;
       settled = true;
       cleanup();
-      reject(error);
-    });
-
-    child.once("close", (code) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
+      try {
+        child.stdout.destroy();
+        child.stderr.destroy();
+        child.unref();
+      } catch {
+        // Cleanup must not hide the bounded subprocess outcome.
+      }
+      if (error) {
+        reject(error);
+        return;
+      }
       const stdout = stdoutCapture.finish("stdout");
       const stderr = stderrCapture.finish("stderr");
       const captureMetadata: ProcessCaptureMetadata = {
@@ -211,6 +243,10 @@ export async function runProcess(
         timedOut,
         capture: captureMetadata,
       });
-    });
+    };
+
+    child.once("error", (error) => complete(null, error));
+    child.once("close", (code) => complete(code));
+    if (options.signal?.aborted) abort();
   });
 }

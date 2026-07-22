@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   codexPlannerArgs,
@@ -17,6 +20,7 @@ import {
 import {
   reconcilePersistedInvocation,
   ChildTerminationController,
+  resolveTrustedExecutable,
   type InvocationRecord,
   type HostExecutionPolicy,
   type PlanningRequest,
@@ -50,6 +54,7 @@ function planningRequest(): PlanningRequest {
     repositoryPath: "/tmp/graphcraft fixture",
     contract: { task: "Plan the benchmark fixture" } as PlanningRequest["contract"],
     repositoryEvidence: {
+      contentTrust: "untrusted_repository",
       trackedPathCount: 1,
       trackedPaths: ["source.js"],
       trackedPathsTruncated: false,
@@ -61,6 +66,43 @@ function planningRequest(): PlanningRequest {
 }
 
 describe("native host continuation protocol", () => {
+  it("resolves Windows PATH commands outside an untrusted working directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-trusted-command-"));
+    const untrusted = join(root, "repository");
+    const trusted = join(root, "installed tools");
+    await Promise.all([mkdir(untrusted), mkdir(trusted)]);
+    await Promise.all([
+      writeFile(join(untrusted, "codex.cmd"), "@echo hostile\r\n", "utf8"),
+      writeFile(join(trusted, "codex.cmd"), "@echo trusted\r\n", "utf8"),
+    ]);
+    try {
+      const trustedExecutable = await realpath(join(trusted, "codex.cmd"));
+      await expect(
+        resolveTrustedExecutable("codex", {
+          platform: "win32",
+          environment: { Path: `${untrusted};${trusted}`, PATHEXT: ".cmd;.exe" },
+          untrustedCwd: untrusted,
+        }),
+      ).resolves.toBe(trustedExecutable);
+      await expect(
+        resolveTrustedExecutable("codex", {
+          platform: "win32",
+          environment: { Path: untrusted, PATHEXT: ".cmd;.exe" },
+          untrustedCwd: untrusted,
+        }),
+      ).rejects.toThrow("Unable to resolve trusted Windows executable");
+      await expect(
+        resolveTrustedExecutable("node", {
+          platform: "win32",
+          environment: { Path: untrusted, PATHEXT: ".cmd;.exe" },
+          untrustedCwd: untrusted,
+        }),
+      ).resolves.toBe(process.execPath);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("normalizes provider token dimensions without fabricating missing values", () => {
     expect(
       codexUsage({

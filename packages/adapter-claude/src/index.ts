@@ -1,7 +1,9 @@
-import { spawn } from "node:child_process";
+import crossSpawn from "cross-spawn";
 import {
   ChildTerminationController,
   GraphPlanSchema,
+  HOST_CAPABILITY_PROBE_SETTLE_GRACE_MS,
+  HOST_CAPABILITY_PROBE_TIMEOUT_MS,
   HostTerminationError,
   HostCapabilitiesSchema,
   SemanticVerdictSchema,
@@ -9,6 +11,7 @@ import {
   graphPlanJsonSchema,
   normalizeTokenUsage,
   reconcilePersistedInvocation,
+  resolveTrustedExecutable,
   renderPlannerPrompt,
   renderSemanticVerifierPrompt,
   renderWorkerPrompt,
@@ -34,6 +37,8 @@ import {
   structuredOutputExceedsLimit,
   structuredOutputLimitError,
 } from "./protocol.ts";
+
+const spawn = crossSpawn.spawn;
 
 function parseResult(value: unknown) {
   if (typeof value === "object" && value !== null) {
@@ -78,43 +83,72 @@ export function claudeUsage(value: unknown) {
   return normalizeTokenUsage("claude", value);
 }
 
-async function claudeVersion(): Promise<{ installed: boolean; version?: string }> {
+async function runCapabilityProbe(
+  args: string[],
+): Promise<{ code: number | null; output: string; overflowed: boolean; terminated: boolean }> {
+  let executable: string;
+  try {
+    executable = await resolveTrustedExecutable("claude", { untrustedCwd: process.cwd() });
+  } catch {
+    return { code: null, output: "", overflowed: false, terminated: false };
+  }
   return await new Promise((resolve) => {
-    const child = spawn("claude", ["--version"], { stdio: ["ignore", "pipe", "ignore"] });
+    const child = spawn(executable, args, { stdio: ["ignore", "pipe", "ignore"] });
     const output = new BoundedTextCapture(ADAPTER_STDERR_LIMIT_BYTES);
+    const timeoutAbort = new AbortController();
+    const terminationController = new ChildTerminationController(child, timeoutAbort.signal);
+    let settled = false;
+    let settlement: NodeJS.Timeout | undefined;
+    let timeout: NodeJS.Timeout | undefined;
+    const complete = (code: number | null, signal: NodeJS.Signals | null): void => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      if (settlement) clearTimeout(settlement);
+      const termination = terminationController.finish(code, signal);
+      resolve({
+        code,
+        output: output.text(),
+        overflowed: output.overflowed,
+        terminated: termination !== undefined,
+      });
+    };
     child.stdout.on("data", (chunk: Buffer | string) => output.append(chunk));
-    child.once("error", () => resolve({ installed: false }));
-    child.once("close", (code) =>
-      resolve(
-        code === 0 && !output.overflowed
-          ? { installed: true, version: output.text().trim() }
-          : { installed: false },
-      ),
-    );
+    child.once("error", () => complete(null, null));
+    child.once("close", complete);
+    timeout = setTimeout(() => {
+      timeoutAbort.abort({
+        cause: "timeout",
+        reason: "claude capability probe timed out",
+      });
+      if (settled) return;
+      settlement = setTimeout(() => {
+        child.stdout.destroy();
+        child.unref?.();
+        complete(null, null);
+      }, HOST_CAPABILITY_PROBE_SETTLE_GRACE_MS);
+      settlement.unref();
+    }, HOST_CAPABILITY_PROBE_TIMEOUT_MS);
+    timeout.unref();
   });
 }
 
+async function claudeVersion(): Promise<{ installed: boolean; version?: string }> {
+  const result = await runCapabilityProbe(["--version"]);
+  return result.code === 0 && !result.overflowed && !result.terminated
+    ? { installed: true, version: result.output.trim() }
+    : { installed: false };
+}
+
 async function claudeAuthenticated(): Promise<boolean> {
-  return await new Promise((resolve) => {
-    const child = spawn("claude", ["auth", "status", "--json"], {
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    const output = new BoundedTextCapture(ADAPTER_STDERR_LIMIT_BYTES);
-    child.stdout.on("data", (chunk: Buffer | string) => output.append(chunk));
-    child.once("error", () => resolve(false));
-    child.once("close", (code) => {
-      if (output.overflowed) {
-        resolve(false);
-        return;
-      }
-      try {
-        const status = JSON.parse(output.text()) as { loggedIn?: boolean };
-        resolve(code === 0 && status.loggedIn === true);
-      } catch {
-        resolve(false);
-      }
-    });
-  });
+  const result = await runCapabilityProbe(["auth", "status", "--json"]);
+  if (result.code !== 0 || result.overflowed || result.terminated) return false;
+  try {
+    const status = JSON.parse(result.output) as { loggedIn?: boolean };
+    return status.loggedIn === true;
+  } catch {
+    return false;
+  }
 }
 
 export class ClaudeAdapter implements HostAdapter {
@@ -135,26 +169,27 @@ export class ClaudeAdapter implements HostAdapter {
   }
 
   async plan(request: PlanningRequest, signal: AbortSignal): Promise<PlanningResult> {
-    const child = spawn("claude", claudePlannerArgs(request, this.policy), {
+    const executable = await resolveTrustedExecutable("claude", {
+      untrustedCwd: request.repositoryPath,
+    });
+    const child = spawn(executable, claudePlannerArgs(request, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    const exitPromise = new Promise<number>((resolve) =>
-      child.once("close", (code) => resolve(code ?? 1)),
+    const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolve) =>
+        child.once("close", (code, closeSignal) => resolve({ code, signal: closeSignal })),
     );
-    const abort = (): void => {
-      child.kill("SIGTERM");
-    };
-    signal.addEventListener("abort", abort, { once: true });
+    const terminationController = new ChildTerminationController(child, signal);
     let protocolExceededLimit = false;
     let structuredExceededLimit = false;
     let plan: ReturnType<typeof GraphPlanSchema.parse> | undefined;
     let usage: ReturnType<typeof claudeUsage> | undefined;
     const stderr = captureStderr(child.stderr);
     try {
-      for await (const line of readBoundedProtocolLines(child.stdout)) {
+      for await (const line of readBoundedProtocolLines(child.stdout, signal)) {
         if (line.overflowed) {
           protocolExceededLimit = true;
           continue;
@@ -173,20 +208,22 @@ export class ClaudeAdapter implements HostAdapter {
           usage = claudeUsage(event.usage);
         }
       }
-      const exitCode = await exitPromise;
-      if (signal.aborted) throw new Error("Claude planning invocation aborted");
+      const exit = await terminationController.waitForExit(exitPromise);
+      const termination = terminationController.finish(exit.code, exit.signal);
+      if (termination) throw new HostTerminationError(termination);
       if (protocolExceededLimit) throw protocolLineLimitError("Claude");
       if (structuredExceededLimit) {
         throw structuredOutputLimitError("Claude", "structured graph plan");
       }
-      if (exitCode !== 0 || !plan) {
+      if (exit.code !== 0 || !plan) {
         throw new Error(
-          stderr.text().trim() || `Claude exited ${exitCode} without a valid structured graph plan`,
+          stderr.text().trim() ||
+            `Claude exited ${exit.code ?? 1} without a valid structured graph plan`,
         );
       }
       return { plan, ...(usage ? { usage } : {}) };
     } finally {
-      signal.removeEventListener("abort", abort);
+      terminationController.dispose();
     }
   }
 
@@ -194,7 +231,10 @@ export class ClaudeAdapter implements HostAdapter {
     request: SemanticVerificationRequest,
     signal: AbortSignal,
   ): Promise<SemanticVerificationResult> {
-    const child = spawn("claude", claudeSemanticVerifierArgs(request, this.policy), {
+    const executable = await resolveTrustedExecutable("claude", {
+      untrustedCwd: request.repositoryPath,
+    });
+    const child = spawn(executable, claudeSemanticVerifierArgs(request, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
       shell: false,
@@ -211,7 +251,7 @@ export class ClaudeAdapter implements HostAdapter {
     let usage: ReturnType<typeof claudeUsage> | undefined;
     const stderr = captureStderr(child.stderr);
     try {
-      for await (const line of readBoundedProtocolLines(child.stdout)) {
+      for await (const line of readBoundedProtocolLines(child.stdout, signal)) {
         if (line.overflowed) {
           protocolExceededLimit = true;
           continue;
@@ -230,7 +270,7 @@ export class ClaudeAdapter implements HostAdapter {
           usage = claudeUsage(event.usage);
         }
       }
-      const exit = await exitPromise;
+      const exit = await terminationController.waitForExit(exitPromise);
       const termination = terminationController.finish(exit.code, exit.signal);
       if (termination) throw new HostTerminationError(termination);
       if (protocolExceededLimit) throw protocolLineLimitError("Claude");
@@ -251,7 +291,10 @@ export class ClaudeAdapter implements HostAdapter {
 
   async *execute(request: WorkerRequest, signal: AbortSignal): AsyncIterable<HostEvent> {
     const args = claudeWorkerArgs(request, this.policy);
-    const child = spawn("claude", args, {
+    const executable = await resolveTrustedExecutable("claude", {
+      untrustedCwd: request.repositoryPath,
+    });
+    const child = spawn(executable, args, {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
       shell: false,
@@ -268,7 +311,7 @@ export class ClaudeAdapter implements HostAdapter {
     let observedSessionId: string | undefined;
     let sessionReported = false;
     const stderr = captureStderr(child.stderr);
-    const protocolLines = readBoundedProtocolLines(child.stdout)[Symbol.asyncIterator]();
+    const protocolLines = readBoundedProtocolLines(child.stdout, signal)[Symbol.asyncIterator]();
     let nextProtocolLine = protocolLines.next();
 
     yield { type: "started", invocationId: request.invocationId };
@@ -318,7 +361,7 @@ export class ClaudeAdapter implements HostAdapter {
         }
       }
 
-      const exit = await exitPromise;
+      const exit = await terminationController.waitForExit(exitPromise);
       const termination = terminationController.finish(exit.code, exit.signal);
       if (termination) {
         yield { type: "terminated", termination };
@@ -403,7 +446,7 @@ export function claudeWorkerArgs(request: WorkerRequest, policy?: HostExecutionP
       : ["--session-id", request.invocationId]),
     "--json-schema",
     JSON.stringify(workerResultJsonSchema),
-    renderWorkerPrompt(request.capsule),
+    renderWorkerPrompt(request.capsule, request.authorityBoundary),
   ];
 }
 
@@ -429,6 +472,6 @@ export function claudeSemanticVerifierArgs(
     '{"mcpServers":{}}',
     "--json-schema",
     JSON.stringify(semanticVerdictJsonSchema),
-    renderSemanticVerifierPrompt(request.context),
+    renderSemanticVerifierPrompt(request.context, request.authorityBoundary),
   ];
 }

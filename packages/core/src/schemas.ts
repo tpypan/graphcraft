@@ -765,6 +765,36 @@ export const SemanticVerdictSchema = z.strictObject({
   uncertainty: z.number().min(0).max(1),
 });
 
+export const UntrustedInputSourceSchema = z.enum([
+  "task_or_issue_text",
+  "repository_content",
+  "command_output",
+  "worker_output",
+  "review_comment",
+  "external_event",
+]);
+
+export const ModelAuthorityBoundarySchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  contentAuthority: z.literal("none"),
+  inputs: z
+    .array(
+      z.strictObject({
+        source: UntrustedInputSourceSchema,
+        location: z.string().min(1).max(512),
+      }),
+    )
+    .min(1)
+    .max(16),
+  protectedAuthority: z.strictObject({
+    permissions: z.literal("approved_contract"),
+    finishLine: z.literal("approved_contract"),
+    acceptanceAnchors: z.literal("approved_contract"),
+    probes: z.literal("approved_probe_plan"),
+    scope: z.literal("approved_contract"),
+  }),
+});
+
 export const HostCapabilitiesSchema = z.strictObject({
   installed: z.boolean(),
   authenticated: z.boolean(),
@@ -870,6 +900,7 @@ export const RunEventTypeSchema = z.enum([
   "wait.human_decision_observed",
   "wait.human_decision_resolved",
   "wait.observed",
+  "wait.rearmed",
   "wait.satisfied",
   "wait.timed_out",
   "graph.amended",
@@ -1266,6 +1297,8 @@ export type ContextCapsule = z.infer<typeof ContextCapsuleSchema>;
 export type ContextSelectionReceipt = z.infer<typeof ContextSelectionReceiptSchema>;
 export type SemanticVerifierContext = z.infer<typeof SemanticVerifierContextSchema>;
 export type SemanticVerdict = z.infer<typeof SemanticVerdictSchema>;
+export type UntrustedInputSource = z.infer<typeof UntrustedInputSourceSchema>;
+export type ModelAuthorityBoundary = z.infer<typeof ModelAuthorityBoundarySchema>;
 export type HostCapabilities = z.infer<typeof HostCapabilitiesSchema>;
 export type InterruptionCause = z.infer<typeof InterruptionCauseSchema>;
 export type HostTermination = z.infer<typeof HostTerminationSchema>;

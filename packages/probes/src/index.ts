@@ -221,22 +221,35 @@ function stableId(value: string): string {
     .slice(0, 64);
 }
 
-function packageCommand(
+export interface PackageScriptCommandOptions {
+  platform?: NodeJS.Platform;
+  comSpec?: string;
+}
+
+const packageManagerPattern = /^(npm|pnpm|yarn)(?:@[a-z0-9][a-z0-9._+-]*)?$/i;
+const packageScriptPattern = /^[a-z0-9][a-z0-9:._/-]*$/i;
+
+export function resolvePackageScriptCommand(
   packageManager: string | undefined,
   script: string,
-): Pick<Extract<ProbeSpec, { kind: "command" }>, "command" | "args" | "platforms"> {
-  const manager = packageManager?.split("@")[0] ?? "npm";
+  options: PackageScriptCommandOptions = {},
+): Pick<Extract<ProbeSpec, { kind: "command" }>, "command" | "args" | "platforms"> | undefined {
+  const packageManagerValue = packageManager ?? "npm";
+  const match = packageManagerPattern.exec(packageManagerValue);
+  if (!match || script.length > 256 || !packageScriptPattern.test(script)) return undefined;
+  const manager = match[1]!.toLowerCase();
   const direct = manager === "pnpm" || manager === "yarn" ? "corepack" : manager;
   const directArgs = [
     ...(direct === "corepack" ? [manager] : []),
     ...(manager === "npm" ? ["run"] : []),
     script,
   ];
-  if (process.platform !== "win32") {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "win32") {
     return { command: direct, args: directArgs, platforms: ["darwin", "linux"] };
   }
   return {
-    command: process.env.ComSpec ?? "cmd.exe",
+    command: options.comSpec ?? process.env.ComSpec ?? "cmd.exe",
     args: ["/d", "/s", "/c", [direct, ...directArgs].join(" ")],
     platforms: ["win32"],
   };
@@ -303,7 +316,11 @@ async function packageCandidates(
     for (const name of Object.keys(manifest.scripts ?? {}).sort()) {
       const purpose = familyScriptPurpose(family, name, terms);
       if (!purpose) continue;
-      const command = packageCommand(manifest.packageManager ?? rootManifest?.packageManager, name);
+      const command = resolvePackageScriptCommand(
+        manifest.packageManager ?? rootManifest?.packageManager,
+        name,
+      );
+      if (!command) continue;
       candidates.push({
         root: !directory,
         item: {

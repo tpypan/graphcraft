@@ -1,8 +1,35 @@
 import { createHash } from "node:crypto";
-import { describe, expect, it } from "vitest";
-import { runProcess } from "./process.ts";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import crossSpawn from "cross-spawn";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  PROCESS_SETTLEMENT_GRACE_MS,
+  PROCESS_TERMINATION_GRACE_MS,
+  runProcess,
+} from "./process.ts";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
 
 describe("bounded subprocess output capture", () => {
+  it("rejects empty or NUL-bearing invocations before spawning", async () => {
+    await expect(runProcess("", [], { cwd: process.cwd() })).rejects.toThrow(
+      "Subprocess command must not be empty",
+    );
+    await expect(runProcess(" \t", [], { cwd: process.cwd() })).rejects.toThrow(
+      "Subprocess command must not be empty",
+    );
+    await expect(runProcess(`node\0hostile`, [], { cwd: process.cwd() })).rejects.toThrow(
+      "Subprocess command must not contain NUL bytes",
+    );
+    await expect(
+      runProcess(process.execPath, ["safe", `hostile\0argument`], { cwd: process.cwd() }),
+    ).rejects.toThrow("Subprocess argument 1 must not contain NUL bytes");
+  });
+
   it("preserves stdout and stderr exactly below the capture limit", async () => {
     const result = await runProcess(
       process.execPath,
@@ -91,5 +118,31 @@ describe("bounded subprocess output capture", () => {
         },
       },
     });
+  });
+
+  it("settles after escalation when a timed-out child never emits close", async () => {
+    vi.useFakeTimers();
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill: vi.fn(() => true),
+      unref: vi.fn(),
+    });
+    vi.spyOn(crossSpawn, "spawn").mockReturnValue(child as never);
+
+    const result = runProcess("fixture-host", [], {
+      cwd: process.cwd(),
+      timeoutMs: 10,
+    });
+    await vi.advanceTimersByTimeAsync(
+      10 + PROCESS_TERMINATION_GRACE_MS + PROCESS_SETTLEMENT_GRACE_MS + 1,
+    );
+
+    await expect(result).resolves.toMatchObject({ exitCode: 124, timedOut: true });
+    expect(child.kill).toHaveBeenNthCalledWith(1, "SIGTERM");
+    expect(child.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
+    expect(child.stdout.destroyed).toBe(true);
+    expect(child.stderr.destroyed).toBe(true);
+    expect(child.unref).toHaveBeenCalledOnce();
   });
 });

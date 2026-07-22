@@ -1,3 +1,4 @@
+import { ModelAuthorityBoundarySchema } from "./schemas.ts";
 import type {
   ContextCapsule,
   GraphPlan,
@@ -9,6 +10,8 @@ import type {
   SemanticVerifierContext,
   SemanticVerdict,
   TokenUsage,
+  ModelAuthorityBoundary,
+  UntrustedInputSource,
   WorkerResult,
 } from "./schemas.ts";
 import type { EvidenceSnapshot } from "./schemas.ts";
@@ -19,6 +22,7 @@ export interface PlanningRequest {
   repositoryEvidence: RepositoryPlanningEvidence;
   probePlan: ProbePlan;
   verificationProbes: ProbeSpec[];
+  authorityBoundary?: ModelAuthorityBoundary;
 }
 
 export interface RepositoryEvidenceFile {
@@ -28,6 +32,7 @@ export interface RepositoryEvidenceFile {
 }
 
 export interface RepositoryPlanningEvidence {
+  contentTrust: "untrusted_repository";
   trackedPathCount: number;
   trackedPaths: string[];
   trackedPathsTruncated: boolean;
@@ -56,12 +61,34 @@ export interface WorkerRequest {
   capsule: ContextCapsule;
   allowedTools: string[];
   resumeSessionId?: string;
+  authorityBoundary?: ModelAuthorityBoundary;
 }
 
 export interface SemanticVerificationRequest {
   invocationId: string;
   repositoryPath: string;
   context: SemanticVerifierContext;
+  authorityBoundary?: ModelAuthorityBoundary;
+}
+
+export function createModelAuthorityBoundary(
+  inputs: Array<{ source: UntrustedInputSource; location: string }>,
+): ModelAuthorityBoundary {
+  const unique = [
+    ...new Map(inputs.map((input) => [`${input.source}\0${input.location}`, input])).values(),
+  ];
+  return ModelAuthorityBoundarySchema.parse({
+    schemaVersion: 1,
+    contentAuthority: "none",
+    inputs: unique,
+    protectedAuthority: {
+      permissions: "approved_contract",
+      finishLine: "approved_contract",
+      acceptanceAnchors: "approved_contract",
+      probes: "approved_probe_plan",
+      scope: "approved_contract",
+    },
+  });
 }
 
 export interface SemanticVerificationResult {

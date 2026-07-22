@@ -1,11 +1,16 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ProbePlan } from "@graphcraft/core";
-import { discoverProbePlan, runProbe, validateProbePlan } from "./index.ts";
+import {
+  discoverProbePlan,
+  resolvePackageScriptCommand,
+  runProbe,
+  validateProbePlan,
+} from "./index.ts";
 
 const execFileAsync = promisify(execFile);
 const temporaryRoots: string[] = [];
@@ -55,6 +60,50 @@ function completionIds(plan: ProbePlan): string[] {
 }
 
 describe("task-specific probe planning", () => {
+  it("constructs Windows package commands only from validated metadata tokens", () => {
+    expect(
+      resolvePackageScriptCommand("pnpm@11.15.1", "test:unit", {
+        platform: "win32",
+        comSpec: "C:\\Windows\\System32\\cmd.exe",
+      }),
+    ).toEqual({
+      command: "C:\\Windows\\System32\\cmd.exe",
+      args: ["/d", "/s", "/c", "corepack pnpm test:unit"],
+      platforms: ["win32"],
+    });
+    expect(resolvePackageScriptCommand("npm@10.8.2", "test:unit", { platform: "linux" })).toEqual({
+      command: "npm",
+      args: ["run", "test:unit"],
+      platforms: ["darwin", "linux"],
+    });
+
+    for (const manager of ["npm & calc", "pnpm\ncalc", "yarn|calc", "bun@1.0.0"])
+      expect(resolvePackageScriptCommand(manager, "test:unit", { platform: "win32" })).toBe(
+        undefined,
+      );
+    for (const script of ["test & calc", "%PATH%", "test\ncalc", "test|calc", "../test"])
+      expect(resolvePackageScriptCommand("npm@10.8.2", script, { platform: "win32" })).toBe(
+        undefined,
+      );
+  });
+
+  it("skips unsafe repository-controlled package script names", async () => {
+    const { root, sha } = await createRepository();
+    const manifest = JSON.parse(await readFile(join(root, "package.json"), "utf8")) as {
+      scripts: Record<string, string>;
+    };
+    manifest.scripts["test & calc"] = "node hostile.mjs";
+    manifest.scripts["test\ncalc"] = "node hostile.mjs";
+    await writeFile(join(root, "package.json"), JSON.stringify(manifest));
+
+    const plan = await discoverProbePlan(root, "Fix the unit regression", sha);
+
+    expect(plan.items.map(({ source }) => source)).not.toEqual(
+      expect.arrayContaining(["package.json script test & calc", "package.json script test\ncalc"]),
+    );
+    expect(completionIds(plan)).toContain("package-root-test-unit");
+  });
+
   it("selects distinct focused and regression evidence for every local task family", async () => {
     const { root, sha } = await createRepository();
     const plans = await Promise.all([

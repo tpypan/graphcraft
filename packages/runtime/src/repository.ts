@@ -191,6 +191,7 @@ export async function discoverPlanningEvidence(
   }
   const trackedPathLimit = 2_000;
   return {
+    contentTrust: "untrusted_repository",
     trackedPathCount: trackedPaths.length,
     trackedPaths: trackedPaths.slice(0, trackedPathLimit),
     trackedPathsTruncated: trackedPaths.length > trackedPathLimit,

@@ -91,22 +91,28 @@ class LineAccumulator {
 
 export async function* readBoundedProtocolLines(
   stream: Readable,
+  signal?: AbortSignal,
 ): AsyncIterable<BoundedProtocolLine> {
   let line = new LineAccumulator();
-  for await (const chunk of stream) {
-    const source = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    let offset = 0;
-    while (offset < source.length) {
-      const newline = source.indexOf(0x0a, offset);
-      if (newline === -1) {
-        line.append(source.subarray(offset));
-        break;
+  try {
+    for await (const chunk of stream) {
+      const source = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      let offset = 0;
+      while (offset < source.length) {
+        const newline = source.indexOf(0x0a, offset);
+        if (newline === -1) {
+          line.append(source.subarray(offset));
+          break;
+        }
+        line.append(source.subarray(offset, newline));
+        yield line.finish();
+        line = new LineAccumulator();
+        offset = newline + 1;
       }
-      line.append(source.subarray(offset, newline));
-      yield line.finish();
-      line = new LineAccumulator();
-      offset = newline + 1;
     }
+  } catch (error) {
+    if (!signal?.aborted) throw error;
+    return;
   }
   if (!line.empty) yield line.finish();
 }

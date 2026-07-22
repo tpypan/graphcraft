@@ -4,6 +4,9 @@ import { build } from "esbuild";
 await mkdir("dist", { recursive: true });
 
 const common = {
+  banner: {
+    js: 'import { createRequire as __graphcraftBundleCreateRequire } from "node:module";\nconst require = __graphcraftBundleCreateRequire(import.meta.url);',
+  },
   bundle: true,
   format: "esm",
   logLevel: "info",

@@ -1,10 +1,12 @@
-import { spawn } from "node:child_process";
+import crossSpawn from "cross-spawn";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ChildTerminationController,
   GraphPlanSchema,
+  HOST_CAPABILITY_PROBE_SETTLE_GRACE_MS,
+  HOST_CAPABILITY_PROBE_TIMEOUT_MS,
   HostTerminationError,
   HostCapabilitiesSchema,
   SemanticVerdictSchema,
@@ -14,6 +16,7 @@ import {
   codexWorkerResultJsonSchema,
   normalizeTokenUsage,
   reconcilePersistedInvocation,
+  resolveTrustedExecutable,
   renderPlannerPrompt,
   renderSemanticVerifierPrompt,
   renderWorkerPrompt,
@@ -37,6 +40,8 @@ import {
   structuredOutputExceedsLimit,
   structuredOutputLimitError,
 } from "./protocol.ts";
+
+const spawn = crossSpawn.spawn;
 
 function omitNullObjectProperties(value: unknown): unknown {
   if (Array.isArray(value)) return value.map((item) => omitNullObjectProperties(item));
@@ -93,33 +98,77 @@ export function codexUsage(value: unknown) {
   return normalizeTokenUsage("codex", value);
 }
 
-async function commandVersion(command: string): Promise<{ installed: boolean; version?: string }> {
+async function runCapabilityProbe(
+  command: string,
+  args: string[],
+  captureErrorOutput = false,
+): Promise<{ code: number | null; output: string; overflowed: boolean; terminated: boolean }> {
+  let executable: string;
+  try {
+    executable = await resolveTrustedExecutable(command, { untrustedCwd: process.cwd() });
+  } catch {
+    return { code: null, output: "", overflowed: false, terminated: false };
+  }
   return await new Promise((resolve) => {
-    const child = spawn(command, ["--version"], { stdio: ["ignore", "pipe", "ignore"] });
+    const child = spawn(executable, args, { stdio: ["ignore", "pipe", "pipe"] });
     const output = new BoundedTextCapture(ADAPTER_STDERR_LIMIT_BYTES);
+    const timeoutAbort = new AbortController();
+    const terminationController = new ChildTerminationController(child, timeoutAbort.signal);
+    let settled = false;
+    let settlement: NodeJS.Timeout | undefined;
+    let timeout: NodeJS.Timeout | undefined;
+    const complete = (code: number | null, signal: NodeJS.Signals | null): void => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      if (settlement) clearTimeout(settlement);
+      const termination = terminationController.finish(code, signal);
+      resolve({
+        code,
+        output: output.text(),
+        overflowed: output.overflowed,
+        terminated: termination !== undefined,
+      });
+    };
     child.stdout.on("data", (chunk: Buffer | string) => output.append(chunk));
-    child.once("error", () => resolve({ installed: false }));
-    child.once("close", (code) =>
-      resolve(
-        code === 0 && !output.overflowed
-          ? { installed: true, version: output.text().trim() }
-          : { installed: false },
-      ),
-    );
+    if (captureErrorOutput) {
+      child.stderr.on("data", (chunk: Buffer | string) => output.append(chunk));
+    }
+    child.once("error", () => complete(null, null));
+    child.once("close", complete);
+    timeout = setTimeout(() => {
+      timeoutAbort.abort({
+        cause: "timeout",
+        reason: `${command} capability probe timed out`,
+      });
+      if (settled) return;
+      settlement = setTimeout(() => {
+        child.stdout.destroy();
+        child.stderr.destroy();
+        child.unref?.();
+        complete(null, null);
+      }, HOST_CAPABILITY_PROBE_SETTLE_GRACE_MS);
+      settlement.unref();
+    }, HOST_CAPABILITY_PROBE_TIMEOUT_MS);
+    timeout.unref();
   });
 }
 
+async function commandVersion(command: string): Promise<{ installed: boolean; version?: string }> {
+  const result = await runCapabilityProbe(command, ["--version"]);
+  return result.code === 0 && !result.overflowed && !result.terminated
+    ? { installed: true, version: result.output.trim() }
+    : { installed: false };
+}
+
 async function codexAuthenticated(): Promise<boolean> {
-  return await new Promise((resolve) => {
-    const child = spawn("codex", ["login", "status"], { stdio: ["ignore", "pipe", "pipe"] });
-    const output = new BoundedTextCapture(ADAPTER_STDERR_LIMIT_BYTES);
-    child.stdout.on("data", (chunk: Buffer | string) => output.append(chunk));
-    child.stderr.on("data", (chunk: Buffer | string) => output.append(chunk));
-    child.once("error", () => resolve(false));
-    child.once("close", (code) =>
-      resolve(code === 0 && !output.overflowed && !/not logged in/i.test(output.text())),
-    );
-  });
+  const result = await runCapabilityProbe("codex", ["login", "status"], true);
+  return (
+    result.code === 0 &&
+    !result.overflowed &&
+    !result.terminated &&
+    !/not logged in/i.test(result.output)
+  );
 }
 
 export class CodexAdapter implements HostAdapter {
@@ -143,19 +192,20 @@ export class CodexAdapter implements HostAdapter {
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-plan-"));
     const schemaPath = join(schemaDirectory, "graph-plan.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexGraphPlanJsonSchema), "utf8");
-    const child = spawn("codex", codexPlannerArgs(request, schemaPath, this.policy), {
+    const executable = await resolveTrustedExecutable("codex", {
+      untrustedCwd: request.repositoryPath,
+    });
+    const child = spawn(executable, codexPlannerArgs(request, schemaPath, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
     });
-    const exitPromise = new Promise<number>((resolve) =>
-      child.once("close", (code) => resolve(code ?? 1)),
+    const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolve) =>
+        child.once("close", (code, closeSignal) => resolve({ code, signal: closeSignal })),
     );
-    const abort = (): void => {
-      child.kill("SIGTERM");
-    };
-    signal.addEventListener("abort", abort, { once: true });
+    const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderPlannerPrompt(request));
     let lastMessage = "";
     let lastMessageExceededLimit = false;
@@ -164,7 +214,7 @@ export class CodexAdapter implements HostAdapter {
     const stderr = captureStderr(child.stderr);
 
     try {
-      for await (const line of readBoundedProtocolLines(child.stdout)) {
+      for await (const line of readBoundedProtocolLines(child.stdout, signal)) {
         if (line.overflowed) {
           protocolExceededLimit = true;
           continue;
@@ -184,21 +234,23 @@ export class CodexAdapter implements HostAdapter {
         }
         if (event.type === "turn.completed") usage = codexUsage(event.usage);
       }
-      const exitCode = await exitPromise;
-      if (signal.aborted) throw new Error("Codex planning invocation aborted");
+      const exit = await terminationController.waitForExit(exitPromise);
+      const termination = terminationController.finish(exit.code, exit.signal);
+      if (termination) throw new HostTerminationError(termination);
       if (protocolExceededLimit) throw protocolLineLimitError("Codex");
       if (lastMessageExceededLimit) {
         throw structuredOutputLimitError("Codex", "structured graph plan");
       }
       const plan = parseGraphPlan(lastMessage);
-      if (exitCode !== 0 || !plan) {
+      if (exit.code !== 0 || !plan) {
         throw new Error(
-          stderr.text().trim() || `Codex exited ${exitCode} without a valid structured graph plan`,
+          stderr.text().trim() ||
+            `Codex exited ${exit.code ?? 1} without a valid structured graph plan`,
         );
       }
       return { plan, ...(usage ? { usage } : {}) };
     } finally {
-      signal.removeEventListener("abort", abort);
+      terminationController.dispose();
       await rm(schemaDirectory, { recursive: true, force: true });
     }
   }
@@ -210,7 +262,10 @@ export class CodexAdapter implements HostAdapter {
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-verify-"));
     const schemaPath = join(schemaDirectory, "semantic-verdict.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexSemanticVerdictJsonSchema), "utf8");
-    const child = spawn("codex", codexSemanticVerifierArgs(request, schemaPath, this.policy), {
+    const executable = await resolveTrustedExecutable("codex", {
+      untrustedCwd: request.repositoryPath,
+    });
+    const child = spawn(executable, codexSemanticVerifierArgs(request, schemaPath, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
       shell: false,
@@ -221,14 +276,14 @@ export class CodexAdapter implements HostAdapter {
         child.once("close", (code, closeSignal) => resolve({ code, signal: closeSignal })),
     );
     const terminationController = new ChildTerminationController(child, signal);
-    child.stdin.end(renderSemanticVerifierPrompt(request.context));
+    child.stdin.end(renderSemanticVerifierPrompt(request.context, request.authorityBoundary));
     let lastMessage = "";
     let lastMessageExceededLimit = false;
     let protocolExceededLimit = false;
     let usage: ReturnType<typeof codexUsage> | undefined;
     const stderr = captureStderr(child.stderr);
     try {
-      for await (const line of readBoundedProtocolLines(child.stdout)) {
+      for await (const line of readBoundedProtocolLines(child.stdout, signal)) {
         if (line.overflowed) {
           protocolExceededLimit = true;
           continue;
@@ -248,7 +303,7 @@ export class CodexAdapter implements HostAdapter {
         }
         if (event.type === "turn.completed") usage = codexUsage(event.usage);
       }
-      const exit = await exitPromise;
+      const exit = await terminationController.waitForExit(exitPromise);
       const termination = terminationController.finish(exit.code, exit.signal);
       if (termination) throw new HostTerminationError(termination);
       if (protocolExceededLimit) throw protocolLineLimitError("Codex");
@@ -273,7 +328,10 @@ export class CodexAdapter implements HostAdapter {
     const schemaPath = join(schemaDirectory, "worker-result.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexWorkerResultJsonSchema), "utf8");
     const args = codexWorkerArgs(request, schemaPath, this.policy);
-    const child = spawn("codex", args, {
+    const executable = await resolveTrustedExecutable("codex", {
+      untrustedCwd: request.repositoryPath,
+    });
+    const child = spawn(executable, args, {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
       shell: false,
@@ -284,14 +342,14 @@ export class CodexAdapter implements HostAdapter {
         child.once("close", (code, closeSignal) => resolve({ code, signal: closeSignal })),
     );
     const terminationController = new ChildTerminationController(child, signal);
-    child.stdin.end(renderWorkerPrompt(request.capsule));
+    child.stdin.end(renderWorkerPrompt(request.capsule, request.authorityBoundary));
     let lastMessage = "";
     let lastMessageExceededLimit = false;
     let protocolExceededLimit = false;
     let observedSessionId: string | undefined;
     let sessionReported = false;
     const stderr = captureStderr(child.stderr);
-    const protocolLines = readBoundedProtocolLines(child.stdout)[Symbol.asyncIterator]();
+    const protocolLines = readBoundedProtocolLines(child.stdout, signal)[Symbol.asyncIterator]();
     let nextProtocolLine = protocolLines.next();
 
     yield { type: "started", invocationId: request.invocationId };
@@ -340,7 +398,7 @@ export class CodexAdapter implements HostAdapter {
         }
       }
 
-      const exit = await exitPromise;
+      const exit = await terminationController.waitForExit(exitPromise);
       const termination = terminationController.finish(exit.code, exit.signal);
       if (termination) {
         yield { type: "terminated", termination };
