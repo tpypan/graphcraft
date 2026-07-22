@@ -1,10 +1,11 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   BenchmarkSuiteSchema,
   reconcilePersistedInvocation,
+  summarizeBenchmark,
   type HostAdapter,
   type HostCapabilities,
   type HostEvent,
@@ -48,8 +49,20 @@ function usage(input: number, output: number): TokenUsage {
 
 class BenchmarkAdapter implements HostAdapter {
   readonly id = "test" as const;
+  readonly graphcraftRepositories: string[] = [];
 
-  constructor(private readonly failureMessage?: string) {}
+  constructor(
+    private readonly options: {
+      failureMessage?: string;
+      usageReceipt?: TokenUsage;
+      weakenBaselineScorer?: boolean;
+      makeBaselineAcceptancePathDirectory?: boolean;
+    } = {},
+  ) {}
+
+  private usage(input: number, output: number): TokenUsage {
+    return this.options.usageReceipt ?? usage(input, output);
+  }
 
   async probe(): Promise<HostCapabilities> {
     return {
@@ -63,6 +76,7 @@ class BenchmarkAdapter implements HostAdapter {
   }
 
   async plan(request: PlanningRequest): Promise<PlanningResult> {
+    this.graphcraftRepositories.push(request.contract.repository.root);
     return {
       plan: {
         schemaVersion: 1,
@@ -107,15 +121,48 @@ class BenchmarkAdapter implements HostAdapter {
           },
         ],
       },
-      usage: usage(5, 2),
+      usage: this.usage(5, 2),
     };
   }
 
   async *execute(request: WorkerRequest): AsyncIterable<HostEvent> {
     yield { type: "started", invocationId: request.invocationId };
     yield { type: "session", hostSessionId: request.invocationId };
-    if (this.failureMessage) {
-      yield { type: "error", message: this.failureMessage };
+    if (this.options.failureMessage) {
+      yield { type: "error", message: this.options.failureMessage };
+      return;
+    }
+    if (this.options.weakenBaselineScorer && request.capsule.nodeId.startsWith("baseline-")) {
+      await writeFile(join(request.repositoryPath, "score.mjs"), "process.exit(0);\n", "utf8");
+      yield { type: "usage", usage: this.usage(10, 4) };
+      yield {
+        type: "result",
+        result: {
+          status: "completed",
+          summary: "Changed the visible check without implementing the task",
+          changedPaths: ["score.mjs"],
+          evidence: ["mutable visible check passes"],
+        },
+      };
+      return;
+    }
+    if (
+      this.options.makeBaselineAcceptancePathDirectory &&
+      request.capsule.nodeId.startsWith("baseline-")
+    ) {
+      const sourcePath = join(request.repositoryPath, "source.js");
+      await rm(sourcePath, { force: true });
+      await mkdir(sourcePath);
+      yield { type: "usage", usage: this.usage(10, 4) };
+      yield {
+        type: "result",
+        result: {
+          status: "completed",
+          summary: "Replaced the asserted file with a directory",
+          changedPaths: ["source.js"],
+          evidence: ["malformed acceptance target"],
+        },
+      };
       return;
     }
     await writeFile(
@@ -123,7 +170,7 @@ class BenchmarkAdapter implements HostAdapter {
       "export const value = 'implemented';\n",
       "utf8",
     );
-    yield { type: "usage", usage: usage(10, 4) };
+    yield { type: "usage", usage: this.usage(10, 4) };
     yield {
       type: "result",
       result: {
@@ -143,7 +190,7 @@ class BenchmarkAdapter implements HostAdapter {
         rationale: "The deterministic fixture is satisfied",
         uncertainty: 0,
       },
-      usage: usage(2, 1),
+      usage: this.usage(2, 1),
     };
   }
 
@@ -153,6 +200,60 @@ class BenchmarkAdapter implements HostAdapter {
 }
 
 describe("benchmark harness", () => {
+  it("removes a temporary fixture when materialization fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-cleanup-report-"));
+    temporaryRoots.push(root);
+    const taskId = "materialization-cleanup";
+    const fixturePrefix = `graphcraft-benchmark-${taskId}-`;
+    const before = new Set(
+      (await readdir(tmpdir())).filter((name) => name.startsWith(fixturePrefix)),
+    );
+    const suite = BenchmarkSuiteSchema.parse({
+      schemaVersion: 2,
+      id: "materialization-cleanup-suite",
+      version: 1,
+      description: "Fixture setup cleanup regression",
+      tasks: [
+        {
+          id: taskId,
+          family: "feature",
+          task: "Exercise benchmark fixture setup cleanup",
+          initialFiles: {
+            collision: "regular file\n",
+            "collision/nested.js": "export const nested = true;\n",
+            "score.mjs": "process.exit(0);\n",
+          },
+          checks: [{ command: "node", scorerPath: "score.mjs" }],
+          acceptance: [{ kind: "exists", path: "collision" }],
+          repetitions: 1,
+        },
+      ],
+    });
+    let leaked: string[] = [];
+    try {
+      await expect(
+        runBenchmark({
+          suite,
+          hosts: ["codex"],
+          adapters: { codex: new BenchmarkAdapter() },
+          policies: { codex: { model: "cleanup-fixture", effort: "high" } },
+          graphcraftVersion: "0.1.2-cleanup-fixture",
+          seed: "cleanup-seed",
+          repetitions: 1,
+          outputPath: join(root, "report.json"),
+        }),
+      ).rejects.toThrow();
+    } finally {
+      leaked = (await readdir(tmpdir())).filter(
+        (name) => name.startsWith(fixturePrefix) && !before.has(name),
+      );
+      await Promise.all(
+        leaked.map((name) => rm(join(tmpdir(), name), { recursive: true, force: true })),
+      );
+    }
+    expect(leaked).toEqual([]);
+  });
+
   it(
     "runs matched fresh fixtures and persists baseline plus Graphcraft receipts",
     async () => {
@@ -160,7 +261,7 @@ describe("benchmark harness", () => {
       temporaryRoots.push(root);
       const outputPath = join(root, "report.json");
       const suite = BenchmarkSuiteSchema.parse({
-        schemaVersion: 1,
+        schemaVersion: 2,
         id: "runtime-fixture",
         version: 1,
         description: "Runtime benchmark fixture",
@@ -175,8 +276,10 @@ describe("benchmark harness", () => {
               "source.js": "export const value = 'pending';\n",
               "verify.mjs":
                 "import { value } from './source.js'; if (value !== 'implemented') process.exit(1);\n",
+              "score.mjs":
+                "import { value } from './source.js'; if (value !== 'implemented') process.exit(1);\n",
             },
-            checks: [{ command: "node", args: ["verify.mjs"] }],
+            checks: [{ command: "node", scorerPath: "score.mjs" }],
             acceptance: [{ kind: "contains", path: "source.js", value: "implemented" }],
             repetitions: 1,
           },
@@ -184,12 +287,14 @@ describe("benchmark harness", () => {
       });
       const adapter = new BenchmarkAdapter();
       const policies = { codex: { model: "gpt-benchmark-fixture", effort: "high" as const } };
+      const graphcraftVersion = "0.1.2-benchmark-fixture";
 
       const { report } = await runBenchmark({
         suite,
         hosts: ["codex"],
         adapters: { codex: adapter },
         policies,
+        graphcraftVersion,
         seed: "runtime-seed",
         repetitions: 1,
         outputPath,
@@ -206,20 +311,41 @@ describe("benchmark harness", () => {
         true,
       );
       expect(results.every(({ effortPolicy }) => effortPolicy === "high")).toBe(true);
+      expect(
+        results.every(
+          ({ permissionPolicy }) =>
+            permissionPolicy === "codex_workspace_write_shell_external_not_graphcraft_enforced",
+        ),
+      ).toBe(true);
+      expect(results.every(({ scorerVerified }) => scorerVerified === true)).toBe(true);
       expect(persisted.modelPolicy).toEqual({ codex: "gpt-benchmark-fixture" });
       expect(persisted.effortPolicy).toBe("high");
+      expect(persisted.permissionPolicy).toEqual({
+        codex: "codex_workspace_write_shell_external_not_graphcraft_enforced",
+      });
+      expect(persisted.environment.graphcraftVersion).toBe(graphcraftVersion);
       expect(persisted.summary).toMatchObject({
         codex: {
           baseline: { trials: 1, accepted: 1 },
           graphcraft: { trials: 1, accepted: 1 },
         },
       });
+      expect(adapter.graphcraftRepositories).toHaveLength(1);
+      for (const repository of adapter.graphcraftRepositories) {
+        const worktreeRoot = join(
+          dirname(repository),
+          `.${basename(repository)}-graphcraft-worktrees`,
+        );
+        await expect(stat(repository)).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(stat(worktreeRoot)).rejects.toMatchObject({ code: "ENOENT" });
+      }
 
       const resumed = await runBenchmark({
         suite,
         hosts: ["codex"],
         adapters: {},
         policies,
+        graphcraftVersion,
         seed: "runtime-seed",
         repetitions: 1,
         outputPath,
@@ -236,11 +362,12 @@ describe("benchmark harness", () => {
           suite,
           hosts: ["codex"],
           adapters: {
-            codex: new BenchmarkAdapter(
-              `Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz configured=${configuredSecret}`,
-            ),
+            codex: new BenchmarkAdapter({
+              failureMessage: `Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz configured=${configuredSecret}`,
+            }),
           },
           policies,
+          graphcraftVersion,
           seed: "redaction-seed",
           repetitions: 1,
           outputPath: redactedOutputPath,
@@ -257,19 +384,149 @@ describe("benchmark harness", () => {
         else process.env.GRAPHCRAFT_BENCHMARK_API_KEY = previousSecret;
       }
 
+      const providerLimited = usage(10, 4);
+      providerLimited.availability.reasoning = "unavailable";
+      const providerLimitedResult = await runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: { codex: new BenchmarkAdapter({ usageReceipt: providerLimited }) },
+        policies,
+        graphcraftVersion,
+        seed: "provider-limited-seed",
+        repetitions: 1,
+        outputPath: join(root, "provider-limited-report.json"),
+      });
+      expect(
+        providerLimitedResult.report.results.every(({ usageReconciled }) => usageReconciled),
+      ).toBe(true);
+      expect(
+        providerLimitedResult.report.results.every(({ limitations }) =>
+          limitations.includes("reasoning:unavailable"),
+        ),
+      ).toBe(true);
+      expect(providerLimitedResult.report.summary).toMatchObject({
+        codex: {
+          matchedAccepted: {
+            pairs: 1,
+            minimumPairsPerTask: 3,
+            completeTaskCoverage: false,
+          },
+          gate: { completeSchedule: true, comparable: false, passes: null },
+        },
+      });
+
+      const weakened = await runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: { codex: new BenchmarkAdapter({ weakenBaselineScorer: true }) },
+        policies,
+        graphcraftVersion,
+        seed: "weakened-scorer-seed",
+        repetitions: 1,
+        outputPath: join(root, "weakened-scorer-report.json"),
+      });
+      const weakenedBaseline = weakened.report.results.find(
+        ({ trial }) => trial.mode === "baseline",
+      )!;
+      const protectedGraphcraft = weakened.report.results.find(
+        ({ trial }) => trial.mode === "graphcraft",
+      )!;
+      expect(weakenedBaseline).toMatchObject({ accepted: false, scorerVerified: false });
+      expect(weakenedBaseline.observedScorerDigest).not.toBe(
+        weakenedBaseline.acceptanceScorerDigest,
+      );
+      expect(weakenedBaseline.acceptance[0]?.summary).toContain("changed from its fixture bytes");
+      expect(protectedGraphcraft).toMatchObject({ accepted: true, scorerVerified: true });
+
+      const malformedAcceptance = await runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: {
+          codex: new BenchmarkAdapter({ makeBaselineAcceptancePathDirectory: true }),
+        },
+        policies,
+        graphcraftVersion,
+        seed: "malformed-acceptance-seed",
+        repetitions: 1,
+        outputPath: join(root, "malformed-acceptance-report.json"),
+      });
+      const malformedBaseline = malformedAcceptance.report.results.find(
+        ({ trial }) => trial.mode === "baseline",
+      )!;
+      expect(malformedBaseline).toMatchObject({ executionStatus: "completed", accepted: false });
+      expect(malformedBaseline.acceptance).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            path: "source.js",
+            passed: false,
+            summary: expect.stringContaining("could not be evaluated"),
+          }),
+        ]),
+      );
+
+      const incompleteComplete = structuredClone(persisted);
+      incompleteComplete.results = [];
+      incompleteComplete.summary = { codex: { gate: { passes: true } } };
+      const incompletePath = join(root, "incomplete-complete-report.json");
+      await writeFile(incompletePath, JSON.stringify(incompleteComplete), "utf8");
+      await expect(
+        runBenchmark({
+          suite,
+          hosts: ["codex"],
+          adapters: {},
+          policies,
+          graphcraftVersion,
+          seed: "runtime-seed",
+          repetitions: 1,
+          outputPath: incompletePath,
+        }),
+      ).rejects.toThrow("does not cover the exact current schedule");
+
+      const forgedSummary = structuredClone(persisted);
+      forgedSummary.summary = { codex: { gate: { passes: true } } };
+      const forgedSummaryPath = join(root, "forged-summary-report.json");
+      await writeFile(forgedSummaryPath, JSON.stringify(forgedSummary), "utf8");
+      await expect(
+        runBenchmark({
+          suite,
+          hosts: ["codex"],
+          adapters: {},
+          policies,
+          graphcraftVersion,
+          seed: "runtime-seed",
+          repetitions: 1,
+          outputPath: forgedSummaryPath,
+        }),
+      ).rejects.toThrow("summary does not match its trial evidence");
+
       await expect(
         runBenchmark({
           suite,
           hosts: ["codex"],
           adapters: {},
           policies: { codex: { model: "different-model", effort: "high" } },
+          graphcraftVersion,
           seed: "runtime-seed",
           repetitions: 1,
           outputPath,
         }),
       ).rejects.toThrow("does not match this suite and schedule");
 
+      await expect(
+        runBenchmark({
+          suite,
+          hosts: ["codex"],
+          adapters: {},
+          policies,
+          graphcraftVersion: "0.1.3-different-implementation",
+          seed: "runtime-seed",
+          repetitions: 1,
+          outputPath,
+        }),
+      ).rejects.toThrow("Graphcraft version identity does not match this execution");
+
       persisted.results[0]!.acceptanceScorerDigest = "tampered-scorer";
+      persisted.summary = summarizeBenchmark(persisted.results, persisted.schedule);
       await writeFile(outputPath, JSON.stringify(persisted), "utf8");
       await expect(
         runBenchmark({
@@ -277,6 +534,7 @@ describe("benchmark harness", () => {
           hosts: ["codex"],
           adapters: {},
           policies,
+          graphcraftVersion,
           seed: "runtime-seed",
           repetitions: 1,
           outputPath,

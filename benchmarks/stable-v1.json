@@ -1,7 +1,7 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "id": "stable-v1",
-  "version": 1,
+  "version": 4,
   "description": "Versioned local corpus for matched Codex and Claude baseline-versus-Graphcraft trials.",
   "tasks": [
     {
@@ -12,9 +12,10 @@
       "initialFiles": {
         "package.json": "{\"name\":\"benchmark-bug-empty-input\",\"private\":true,\"type\":\"module\",\"scripts\":{\"test\":\"node verify.mjs\"}}\n",
         "src.js": "export function normalizeName(value) { return value.trim() || 'unknown'; }\n",
-        "verify.mjs": "import { normalizeName } from './src.js'; if (normalizeName('') !== '' || normalizeName('  Ada  ') !== 'Ada') process.exit(1);\n"
+        "verify.mjs": "import { normalizeName } from './src.js'; if (normalizeName('') !== '' || normalizeName('  Ada  ') !== 'Ada') process.exit(1);\n",
+        "score.mjs": "import { normalizeName } from './src.js'; if (normalizeName('') !== '' || normalizeName('  Ada  ') !== 'Ada') process.exit(1);\n"
       },
-      "checks": [{ "command": "node", "args": ["verify.mjs"] }],
+      "checks": [{ "command": "node", "scorerPath": "score.mjs" }],
       "acceptance": [
         { "kind": "contains", "path": "src.js", "value": "return value.trim()" },
         { "kind": "not_contains", "path": "src.js", "value": "unknown" }
@@ -29,9 +30,10 @@
       "initialFiles": {
         "package.json": "{\"name\":\"benchmark-bug-inclusive-range\",\"private\":true,\"type\":\"module\",\"scripts\":{\"test\":\"node verify.mjs\"}}\n",
         "range.js": "export function range(start, end) { return Array.from({ length: end - start }, (_, index) => start + index); }\n",
-        "verify.mjs": "import { range } from './range.js'; if (JSON.stringify(range(2, 4)) !== '[2,3,4]') process.exit(1);\n"
+        "verify.mjs": "import { range } from './range.js'; if (JSON.stringify(range(2, 4)) !== '[2,3,4]') process.exit(1);\n",
+        "score.mjs": "import { range } from './range.js'; if (JSON.stringify(range(2, 4)) !== '[2,3,4]') process.exit(1);\n"
       },
-      "checks": [{ "command": "node", "args": ["verify.mjs"] }],
+      "checks": [{ "command": "node", "scorerPath": "score.mjs" }],
       "acceptance": [{ "kind": "contains", "path": "range.js", "value": "end - start + 1" }],
       "repetitions": 3
     },
@@ -43,9 +45,10 @@
       "initialFiles": {
         "package.json": "{\"name\":\"benchmark-feature-uppercase-slug\",\"private\":true,\"type\":\"module\",\"scripts\":{\"test\":\"node verify.mjs\"}}\n",
         "slug.js": "export function slug(value) { return value.trim().replace(/\\s+/g, '-').toLowerCase(); }\n",
-        "verify.mjs": "import { upperSlug } from './slug.js'; if (upperSlug('  hello world ') !== 'HELLO-WORLD') process.exit(1);\n"
+        "verify.mjs": "import { upperSlug } from './slug.js'; if (upperSlug('  hello world ') !== 'HELLO-WORLD') process.exit(1);\n",
+        "score.mjs": "import { upperSlug } from './slug.js'; if (upperSlug('  hello world ') !== 'HELLO-WORLD') process.exit(1);\n"
       },
-      "checks": [{ "command": "node", "args": ["verify.mjs"] }],
+      "checks": [{ "command": "node", "scorerPath": "score.mjs" }],
       "acceptance": [
         { "kind": "contains", "path": "slug.js", "value": "export function upperSlug" },
         { "kind": "contains", "path": "slug.js", "value": "toUpperCase" }
@@ -60,9 +63,10 @@
       "initialFiles": {
         "package.json": "{\"name\":\"benchmark-feature-summary-report\",\"private\":true,\"type\":\"module\",\"scripts\":{\"test\":\"node verify.mjs\"}}\n",
         "index.js": "export const version = 1;\n",
-        "verify.mjs": "import { summarize } from './report.js'; const value = summarize([2,3,5]); if (value.count !== 3 || value.total !== 10) process.exit(1); let rejected = false; try { summarize([1,'x']); } catch { rejected = true; } if (!rejected) process.exit(1);\n"
+        "verify.mjs": "import { summarize } from './report.js'; const value = summarize([2,3,5]); if (value.count !== 3 || value.total !== 10) process.exit(1); let rejected = false; try { summarize([1,'x']); } catch { rejected = true; } if (!rejected) process.exit(1);\n",
+        "score.mjs": "import { summarize } from './report.js'; const value = summarize([2,3,5]); if (value.count !== 3 || value.total !== 10) process.exit(1); let rejected = false; try { summarize([1,'x']); } catch { rejected = true; } if (!rejected) process.exit(1);\n"
       },
-      "checks": [{ "command": "node", "args": ["verify.mjs"] }],
+      "checks": [{ "command": "node", "scorerPath": "score.mjs" }],
       "acceptance": [
         { "kind": "exists", "path": "report.js" },
         { "kind": "contains", "path": "report.js", "value": "count" },
@@ -79,9 +83,10 @@
         "package.json": "{\"name\":\"benchmark-migration-client-v3\",\"private\":true,\"type\":\"module\",\"scripts\":{\"test\":\"node verify.mjs\"}}\n",
         "client.js": "export const createClientV2 = () => ({ version: 2 }); export const createClientV3 = () => ({ version: 3 });\n",
         "app.js": "import { createClientV2 } from './client.js'; export const client = createClientV2();\n",
-        "verify.mjs": "const app = await import('./app.js'); const source = await import('node:fs/promises').then(fs => fs.readFile('client.js','utf8')); if (app.client.version !== 3 || source.includes('createClientV2')) process.exit(1);\n"
+        "verify.mjs": "const app = await import('./app.js'); const source = await import('node:fs/promises').then(fs => fs.readFile('client.js','utf8')); if (app.client.version !== 3 || source.includes('createClientV2')) process.exit(1);\n",
+        "score.mjs": "const app = await import('./app.js'); const source = await import('node:fs/promises').then(fs => fs.readFile('client.js','utf8')); if (app.client.version !== 3 || source.includes('createClientV2')) process.exit(1);\n"
       },
-      "checks": [{ "command": "node", "args": ["verify.mjs"] }],
+      "checks": [{ "command": "node", "scorerPath": "score.mjs" }],
       "acceptance": [
         { "kind": "contains", "path": "app.js", "value": "createClientV3" },
         { "kind": "not_contains", "path": "client.js", "value": "createClientV2" }
@@ -97,9 +102,10 @@
         "package.json": "{\"name\":\"benchmark-migration-timeout-key\",\"private\":true,\"type\":\"module\",\"scripts\":{\"test\":\"node verify.mjs\"}}\n",
         "config.json": "{\"timeoutSeconds\":5}\n",
         "config.js": "import data from './config.json' with { type: 'json' }; export const timeout = data.timeoutSeconds * 1000;\n",
-        "verify.mjs": "import { timeout } from './config.js'; const data = JSON.parse(await import('node:fs/promises').then(fs => fs.readFile('config.json','utf8'))); if (timeout !== 5000 || data.timeoutMs !== 5000 || 'timeoutSeconds' in data) process.exit(1);\n"
+        "verify.mjs": "import { timeout } from './config.js'; const data = JSON.parse(await import('node:fs/promises').then(fs => fs.readFile('config.json','utf8'))); if (timeout !== 5000 || data.timeoutMs !== 5000 || 'timeoutSeconds' in data) process.exit(1);\n",
+        "score.mjs": "import { timeout } from './config.js'; const data = JSON.parse(await import('node:fs/promises').then(fs => fs.readFile('config.json','utf8'))); if (timeout !== 5000 || data.timeoutMs !== 5000 || 'timeoutSeconds' in data) process.exit(1);\n"
       },
-      "checks": [{ "command": "node", "args": ["verify.mjs"] }],
+      "checks": [{ "command": "node", "scorerPath": "score.mjs" }],
       "acceptance": [
         { "kind": "contains", "path": "config.json", "value": "timeoutMs" },
         { "kind": "not_contains", "path": "config.json", "value": "timeoutSeconds" },
@@ -115,9 +121,10 @@
       "initialFiles": {
         "package.json": "{\"name\":\"benchmark-refactor-shared-clamp\",\"private\":true,\"type\":\"module\",\"scripts\":{\"test\":\"node verify.mjs\"}}\n",
         "values.js": "export function volume(value) { return Math.max(0, Math.min(100, value)); } export function brightness(value) { return Math.max(0, Math.min(100, value)); }\n",
-        "verify.mjs": "import { volume, brightness, clamp } from './values.js'; if (volume(120) !== 100 || brightness(-2) !== 0 || clamp(40) !== 40) process.exit(1);\n"
+        "verify.mjs": "import { volume, brightness, clamp } from './values.js'; if (volume(120) !== 100 || brightness(-2) !== 0 || clamp(40) !== 40) process.exit(1);\n",
+        "score.mjs": "import { volume, brightness, clamp } from './values.js'; if (volume(120) !== 100 || brightness(-2) !== 0 || clamp(40) !== 40) process.exit(1);\n"
       },
-      "checks": [{ "command": "node", "args": ["verify.mjs"] }],
+      "checks": [{ "command": "node", "scorerPath": "score.mjs" }],
       "acceptance": [
         { "kind": "contains", "path": "values.js", "value": "export function clamp" },
         { "kind": "contains", "path": "values.js", "value": "return clamp(value)" }
@@ -132,14 +139,24 @@
       "initialFiles": {
         "package.json": "{\"name\":\"benchmark-audit-api-boundary\",\"private\":true,\"type\":\"module\",\"scripts\":{\"test\":\"node verify.mjs\"}}\n",
         "api.js": "export async function handle(input) { return JSON.parse(input); }\n",
-        "verify.mjs": "import { handle } from './api.js'; const value = await handle('{\"ok\":true}'); if (value.ok !== true) process.exit(1);\n"
+        "verify.mjs": "import { handle } from './api.js'; const value = await handle('{\"ok\":true}'); if (value.ok !== true) process.exit(1);\n",
+        "score.mjs": "import { handle } from './api.js'; const value = await handle('{\"ok\":true}'); if (value.ok !== true) process.exit(1); let malformed = false; try { await handle('{'); } catch (error) { malformed = error instanceof SyntaxError; } const nonStringResult = await handle(null); if (!malformed || nonStringResult !== null) process.exit(1);\n"
       },
-      "checks": [{ "command": "node", "args": ["verify.mjs"] }],
+      "checks": [{ "command": "node", "scorerPath": "score.mjs" }],
       "acceptance": [
         { "kind": "summary_contains", "value": "Findings" },
         { "kind": "summary_contains", "value": "Evidence" },
         { "kind": "summary_contains", "value": "Unknowns" },
-        { "kind": "summary_contains", "value": "api.js" }
+        { "kind": "summary_contains", "value": "api.js" },
+        { "kind": "summary_contains", "value": "JSON.parse" },
+        { "kind": "summary_contains", "value": "SyntaxError" },
+        { "kind": "summary_contains", "value": "null" },
+        { "kind": "summary_contains", "value": "non-string" },
+        {
+          "kind": "equals",
+          "path": "api.js",
+          "value": "export async function handle(input) { return JSON.parse(input); }\n"
+        }
       ],
       "repetitions": 3
     },
@@ -152,9 +169,10 @@
         "package.json": "{\"name\":\"benchmark-pr-repair-email-validation\",\"private\":true,\"type\":\"module\",\"scripts\":{\"test\":\"node verify.mjs\"}}\n",
         "email.js": "export function parseEmail(value) { return value.trim().toLowerCase(); }\n",
         "REVIEW.md": "Review: parseEmail currently accepts malformed addresses. Require exactly one @ separator.\n",
-        "verify.mjs": "import { parseEmail } from './email.js'; if (parseEmail(' A@B.COM ') !== 'a@b.com') process.exit(1); for (const bad of ['abc','a@@b']) { let rejected = false; try { parseEmail(bad); } catch { rejected = true; } if (!rejected) process.exit(1); }\n"
+        "verify.mjs": "import { parseEmail } from './email.js'; if (parseEmail(' A@B.COM ') !== 'a@b.com') process.exit(1); for (const bad of ['abc','a@@b']) { let rejected = false; try { parseEmail(bad); } catch { rejected = true; } if (!rejected) process.exit(1); }\n",
+        "score.mjs": "import { parseEmail } from './email.js'; if (parseEmail(' A@B.COM ') !== 'a@b.com') process.exit(1); for (const bad of ['abc','a@@b']) { let rejected = false; try { parseEmail(bad); } catch { rejected = true; } if (!rejected) process.exit(1); }\n"
       },
-      "checks": [{ "command": "node", "args": ["verify.mjs"] }],
+      "checks": [{ "command": "node", "scorerPath": "score.mjs" }],
       "acceptance": [
         { "kind": "contains", "path": "email.js", "value": "split" },
         { "kind": "contains", "path": "email.js", "value": "throw" }
@@ -170,9 +188,10 @@
         "package.json": "{\"name\":\"benchmark-pr-repair-null-owner\",\"private\":true,\"type\":\"module\",\"scripts\":{\"test\":\"node verify.mjs\"}}\n",
         "owner.js": "export function ownerLabel(owner) { return `Owner: ${owner.name}`; }\n",
         "REVIEW.md": "Review: owner can be null for imported records. Render Unassigned instead of throwing.\n",
-        "verify.mjs": "import { ownerLabel } from './owner.js'; if (ownerLabel(null) !== 'Unassigned' || ownerLabel({name:'Ada'}) !== 'Owner: Ada') process.exit(1);\n"
+        "verify.mjs": "import { ownerLabel } from './owner.js'; if (ownerLabel(null) !== 'Unassigned' || ownerLabel({name:'Ada'}) !== 'Owner: Ada') process.exit(1);\n",
+        "score.mjs": "import { ownerLabel } from './owner.js'; if (ownerLabel(null) !== 'Unassigned' || ownerLabel({name:'Ada'}) !== 'Owner: Ada') process.exit(1);\n"
       },
-      "checks": [{ "command": "node", "args": ["verify.mjs"] }],
+      "checks": [{ "command": "node", "scorerPath": "score.mjs" }],
       "acceptance": [
         { "kind": "contains", "path": "owner.js", "value": "Unassigned" },
         { "kind": "contains", "path": "owner.js", "value": "owner.name" }

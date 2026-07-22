@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, resolve, sep } from "node:path";
 import {
   BenchmarkSuiteSchema,
   BenchmarkReportSchema,
@@ -14,6 +14,7 @@ import {
   unavailableTokenUsage,
   type BenchmarkScheduleEntry,
   type BenchmarkReport,
+  type BenchmarkPermissionPolicy,
   type BenchmarkSuite,
   type BenchmarkTask,
   type BenchmarkTrialResult,
@@ -34,8 +35,17 @@ const tokenDimensions = [
   "reasoning",
   "total",
 ] as const;
-const permissionPolicy = "local_read_write_shell_no_external" as const;
-const scorerPolicy = "declared_checks_plus_suite_assertions" as const;
+const scorerPolicy = "fixture_bound_scorers_plus_suite_assertions" as const;
+const reportLimitations = [
+  "Stable efficiency claims require at least three jointly accepted reconciled baseline/Graphcraft pairs per task and host.",
+  "Blinded human defect review remains outside this deterministic harness slice.",
+];
+
+function benchmarkPermissionPolicy(host: "codex" | "claude"): BenchmarkPermissionPolicy {
+  return host === "codex"
+    ? "codex_workspace_write_shell_external_not_graphcraft_enforced"
+    : "claude_accept_edits_bash_external_not_graphcraft_enforced";
+}
 
 function safeFixturePath(root: string, path: string): string {
   if (isAbsolute(path) || path.split(/[\\/]/).includes(".."))
@@ -56,55 +66,149 @@ async function materializeTask(task: BenchmarkTask): Promise<{
   baseSha: string;
 }> {
   const repository = await mkdtemp(join(tmpdir(), `graphcraft-benchmark-${task.id}-`));
-  for (const [path, value] of Object.entries(task.initialFiles)) {
-    const target = safeFixturePath(repository, path);
-    await mkdir(dirname(target), { recursive: true });
-    await writeFile(target, value, "utf8");
-  }
-  const initialized = await runProcess("git", ["init", "-b", "main"], { cwd: repository });
-  if (initialized.exitCode !== 0) throw new Error(`Unable to initialize ${task.id}`);
-  await runProcess("git", ["add", "."], { cwd: repository });
-  const committed = await runProcess(
-    "git",
-    [
-      "-c",
-      "commit.gpgSign=false",
-      "-c",
-      "user.name=Graphcraft Benchmark",
-      "-c",
-      "user.email=benchmark@graphcraft.local",
-      "commit",
-      "-m",
-      `fixture ${task.id}`,
-    ],
-    {
-      cwd: repository,
-      env: {
-        GIT_AUTHOR_DATE: "2026-01-01T00:00:00Z",
-        GIT_COMMITTER_DATE: "2026-01-01T00:00:00Z",
+  try {
+    for (const [path, value] of Object.entries(task.initialFiles)) {
+      const target = safeFixturePath(repository, path);
+      await mkdir(dirname(target), { recursive: true });
+      await writeFile(target, value, "utf8");
+    }
+    const initialized = await runProcess("git", ["init", "-b", "main"], { cwd: repository });
+    if (initialized.exitCode !== 0) throw new Error(`Unable to initialize ${task.id}`);
+    const staged = await runProcess("git", ["add", "."], { cwd: repository });
+    if (staged.exitCode !== 0) throw new Error(`Unable to stage fixture ${task.id}`);
+    const committed = await runProcess(
+      "git",
+      [
+        "-c",
+        "commit.gpgSign=false",
+        "-c",
+        "user.name=Graphcraft Benchmark",
+        "-c",
+        "user.email=benchmark@graphcraft.local",
+        "commit",
+        "-m",
+        `fixture ${task.id}`,
+      ],
+      {
+        cwd: repository,
+        env: {
+          GIT_AUTHOR_DATE: "2026-01-01T00:00:00Z",
+          GIT_COMMITTER_DATE: "2026-01-01T00:00:00Z",
+        },
       },
-    },
+    );
+    if (committed.exitCode !== 0) throw new Error(`Unable to commit fixture ${task.id}`);
+    const head = await runProcess("git", ["rev-parse", "HEAD"], { cwd: repository });
+    if (head.exitCode !== 0 || !head.stdout.trim())
+      throw new Error(`Unable to hash fixture ${task.id}`);
+    return {
+      repository,
+      repositoryDigest: contentHash(task.initialFiles),
+      baseSha: head.stdout.trim(),
+    };
+  } catch (error) {
+    try {
+      await removeBenchmarkFixture(repository);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        `Benchmark fixture ${task.id} failed during setup and cleanup`,
+      );
+    }
+    throw error;
+  }
+}
+
+function benchmarkWorktreeRoot(repository: string): string {
+  return join(dirname(repository), `.${basename(repository)}-graphcraft-worktrees`);
+}
+
+async function removeBenchmarkFixture(repository: string): Promise<void> {
+  const failures: unknown[] = [];
+  for (const path of [benchmarkWorktreeRoot(repository), repository]) {
+    try {
+      await rm(path, { recursive: true, force: true });
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length > 0)
+    throw new AggregateError(failures, `Unable to remove benchmark fixture ${repository}`);
+}
+
+function expectedScorerFiles(task: BenchmarkTask) {
+  return [...new Set(task.checks.map(({ scorerPath }) => scorerPath))].sort().map((path) => ({
+    path,
+    kind: "regular_file" as const,
+    digest: contentHash(task.initialFiles[path]),
+  }));
+}
+
+async function observedScorerFiles(task: BenchmarkTask, repository: string) {
+  return await Promise.all(
+    [...new Set(task.checks.map(({ scorerPath }) => scorerPath))].sort().map(async (path) => {
+      const target = safeFixturePath(repository, path);
+      try {
+        const status = await lstat(target);
+        if (!status.isFile() || status.isSymbolicLink()) {
+          return { path, kind: status.isSymbolicLink() ? "symbolic_link" : "not_regular" };
+        }
+        return {
+          path,
+          kind: "regular_file" as const,
+          digest: contentHash(await readFile(target, "utf8")),
+        };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return { path, kind: "missing" };
+        throw error;
+      }
+    }),
   );
-  if (committed.exitCode !== 0) throw new Error(`Unable to commit fixture ${task.id}`);
-  const head = await runProcess("git", ["rev-parse", "HEAD"], { cwd: repository });
-  if (head.exitCode !== 0 || !head.stdout.trim())
-    throw new Error(`Unable to hash fixture ${task.id}`);
-  return {
-    repository,
-    repositoryDigest: contentHash(task.initialFiles),
-    baseSha: head.stdout.trim(),
-  };
+}
+
+function scorerDigest(
+  task: BenchmarkTask,
+  files: Awaited<ReturnType<typeof observedScorerFiles>> | ReturnType<typeof expectedScorerFiles>,
+): string {
+  return contentHash({ checks: task.checks, acceptance: task.acceptance, files });
 }
 
 async function scoreAcceptance(
   task: BenchmarkTask,
   repository: string,
   summaryEvidence = "",
-): Promise<Array<{ path: string; passed: boolean; summary: string }>> {
+): Promise<{
+  results: Array<{ path: string; passed: boolean; summary: string }>;
+  expectedScorerDigest: string;
+  observedScorerDigest: string;
+  scorerVerified: boolean;
+}> {
   const results: Array<{ path: string; passed: boolean; summary: string }> = [];
+  const expectedScorerDigest = scorerDigest(task, expectedScorerFiles(task));
+  const observedScorerDigest = scorerDigest(task, await observedScorerFiles(task, repository));
+  const scorerVerified = expectedScorerDigest === observedScorerDigest;
   for (const [index, check] of task.checks.entries()) {
+    if (!scorerVerified) {
+      results.push({
+        path: `$check:${index + 1}`,
+        passed: false,
+        summary: `immutable scorer ${check.scorerPath} changed from its fixture bytes`,
+      });
+      continue;
+    }
+    const scorerSource = task.initialFiles[check.scorerPath]!;
+    const sourcePath = safeFixturePath(repository, check.scorerPath);
+    const trustedScorerPath = join(
+      dirname(sourcePath),
+      `.graphcraft-benchmark-scorer-${randomUUID()}${extname(sourcePath)}`,
+    );
     try {
-      const result = await runProcess(check.command, check.args, {
+      await writeFile(trustedScorerPath, scorerSource, {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600,
+      });
+      const result = await runProcess(check.command, [trustedScorerPath, ...check.args], {
         cwd: repository,
         timeoutMs: check.timeoutMs,
       });
@@ -122,49 +226,59 @@ async function scoreAcceptance(
         passed: false,
         summary: `${check.command} could not run: ${error instanceof Error ? error.message : String(error)}`,
       });
+    } finally {
+      await rm(trustedScorerPath, { force: true });
     }
   }
   for (const assertion of task.acceptance) {
-    if (assertion.kind === "summary_contains") {
-      const passed = summaryEvidence.includes(assertion.value);
-      results.push({
-        path: "$summary",
-        passed,
-        summary: `run summary ${passed ? "contains" : "does not contain"} ${assertion.value}`,
-      });
-      continue;
-    }
-    const target = safeFixturePath(repository, assertion.path);
-    let exists = true;
     try {
-      await access(target);
-    } catch {
-      exists = false;
-    }
-    if (assertion.kind === "exists" || assertion.kind === "absent") {
-      const passed = assertion.kind === "exists" ? exists : !exists;
+      if (assertion.kind === "summary_contains") {
+        const passed = summaryEvidence.includes(assertion.value);
+        results.push({
+          path: "$summary",
+          passed,
+          summary: `run summary ${passed ? "contains" : "does not contain"} ${assertion.value}`,
+        });
+        continue;
+      }
+      const target = safeFixturePath(repository, assertion.path);
+      let exists = true;
+      try {
+        await access(target);
+      } catch {
+        exists = false;
+      }
+      if (assertion.kind === "exists" || assertion.kind === "absent") {
+        const passed = assertion.kind === "exists" ? exists : !exists;
+        results.push({
+          path: assertion.path,
+          passed,
+          summary: `${assertion.path} ${exists ? "exists" : "is absent"}`,
+        });
+        continue;
+      }
+      const value = exists ? await readFile(target, "utf8") : "";
+      const passed =
+        exists &&
+        (assertion.kind === "equals"
+          ? value === assertion.value
+          : assertion.kind === "not_contains"
+            ? !value.includes(assertion.value)
+            : value.includes(assertion.value));
       results.push({
         path: assertion.path,
         passed,
-        summary: `${assertion.path} ${exists ? "exists" : "is absent"}`,
+        summary: `${assertion.path} ${passed ? "satisfies" : "does not satisfy"} ${assertion.kind}`,
       });
-      continue;
+    } catch (error) {
+      results.push({
+        path: assertion.kind === "summary_contains" ? "$summary" : assertion.path,
+        passed: false,
+        summary: `acceptance assertion could not be evaluated: ${error instanceof Error ? error.message : String(error)}`,
+      });
     }
-    const value = exists ? await readFile(target, "utf8") : "";
-    const passed =
-      exists &&
-      (assertion.kind === "equals"
-        ? value === assertion.value
-        : assertion.kind === "not_contains"
-          ? !value.includes(assertion.value)
-          : value.includes(assertion.value));
-    results.push({
-      path: assertion.path,
-      passed,
-      summary: `${assertion.path} ${passed ? "satisfies" : "does not satisfy"} ${assertion.kind}`,
-    });
   }
-  return results;
+  return { results, expectedScorerDigest, observedScorerDigest, scorerVerified };
 }
 
 function usageSummary(usages: TokenUsage[]): {
@@ -178,7 +292,11 @@ function usageSummary(usages: TokenUsage[]): {
       ["estimated", "unavailable", "legacy_unknown"].includes(usage.availability[dimension]),
     )
     .map((dimension) => `${dimension}:${usage.availability[dimension]}`);
-  return { usage, reconciled: limitations.length === 0, limitations };
+  return {
+    usage,
+    reconciled: ["reported", "derived"].includes(usage.availability.total),
+    limitations,
+  };
 }
 
 async function runBaselineTrial(input: {
@@ -210,7 +328,7 @@ async function runBaselineTrial(input: {
     acceptanceAnchors: [
       {
         id: "benchmark-outcome",
-        description: "The task outcome must satisfy an external deterministic scorer",
+        description: "The task outcome must satisfy an immutable fixture-bound scorer",
         owner: "held_out_eval",
         evidenceSource: "benchmark harness",
         mutationPolicy: "immutable",
@@ -248,13 +366,9 @@ async function runBaselineTrial(input: {
     resultStatus = "error";
     failureTrace.push(error instanceof Error ? error.message : String(error));
   }
-  const acceptance = await scoreAcceptance(
-    input.task,
-    input.repository,
-    summaryEvidence.join("\n"),
-  );
+  const score = await scoreAcceptance(input.task, input.repository, summaryEvidence.join("\n"));
   failureTrace.push(
-    ...acceptance.filter(({ passed }) => !passed).map(({ summary }) => `acceptance: ${summary}`),
+    ...score.results.filter(({ passed }) => !passed).map(({ summary }) => `acceptance: ${summary}`),
   );
   const tokens = usageSummary(usages);
   return BenchmarkTrialResultSchema.parse({
@@ -262,16 +376,18 @@ async function runBaselineTrial(input: {
     hostVersion: input.hostVersion,
     modelPolicy: input.policy.model,
     effortPolicy: input.policy.effort,
-    permissionPolicy,
-    acceptanceScorerDigest: contentHash({
-      checks: input.task.checks,
-      acceptance: input.task.acceptance,
-    }),
+    permissionPolicy: benchmarkPermissionPolicy(input.trial.host),
+    acceptanceScorerDigest: score.expectedScorerDigest,
+    observedScorerDigest: score.observedScorerDigest,
+    scorerVerified: score.scorerVerified,
     repositoryDigest: input.repositoryDigest,
     baseSha: input.baseSha,
     executionStatus: resultStatus,
-    accepted: resultStatus === "completed" && acceptance.every(({ passed }) => passed),
-    acceptance,
+    accepted:
+      resultStatus === "completed" &&
+      score.scorerVerified &&
+      score.results.every(({ passed }) => passed),
+    acceptance: score.results,
     usage: tokens.usage,
     usageReconciled: tokens.reconciled,
     limitations: tokens.limitations,
@@ -329,25 +445,27 @@ async function runGraphcraftTrial(input: {
   } catch (error) {
     failureTrace.push(error instanceof Error ? error.message : String(error));
   }
-  const acceptance = await scoreAcceptance(input.task, acceptanceRepository, summaryEvidence);
+  const score = await scoreAcceptance(input.task, acceptanceRepository, summaryEvidence);
   failureTrace.push(
-    ...acceptance.filter(({ passed }) => !passed).map(({ summary }) => `acceptance: ${summary}`),
+    ...score.results.filter(({ passed }) => !passed).map(({ summary }) => `acceptance: ${summary}`),
   );
   return BenchmarkTrialResultSchema.parse({
     trial: input.trial,
     hostVersion: input.hostVersion,
     modelPolicy: input.policy.model,
     effortPolicy: input.policy.effort,
-    permissionPolicy,
-    acceptanceScorerDigest: contentHash({
-      checks: input.task.checks,
-      acceptance: input.task.acceptance,
-    }),
+    permissionPolicy: benchmarkPermissionPolicy(input.trial.host),
+    acceptanceScorerDigest: score.expectedScorerDigest,
+    observedScorerDigest: score.observedScorerDigest,
+    scorerVerified: score.scorerVerified,
     repositoryDigest: input.repositoryDigest,
     baseSha: input.baseSha,
     executionStatus,
-    accepted: executionStatus === "completed" && acceptance.every(({ passed }) => passed),
-    acceptance,
+    accepted:
+      executionStatus === "completed" &&
+      score.scorerVerified &&
+      score.results.every(({ passed }) => passed),
+    acceptance: score.results,
     usage: tokens.usage,
     usageReconciled: tokens.reconciled,
     limitations: tokens.limitations,
@@ -362,12 +480,15 @@ export async function runBenchmark(input: {
   hosts: Array<"codex" | "claude">;
   adapters: Partial<Record<"codex" | "claude", HostAdapter>>;
   policies: Partial<Record<"codex" | "claude", HostExecutionPolicy>>;
+  graphcraftVersion: string;
   seed: string;
   repetitions?: number;
   outputPath: string;
   observer?: (message: string) => void;
 }): Promise<{ outputPath: string; report: BenchmarkReport }> {
   const suite = BenchmarkSuiteSchema.parse(input.suite);
+  const graphcraftVersion = input.graphcraftVersion?.trim();
+  if (!graphcraftVersion) throw new Error("A Graphcraft version identity is required");
   const hosts = [...new Set(input.hosts)].sort() as Array<"codex" | "claude">;
   if (hosts.length === 0) throw new Error("A benchmark requires at least one host");
   const policies: Partial<Record<"codex" | "claude", HostExecutionPolicy>> = {};
@@ -384,6 +505,8 @@ export async function runBenchmark(input: {
   const effortPolicy = policies[hosts[0]!]!.effort;
   const modelPolicy: { codex?: string; claude?: string } = {};
   for (const host of hosts) modelPolicy[host] = policies[host]!.model;
+  const permissionPolicy: Partial<Record<"codex" | "claude", BenchmarkPermissionPolicy>> = {};
+  for (const host of hosts) permissionPolicy[host] = benchmarkPermissionPolicy(host);
   const schedule = createBenchmarkSchedule({
     suite,
     hosts,
@@ -396,6 +519,7 @@ export async function runBenchmark(input: {
     platform: process.platform,
     architecture: process.arch,
     nodeVersion: process.version,
+    graphcraftVersion,
   };
   const byTask = new Map(suite.tasks.map((task) => [task.id, task]));
   let startedAt = new Date().toISOString();
@@ -403,6 +527,10 @@ export async function runBenchmark(input: {
   let existingReport: BenchmarkReport | undefined;
   try {
     const existing = BenchmarkReportSchema.parse(JSON.parse(await readFile(outputPath, "utf8")));
+    if (existing.environment.graphcraftVersion !== graphcraftVersion)
+      throw new Error(
+        "The existing benchmark report Graphcraft version identity does not match this execution",
+      );
     if (
       existing.suite.id !== suite.id ||
       existing.suite.version !== suite.version ||
@@ -410,6 +538,7 @@ export async function runBenchmark(input: {
       existing.seed !== input.seed ||
       JSON.stringify(existing.modelPolicy) !== JSON.stringify(modelPolicy) ||
       existing.effortPolicy !== effortPolicy ||
+      JSON.stringify(existing.permissionPolicy) !== JSON.stringify(permissionPolicy) ||
       JSON.stringify(existing.environment) !== JSON.stringify(environment) ||
       JSON.stringify(existing.schedule) !== JSON.stringify(schedule)
     )
@@ -436,29 +565,34 @@ export async function runBenchmark(input: {
           JSON.stringify(schedule.find(({ trialId }) => trialId === trial.trialId)) ||
         resultModel !== policies[trial.host]!.model ||
         resultEffort !== policies[trial.host]!.effort ||
+        result.permissionPolicy !== permissionPolicy[trial.host] ||
         result.repositoryDigest !== contentHash(byTask.get(trial.taskId)!.initialFiles) ||
         result.acceptanceScorerDigest !==
-          contentHash({
-            checks: byTask.get(trial.taskId)!.checks,
-            acceptance: byTask.get(trial.taskId)!.acceptance,
-          }) ||
+          scorerDigest(byTask.get(trial.taskId)!, expectedScorerFiles(byTask.get(trial.taskId)!)) ||
+        result.scorerVerified !== (result.acceptanceScorerDigest === result.observedScorerDigest) ||
         result.acceptance.length !==
           byTask.get(trial.taskId)!.checks.length + byTask.get(trial.taskId)!.acceptance.length ||
         result.accepted !==
           (result.executionStatus === "completed" &&
+            result.scorerVerified &&
             result.acceptance.every(({ passed }) => passed)),
     )
   )
     throw new Error("The existing benchmark report contains mismatched trial controls");
+  if (existingReport?.status === "complete" && results.length !== schedule.length)
+    throw new Error("The complete benchmark report does not cover the exact current schedule");
+  if (
+    existingReport &&
+    contentHash(existingReport.summary) !== contentHash(summarizeBenchmark(results, schedule))
+  )
+    throw new Error("The existing benchmark report summary does not match its trial evidence");
+  if (existingReport && contentHash(existingReport.limitations) !== contentHash(reportLimitations))
+    throw new Error("The existing benchmark report limitations do not match this harness");
   if (existingReport?.status === "complete") return { outputPath, report: existingReport };
-  const limitations = [
-    "Stable efficiency claims require at least three complete trials per task and host.",
-    "Blinded human defect review remains outside this deterministic harness slice.",
-  ];
   const persist = async (status: "running" | "complete"): Promise<BenchmarkReport> => {
     const report = BenchmarkReportSchema.parse(
       redactValue({
-        schemaVersion: 1,
+        schemaVersion: 2,
         status,
         suite: { id: suite.id, version: suite.version, digest: suiteDigest },
         startedAt,
@@ -470,7 +604,7 @@ export async function runBenchmark(input: {
         permissionPolicy,
         scorerPolicy,
         environment,
-        limitations,
+        limitations: reportLimitations,
         schedule,
         results,
         summary: summarizeBenchmark(results, schedule),
@@ -523,7 +657,7 @@ export async function runBenchmark(input: {
             }),
       );
     } finally {
-      await rm(fixture.repository, { recursive: true, force: true });
+      await removeBenchmarkFixture(fixture.repository);
     }
     completedTrialIds.add(trial.trialId);
     await persist("running");
