@@ -42,6 +42,7 @@ import { createRunWorkspace, discoverPlanningEvidence } from "./repository.ts";
 import { RunStore } from "./store.ts";
 import { amendRunGraph } from "./amendment.ts";
 import { assessRunProgress, createProgressDecisionPacket } from "./trajectory.ts";
+import type { SideEffectBoundary } from "./side-effect.ts";
 
 const execFileAsync = promisify(execFile);
 const temporaryRoots: string[] = [];
@@ -1712,7 +1713,141 @@ describe("durable runtime", () => {
 
     expect(state.status).toBe("completed");
     expect(state.nodes.commit?.status).toBe("accepted");
+    expect(state.sideEffects).toMatchObject([
+      {
+        status: "confirmed",
+        claim: { kind: "git_commit", nodeId: "commit" },
+        result: { sha: worktreeHead.trim() },
+      },
+    ]);
     expect(worktreeHead.trim()).not.toBe(mainHead.trim());
+    const { stdout: message } = await execFileAsync("git", ["show", "-s", "--format=%B"], {
+      cwd: workspace.path,
+    });
+    expect(message).toContain(`Graphcraft-Action: ${state.sideEffects[0]!.claim.idempotencyKey}`);
+    const sideEffectEvents = (await created.store.loadEvents()).filter(({ type }) =>
+      type.startsWith("side_effect."),
+    );
+    expect(sideEffectEvents.map(({ type }) => type)).toEqual([
+      "side_effect.claimed",
+      "side_effect.reconciled",
+      "side_effect.reconciled",
+      "side_effect.confirmed",
+    ]);
+  });
+
+  it("reconciles one atomic commit across every claim-act-confirm interruption boundary", async () => {
+    const faultPoints: SideEffectBoundary[] = [
+      "before_claim",
+      "after_claim",
+      "after_precondition_reconcile",
+      "before_act",
+      "after_action_prepare",
+      "after_action_command",
+      "after_act",
+      "after_confirmation_reconcile",
+      "after_confirm",
+      "after_node_acceptance",
+    ];
+
+    for (const faultPoint of faultPoints) {
+      const repository = await createRepository();
+      const adapter = new FakeAdapter(async (request) => {
+        if (request.capsule.nodeId === "implement")
+          await writeFile(join(request.repositoryPath, "feature.txt"), "committed\n");
+      });
+      const created = await createRun(
+        "Implement a substantial feature across the fixture and commit the verified result",
+        { cwd: repository },
+      );
+      let armed = true;
+      await expect(
+        executeRun({
+          store: created.store,
+          adapter,
+          approve: true,
+          sideEffectBoundary: (point) => {
+            if (armed && point === faultPoint) {
+              armed = false;
+              throw new Error(`Injected termination at ${point}`);
+            }
+          },
+        }),
+        faultPoint,
+      ).rejects.toThrow(`Side-effect execution interrupted after ${faultPoint}`);
+      expect(armed, faultPoint).toBe(false);
+
+      const completed = await executeRun({ store: created.store, adapter });
+      const workspace = await created.store.loadWorkspace<{ path: string }>();
+      const events = await created.store.loadEvents();
+      const { stdout: commitCount } = await execFileAsync(
+        "git",
+        ["rev-list", "--count", `${(await created.store.loadContract()).repository.baseSha}..HEAD`],
+        { cwd: workspace.path },
+      );
+
+      expect(completed.status, faultPoint).toBe("completed");
+      expect(completed.sideEffects, faultPoint).toHaveLength(1);
+      expect(completed.sideEffects[0], faultPoint).toMatchObject({
+        status: "confirmed",
+        claim: { kind: "git_commit", nodeId: "commit" },
+      });
+      expect(commitCount.trim(), faultPoint).toBe("1");
+      expect(
+        adapter.calls.filter((nodeId) => nodeId === "implement"),
+        faultPoint,
+      ).toHaveLength(1);
+      expect(
+        events.filter(({ type }) => type === "side_effect.claimed"),
+        faultPoint,
+      ).toHaveLength(1);
+      expect(
+        events.filter(({ type }) => type === "side_effect.confirmed"),
+        faultPoint,
+      ).toHaveLength(1);
+      expect(
+        events.filter(({ type, data }) => type === "node.accepted" && data.nodeId === "commit"),
+        faultPoint,
+      ).toHaveLength(1);
+    }
+  }, 60_000);
+
+  it("refuses to retry a claimed commit after unrelated Git state replaces its precondition", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "committed\n");
+    });
+    const created = await createRun(
+      "Implement a substantial feature across the fixture and commit the verified result",
+      { cwd: repository },
+    );
+    await expect(
+      executeRun({
+        store: created.store,
+        adapter,
+        approve: true,
+        sideEffectBoundary: (point) => {
+          if (point === "after_claim") throw new Error("Injected termination after claim");
+        },
+      }),
+    ).rejects.toThrow("Side-effect execution interrupted after after_claim");
+
+    const workspace = await created.store.loadWorkspace<{ path: string }>();
+    await execFileAsync("git", ["add", "-A"], { cwd: workspace.path });
+    await execFileAsync("git", ["commit", "-m", "unrelated external commit"], {
+      cwd: workspace.path,
+    });
+    const state = await executeRun({ store: created.store, adapter });
+    const { stdout: message } = await execFileAsync("git", ["show", "-s", "--format=%B"], {
+      cwd: workspace.path,
+    });
+
+    expect(state.status).toBe("blocked");
+    expect(state.nodes.commit?.status).toBe("failed");
+    expect(state.sideEffects).toMatchObject([{ status: "uncertain", retryable: false }]);
+    expect(message).toContain("unrelated external commit");
+    expect(message).not.toContain("Graphcraft-Action:");
   });
 
   it("rebuilds a corrupted materialized state from hashed events", async () => {

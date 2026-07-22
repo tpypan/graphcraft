@@ -1,12 +1,28 @@
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { appendFile, lstat, mkdir, readFile, readlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { runProcess } from "@graphcraft/probes";
-import type { RepositoryIdentity, RepositoryPlanningEvidence, RunContract } from "@graphcraft/core";
+import {
+  SideEffectClaimSchema,
+  contentHash,
+  type RepositoryIdentity,
+  type RepositoryPlanningEvidence,
+  type RunContract,
+  type SideEffectClaim,
+} from "@graphcraft/core";
+import {
+  crossSideEffectBoundary,
+  type SideEffectBoundary,
+  type SideEffectReconciliation,
+} from "./side-effect.ts";
 
-async function git(repositoryPath: string, args: string[]): Promise<string> {
+async function gitRaw(repositoryPath: string, args: string[]): Promise<string> {
   const result = await runProcess("git", args, { cwd: repositoryPath, timeoutMs: 120_000 });
   if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `git ${args[0]} failed`);
-  return result.stdout.trim();
+  return result.stdout;
+}
+
+async function git(repositoryPath: string, args: string[]): Promise<string> {
+  return (await gitRaw(repositoryPath, args)).trim();
 }
 
 export async function discoverRepository(cwd: string): Promise<RepositoryIdentity> {
@@ -241,11 +257,163 @@ export async function createRunWorkspace(contract: RunContract): Promise<RunWork
   return { path, branch, created: true };
 }
 
-export async function createAtomicCommit(workspace: RunWorkspace, task: string): Promise<string> {
+interface CommitPrecondition {
+  expectedHead: string;
+  branch: string;
+  contentDigest: string;
+}
+
+async function commitContentDigest(repositoryPath: string): Promise<string> {
+  const [changedOutput, untrackedOutput] = await Promise.all([
+    gitRaw(repositoryPath, ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"]),
+    gitRaw(repositoryPath, ["ls-files", "--others", "--exclude-standard", "-z"]),
+  ]);
+  const paths = [
+    ...new Set(
+      [changedOutput, untrackedOutput].flatMap((output) => output.split("\0").filter(Boolean)),
+    ),
+  ].sort();
+  const changes = await Promise.all(
+    paths.map(async (path) => {
+      const absolutePath = join(repositoryPath, path);
+      const stats = await lstat(absolutePath).catch(() => undefined);
+      if (!stats) return { path, kind: "absent" };
+      if (stats.isSymbolicLink())
+        return { path, kind: "symlink", target: await readlink(absolutePath) };
+      if (stats.isFile())
+        return {
+          path,
+          kind: "file",
+          executable: (stats.mode & 0o111) !== 0,
+          contents: (await readFile(absolutePath)).toString("base64"),
+        };
+      return { path, kind: "other" };
+    }),
+  );
+  return contentHash(changes);
+}
+
+async function captureCommitPrecondition(workspace: RunWorkspace): Promise<CommitPrecondition> {
+  const [expectedHead, branch, contentDigest] = await Promise.all([
+    git(workspace.path, ["rev-parse", "HEAD"]),
+    git(workspace.path, ["branch", "--show-current"]),
+    commitContentDigest(workspace.path),
+  ]);
+  if (!branch) throw new Error("The Graphcraft worktree is not on a named branch");
+  return { expectedHead, branch, contentDigest };
+}
+
+function commitPrecondition(claim: SideEffectClaim): CommitPrecondition {
+  const expectedHead = claim.precondition.expectedHead;
+  const branch = claim.precondition.branch;
+  const contentDigest = claim.precondition.contentDigest;
+  if (
+    typeof expectedHead !== "string" ||
+    typeof branch !== "string" ||
+    typeof contentDigest !== "string"
+  )
+    throw new Error(`Commit claim ${claim.actionId} has an invalid precondition`);
+  return { expectedHead, branch, contentDigest };
+}
+
+export async function createAtomicCommitClaim(
+  workspace: RunWorkspace,
+  runId: string,
+  nodeId: string,
+): Promise<SideEffectClaim> {
+  const precondition = await captureCommitPrecondition(workspace);
+  const actionId = contentHash({ schemaVersion: 1, runId, nodeId, kind: "git_commit" });
+  return SideEffectClaimSchema.parse({
+    schemaVersion: 1,
+    actionId,
+    idempotencyKey: `graphcraft-${actionId}`,
+    nodeId,
+    kind: "git_commit",
+    target: precondition.branch,
+    precondition,
+    claimedAt: new Date().toISOString(),
+  });
+}
+
+export async function performAtomicCommit(
+  workspace: RunWorkspace,
+  claim: SideEffectClaim,
+  task: string,
+  boundary?: (point: SideEffectBoundary) => void | Promise<void>,
+): Promise<Record<string, unknown>> {
+  if (claim.kind !== "git_commit") throw new Error(`Side effect ${claim.actionId} is not a commit`);
+  const expected = commitPrecondition(claim);
+  const current = await captureCommitPrecondition(workspace);
+  if (
+    current.expectedHead !== expected.expectedHead ||
+    current.branch !== expected.branch ||
+    current.contentDigest !== expected.contentDigest
+  )
+    throw new Error(`Commit precondition changed for side effect ${claim.actionId}`);
   const status = await git(workspace.path, ["status", "--porcelain=v1"]);
   if (!status) throw new Error("No accepted changes are available to commit");
   await git(workspace.path, ["add", "-A"]);
+  await crossSideEffectBoundary(boundary, "after_action_prepare");
   const summary = task.replace(/\s+/g, " ").slice(0, 64);
-  await git(workspace.path, ["commit", "-m", `graphcraft: ${summary}`]);
-  return await git(workspace.path, ["rev-parse", "HEAD"]);
+  await git(workspace.path, [
+    "commit",
+    "-m",
+    `graphcraft: ${summary}`,
+    "-m",
+    `Graphcraft-Action: ${claim.idempotencyKey}`,
+  ]);
+  await crossSideEffectBoundary(boundary, "after_action_command");
+  return { sha: await git(workspace.path, ["rev-parse", "HEAD"]), branch: expected.branch };
+}
+
+export async function reconcileAtomicCommit(
+  workspace: RunWorkspace,
+  claim: SideEffectClaim,
+): Promise<SideEffectReconciliation> {
+  if (claim.kind !== "git_commit") throw new Error(`Side effect ${claim.actionId} is not a commit`);
+  const expected = commitPrecondition(claim);
+  const [currentHead, currentBranch] = await Promise.all([
+    git(workspace.path, ["rev-parse", "HEAD"]),
+    git(workspace.path, ["branch", "--show-current"]),
+  ]);
+  if (currentBranch !== expected.branch || currentBranch !== claim.target)
+    return {
+      status: "unknown",
+      evidence: [
+        `Expected branch ${expected.branch}; observed ${currentBranch || "detached HEAD"}`,
+      ],
+    };
+  if (currentHead === expected.expectedHead) {
+    const currentDigest = await commitContentDigest(workspace.path);
+    return currentDigest === expected.contentDigest
+      ? {
+          status: "not_applied",
+          evidence: [`HEAD remains ${currentHead} and the claimed content digest is unchanged`],
+        }
+      : {
+          status: "unknown",
+          evidence: ["HEAD is unchanged but the claimed repository content changed"],
+        };
+  }
+  const [parent, message] = await Promise.all([
+    git(workspace.path, ["rev-parse", `${currentHead}^`]).catch(() => ""),
+    git(workspace.path, ["show", "-s", "--format=%B", currentHead]),
+  ]);
+  if (
+    parent === expected.expectedHead &&
+    message.split("\n").includes(`Graphcraft-Action: ${claim.idempotencyKey}`)
+  )
+    return {
+      status: "applied",
+      result: { sha: currentHead, branch: currentBranch },
+      evidence: [
+        `Commit ${currentHead} directly follows the claimed HEAD and carries the idempotency trailer`,
+      ],
+    };
+  return {
+    status: "unknown",
+    evidence: [
+      `HEAD moved from ${expected.expectedHead} to ${currentHead} without the claimed commit identity`,
+    ],
+  };
 }

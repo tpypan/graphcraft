@@ -272,6 +272,7 @@ export function stateView(state: RunState, contract: RunContract): Record<string
     tokens: state.tokens,
     tokenReport: tokenCostReport(state.tokenLedger),
     optimizationDecisions: state.optimizationDecisions,
+    sideEffects: state.sideEffects,
     stopReason: state.stopReason,
     updatedAt: state.updatedAt,
   };

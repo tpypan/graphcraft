@@ -61,6 +61,7 @@ Graphcraft displays a concise run contract before doing work. Use `--yes` only w
 - Optimizes the approved shape deterministically by fusing redundant bounded reads, splitting safely partitionable broad writes, recording concurrency choices, and reusing a durable host context only for tightly dependent same-authority reasoning with reconciled cost evidence.
 - Checkpoints host sessions and results during execution, resumes the same host session when safe, and falls back to repository evidence when switching hosts or native continuation is unavailable.
 - Accepts pause or stop from another CLI process, terminates the active child with bounded escalation, and records the exact cause and outcome before releasing the run lock.
+- Journals atomic commits as durable claim–act–confirm side effects with exact HEAD, branch, and changed-content preconditions plus an idempotency trailer, so restart reconciles Git truth instead of creating a duplicate commit.
 - Tracks cached, uncached, output, reasoning, and total tokens with explicit provider availability, and reports planning, worker, repair, semantic-verification, and Graphcraft-overhead costs by phase and node.
 - Provides an experimental matched benchmark harness with a versioned ten-task public corpus, fresh deterministic fixtures, explicit model/effort controls, executable external scoring, atomic checkpoints, and resumable randomized trials.
 

@@ -61,12 +61,20 @@ import {
   type ControlEvaluation,
 } from "./governance.ts";
 import {
-  createAtomicCommit,
+  createAtomicCommitClaim,
   discoverPlanningEvidence,
   createRunWorkspace,
   discoverRepository,
+  performAtomicCommit,
+  reconcileAtomicCommit,
   type RunWorkspace,
 } from "./repository.ts";
+import {
+  SideEffectBoundaryInterruption,
+  crossSideEffectBoundary,
+  executeSideEffect,
+  type SideEffectBoundary,
+} from "./side-effect.ts";
 import { RunStore } from "./store.ts";
 import { groundedRelevantPaths, prepareWorkerContext } from "./context.ts";
 import {
@@ -1379,6 +1387,7 @@ export async function executeRun(input: {
   observer?: RunObserver;
   signal?: AbortSignal;
   maxWorkers?: 1 | 2;
+  sideEffectBoundary?: (point: SideEffectBoundary) => void | Promise<void>;
 }): Promise<RunState> {
   const externalSignal = input.signal ?? new AbortController().signal;
   const contract = await input.store.loadContract();
@@ -1923,9 +1932,27 @@ export async function executeRun(input: {
           return await input.store.loadState();
         }
         try {
-          const sha = await createAtomicCommit(workspace, contract.task);
-          await input.store.append("runtime", "node.accepted", { nodeId: current.id, sha });
+          const proposedClaim = await createAtomicCommitClaim(
+            workspace,
+            contract.runId,
+            current.id,
+          );
+          const result = await executeSideEffect({
+            store: input.store,
+            claim: proposedClaim,
+            reconcile: async (claim) => await reconcileAtomicCommit(workspace, claim),
+            act: async (claim) =>
+              await performAtomicCommit(workspace, claim, contract.task, input.sideEffectBoundary),
+            ...(input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}),
+          });
+          await input.store.append("runtime", "node.accepted", {
+            nodeId: current.id,
+            sha: result.sha,
+            sideEffectActionId: proposedClaim.actionId,
+          });
+          await crossSideEffectBoundary(input.sideEffectBoundary, "after_node_acceptance");
         } catch (error) {
+          if (error instanceof SideEffectBoundaryInterruption) throw error;
           await input.store.append("runtime", "node.failed", {
             nodeId: current.id,
             reason: (error as Error).message,

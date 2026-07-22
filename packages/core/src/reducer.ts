@@ -7,6 +7,8 @@ import {
   ProgressTrajectoryEntrySchema,
   RunContractSchema,
   RunStateSchema,
+  SideEffectClaimSchema,
+  SideEffectJournalEntrySchema,
   TokenAttributionPhaseSchema,
   TokenLedgerEntrySchema,
   TokenUsageSchema,
@@ -19,6 +21,13 @@ function requiredString(data: Record<string, unknown>, key: string): string {
   if (typeof value !== "string" || value.length === 0)
     throw new Error(`Event data.${key} must be a string`);
   return value;
+}
+
+function requiredRecord(data: Record<string, unknown>, key: string): Record<string, unknown> {
+  const value = data[key];
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    throw new Error(`Event data.${key} must be an object`);
+  return value as Record<string, unknown>;
 }
 
 export function reduceEvents(events: RunEvent[]): RunState {
@@ -53,6 +62,7 @@ export function reduceEvents(events: RunEvent[]): RunState {
         tokens: unavailableTokenUsage(),
         tokenLedger: [],
         optimizationDecisions: [],
+        sideEffects: [],
         controlDecisions: [],
         updatedAt: event.timestamp,
       };
@@ -171,6 +181,59 @@ export function reduceEvents(events: RunEvent[]): RunState {
         state.optimizationDecisions.push(OptimizationDecisionSchema.parse(data.decision));
         state.optimizationDecisions = state.optimizationDecisions.slice(-200);
         break;
+      case "side_effect.claimed": {
+        const claim = SideEffectClaimSchema.parse(data.claim);
+        if (state.sideEffects.some(({ claim: existing }) => existing.actionId === claim.actionId))
+          throw new Error(`Side effect ${claim.actionId} was claimed more than once`);
+        state.sideEffects.push(
+          SideEffectJournalEntrySchema.parse({
+            claim,
+            status: "claimed",
+            reconciliationAttempts: 0,
+            updatedAt: event.timestamp,
+          }),
+        );
+        break;
+      }
+      case "side_effect.reconciled": {
+        const actionId = requiredString(data, "actionId");
+        const entry = state.sideEffects.find(({ claim }) => claim.actionId === actionId);
+        if (!entry) throw new Error(`Unknown side effect ${actionId}`);
+        const outcome = requiredString(data, "outcome");
+        if (!["applied", "not_applied", "unknown"].includes(outcome))
+          throw new Error(`Unsupported side-effect reconciliation outcome ${outcome}`);
+        entry.reconciliationAttempts += 1;
+        entry.status = outcome === "unknown" ? "uncertain" : "claimed";
+        entry.evidence = Array.isArray(data.evidence)
+          ? data.evidence.map((value) => String(value))
+          : [];
+        entry.updatedAt = event.timestamp;
+        break;
+      }
+      case "side_effect.confirmed": {
+        const actionId = requiredString(data, "actionId");
+        const entry = state.sideEffects.find(({ claim }) => claim.actionId === actionId);
+        if (!entry) throw new Error(`Unknown side effect ${actionId}`);
+        entry.status = "confirmed";
+        entry.result = requiredRecord(data, "result");
+        entry.evidence = Array.isArray(data.evidence)
+          ? data.evidence.map((value) => String(value))
+          : entry.evidence;
+        entry.failure = undefined;
+        entry.retryable = undefined;
+        entry.updatedAt = event.timestamp;
+        break;
+      }
+      case "side_effect.failed": {
+        const actionId = requiredString(data, "actionId");
+        const entry = state.sideEffects.find(({ claim }) => claim.actionId === actionId);
+        if (!entry) throw new Error(`Unknown side effect ${actionId}`);
+        entry.status = data.uncertain === true ? "uncertain" : "failed";
+        entry.failure = requiredString(data, "reason");
+        entry.retryable = data.retryable === true;
+        entry.updatedAt = event.timestamp;
+        break;
+      }
       case "graph.amended": {
         const addedNodeIds = Array.isArray(data.addedNodeIds)
           ? data.addedNodeIds.map((value) => String(value))

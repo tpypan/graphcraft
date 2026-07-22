@@ -454,6 +454,36 @@ export const OptimizationDecisionSchema = z.strictObject({
   costBasis: z.enum(["deterministic_static", "durable_receipts"]),
 });
 
+export const SideEffectKindSchema = z.enum([
+  "git_commit",
+  "git_push",
+  "github_pr_create",
+  "github_pr_comment",
+  "github_check_rerun",
+]);
+
+export const SideEffectClaimSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  actionId: z.string().regex(/^[a-f0-9]{64}$/),
+  idempotencyKey: z.string().min(1),
+  nodeId: z.string().min(1),
+  kind: SideEffectKindSchema,
+  target: z.string().min(1),
+  precondition: z.record(z.string(), z.unknown()),
+  claimedAt: z.iso.datetime(),
+});
+
+export const SideEffectJournalEntrySchema = z.strictObject({
+  claim: SideEffectClaimSchema,
+  status: z.enum(["claimed", "confirmed", "failed", "uncertain"]),
+  reconciliationAttempts: z.number().int().nonnegative(),
+  result: z.record(z.string(), z.unknown()).optional(),
+  evidence: z.array(z.string()).default([]),
+  failure: z.string().optional(),
+  retryable: z.boolean().optional(),
+  updatedAt: z.iso.datetime(),
+});
+
 export const WorkerResultSchema = z.strictObject({
   status: z.enum(["completed", "blocked", "failed"]),
   summary: z.string(),
@@ -614,6 +644,10 @@ export const RunEventTypeSchema = z.enum([
   "semantic.verdict",
   "tokens.recorded",
   "optimizer.decided",
+  "side_effect.claimed",
+  "side_effect.reconciled",
+  "side_effect.confirmed",
+  "side_effect.failed",
   "graph.amended",
 ]);
 
@@ -659,6 +693,7 @@ export const RunStateSchema = z.strictObject({
   tokens: TokenUsageSchema,
   tokenLedger: z.array(TokenLedgerEntrySchema).default([]),
   optimizationDecisions: z.array(OptimizationDecisionSchema).default([]),
+  sideEffects: z.array(SideEffectJournalEntrySchema).default([]),
   controlDecisions: z.array(ControlDecisionSchema),
   pendingDecision: ControlDecisionPacketSchema.optional(),
   stopReason: z.string().optional(),
@@ -720,6 +755,9 @@ export type TokenAvailabilityStatus = z.infer<typeof TokenAvailabilityStatusSche
 export type TokenAttributionPhase = z.infer<typeof TokenAttributionPhaseSchema>;
 export type TokenLedgerEntry = z.infer<typeof TokenLedgerEntrySchema>;
 export type OptimizationDecision = z.infer<typeof OptimizationDecisionSchema>;
+export type SideEffectKind = z.infer<typeof SideEffectKindSchema>;
+export type SideEffectClaim = z.infer<typeof SideEffectClaimSchema>;
+export type SideEffectJournalEntry = z.infer<typeof SideEffectJournalEntrySchema>;
 export type WorkerResult = z.infer<typeof WorkerResultSchema>;
 export type ContextCapsule = z.infer<typeof ContextCapsuleSchema>;
 export type ContextSelectionReceipt = z.infer<typeof ContextSelectionReceiptSchema>;

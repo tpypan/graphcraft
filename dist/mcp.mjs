@@ -31462,6 +31462,33 @@ var OptimizationDecisionSchema = external_exports.strictObject({
   }),
   costBasis: external_exports.enum(["deterministic_static", "durable_receipts"])
 });
+var SideEffectKindSchema = external_exports.enum([
+  "git_commit",
+  "git_push",
+  "github_pr_create",
+  "github_pr_comment",
+  "github_check_rerun"
+]);
+var SideEffectClaimSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  actionId: external_exports.string().regex(/^[a-f0-9]{64}$/),
+  idempotencyKey: external_exports.string().min(1),
+  nodeId: external_exports.string().min(1),
+  kind: SideEffectKindSchema,
+  target: external_exports.string().min(1),
+  precondition: external_exports.record(external_exports.string(), external_exports.unknown()),
+  claimedAt: external_exports.iso.datetime()
+});
+var SideEffectJournalEntrySchema = external_exports.strictObject({
+  claim: SideEffectClaimSchema,
+  status: external_exports.enum(["claimed", "confirmed", "failed", "uncertain"]),
+  reconciliationAttempts: external_exports.number().int().nonnegative(),
+  result: external_exports.record(external_exports.string(), external_exports.unknown()).optional(),
+  evidence: external_exports.array(external_exports.string()).default([]),
+  failure: external_exports.string().optional(),
+  retryable: external_exports.boolean().optional(),
+  updatedAt: external_exports.iso.datetime()
+});
 var WorkerResultSchema = external_exports.strictObject({
   status: external_exports.enum(["completed", "blocked", "failed"]),
   summary: external_exports.string(),
@@ -31612,6 +31639,10 @@ var RunEventTypeSchema = external_exports.enum([
   "semantic.verdict",
   "tokens.recorded",
   "optimizer.decided",
+  "side_effect.claimed",
+  "side_effect.reconciled",
+  "side_effect.confirmed",
+  "side_effect.failed",
   "graph.amended"
 ]);
 var RunEventSchema = external_exports.strictObject({
@@ -31652,6 +31683,7 @@ var RunStateSchema = external_exports.strictObject({
   tokens: TokenUsageSchema,
   tokenLedger: external_exports.array(TokenLedgerEntrySchema).default([]),
   optimizationDecisions: external_exports.array(OptimizationDecisionSchema).default([]),
+  sideEffects: external_exports.array(SideEffectJournalEntrySchema).default([]),
   controlDecisions: external_exports.array(ControlDecisionSchema),
   pendingDecision: ControlDecisionPacketSchema.optional(),
   stopReason: external_exports.string().optional(),
@@ -33129,6 +33161,12 @@ function requiredString(data, key) {
     throw new Error(`Event data.${key} must be a string`);
   return value;
 }
+function requiredRecord(data, key) {
+  const value = data[key];
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    throw new Error(`Event data.${key} must be an object`);
+  return value;
+}
 function reduceEvents(events) {
   let state;
   let previousSequence = 0;
@@ -33157,6 +33195,7 @@ function reduceEvents(events) {
         tokens: unavailableTokenUsage(),
         tokenLedger: [],
         optimizationDecisions: [],
+        sideEffects: [],
         controlDecisions: [],
         updatedAt: event.timestamp
       };
@@ -33263,6 +33302,55 @@ function reduceEvents(events) {
         state.optimizationDecisions.push(OptimizationDecisionSchema.parse(data.decision));
         state.optimizationDecisions = state.optimizationDecisions.slice(-200);
         break;
+      case "side_effect.claimed": {
+        const claim = SideEffectClaimSchema.parse(data.claim);
+        if (state.sideEffects.some(({ claim: existing }) => existing.actionId === claim.actionId))
+          throw new Error(`Side effect ${claim.actionId} was claimed more than once`);
+        state.sideEffects.push(
+          SideEffectJournalEntrySchema.parse({
+            claim,
+            status: "claimed",
+            reconciliationAttempts: 0,
+            updatedAt: event.timestamp
+          })
+        );
+        break;
+      }
+      case "side_effect.reconciled": {
+        const actionId = requiredString(data, "actionId");
+        const entry = state.sideEffects.find(({ claim }) => claim.actionId === actionId);
+        if (!entry) throw new Error(`Unknown side effect ${actionId}`);
+        const outcome = requiredString(data, "outcome");
+        if (!["applied", "not_applied", "unknown"].includes(outcome))
+          throw new Error(`Unsupported side-effect reconciliation outcome ${outcome}`);
+        entry.reconciliationAttempts += 1;
+        entry.status = outcome === "unknown" ? "uncertain" : "claimed";
+        entry.evidence = Array.isArray(data.evidence) ? data.evidence.map((value) => String(value)) : [];
+        entry.updatedAt = event.timestamp;
+        break;
+      }
+      case "side_effect.confirmed": {
+        const actionId = requiredString(data, "actionId");
+        const entry = state.sideEffects.find(({ claim }) => claim.actionId === actionId);
+        if (!entry) throw new Error(`Unknown side effect ${actionId}`);
+        entry.status = "confirmed";
+        entry.result = requiredRecord(data, "result");
+        entry.evidence = Array.isArray(data.evidence) ? data.evidence.map((value) => String(value)) : entry.evidence;
+        entry.failure = void 0;
+        entry.retryable = void 0;
+        entry.updatedAt = event.timestamp;
+        break;
+      }
+      case "side_effect.failed": {
+        const actionId = requiredString(data, "actionId");
+        const entry = state.sideEffects.find(({ claim }) => claim.actionId === actionId);
+        if (!entry) throw new Error(`Unknown side effect ${actionId}`);
+        entry.status = data.uncertain === true ? "uncertain" : "failed";
+        entry.failure = requiredString(data, "reason");
+        entry.retryable = data.retryable === true;
+        entry.updatedAt = event.timestamp;
+        break;
+      }
       case "graph.amended": {
         const addedNodeIds = Array.isArray(data.addedNodeIds) ? data.addedNodeIds.map((value) => String(value)) : [];
         const removedNodeIds = Array.isArray(data.removedNodeIds) ? data.removedNodeIds.map((value) => String(value)) : [];
@@ -35205,12 +35293,143 @@ async function decideRunControl(store, input) {
 }
 
 // packages/runtime/src/repository.ts
-import { appendFile, mkdir as mkdir3, readFile as readFile4 } from "node:fs/promises";
+import { appendFile, lstat, mkdir as mkdir3, readFile as readFile4, readlink } from "node:fs/promises";
 import { basename, dirname as dirname4, isAbsolute as isAbsolute2, join as join6, resolve as resolve2 } from "node:path";
-async function git(repositoryPath, args) {
+
+// packages/runtime/src/side-effect.ts
+var SideEffectBoundaryInterruption = class extends Error {
+  constructor(point, options) {
+    super(`Side-effect execution interrupted after ${point}`, options);
+    this.point = point;
+    this.name = "SideEffectBoundaryInterruption";
+  }
+  point;
+};
+function journalEntry(entries, actionId) {
+  return entries.find(({ claim }) => claim.actionId === actionId);
+}
+async function crossSideEffectBoundary(boundary, point) {
+  try {
+    await boundary?.(point);
+  } catch (error51) {
+    throw new SideEffectBoundaryInterruption(point, { cause: error51 });
+  }
+}
+async function reconcileAndRecord(input, claim, boundary) {
+  let reconciliation;
+  try {
+    reconciliation = await input.reconcile(claim);
+  } catch (error51) {
+    const reason = `Unable to reconcile ${claim.kind} ${claim.actionId}: ${error51 instanceof Error ? error51.message : String(error51)}`;
+    await input.store.append(
+      "runtime",
+      "side_effect.failed",
+      { actionId: claim.actionId, reason, retryable: false, uncertain: true },
+      claim.actionId
+    );
+    throw new Error(reason);
+  }
+  await input.store.append(
+    "runtime",
+    "side_effect.reconciled",
+    {
+      actionId: claim.actionId,
+      outcome: reconciliation.status,
+      evidence: reconciliation.evidence
+    },
+    claim.actionId
+  );
+  await crossSideEffectBoundary(input.boundary, boundary);
+  return reconciliation;
+}
+async function confirm(input, claim, reconciliation) {
+  await input.store.append(
+    "runtime",
+    "side_effect.confirmed",
+    {
+      actionId: claim.actionId,
+      result: reconciliation.result,
+      evidence: reconciliation.evidence
+    },
+    claim.actionId
+  );
+  await crossSideEffectBoundary(input.boundary, "after_confirm");
+  return reconciliation.result;
+}
+async function executeSideEffect(input) {
+  const proposedClaim = SideEffectClaimSchema.parse(input.claim);
+  let entry = journalEntry((await input.store.loadState()).sideEffects, proposedClaim.actionId);
+  let claim = entry?.claim ?? proposedClaim;
+  if (!entry) {
+    await crossSideEffectBoundary(input.boundary, "before_claim");
+    await input.store.append("runtime", "side_effect.claimed", { claim }, claim.actionId);
+    await crossSideEffectBoundary(input.boundary, "after_claim");
+    entry = journalEntry((await input.store.loadState()).sideEffects, claim.actionId);
+  }
+  if (!entry) throw new Error(`Side-effect claim ${claim.actionId} was not persisted`);
+  claim = entry.claim;
+  if (entry.status === "confirmed") {
+    if (!entry.result) throw new Error(`Confirmed side effect ${claim.actionId} has no result`);
+    return entry.result;
+  }
+  const before = await reconcileAndRecord(input, claim, "after_precondition_reconcile");
+  if (before.status === "applied") return await confirm(input, claim, before);
+  if (before.status === "unknown") {
+    const reason2 = `The outcome of ${claim.kind} ${claim.actionId} is uncertain; refusing to retry`;
+    await input.store.append(
+      "runtime",
+      "side_effect.failed",
+      { actionId: claim.actionId, reason: reason2, retryable: false, uncertain: true },
+      claim.actionId
+    );
+    throw new Error(reason2);
+  }
+  await crossSideEffectBoundary(input.boundary, "before_act");
+  try {
+    await input.act(claim);
+  } catch (error51) {
+    if (error51 instanceof SideEffectBoundaryInterruption) throw error51;
+    const reason2 = error51 instanceof Error ? error51.message : String(error51);
+    const afterFailure = await reconcileAndRecord(input, claim, "after_confirmation_reconcile");
+    if (afterFailure.status === "applied") return await confirm(input, claim, afterFailure);
+    const uncertain2 = afterFailure.status === "unknown";
+    await input.store.append(
+      "runtime",
+      "side_effect.failed",
+      {
+        actionId: claim.actionId,
+        reason: reason2,
+        retryable: !uncertain2,
+        uncertain: uncertain2
+      },
+      claim.actionId
+    );
+    throw new Error(
+      uncertain2 ? `${reason2}; the side-effect outcome is uncertain and will not be retried blindly` : reason2
+    );
+  }
+  await crossSideEffectBoundary(input.boundary, "after_act");
+  const after = await reconcileAndRecord(input, claim, "after_confirmation_reconcile");
+  if (after.status === "applied") return await confirm(input, claim, after);
+  const uncertain = after.status === "unknown";
+  const reason = uncertain ? `The outcome of ${claim.kind} ${claim.actionId} is uncertain after execution` : `${claim.kind} ${claim.actionId} was not observable after execution`;
+  await input.store.append(
+    "runtime",
+    "side_effect.failed",
+    { actionId: claim.actionId, reason, retryable: !uncertain, uncertain },
+    claim.actionId
+  );
+  throw new Error(reason);
+}
+
+// packages/runtime/src/repository.ts
+async function gitRaw(repositoryPath, args) {
   const result = await runProcess("git", args, { cwd: repositoryPath, timeoutMs: 12e4 });
   if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `git ${args[0]} failed`);
-  return result.stdout.trim();
+  return result.stdout;
+}
+async function git(repositoryPath, args) {
+  return (await gitRaw(repositoryPath, args)).trim();
 }
 async function discoverRepository(cwd) {
   const root = await git(cwd, ["rev-parse", "--show-toplevel"]);
@@ -35384,13 +35603,129 @@ async function createRunWorkspace(contract) {
   );
   return { path, branch, created: true };
 }
-async function createAtomicCommit(workspace, task) {
+async function commitContentDigest(repositoryPath) {
+  const [changedOutput, untrackedOutput] = await Promise.all([
+    gitRaw(repositoryPath, ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"]),
+    gitRaw(repositoryPath, ["ls-files", "--others", "--exclude-standard", "-z"])
+  ]);
+  const paths = [
+    ...new Set(
+      [changedOutput, untrackedOutput].flatMap((output) => output.split("\0").filter(Boolean))
+    )
+  ].sort();
+  const changes = await Promise.all(
+    paths.map(async (path) => {
+      const absolutePath = join6(repositoryPath, path);
+      const stats = await lstat(absolutePath).catch(() => void 0);
+      if (!stats) return { path, kind: "absent" };
+      if (stats.isSymbolicLink())
+        return { path, kind: "symlink", target: await readlink(absolutePath) };
+      if (stats.isFile())
+        return {
+          path,
+          kind: "file",
+          executable: (stats.mode & 73) !== 0,
+          contents: (await readFile4(absolutePath)).toString("base64")
+        };
+      return { path, kind: "other" };
+    })
+  );
+  return contentHash(changes);
+}
+async function captureCommitPrecondition(workspace) {
+  const [expectedHead, branch, contentDigest] = await Promise.all([
+    git(workspace.path, ["rev-parse", "HEAD"]),
+    git(workspace.path, ["branch", "--show-current"]),
+    commitContentDigest(workspace.path)
+  ]);
+  if (!branch) throw new Error("The Graphcraft worktree is not on a named branch");
+  return { expectedHead, branch, contentDigest };
+}
+function commitPrecondition(claim) {
+  const expectedHead = claim.precondition.expectedHead;
+  const branch = claim.precondition.branch;
+  const contentDigest = claim.precondition.contentDigest;
+  if (typeof expectedHead !== "string" || typeof branch !== "string" || typeof contentDigest !== "string")
+    throw new Error(`Commit claim ${claim.actionId} has an invalid precondition`);
+  return { expectedHead, branch, contentDigest };
+}
+async function createAtomicCommitClaim(workspace, runId, nodeId) {
+  const precondition = await captureCommitPrecondition(workspace);
+  const actionId = contentHash({ schemaVersion: 1, runId, nodeId, kind: "git_commit" });
+  return SideEffectClaimSchema.parse({
+    schemaVersion: 1,
+    actionId,
+    idempotencyKey: `graphcraft-${actionId}`,
+    nodeId,
+    kind: "git_commit",
+    target: precondition.branch,
+    precondition,
+    claimedAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+}
+async function performAtomicCommit(workspace, claim, task, boundary) {
+  if (claim.kind !== "git_commit") throw new Error(`Side effect ${claim.actionId} is not a commit`);
+  const expected = commitPrecondition(claim);
+  const current = await captureCommitPrecondition(workspace);
+  if (current.expectedHead !== expected.expectedHead || current.branch !== expected.branch || current.contentDigest !== expected.contentDigest)
+    throw new Error(`Commit precondition changed for side effect ${claim.actionId}`);
   const status2 = await git(workspace.path, ["status", "--porcelain=v1"]);
   if (!status2) throw new Error("No accepted changes are available to commit");
   await git(workspace.path, ["add", "-A"]);
+  await crossSideEffectBoundary(boundary, "after_action_prepare");
   const summary = task.replace(/\s+/g, " ").slice(0, 64);
-  await git(workspace.path, ["commit", "-m", `graphcraft: ${summary}`]);
-  return await git(workspace.path, ["rev-parse", "HEAD"]);
+  await git(workspace.path, [
+    "commit",
+    "-m",
+    `graphcraft: ${summary}`,
+    "-m",
+    `Graphcraft-Action: ${claim.idempotencyKey}`
+  ]);
+  await crossSideEffectBoundary(boundary, "after_action_command");
+  return { sha: await git(workspace.path, ["rev-parse", "HEAD"]), branch: expected.branch };
+}
+async function reconcileAtomicCommit(workspace, claim) {
+  if (claim.kind !== "git_commit") throw new Error(`Side effect ${claim.actionId} is not a commit`);
+  const expected = commitPrecondition(claim);
+  const [currentHead, currentBranch] = await Promise.all([
+    git(workspace.path, ["rev-parse", "HEAD"]),
+    git(workspace.path, ["branch", "--show-current"])
+  ]);
+  if (currentBranch !== expected.branch || currentBranch !== claim.target)
+    return {
+      status: "unknown",
+      evidence: [
+        `Expected branch ${expected.branch}; observed ${currentBranch || "detached HEAD"}`
+      ]
+    };
+  if (currentHead === expected.expectedHead) {
+    const currentDigest = await commitContentDigest(workspace.path);
+    return currentDigest === expected.contentDigest ? {
+      status: "not_applied",
+      evidence: [`HEAD remains ${currentHead} and the claimed content digest is unchanged`]
+    } : {
+      status: "unknown",
+      evidence: ["HEAD is unchanged but the claimed repository content changed"]
+    };
+  }
+  const [parent, message] = await Promise.all([
+    git(workspace.path, ["rev-parse", `${currentHead}^`]).catch(() => ""),
+    git(workspace.path, ["show", "-s", "--format=%B", currentHead])
+  ]);
+  if (parent === expected.expectedHead && message.split("\n").includes(`Graphcraft-Action: ${claim.idempotencyKey}`))
+    return {
+      status: "applied",
+      result: { sha: currentHead, branch: currentBranch },
+      evidence: [
+        `Commit ${currentHead} directly follows the claimed HEAD and carries the idempotency trailer`
+      ]
+    };
+  return {
+    status: "unknown",
+    evidence: [
+      `HEAD moved from ${expected.expectedHead} to ${currentHead} without the claimed commit identity`
+    ]
+  };
 }
 
 // packages/runtime/src/store.ts
@@ -37643,9 +37978,26 @@ async function executeRun(input) {
           return await input.store.loadState();
         }
         try {
-          const sha = await createAtomicCommit(workspace, contract.task);
-          await input.store.append("runtime", "node.accepted", { nodeId: current.id, sha });
+          const proposedClaim = await createAtomicCommitClaim(
+            workspace,
+            contract.runId,
+            current.id
+          );
+          const result = await executeSideEffect({
+            store: input.store,
+            claim: proposedClaim,
+            reconcile: async (claim) => await reconcileAtomicCommit(workspace, claim),
+            act: async (claim) => await performAtomicCommit(workspace, claim, contract.task, input.sideEffectBoundary),
+            ...input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}
+          });
+          await input.store.append("runtime", "node.accepted", {
+            nodeId: current.id,
+            sha: result.sha,
+            sideEffectActionId: proposedClaim.actionId
+          });
+          await crossSideEffectBoundary(input.sideEffectBoundary, "after_node_acceptance");
         } catch (error51) {
+          if (error51 instanceof SideEffectBoundaryInterruption) throw error51;
           await input.store.append("runtime", "node.failed", {
             nodeId: current.id,
             reason: error51.message
@@ -37799,6 +38151,7 @@ function stateView(state, contract) {
     tokens: state.tokens,
     tokenReport: tokenCostReport(state.tokenLedger),
     optimizationDecisions: state.optimizationDecisions,
+    sideEffects: state.sideEffects,
     stopReason: state.stopReason,
     updatedAt: state.updatedAt
   };

@@ -8,5 +8,6 @@ export * from "./lock.ts";
 export * from "./migration.ts";
 export * from "./repository.ts";
 export * from "./runner.ts";
+export * from "./side-effect.ts";
 export * from "./store.ts";
 export * from "./trajectory.ts";
