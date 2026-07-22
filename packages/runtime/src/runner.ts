@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import {
   HostTerminationError,
+  HostEventSchema,
   OptimizationDecisionSchema,
   SemanticVerifierContextSchema,
   WorkerResultSchema,
@@ -81,6 +82,14 @@ import {
   type SideEffectBoundary,
 } from "./side-effect.ts";
 import { RunStore } from "./store.ts";
+import { redactString, redactValue } from "./redaction.ts";
+import {
+  auditWorkspaceScope,
+  captureWorkspaceScopeSnapshot,
+  parseWorkspaceScopeSnapshot,
+  scopeViolationReason,
+  type WorkspaceScopeSnapshot,
+} from "./scope.ts";
 import { groundedRelevantPaths, prepareWorkerContext } from "./context.ts";
 import { evaluateWaitNode, sleepUntilWake } from "./wait.ts";
 import {
@@ -93,8 +102,12 @@ import {
   capturePullRequestLifecycleProbe,
   createPullRequestClaim,
   evaluateGitHubLifecycleWait,
+  hasReviewThreadActions,
   performPullRequestCreation,
+  reconcilePendingGitHubActions,
+  reconcileReviewThreadActions,
   reconcilePullRequest,
+  rerunLifecycleChecks,
   type CapturedPullRequestLifecycle,
   type GitHubExecutionOptions,
 } from "./github.ts";
@@ -102,6 +115,8 @@ import {
 export interface CreateRunOptions {
   cwd: string;
   finishLine?: "local_verified" | "committed" | "pushed" | "pr_open" | "pr_green";
+  include?: string[];
+  exclude?: string[];
   planner?: GraphPlanner;
   signal?: AbortSignal;
 }
@@ -147,6 +162,7 @@ interface RecoverableInvocation {
   adapterId: string;
   nodeId: string;
   record: InvocationRecord;
+  scopeBaseline?: WorkspaceScopeSnapshot;
 }
 
 function persistedBaseline(value: unknown, family: Graph["family"]): EvidenceSnapshot | undefined {
@@ -204,6 +220,7 @@ async function recoverableInvocation(
         ? started.data.reusedHostSessionId
         : undefined;
   const baseline = persistedBaseline(started.data.baseline, family);
+  const scopeBaseline = parseWorkspaceScopeSnapshot(started.data.scopeBaseline);
   return {
     adapterId: String(started.data.adapter ?? ""),
     nodeId,
@@ -215,6 +232,7 @@ async function recoverableInvocation(
       ...(baseline ? { baseline } : {}),
       transcript,
     },
+    ...(scopeBaseline ? { scopeBaseline } : {}),
   };
 }
 
@@ -299,14 +317,17 @@ export async function createRun(
   probePlan: ProbePlan;
 }> {
   const repository = await discoverRepository(options.cwd);
-  const contract = compileRunContract(task, repository, {
+  const persistedTask = redactString(task);
+  const contract = compileRunContract(persistedTask, repository, {
     ...(options.finishLine ? { finishLine: options.finishLine } : {}),
+    ...(options.include ? { include: options.include } : {}),
+    ...(options.exclude ? { exclude: options.exclude } : {}),
   });
   const [probePlan, repositoryEvidence] = await Promise.all([
-    discoverProbePlan(repository.root, task, repository.baseSha, {
+    discoverProbePlan(repository.root, persistedTask, repository.baseSha, {
       ...(contract.finishLine.kind === "pr_open" ? { finishLine: "pr_open" } : {}),
     }),
-    discoverPlanningEvidence(repository.root, task),
+    discoverPlanningEvidence(repository.root, persistedTask),
   ]);
   const heldOutProbePlan = await createRuntimeHeldOutProbePlan(
     contract.runId,
@@ -435,6 +456,7 @@ async function executeWorker(input: {
   observer?: RunObserver;
   signal: AbortSignal;
   baseline: EvidenceSnapshot;
+  scopeBaseline: WorkspaceScopeSnapshot;
   resume?: InvocationRecord;
   reuseSession?: { hostSessionId: string; sourceNodeId: string };
 }): Promise<{
@@ -508,6 +530,7 @@ async function executeWorker(input: {
       adapter: input.adapter.id,
       capsuleHash,
       baseline: input.baseline,
+      scopeBaseline: input.scopeBaseline,
       ...(input.reuseSession
         ? {
             reusedHostSessionId: input.reuseSession.hostSessionId,
@@ -548,7 +571,7 @@ async function executeWorker(input: {
       break;
     }
     if (next.done) break;
-    const event = next.value;
+    const event = HostEventSchema.parse(redactValue(next.value));
     artifact = await input.store.appendInvocationEvent(invocationId, event);
     if (event.type === "session") {
       await input.store.append(
@@ -692,21 +715,26 @@ async function runSemanticVerification(input: {
   signal: AbortSignal;
 }): Promise<SemanticVerdict> {
   const invocationId = randomUUID();
-  const context = SemanticVerifierContextSchema.parse({
-    schemaVersion: 1,
-    phase: input.phase,
-    runId: input.contract.runId,
-    nodeId: input.node.id,
-    objective: input.node.objective,
-    finishLine: input.contract.finishLine,
-    acceptanceAnchors: input.contract.acceptanceAnchors,
-    relevantPaths: input.node.contextSelector.relevantPaths,
-    workerSummary: input.workerSummary,
-    workerEvidence: input.workerEvidence,
-    baselineProbeEvidence: input.baselineProbeEvidence,
-    currentProbeEvidence: input.currentProbeEvidence,
-  });
-  const beforeDigest = await workspaceDigest(input.workspace.path);
+  const context = SemanticVerifierContextSchema.parse(
+    redactValue({
+      schemaVersion: 1,
+      phase: input.phase,
+      runId: input.contract.runId,
+      nodeId: input.node.id,
+      objective: input.node.objective,
+      finishLine: input.contract.finishLine,
+      acceptanceAnchors: input.contract.acceptanceAnchors,
+      relevantPaths: input.node.contextSelector.relevantPaths,
+      workerSummary: input.workerSummary,
+      workerEvidence: input.workerEvidence,
+      baselineProbeEvidence: input.baselineProbeEvidence,
+      currentProbeEvidence: input.currentProbeEvidence,
+    }),
+  );
+  const beforeScope = await captureWorkspaceScopeSnapshot(
+    input.workspace.path,
+    input.contract.scope.exclude,
+  );
   let verdictPersisted = false;
   try {
     const result = await input.adapter.verify(
@@ -717,7 +745,12 @@ async function runSemanticVerification(input: {
       },
       input.signal,
     );
-    const afterDigest = await workspaceDigest(input.workspace.path);
+    const afterScope = await captureWorkspaceScopeSnapshot(
+      input.workspace.path,
+      input.contract.scope.exclude,
+    );
+    const beforeDigest = beforeScope.digest;
+    const afterDigest = afterScope.digest;
     const policyViolation = beforeDigest !== afterDigest;
     const artifact = await input.store.writeArtifact(
       `semantic/${invocationId}.json`,
@@ -1435,6 +1468,7 @@ async function executeWorkNode(input: {
   observer?: RunObserver;
   signal: AbortSignal;
   recovery?: InvocationRecord;
+  recoveryScopeBaseline?: WorkspaceScopeSnapshot;
   reuseSession?: { hostSessionId: string; sourceNodeId: string };
 }): Promise<WorkNodeOutcome> {
   let baseline: EvidenceSnapshot;
@@ -1456,6 +1490,16 @@ async function executeWorkNode(input: {
       input.graph.family,
     );
   }
+  let scopeBaseline: WorkspaceScopeSnapshot;
+  try {
+    scopeBaseline =
+      input.recoveryScopeBaseline ??
+      (await captureWorkspaceScopeSnapshot(input.workspace.path, input.contract.scope.exclude));
+  } catch (error) {
+    const reason = `Workspace scope inspection failed before node ${input.node.id}: ${(error as Error).message}`;
+    await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason });
+    return { status: "failed", nodeId: input.node.id, reason };
+  }
   const worker = await executeWorker({
     adapter: input.adapter,
     store: input.store,
@@ -1470,9 +1514,46 @@ async function executeWorkNode(input: {
     ...(input.observer ? { observer: input.observer } : {}),
     signal: input.signal,
     baseline,
+    scopeBaseline,
     ...(input.recovery ? { resume: input.recovery } : {}),
     ...(input.reuseSession ? { reuseSession: input.reuseSession } : {}),
   });
+  try {
+    const currentScope = await captureWorkspaceScopeSnapshot(
+      input.workspace.path,
+      input.contract.scope.exclude,
+    );
+    const audit = auditWorkspaceScope({
+      contract: input.contract,
+      graph: input.graph,
+      state: input.state,
+      node: input.node,
+      baseline: scopeBaseline,
+      current: currentScope,
+      ...(worker.result ? { reportedChangedPaths: worker.result.changedPaths } : {}),
+    });
+    await input.store.append(
+      "runtime",
+      "scope.checked",
+      {
+        nodeId: input.node.id,
+        invocationId: worker.invocationId,
+        enforced: !input.signal.aborted,
+        audit,
+        current: currentScope,
+      },
+      worker.invocationId,
+    );
+    if (!audit.allowed && !input.signal.aborted) {
+      const reason = scopeViolationReason(audit, input.workspace.path);
+      await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason });
+      return { status: "failed", nodeId: input.node.id, reason };
+    }
+  } catch (error) {
+    const reason = `Workspace scope inspection failed after node ${input.node.id}: ${(error as Error).message}`;
+    await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason });
+    return { status: "failed", nodeId: input.node.id, reason };
+  }
   if (input.signal.aborted)
     return {
       status: "interrupted",
@@ -1511,14 +1592,6 @@ async function executeWorkNode(input: {
     afterProbes.map(({ result }) => result),
     input.graph.family,
   );
-  if (
-    input.node.sideEffectClass === "none" &&
-    currentEvidence.workspaceDigest !== baseline.workspaceDigest
-  ) {
-    const reason = `Read-only node ${input.node.id} mutated the shared run workspace`;
-    await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason });
-    return { status: "failed", nodeId: input.node.id, reason };
-  }
   const assessed = await assessRunProgress({
     store: input.store,
     attemptId: worker.invocationId,
@@ -1789,7 +1862,9 @@ export async function executeRun(input: {
       );
       if (
         recovery &&
-        (recovery.adapterId !== input.adapter.id || recovery.record.baseline === undefined)
+        (recovery.adapterId !== input.adapter.id ||
+          recovery.record.baseline === undefined ||
+          recovery.scopeBaseline === undefined)
       ) {
         await input.store.append(
           "runtime",
@@ -1801,7 +1876,9 @@ export async function executeRun(input: {
             reason:
               recovery.adapterId !== input.adapter.id
                 ? "Selected host changed; using repository recovery"
-                : "The interrupted invocation predates durable progress baselines",
+                : recovery.record.baseline === undefined
+                  ? "The interrupted invocation predates durable progress baselines"
+                  : "The interrupted invocation predates durable scope baselines",
           },
           recovery.record.invocationId,
         );
@@ -1919,7 +1996,12 @@ export async function executeRun(input: {
               ...(input.observer ? { observer: input.observer } : {}),
               signal: batchSignal,
               ...(recoveries.get(candidate.id)
-                ? { recovery: recoveries.get(candidate.id)!.record }
+                ? {
+                    recovery: recoveries.get(candidate.id)!.record,
+                    ...(recoveries.get(candidate.id)!.scopeBaseline
+                      ? { recoveryScopeBaseline: recoveries.get(candidate.id)!.scopeBaseline }
+                      : {}),
+                  }
                 : {}),
               ...(reuseSessions.get(candidate.id)
                 ? { reuseSession: reuseSessions.get(candidate.id)! }
@@ -1977,6 +2059,33 @@ export async function executeRun(input: {
       const current = batch[0]!;
 
       if (current.kind === "wait") {
+        if (current.waitCondition?.kind === "github_pull_request") {
+          try {
+            const reconciliationEvidence = await reconcilePendingGitHubActions({
+              store: input.store,
+              node: current,
+              workspace,
+              ...(input.github ? { options: input.github } : {}),
+              ...(input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}),
+            });
+            if (reconciliationEvidence.length > 0)
+              await input.store.append("runtime", "node.progress", {
+                nodeId: current.id,
+                classification: "advanced",
+                summary: "Reconciled pending review-thread mutations",
+                evidence: reconciliationEvidence,
+              });
+          } catch (error) {
+            if (error instanceof SideEffectBoundaryInterruption) throw error;
+            const reason = error instanceof Error ? error.message : String(error);
+            await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+            await input.store.append("runtime", "run.blocked", {
+              reason,
+              evidence: ["Pending review-thread mutation could not be reconciled"],
+            });
+            return await input.store.loadState();
+          }
+        }
         const outcome =
           current.waitCondition?.kind === "github_pull_request"
             ? await evaluateGitHubLifecycleWait({
@@ -2041,10 +2150,46 @@ export async function executeRun(input: {
               )
               ?.slice("github-review-signature:".length);
             const repeated = previousSignature === outcome.lifecycle.reviewFeedbackSignature;
-            if (repeated || reviewHistory.length >= 3) {
-              const reason = repeated
-                ? "The same unresolved review feedback remained after a verified repair push"
-                : "The pull request received three distinct review-repair strategies without reaching a resolved state";
+            const hasActions = hasReviewThreadActions(
+              await input.store.loadState(),
+              outcome.lifecycle,
+            );
+            if (repeated || hasActions) {
+              try {
+                const mutationEvidence = await reconcileReviewThreadActions({
+                  store: input.store,
+                  node: current,
+                  workspace,
+                  contract,
+                  lifecycle: outcome.lifecycle,
+                  ...(input.github ? { options: input.github } : {}),
+                  ...(input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}),
+                });
+                await input.store.append("runtime", "node.progress", {
+                  nodeId: current.id,
+                  classification: "advanced",
+                  summary: "Confirmed review replies and thread resolutions",
+                  evidence: mutationEvidence,
+                });
+                continue;
+              } catch (error) {
+                if (error instanceof SideEffectBoundaryInterruption) throw error;
+                const reason = error instanceof Error ? error.message : String(error);
+                await input.store.append("runtime", "node.failed", {
+                  nodeId: current.id,
+                  reason,
+                });
+                await input.store.append("runtime", "run.blocked", {
+                  reason,
+                  githubLifecycleStatus: lifecycleStatus,
+                  evidence: outcome.evidence,
+                });
+                return await input.store.loadState();
+              }
+            }
+            if (reviewHistory.length >= 3) {
+              const reason =
+                "The pull request received three distinct review-repair strategies without reaching a resolved state";
               await input.store.append("probe", "node.progress", {
                 nodeId: current.id,
                 classification: "blocked",
@@ -2071,6 +2216,24 @@ export async function executeRun(input: {
             continue;
           }
           if (lifecycleStatus === "actionable_failure") {
+            if (outcome.lifecycle.ciFailures.length === 0) {
+              const reason =
+                "The pull request conflicts with its current base; Graphcraft will not infer a published-branch rebase or merge";
+              await input.store.append("probe", "node.progress", {
+                nodeId: current.id,
+                classification: "blocked",
+                summary: reason,
+                evidence: outcome.evidence,
+                probeResults: [outcome.lifecycle.result],
+              });
+              await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+              await input.store.append("runtime", "run.blocked", {
+                reason,
+                githubLifecycleStatus: "human_decision",
+                evidence: outcome.evidence,
+              });
+              return await input.store.loadState();
+            }
             const ciHistory = (await input.store.loadGraphHistory()).filter(
               ({ amendment }) =>
                 amendment?.actor === "runtime" &&
@@ -2109,6 +2272,47 @@ export async function executeRun(input: {
             );
             graph = applied.graph;
             continue;
+          }
+          if (lifecycleStatus === "infrastructure_failure" || lifecycleStatus === "cancelled") {
+            try {
+              const rerunEvidence = await rerunLifecycleChecks({
+                store: input.store,
+                node: current,
+                workspace,
+                contract,
+                lifecycle: outcome.lifecycle,
+                ...(input.github ? { options: input.github } : {}),
+                ...(input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}),
+              });
+              await input.store.append("runtime", "node.progress", {
+                nodeId: current.id,
+                classification: "advanced",
+                summary: "Confirmed justified required-check reruns",
+                evidence: rerunEvidence,
+              });
+              continue;
+            } catch (error) {
+              if (error instanceof SideEffectBoundaryInterruption) throw error;
+              const reason = error instanceof Error ? error.message : String(error);
+              await input.store.append("probe", "node.progress", {
+                nodeId: current.id,
+                classification: "blocked",
+                summary: reason,
+                evidence: outcome.evidence,
+                probeResults: [outcome.lifecycle.result],
+              });
+              await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+              await input.store.append("runtime", "run.blocked", {
+                reason,
+                githubLifecycleStatus: lifecycleStatus,
+                checkIds:
+                  lifecycleStatus === "infrastructure_failure"
+                    ? outcome.lifecycle.classification.checkIds.infrastructure
+                    : outcome.lifecycle.classification.checkIds.cancelled,
+                evidence: outcome.evidence,
+              });
+              return await input.store.loadState();
+            }
           }
           const reason = `GitHub lifecycle requires reasoning before pr_green completion: ${lifecycleStatus}`;
           await input.store.append("probe", "node.progress", {
@@ -2165,10 +2369,59 @@ export async function executeRun(input: {
           });
           return await input.store.loadState();
         }
+        let verificationScopeBaseline: WorkspaceScopeSnapshot;
+        try {
+          verificationScopeBaseline = await captureWorkspaceScopeSnapshot(
+            workspace.path,
+            contract.scope.exclude,
+          );
+        } catch (error) {
+          const reason = `Workspace scope inspection failed before verification node ${current.id}: ${(error as Error).message}`;
+          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+          await input.store.append("runtime", "run.blocked", { reason });
+          return await input.store.loadState();
+        }
         const integrityFailures = await heldOutIntegrityFailures(heldOutProbePlan, workspace.path);
         const executed = integrityFailures.length
           ? []
           : await captureProbes(input.store, completionProbes, workspace, input.observer, signal);
+        try {
+          const verificationScopeCurrent = await captureWorkspaceScopeSnapshot(
+            workspace.path,
+            contract.scope.exclude,
+          );
+          const scopeAudit = auditWorkspaceScope({
+            contract,
+            graph,
+            state,
+            node: current,
+            baseline: verificationScopeBaseline,
+            current: verificationScopeCurrent,
+          });
+          await input.store.append(
+            "runtime",
+            "scope.checked",
+            {
+              nodeId: current.id,
+              stage: "verification",
+              enforced: !signal.aborted,
+              audit: scopeAudit,
+              current: verificationScopeCurrent,
+            },
+            batchId,
+          );
+          if (!scopeAudit.allowed && !signal.aborted) {
+            const reason = scopeViolationReason(scopeAudit, workspace.path);
+            await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+            await input.store.append("runtime", "run.blocked", { reason });
+            return await input.store.loadState();
+          }
+        } catch (error) {
+          const reason = `Workspace scope inspection failed after verification node ${current.id}: ${(error as Error).message}`;
+          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+          await input.store.append("runtime", "run.blocked", { reason });
+          return await input.store.loadState();
+        }
         if (signal.aborted) return await finishInterruption(current.id);
         const results = integrityFailures.length
           ? integrityFailures
@@ -2604,7 +2857,14 @@ export async function executeRun(input: {
         workspace,
         ...(input.observer ? { observer: input.observer } : {}),
         signal,
-        ...(recoveries.get(current.id) ? { recovery: recoveries.get(current.id)!.record } : {}),
+        ...(recoveries.get(current.id)
+          ? {
+              recovery: recoveries.get(current.id)!.record,
+              ...(recoveries.get(current.id)!.scopeBaseline
+                ? { recoveryScopeBaseline: recoveries.get(current.id)!.scopeBaseline }
+                : {}),
+            }
+          : {}),
         ...(reuseSessions.get(current.id) ? { reuseSession: reuseSessions.get(current.id)! } : {}),
       });
       recoveries.delete(current.id);

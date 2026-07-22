@@ -32,9 +32,13 @@ import {
   discoverRepository,
   executeRun,
   latestSupervisor,
+  listRunIds,
   requestRunControl,
+  redactString,
+  redactValue,
   resolveRunId,
   type RunObserver,
+  type RunObserverEvent,
 } from "@graphcraft/runtime";
 
 export type HostName = "codex" | "claude";
@@ -317,6 +321,137 @@ export function stateView(state: RunState, contract: RunContract): Record<string
   };
 }
 
+function line(label: string, value: string): string {
+  return `${label.padEnd(14)}${value}`;
+}
+
+export function recoveryHint(message: string): string | undefined {
+  if (/matched (?:0|[2-9]\d*) runs|No Graphcraft runs/i.test(message))
+    return "Run `graphcraft runs` to list stable run IDs, or start one with `graphcraft run`.";
+  if (/auth|login|credential|permission|GitHub .*preflight/i.test(message))
+    return "Run `graphcraft doctor`, then authenticate the reported host or GitHub CLI.";
+  if (/future|unsupported.*(?:schema|storage|format)|storage version/i.test(message))
+    return "Update Graphcraft before reopening this run; its durable files were left unchanged.";
+  if (/probe|completion check|held.out/i.test(message))
+    return "Inspect the approved checks with `graphcraft probes [run]` before changing them.";
+  if (/worktree|run lock|locked|supervisor/i.test(message))
+    return "Inspect ownership with `graphcraft status [run]` and `graphcraft supervisors [run]`.";
+  if (/stale|moved|diverg|conflict/i.test(message))
+    return "Inspect exact local and remote evidence with `graphcraft inspect [run]`; Graphcraft will not overwrite it.";
+  return undefined;
+}
+
+export function renderRunStatus(state: RunState, contract: RunContract, graph: Graph): string {
+  const accepted = Object.entries(state.nodes)
+    .filter(([, value]) => value.status === "accepted")
+    .map(([id]) => id);
+  const running = Object.entries(state.nodes)
+    .filter(([, value]) => value.status === "running")
+    .map(([id]) => id);
+  const ready = graph.nodes
+    .filter(
+      (node) =>
+        state.nodes[node.id]?.status === "pending" &&
+        node.dependsOn.every((id) => state.nodes[id]?.status === "accepted"),
+    )
+    .map(({ id }) => id);
+  const tokenReport = tokenCostReport(state.tokenLedger);
+  const nextAction = state.pendingDecision
+    ? `Resolve the pending decision with graphcraft decide ${state.runId.slice(0, 8)} ...`
+    : state.status === "awaiting_approval"
+      ? `graphcraft resume ${state.runId.slice(0, 8)} --yes`
+      : state.status === "paused" || state.status === "waiting"
+        ? `graphcraft resume ${state.runId.slice(0, 8)} --background`
+        : state.status === "completed"
+          ? `graphcraft view ${state.runId.slice(0, 8)}`
+          : state.stopReason
+            ? (recoveryHint(state.stopReason) ??
+              `graphcraft inspect ${state.runId.slice(0, 8)} to review the blocker`)
+            : `graphcraft inspect ${state.runId.slice(0, 8)}`;
+  const evidence = state.latestProgressEvidence.slice(-3);
+  return [
+    line("Run", state.runId),
+    line("Outcome", contract.outcome),
+    line("Finish line", contract.finishLine.kind),
+    line("Status", state.status),
+    line("Accepted", accepted.join(", ") || "none"),
+    line("Ready", ready.join(", ") || "none"),
+    line("Running", running.join(", ") || "none"),
+    line("Evidence", evidence[0] ?? "none"),
+    ...evidence.slice(1).map((item) => line("", item)),
+    ...(state.stopReason ? [line("Blocker", state.stopReason)] : []),
+    line(
+      "Tokens",
+      `cached ${tokenReport.totals.cachedInput}, uncached ${tokenReport.totals.uncachedInput}, output ${tokenReport.totals.output}, reasoning ${tokenReport.totals.reasoning}, total ${tokenReport.totals.total}`,
+    ),
+    line("Next", nextAction),
+  ].join("\n");
+}
+
+export function renderRunInspection(input: {
+  state: RunState;
+  contract: RunContract;
+  graph: Graph;
+  graphHistory: Awaited<ReturnType<RunStore["loadGraphHistory"]>>;
+}): string {
+  return [
+    renderRunStatus(input.state, input.contract, input.graph),
+    "",
+    "Plan",
+    ...input.graph.nodes.map((node) => {
+      const status = input.state.nodes[node.id]?.status ?? node.status;
+      return `  [${status}] ${node.id} · ${node.kind} · depends on ${node.dependsOn.join(", ") || "nothing"} · ${node.sideEffectClass}`;
+    }),
+    "",
+    `Governance    ${input.graph.controlEdges.length} control edges; ${input.contract.acceptanceAnchors.length} anchors`,
+    `Revisions     ${input.graph.revision}; ${input.graphHistory.length} amendments`,
+    `Durable files ${join(input.contract.repository.root, ".graphcraft", "runs", input.state.runId)}`,
+  ].join("\n");
+}
+
+export interface RunListEntry {
+  runId: string;
+  task: string;
+  finishLine: string;
+  status: RunState["status"];
+  updatedAt: string;
+}
+
+export async function loadRunList(cwd: string): Promise<RunListEntry[]> {
+  const repository = await discoverRepository(cwd);
+  const runIds = await listRunIds(repository.root);
+  const entries = await Promise.all(
+    runIds.map(async (runId) => {
+      const store = new RunStore(repository.root, runId);
+      const [contract, state] = await Promise.all([store.loadContract(), store.loadState()]);
+      return {
+        runId,
+        task: contract.task,
+        finishLine: contract.finishLine.kind,
+        status: state.status,
+        updatedAt: state.updatedAt,
+      } satisfies RunListEntry;
+    }),
+  );
+  return entries.sort(
+    (left, right) =>
+      right.updatedAt.localeCompare(left.updatedAt) || left.runId.localeCompare(right.runId),
+  );
+}
+
+export function renderRunList(entries: RunListEntry[]): string {
+  if (entries.length === 0) return "No Graphcraft runs exist in this repository.";
+  return [
+    "RUN       STATUS              FINISH LINE     UPDATED                   TASK",
+    ...entries.map(
+      (entry) =>
+        `${entry.runId.slice(0, 8).padEnd(10)}${entry.status.padEnd(20)}${entry.finishLine.padEnd(16)}${entry.updatedAt.padEnd(26)}${entry.task}`,
+    ),
+    "",
+    "Use the displayed run prefix with status, inspect, trace, view, resume, pause, or stop.",
+  ].join("\n");
+}
+
 export async function supervisorView(repositoryRoot: string, runId: string) {
   try {
     return (await latestSupervisor(repositoryRoot, runId)) ?? null;
@@ -362,8 +497,9 @@ export async function askForApproval(
 
 export function consoleObserver(json = false): RunObserver {
   return (event) => {
-    if (json) console.log(JSON.stringify(event));
-    else console.log(`[${event.type}] ${event.message}`);
+    const persisted = redactValue(event) as RunObserverEvent;
+    if (json) console.log(JSON.stringify(persisted));
+    else console.log(`[${persisted.type}] ${redactString(persisted.message)}`);
   };
 }
 
@@ -404,7 +540,7 @@ export interface McpActionInput {
   replaces?: string | undefined;
 }
 
-export async function handleAction(input: McpActionInput): Promise<Record<string, unknown>> {
+async function performAction(input: McpActionInput): Promise<Record<string, unknown>> {
   const cwd = input.repository ?? process.cwd();
   if (input.action === "doctor") {
     const [codex, claude, github] = await Promise.all([
@@ -536,4 +672,12 @@ export async function handleAction(input: McpActionInput): Promise<Record<string
     return stateView(resumed, contract);
   }
   throw new Error(`Unsupported action: ${input.action}`);
+}
+
+export async function handleAction(input: McpActionInput): Promise<Record<string, unknown>> {
+  try {
+    return redactValue(await performAction(input)) as Record<string, unknown>;
+  } catch (error) {
+    throw new Error(redactString(error instanceof Error ? error.message : String(error)));
+  }
 }

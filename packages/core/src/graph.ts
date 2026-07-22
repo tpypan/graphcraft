@@ -91,7 +91,7 @@ export function compileRunContract(
     repository,
     scope: {
       include: options.include ?? ["**/*"],
-      exclude: options.exclude ?? [".graphcraft/**", ".git/**"],
+      exclude: [...new Set([".graphcraft/**", ".git/**", ...(options.exclude ?? [])])],
     },
     permissions,
     acceptanceAnchors: [

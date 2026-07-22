@@ -2,11 +2,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { handleAction } from "@graphcraft/cli";
 import { GraphAmendmentSchema, ProbePlanSchema } from "@graphcraft/core";
+import packageMetadata from "../../../package.json" with { type: "json" };
 import metadata from "../tool-metadata.json" with { type: "json" };
+
+export const GRAPHCRAFT_MCP_VERSION = packageMetadata.version;
 
 export function createGraphcraftServer(): McpServer {
   const server = new McpServer(
-    { name: "graphcraft", version: "0.1.0" },
+    { name: "graphcraft", version: GRAPHCRAFT_MCP_VERSION },
     {
       instructions: metadata.instructions,
     },

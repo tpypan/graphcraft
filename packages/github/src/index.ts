@@ -64,6 +64,7 @@ const PullRequestReviewSchema = z.strictObject({
 
 const CheckObservationSchema = z.strictObject({
   id: z.string().min(1),
+  databaseId: z.number().int().positive().optional(),
   kind: z.enum(["check_run", "status_context"]),
   name: z.string().min(1),
   status: z.string().min(1),
@@ -189,6 +190,7 @@ export type GitHubPullRequestLifecycleClassification = z.infer<
 export interface GitHubCommandOptions {
   cwd: string;
   command?: string;
+  commandArgs?: string[];
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
 }
@@ -208,8 +210,9 @@ async function runCommand(
   args: string[],
 ): Promise<{ stdout: string; stderr: string }> {
   const command = options.command ?? "gh";
+  const commandArgs = [...(options.commandArgs ?? []), ...args];
   return await new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
+    const child = spawn(command, commandArgs, {
       cwd: options.cwd,
       env: options.env ?? process.env,
       shell: false,
@@ -260,7 +263,7 @@ async function runCommand(
       else
         reject(
           new GitHubCommandError(
-            stderr.trim() || stdout.trim() || `${command} ${args[0] ?? ""} exited ${code}`,
+            stderr.trim() || stdout.trim() || `${command} ${commandArgs[0] ?? ""} exited ${code}`,
             code,
           ),
         );
@@ -573,6 +576,7 @@ const CheckNodeSchema = z.discriminatedUnion("__typename", [
   z.strictObject({
     __typename: z.literal("CheckRun"),
     id: z.string().min(1),
+    databaseId: z.number().int().positive().nullable(),
     name: z.string().min(1),
     status: z.string().min(1),
     conclusion: z.string().nullable(),
@@ -634,6 +638,25 @@ export const GitHubPullRequestCandidateSchema = z.strictObject({
 
 export type GitHubPullRequestCandidate = z.infer<typeof GitHubPullRequestCandidateSchema>;
 
+export const GitHubReviewThreadStateSchema = z.strictObject({
+  id: z.string().min(1),
+  isResolved: z.boolean(),
+  isOutdated: z.boolean(),
+  path: z.string().optional(),
+  line: z.number().int().positive().optional(),
+  comments: z.array(
+    z.strictObject({
+      id: z.string().min(1),
+      author: z.string().optional(),
+      body: z.string(),
+      url: z.string().url(),
+      createdAt: z.iso.datetime(),
+    }),
+  ),
+});
+
+export type GitHubReviewThreadState = z.infer<typeof GitHubReviewThreadStateSchema>;
+
 const PullRequestsByHeadResponseSchema = z.strictObject({
   data: z.strictObject({
     repository: z.strictObject({
@@ -672,11 +695,67 @@ const PullRequestMutationIdentitySchema = z.strictObject({
   baseRefOid: z.string().min(7),
 });
 
+const ReviewThreadPageResponseSchema = z.strictObject({
+  data: z.strictObject({
+    node: z
+      .strictObject({
+        id: z.string().min(1),
+        isResolved: z.boolean(),
+        isOutdated: z.boolean(),
+        path: z.string().nullable(),
+        line: z.number().int().positive().nullable(),
+        comments: z.strictObject({
+          nodes: z.array(
+            z.strictObject({
+              id: z.string().min(1),
+              author: z.strictObject({ login: z.string() }).nullable(),
+              body: z.string(),
+              url: z.string().url(),
+              createdAt: z.iso.datetime(),
+            }),
+          ),
+          pageInfo: PageInfoSchema,
+        }),
+      })
+      .nullable(),
+    rateLimit: RateLimitSchema,
+  }),
+});
+
+const ReviewReplyMutationResponseSchema = z.strictObject({
+  data: z.strictObject({
+    addPullRequestReviewThreadReply: z
+      .strictObject({
+        clientMutationId: z.string().nullable(),
+        comment: z.strictObject({
+          id: z.string().min(1),
+          body: z.string(),
+          url: z.string().url(),
+        }),
+      })
+      .nullable(),
+  }),
+});
+
+const ResolveReviewThreadMutationResponseSchema = z.strictObject({
+  data: z.strictObject({
+    resolveReviewThread: z
+      .strictObject({
+        clientMutationId: z.string().nullable(),
+        thread: z.strictObject({ id: z.string().min(1), isResolved: z.boolean() }),
+      })
+      .nullable(),
+  }),
+});
+
 const THREADS_QUERY = `query GraphcraftPullRequestThreads($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){url viewerPermission pullRequest(number:$number){number url title state isDraft headRefName baseRefName headRefOid baseRefOid mergeable reviewDecision updatedAt reviewThreads(first:100,after:$cursor){nodes{id isResolved isOutdated path line comments(last:1){totalCount nodes{id author{login} body url createdAt}}} pageInfo{hasNextPage endCursor}}}} rateLimit{cost remaining resetAt}}`;
 const REVIEWS_QUERY = `query GraphcraftPullRequestReviews($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid baseRefOid reviews(first:100,after:$cursor){nodes{id state author{login} commit{oid} submittedAt} pageInfo{hasNextPage endCursor}}}} rateLimit{cost remaining resetAt}}`;
-const CHECKS_QUERY = `query GraphcraftCommitChecks($owner:String!,$name:String!,$head:GitObjectID!,$cursor:String){repository(owner:$owner,name:$name){object(oid:$head){... on Commit{oid statusCheckRollup{contexts(first:100,after:$cursor){nodes{__typename ... on CheckRun{id name status conclusion detailsUrl app{databaseId}} ... on StatusContext{id context state targetUrl}} pageInfo{hasNextPage endCursor}}}}}} rateLimit{cost remaining resetAt}}`;
+const CHECKS_QUERY = `query GraphcraftCommitChecks($owner:String!,$name:String!,$head:GitObjectID!,$cursor:String){repository(owner:$owner,name:$name){object(oid:$head){... on Commit{oid statusCheckRollup{contexts(first:100,after:$cursor){nodes{__typename ... on CheckRun{id databaseId name status conclusion detailsUrl app{databaseId}} ... on StatusContext{id context state targetUrl}} pageInfo{hasNextPage endCursor}}}}}} rateLimit{cost remaining resetAt}}`;
 const IDENTITY_QUERY = `query GraphcraftPullRequestIdentity($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid baseRefOid}} rateLimit{cost remaining resetAt}}`;
 const PULL_REQUESTS_BY_HEAD_QUERY = `query GraphcraftPullRequestsByHead($owner:String!,$name:String!,$head:String!,$cursor:String){repository(owner:$owner,name:$name){pullRequests(first:100,after:$cursor,headRefName:$head,states:[OPEN,CLOSED,MERGED],orderBy:{field:UPDATED_AT,direction:DESC}){nodes{number url title body state isDraft headRefName baseRefName headRefOid baseRefOid} pageInfo{hasNextPage endCursor}}} rateLimit{cost remaining resetAt}}`;
+const REVIEW_THREAD_QUERY = `query GraphcraftReviewThread($threadId:ID!,$cursor:String){node(id:$threadId){... on PullRequestReviewThread{id isResolved isOutdated path line comments(first:100,after:$cursor){nodes{id author{login} body url createdAt} pageInfo{hasNextPage endCursor}}}} rateLimit{cost remaining resetAt}}`;
+const ADD_REVIEW_REPLY_MUTATION = `mutation GraphcraftAddReviewReply($threadId:ID!,$body:String!,$clientMutationId:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body,clientMutationId:$clientMutationId}){clientMutationId comment{id body url}}}`;
+const RESOLVE_REVIEW_THREAD_MUTATION = `mutation GraphcraftResolveReviewThread($threadId:ID!,$clientMutationId:String!){resolveReviewThread(input:{threadId:$threadId,clientMutationId:$clientMutationId}){clientMutationId thread{id isResolved}}}`;
 
 async function graphql(
   options: GitHubCommandOptions,
@@ -786,6 +865,94 @@ export async function createGitHubPullRequest(
     input.title,
     "--body",
     input.body,
+  ]);
+}
+
+export async function readGitHubReviewThread(
+  options: GitHubCommandOptions,
+  input: { host: string; threadId: string },
+): Promise<GitHubReviewThreadState> {
+  let cursor: string | undefined;
+  let thread: Omit<GitHubReviewThreadState, "comments"> | undefined;
+  const comments: GitHubReviewThreadState["comments"] = [];
+  do {
+    const response = ReviewThreadPageResponseSchema.parse(
+      await graphql(options, input.host, REVIEW_THREAD_QUERY, {
+        threadId: input.threadId,
+        cursor,
+      }),
+    );
+    const node = response.data.node;
+    if (!node) throw new Error(`GitHub review thread ${input.threadId} is unavailable`);
+    const identity = {
+      id: node.id,
+      isResolved: node.isResolved,
+      isOutdated: node.isOutdated,
+      ...(node.path ? { path: node.path } : {}),
+      ...(node.line !== null ? { line: node.line } : {}),
+    };
+    if (thread && JSON.stringify(thread) !== JSON.stringify(identity))
+      throw new Error(`GitHub review thread ${input.threadId} changed during pagination`);
+    thread = identity;
+    comments.push(
+      ...node.comments.nodes.map(({ id, author, body, url, createdAt }) => ({
+        id,
+        ...(author ? { author: author.login } : {}),
+        body,
+        url,
+        createdAt,
+      })),
+    );
+    cursor = node.comments.pageInfo.hasNextPage
+      ? (node.comments.pageInfo.endCursor ?? undefined)
+      : undefined;
+    if (node.comments.pageInfo.hasNextPage && !cursor)
+      throw new Error(`GitHub review thread ${input.threadId} omitted its next comment cursor`);
+  } while (cursor);
+  if (!thread) throw new Error(`GitHub review thread ${input.threadId} is unavailable`);
+  return GitHubReviewThreadStateSchema.parse({ ...thread, comments });
+}
+
+export async function addGitHubReviewThreadReply(
+  options: GitHubCommandOptions,
+  input: { host: string; threadId: string; body: string; clientMutationId: string },
+): Promise<{ id: string; body: string; url: string }> {
+  const response = ReviewReplyMutationResponseSchema.parse(
+    await graphql(options, input.host, ADD_REVIEW_REPLY_MUTATION, input),
+  ).data.addPullRequestReviewThreadReply;
+  if (!response || response.clientMutationId !== input.clientMutationId)
+    throw new Error(`GitHub did not confirm review reply ${input.clientMutationId}`);
+  return response.comment;
+}
+
+export async function resolveGitHubReviewThread(
+  options: GitHubCommandOptions,
+  input: { host: string; threadId: string; clientMutationId: string },
+): Promise<{ id: string; isResolved: boolean }> {
+  const response = ResolveReviewThreadMutationResponseSchema.parse(
+    await graphql(options, input.host, RESOLVE_REVIEW_THREAD_MUTATION, input),
+  ).data.resolveReviewThread;
+  if (
+    !response ||
+    response.clientMutationId !== input.clientMutationId ||
+    response.thread.id !== input.threadId ||
+    !response.thread.isResolved
+  )
+    throw new Error(`GitHub did not confirm review-thread resolution ${input.clientMutationId}`);
+  return response.thread;
+}
+
+export async function rerequestGitHubCheckRun(
+  options: GitHubCommandOptions,
+  input: { host: string; nameWithOwner: string; databaseId: number },
+): Promise<void> {
+  await runCommand(options, [
+    "api",
+    `repos/${input.nameWithOwner}/check-runs/${input.databaseId}/rerequest`,
+    "--hostname",
+    input.host,
+    "--method",
+    "POST",
   ]);
 }
 
@@ -943,6 +1110,7 @@ async function collectChecks(input: {
         check.__typename === "CheckRun"
           ? CheckObservationSchema.parse({
               id: check.id,
+              ...(check.databaseId !== null ? { databaseId: check.databaseId } : {}),
               kind: "check_run",
               name: check.name,
               status: check.status,

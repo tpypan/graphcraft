@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { Command, Option } from "commander";
+import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import stableBenchmarkSuite from "../../../benchmarks/stable-v1.json" with { type: "json" };
@@ -12,8 +13,13 @@ import {
   GRAPHCRAFT_VERSION,
   handleAction,
   installHost,
+  loadRunList,
   prepareFinishLine,
+  recoveryHint,
   renderContract,
+  renderRunInspection,
+  renderRunList,
+  renderRunStatus,
   stateView,
   storeFor,
   supervisorView,
@@ -27,8 +33,11 @@ import {
   inspectSupervisorRecord,
   listSupervisorRecords,
   loadBenchmarkSuite,
+  redactString,
+  redactValue,
   runBenchmark,
   startDetachedSupervisor,
+  startRunViewer,
   superviseRun,
   type SupervisorLauncher,
 } from "@graphcraft/runtime";
@@ -50,6 +59,10 @@ const program = new Command()
 const hostOption = new Option("--host <host>", "coding-agent host")
   .choices(["codex", "claude"])
   .default("codex");
+
+function collectScope(value: string, previous: string[] | undefined): string[] {
+  return [...(previous ?? []), value];
+}
 
 function executionSignal(): { signal: AbortSignal; dispose: () => void } {
   const controller = new AbortController();
@@ -75,6 +88,18 @@ function currentSupervisorLauncher(): SupervisorLauncher {
     command: process.execPath,
     args: [...process.execArgv.filter((argument) => !argument.startsWith("--inspect")), entrypoint],
   };
+}
+
+async function openLocalUrl(url: string): Promise<void> {
+  const command =
+    process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  const child = spawn(command, args, { detached: true, shell: false, stdio: "ignore" });
+  await new Promise<void>((resolveOpen, reject) => {
+    child.once("error", reject);
+    child.once("spawn", resolveOpen);
+  });
+  child.unref();
 }
 
 program
@@ -214,6 +239,8 @@ program
   .option("--force", "force Graphcraft for a small task")
   .option("--json", "emit machine-readable progress")
   .option("--background", "continue under a detached local supervisor")
+  .option("--include <glob>", "approved repository path glob (repeatable)", collectScope)
+  .option("--exclude <glob>", "excluded repository path glob (repeatable)", collectScope)
   .addOption(
     new Option("--max-workers <count>", "maximum concurrent read-only workers")
       .choices(["1", "2"])
@@ -238,6 +265,8 @@ program
         force?: boolean;
         json?: boolean;
         background?: boolean;
+        include?: string[];
+        exclude?: string[];
         host: HostName;
         maxWorkers: "1" | "2";
         finishLine?: ExecutableFinishLine;
@@ -256,6 +285,8 @@ program
         cwd: options.cwd,
         planner: adapter,
         finishLine,
+        ...(options.include ? { include: options.include } : {}),
+        ...(options.exclude ? { exclude: options.exclude } : {}),
       });
       const approved =
         options.yes || (await askForApproval(created.contract, created.graph, created.probePlan));
@@ -299,12 +330,26 @@ program
   .option("--json", "emit JSON")
   .action(async (run: string | undefined, options: { cwd: string; json?: boolean }) => {
     const store = await storeFor(options.cwd, run);
-    const [state, contract] = await Promise.all([store.loadState(), store.loadContract()]);
+    const [state, contract, graph] = await Promise.all([
+      store.loadState(),
+      store.loadContract(),
+      store.loadGraph(),
+    ]);
     const view = {
       ...stateView(state, contract),
       supervisor: await supervisorView(store.repositoryRoot, store.runId),
     };
-    console.log(options.json ? JSON.stringify(view) : JSON.stringify(view, null, 2));
+    console.log(options.json ? JSON.stringify(view) : renderRunStatus(state, contract, graph));
+  });
+
+program
+  .command("runs")
+  .description("List durable runs in stable updated order")
+  .option("-C, --cwd <path>", "repository path", process.cwd())
+  .option("--json", "emit JSON")
+  .action(async (options: { cwd: string; json?: boolean }) => {
+    const entries = await loadRunList(options.cwd);
+    console.log(options.json ? JSON.stringify(entries) : renderRunList(entries));
   });
 
 program
@@ -312,18 +357,28 @@ program
   .description("Show the contract, graph, anchors, and state")
   .argument("[run]")
   .option("-C, --cwd <path>", "repository path", process.cwd())
-  .action(async (run: string | undefined, options: { cwd: string }) => {
-    console.log(
-      JSON.stringify(
-        await handleAction({
-          action: "inspect",
-          repository: options.cwd,
-          ...(run ? { run } : {}),
-        }),
-        null,
-        2,
-      ),
-    );
+  .option("--json", "emit JSON")
+  .action(async (run: string | undefined, options: { cwd: string; json?: boolean }) => {
+    if (options.json) {
+      console.log(
+        JSON.stringify(
+          await handleAction({
+            action: "inspect",
+            repository: options.cwd,
+            ...(run ? { run } : {}),
+          }),
+        ),
+      );
+      return;
+    }
+    const store = await storeFor(options.cwd, run);
+    const [state, contract, graph, graphHistory] = await Promise.all([
+      store.loadState(),
+      store.loadContract(),
+      store.loadGraph(),
+      store.loadGraphHistory(),
+    ]);
+    console.log(renderRunInspection({ state, contract, graph, graphHistory }));
   });
 
 program
@@ -597,6 +652,31 @@ program
   });
 
 program
+  .command("view")
+  .description("Open a loopback-only read-only graph and trace viewer")
+  .argument("[run]")
+  .option("-C, --cwd <path>", "repository path", process.cwd())
+  .option("--port <port>", "loopback port (0 selects an available port)", "0")
+  .option("--no-open", "print the URL without opening a browser")
+  .action(
+    async (run: string | undefined, options: { cwd: string; port: string; open: boolean }) => {
+      const parsedPort = Number(options.port);
+      const store = await storeFor(options.cwd, run);
+      const viewer = await startRunViewer({ store, port: parsedPort });
+      console.log(`Graphcraft read-only viewer: ${viewer.url}`);
+      if (options.open && process.stdout.isTTY)
+        await openLocalUrl(viewer.url).catch((error) =>
+          console.error(`graphcraft: unable to open a browser: ${(error as Error).message}`),
+        );
+      await new Promise<void>((resolveStop) => {
+        process.once("SIGINT", resolveStop);
+        process.once("SIGTERM", resolveStop);
+      });
+      await viewer.close();
+    },
+  );
+
+program
   .command("github-snapshot")
   .description("Capture one fully paginated, SHA-bound read-only pull request snapshot")
   .argument("[pull-request]", "pull request number, URL, or branch")
@@ -604,10 +684,12 @@ program
   .action(async (pullRequest: string | undefined, options: { cwd: string }) => {
     console.log(
       JSON.stringify(
-        await captureGitHubPullRequestSnapshot({
-          cwd: options.cwd,
-          ...(pullRequest ? { pullRequest } : {}),
-        }),
+        redactValue(
+          await captureGitHubPullRequestSnapshot({
+            cwd: options.cwd,
+            ...(pullRequest ? { pullRequest } : {}),
+          }),
+        ),
         null,
         2,
       ),
@@ -625,6 +707,8 @@ program
   });
 
 program.parseAsync().catch((error: unknown) => {
-  console.error(`graphcraft: ${(error as Error).message}`);
+  const message = redactString((error as Error).message);
+  const hint = recoveryHint(message);
+  console.error(`graphcraft: ${message}${hint ? `\nNext: ${hint}` : ""}`);
   process.exitCode = 1;
 });

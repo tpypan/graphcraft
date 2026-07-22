@@ -1,4 +1,5 @@
 import {
+  ContextCapsuleSchema,
   ContextSelectionReceiptSchema,
   contentHash,
   contextCapsuleCharacters,
@@ -11,6 +12,7 @@ import {
 } from "@graphcraft/core";
 import { runProcess } from "@graphcraft/probes";
 import { RunStore } from "./store.ts";
+import { redactValue } from "./redaction.ts";
 
 const contextStopWords = new Set([
   "acceptance",
@@ -108,12 +110,16 @@ export async function prepareWorkerContext(input: {
     ...input.node,
     contextSelector: { ...input.node.contextSelector, relevantPaths },
   };
-  const capsule = createContextCapsule({
-    contract: input.contract,
-    node,
-    predecessorEvidence: input.predecessorEvidence,
-    probeResults: input.probeResults,
-  });
+  const capsule = ContextCapsuleSchema.parse(
+    redactValue(
+      createContextCapsule({
+        contract: input.contract,
+        node,
+        predecessorEvidence: input.predecessorEvidence,
+        probeResults: input.probeResults,
+      }),
+    ),
+  );
   const capsuleHash = contentHash(capsule);
   const storedCapsule = await input.store.writeCapsule(capsuleHash, capsule);
   const matchedPaths = selectedTrackedPaths(repositoryPaths, capsule.relevantPaths);

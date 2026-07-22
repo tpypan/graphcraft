@@ -147,6 +147,7 @@ export const HeldOutProbeIntegritySchema = z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("file"),
     path: z.string().min(1),
+    algorithm: z.literal("git_hash_object").optional(),
     valueHash: z.string().regex(/^[a-f0-9]{64}$/),
   }),
 ]);
@@ -494,6 +495,7 @@ export const SideEffectKindSchema = z.enum([
   "git_push",
   "github_pr_create",
   "github_pr_comment",
+  "github_review_thread_resolve",
   "github_check_rerun",
 ]);
 
@@ -512,6 +514,7 @@ export const SideEffectJournalEntrySchema = z.strictObject({
   claim: SideEffectClaimSchema,
   status: z.enum(["claimed", "confirmed", "failed", "uncertain"]),
   reconciliationAttempts: z.number().int().nonnegative(),
+  dispatchedAt: z.iso.datetime().optional(),
   result: z.record(z.string(), z.unknown()).optional(),
   evidence: z.array(z.string()).default([]),
   failure: z.string().optional(),
@@ -526,6 +529,15 @@ export const WaitRuntimeStateSchema = z.strictObject({
   status: z.enum(["waiting", "satisfied", "timed_out"]),
   registeredAt: z.iso.datetime(),
   baselineSignature: z.string().optional(),
+  bindingBaseSha: z.string().min(7).optional(),
+  stickyHumanDecision: z
+    .strictObject({
+      kind: z.enum(["draft", "changes_requested"]),
+      observedAt: z.iso.datetime(),
+      snapshotId: z.string().regex(/^[a-f0-9]{64}$/),
+      evidence: z.array(z.string().min(1)),
+    })
+    .optional(),
   lastSignature: z.string().optional(),
   nextWakeAt: z.iso.datetime(),
   observations: z.number().int().nonnegative(),
@@ -721,14 +733,19 @@ export const RunEventTypeSchema = z.enum([
   "context.selected",
   "held_out.checked",
   "semantic.verdict",
+  "scope.checked",
   "tokens.recorded",
   "optimizer.decided",
   "side_effect.claimed",
+  "side_effect.dispatched",
   "side_effect.reconciled",
   "side_effect.confirmed",
   "side_effect.failed",
   "run.waiting",
   "wait.registered",
+  "wait.rebound",
+  "wait.human_decision_observed",
+  "wait.human_decision_resolved",
   "wait.observed",
   "wait.satisfied",
   "wait.timed_out",

@@ -2984,7 +2984,7 @@ var require_compile = __commonJS({
       const schOrFunc = root.refs[ref];
       if (schOrFunc)
         return schOrFunc;
-      let _sch = resolve5.call(this, root, ref);
+      let _sch = resolve6.call(this, root, ref);
       if (_sch === void 0) {
         const schema = (_a3 = root.localRefs) === null || _a3 === void 0 ? void 0 : _a3[ref];
         const { schemaId } = this.opts;
@@ -3011,7 +3011,7 @@ var require_compile = __commonJS({
     function sameSchemaEnv(s1, s2) {
       return s1.schema === s2.schema && s1.root === s2.root && s1.baseId === s2.baseId;
     }
-    function resolve5(root, ref) {
+    function resolve6(root, ref) {
       let sch;
       while (typeof (sch = this.refs[ref]) == "string")
         ref = sch;
@@ -3642,55 +3642,55 @@ var require_fast_uri = __commonJS({
       }
       return uri;
     }
-    function resolve5(baseURI, relativeURI, options) {
+    function resolve6(baseURI, relativeURI, options) {
       const schemelessOptions = options ? Object.assign({ scheme: "null" }, options) : { scheme: "null" };
       const resolved = resolveComponent(parse3(baseURI, schemelessOptions), parse3(relativeURI, schemelessOptions), schemelessOptions, true);
       schemelessOptions.skipEscape = true;
       return serialize(resolved, schemelessOptions);
     }
-    function resolveComponent(base, relative2, options, skipNormalization) {
+    function resolveComponent(base, relative3, options, skipNormalization) {
       const target = {};
       if (!skipNormalization) {
         base = parse3(serialize(base, options), options);
-        relative2 = parse3(serialize(relative2, options), options);
+        relative3 = parse3(serialize(relative3, options), options);
       }
       options = options || {};
-      if (!options.tolerant && relative2.scheme) {
-        target.scheme = relative2.scheme;
-        target.userinfo = relative2.userinfo;
-        target.host = relative2.host;
-        target.port = relative2.port;
-        target.path = removeDotSegments(relative2.path || "");
-        target.query = relative2.query;
+      if (!options.tolerant && relative3.scheme) {
+        target.scheme = relative3.scheme;
+        target.userinfo = relative3.userinfo;
+        target.host = relative3.host;
+        target.port = relative3.port;
+        target.path = removeDotSegments(relative3.path || "");
+        target.query = relative3.query;
       } else {
-        if (relative2.userinfo !== void 0 || relative2.host !== void 0 || relative2.port !== void 0) {
-          target.userinfo = relative2.userinfo;
-          target.host = relative2.host;
-          target.port = relative2.port;
-          target.path = removeDotSegments(relative2.path || "");
-          target.query = relative2.query;
+        if (relative3.userinfo !== void 0 || relative3.host !== void 0 || relative3.port !== void 0) {
+          target.userinfo = relative3.userinfo;
+          target.host = relative3.host;
+          target.port = relative3.port;
+          target.path = removeDotSegments(relative3.path || "");
+          target.query = relative3.query;
         } else {
-          if (!relative2.path) {
+          if (!relative3.path) {
             target.path = base.path;
-            if (relative2.query !== void 0) {
-              target.query = relative2.query;
+            if (relative3.query !== void 0) {
+              target.query = relative3.query;
             } else {
               target.query = base.query;
             }
           } else {
-            if (relative2.path[0] === "/") {
-              target.path = removeDotSegments(relative2.path);
+            if (relative3.path[0] === "/") {
+              target.path = removeDotSegments(relative3.path);
             } else {
               if ((base.userinfo !== void 0 || base.host !== void 0 || base.port !== void 0) && !base.path) {
-                target.path = "/" + relative2.path;
+                target.path = "/" + relative3.path;
               } else if (!base.path) {
-                target.path = relative2.path;
+                target.path = relative3.path;
               } else {
-                target.path = base.path.slice(0, base.path.lastIndexOf("/") + 1) + relative2.path;
+                target.path = base.path.slice(0, base.path.lastIndexOf("/") + 1) + relative3.path;
               }
               target.path = removeDotSegments(target.path);
             }
-            target.query = relative2.query;
+            target.query = relative3.query;
           }
           target.userinfo = base.userinfo;
           target.host = base.host;
@@ -3698,7 +3698,7 @@ var require_fast_uri = __commonJS({
         }
         target.scheme = base.scheme;
       }
-      target.fragment = relative2.fragment;
+      target.fragment = relative3.fragment;
       return target;
     }
     function equal(uriA, uriB, options) {
@@ -3906,7 +3906,7 @@ var require_fast_uri = __commonJS({
     var fastUri = {
       SCHEMES,
       normalize,
-      resolve: resolve5,
+      resolve: resolve6,
       resolveComponent,
       equal,
       serialize,
@@ -23021,12 +23021,12 @@ var StdioServerTransport = class {
     this.onclose?.();
   }
   send(message) {
-    return new Promise((resolve5) => {
+    return new Promise((resolve6) => {
       const json2 = serializeMessage(message);
       if (this._stdout.write(json2)) {
-        resolve5();
+        resolve6();
       } else {
-        this._stdout.once("drain", resolve5);
+        this._stdout.once("drain", resolve6);
       }
     });
   }
@@ -28929,7 +28929,7 @@ var Protocol = class {
           return;
         }
         const pollInterval = task2.pollInterval ?? this._options?.defaultTaskPollInterval ?? 1e3;
-        await new Promise((resolve5) => setTimeout(resolve5, pollInterval));
+        await new Promise((resolve6) => setTimeout(resolve6, pollInterval));
         options?.signal?.throwIfAborted();
       }
     } catch (error51) {
@@ -28946,7 +28946,7 @@ var Protocol = class {
    */
   request(request, resultSchema, options) {
     const { relatedRequestId, resumptionToken, onresumptiontoken, task, relatedTask } = options ?? {};
-    return new Promise((resolve5, reject) => {
+    return new Promise((resolve6, reject) => {
       const earlyReject = (error51) => {
         reject(error51);
       };
@@ -29024,7 +29024,7 @@ var Protocol = class {
           if (!parseResult2.success) {
             reject(parseResult2.error);
           } else {
-            resolve5(parseResult2.data);
+            resolve6(parseResult2.data);
           }
         } catch (error51) {
           reject(error51);
@@ -29285,12 +29285,12 @@ var Protocol = class {
       }
     } catch {
     }
-    return new Promise((resolve5, reject) => {
+    return new Promise((resolve6, reject) => {
       if (signal.aborted) {
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
         return;
       }
-      const timeoutId = setTimeout(resolve5, interval);
+      const timeoutId = setTimeout(resolve6, interval);
       signal.addEventListener("abort", () => {
         clearTimeout(timeoutId);
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
@@ -30390,7 +30390,7 @@ var McpServer = class {
     let task = createTaskResult.task;
     const pollInterval = task.pollInterval ?? 5e3;
     while (task.status !== "completed" && task.status !== "failed" && task.status !== "cancelled") {
-      await new Promise((resolve5) => setTimeout(resolve5, pollInterval));
+      await new Promise((resolve6) => setTimeout(resolve6, pollInterval));
       const updatedTask = await extra.taskStore.getTask(taskId);
       if (!updatedTask) {
         throw new McpError(ErrorCode.InternalError, `Task ${taskId} not found during polling`);
@@ -31188,6 +31188,7 @@ var HeldOutProbeIntegritySchema = external_exports.discriminatedUnion("kind", [
   external_exports.strictObject({
     kind: external_exports.literal("file"),
     path: external_exports.string().min(1),
+    algorithm: external_exports.literal("git_hash_object").optional(),
     valueHash: external_exports.string().regex(/^[a-f0-9]{64}$/)
   })
 ]);
@@ -31500,6 +31501,7 @@ var SideEffectKindSchema = external_exports.enum([
   "git_push",
   "github_pr_create",
   "github_pr_comment",
+  "github_review_thread_resolve",
   "github_check_rerun"
 ]);
 var SideEffectClaimSchema = external_exports.strictObject({
@@ -31516,6 +31518,7 @@ var SideEffectJournalEntrySchema = external_exports.strictObject({
   claim: SideEffectClaimSchema,
   status: external_exports.enum(["claimed", "confirmed", "failed", "uncertain"]),
   reconciliationAttempts: external_exports.number().int().nonnegative(),
+  dispatchedAt: external_exports.iso.datetime().optional(),
   result: external_exports.record(external_exports.string(), external_exports.unknown()).optional(),
   evidence: external_exports.array(external_exports.string()).default([]),
   failure: external_exports.string().optional(),
@@ -31529,6 +31532,13 @@ var WaitRuntimeStateSchema = external_exports.strictObject({
   status: external_exports.enum(["waiting", "satisfied", "timed_out"]),
   registeredAt: external_exports.iso.datetime(),
   baselineSignature: external_exports.string().optional(),
+  bindingBaseSha: external_exports.string().min(7).optional(),
+  stickyHumanDecision: external_exports.strictObject({
+    kind: external_exports.enum(["draft", "changes_requested"]),
+    observedAt: external_exports.iso.datetime(),
+    snapshotId: external_exports.string().regex(/^[a-f0-9]{64}$/),
+    evidence: external_exports.array(external_exports.string().min(1))
+  }).optional(),
   lastSignature: external_exports.string().optional(),
   nextWakeAt: external_exports.iso.datetime(),
   observations: external_exports.number().int().nonnegative(),
@@ -31710,14 +31720,19 @@ var RunEventTypeSchema = external_exports.enum([
   "context.selected",
   "held_out.checked",
   "semantic.verdict",
+  "scope.checked",
   "tokens.recorded",
   "optimizer.decided",
   "side_effect.claimed",
+  "side_effect.dispatched",
   "side_effect.reconciled",
   "side_effect.confirmed",
   "side_effect.failed",
   "run.waiting",
   "wait.registered",
+  "wait.rebound",
+  "wait.human_decision_observed",
+  "wait.human_decision_resolved",
   "wait.observed",
   "wait.satisfied",
   "wait.timed_out",
@@ -32082,7 +32097,7 @@ function compileRunContract(task, repository, options = {}) {
     repository,
     scope: {
       include: options.include ?? ["**/*"],
-      exclude: options.exclude ?? [".graphcraft/**", ".git/**"]
+      exclude: [.../* @__PURE__ */ new Set([".graphcraft/**", ".git/**", ...options.exclude ?? []])]
     },
     permissions,
     acceptanceAnchors: [
@@ -33548,6 +33563,16 @@ function reduceEvents(events) {
         );
         break;
       }
+      case "side_effect.dispatched": {
+        const actionId = requiredString(data, "actionId");
+        const entry = state.sideEffects.find(({ claim }) => claim.actionId === actionId);
+        if (!entry) throw new Error(`Unknown side effect ${actionId}`);
+        if (entry.dispatchedAt)
+          throw new Error(`Side effect ${actionId} was marked dispatched more than once`);
+        entry.dispatchedAt = event.timestamp;
+        entry.updatedAt = event.timestamp;
+        break;
+      }
       case "side_effect.reconciled": {
         const actionId = requiredString(data, "actionId");
         const entry = state.sideEffects.find(({ claim }) => claim.actionId === actionId);
@@ -33592,6 +33617,43 @@ function reduceEvents(events) {
         nodeState.status = "waiting";
         state.currentNodeId = void 0;
         state.waits.push(wait);
+        break;
+      }
+      case "wait.rebound": {
+        const nodeId = requiredString(data, "nodeId");
+        const wait = state.waits.find((candidate) => candidate.nodeId === nodeId);
+        if (!wait) throw new Error(`Unknown wait node ${nodeId}`);
+        const previousBaseSha = requiredString(data, "previousBaseSha");
+        const baseSha = requiredString(data, "baseSha");
+        if (wait.bindingBaseSha && wait.bindingBaseSha !== previousBaseSha)
+          throw new Error(`Wait node ${nodeId} base binding changed concurrently`);
+        wait.bindingBaseSha = baseSha;
+        wait.evidence = Array.isArray(data.evidence) ? data.evidence.map((value) => String(value)) : wait.evidence;
+        wait.updatedAt = event.timestamp;
+        break;
+      }
+      case "wait.human_decision_observed": {
+        const nodeId = requiredString(data, "nodeId");
+        const wait = state.waits.find((candidate) => candidate.nodeId === nodeId);
+        if (!wait) throw new Error(`Unknown wait node ${nodeId}`);
+        wait.stickyHumanDecision = {
+          kind: external_exports.enum(["draft", "changes_requested"]).parse(data.kind),
+          observedAt: event.timestamp,
+          snapshotId: external_exports.string().regex(/^[a-f0-9]{64}$/).parse(data.snapshotId),
+          evidence: Array.isArray(data.evidence) ? data.evidence.map((value) => String(value)) : []
+        };
+        wait.updatedAt = event.timestamp;
+        break;
+      }
+      case "wait.human_decision_resolved": {
+        const nodeId = requiredString(data, "nodeId");
+        const wait = state.waits.find((candidate) => candidate.nodeId === nodeId);
+        if (!wait) throw new Error(`Unknown wait node ${nodeId}`);
+        const kind = requiredString(data, "kind");
+        if (wait.stickyHumanDecision?.kind !== kind)
+          throw new Error(`Wait node ${nodeId} has no matching sticky human decision`);
+        delete wait.stickyHumanDecision;
+        wait.updatedAt = event.timestamp;
         break;
       }
       case "wait.observed": {
@@ -33811,22 +33873,22 @@ function codexUsage(value) {
   return normalizeTokenUsage("codex", value);
 }
 async function commandVersion(command) {
-  return await new Promise((resolve5) => {
+  return await new Promise((resolve6) => {
     const child = spawn(command, ["--version"], { stdio: ["ignore", "pipe", "ignore"] });
     let output = "";
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       output += chunk;
     });
-    child.once("error", () => resolve5({ installed: false }));
+    child.once("error", () => resolve6({ installed: false }));
     child.once(
       "close",
-      (code) => resolve5(code === 0 ? { installed: true, version: output.trim() } : { installed: false })
+      (code) => resolve6(code === 0 ? { installed: true, version: output.trim() } : { installed: false })
     );
   });
 }
 async function codexAuthenticated() {
-  return await new Promise((resolve5) => {
+  return await new Promise((resolve6) => {
     const child = spawn("codex", ["login", "status"], { stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     child.stdout.setEncoding("utf8");
@@ -33837,8 +33899,8 @@ async function codexAuthenticated() {
     child.stderr.on("data", (chunk) => {
       output += chunk;
     });
-    child.once("error", () => resolve5(false));
-    child.once("close", (code) => resolve5(code === 0 && !/not logged in/i.test(output)));
+    child.once("error", () => resolve6(false));
+    child.once("close", (code) => resolve6(code === 0 && !/not logged in/i.test(output)));
   });
 }
 var CodexAdapter = class {
@@ -33869,7 +33931,7 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve5) => child.once("close", (code) => resolve5(code ?? 1))
+      (resolve6) => child.once("close", (code) => resolve6(code ?? 1))
     );
     const abort = () => {
       child.kill("SIGTERM");
@@ -33923,7 +33985,7 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve5) => child.once("close", (code, closeSignal) => resolve5({ code, signal: closeSignal }))
+      (resolve6) => child.once("close", (code, closeSignal) => resolve6({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderSemanticVerifierPrompt(request.context));
@@ -33976,7 +34038,7 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve5) => child.once("close", (code, closeSignal) => resolve5({ code, signal: closeSignal }))
+      (resolve6) => child.once("close", (code, closeSignal) => resolve6({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderWorkerPrompt(request.capsule));
@@ -34155,22 +34217,22 @@ function claudeUsage(value) {
   return normalizeTokenUsage("claude", value);
 }
 async function claudeVersion() {
-  return await new Promise((resolve5) => {
+  return await new Promise((resolve6) => {
     const child = spawn2("claude", ["--version"], { stdio: ["ignore", "pipe", "ignore"] });
     let output = "";
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       output += chunk;
     });
-    child.once("error", () => resolve5({ installed: false }));
+    child.once("error", () => resolve6({ installed: false }));
     child.once(
       "close",
-      (code) => resolve5(code === 0 ? { installed: true, version: output.trim() } : { installed: false })
+      (code) => resolve6(code === 0 ? { installed: true, version: output.trim() } : { installed: false })
     );
   });
 }
 async function claudeAuthenticated() {
-  return await new Promise((resolve5) => {
+  return await new Promise((resolve6) => {
     const child = spawn2("claude", ["auth", "status", "--json"], {
       stdio: ["ignore", "pipe", "ignore"]
     });
@@ -34179,13 +34241,13 @@ async function claudeAuthenticated() {
     child.stdout.on("data", (chunk) => {
       output += chunk;
     });
-    child.once("error", () => resolve5(false));
+    child.once("error", () => resolve6(false));
     child.once("close", (code) => {
       try {
         const status2 = JSON.parse(output);
-        resolve5(code === 0 && status2.loggedIn === true);
+        resolve6(code === 0 && status2.loggedIn === true);
       } catch {
-        resolve5(false);
+        resolve6(false);
       }
     });
   });
@@ -34215,7 +34277,7 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve5) => child.once("close", (code) => resolve5(code ?? 1))
+      (resolve6) => child.once("close", (code) => resolve6(code ?? 1))
     );
     const abort = () => {
       child.kill("SIGTERM");
@@ -34263,7 +34325,7 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve5) => child.once("close", (code, closeSignal) => resolve5({ code, signal: closeSignal }))
+      (resolve6) => child.once("close", (code, closeSignal) => resolve6({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     let stderr = "";
@@ -34310,7 +34372,7 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve5) => child.once("close", (code, closeSignal) => resolve5({ code, signal: closeSignal }))
+      (resolve6) => child.once("close", (code, closeSignal) => resolve6({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     yield { type: "started", invocationId: request.invocationId };
@@ -34501,6 +34563,7 @@ var PullRequestReviewSchema = external_exports.strictObject({
 });
 var CheckObservationSchema = external_exports.strictObject({
   id: external_exports.string().min(1),
+  databaseId: external_exports.number().int().positive().optional(),
   kind: external_exports.enum(["check_run", "status_context"]),
   name: external_exports.string().min(1),
   status: external_exports.string().min(1),
@@ -34615,8 +34678,9 @@ var GitHubCommandError = class extends Error {
 };
 async function runCommand(options, args) {
   const command = options.command ?? "gh";
-  return await new Promise((resolve5, reject) => {
-    const child = spawn3(command, args, {
+  const commandArgs = [...options.commandArgs ?? [], ...args];
+  return await new Promise((resolve6, reject) => {
+    const child = spawn3(command, commandArgs, {
       cwd: options.cwd,
       env: options.env ?? process.env,
       shell: false,
@@ -34663,11 +34727,11 @@ async function runCommand(options, args) {
       if (forceTimer) clearTimeout(forceTimer);
       if (failure) return reject(new GitHubCommandError(failure, exitCode ?? 1));
       const code = exitCode ?? 1;
-      if (code === 0) resolve5({ stdout, stderr });
+      if (code === 0) resolve6({ stdout, stderr });
       else
         reject(
           new GitHubCommandError(
-            stderr.trim() || stdout.trim() || `${command} ${args[0] ?? ""} exited ${code}`,
+            stderr.trim() || stdout.trim() || `${command} ${commandArgs[0] ?? ""} exited ${code}`,
             code
           )
         );
@@ -34939,6 +35003,7 @@ var CheckNodeSchema = external_exports.discriminatedUnion("__typename", [
   external_exports.strictObject({
     __typename: external_exports.literal("CheckRun"),
     id: external_exports.string().min(1),
+    databaseId: external_exports.number().int().positive().nullable(),
     name: external_exports.string().min(1),
     status: external_exports.string().min(1),
     conclusion: external_exports.string().nullable(),
@@ -34992,6 +35057,22 @@ var GitHubPullRequestCandidateSchema = external_exports.strictObject({
   headSha: external_exports.string().min(7),
   baseSha: external_exports.string().min(7)
 });
+var GitHubReviewThreadStateSchema = external_exports.strictObject({
+  id: external_exports.string().min(1),
+  isResolved: external_exports.boolean(),
+  isOutdated: external_exports.boolean(),
+  path: external_exports.string().optional(),
+  line: external_exports.number().int().positive().optional(),
+  comments: external_exports.array(
+    external_exports.strictObject({
+      id: external_exports.string().min(1),
+      author: external_exports.string().optional(),
+      body: external_exports.string(),
+      url: external_exports.string().url(),
+      createdAt: external_exports.iso.datetime()
+    })
+  )
+});
 var PullRequestsByHeadResponseSchema = external_exports.strictObject({
   data: external_exports.strictObject({
     repository: external_exports.strictObject({
@@ -35028,11 +35109,58 @@ var PullRequestMutationIdentitySchema = external_exports.strictObject({
   headRefOid: external_exports.string().min(7),
   baseRefOid: external_exports.string().min(7)
 });
+var ReviewThreadPageResponseSchema = external_exports.strictObject({
+  data: external_exports.strictObject({
+    node: external_exports.strictObject({
+      id: external_exports.string().min(1),
+      isResolved: external_exports.boolean(),
+      isOutdated: external_exports.boolean(),
+      path: external_exports.string().nullable(),
+      line: external_exports.number().int().positive().nullable(),
+      comments: external_exports.strictObject({
+        nodes: external_exports.array(
+          external_exports.strictObject({
+            id: external_exports.string().min(1),
+            author: external_exports.strictObject({ login: external_exports.string() }).nullable(),
+            body: external_exports.string(),
+            url: external_exports.string().url(),
+            createdAt: external_exports.iso.datetime()
+          })
+        ),
+        pageInfo: PageInfoSchema
+      })
+    }).nullable(),
+    rateLimit: RateLimitSchema
+  })
+});
+var ReviewReplyMutationResponseSchema = external_exports.strictObject({
+  data: external_exports.strictObject({
+    addPullRequestReviewThreadReply: external_exports.strictObject({
+      clientMutationId: external_exports.string().nullable(),
+      comment: external_exports.strictObject({
+        id: external_exports.string().min(1),
+        body: external_exports.string(),
+        url: external_exports.string().url()
+      })
+    }).nullable()
+  })
+});
+var ResolveReviewThreadMutationResponseSchema = external_exports.strictObject({
+  data: external_exports.strictObject({
+    resolveReviewThread: external_exports.strictObject({
+      clientMutationId: external_exports.string().nullable(),
+      thread: external_exports.strictObject({ id: external_exports.string().min(1), isResolved: external_exports.boolean() })
+    }).nullable()
+  })
+});
 var THREADS_QUERY = `query GraphcraftPullRequestThreads($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){url viewerPermission pullRequest(number:$number){number url title state isDraft headRefName baseRefName headRefOid baseRefOid mergeable reviewDecision updatedAt reviewThreads(first:100,after:$cursor){nodes{id isResolved isOutdated path line comments(last:1){totalCount nodes{id author{login} body url createdAt}}} pageInfo{hasNextPage endCursor}}}} rateLimit{cost remaining resetAt}}`;
 var REVIEWS_QUERY = `query GraphcraftPullRequestReviews($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid baseRefOid reviews(first:100,after:$cursor){nodes{id state author{login} commit{oid} submittedAt} pageInfo{hasNextPage endCursor}}}} rateLimit{cost remaining resetAt}}`;
-var CHECKS_QUERY = `query GraphcraftCommitChecks($owner:String!,$name:String!,$head:GitObjectID!,$cursor:String){repository(owner:$owner,name:$name){object(oid:$head){... on Commit{oid statusCheckRollup{contexts(first:100,after:$cursor){nodes{__typename ... on CheckRun{id name status conclusion detailsUrl app{databaseId}} ... on StatusContext{id context state targetUrl}} pageInfo{hasNextPage endCursor}}}}}} rateLimit{cost remaining resetAt}}`;
+var CHECKS_QUERY = `query GraphcraftCommitChecks($owner:String!,$name:String!,$head:GitObjectID!,$cursor:String){repository(owner:$owner,name:$name){object(oid:$head){... on Commit{oid statusCheckRollup{contexts(first:100,after:$cursor){nodes{__typename ... on CheckRun{id databaseId name status conclusion detailsUrl app{databaseId}} ... on StatusContext{id context state targetUrl}} pageInfo{hasNextPage endCursor}}}}}} rateLimit{cost remaining resetAt}}`;
 var IDENTITY_QUERY = `query GraphcraftPullRequestIdentity($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid baseRefOid}} rateLimit{cost remaining resetAt}}`;
 var PULL_REQUESTS_BY_HEAD_QUERY = `query GraphcraftPullRequestsByHead($owner:String!,$name:String!,$head:String!,$cursor:String){repository(owner:$owner,name:$name){pullRequests(first:100,after:$cursor,headRefName:$head,states:[OPEN,CLOSED,MERGED],orderBy:{field:UPDATED_AT,direction:DESC}){nodes{number url title body state isDraft headRefName baseRefName headRefOid baseRefOid} pageInfo{hasNextPage endCursor}}} rateLimit{cost remaining resetAt}}`;
+var REVIEW_THREAD_QUERY = `query GraphcraftReviewThread($threadId:ID!,$cursor:String){node(id:$threadId){... on PullRequestReviewThread{id isResolved isOutdated path line comments(first:100,after:$cursor){nodes{id author{login} body url createdAt} pageInfo{hasNextPage endCursor}}}} rateLimit{cost remaining resetAt}}`;
+var ADD_REVIEW_REPLY_MUTATION = `mutation GraphcraftAddReviewReply($threadId:ID!,$body:String!,$clientMutationId:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body,clientMutationId:$clientMutationId}){clientMutationId comment{id body url}}}`;
+var RESOLVE_REVIEW_THREAD_MUTATION = `mutation GraphcraftResolveReviewThread($threadId:ID!,$clientMutationId:String!){resolveReviewThread(input:{threadId:$threadId,clientMutationId:$clientMutationId}){clientMutationId thread{id isResolved}}}`;
 async function graphql(options, host, query, variables) {
   const args = ["api", "graphql", "--hostname", host, "-f", `query=${query}`];
   for (const [name, value] of Object.entries(variables)) {
@@ -35116,6 +35244,71 @@ async function createGitHubPullRequest(options, input) {
     input.title,
     "--body",
     input.body
+  ]);
+}
+async function readGitHubReviewThread(options, input) {
+  let cursor;
+  let thread;
+  const comments = [];
+  do {
+    const response = ReviewThreadPageResponseSchema.parse(
+      await graphql(options, input.host, REVIEW_THREAD_QUERY, {
+        threadId: input.threadId,
+        cursor
+      })
+    );
+    const node2 = response.data.node;
+    if (!node2) throw new Error(`GitHub review thread ${input.threadId} is unavailable`);
+    const identity = {
+      id: node2.id,
+      isResolved: node2.isResolved,
+      isOutdated: node2.isOutdated,
+      ...node2.path ? { path: node2.path } : {},
+      ...node2.line !== null ? { line: node2.line } : {}
+    };
+    if (thread && JSON.stringify(thread) !== JSON.stringify(identity))
+      throw new Error(`GitHub review thread ${input.threadId} changed during pagination`);
+    thread = identity;
+    comments.push(
+      ...node2.comments.nodes.map(({ id, author, body, url: url2, createdAt }) => ({
+        id,
+        ...author ? { author: author.login } : {},
+        body,
+        url: url2,
+        createdAt
+      }))
+    );
+    cursor = node2.comments.pageInfo.hasNextPage ? node2.comments.pageInfo.endCursor ?? void 0 : void 0;
+    if (node2.comments.pageInfo.hasNextPage && !cursor)
+      throw new Error(`GitHub review thread ${input.threadId} omitted its next comment cursor`);
+  } while (cursor);
+  if (!thread) throw new Error(`GitHub review thread ${input.threadId} is unavailable`);
+  return GitHubReviewThreadStateSchema.parse({ ...thread, comments });
+}
+async function addGitHubReviewThreadReply(options, input) {
+  const response = ReviewReplyMutationResponseSchema.parse(
+    await graphql(options, input.host, ADD_REVIEW_REPLY_MUTATION, input)
+  ).data.addPullRequestReviewThreadReply;
+  if (!response || response.clientMutationId !== input.clientMutationId)
+    throw new Error(`GitHub did not confirm review reply ${input.clientMutationId}`);
+  return response.comment;
+}
+async function resolveGitHubReviewThread(options, input) {
+  const response = ResolveReviewThreadMutationResponseSchema.parse(
+    await graphql(options, input.host, RESOLVE_REVIEW_THREAD_MUTATION, input)
+  ).data.resolveReviewThread;
+  if (!response || response.clientMutationId !== input.clientMutationId || response.thread.id !== input.threadId || !response.thread.isResolved)
+    throw new Error(`GitHub did not confirm review-thread resolution ${input.clientMutationId}`);
+  return response.thread;
+}
+async function rerequestGitHubCheckRun(options, input) {
+  await runCommand(options, [
+    "api",
+    `repos/${input.nameWithOwner}/check-runs/${input.databaseId}/rerequest`,
+    "--hostname",
+    input.host,
+    "--method",
+    "POST"
   ]);
 }
 function assertBound(expected, actual) {
@@ -35230,6 +35423,7 @@ async function collectChecks(input) {
       checks.push(
         check2.__typename === "CheckRun" ? CheckObservationSchema.parse({
           id: check2.id,
+          ...check2.databaseId !== null ? { databaseId: check2.databaseId } : {},
           kind: "check_run",
           name: check2.name,
           status: check2.status,
@@ -35555,10 +35749,73 @@ import { dirname as dirname2 } from "node:path";
 import { randomUUID as randomUUID2 } from "node:crypto";
 import { mkdir, rename, writeFile as writeFile2 } from "node:fs/promises";
 import { dirname } from "node:path";
+
+// packages/runtime/src/redaction.ts
+var secretKey = /(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|passwd|credential)/i;
+var secretPatterns = [
+  /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g,
+  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
+  /\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}\b/g,
+  /\bnpm_[A-Za-z0-9]{20,}\b/g,
+  /\bxox[baprs]-[A-Za-z0-9-]{20,}\b/g,
+  /\bAKIA[A-Z0-9]{16}\b/g,
+  /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g,
+  /\bAuthorization\s*:\s*(?:Bearer|Basic)\s+[^\s,;"'\])}]+/gi,
+  /\b(?:token|password|passwd|secret|api[_-]?key|access[_-]?token)\s*[=:]\s*[^\s,;"'\])}]+/gi,
+  /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi,
+  /([?&](?:access_token|refresh_token|token|api[_-]?key|password|secret)=)[^&#\s"'\])}]+/gi
+];
+function configuredSensitiveValues() {
+  return [
+    ...new Set(
+      Object.entries(process.env).filter(([name, value]) => secretKey.test(name) && typeof value === "string").map(([, value]) => value).filter((value) => value.length >= 6)
+    )
+  ].sort((left, right) => right.length - left.length);
+}
+function redactString(value, configured = configuredSensitiveValues()) {
+  let result = value;
+  for (const sensitive of configured) result = result.split(sensitive).join("[REDACTED]");
+  for (const pattern of secretPatterns)
+    result = result.replace(pattern, (match, schemeOrPrefix) => {
+      if (match.includes("://") && schemeOrPrefix) return `${schemeOrPrefix}[REDACTED]@`;
+      if ((match.startsWith("?") || match.startsWith("&")) && schemeOrPrefix)
+        return `${schemeOrPrefix}[REDACTED]`;
+      return "[REDACTED]";
+    });
+  return result;
+}
+function redact(value, key, configured) {
+  if (secretKey.test(key)) return "[REDACTED]";
+  if (typeof value === "string") return redactString(value, configured);
+  if (Array.isArray(value)) return value.map((item) => redact(item, "", configured));
+  if (value && typeof value === "object")
+    return Object.fromEntries(
+      Object.entries(value).map(([name, item]) => [name, redact(item, name, configured)])
+    );
+  return value;
+}
+function redactValue(value) {
+  return redact(value, "", configuredSensitiveValues());
+}
+function redactTextBytes(value) {
+  const bytes = typeof value === "string" ? Buffer.from(value) : Buffer.from(value);
+  try {
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return Buffer.from(redactString(text));
+  } catch {
+    return Buffer.from(redactString(bytes.toString("latin1")), "latin1");
+  }
+}
+function assertPersistenceSafe(value, label) {
+  if (JSON.stringify(redactValue(value)) !== JSON.stringify(value))
+    throw new Error(`${label} contains secret-like material and cannot be persisted or executed`);
+}
+
+// packages/runtime/src/json.ts
 async function writeJsonAtomic(path, value) {
   await mkdir(dirname(path), { recursive: true });
   const temporaryPath = `${path}.${process.pid}.${randomUUID2()}.tmp`;
-  await writeFile2(temporaryPath, `${JSON.stringify(value, null, 2)}
+  await writeFile2(temporaryPath, `${JSON.stringify(redactValue(value), null, 2)}
 `, {
     encoding: "utf8",
     mode: 384
@@ -35767,7 +36024,7 @@ import { spawn as spawn4 } from "node:child_process";
 async function runProcess(command, args, options) {
   const started = performance.now();
   const timeoutMs = options.timeoutMs ?? 12e4;
-  return await new Promise((resolve5, reject) => {
+  return await new Promise((resolve6, reject) => {
     const child = spawn4(command, args, {
       cwd: options.cwd,
       env: { ...process.env, ...options.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -35799,7 +36056,7 @@ async function runProcess(command, args, options) {
     child.once("close", (code) => {
       clearTimeout(timer);
       options.signal?.removeEventListener("abort", abort);
-      resolve5({
+      resolve6({
         exitCode: code ?? (timedOut ? 124 : 1),
         stdout,
         stderr,
@@ -36292,7 +36549,7 @@ async function requestRunControl(store, action, reason = action === "pause" ? "P
       if (!(error51 instanceof Error) || error51.message !== "Graphcraft run is already active")
         throw error51;
     }
-    await new Promise((resolve5) => setTimeout(resolve5, 50));
+    await new Promise((resolve6) => setTimeout(resolve6, 50));
   }
   throw new Error(
     `The active Graphcraft process did not acknowledge ${action} within ${waitMs}ms; the durable request remains pending`
@@ -36785,7 +37042,24 @@ async function executeSideEffect(input) {
     );
     throw new Error(reason2);
   }
+  if (input.durableDispatch && entry.dispatchedAt) {
+    const reason2 = `The dispatched ${claim.kind} ${claim.actionId} is not yet observable; refusing a possibly duplicate retry`;
+    await input.store.append(
+      "runtime",
+      "side_effect.failed",
+      { actionId: claim.actionId, reason: reason2, retryable: false, uncertain: true },
+      claim.actionId
+    );
+    throw new Error(reason2);
+  }
   await crossSideEffectBoundary(input.boundary, "before_act");
+  if (input.durableDispatch)
+    await input.store.append(
+      "runtime",
+      "side_effect.dispatched",
+      { actionId: claim.actionId },
+      claim.actionId
+    );
   try {
     await input.act(claim);
   } catch (error51) {
@@ -37319,7 +37593,7 @@ async function ensureCurrentRunStorage(input) {
     while (Date.now() <= deadline) {
       const migrated = await readFile5(path, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
       if (migrated) return migrated;
-      await new Promise((resolve5) => setTimeout(resolve5, 10));
+      await new Promise((resolve6) => setTimeout(resolve6, 10));
     }
     throw new Error(`Timed out waiting for storage migration of run ${input.runId}`);
   }
@@ -37365,8 +37639,12 @@ var RunStore = class _RunStore {
   static async create(repositoryRoot, contract, graph, inputProbePlan, inputHeldOutProbePlan) {
     const store = new _RunStore(repositoryRoot, contract.runId);
     store.initializing = true;
+    const persistedContract = RunContractSchema.parse(redactValue(contract));
+    const persistedGraph = GraphSchema.parse(redactValue(graph));
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
     const heldOutProbePlan = inputHeldOutProbePlan ? validateHeldOutProbePlan(inputHeldOutProbePlan) : createHeldOutProbePlan(contract.runId, probePlan);
+    assertPersistenceSafe(probePlan, "Probe plan");
+    assertPersistenceSafe(heldOutProbePlan, "Held-out probe plan");
     await Promise.all([
       mkdir4(join8(store.runRoot, "artifacts"), { recursive: true }),
       mkdir4(join8(store.runRoot, "capsules"), { recursive: true }),
@@ -37374,8 +37652,8 @@ var RunStore = class _RunStore {
       mkdir4(join8(store.graphcraftRoot, "locks"), { recursive: true })
     ]);
     await Promise.all([
-      store.saveContract(contract),
-      store.saveGraph(graph),
+      store.saveContract(persistedContract),
+      store.saveGraph(persistedGraph),
       store.saveProbePlan(probePlan),
       store.saveHeldOutProbePlan(heldOutProbePlan)
     ]);
@@ -37385,8 +37663,8 @@ var RunStore = class _RunStore {
       causationId: contract.runId,
       type: "run.created",
       data: {
-        contract,
-        graph,
+        contract: persistedContract,
+        graph: persistedGraph,
         probePlan,
         heldOutProbePlan,
         nodeIds: graph.nodes.map(({ id }) => id)
@@ -37407,7 +37685,10 @@ var RunStore = class _RunStore {
   }
   async saveContract(contract) {
     await this.ensureStorage();
-    await writeJsonAtomic(join8(this.runRoot, "contract.json"), RunContractSchema.parse(contract));
+    await writeJsonAtomic(
+      join8(this.runRoot, "contract.json"),
+      RunContractSchema.parse(redactValue(contract))
+    );
   }
   async loadContract() {
     await this.ensureStorage();
@@ -37417,7 +37698,7 @@ var RunStore = class _RunStore {
   }
   async saveGraph(graph) {
     await this.ensureStorage();
-    await writeJsonAtomic(join8(this.runRoot, "graph.json"), GraphSchema.parse(graph));
+    await writeJsonAtomic(join8(this.runRoot, "graph.json"), GraphSchema.parse(redactValue(graph)));
   }
   async loadGraph() {
     await this.ensureStorage();
@@ -37435,6 +37716,7 @@ var RunStore = class _RunStore {
   }
   async saveProbePlan(probePlan) {
     await this.ensureStorage();
+    assertPersistenceSafe(probePlan, "Probe plan");
     await writeJsonAtomic(join8(this.runRoot, "probe-plan.json"), ProbePlanSchema.parse(probePlan));
   }
   async loadProbePlan() {
@@ -37460,6 +37742,7 @@ var RunStore = class _RunStore {
   }
   async saveHeldOutProbePlan(heldOutProbePlan) {
     await this.ensureStorage();
+    assertPersistenceSafe(heldOutProbePlan, "Held-out probe plan");
     await writeJsonAtomic(
       join8(this.runRoot, "held-out-probes.json"),
       validateHeldOutProbePlan(heldOutProbePlan)
@@ -37518,7 +37801,7 @@ var RunStore = class _RunStore {
         actor,
         causationId,
         type,
-        data
+        data: redactValue(data)
       });
       await appendFile2(this.eventsPath(), `${JSON.stringify(event)}
 `, "utf8");
@@ -37560,14 +37843,15 @@ var RunStore = class _RunStore {
     await this.ensureStorage();
     const path = join8(this.runRoot, "artifacts", relativePath);
     await mkdir4(dirname5(path), { recursive: true });
-    await writeFile3(path, value, { mode: 384 });
+    await writeFile3(path, redactTextBytes(value), { mode: 384 });
     return path;
   }
   async appendInvocationEvent(invocationId, event) {
     await this.ensureStorage();
     const path = join8(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
     await mkdir4(dirname5(path), { recursive: true });
-    await appendFile2(path, `${JSON.stringify(HostEventSchema.parse(event))}
+    const persistedEvent = HostEventSchema.parse(redactValue(event));
+    await appendFile2(path, `${JSON.stringify(persistedEvent)}
 `, {
       encoding: "utf8",
       mode: 384
@@ -37626,17 +37910,20 @@ var RunStore = class _RunStore {
   }
   async writeCapsule(hash2, value) {
     await this.ensureStorage();
+    const persistedValue = redactValue(value);
+    if (contentHash(persistedValue) !== hash2)
+      throw new Error("Context capsule must be redacted before content addressing");
     const path = join8(this.runRoot, "capsules", `${hash2}.json`);
     const reused = await readFile6(path, "utf8").then((existing) => contentHash(JSON.parse(existing)) === hash2).catch(() => false);
     if (reused) return { path, reused: true };
-    await writeJsonAtomic(path, value);
+    await writeJsonAtomic(path, persistedValue);
     return { path, reused: false };
   }
   async writeContentAddressedArtifact(category, value, extension = "json") {
     await this.ensureStorage();
     if (!/^[a-z0-9][a-z0-9-]*$/.test(category) || !/^[a-z0-9]+$/.test(extension))
       throw new Error("Content-addressed artifact category or extension is invalid");
-    const bytes = typeof value === "string" ? Buffer.from(value) : Buffer.from(value);
+    const bytes = redactTextBytes(value);
     const hash2 = contentHash({ contents: bytes.toString("base64") });
     const path = join8(this.runRoot, "artifacts", category, `${hash2}.${extension}`);
     const reused = await readFile6(path).then((existing) => Buffer.compare(existing, bytes) === 0).catch(() => false);
@@ -37686,6 +37973,209 @@ async function resolveRunId(repositoryRoot, reference) {
   if (matches.length !== 1)
     throw new Error(`Run reference ${reference} matched ${matches.length} runs`);
   return matches[0];
+}
+
+// packages/runtime/src/scope.ts
+import { createHash as createHash2 } from "node:crypto";
+import { createReadStream } from "node:fs";
+import { lstat as lstat2, readlink as readlink2 } from "node:fs/promises";
+import { isAbsolute as isAbsolute3, matchesGlob, relative, resolve as resolve3, sep as sep2 } from "node:path";
+var maximumChangedPaths = 1e4;
+async function gitOutput(repositoryPath, args) {
+  const result = await runProcess("git", args, { cwd: repositoryPath, timeoutMs: 12e4 });
+  if (result.exitCode !== 0)
+    throw new Error(result.stderr.trim() || `git ${args[0] ?? "command"} failed`);
+  return result.stdout;
+}
+function nulPaths(value) {
+  return value.split("\0").filter(Boolean);
+}
+function confinedPath(repositoryPath, path) {
+  if (isAbsolute3(path)) throw new Error(`Git reported an absolute workspace path: ${path}`);
+  const absolute = resolve3(repositoryPath, path);
+  const confined = relative(repositoryPath, absolute);
+  if (confined === ".." || confined.startsWith(`..${sep2}`) || isAbsolute3(confined))
+    throw new Error(`Git reported a path outside the workspace: ${path}`);
+  return absolute;
+}
+async function fileDigest(path) {
+  const hash2 = createHash2("sha256");
+  for await (const chunk of createReadStream(path)) hash2.update(chunk);
+  return hash2.digest("hex");
+}
+async function pathSignature(repositoryPath, path) {
+  const absolute = confinedPath(repositoryPath, path);
+  let status2;
+  try {
+    status2 = await lstat2(absolute);
+  } catch (error51) {
+    if (error51.code === "ENOENT") return "missing";
+    throw error51;
+  }
+  const mode = status2.mode & 511;
+  if (status2.isSymbolicLink())
+    return contentHash({ kind: "symlink", mode, target: await readlink2(absolute) });
+  if (status2.isFile())
+    return contentHash({
+      kind: "file",
+      mode,
+      size: status2.size,
+      digest: await fileDigest(absolute)
+    });
+  if (status2.isDirectory()) {
+    const [head, state] = await Promise.all([
+      gitOutput(absolute, ["rev-parse", "HEAD"]).catch(() => "not-a-repository"),
+      gitOutput(absolute, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]).catch(
+        () => "unavailable"
+      )
+    ]);
+    return contentHash({ kind: "directory", mode, head: head.trim(), state });
+  }
+  return contentHash({ kind: "other", mode, size: status2.size });
+}
+async function captureWorkspaceScopeSnapshot(repositoryPath, inspectedIgnoredPatterns = []) {
+  const ignored = inspectedIgnoredPatterns.length > 0 ? gitOutput(repositoryPath, [
+    "ls-files",
+    "--others",
+    "--ignored",
+    "--exclude-standard",
+    "-z",
+    "--",
+    ...inspectedIgnoredPatterns
+  ]) : Promise.resolve("");
+  const [tracked, untracked, excludedIgnored, head, branch, index] = await Promise.all([
+    gitOutput(repositoryPath, ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"]),
+    gitOutput(repositoryPath, ["ls-files", "--others", "--exclude-standard", "-z"]),
+    ignored,
+    gitOutput(repositoryPath, ["rev-parse", "HEAD"]),
+    gitOutput(repositoryPath, ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(
+      () => "(detached)"
+    ),
+    gitOutput(repositoryPath, ["diff", "--cached", "--no-ext-diff", "--binary", "HEAD", "--"])
+  ]);
+  const paths = [
+    .../* @__PURE__ */ new Set([...nulPaths(tracked), ...nulPaths(untracked), ...nulPaths(excludedIgnored)])
+  ].sort();
+  if (paths.length > maximumChangedPaths)
+    throw new Error(
+      `Workspace scope inspection refused ${paths.length} changed paths; maximum is ${maximumChangedPaths}`
+    );
+  const changed = {};
+  for (const path of paths)
+    changed[path.replaceAll("\\", "/")] = await pathSignature(repositoryPath, path);
+  const core = {
+    headSha: head.trim(),
+    branch: branch.trim(),
+    indexDigest: contentHash(index),
+    changed
+  };
+  return { schemaVersion: 1, digest: contentHash(core), ...core };
+}
+function parseWorkspaceScopeSnapshot(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return void 0;
+  const candidate = value;
+  if (candidate.schemaVersion !== 1 || typeof candidate.digest !== "string" || typeof candidate.headSha !== "string" || typeof candidate.branch !== "string" || typeof candidate.indexDigest !== "string" || typeof candidate.changed !== "object" || candidate.changed === null || Array.isArray(candidate.changed) || Object.entries(candidate.changed).some(
+    ([path, signature]) => path.length === 0 || typeof signature !== "string"
+  ))
+    return void 0;
+  return candidate;
+}
+function normalizedPattern(value) {
+  return value.replaceAll("\\", "/").replace(/^\.\//, "");
+}
+function pathMatchesScope(path, patterns) {
+  const normalizedPath = normalizedPattern(path);
+  return patterns.some((value) => {
+    const pattern = normalizedPattern(value);
+    if (pattern === "**" || pattern === "**/*") return true;
+    if (normalizedPath === pattern) return true;
+    if (pattern.endsWith("/**") && normalizedPath === pattern.slice(0, -3).replace(/\/$/, ""))
+      return true;
+    return matchesGlob(normalizedPath, pattern);
+  });
+}
+function acceptedWriteScopes(graph, state) {
+  return graph.nodes.filter(
+    (candidate) => candidate.sideEffectClass === "workspace_write" && state.nodes[candidate.id]?.status === "accepted"
+  ).flatMap(({ scope }) => scope);
+}
+function auditWorkspaceScope(input) {
+  const currentPaths = Object.keys(input.current.changed).sort();
+  const touchedPaths = [.../* @__PURE__ */ new Set([...Object.keys(input.baseline.changed), ...currentPaths])].filter((path) => input.baseline.changed[path] !== input.current.changed[path]).sort();
+  const candidatePaths = [.../* @__PURE__ */ new Set([...currentPaths, ...touchedPaths])].sort();
+  const priorScopes = acceptedWriteScopes(input.graph, input.state);
+  const violations = [];
+  for (const path of candidatePaths) {
+    if (!pathMatchesScope(path, input.contract.scope.include))
+      violations.push({
+        kind: "contract_not_included",
+        path,
+        detail: `${path} is outside contract include scope ${input.contract.scope.include.join(", ")}`
+      });
+    if (pathMatchesScope(path, input.contract.scope.exclude))
+      violations.push({
+        kind: "contract_excluded",
+        path,
+        detail: `${path} matches contract exclude scope ${input.contract.scope.exclude.join(", ")}`
+      });
+  }
+  for (const path of touchedPaths) {
+    if (input.node.sideEffectClass === "none")
+      violations.push({
+        kind: "read_only_write",
+        path,
+        detail: `${path} changed during read-only node ${input.node.id}`
+      });
+    else if (!pathMatchesScope(path, input.node.scope))
+      violations.push({
+        kind: "node_scope",
+        path,
+        detail: `${path} changed outside node ${input.node.id} scope ${input.node.scope.join(", ")}`
+      });
+  }
+  for (const path of currentPaths)
+    if (!pathMatchesScope(path, input.node.scope) && !pathMatchesScope(path, priorScopes))
+      violations.push({
+        kind: "unowned_change",
+        path,
+        detail: `${path} is not owned by ${input.node.id} or an accepted write node`
+      });
+  if (input.baseline.headSha !== input.current.headSha)
+    violations.push({
+      kind: "git_head",
+      detail: `HEAD changed from ${input.baseline.headSha} to ${input.current.headSha} outside a commit node`
+    });
+  if (input.baseline.branch !== input.current.branch)
+    violations.push({
+      kind: "git_branch",
+      detail: `branch changed from ${input.baseline.branch} to ${input.current.branch} outside a runtime boundary`
+    });
+  if (input.baseline.indexDigest !== input.current.indexDigest)
+    violations.push({
+      kind: "git_index",
+      detail: "the Git index changed outside a runtime-owned commit boundary"
+    });
+  const uniqueViolations = violations.filter(
+    (violation, index) => violations.findIndex(
+      (candidate) => candidate.kind === violation.kind && candidate.path === violation.path && candidate.detail === violation.detail
+    ) === index
+  );
+  return {
+    schemaVersion: 1,
+    nodeId: input.node.id,
+    allowed: uniqueViolations.length === 0,
+    changedPaths: currentPaths,
+    touchedPaths,
+    reportedChangedPaths: [...new Set(input.reportedChangedPaths ?? [])].sort(),
+    violations: uniqueViolations,
+    baselineDigest: input.baseline.digest,
+    currentDigest: input.current.digest
+  };
+}
+function scopeViolationReason(audit, workspacePath) {
+  const evidence = audit.violations.slice(0, 12).map(({ detail }) => detail).join("; ");
+  const omitted = audit.violations.length > 12 ? `; ${audit.violations.length - 12} more` : "";
+  return `Scope policy rejected node ${audit.nodeId}: ${evidence}${omitted}. Changes were preserved in the isolated workspace at ${workspacePath}`;
 }
 
 // packages/runtime/src/context.ts
@@ -37752,12 +38242,16 @@ async function prepareWorkerContext(input) {
     ...input.node,
     contextSelector: { ...input.node.contextSelector, relevantPaths }
   };
-  const capsule = createContextCapsule({
-    contract: input.contract,
-    node: node2,
-    predecessorEvidence: input.predecessorEvidence,
-    probeResults: input.probeResults
-  });
+  const capsule = ContextCapsuleSchema.parse(
+    redactValue(
+      createContextCapsule({
+        contract: input.contract,
+        node: node2,
+        predecessorEvidence: input.predecessorEvidence,
+        probeResults: input.probeResults
+      })
+    )
+  );
   const capsuleHash = contentHash(capsule);
   const storedCapsule = await input.store.writeCapsule(capsuleHash, capsule);
   const matchedPaths = selectedTrackedPaths(repositoryPaths, capsule.relevantPaths);
@@ -37816,23 +38310,23 @@ async function prepareWorkerContext(input) {
 }
 
 // packages/runtime/src/wait.ts
-import { lstat as lstat2, readFile as readFile7, readlink as readlink2 } from "node:fs/promises";
+import { lstat as lstat3, readFile as readFile7, readlink as readlink3 } from "node:fs/promises";
 import { setTimeout as waitForTimeout } from "node:timers/promises";
-import { isAbsolute as isAbsolute3, resolve as resolve3, sep as sep2 } from "node:path";
+import { isAbsolute as isAbsolute4, resolve as resolve4, sep as sep3 } from "node:path";
 function waitPath(root, path) {
-  if (isAbsolute3(path) || path.split(/[\\/]/).includes(".."))
+  if (isAbsolute4(path) || path.split(/[\\/]/).includes(".."))
     throw new Error(`Wait condition path is unsafe: ${path}`);
-  const absolute = resolve3(root, path);
-  if (absolute !== root && !absolute.startsWith(`${root}${sep2}`))
+  const absolute = resolve4(root, path);
+  if (absolute !== root && !absolute.startsWith(`${root}${sep3}`))
     throw new Error(`Wait condition path escapes the workspace: ${path}`);
   return absolute;
 }
 async function fileSignature(root, path) {
   const absolute = waitPath(root, path);
-  const stats = await lstat2(absolute).catch(() => void 0);
+  const stats = await lstat3(absolute).catch(() => void 0);
   if (!stats) return contentHash({ kind: "absent", path });
   if (stats.isSymbolicLink())
-    return contentHash({ kind: "symlink", path, target: await readlink2(absolute) });
+    return contentHash({ kind: "symlink", path, target: await readlink3(absolute) });
   if (stats.isFile())
     return contentHash({
       kind: "file",
@@ -37950,14 +38444,36 @@ async function sleepUntilWake(nextWakeAt2, signal) {
 }
 
 // packages/runtime/src/held-out.ts
+import { execFile } from "node:child_process";
 import { readFile as readFile8, stat as stat3 } from "node:fs/promises";
-import { isAbsolute as isAbsolute4, relative, resolve as resolve4, sep as sep3 } from "node:path";
+import { isAbsolute as isAbsolute5, relative as relative2, resolve as resolve5, sep as sep4 } from "node:path";
+import { promisify } from "node:util";
+var execFileAsync = promisify(execFile);
 function relativeRepositoryPath(repositoryRoot, candidate) {
-  const root = resolve4(repositoryRoot);
-  const path = resolve4(repositoryRoot, candidate);
-  if (path !== root && !path.startsWith(`${root}${sep3}`)) return void 0;
-  const result = relative(root, path);
-  return result && !isAbsolute4(result) ? result : void 0;
+  const root = resolve5(repositoryRoot);
+  const path = resolve5(repositoryRoot, candidate);
+  if (path !== root && !path.startsWith(`${root}${sep4}`)) return void 0;
+  const result = relative2(root, path);
+  return result && !isAbsolute5(result) ? result.split(sep4).join("/") : void 0;
+}
+async function gitObjectValueHash(repositoryRoot, path) {
+  const { stdout } = await execFileAsync(
+    "git",
+    ["hash-object", `--path=${path.replaceAll("\\", "/")}`, resolve5(repositoryRoot, path)],
+    { cwd: repositoryRoot, encoding: "utf8", maxBuffer: 1024 * 1024 }
+  );
+  const objectHash = stdout.trim();
+  if (!/^[a-f0-9]{40,64}$/.test(objectHash))
+    throw new Error(`Unable to establish held-out integrity for ${path}`);
+  return contentHash({ path, objectHash });
+}
+async function fileValueHash(repositoryRoot, path, algorithm) {
+  if (algorithm === "git_hash_object") {
+    const details = await stat3(resolve5(repositoryRoot, path)).catch(() => void 0);
+    return details?.isFile() ? await gitObjectValueHash(repositoryRoot, path) : contentHash({ missing: true, path, algorithm });
+  }
+  const contents = await readFile8(resolve5(repositoryRoot, path)).catch(() => void 0);
+  return contents ? contentHash({ path, contents: contents.toString("base64") }) : contentHash({ missing: true, path });
 }
 function possibleFileArguments(values) {
   return values.map((value) => value.replace(/^["']|["']$/g, "").replace(/[;&|]+$/g, "")).filter(
@@ -37967,15 +38483,15 @@ function possibleFileArguments(values) {
 async function fileIntegrity(repositoryRoot, cwd, values) {
   const result = [];
   for (const value of possibleFileArguments(values)) {
-    const path = relativeRepositoryPath(repositoryRoot, resolve4(repositoryRoot, cwd ?? ".", value));
+    const path = relativeRepositoryPath(repositoryRoot, resolve5(repositoryRoot, cwd ?? ".", value));
     if (!path) continue;
-    const details = await stat3(resolve4(repositoryRoot, path)).catch(() => void 0);
+    const details = await stat3(resolve5(repositoryRoot, path)).catch(() => void 0);
     if (!details?.isFile()) continue;
-    const contents = await readFile8(resolve4(repositoryRoot, path));
     result.push({
       kind: "file",
       path,
-      valueHash: contentHash({ path, contents: contents.toString("base64") })
+      algorithm: "git_hash_object",
+      valueHash: await fileValueHash(repositoryRoot, path, "git_hash_object")
     });
   }
   return result;
@@ -38000,7 +38516,7 @@ async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot) {
     const script = match[2];
     const manifestPath = relativeRepositoryPath(repositoryRoot, path);
     if (!manifestPath) throw new Error(`Completion script ${script} escapes the repository`);
-    const manifest2 = JSON.parse(await readFile8(resolve4(repositoryRoot, manifestPath), "utf8"));
+    const manifest2 = JSON.parse(await readFile8(resolve5(repositoryRoot, manifestPath), "utf8"));
     const value = manifest2.scripts?.[script];
     if (!value) throw new Error(`Completion script ${script} is missing from ${manifestPath}`);
     protectedValues.push({
@@ -38031,16 +38547,13 @@ async function heldOutIntegrityFailures(plan, repositoryPath) {
     for (const integrity of entry.integrity) {
       let actualHash;
       if (integrity.kind === "package_script") {
-        const manifest2 = await readFile8(resolve4(repositoryPath, integrity.path), "utf8").then(
+        const manifest2 = await readFile8(resolve5(repositoryPath, integrity.path), "utf8").then(
           (value2) => JSON.parse(value2)
         ).catch(() => void 0);
         const value = manifest2?.scripts?.[integrity.script];
         actualHash = value ? contentHash({ path: integrity.path, script: integrity.script, value }) : contentHash({ missing: true, path: integrity.path, script: integrity.script });
       } else {
-        const contents = await readFile8(resolve4(repositoryPath, integrity.path)).catch(
-          () => void 0
-        );
-        actualHash = contents ? contentHash({ path: integrity.path, contents: contents.toString("base64") }) : contentHash({ missing: true, path: integrity.path });
+        actualHash = await fileValueHash(repositoryPath, integrity.path, integrity.algorithm);
       }
       if (actualHash === integrity.valueHash) continue;
       changedKinds.add(integrity.kind);
@@ -38471,6 +38984,46 @@ function currentReviewFeedback(snapshot) {
     } : {}
   }));
 }
+function lifecycleBinding(state, node2) {
+  const pullRequests = state.sideEffects.filter(
+    ({ claim, status: status2, result }) => claim.kind === "github_pr_create" && status2 === "confirmed" && result !== void 0
+  );
+  if (pullRequests.length !== 1 || !pullRequests[0]?.result)
+    throw new Error("The GitHub lifecycle requires one confirmed pull-request binding");
+  const pullRequest = pullRequests[0];
+  const pullRequestResult = pullRequest.result;
+  if (!pullRequestResult)
+    throw new Error("The confirmed pull-request binding has no durable result");
+  const originalExpected = pullRequestPrecondition(pullRequest.claim);
+  const number4 = pullRequestResult.number;
+  if (typeof number4 !== "number" || !Number.isInteger(number4) || number4 <= 0)
+    throw new Error("The confirmed pull-request binding has no valid number");
+  let expected = originalExpected;
+  const boundaryNodeId = node2.dependsOn[0];
+  if (!boundaryNodeId) throw new Error("The GitHub lifecycle has no remote dependency");
+  if (boundaryNodeId !== pullRequest.claim.nodeId) {
+    const pushed = state.sideEffects.find(
+      ({ claim }) => claim.nodeId === boundaryNodeId && claim.kind === "git_push"
+    );
+    if (pushed?.status !== "confirmed" || !pushed.result)
+      throw new Error(`The GitHub lifecycle has no confirmed push for ${boundaryNodeId}`);
+    const branch = pushed.claim.precondition.branch;
+    const remote = pushed.claim.precondition.remote;
+    const remoteUrl = pushed.claim.precondition.remoteUrl;
+    const sha = pushed.result.sha;
+    if (branch !== originalExpected.headRefName || remote !== originalExpected.remote || remoteUrl !== originalExpected.remoteUrl || typeof sha !== "string")
+      throw new Error(`The repair push ${boundaryNodeId} does not preserve the pull-request head`);
+    expected = { ...originalExpected, headSha: sha };
+  }
+  const wait = state.waits.find(({ nodeId }) => nodeId === node2.id);
+  if (wait?.bindingBaseSha) expected = { ...expected, baseSha: wait.bindingBaseSha };
+  return {
+    pullRequestClaim: pullRequest.claim,
+    pullRequestResult,
+    expected,
+    number: number4
+  };
+}
 function lifecycleProjection(snapshot, classification) {
   return {
     schemaVersion: 1,
@@ -38497,8 +39050,9 @@ function lifecycleProjection(snapshot, classification) {
     binding: snapshot.binding,
     branchProtection: snapshot.branchProtection,
     requiredChecks: snapshot.requiredChecks,
-    checks: snapshot.checks.map(({ id, kind, name, status: status2, conclusion, appId }) => ({
+    checks: snapshot.checks.map(({ id, databaseId, kind, name, status: status2, conclusion, appId }) => ({
       id,
+      ...databaseId !== void 0 ? { databaseId } : {},
       kind,
       name,
       status: status2,
@@ -38608,12 +39162,34 @@ async function captureExpectedPullRequestLifecycle(workspace, contract, expected
       )
     )
   });
+  const rerunnableCheckIds = /* @__PURE__ */ new Set([
+    ...classification.checkIds.infrastructure,
+    ...classification.checkIds.cancelled
+  ]);
+  const rerunnableChecks = snapshot.checks.filter(
+    (check2) => rerunnableCheckIds.has(check2.id) && check2.kind === "check_run" && check2.databaseId !== void 0
+  ).map(({ id, databaseId, kind, name, status: status2, conclusion, appId, detailsUrl }) => ({
+    contentTrust: "untrusted_external",
+    id,
+    databaseId,
+    kind,
+    name,
+    status: status2,
+    ...conclusion ? { conclusion } : {},
+    ...appId !== void 0 ? { appId } : {},
+    ...detailsUrl ? { detailsUrl } : {}
+  }));
   return {
     classification,
     reviewFeedback,
     reviewFeedbackSignature,
     ciFailures,
     ciFailureSignature,
+    rerunnableChecks,
+    pullRequestDecision: {
+      isDraft: snapshot.pullRequest.isDraft,
+      ...snapshot.pullRequest.reviewDecision ? { reviewDecision: snapshot.pullRequest.reviewDecision } : {}
+    },
     result: {
       probeId: spec.id,
       kind: spec.kind,
@@ -38637,12 +39213,540 @@ async function captureExpectedPullRequestLifecycle(workspace, contract, expected
 `
   };
 }
+function reviewReplyPrecondition(claim) {
+  const value = claim.precondition;
+  const fields = {
+    host: value.host,
+    nameWithOwner: value.nameWithOwner,
+    remote: value.remote,
+    remoteUrl: value.remoteUrl,
+    headRefName: value.headRefName,
+    baseRefName: value.baseRefName,
+    headSha: value.headSha,
+    baseSha: value.baseSha,
+    number: value.number,
+    threadId: value.threadId,
+    feedbackCommentId: value.feedbackCommentId,
+    feedbackBodyHash: value.feedbackBodyHash,
+    replyBodyHash: value.replyBodyHash
+  };
+  if (Object.entries(fields).filter(([name]) => !["number", "feedbackCommentId", "feedbackBodyHash"].includes(name)).some(([, field]) => typeof field !== "string") || typeof fields.number !== "number" || !Number.isInteger(fields.number) || fields.number <= 0 || fields.feedbackCommentId !== null && typeof fields.feedbackCommentId !== "string" || fields.feedbackBodyHash !== null && typeof fields.feedbackBodyHash !== "string")
+    throw new Error(`Review-reply claim ${claim.actionId} has an invalid precondition`);
+  return fields;
+}
+function reviewResolutionPrecondition(claim) {
+  const value = claim.precondition;
+  const fields = {
+    host: value.host,
+    nameWithOwner: value.nameWithOwner,
+    remote: value.remote,
+    remoteUrl: value.remoteUrl,
+    headRefName: value.headRefName,
+    baseRefName: value.baseRefName,
+    headSha: value.headSha,
+    baseSha: value.baseSha,
+    number: value.number,
+    threadId: value.threadId,
+    replyIdempotencyKey: value.replyIdempotencyKey,
+    replyCommentId: value.replyCommentId,
+    replyBodyHash: value.replyBodyHash
+  };
+  if (Object.entries(fields).filter(([name]) => name !== "number").some(([, field]) => typeof field !== "string") || typeof fields.number !== "number" || !Number.isInteger(fields.number) || fields.number <= 0)
+    throw new Error(`Review-resolution claim ${claim.actionId} has an invalid precondition`);
+  return fields;
+}
+function reviewReplyBody(headSha, idempotencyKey) {
+  return [
+    `Addressed in ${headSha} and reverified against the approved Graphcraft completion checks.`,
+    "",
+    `<!-- Graphcraft-Action: ${idempotencyKey} -->`
+  ].join("\n");
+}
+async function assertPullRequestBinding(workspace, expected, number4, options) {
+  const evidence = await assertCurrentRemoteBinding(workspace, expected);
+  const current = await readGitHubPullRequestIdentity(commandOptions(workspace, options), {
+    nameWithOwner: expected.nameWithOwner,
+    number: number4
+  });
+  if (current.state !== "OPEN" || current.headRefName !== expected.headRefName || current.baseRefName !== expected.baseRefName || current.headSha !== expected.headSha || current.baseSha !== expected.baseSha)
+    throw new Error(`Pull request #${number4} moved before the review-thread mutation`);
+  return [
+    ...evidence,
+    `Pull request #${number4} remains ${expected.headRefName}@${expected.headSha}/${expected.baseRefName}@${expected.baseSha}`
+  ];
+}
+function createReviewReplyClaim(input) {
+  const actionId = contentHash({
+    schemaVersion: 1,
+    runId: input.contract.runId,
+    nodeId: input.nodeId,
+    kind: "github_pr_comment",
+    threadId: input.feedback.threadId,
+    headSha: input.binding.expected.headSha
+  });
+  const idempotencyKey = `graphcraft-${actionId}`;
+  const body = reviewReplyBody(input.binding.expected.headSha, idempotencyKey);
+  return SideEffectClaimSchema.parse({
+    schemaVersion: 1,
+    actionId,
+    idempotencyKey,
+    nodeId: input.nodeId,
+    kind: "github_pr_comment",
+    target: `${input.binding.expected.nameWithOwner}#${input.binding.number}:${input.feedback.threadId}`,
+    precondition: {
+      ...input.binding.expected,
+      number: input.binding.number,
+      threadId: input.feedback.threadId,
+      feedbackCommentId: input.feedback.latestComment?.id ?? null,
+      feedbackBodyHash: input.feedback.latestComment ? contentHash(input.feedback.latestComment.body) : null,
+      replyBodyHash: contentHash(body)
+    },
+    claimedAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+}
+async function reconcileReviewReply(workspace, claim, options) {
+  if (claim.kind !== "github_pr_comment")
+    throw new Error(`Side effect ${claim.actionId} is not a review reply`);
+  const expected = reviewReplyPrecondition(claim);
+  let evidence;
+  try {
+    evidence = await assertPullRequestBinding(workspace, expected, expected.number, options);
+  } catch (error51) {
+    return {
+      status: "unknown",
+      evidence: [error51 instanceof Error ? error51.message : String(error51)]
+    };
+  }
+  const thread = await readGitHubReviewThread(commandOptions(workspace, options), {
+    host: expected.host,
+    threadId: expected.threadId
+  });
+  const marker = `<!-- Graphcraft-Action: ${claim.idempotencyKey} -->`;
+  const replies = thread.comments.filter(({ body }) => body.includes(marker));
+  if (replies.length === 1 && contentHash(replies[0].body) === expected.replyBodyHash)
+    return {
+      status: "applied",
+      result: { threadId: thread.id, commentId: replies[0].id, url: replies[0].url },
+      evidence: [...evidence, `Review thread ${thread.id} contains the exact action reply`]
+    };
+  if (replies.length > 0)
+    return {
+      status: "unknown",
+      evidence: [...evidence, `Review thread ${thread.id} has an ambiguous action reply`]
+    };
+  const latest = thread.comments.at(-1);
+  const feedbackMatches = (expected.feedbackCommentId === null ? latest === void 0 : latest?.id === expected.feedbackCommentId) && (expected.feedbackBodyHash === null ? latest === void 0 : latest !== void 0 && contentHash(latest.body) === expected.feedbackBodyHash);
+  if (thread.isResolved || thread.isOutdated || !feedbackMatches)
+    return {
+      status: "unknown",
+      evidence: [
+        ...evidence,
+        `Review thread ${thread.id} changed before the claimed reply could be confirmed`
+      ]
+    };
+  return {
+    status: "not_applied",
+    evidence: [...evidence, `Review thread ${thread.id} has no action reply yet`]
+  };
+}
+async function performReviewReply(workspace, claim, options, boundary) {
+  const expected = reviewReplyPrecondition(claim);
+  await assertPullRequestBinding(workspace, expected, expected.number, options);
+  const thread = await readGitHubReviewThread(commandOptions(workspace, options), {
+    host: expected.host,
+    threadId: expected.threadId
+  });
+  const latest = thread.comments.at(-1);
+  if (thread.isResolved || thread.isOutdated || (expected.feedbackCommentId === null ? latest !== void 0 : latest?.id !== expected.feedbackCommentId) || expected.feedbackBodyHash !== null && (!latest || contentHash(latest.body) !== expected.feedbackBodyHash))
+    throw new Error(`Review thread ${expected.threadId} moved before reply`);
+  const body = reviewReplyBody(expected.headSha, claim.idempotencyKey);
+  if (contentHash(body) !== expected.replyBodyHash)
+    throw new Error(`Review reply body changed for side effect ${claim.actionId}`);
+  await crossSideEffectBoundary(boundary, "after_action_prepare");
+  const reply = await addGitHubReviewThreadReply(commandOptions(workspace, options), {
+    host: expected.host,
+    threadId: expected.threadId,
+    body,
+    clientMutationId: claim.idempotencyKey
+  });
+  await crossSideEffectBoundary(boundary, "after_action_command");
+  return { threadId: expected.threadId, commentId: reply.id, url: reply.url };
+}
+function createReviewResolutionClaim(input) {
+  const commentId = input.replyResult.commentId;
+  if (typeof commentId !== "string")
+    throw new Error(`Review reply ${input.replyClaim.actionId} has no confirmed comment ID`);
+  const actionId = contentHash({
+    schemaVersion: 1,
+    runId: input.contract.runId,
+    nodeId: input.nodeId,
+    kind: "github_review_thread_resolve",
+    threadId: input.feedback.threadId,
+    headSha: input.binding.expected.headSha
+  });
+  return SideEffectClaimSchema.parse({
+    schemaVersion: 1,
+    actionId,
+    idempotencyKey: `graphcraft-${actionId}`,
+    nodeId: input.nodeId,
+    kind: "github_review_thread_resolve",
+    target: `${input.binding.expected.nameWithOwner}#${input.binding.number}:${input.feedback.threadId}`,
+    precondition: {
+      ...input.binding.expected,
+      number: input.binding.number,
+      threadId: input.feedback.threadId,
+      replyIdempotencyKey: input.replyClaim.idempotencyKey,
+      replyCommentId: commentId,
+      replyBodyHash: reviewReplyPrecondition(input.replyClaim).replyBodyHash
+    },
+    claimedAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+}
+async function reconcileReviewResolution(workspace, claim, options) {
+  if (claim.kind !== "github_review_thread_resolve")
+    throw new Error(`Side effect ${claim.actionId} is not a review-thread resolution`);
+  const expected = reviewResolutionPrecondition(claim);
+  let evidence;
+  try {
+    evidence = await assertPullRequestBinding(workspace, expected, expected.number, options);
+  } catch (error51) {
+    return {
+      status: "unknown",
+      evidence: [error51 instanceof Error ? error51.message : String(error51)]
+    };
+  }
+  const thread = await readGitHubReviewThread(commandOptions(workspace, options), {
+    host: expected.host,
+    threadId: expected.threadId
+  });
+  const reply = thread.comments.find(
+    ({ id, body }) => id === expected.replyCommentId && body.includes(`<!-- Graphcraft-Action: ${expected.replyIdempotencyKey} -->`) && contentHash(body) === expected.replyBodyHash
+  );
+  if (!reply)
+    return {
+      status: "unknown",
+      evidence: [...evidence, `Review thread ${thread.id} lost its confirmed action reply`]
+    };
+  if (!thread.isResolved && thread.comments.at(-1)?.id !== reply.id)
+    return {
+      status: "unknown",
+      evidence: [
+        ...evidence,
+        `Review thread ${thread.id} received newer feedback after the action reply`
+      ]
+    };
+  return thread.isResolved ? {
+    status: "applied",
+    result: { threadId: thread.id, resolved: true, replyCommentId: reply.id },
+    evidence: [...evidence, `Review thread ${thread.id} is resolved after the action reply`]
+  } : {
+    status: "not_applied",
+    evidence: [...evidence, `Review thread ${thread.id} remains unresolved`]
+  };
+}
+async function performReviewResolution(workspace, claim, options, boundary) {
+  const expected = reviewResolutionPrecondition(claim);
+  await assertPullRequestBinding(workspace, expected, expected.number, options);
+  const thread = await readGitHubReviewThread(commandOptions(workspace, options), {
+    host: expected.host,
+    threadId: expected.threadId
+  });
+  const reply = thread.comments.find(
+    ({ id, body }) => id === expected.replyCommentId && body.includes(`<!-- Graphcraft-Action: ${expected.replyIdempotencyKey} -->`) && contentHash(body) === expected.replyBodyHash
+  );
+  if (!reply || thread.isResolved || thread.comments.at(-1)?.id !== reply.id)
+    throw new Error(`Review thread ${expected.threadId} is not ready for resolution`);
+  await crossSideEffectBoundary(boundary, "after_action_prepare");
+  const resolved = await resolveGitHubReviewThread(commandOptions(workspace, options), {
+    host: expected.host,
+    threadId: expected.threadId,
+    clientMutationId: claim.idempotencyKey
+  });
+  await crossSideEffectBoundary(boundary, "after_action_command");
+  return { threadId: resolved.id, resolved: resolved.isResolved, replyCommentId: reply.id };
+}
+function checkRerunPrecondition(claim) {
+  const value = claim.precondition;
+  const fields = {
+    host: value.host,
+    nameWithOwner: value.nameWithOwner,
+    remote: value.remote,
+    remoteUrl: value.remoteUrl,
+    headRefName: value.headRefName,
+    baseRefName: value.baseRefName,
+    headSha: value.headSha,
+    baseSha: value.baseSha,
+    number: value.number,
+    checkId: value.checkId,
+    databaseId: value.databaseId,
+    checkName: value.checkName,
+    checkStatus: value.checkStatus,
+    checkConclusion: value.checkConclusion,
+    appId: value.appId
+  };
+  if (Object.entries(fields).filter(([name]) => !["number", "databaseId", "checkConclusion", "appId"].includes(name)).some(([, field]) => typeof field !== "string") || typeof fields.number !== "number" || !Number.isInteger(fields.number) || fields.number <= 0 || typeof fields.databaseId !== "number" || !Number.isInteger(fields.databaseId) || fields.databaseId <= 0 || fields.checkConclusion !== null && typeof fields.checkConclusion !== "string" || fields.appId !== null && (typeof fields.appId !== "number" || !Number.isInteger(fields.appId)))
+    throw new Error(`Check-rerun claim ${claim.actionId} has an invalid precondition`);
+  return fields;
+}
+async function currentBoundCheck(workspace, expected, options) {
+  const evidence = await assertPullRequestBinding(workspace, expected, expected.number, options);
+  const github = commandOptions(workspace, options);
+  const snapshot = await captureGitHubPullRequestSnapshot({
+    ...github,
+    pullRequest: expected.number
+  });
+  await assertGitHubSnapshotCurrent(github, snapshot);
+  if (snapshot.repository.host !== expected.host || snapshot.repository.nameWithOwner !== expected.nameWithOwner || snapshot.binding.headSha !== expected.headSha || snapshot.binding.baseSha !== expected.baseSha)
+    throw new Error(`Check-rerun snapshot moved from ${expected.headSha}/${expected.baseSha}`);
+  const check2 = snapshot.checks.find(
+    ({ id, databaseId }) => id === expected.checkId && databaseId === expected.databaseId
+  );
+  return { evidence, check: check2 };
+}
+function createCheckRerunClaim(input) {
+  const actionId = contentHash({
+    schemaVersion: 1,
+    runId: input.contract.runId,
+    nodeId: input.nodeId,
+    kind: "github_check_rerun",
+    headSha: input.binding.expected.headSha,
+    checkId: input.check.id,
+    databaseId: input.check.databaseId,
+    status: input.check.status,
+    conclusion: input.check.conclusion ?? null
+  });
+  return SideEffectClaimSchema.parse({
+    schemaVersion: 1,
+    actionId,
+    idempotencyKey: `graphcraft-${actionId}`,
+    nodeId: input.nodeId,
+    kind: "github_check_rerun",
+    target: `${input.binding.expected.nameWithOwner}#${input.binding.number}:${input.check.name}`,
+    precondition: {
+      ...input.binding.expected,
+      number: input.binding.number,
+      checkId: input.check.id,
+      databaseId: input.check.databaseId,
+      checkName: input.check.name,
+      checkStatus: input.check.status,
+      checkConclusion: input.check.conclusion ?? null,
+      appId: input.check.appId ?? null
+    },
+    claimedAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+}
+async function reconcileCheckRerun(workspace, claim, options) {
+  if (claim.kind !== "github_check_rerun")
+    throw new Error(`Side effect ${claim.actionId} is not a check rerun`);
+  const expected = checkRerunPrecondition(claim);
+  let current;
+  try {
+    current = await currentBoundCheck(workspace, expected, options);
+  } catch (error51) {
+    return {
+      status: "unknown",
+      evidence: [error51 instanceof Error ? error51.message : String(error51)]
+    };
+  }
+  const check2 = current.check;
+  if (!check2)
+    return {
+      status: "unknown",
+      evidence: [
+        ...current.evidence,
+        `Check run ${expected.checkId}/${expected.databaseId} is no longer observable`
+      ]
+    };
+  if (check2.name !== expected.checkName || (check2.appId ?? null) !== expected.appId || check2.kind !== "check_run")
+    return {
+      status: "unknown",
+      evidence: [...current.evidence, `Check run ${expected.checkId} changed identity`]
+    };
+  const unchanged = check2.status === expected.checkStatus && (check2.conclusion ?? null) === expected.checkConclusion;
+  return unchanged ? {
+    status: "not_applied",
+    evidence: [...current.evidence, `Check run ${expected.checkId} has not transitioned`]
+  } : {
+    status: "applied",
+    result: {
+      checkId: check2.id,
+      databaseId: expected.databaseId,
+      headSha: expected.headSha,
+      status: check2.status,
+      conclusion: check2.conclusion ?? null
+    },
+    evidence: [
+      ...current.evidence,
+      `Check run ${expected.checkId} transitioned from ${expected.checkStatus}/${expected.checkConclusion ?? "none"} to ${check2.status}/${check2.conclusion ?? "none"}`
+    ]
+  };
+}
+async function performCheckRerun(workspace, claim, options, boundary) {
+  const expected = checkRerunPrecondition(claim);
+  const current = await currentBoundCheck(workspace, expected, options);
+  const check2 = current.check;
+  if (!check2 || check2.kind !== "check_run" || check2.name !== expected.checkName || check2.status !== expected.checkStatus || (check2.conclusion ?? null) !== expected.checkConclusion)
+    throw new Error(`Check run ${expected.checkId} moved before rerun`);
+  await crossSideEffectBoundary(boundary, "after_action_prepare");
+  await rerequestGitHubCheckRun(commandOptions(workspace, options), {
+    host: expected.host,
+    nameWithOwner: expected.nameWithOwner,
+    databaseId: expected.databaseId
+  });
+  await crossSideEffectBoundary(boundary, "after_action_command");
+  return { checkId: expected.checkId, databaseId: expected.databaseId };
+}
+async function rerunLifecycleChecks(input) {
+  const classification = input.lifecycle.classification;
+  const relevantIds = classification.status === "infrastructure_failure" ? classification.checkIds.infrastructure : classification.status === "cancelled" ? classification.checkIds.cancelled : [];
+  const rerunnableIds = new Set(input.lifecycle.rerunnableChecks.map(({ id }) => id));
+  if (relevantIds.length === 0 || relevantIds.some((id) => !rerunnableIds.has(id)) || input.lifecycle.rerunnableChecks.some(({ id }) => !relevantIds.includes(id)))
+    throw new Error(
+      "The infrastructure or cancelled required-check state is not fully rerunnable as GitHub check runs"
+    );
+  const state = await input.store.loadState();
+  const alreadyRequested = new Set(
+    state.sideEffects.filter(
+      ({ claim }) => claim.kind === "github_check_rerun" && claim.nodeId === input.node.id && claim.precondition.headSha === lifecycleBinding(state, input.node).expected.headSha
+    ).map(
+      ({ claim }) => `${String(claim.precondition.checkName)}:${String(claim.precondition.appId ?? "")}`
+    )
+  );
+  const pending = input.lifecycle.rerunnableChecks.filter(
+    ({ name, appId }) => !alreadyRequested.has(`${name}:${String(appId ?? "")}`)
+  );
+  if (pending.length === 0)
+    throw new Error(
+      "The same infrastructure or cancelled required check remained after one justified rerun"
+    );
+  const binding = lifecycleBinding(state, input.node);
+  const options = input.options ?? {};
+  const evidence = [];
+  for (const check2 of pending.sort((left, right) => left.id.localeCompare(right.id))) {
+    const claim = createCheckRerunClaim({
+      contract: input.contract,
+      nodeId: input.node.id,
+      binding,
+      check: check2
+    });
+    const result = await executeSideEffect({
+      store: input.store,
+      claim,
+      reconcile: async (currentClaim) => await reconcileCheckRerun(input.workspace, currentClaim, options),
+      act: async (currentClaim) => await performCheckRerun(input.workspace, currentClaim, options, input.boundary),
+      durableDispatch: true,
+      ...input.boundary ? { boundary: input.boundary } : {}
+    });
+    evidence.push(
+      `Justified one rerun for ${check2.name} at ${binding.expected.headSha}`,
+      `Check ${String(result.checkId)} transitioned to ${String(result.status)}`
+    );
+  }
+  return evidence;
+}
+function hasReviewThreadActions(state, lifecycle) {
+  const threadIds = new Set(lifecycle.reviewFeedback.map(({ threadId }) => threadId));
+  return state.sideEffects.some(
+    ({ claim }) => ["github_pr_comment", "github_review_thread_resolve"].includes(claim.kind) && typeof claim.precondition.threadId === "string" && threadIds.has(claim.precondition.threadId)
+  );
+}
+async function reconcileReviewThreadActions(input) {
+  const options = input.options ?? {};
+  const evidence = [];
+  for (const feedback of [...input.lifecycle.reviewFeedback].sort(
+    (left, right) => left.threadId.localeCompare(right.threadId)
+  )) {
+    let state = await input.store.loadState();
+    const binding = lifecycleBinding(state, input.node);
+    const existingReply = state.sideEffects.find(
+      ({ claim }) => claim.kind === "github_pr_comment" && claim.precondition.threadId === feedback.threadId && claim.precondition.headSha === binding.expected.headSha
+    )?.claim;
+    const replyClaim = existingReply ?? createReviewReplyClaim({
+      contract: input.contract,
+      nodeId: input.node.id,
+      binding,
+      feedback
+    });
+    const replyResult = await executeSideEffect({
+      store: input.store,
+      claim: replyClaim,
+      reconcile: async (claim) => await reconcileReviewReply(input.workspace, claim, options),
+      act: async (claim) => await performReviewReply(input.workspace, claim, options, input.boundary),
+      revalidateConfirmed: true,
+      ...input.boundary ? { boundary: input.boundary } : {}
+    });
+    state = await input.store.loadState();
+    const existingResolution = state.sideEffects.find(
+      ({ claim }) => claim.kind === "github_review_thread_resolve" && claim.precondition.threadId === feedback.threadId && claim.precondition.headSha === binding.expected.headSha
+    )?.claim;
+    const resolutionClaim = existingResolution ?? createReviewResolutionClaim({
+      contract: input.contract,
+      nodeId: input.node.id,
+      binding,
+      feedback,
+      replyClaim,
+      replyResult
+    });
+    const resolutionResult = await executeSideEffect({
+      store: input.store,
+      claim: resolutionClaim,
+      reconcile: async (claim) => await reconcileReviewResolution(input.workspace, claim, options),
+      act: async (claim) => await performReviewResolution(input.workspace, claim, options, input.boundary),
+      revalidateConfirmed: true,
+      ...input.boundary ? { boundary: input.boundary } : {}
+    });
+    evidence.push(
+      `Replied to and resolved review thread ${feedback.threadId} at ${binding.expected.headSha}`,
+      `Reply ${String(replyResult.commentId)}; resolution ${String(resolutionResult.resolved)}`
+    );
+  }
+  return evidence;
+}
+async function reconcilePendingGitHubActions(input) {
+  const options = input.options ?? {};
+  const state = await input.store.loadState();
+  const pending = state.sideEffects.filter(
+    ({ claim, status: status2 }) => claim.nodeId === input.node.id && ["github_pr_comment", "github_review_thread_resolve", "github_check_rerun"].includes(
+      claim.kind
+    ) && status2 !== "confirmed"
+  );
+  const evidence = [];
+  for (const entry of pending) {
+    const result = await executeSideEffect({
+      store: input.store,
+      claim: entry.claim,
+      reconcile: async (claim) => {
+        if (claim.kind === "github_pr_comment")
+          return await reconcileReviewReply(input.workspace, claim, options);
+        if (claim.kind === "github_review_thread_resolve")
+          return await reconcileReviewResolution(input.workspace, claim, options);
+        return await reconcileCheckRerun(input.workspace, claim, options);
+      },
+      act: async (claim) => {
+        if (claim.kind === "github_pr_comment")
+          return await performReviewReply(input.workspace, claim, options, input.boundary);
+        if (claim.kind === "github_review_thread_resolve")
+          return await performReviewResolution(input.workspace, claim, options, input.boundary);
+        return await performCheckRerun(input.workspace, claim, options, input.boundary);
+      },
+      revalidateConfirmed: true,
+      ...entry.claim.kind === "github_check_rerun" ? { durableDispatch: true } : {},
+      ...input.boundary ? { boundary: input.boundary } : {}
+    });
+    evidence.push(
+      `Reconciled pending ${entry.claim.kind} ${entry.claim.actionId}`,
+      `External target ${String(result.threadId ?? result.checkId)} is confirmed`
+    );
+  }
+  return evidence;
+}
 async function evaluateGitHubLifecycleWait(input) {
   const condition = input.node.waitCondition;
   if (input.node.kind !== "wait" || condition?.kind !== "github_pull_request")
     throw new Error(`Node ${input.node.id} is not a GitHub lifecycle wait`);
   const now = input.now ?? Date.now();
   let state = await input.store.loadState();
+  let binding = lifecycleBinding(state, input.node);
   let wait = state.waits.find(({ nodeId }) => nodeId === input.node.id);
   if (!wait) {
     const registeredAt = new Date(now).toISOString();
@@ -38652,6 +39756,7 @@ async function evaluateGitHubLifecycleWait(input) {
       workspacePath: input.workspace.path,
       status: "waiting",
       registeredAt,
+      bindingBaseSha: binding.expected.baseSha,
       nextWakeAt: registeredAt,
       observations: 0,
       evidence: [],
@@ -38664,40 +39769,57 @@ async function evaluateGitHubLifecycleWait(input) {
   if (wait.status === "timed_out") return { status: "timed_out", evidence: wait.evidence };
   if (now < Date.parse(wait.nextWakeAt))
     return { status: "waiting", nextWakeAt: wait.nextWakeAt, evidence: wait.evidence };
-  const pullRequests = state.sideEffects.filter(
-    ({ claim, status: status2, result }) => claim.kind === "github_pr_create" && status2 === "confirmed" && result !== void 0
+  binding = lifecycleBinding(state, input.node);
+  const baseMovementEvidence = [];
+  const observedBaseSha = await remoteBranchSha2(
+    input.workspace,
+    binding.expected.remote,
+    binding.expected.baseRefName
   );
-  if (pullRequests.length !== 1 || !pullRequests[0]?.result)
-    throw new Error("The GitHub lifecycle wait requires one confirmed pull-request binding");
-  const pullRequest = pullRequests[0];
-  const pullRequestResult = pullRequest.result;
-  if (!pullRequestResult)
-    throw new Error("The confirmed pull-request binding has no durable result");
-  const originalExpected = pullRequestPrecondition(pullRequest.claim);
-  const number4 = pullRequestResult.number;
-  if (typeof number4 !== "number" || !Number.isInteger(number4) || number4 <= 0)
-    throw new Error("The confirmed pull-request binding has no valid number");
-  let expected = originalExpected;
-  const boundaryNodeId = input.node.dependsOn[0];
-  if (boundaryNodeId !== pullRequest.claim.nodeId) {
-    const pushed = state.sideEffects.find(
-      ({ claim }) => claim.nodeId === boundaryNodeId && claim.kind === "git_push"
+  if (!observedBaseSha)
+    throw new Error(`Remote base branch ${binding.expected.baseRefName} is absent`);
+  if (observedBaseSha !== binding.expected.baseSha) {
+    const rebound = { ...binding.expected, baseSha: observedBaseSha };
+    const evidence2 = await assertCurrentRemoteBinding(input.workspace, rebound);
+    const pullRequest = await readGitHubPullRequestIdentity(
+      commandOptions(input.workspace, input.options),
+      {
+        nameWithOwner: rebound.nameWithOwner,
+        number: binding.number
+      }
     );
-    if (pushed?.status !== "confirmed" || !pushed.result)
-      throw new Error(`The GitHub lifecycle wait has no confirmed push for ${boundaryNodeId}`);
-    const branch = pushed.claim.precondition.branch;
-    const remote = pushed.claim.precondition.remote;
-    const remoteUrl = pushed.claim.precondition.remoteUrl;
-    const sha = pushed.result.sha;
-    if (branch !== originalExpected.headRefName || remote !== originalExpected.remote || remoteUrl !== originalExpected.remoteUrl || typeof sha !== "string")
-      throw new Error(`The repair push ${boundaryNodeId} does not preserve the pull-request head`);
-    expected = { ...originalExpected, headSha: sha };
+    if (pullRequest.state !== "OPEN" || pullRequest.headRefName !== rebound.headRefName || pullRequest.baseRefName !== rebound.baseRefName || pullRequest.headSha !== rebound.headSha || pullRequest.baseSha !== rebound.baseSha)
+      throw new Error(
+        `Pull request #${binding.number} did not preserve its exact head while base ${rebound.baseRefName} moved to ${observedBaseSha}`
+      );
+    baseMovementEvidence.push(
+      `Rebound ${rebound.baseRefName} from ${binding.expected.baseSha} to ${observedBaseSha} without mutating the PR head`,
+      ...evidence2
+    );
+    await input.store.append(
+      "runtime",
+      "wait.rebound",
+      {
+        nodeId: input.node.id,
+        previousBaseSha: binding.expected.baseSha,
+        baseSha: observedBaseSha,
+        headSha: rebound.headSha,
+        evidence: baseMovementEvidence
+      },
+      input.node.id
+    );
+    state = await input.store.loadState();
+    wait = state.waits.find(({ nodeId }) => nodeId === input.node.id);
+    if (!wait) throw new Error(`Wait node ${input.node.id} disappeared after base rebind`);
+    binding = lifecycleBinding(state, input.node);
   }
-  const lifecycle = await captureExpectedPullRequestLifecycle(
+  const originalExpected = pullRequestPrecondition(binding.pullRequestClaim);
+  const boundaryNodeId = input.node.dependsOn[0];
+  let lifecycle = await captureExpectedPullRequestLifecycle(
     input.workspace,
     input.contract,
-    expected,
-    number4,
+    binding.expected,
+    binding.number,
     {
       id: `${input.node.id}-lifecycle`,
       kind: "github_snapshot",
@@ -38706,16 +39828,85 @@ async function evaluateGitHubLifecycleWait(input) {
       requiredChecks: "success",
       reviewThreads: "resolved"
     },
-    pullRequestResult.baseSha === originalExpected.baseSha && (boundaryNodeId !== pullRequest.claim.nodeId || pullRequestResult.headSha === originalExpected.headSha),
+    binding.pullRequestResult.baseSha === originalExpected.baseSha && (boundaryNodeId !== binding.pullRequestClaim.nodeId || binding.pullRequestResult.headSha === originalExpected.headSha),
     input.options ?? {}
   );
+  const observedHumanDecision = lifecycle.pullRequestDecision.isDraft ? "draft" : lifecycle.pullRequestDecision.reviewDecision === "CHANGES_REQUESTED" ? "changes_requested" : void 0;
+  if (observedHumanDecision && wait.stickyHumanDecision?.kind !== observedHumanDecision) {
+    await input.store.append(
+      "runtime",
+      "wait.human_decision_observed",
+      {
+        nodeId: input.node.id,
+        kind: observedHumanDecision,
+        snapshotId: lifecycle.classification.snapshotId,
+        evidence: [
+          observedHumanDecision === "draft" ? "The pull request requires a human to mark it ready" : "A human review requested changes"
+        ]
+      },
+      input.node.id
+    );
+  } else if (wait.stickyHumanDecision && (wait.stickyHumanDecision.kind === "draft" && !lifecycle.pullRequestDecision.isDraft || wait.stickyHumanDecision.kind === "changes_requested" && lifecycle.pullRequestDecision.reviewDecision === "APPROVED")) {
+    await input.store.append(
+      "runtime",
+      "wait.human_decision_resolved",
+      {
+        nodeId: input.node.id,
+        kind: wait.stickyHumanDecision.kind,
+        snapshotId: lifecycle.classification.snapshotId
+      },
+      input.node.id
+    );
+  }
+  state = await input.store.loadState();
+  wait = state.waits.find(({ nodeId }) => nodeId === input.node.id);
+  if (!wait) throw new Error(`Wait node ${input.node.id} disappeared during lifecycle capture`);
+  if (wait.stickyHumanDecision?.kind === "changes_requested" && lifecycle.classification.counts.unresolvedReviewThreads === 0 && lifecycle.pullRequestDecision.reviewDecision !== "APPROVED") {
+    const stickyEvidence = [
+      ...lifecycle.classification.evidence,
+      "The earlier human changes-requested decision remains sticky until an explicit approval"
+    ];
+    const signature = contentHash({
+      snapshotId: lifecycle.classification.snapshotId,
+      status: "human_decision",
+      stickyHumanDecision: wait.stickyHumanDecision
+    });
+    const classification = {
+      ...lifecycle.classification,
+      status: "human_decision",
+      signature,
+      evidence: stickyEvidence
+    };
+    lifecycle = {
+      ...lifecycle,
+      classification,
+      result: {
+        ...lifecycle.result,
+        passed: false,
+        signature,
+        summary: stickyEvidence.join("; ")
+      },
+      ...lifecycle.output ? {
+        output: `${JSON.stringify(
+          {
+            ...JSON.parse(lifecycle.output),
+            stickyHumanDecision: wait.stickyHumanDecision,
+            classification
+          },
+          null,
+          2
+        )}
+`
+      } : {}
+    };
+  }
   if (lifecycle.output) {
     lifecycle.result.artifact = await input.store.writeArtifact(
       `probes/${lifecycle.result.signature}.log`,
       lifecycle.output
     );
   }
-  const evidence = lifecycle.classification.evidence;
+  const evidence = [...baseMovementEvidence, ...lifecycle.classification.evidence];
   const timedOut = condition.timeoutAt && now >= Date.parse(condition.timeoutAt);
   if (timedOut) {
     const timeoutEvidence = [
@@ -38838,6 +40029,7 @@ async function recoverableInvocation(store, nodeId, repositoryPath, family) {
   const transcriptSession = transcript.findLast((event) => event.type === "session");
   const hostSessionId = session ? String(session.data.hostSessionId) : transcriptSession?.type === "session" ? transcriptSession.hostSessionId : typeof started.data.reusedHostSessionId === "string" ? started.data.reusedHostSessionId : void 0;
   const baseline = persistedBaseline(started.data.baseline, family);
+  const scopeBaseline = parseWorkspaceScopeSnapshot(started.data.scopeBaseline);
   return {
     adapterId: String(started.data.adapter ?? ""),
     nodeId,
@@ -38848,7 +40040,8 @@ async function recoverableInvocation(store, nodeId, repositoryPath, family) {
       ...hostSessionId ? { hostSessionId } : {},
       ...baseline ? { baseline } : {},
       transcript
-    }
+    },
+    ...scopeBaseline ? { scopeBaseline } : {}
   };
 }
 async function recordMissingUsage(store, invocation, node2, host) {
@@ -38904,14 +40097,17 @@ async function validatePlannedContext(graph, repositoryPath) {
 }
 async function createRun(task, options) {
   const repository = await discoverRepository(options.cwd);
-  const contract = compileRunContract(task, repository, {
-    ...options.finishLine ? { finishLine: options.finishLine } : {}
+  const persistedTask = redactString(task);
+  const contract = compileRunContract(persistedTask, repository, {
+    ...options.finishLine ? { finishLine: options.finishLine } : {},
+    ...options.include ? { include: options.include } : {},
+    ...options.exclude ? { exclude: options.exclude } : {}
   });
   const [probePlan, repositoryEvidence] = await Promise.all([
-    discoverProbePlan(repository.root, task, repository.baseSha, {
+    discoverProbePlan(repository.root, persistedTask, repository.baseSha, {
       ...contract.finishLine.kind === "pr_open" ? { finishLine: "pr_open" } : {}
     }),
-    discoverPlanningEvidence(repository.root, task)
+    discoverPlanningEvidence(repository.root, persistedTask)
   ]);
   const heldOutProbePlan = await createRuntimeHeldOutProbePlan(
     contract.runId,
@@ -39081,6 +40277,7 @@ async function executeWorker(input) {
       adapter: input.adapter.id,
       capsuleHash,
       baseline: input.baseline,
+      scopeBaseline: input.scopeBaseline,
       ...input.reuseSession ? {
         reusedHostSessionId: input.reuseSession.hostSessionId,
         reusedFromNodeId: input.reuseSession.sourceNodeId
@@ -39117,7 +40314,7 @@ async function executeWorker(input) {
       break;
     }
     if (next.done) break;
-    const event = next.value;
+    const event = HostEventSchema.parse(redactValue(next.value));
     artifact = await input.store.appendInvocationEvent(invocationId, event);
     if (event.type === "session") {
       await input.store.append(
@@ -39230,21 +40427,26 @@ function needsSemanticVerification(phase, probes, classification) {
 }
 async function runSemanticVerification(input) {
   const invocationId = randomUUID7();
-  const context = SemanticVerifierContextSchema.parse({
-    schemaVersion: 1,
-    phase: input.phase,
-    runId: input.contract.runId,
-    nodeId: input.node.id,
-    objective: input.node.objective,
-    finishLine: input.contract.finishLine,
-    acceptanceAnchors: input.contract.acceptanceAnchors,
-    relevantPaths: input.node.contextSelector.relevantPaths,
-    workerSummary: input.workerSummary,
-    workerEvidence: input.workerEvidence,
-    baselineProbeEvidence: input.baselineProbeEvidence,
-    currentProbeEvidence: input.currentProbeEvidence
-  });
-  const beforeDigest = await workspaceDigest(input.workspace.path);
+  const context = SemanticVerifierContextSchema.parse(
+    redactValue({
+      schemaVersion: 1,
+      phase: input.phase,
+      runId: input.contract.runId,
+      nodeId: input.node.id,
+      objective: input.node.objective,
+      finishLine: input.contract.finishLine,
+      acceptanceAnchors: input.contract.acceptanceAnchors,
+      relevantPaths: input.node.contextSelector.relevantPaths,
+      workerSummary: input.workerSummary,
+      workerEvidence: input.workerEvidence,
+      baselineProbeEvidence: input.baselineProbeEvidence,
+      currentProbeEvidence: input.currentProbeEvidence
+    })
+  );
+  const beforeScope = await captureWorkspaceScopeSnapshot(
+    input.workspace.path,
+    input.contract.scope.exclude
+  );
   let verdictPersisted = false;
   try {
     const result = await input.adapter.verify(
@@ -39255,7 +40457,12 @@ async function runSemanticVerification(input) {
       },
       input.signal
     );
-    const afterDigest = await workspaceDigest(input.workspace.path);
+    const afterScope = await captureWorkspaceScopeSnapshot(
+      input.workspace.path,
+      input.contract.scope.exclude
+    );
+    const beforeDigest = beforeScope.digest;
+    const afterDigest = afterScope.digest;
     const policyViolation = beforeDigest !== afterDigest;
     const artifact = await input.store.writeArtifact(
       `semantic/${invocationId}.json`,
@@ -39790,6 +40997,14 @@ async function executeWorkNode(input) {
       input.graph.family
     );
   }
+  let scopeBaseline;
+  try {
+    scopeBaseline = input.recoveryScopeBaseline ?? await captureWorkspaceScopeSnapshot(input.workspace.path, input.contract.scope.exclude);
+  } catch (error51) {
+    const reason2 = `Workspace scope inspection failed before node ${input.node.id}: ${error51.message}`;
+    await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason: reason2 });
+    return { status: "failed", nodeId: input.node.id, reason: reason2 };
+  }
   const worker = await executeWorker({
     adapter: input.adapter,
     store: input.store,
@@ -39804,9 +41019,46 @@ async function executeWorkNode(input) {
     ...input.observer ? { observer: input.observer } : {},
     signal: input.signal,
     baseline,
+    scopeBaseline,
     ...input.recovery ? { resume: input.recovery } : {},
     ...input.reuseSession ? { reuseSession: input.reuseSession } : {}
   });
+  try {
+    const currentScope = await captureWorkspaceScopeSnapshot(
+      input.workspace.path,
+      input.contract.scope.exclude
+    );
+    const audit = auditWorkspaceScope({
+      contract: input.contract,
+      graph: input.graph,
+      state: input.state,
+      node: input.node,
+      baseline: scopeBaseline,
+      current: currentScope,
+      ...worker.result ? { reportedChangedPaths: worker.result.changedPaths } : {}
+    });
+    await input.store.append(
+      "runtime",
+      "scope.checked",
+      {
+        nodeId: input.node.id,
+        invocationId: worker.invocationId,
+        enforced: !input.signal.aborted,
+        audit,
+        current: currentScope
+      },
+      worker.invocationId
+    );
+    if (!audit.allowed && !input.signal.aborted) {
+      const reason2 = scopeViolationReason(audit, input.workspace.path);
+      await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason: reason2 });
+      return { status: "failed", nodeId: input.node.id, reason: reason2 };
+    }
+  } catch (error51) {
+    const reason2 = `Workspace scope inspection failed after node ${input.node.id}: ${error51.message}`;
+    await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason: reason2 });
+    return { status: "failed", nodeId: input.node.id, reason: reason2 };
+  }
   if (input.signal.aborted)
     return {
       status: "interrupted",
@@ -39844,11 +41096,6 @@ async function executeWorkNode(input) {
     afterProbes.map(({ result }) => result),
     input.graph.family
   );
-  if (input.node.sideEffectClass === "none" && currentEvidence.workspaceDigest !== baseline.workspaceDigest) {
-    const reason2 = `Read-only node ${input.node.id} mutated the shared run workspace`;
-    await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason: reason2 });
-    return { status: "failed", nodeId: input.node.id, reason: reason2 };
-  }
   const assessed = await assessRunProgress({
     store: input.store,
     attemptId: worker.invocationId,
@@ -40078,7 +41325,7 @@ async function executeRun(input) {
         workspace.path,
         graph.family
       );
-      if (recovery && (recovery.adapterId !== input.adapter.id || recovery.record.baseline === void 0)) {
+      if (recovery && (recovery.adapterId !== input.adapter.id || recovery.record.baseline === void 0 || recovery.scopeBaseline === void 0)) {
         await input.store.append(
           "runtime",
           "invocation.finished",
@@ -40086,7 +41333,7 @@ async function executeRun(input) {
             invocationId: recovery.record.invocationId,
             nodeId: recovery.nodeId,
             success: false,
-            reason: recovery.adapterId !== input.adapter.id ? "Selected host changed; using repository recovery" : "The interrupted invocation predates durable progress baselines"
+            reason: recovery.adapterId !== input.adapter.id ? "Selected host changed; using repository recovery" : recovery.record.baseline === void 0 ? "The interrupted invocation predates durable progress baselines" : "The interrupted invocation predates durable scope baselines"
           },
           recovery.record.invocationId
         );
@@ -40186,7 +41433,10 @@ async function executeRun(input) {
               workspace,
               ...input.observer ? { observer: input.observer } : {},
               signal: batchSignal,
-              ...recoveries.get(candidate.id) ? { recovery: recoveries.get(candidate.id).record } : {},
+              ...recoveries.get(candidate.id) ? {
+                recovery: recoveries.get(candidate.id).record,
+                ...recoveries.get(candidate.id).scopeBaseline ? { recoveryScopeBaseline: recoveries.get(candidate.id).scopeBaseline } : {}
+              } : {},
               ...reuseSessions.get(candidate.id) ? { reuseSession: reuseSessions.get(candidate.id) } : {}
             });
             if (outcome2.status === "failed" && !batchAbort.signal.aborted)
@@ -40233,6 +41483,33 @@ async function executeRun(input) {
       }
       const current = batch[0];
       if (current.kind === "wait") {
+        if (current.waitCondition?.kind === "github_pull_request") {
+          try {
+            const reconciliationEvidence = await reconcilePendingGitHubActions({
+              store: input.store,
+              node: current,
+              workspace,
+              ...input.github ? { options: input.github } : {},
+              ...input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}
+            });
+            if (reconciliationEvidence.length > 0)
+              await input.store.append("runtime", "node.progress", {
+                nodeId: current.id,
+                classification: "advanced",
+                summary: "Reconciled pending review-thread mutations",
+                evidence: reconciliationEvidence
+              });
+          } catch (error51) {
+            if (error51 instanceof SideEffectBoundaryInterruption) throw error51;
+            const reason = error51 instanceof Error ? error51.message : String(error51);
+            await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+            await input.store.append("runtime", "run.blocked", {
+              reason,
+              evidence: ["Pending review-thread mutation could not be reconciled"]
+            });
+            return await input.store.loadState();
+          }
+        }
         const outcome2 = current.waitCondition?.kind === "github_pull_request" ? await evaluateGitHubLifecycleWait({
           store: input.store,
           node: current,
@@ -40286,8 +41563,45 @@ async function executeRun(input) {
               (item) => item.startsWith("github-review-signature:")
             )?.slice("github-review-signature:".length);
             const repeated = previousSignature === outcome2.lifecycle.reviewFeedbackSignature;
-            if (repeated || reviewHistory.length >= 3) {
-              const reason2 = repeated ? "The same unresolved review feedback remained after a verified repair push" : "The pull request received three distinct review-repair strategies without reaching a resolved state";
+            const hasActions = hasReviewThreadActions(
+              await input.store.loadState(),
+              outcome2.lifecycle
+            );
+            if (repeated || hasActions) {
+              try {
+                const mutationEvidence = await reconcileReviewThreadActions({
+                  store: input.store,
+                  node: current,
+                  workspace,
+                  contract,
+                  lifecycle: outcome2.lifecycle,
+                  ...input.github ? { options: input.github } : {},
+                  ...input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}
+                });
+                await input.store.append("runtime", "node.progress", {
+                  nodeId: current.id,
+                  classification: "advanced",
+                  summary: "Confirmed review replies and thread resolutions",
+                  evidence: mutationEvidence
+                });
+                continue;
+              } catch (error51) {
+                if (error51 instanceof SideEffectBoundaryInterruption) throw error51;
+                const reason2 = error51 instanceof Error ? error51.message : String(error51);
+                await input.store.append("runtime", "node.failed", {
+                  nodeId: current.id,
+                  reason: reason2
+                });
+                await input.store.append("runtime", "run.blocked", {
+                  reason: reason2,
+                  githubLifecycleStatus: lifecycleStatus,
+                  evidence: outcome2.evidence
+                });
+                return await input.store.loadState();
+              }
+            }
+            if (reviewHistory.length >= 3) {
+              const reason2 = "The pull request received three distinct review-repair strategies without reaching a resolved state";
               await input.store.append("probe", "node.progress", {
                 nodeId: current.id,
                 classification: "blocked",
@@ -40314,6 +41628,23 @@ async function executeRun(input) {
             continue;
           }
           if (lifecycleStatus === "actionable_failure") {
+            if (outcome2.lifecycle.ciFailures.length === 0) {
+              const reason2 = "The pull request conflicts with its current base; Graphcraft will not infer a published-branch rebase or merge";
+              await input.store.append("probe", "node.progress", {
+                nodeId: current.id,
+                classification: "blocked",
+                summary: reason2,
+                evidence: outcome2.evidence,
+                probeResults: [outcome2.lifecycle.result]
+              });
+              await input.store.append("runtime", "node.failed", { nodeId: current.id, reason: reason2 });
+              await input.store.append("runtime", "run.blocked", {
+                reason: reason2,
+                githubLifecycleStatus: "human_decision",
+                evidence: outcome2.evidence
+              });
+              return await input.store.loadState();
+            }
             const ciHistory = (await input.store.loadGraphHistory()).filter(
               ({ amendment }) => amendment?.actor === "runtime" && amendment.proposal.rationale === GITHUB_CI_REPAIR_RATIONALE
             );
@@ -40345,6 +41676,44 @@ async function executeRun(input) {
             );
             graph = applied.graph;
             continue;
+          }
+          if (lifecycleStatus === "infrastructure_failure" || lifecycleStatus === "cancelled") {
+            try {
+              const rerunEvidence = await rerunLifecycleChecks({
+                store: input.store,
+                node: current,
+                workspace,
+                contract,
+                lifecycle: outcome2.lifecycle,
+                ...input.github ? { options: input.github } : {},
+                ...input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}
+              });
+              await input.store.append("runtime", "node.progress", {
+                nodeId: current.id,
+                classification: "advanced",
+                summary: "Confirmed justified required-check reruns",
+                evidence: rerunEvidence
+              });
+              continue;
+            } catch (error51) {
+              if (error51 instanceof SideEffectBoundaryInterruption) throw error51;
+              const reason2 = error51 instanceof Error ? error51.message : String(error51);
+              await input.store.append("probe", "node.progress", {
+                nodeId: current.id,
+                classification: "blocked",
+                summary: reason2,
+                evidence: outcome2.evidence,
+                probeResults: [outcome2.lifecycle.result]
+              });
+              await input.store.append("runtime", "node.failed", { nodeId: current.id, reason: reason2 });
+              await input.store.append("runtime", "run.blocked", {
+                reason: reason2,
+                githubLifecycleStatus: lifecycleStatus,
+                checkIds: lifecycleStatus === "infrastructure_failure" ? outcome2.lifecycle.classification.checkIds.infrastructure : outcome2.lifecycle.classification.checkIds.cancelled,
+                evidence: outcome2.evidence
+              });
+              return await input.store.loadState();
+            }
           }
           const reason = `GitHub lifecycle requires reasoning before pr_green completion: ${lifecycleStatus}`;
           await input.store.append("probe", "node.progress", {
@@ -40399,8 +41768,57 @@ async function executeRun(input) {
           });
           return await input.store.loadState();
         }
+        let verificationScopeBaseline;
+        try {
+          verificationScopeBaseline = await captureWorkspaceScopeSnapshot(
+            workspace.path,
+            contract.scope.exclude
+          );
+        } catch (error51) {
+          const reason = `Workspace scope inspection failed before verification node ${current.id}: ${error51.message}`;
+          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+          await input.store.append("runtime", "run.blocked", { reason });
+          return await input.store.loadState();
+        }
         const integrityFailures = await heldOutIntegrityFailures(heldOutProbePlan, workspace.path);
         const executed = integrityFailures.length ? [] : await captureProbes(input.store, completionProbes, workspace, input.observer, signal);
+        try {
+          const verificationScopeCurrent = await captureWorkspaceScopeSnapshot(
+            workspace.path,
+            contract.scope.exclude
+          );
+          const scopeAudit = auditWorkspaceScope({
+            contract,
+            graph,
+            state,
+            node: current,
+            baseline: verificationScopeBaseline,
+            current: verificationScopeCurrent
+          });
+          await input.store.append(
+            "runtime",
+            "scope.checked",
+            {
+              nodeId: current.id,
+              stage: "verification",
+              enforced: !signal.aborted,
+              audit: scopeAudit,
+              current: verificationScopeCurrent
+            },
+            batchId
+          );
+          if (!scopeAudit.allowed && !signal.aborted) {
+            const reason = scopeViolationReason(scopeAudit, workspace.path);
+            await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+            await input.store.append("runtime", "run.blocked", { reason });
+            return await input.store.loadState();
+          }
+        } catch (error51) {
+          const reason = `Workspace scope inspection failed after verification node ${current.id}: ${error51.message}`;
+          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+          await input.store.append("runtime", "run.blocked", { reason });
+          return await input.store.loadState();
+        }
         if (signal.aborted) return await finishInterruption(current.id);
         const results = integrityFailures.length ? integrityFailures : executed.map(({ result }) => result);
         await input.store.append("probe", "held_out.checked", {
@@ -40797,7 +42215,10 @@ async function executeRun(input) {
         workspace,
         ...input.observer ? { observer: input.observer } : {},
         signal,
-        ...recoveries.get(current.id) ? { recovery: recoveries.get(current.id).record } : {},
+        ...recoveries.get(current.id) ? {
+          recovery: recoveries.get(current.id).record,
+          ...recoveries.get(current.id).scopeBaseline ? { recoveryScopeBaseline: recoveries.get(current.id).scopeBaseline } : {}
+        } : {},
         ...reuseSessions.get(current.id) ? { reuseSession: reuseSessions.get(current.id) } : {}
       });
       recoveries.delete(current.id);
@@ -40868,6 +42289,40 @@ async function latestSupervisor(repositoryRoot, runId) {
   const latest = (await listSupervisorRecords(repositoryRoot, runId)).at(-1);
   return latest ? inspectSupervisorRecord(latest) : void 0;
 }
+
+// packages/runtime/src/viewer.ts
+var MAX_ARTIFACT_BYTES = 1024 * 1024;
+var VIEWER_HTML = String.raw`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Graphcraft run viewer</title>
+  <style>
+    :root{color-scheme:light dark;--bg:#f5f7fb;--panel:#fff;--text:#182033;--muted:#62708a;--line:#cbd4e4;--accent:#315cf5;--control:#a64ac9;--good:#147d50;--bad:#ba2d3b;--wait:#9a6500} @media(prefers-color-scheme:dark){:root{--bg:#10131b;--panel:#191e2a;--text:#edf1fa;--muted:#aab4ca;--line:#384156;--accent:#84a3ff;--control:#d594ef;--good:#62d49c;--bad:#ff7e89;--wait:#f0bd58}}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-sans-serif,system-ui,sans-serif}header{position:sticky;top:0;z-index:3;background:color-mix(in srgb,var(--panel) 92%,transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--line);padding:14px 20px;display:flex;gap:18px;align-items:center;flex-wrap:wrap}h1{font-size:18px;margin:0}.meta{color:var(--muted)}.badge{border:1px solid var(--line);border-radius:999px;padding:3px 9px}.tabs{display:flex;gap:6px;margin-left:auto}.tabs button,.filters button,.download{border:1px solid var(--line);background:var(--panel);color:var(--text);border-radius:7px;padding:7px 10px;cursor:pointer}.tabs button[aria-selected=true],.filters button.active{border-color:var(--accent);color:var(--accent)}main{padding:18px;max-width:1500px;margin:auto}.view{display:none}.view.active{display:block}.grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(280px,1fr);gap:16px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;min-width:0}.panel h2{font-size:15px;margin:0 0 12px}.graph-scroll{overflow:auto;min-height:480px}svg{min-width:900px;width:100%;height:620px}.edge{stroke:var(--line);stroke-width:2}.edge.control{stroke:var(--control);stroke-dasharray:7 5}.edge.depends{stroke:var(--accent)}.node rect{fill:var(--panel);stroke:var(--line);stroke-width:2;rx:10}.node.current rect{stroke:var(--accent);stroke-width:4}.node.failed rect{stroke:var(--bad)}.node.accepted rect{stroke:var(--good)}.node.waiting rect{stroke:var(--wait)}.node text{fill:var(--text);pointer-events:none}.node{cursor:pointer}.node:focus rect{outline:none;stroke:var(--accent);stroke-width:4}.legend{display:flex;gap:14px;color:var(--muted);flex-wrap:wrap}.swatch{display:inline-block;width:26px;border-top:3px solid var(--accent);vertical-align:middle;margin-right:5px}.swatch.control{border-color:var(--control);border-top-style:dashed}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:color-mix(in srgb,var(--bg) 75%,var(--panel));padding:12px;border-radius:8px;max-height:520px;overflow:auto}.timeline{display:grid;gap:7px}.event{border-left:3px solid var(--line);padding:8px 10px;background:var(--panel);border-radius:0 8px 8px 0}.event.side_effect{border-color:var(--control)}.event.recovery{border-color:var(--wait)}.event.graph{border-color:var(--accent)}.event small{color:var(--muted)}.filters{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}.token-row{display:grid;grid-template-columns:180px 1fr 90px;gap:8px;align-items:center;margin:8px 0}.bar{height:12px;background:var(--line);border-radius:6px;overflow:hidden}.bar i{display:block;height:100%;background:var(--accent)}.artifact-list{display:grid;gap:6px}.artifact-list a{color:var(--accent)}.empty{color:var(--muted)}@media(max-width:850px){.grid{grid-template-columns:1fr}.tabs{order:3;width:100%;overflow:auto}main{padding:10px}}
+  </style>
+</head>
+<body><header><h1>Graphcraft</h1><span id="run-meta" class="meta">Loading durable state…</span><span id="status" class="badge"></span><nav class="tabs" aria-label="Viewer sections"><button aria-selected="true" data-view="graph">Graph</button><button aria-selected="false" data-view="timeline">Timeline</button><button aria-selected="false" data-view="revisions">Revisions</button><button aria-selected="false" data-view="tokens">Tokens</button><button aria-selected="false" data-view="artifacts">Artifacts</button></nav></header>
+<main><section id="graph" class="view active"><div class="grid"><div class="panel"><h2>Work and control graph</h2><div class="legend"><span><i class="swatch"></i>dependency</span><span><i class="swatch control"></i>control</span></div><div class="graph-scroll"><svg id="graph-svg" role="img" aria-label="Execution and governance graph"></svg></div></div><aside class="panel"><h2>Node evidence</h2><pre id="node-detail" tabindex="0">Select a node. Arrow keys move between nodes.</pre></aside></div></section>
+<section id="timeline" class="view"><div class="panel"><h2>Durable event timeline</h2><div id="filters" class="filters"></div><div id="event-list" class="timeline"></div></div></section>
+<section id="revisions" class="view"><div class="panel"><h2>Graph revisions</h2><div id="revision-list"></div></div></section>
+<section id="tokens" class="view"><div class="panel"><h2>Token cost by phase</h2><div id="token-list"></div></div></section>
+<section id="artifacts" class="view"><div class="panel"><h2>Local artifacts</h2><p class="meta">Opened on demand; contents are redacted and capped at 1 MiB.</p><div id="artifact-list" class="artifact-list"></div><p><a class="download" href="/api/export" download="graphcraft-run-report.json">Export redacted run report</a></p></div></section></main>
+<script>
+const $=id=>document.getElementById(id), ns='http://www.w3.org/2000/svg'; let snapshot, selected, filter='all';
+const el=(name,attrs={})=>{const n=document.createElementNS(ns,name);for(const[k,v]of Object.entries(attrs))n.setAttribute(k,String(v));return n};
+function show(name){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===name));document.querySelectorAll('.tabs button').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.view===name)))}
+document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>show(b.dataset.view));
+function renderGraph(){const svg=$('graph-svg');svg.textContent='';const nodes=[...snapshot.anchors.map(a=>({id:a.id,kind:'anchor',objective:a.description,status:'anchor',attempts:0,scope:[],sideEffectClass:'none'})),...snapshot.nodes];const levels=new Map();const level=id=>{if(levels.has(id))return levels.get(id);const n=snapshot.nodes.find(n=>n.id===id);const value=n?1+Math.max(-1,...n.dependsOn.map(level)):0;levels.set(id,value);return value};snapshot.nodes.forEach(n=>level(n.id));snapshot.anchors.forEach(a=>levels.set(a.id,0));const groups={};nodes.forEach(n=>(groups[levels.get(n.id)||0]??=[]).push(n));const pos=new Map();Object.entries(groups).forEach(([l,items])=>items.forEach((n,i)=>pos.set(n.id,{x:70+Number(l)*250,y:55+i*105})));const edges=[...snapshot.workEdges.map(e=>({...e,type:'depends'})),...snapshot.controlEdges.map(e=>({...e,type:'control'}))];edges.forEach(e=>{const a=pos.get(e.from),b=pos.get(e.to);if(!a||!b)return;svg.append(el('line',{x1:a.x+170,y1:a.y+34,x2:b.x,y2:b.y+34,class:'edge '+e.type,'aria-label':e.relation}))});nodes.forEach((n,index)=>{const p=pos.get(n.id),g=el('g',{class:'node '+n.status+(n.current?' current':''),tabindex:'0',role:'button','aria-label':n.id+', '+n.kind+', '+n.status,'data-index':index});g.append(el('rect',{x:p.x,y:p.y,width:170,height:68}));const title=el('text',{x:p.x+10,y:p.y+25});title.textContent=n.id.slice(0,24);g.append(title);const sub=el('text',{x:p.x+10,y:p.y+48,'font-size':'12'});sub.textContent=(n.kind+' · '+n.status).slice(0,28);g.append(sub);g.onclick=()=>selectNode(n.id);g.onkeydown=e=>{if(!['ArrowRight','ArrowDown','ArrowLeft','ArrowUp'].includes(e.key))return;e.preventDefault();const next=(index+(e.key==='ArrowRight'||e.key==='ArrowDown'?1:-1)+nodes.length)%nodes.length;svg.querySelector('[data-index="'+next+'"]')?.focus();selectNode(nodes[next].id)};svg.append(g)});const maxLevel=Math.max(1,...levels.values());svg.setAttribute('viewBox','0 0 '+Math.max(900,120+maxLevel*250)+' '+Math.max(620,120+Math.max(...Object.values(groups).map(x=>x.length))*105));if(!selected&&snapshot.nodes[0])selectNode(snapshot.nodes[0].id)}
+function selectNode(id){selected=id;const n=snapshot.nodes.find(n=>n.id===id)||snapshot.anchors.find(n=>n.id===id);$('node-detail').textContent=JSON.stringify(n,null,2)}
+function renderTimeline(){const categories=['all',...new Set(snapshot.timeline.map(e=>e.category))];$('filters').textContent='';categories.forEach(c=>{const b=document.createElement('button');b.textContent=c;b.className=c===filter?'active':'';b.onclick=()=>{filter=c;renderTimeline()};$('filters').append(b)});$('event-list').textContent='';snapshot.timeline.filter(e=>filter==='all'||e.category===filter).forEach(e=>{const d=document.createElement('div');d.className='event '+e.category;const title=document.createElement('div');title.textContent=e.sequence+'. '+e.type;const meta=document.createElement('small');meta.textContent=e.timestamp+' · '+e.actor;const pre=document.createElement('pre');pre.textContent=JSON.stringify(e.data,null,2);d.append(title,meta,pre);$('event-list').append(d)})}
+function renderRevisions(){const root=$('revision-list');root.textContent='';if(!snapshot.revisions.length){root.textContent='No amendments. Revision 1 is the approved graph.';root.className='empty';return}snapshot.revisions.forEach(r=>{const p=document.createElement('pre');p.textContent=JSON.stringify(r,null,2);root.append(p)})}
+function renderTokens(){const root=$('token-list');root.textContent='';const report=snapshot.tokenReport||{};const groups=[['Cumulative',{all:report.totals||{}}],['By phase',report.byPhase||{}],['By node',report.byNode||{}]];const all=groups.flatMap(([,rows])=>Object.values(rows));const max=Math.max(1,...all.map(v=>v.total||0));if(!report.receipts){root.textContent='No token receipts.';root.className='empty';return}groups.forEach(([heading,rows])=>{const h=document.createElement('h3');h.textContent=heading;root.append(h);Object.entries(rows).forEach(([name,value])=>{const row=document.createElement('div');row.className='token-row';const label=document.createElement('span');label.textContent=name;const bar=document.createElement('div');bar.className='bar';const fill=document.createElement('i');fill.style.width=100*(value.total||0)/max+'%';bar.append(fill);const number=document.createElement('code');number.textContent='cached '+(value.cachedInput||0)+' · uncached '+(value.uncachedInput||0)+' · output '+(value.output||0)+' · reasoning '+(value.reasoning||0)+' · total '+(value.total||0);row.append(label,bar,number);root.append(row)})})}
+function renderArtifacts(){const root=$('artifact-list');root.textContent='';if(!snapshot.artifacts.length){root.textContent='No artifacts.';root.className='empty';return}snapshot.artifacts.forEach(a=>{const link=document.createElement('a');link.href=a.href;link.target='_blank';link.rel='noopener';link.textContent=a.path+' ('+a.size+' bytes)';root.append(link)})}
+function render(){const r=snapshot.run;$('run-meta').textContent=r.task+' · '+r.finishLine+' · '+r.id;$('status').textContent=r.status;renderGraph();renderTimeline();renderRevisions();renderTokens();renderArtifacts()}
+async function refresh(){try{const response=await fetch('/api/snapshot',{cache:'no-store'});if(!response.ok)throw new Error(await response.text());const next=await response.json();const changed=!snapshot||snapshot.run.updatedAt!==next.run.updatedAt||snapshot.timeline.length!==next.timeline.length;snapshot=next;if(changed)render()}catch(error){$('run-meta').textContent='Viewer refresh failed: '+error.message}}
+refresh();setInterval(refresh,1500);
+</script></body></html>`;
 
 // packages/cli/src/index.ts
 var GRAPHCRAFT_VERSION = package_default.version;
@@ -41021,7 +42476,7 @@ async function storeFor(cwd, runReference) {
   const runId = await resolveRunId(repository.root, runReference);
   return new RunStore(repository.root, runId);
 }
-async function handleAction(input) {
+async function performAction(input) {
   const cwd = input.repository ?? process.cwd();
   if (input.action === "doctor") {
     const [codex, claude, github] = await Promise.all([
@@ -41147,6 +42602,13 @@ async function handleAction(input) {
   }
   throw new Error(`Unsupported action: ${input.action}`);
 }
+async function handleAction(input) {
+  try {
+    return redactValue(await performAction(input));
+  } catch (error51) {
+    throw new Error(redactString(error51 instanceof Error ? error51.message : String(error51)));
+  }
+}
 
 // packages/mcp/tool-metadata.json
 var tool_metadata_default = {
@@ -41188,9 +42650,10 @@ var tool_metadata_default = {
 };
 
 // packages/mcp/src/index.ts
+var GRAPHCRAFT_MCP_VERSION = package_default.version;
 function createGraphcraftServer() {
   const server2 = new McpServer(
-    { name: "graphcraft", version: "0.1.0" },
+    { name: "graphcraft", version: GRAPHCRAFT_MCP_VERSION },
     {
       instructions: tool_metadata_default.instructions
     }

@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import { createRun } from "../packages/runtime/src/index.ts";
@@ -10,6 +11,7 @@ import type { GraphAmendment } from "../packages/core/src/index.ts";
 
 const execFileAsync = promisify(execFile);
 const temporaryRoots: string[] = [];
+const tsxCli = fileURLToPath(import.meta.resolve("tsx/cli"));
 
 afterEach(async () => {
   await Promise.all(
@@ -79,10 +81,11 @@ describe("graph amendment CLI", () => {
     };
     const amendmentPath = join(root, "amendment.json");
     await writeFile(amendmentPath, JSON.stringify(amendment));
-    const cli = join(process.cwd(), "node_modules", ".bin", "tsx");
+    const cli = process.execPath;
     const applied = JSON.parse(
       (
         await execFileAsync(cli, [
+          tsxCli,
           "packages/cli/src/bin.ts",
           "amend",
           created.contract.runId,
@@ -107,11 +110,13 @@ describe("graph amendment CLI", () => {
     const inspected = JSON.parse(
       (
         await execFileAsync(cli, [
+          tsxCli,
           "packages/cli/src/bin.ts",
           "inspect",
           created.contract.runId,
           "-C",
           repository,
+          "--json",
         ])
       ).stdout,
     ) as { graphHistory: unknown[]; state: { nodes: Record<string, { status: string }> } };

@@ -9,6 +9,7 @@ import {
   type SupervisorRecord,
 } from "@graphcraft/core";
 import { writeJsonAtomic } from "./json.ts";
+import { redactString } from "./redaction.ts";
 import { RunLock } from "./lock.ts";
 import { executeRun, type RunObserver } from "./runner.ts";
 import { RunStore } from "./store.ts";
@@ -268,7 +269,9 @@ export async function superviseRun(input: {
   const heartbeat = setInterval(() => {
     void lease
       .update({ heartbeatAt: new Date().toISOString() })
-      .catch((error: unknown) => console.error(`Supervisor heartbeat failed: ${String(error)}`));
+      .catch((error: unknown) =>
+        console.error(`Supervisor heartbeat failed: ${redactString(String(error))}`),
+      );
   }, 1_000);
   heartbeat.unref();
   try {

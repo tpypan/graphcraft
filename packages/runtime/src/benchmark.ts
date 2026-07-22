@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import {
@@ -23,6 +23,8 @@ import {
 } from "@graphcraft/core";
 import { runProcess } from "@graphcraft/probes";
 import { createRun, executeRun } from "./runner.ts";
+import { writeJsonAtomic } from "./json.ts";
+import { redactValue } from "./redaction.ts";
 
 const tokenDimensions = [
   "input",
@@ -454,28 +456,27 @@ export async function runBenchmark(input: {
     "Blinded human defect review remains outside this deterministic harness slice.",
   ];
   const persist = async (status: "running" | "complete"): Promise<BenchmarkReport> => {
-    const report = BenchmarkReportSchema.parse({
-      schemaVersion: 1,
-      status,
-      suite: { id: suite.id, version: suite.version, digest: suiteDigest },
-      startedAt,
-      updatedAt: new Date().toISOString(),
-      seed: input.seed,
-      randomized: true,
-      modelPolicy,
-      effortPolicy,
-      permissionPolicy,
-      scorerPolicy,
-      environment,
-      limitations,
-      schedule,
-      results,
-      summary: summarizeBenchmark(results, schedule),
-    });
-    await mkdir(dirname(outputPath), { recursive: true });
-    const temporary = `${outputPath}.${process.pid}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(report, null, 2)}\n`, "utf8");
-    await rename(temporary, outputPath);
+    const report = BenchmarkReportSchema.parse(
+      redactValue({
+        schemaVersion: 1,
+        status,
+        suite: { id: suite.id, version: suite.version, digest: suiteDigest },
+        startedAt,
+        updatedAt: new Date().toISOString(),
+        seed: input.seed,
+        randomized: true,
+        modelPolicy,
+        effortPolicy,
+        permissionPolicy,
+        scorerPolicy,
+        environment,
+        limitations,
+        schedule,
+        results,
+        summary: summarizeBenchmark(results, schedule),
+      }),
+    );
+    await writeJsonAtomic(outputPath, report);
     return report;
   };
   const hostVersions = new Map<string, string>();

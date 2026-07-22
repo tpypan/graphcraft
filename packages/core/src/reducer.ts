@@ -1,3 +1,4 @@
+import { z } from "zod";
 import type { RunContract, RunEvent, RunState } from "./schemas.ts";
 import {
   ControlDecisionPacketSchema,
@@ -202,6 +203,16 @@ export function reduceEvents(events: RunEvent[]): RunState {
         );
         break;
       }
+      case "side_effect.dispatched": {
+        const actionId = requiredString(data, "actionId");
+        const entry = state.sideEffects.find(({ claim }) => claim.actionId === actionId);
+        if (!entry) throw new Error(`Unknown side effect ${actionId}`);
+        if (entry.dispatchedAt)
+          throw new Error(`Side effect ${actionId} was marked dispatched more than once`);
+        entry.dispatchedAt = event.timestamp;
+        entry.updatedAt = event.timestamp;
+        break;
+      }
       case "side_effect.reconciled": {
         const actionId = requiredString(data, "actionId");
         const entry = state.sideEffects.find(({ claim }) => claim.actionId === actionId);
@@ -255,6 +266,48 @@ export function reduceEvents(events: RunEvent[]): RunState {
         nodeState.status = "waiting";
         state.currentNodeId = undefined;
         state.waits.push(wait);
+        break;
+      }
+      case "wait.rebound": {
+        const nodeId = requiredString(data, "nodeId");
+        const wait = state.waits.find((candidate) => candidate.nodeId === nodeId);
+        if (!wait) throw new Error(`Unknown wait node ${nodeId}`);
+        const previousBaseSha = requiredString(data, "previousBaseSha");
+        const baseSha = requiredString(data, "baseSha");
+        if (wait.bindingBaseSha && wait.bindingBaseSha !== previousBaseSha)
+          throw new Error(`Wait node ${nodeId} base binding changed concurrently`);
+        wait.bindingBaseSha = baseSha;
+        wait.evidence = Array.isArray(data.evidence)
+          ? data.evidence.map((value) => String(value))
+          : wait.evidence;
+        wait.updatedAt = event.timestamp;
+        break;
+      }
+      case "wait.human_decision_observed": {
+        const nodeId = requiredString(data, "nodeId");
+        const wait = state.waits.find((candidate) => candidate.nodeId === nodeId);
+        if (!wait) throw new Error(`Unknown wait node ${nodeId}`);
+        wait.stickyHumanDecision = {
+          kind: z.enum(["draft", "changes_requested"]).parse(data.kind),
+          observedAt: event.timestamp,
+          snapshotId: z
+            .string()
+            .regex(/^[a-f0-9]{64}$/)
+            .parse(data.snapshotId),
+          evidence: Array.isArray(data.evidence) ? data.evidence.map((value) => String(value)) : [],
+        };
+        wait.updatedAt = event.timestamp;
+        break;
+      }
+      case "wait.human_decision_resolved": {
+        const nodeId = requiredString(data, "nodeId");
+        const wait = state.waits.find((candidate) => candidate.nodeId === nodeId);
+        if (!wait) throw new Error(`Unknown wait node ${nodeId}`);
+        const kind = requiredString(data, "kind");
+        if (wait.stickyHumanDecision?.kind !== kind)
+          throw new Error(`Wait node ${nodeId} has no matching sticky human decision`);
+        delete wait.stickyHumanDecision;
+        wait.updatedAt = event.timestamp;
         break;
       }
       case "wait.observed": {

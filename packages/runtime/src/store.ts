@@ -28,6 +28,7 @@ import {
 } from "@graphcraft/core";
 import { writeJsonAtomic } from "./json.ts";
 import { ensureCurrentRunStorage, writeCurrentRunStorageManifest } from "./migration.ts";
+import { assertPersistenceSafe, redactTextBytes, redactValue } from "./redaction.ts";
 
 export class RunStore {
   readonly repositoryRoot: string;
@@ -64,10 +65,14 @@ export class RunStore {
   ): Promise<RunStore> {
     const store = new RunStore(repositoryRoot, contract.runId);
     store.initializing = true;
+    const persistedContract = RunContractSchema.parse(redactValue(contract));
+    const persistedGraph = GraphSchema.parse(redactValue(graph));
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
     const heldOutProbePlan = inputHeldOutProbePlan
       ? validateHeldOutProbePlan(inputHeldOutProbePlan)
       : createHeldOutProbePlan(contract.runId, probePlan);
+    assertPersistenceSafe(probePlan, "Probe plan");
+    assertPersistenceSafe(heldOutProbePlan, "Held-out probe plan");
     await Promise.all([
       mkdir(join(store.runRoot, "artifacts"), { recursive: true }),
       mkdir(join(store.runRoot, "capsules"), { recursive: true }),
@@ -75,8 +80,8 @@ export class RunStore {
       mkdir(join(store.graphcraftRoot, "locks"), { recursive: true }),
     ]);
     await Promise.all([
-      store.saveContract(contract),
-      store.saveGraph(graph),
+      store.saveContract(persistedContract),
+      store.saveGraph(persistedGraph),
       store.saveProbePlan(probePlan),
       store.saveHeldOutProbePlan(heldOutProbePlan),
     ]);
@@ -86,8 +91,8 @@ export class RunStore {
       causationId: contract.runId,
       type: "run.created",
       data: {
-        contract,
-        graph,
+        contract: persistedContract,
+        graph: persistedGraph,
         probePlan,
         heldOutProbePlan,
         nodeIds: graph.nodes.map(({ id }) => id),
@@ -109,7 +114,10 @@ export class RunStore {
 
   async saveContract(contract: RunContract): Promise<void> {
     await this.ensureStorage();
-    await writeJsonAtomic(join(this.runRoot, "contract.json"), RunContractSchema.parse(contract));
+    await writeJsonAtomic(
+      join(this.runRoot, "contract.json"),
+      RunContractSchema.parse(redactValue(contract)),
+    );
   }
 
   async loadContract(): Promise<RunContract> {
@@ -121,7 +129,7 @@ export class RunStore {
 
   async saveGraph(graph: Graph): Promise<void> {
     await this.ensureStorage();
-    await writeJsonAtomic(join(this.runRoot, "graph.json"), GraphSchema.parse(graph));
+    await writeJsonAtomic(join(this.runRoot, "graph.json"), GraphSchema.parse(redactValue(graph)));
   }
 
   async loadGraph(): Promise<Graph> {
@@ -144,6 +152,7 @@ export class RunStore {
 
   async saveProbePlan(probePlan: ProbePlan): Promise<void> {
     await this.ensureStorage();
+    assertPersistenceSafe(probePlan, "Probe plan");
     await writeJsonAtomic(join(this.runRoot, "probe-plan.json"), ProbePlanSchema.parse(probePlan));
   }
 
@@ -174,6 +183,7 @@ export class RunStore {
 
   async saveHeldOutProbePlan(heldOutProbePlan: HeldOutProbePlan): Promise<void> {
     await this.ensureStorage();
+    assertPersistenceSafe(heldOutProbePlan, "Held-out probe plan");
     await writeJsonAtomic(
       join(this.runRoot, "held-out-probes.json"),
       validateHeldOutProbePlan(heldOutProbePlan),
@@ -251,7 +261,7 @@ export class RunStore {
         actor,
         causationId,
         type,
-        data,
+        data: redactValue(data) as Record<string, unknown>,
       });
       await appendFile(this.eventsPath(), `${JSON.stringify(event)}\n`, "utf8");
       events.push(event);
@@ -298,7 +308,7 @@ export class RunStore {
     await this.ensureStorage();
     const path = join(this.runRoot, "artifacts", relativePath);
     await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, value, { mode: 0o600 });
+    await writeFile(path, redactTextBytes(value), { mode: 0o600 });
     return path;
   }
 
@@ -306,7 +316,8 @@ export class RunStore {
     await this.ensureStorage();
     const path = join(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
     await mkdir(dirname(path), { recursive: true });
-    await appendFile(path, `${JSON.stringify(HostEventSchema.parse(event))}\n`, {
+    const persistedEvent = HostEventSchema.parse(redactValue(event));
+    await appendFile(path, `${JSON.stringify(persistedEvent)}\n`, {
       encoding: "utf8",
       mode: 0o600,
     });
@@ -383,12 +394,15 @@ export class RunStore {
 
   async writeCapsule(hash: string, value: unknown): Promise<{ path: string; reused: boolean }> {
     await this.ensureStorage();
+    const persistedValue = redactValue(value);
+    if (contentHash(persistedValue) !== hash)
+      throw new Error("Context capsule must be redacted before content addressing");
     const path = join(this.runRoot, "capsules", `${hash}.json`);
     const reused = await readFile(path, "utf8")
       .then((existing) => contentHash(JSON.parse(existing)) === hash)
       .catch(() => false);
     if (reused) return { path, reused: true };
-    await writeJsonAtomic(path, value);
+    await writeJsonAtomic(path, persistedValue);
     return { path, reused: false };
   }
 
@@ -400,7 +414,7 @@ export class RunStore {
     await this.ensureStorage();
     if (!/^[a-z0-9][a-z0-9-]*$/.test(category) || !/^[a-z0-9]+$/.test(extension))
       throw new Error("Content-addressed artifact category or extension is invalid");
-    const bytes = typeof value === "string" ? Buffer.from(value) : Buffer.from(value);
+    const bytes = redactTextBytes(value);
     const hash = contentHash({ contents: bytes.toString("base64") });
     const path = join(this.runRoot, "artifacts", category, `${hash}.${extension}`);
     const reused = await readFile(path)

@@ -12,7 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, relative, resolve } from "node:path";
+import { delimiter, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
@@ -54,6 +54,7 @@ import { createRunWorkspace, discoverPlanningEvidence } from "./repository.ts";
 import { RunStore } from "./store.ts";
 import { amendRunGraph } from "./amendment.ts";
 import { assessRunProgress, createProgressDecisionPacket } from "./trajectory.ts";
+import { captureWorkspaceScopeSnapshot } from "./scope.ts";
 import type { SideEffectBoundary } from "./side-effect.ts";
 import { evaluateGitHubLifecycleWait } from "./github.ts";
 import {
@@ -177,13 +178,14 @@ async function fakePullRequestGitHub(
   initial: Record<string, unknown> = {},
 ): Promise<{
   command: string;
+  commandArgs: string[];
   env: NodeJS.ProcessEnv;
   statePath: string;
   logPath: string;
 }> {
   const root = await mkdtemp(join(tmpdir(), "graphcraft-runtime-github-test-"));
   temporaryRoots.push(root);
-  const command = join(root, "gh");
+  const script = join(root, "gh.cjs");
   const statePath = join(root, "state.json");
   const logPath = join(root, "calls.jsonl");
   await writeFile(
@@ -198,12 +200,13 @@ async function fakePullRequestGitHub(
       checks: [],
       reviewThreads: [],
       reviews: [],
+      rerunCalls: 0,
       syncPullRequestHead: false,
       ...initial,
     })}\n`,
   );
   await writeFile(
-    command,
+    script,
     `#!/usr/bin/env node
 const fs = require("node:fs");
 const { execFileSync } = require("node:child_process");
@@ -217,13 +220,18 @@ const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
 const fail = (message, code = 1) => { process.stderr.write(message + "\\n"); process.exit(code); };
 const value = (flag) => args[args.indexOf(flag) + 1];
 const sha = (branch) => execFileSync("git", ["--git-dir", state.remote, "rev-parse", "refs/heads/" + branch], { encoding: "utf8" }).trim();
-if (state.syncPullRequestHead) {
+if (state.syncPullRequestHead || state.syncPullRequestBase) {
   let changed = false;
   for (const pullRequest of state.pullRequests) {
     if (pullRequest.state !== "OPEN") continue;
-    const current = sha(pullRequest.headRefName);
-    if (current !== pullRequest.headSha) {
-      pullRequest.headSha = current;
+    const currentHead = sha(pullRequest.headRefName);
+    const currentBase = sha(pullRequest.baseRefName);
+    if (state.syncPullRequestHead && currentHead !== pullRequest.headSha) {
+      pullRequest.headSha = currentHead;
+      changed = true;
+    }
+    if (state.syncPullRequestBase && currentBase !== pullRequest.baseSha) {
+      pullRequest.baseSha = currentBase;
       changed = true;
     }
   }
@@ -285,6 +293,18 @@ if (endpoint && endpoint.startsWith("repos/tpypan/fixture/branches/")) {
   else send({ protected: state.protected });
   process.exit(0);
 }
+if (endpoint && endpoint.startsWith("repos/tpypan/fixture/check-runs/") && endpoint.endsWith("/rerequest")) {
+  const databaseId = Number(endpoint.split("/").at(-2));
+  const check = state.checks.find((candidate) => candidate.databaseId === databaseId);
+  if (!check) fail("check run not found");
+  state.rerunCalls += 1;
+  if (!state.rerunLeavesFailure) {
+    check.status = "COMPLETED";
+    check.conclusion = "SUCCESS";
+  }
+  save();
+  process.exit(0);
+}
 if (args[1] !== "graphql") fail("unexpected api endpoint: " + endpoint);
 const fields = {};
 for (let index = 0; index < args.length - 1; index += 1) {
@@ -301,6 +321,69 @@ if (query.includes("GraphcraftPullRequestsByHead")) {
     nodes: matching.map((pullRequest) => ({ ...pullRequest, headRefOid: pullRequest.headSha, baseRefOid: pullRequest.baseSha, headSha: undefined, baseSha: undefined })),
     pageInfo: { hasNextPage: false, endCursor: null },
   } }, rateLimit } });
+  process.exit(0);
+}
+if (query.includes("GraphcraftReviewThread")) {
+  const thread = state.reviewThreads.find((candidate) => candidate.id === fields.threadId);
+  if (!thread) { send({ data: { node: null, rateLimit } }); process.exit(0); }
+  const comments = [{
+    id: "comment-" + thread.id,
+    author: "reviewer",
+    body: thread.body || "untrusted review text",
+    url: "https://github.com/tpypan/fixture/pull/100#discussion_" + thread.id,
+    createdAt: "2026-07-22T04:00:00.000Z",
+  }, ...(thread.replies || [])];
+  const start = fields.cursor ? Number(fields.cursor) : 0;
+  const size = state.paginateThreadComments ? 1 : 100;
+  const selected = comments.slice(start, start + size);
+  const next = start + selected.length;
+  send({ data: { node: {
+    id: thread.id,
+    isResolved: thread.isResolved,
+    isOutdated: thread.isOutdated,
+    path: thread.path,
+    line: thread.line,
+    comments: {
+      nodes: selected.map((comment) => ({
+        id: comment.id,
+        author: comment.author ? { login: comment.author } : null,
+        body: comment.body,
+        url: comment.url,
+        createdAt: comment.createdAt,
+      })),
+      pageInfo: { hasNextPage: next < comments.length, endCursor: next < comments.length ? String(next) : null },
+    },
+  }, rateLimit } });
+  process.exit(0);
+}
+if (query.includes("GraphcraftAddReviewReply")) {
+  const thread = state.reviewThreads.find((candidate) => candidate.id === fields.threadId);
+  if (!thread) fail("review thread not found");
+  thread.replies = thread.replies || [];
+  const comment = {
+    id: "graphcraft-reply-" + thread.id + "-" + (thread.replies.length + 1),
+    author: "graphcraft",
+    body: fields.body,
+    url: "https://github.com/tpypan/fixture/pull/100#discussion_reply_" + thread.id + "_" + (thread.replies.length + 1),
+    createdAt: "2026-07-22T04:05:00.000Z",
+  };
+  thread.replies.push(comment);
+  save();
+  send({ data: { addPullRequestReviewThreadReply: {
+    clientMutationId: fields.clientMutationId,
+    comment: { id: comment.id, body: comment.body, url: comment.url },
+  } } });
+  process.exit(0);
+}
+if (query.includes("GraphcraftResolveReviewThread")) {
+  const thread = state.reviewThreads.find((candidate) => candidate.id === fields.threadId);
+  if (!thread) fail("review thread not found");
+  thread.isResolved = true;
+  save();
+  send({ data: { resolveReviewThread: {
+    clientMutationId: fields.clientMutationId,
+    thread: { id: thread.id, isResolved: true },
+  } } });
   process.exit(0);
 }
 const pullRequest = query.includes("GraphcraftCommitChecks")
@@ -326,20 +409,30 @@ if (query.includes("GraphcraftPullRequestThreads")) {
     url: "https://github.com/tpypan/fixture",
     viewerPermission: state.permission,
     pullRequest: { ...identity, reviewThreads: {
-      nodes: state.reviewThreads.map((thread) => ({
-        id: thread.id,
-        isResolved: thread.isResolved,
-        isOutdated: thread.isOutdated,
-        path: thread.path,
-        line: thread.line,
-        comments: { totalCount: 1, nodes: [{
+      nodes: state.reviewThreads.map((thread) => {
+        const comments = [{
           id: "comment-" + thread.id,
-          author: { login: "reviewer" },
+          author: "reviewer",
           body: thread.body || "untrusted review text",
           url: "https://github.com/tpypan/fixture/pull/" + identity.number + "#discussion_" + thread.id,
           createdAt: "2026-07-22T04:00:00.000Z",
-        }] },
-      })),
+        }, ...(thread.replies || [])];
+        const latest = comments[comments.length - 1];
+        return {
+          id: thread.id,
+          isResolved: thread.isResolved,
+          isOutdated: thread.isOutdated,
+          path: thread.path,
+          line: thread.line,
+          comments: { totalCount: comments.length, nodes: [{
+            id: latest.id,
+            author: latest.author ? { login: latest.author } : null,
+            body: latest.body,
+            url: latest.url,
+            createdAt: latest.createdAt,
+          }] },
+        };
+      }),
       pageInfo: { hasNextPage: false, endCursor: null },
     } },
   }, rateLimit } });
@@ -370,7 +463,7 @@ if (query.includes("GraphcraftCommitChecks")) {
     statusCheckRollup: { contexts: {
       nodes: state.checks.map((check) => check.kind === "status_context"
         ? { __typename: "StatusContext", id: check.id, context: check.name, state: check.state, targetUrl: "https://github.com/checks/" + check.id }
-        : { __typename: "CheckRun", id: check.id, name: check.name, status: check.status, conclusion: check.conclusion, detailsUrl: "https://github.com/checks/" + check.id, app: null }),
+        : { __typename: "CheckRun", id: check.id, databaseId: check.databaseId || null, name: check.name, status: check.status, conclusion: check.conclusion, detailsUrl: "https://github.com/checks/" + check.id, app: null }),
       pageInfo: { hasNextPage: false, endCursor: null },
     } },
   } }, rateLimit } });
@@ -387,9 +480,9 @@ if (query.includes("GraphcraftPullRequestIdentity")) {
 fail("unknown GraphQL operation");
 `,
   );
-  await chmod(command, 0o700);
   return {
-    command,
+    command: process.execPath,
+    commandArgs: [script],
     statePath,
     logPath,
     env: {
@@ -718,6 +811,29 @@ class WaitPlannerAdapter extends FakeAdapter {
   }
 }
 
+class ScopedPlannerAdapter extends FakeAdapter {
+  constructor(
+    scope: string[],
+    act: (request: WorkerRequest, call: number, signal: AbortSignal) => Promise<void>,
+  ) {
+    super(act);
+    this.scope = scope;
+  }
+
+  private readonly scope: string[];
+
+  override async plan(request: PlanningRequest, signal: AbortSignal): Promise<PlanningResult> {
+    const result = await super.plan(request, signal);
+    return {
+      ...result,
+      plan: {
+        ...result.plan,
+        nodes: result.plan.nodes.map((node) => ({ ...node, scope: this.scope })),
+      },
+    };
+  }
+}
+
 class WaitSatisfactionFaultStore extends RunStore {
   injected = false;
 
@@ -900,7 +1016,11 @@ describe("durable runtime", () => {
     expect(adapter.calls).toEqual([]);
     expect(waiting.tokenLedger.filter(({ phase }) => phase === "worker")).toHaveLength(0);
 
-    const workspace = await created.store.loadWorkspace<{ path: string }>();
+    const workspace = await created.store.loadWorkspace<{
+      path: string;
+      branch: string;
+      created: boolean;
+    }>();
     await writeFile(join(workspace.path, "ready.flag"), "ready\n");
     await new Promise<void>((resolve) => setTimeout(resolve, 275));
     const completed = await executeRun({ store: created.store, adapter });
@@ -1056,23 +1176,25 @@ describe("durable runtime", () => {
     ).toHaveLength(1);
   });
 
-  it("detaches, exposes, and replaces a stale supervisor in a repository path with spaces", async () => {
-    const repository = await createRepository("feature.txt", "repo with spaces");
-    const adapter = new WaitPlannerAdapter(
-      { kind: "file_exists", path: "ready.flag", pollIntervalMs: 250 },
-      async () => undefined,
-    );
-    const created = await createRun("Implement a substantial feature after a background wait", {
-      cwd: repository,
-      planner: adapter,
-    });
-    const repositoryRoot = created.store.repositoryRoot;
-    const fakeBin = join(repository, ".test-bin");
-    const fakeCodex = join(fakeBin, "codex");
-    await mkdir(fakeBin);
-    await writeFile(
-      fakeCodex,
-      `#!/usr/bin/env node
+  it.skipIf(process.platform === "win32")(
+    "detaches, exposes, and replaces a stale supervisor in a repository path with spaces",
+    async () => {
+      const repository = await createRepository("feature.txt", "repo with spaces");
+      const adapter = new WaitPlannerAdapter(
+        { kind: "file_exists", path: "ready.flag", pollIntervalMs: 250 },
+        async () => undefined,
+      );
+      const created = await createRun("Implement a substantial feature after a background wait", {
+        cwd: repository,
+        planner: adapter,
+      });
+      const repositoryRoot = created.store.repositoryRoot;
+      const fakeBin = join(repository, ".test-bin");
+      const fakeCodex = join(fakeBin, "codex");
+      await mkdir(fakeBin);
+      await writeFile(
+        fakeCodex,
+        `#!/usr/bin/env node
 const fs = require("node:fs");
 const args = process.argv.slice(2);
 if (args[0] === "--version") { console.log("codex-cli 0.0.0-test"); process.exit(0); }
@@ -1087,98 +1209,100 @@ process.stdin.on("end", () => {
   console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 4 } }));
 });
 `,
-    );
-    await chmod(fakeCodex, 0o700);
-    const launcher = {
-      command: process.execPath,
-      args: [
-        "--import",
-        resolve("node_modules/tsx/dist/loader.mjs"),
-        resolve("packages/cli/src/bin.ts"),
-      ],
-      env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ""}` },
-    };
-    let activePid: number | undefined;
-    try {
-      const first = await startDetachedSupervisor({
-        repositoryRoot,
-        runId: created.contract.runId,
-        host: "codex",
-        maxWorkers: 1,
-        launcher,
-      });
-      activePid = first.pid;
-      expect((await stat(first.logPath)).mode & 0o777).toBe(0o600);
-      expect(
-        inspectSupervisorRecord({ ...first, heartbeatAt: "1970-01-01T00:00:00.000Z" }).health,
-      ).toBe("stale");
+      );
+      await chmod(fakeCodex, 0o700);
+      const launcher = {
+        command: process.execPath,
+        args: [
+          "--import",
+          resolve("node_modules/tsx/dist/loader.mjs"),
+          resolve("packages/cli/src/bin.ts"),
+        ],
+        env: { ...process.env, PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ""}` },
+      };
+      let activePid: number | undefined;
       try {
-        await waitFor(async () => {
-          const [supervisor, state] = await Promise.all([
-            latestSupervisor(repositoryRoot, created.contract.runId),
-            created.store.loadState(),
-          ]);
-          return supervisor?.health === "running" && state.status === "waiting";
-        }, 10_000);
-      } catch (error) {
-        throw new Error(
-          `${(error as Error).message}\nSupervisor log:\n${await readFile(first.logPath, "utf8")}`,
-        );
-      }
-      await expect(
-        startDetachedSupervisor({
+        const first = await startDetachedSupervisor({
           repositoryRoot,
           runId: created.contract.runId,
           host: "codex",
           maxWorkers: 1,
           launcher,
-        }),
-      ).rejects.toThrow(/already has active supervisor/);
+        });
+        activePid = first.pid;
+        if (process.platform !== "win32")
+          expect((await stat(first.logPath)).mode & 0o777).toBe(0o600);
+        expect(
+          inspectSupervisorRecord({ ...first, heartbeatAt: "1970-01-01T00:00:00.000Z" }).health,
+        ).toBe("stale");
+        try {
+          await waitFor(async () => {
+            const [supervisor, state] = await Promise.all([
+              latestSupervisor(repositoryRoot, created.contract.runId),
+              created.store.loadState(),
+            ]);
+            return supervisor?.health === "running" && state.status === "waiting";
+          }, 10_000);
+        } catch (error) {
+          throw new Error(
+            `${(error as Error).message}\nSupervisor log:\n${await readFile(first.logPath, "utf8")}`,
+          );
+        }
+        await expect(
+          startDetachedSupervisor({
+            repositoryRoot,
+            runId: created.contract.runId,
+            host: "codex",
+            maxWorkers: 1,
+            launcher,
+          }),
+        ).rejects.toThrow(/already has active supervisor/);
 
-      process.kill(first.pid, "SIGKILL");
-      await waitFor(() => !isProcessAlive(first.pid));
-      expect((await latestSupervisor(repositoryRoot, created.contract.runId))?.health).toBe(
-        "stale",
-      );
+        process.kill(first.pid, "SIGKILL");
+        await waitFor(() => !isProcessAlive(first.pid));
+        expect((await latestSupervisor(repositoryRoot, created.contract.runId))?.health).toBe(
+          "stale",
+        );
 
-      const second = await startDetachedSupervisor({
-        repositoryRoot,
-        runId: created.contract.runId,
-        host: "codex",
-        maxWorkers: 1,
-        launcher,
-      });
-      activePid = second.pid;
-      expect(second.replacesSupervisorId).toBe(first.supervisorId);
-      await waitFor(
-        async () =>
-          (await latestSupervisor(repositoryRoot, created.contract.runId))?.health === "running",
-        10_000,
-      );
-      const workspace = await created.store.loadWorkspace<{ path: string }>();
-      await writeFile(join(workspace.path, "ready.flag"), "ready\n");
-      await waitFor(async () => (await created.store.loadState()).status === "completed", 15_000);
-      await waitFor(
-        async () =>
-          (await latestSupervisor(repositoryRoot, created.contract.runId))?.runStatus ===
-          "completed",
-        10_000,
-      );
-      activePid = undefined;
+        const second = await startDetachedSupervisor({
+          repositoryRoot,
+          runId: created.contract.runId,
+          host: "codex",
+          maxWorkers: 1,
+          launcher,
+        });
+        activePid = second.pid;
+        expect(second.replacesSupervisorId).toBe(first.supervisorId);
+        await waitFor(
+          async () =>
+            (await latestSupervisor(repositoryRoot, created.contract.runId))?.health === "running",
+          10_000,
+        );
+        const workspace = await created.store.loadWorkspace<{ path: string }>();
+        await writeFile(join(workspace.path, "ready.flag"), "ready\n");
+        await waitFor(async () => (await created.store.loadState()).status === "completed", 15_000);
+        await waitFor(
+          async () =>
+            (await latestSupervisor(repositoryRoot, created.contract.runId))?.runStatus ===
+            "completed",
+          10_000,
+        );
+        activePid = undefined;
 
-      const records = await listSupervisorRecords(repositoryRoot, created.contract.runId);
-      expect(records).toHaveLength(2);
-      expect(records[0]?.status).toBe("running");
-      expect(records[1]).toMatchObject({
-        supervisorId: second.supervisorId,
-        replacesSupervisorId: first.supervisorId,
-        status: "exited",
-        runStatus: "completed",
-      });
-    } finally {
-      if (activePid && isProcessAlive(activePid)) process.kill(activePid, "SIGKILL");
-    }
-  });
+        const records = await listSupervisorRecords(repositoryRoot, created.contract.runId);
+        expect(records).toHaveLength(2);
+        expect(records[0]?.status).toBe("running");
+        expect(records[1]).toMatchObject({
+          supervisorId: second.supervisorId,
+          replacesSupervisorId: first.supervisorId,
+          status: "exited",
+          runStatus: "completed",
+        });
+      } finally {
+        if (activePid && isProcessAlive(activePid)) process.kill(activePid, "SIGKILL");
+      }
+    },
+  );
 
   it("selects bounded task-matched source snippets for planning evidence", async () => {
     const repository = await createRepository();
@@ -1313,6 +1437,33 @@ process.stdin.on("end", () => {
     );
   });
 
+  it("keeps held-out file integrity stable across Git checkout line-ending conversion", async () => {
+    const repository = await createRepository();
+    await git(repository, "config", "core.autocrlf", "true");
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+    });
+    const created = await createRun("Implement a substantial portable fixture feature", {
+      cwd: repository,
+      planner: adapter,
+    });
+    const completed = await executeRun({ store: created.store, adapter, approve: true });
+    const workspace = await created.store.loadWorkspace<{ path: string }>();
+
+    expect(completed.status).toBe("completed");
+    expect(await readFile(join(workspace.path, "verify.mjs"), "utf8")).toContain("\r\n");
+    expect((await created.store.loadHeldOutProbePlan()).probes[0]?.integrity).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "file",
+          path: "verify.mjs",
+          algorithm: "git_hash_object",
+        }),
+      ]),
+    );
+  });
+
   it("rejects event-log tampering before resolving held-out completion checks", async () => {
     const repository = await createRepository();
     const created = await createRun("Implement a substantial held-out integrity feature", {
@@ -1404,6 +1555,208 @@ process.stdin.on("end", () => {
     expect(
       (await created.store.loadEvents()).find(({ type }) => type === "semantic.verdict"),
     ).toMatchObject({ data: { policyViolation: true } });
+  });
+
+  it("redacts task secrets before planning, worker context, and persistence", async () => {
+    const repository = await createRepository();
+    const secret = "ghp_abcdefghijklmnopqrstuvwxyz";
+    const configuredSecret = "opaque-model-context-secret-12345";
+    const credentialUrl = "https://user:password@example.test/path?token=query-secret";
+    const previousSecret = process.env.GRAPHCRAFT_MODEL_CONTEXT_API_KEY;
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+    });
+    process.env.GRAPHCRAFT_MODEL_CONTEXT_API_KEY = configuredSecret;
+    try {
+      const created = await createRun(
+        `Implement a substantial feature with token=${secret}, endpoint ${credentialUrl}, and configured ${configuredSecret}`,
+        {
+          cwd: repository,
+          planner: adapter,
+        },
+      );
+
+      const state = await executeRun({ store: created.store, adapter, approve: true });
+      const persisted = (
+        await Promise.all([
+          readFile(join(created.store.runRoot, "contract.json"), "utf8"),
+          readFile(join(created.store.runRoot, "graph.json"), "utf8"),
+          readFile(created.store.eventsPath(), "utf8"),
+          ...(await readdir(join(created.store.runRoot, "capsules"))).map((name) =>
+            readFile(join(created.store.runRoot, "capsules", name), "utf8"),
+          ),
+        ])
+      ).join("\n");
+
+      expect(state.status).toBe("completed");
+      expect(created.contract.task).toContain("[REDACTED]");
+      expect(adapter.planningRequests[0]?.contract.task).toContain("[REDACTED]");
+      for (const sensitive of [secret, configuredSecret, "user:password", "query-secret"]) {
+        expect(adapter.planningRequests[0]?.contract.task).not.toContain(sensitive);
+        expect(
+          adapter.requests.some(({ capsule }) => JSON.stringify(capsule).includes(sensitive)),
+        ).toBe(false);
+        expect(persisted).not.toContain(sensitive);
+      }
+      expect(persisted).toContain("[REDACTED]");
+    } finally {
+      if (previousSecret === undefined) delete process.env.GRAPHCRAFT_MODEL_CONTEXT_API_KEY;
+      else process.env.GRAPHCRAFT_MODEL_CONTEXT_API_KEY = previousSecret;
+    }
+  });
+
+  it("rejects and preserves worker changes outside contract and node scope", async () => {
+    const repository = await createRepository("src/feature.txt");
+    await writeFile(join(repository, ".gitignore"), "src/private/\n");
+    await git(repository, "add", ".gitignore");
+    await git(repository, "commit", "-m", "ignore private fixture output");
+    const adapter = new ScopedPlannerAdapter(["src/**"], async (request) => {
+      if (request.capsule.nodeId !== "implement") return;
+      await mkdir(join(request.repositoryPath, "src"), { recursive: true });
+      await mkdir(join(request.repositoryPath, "src", "private"), { recursive: true });
+      await mkdir(join(request.repositoryPath, "docs"), { recursive: true });
+      await writeFile(join(request.repositoryPath, "src", "feature.txt"), "implemented\n");
+      await writeFile(join(request.repositoryPath, "src", "private", "secret.txt"), "excluded\n");
+      await writeFile(join(request.repositoryPath, "docs", "escape.txt"), "out of scope\n");
+    });
+    const created = await createRun("Implement a substantial feature in src", {
+      cwd: repository,
+      planner: adapter,
+      include: ["src/**"],
+      exclude: ["src/private/**"],
+    });
+
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+    const workspace = await created.store.loadWorkspace<{ path: string }>();
+    const scopeEvent = (await created.store.loadEvents()).findLast(
+      ({ type, data }) => type === "scope.checked" && data.nodeId === "implement",
+    );
+
+    expect(state.status).toBe("blocked");
+    expect(state.nodes.implement?.status).toBe("failed");
+    expect(state.nodes.verify?.status).toBe("pending");
+    expect(state.stopReason).toContain("docs/escape.txt");
+    expect(state.stopReason).toContain(workspace.path);
+    expect(await readFile(join(workspace.path, "src", "feature.txt"), "utf8")).toBe(
+      "implemented\n",
+    );
+    expect(await readFile(join(workspace.path, "docs", "escape.txt"), "utf8")).toBe(
+      "out of scope\n",
+    );
+    await expect(readFile(join(repository, "docs", "escape.txt"), "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    expect(scopeEvent).toMatchObject({
+      data: {
+        audit: {
+          allowed: false,
+          changedPaths: ["docs/escape.txt", "src/feature.txt", "src/private/secret.txt"],
+          touchedPaths: ["docs/escape.txt", "src/feature.txt", "src/private/secret.txt"],
+          violations: expect.arrayContaining([
+            expect.objectContaining({ kind: "contract_not_included", path: "docs/escape.txt" }),
+            expect.objectContaining({
+              kind: "contract_excluded",
+              path: "src/private/secret.txt",
+            }),
+            expect.objectContaining({ kind: "node_scope", path: "docs/escape.txt" }),
+          ]),
+        },
+      },
+    });
+  });
+
+  it("rejects Git index mutations outside the runtime-owned commit boundary", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async (request) => {
+      await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+      await git(request.repositoryPath, "add", "feature.txt");
+    });
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+    const scopeEvent = (await created.store.loadEvents()).findLast(
+      ({ type }) => type === "scope.checked",
+    );
+
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toMatch(/Git index changed outside a runtime-owned commit boundary/i);
+    expect(scopeEvent).toMatchObject({
+      data: {
+        audit: {
+          allowed: false,
+          violations: expect.arrayContaining([expect.objectContaining({ kind: "git_index" })]),
+        },
+      },
+    });
+  });
+
+  it("rejects worker commits outside the approved side-effect class", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async (request) => {
+      await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+      await git(request.repositoryPath, "add", "feature.txt");
+      await git(request.repositoryPath, "commit", "-m", "unapproved worker commit");
+    });
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+    const scopeEvent = (await created.store.loadEvents()).findLast(
+      ({ type }) => type === "scope.checked",
+    );
+
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toMatch(/HEAD changed .* outside a commit node/);
+    expect(scopeEvent).toMatchObject({
+      data: {
+        audit: {
+          allowed: false,
+          violations: expect.arrayContaining([expect.objectContaining({ kind: "git_head" })]),
+        },
+      },
+    });
+  });
+
+  it("rejects repository mutation by a read-only verification command", async () => {
+    const repository = await createRepository();
+    await writeFile(
+      join(repository, "verify.mjs"),
+      'import { access, writeFile } from "node:fs/promises";\nawait access(new URL("./feature.txt", import.meta.url));\nawait writeFile(new URL("./verification-output.txt", import.meta.url), "not read only\\n");\n',
+    );
+    await git(repository, "add", "verify.mjs");
+    await git(repository, "commit", "-m", "add mutating verification fixture");
+    const adapter = new FakeAdapter(async (request) => {
+      await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+    });
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+    const scopeEvent = (await created.store.loadEvents()).findLast(
+      ({ type, data }) => type === "scope.checked" && data.stage === "verification",
+    );
+
+    expect(state.status).toBe("blocked");
+    expect(state.nodes.verify?.status).toBe("failed");
+    expect(state.stopReason).toContain("verification-output.txt");
+    expect(scopeEvent).toMatchObject({
+      data: {
+        audit: {
+          allowed: false,
+          violations: expect.arrayContaining([
+            expect.objectContaining({
+              kind: "read_only_write",
+              path: "verification-output.txt",
+            }),
+          ]),
+        },
+      },
+    });
   });
 
   it("completes a local run in an isolated worktree and records tokens", async () => {
@@ -2842,7 +3195,7 @@ process.stdin.on("end", () => {
           body: "UNTRUSTED_REVIEW_BODY",
         },
       ],
-      reviewDecision: "CHANGES_REQUESTED",
+      reviewDecision: "",
     });
     const adapter = new FakeAdapter(async (request) => {
       if (request.capsule.nodeId === "implement")
@@ -3141,6 +3494,122 @@ process.stdin.on("end", () => {
     expect(completed.tokens.total).toBe(tokensBeforeWake);
   });
 
+  it("rebinds a moved base without mutating the exact PR head", async () => {
+    const { repository, remote } = await createRepositoryWithRemote();
+    const github = await fakePullRequestGitHub(remote, {
+      syncPullRequestBase: true,
+      protected: true,
+      requiredStatusChecks: ["tests"],
+      checks: [
+        {
+          kind: "check_run",
+          id: "tests-check",
+          name: "tests",
+          status: "IN_PROGRESS",
+          conclusion: null,
+        },
+      ],
+    });
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "base-movement\n");
+    });
+    const created = await createRun("Implement the feature and get the PR green", {
+      cwd: repository,
+      finishLine: "pr_green",
+    });
+    const waiting = await executeRun({
+      store: created.store,
+      adapter,
+      approve: true,
+      github,
+    });
+    const workspace = await created.store.loadWorkspace<{
+      path: string;
+      branch: string;
+      created: boolean;
+    }>();
+    const waitNode = created.graph.nodes.find(({ id }) => id === "pr-green");
+    const nextWakeAt = waiting.waits.find(({ nodeId }) => nodeId === "pr-green")?.nextWakeAt;
+    if (!waitNode || !nextWakeAt) throw new Error("Missing persisted GitHub wait");
+    const before = waiting.waits[0]?.bindingBaseSha;
+    if (!before) throw new Error("Missing initial base binding");
+
+    await writeFile(join(repository, "base.txt"), "advanced base\n");
+    await git(repository, "add", "base.txt");
+    await git(repository, "commit", "-m", "advance base");
+    await git(repository, "push", "origin", "main");
+    const { stdout: movedBase } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+      cwd: repository,
+    });
+    const persisted = JSON.parse(await readFile(github.statePath, "utf8")) as {
+      checks: Array<Record<string, unknown>>;
+    };
+    persisted.checks = [
+      {
+        kind: "check_run",
+        id: "tests-check",
+        name: "tests",
+        status: "COMPLETED",
+        conclusion: "SUCCESS",
+      },
+    ];
+    await writeFile(github.statePath, `${JSON.stringify(persisted)}\n`);
+
+    const observation = await evaluateGitHubLifecycleWait({
+      store: created.store,
+      node: waitNode,
+      workspace,
+      contract: created.contract,
+      options: github,
+      now: Date.parse(nextWakeAt) + 1,
+    });
+    const completed = await executeRun({ store: created.store, adapter, github });
+    const reboundEvents = (await created.store.loadEvents()).filter(
+      ({ type }) => type === "wait.rebound",
+    );
+
+    expect(observation.status).toBe("satisfied");
+    expect(completed.status).toBe("completed");
+    expect(completed.waits[0]?.bindingBaseSha).toBe(movedBase.trim());
+    expect(completed.waits[0]?.bindingBaseSha).not.toBe(before);
+    expect(reboundEvents).toHaveLength(1);
+    expect(reboundEvents[0]?.data).toMatchObject({
+      previousBaseSha: before,
+      baseSha: movedBase.trim(),
+    });
+    expect(adapter.calls).toEqual(["implement"]);
+  });
+
+  it("stops on a base conflict without inferring rebase or merge authority", async () => {
+    const { repository, remote } = await createRepositoryWithRemote();
+    const github = await fakePullRequestGitHub(remote, {
+      mergeable: "CONFLICTING",
+    });
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "conflict\n");
+    });
+    const created = await createRun("Implement the feature and get the PR green", {
+      cwd: repository,
+      finishLine: "pr_green",
+    });
+
+    const state = await executeRun({
+      store: created.store,
+      adapter,
+      approve: true,
+      github,
+    });
+
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toContain("will not infer a published-branch rebase or merge");
+    expect(adapter.calls).toEqual(["implement"]);
+    expect((await created.store.loadGraph()).nodes.map(({ id }) => id)).not.toContain(
+      "repair-ci-1",
+    );
+  });
+
   it("routes current review feedback through a verified repair push before CI", async () => {
     const { repository, remote } = await createRepositoryWithRemote();
     const github = await fakePullRequestGitHub(remote, {
@@ -3166,7 +3635,7 @@ process.stdin.on("end", () => {
           body: "Return the reviewed value instead of the placeholder.",
         },
       ],
-      reviewDecision: "CHANGES_REQUESTED",
+      reviewDecision: "",
     });
     const adapter = new FakeAdapter(async (request) => {
       if (request.capsule.nodeId === "implement")
@@ -3175,8 +3644,6 @@ process.stdin.on("end", () => {
         await writeFile(join(request.repositoryPath, "feature.txt"), "review-fixed\n");
         const remoteState = JSON.parse(await readFile(github.statePath, "utf8")) as {
           checks: Array<Record<string, unknown>>;
-          reviewThreads: Array<Record<string, unknown>>;
-          reviewDecision: string;
         };
         remoteState.checks = [
           {
@@ -3187,11 +3654,6 @@ process.stdin.on("end", () => {
             conclusion: "SUCCESS",
           },
         ];
-        remoteState.reviewThreads = remoteState.reviewThreads.map((thread) => ({
-          ...thread,
-          isOutdated: true,
-        }));
-        remoteState.reviewDecision = "APPROVED";
         await writeFile(github.statePath, `${JSON.stringify(remoteState)}\n`);
       }
     });
@@ -3231,6 +3693,8 @@ process.stdin.on("end", () => {
       "github_pr_create",
       "git_commit",
       "git_push",
+      "github_pr_comment",
+      "github_review_thread_resolve",
     ]);
     const repairPushSha = state.sideEffects.find(({ claim }) => claim.nodeId === "push-review-1")
       ?.result?.sha;
@@ -3238,7 +3702,7 @@ process.stdin.on("end", () => {
     expect(state.latestProgressEvidence.join("\n")).toContain(repairPushSha);
   });
 
-  it("stops instead of repeating an unchanged unresolved review repair", async () => {
+  it("replies to and resolves unchanged review feedback without a second repair", async () => {
     const { repository, remote } = await createRepositoryWithRemote();
     const github = await fakePullRequestGitHub(remote, {
       syncPullRequestHead: true,
@@ -3252,7 +3716,7 @@ process.stdin.on("end", () => {
           body: "This same feedback remains unresolved.",
         },
       ],
-      reviewDecision: "CHANGES_REQUESTED",
+      reviewDecision: "",
     });
     const adapter = new FakeAdapter(async (request) => {
       if (request.capsule.nodeId === "implement")
@@ -3273,8 +3737,7 @@ process.stdin.on("end", () => {
     });
     const graph = await created.store.loadGraph();
 
-    expect(state.status).toBe("blocked");
-    expect(state.stopReason).toContain("same unresolved review feedback");
+    expect(state.status).toBe("completed");
     expect(adapter.calls).toEqual(["implement", "repair-review-1"]);
     expect(graph.nodes.map(({ id }) => id)).toContain("repair-review-1");
     expect(graph.nodes.map(({ id }) => id)).not.toContain("repair-review-2");
@@ -3284,8 +3747,248 @@ process.stdin.on("end", () => {
       "github_pr_create",
       "git_commit",
       "git_push",
+      "github_pr_comment",
+      "github_review_thread_resolve",
     ]);
   });
+
+  it("stops for the remaining human review decision after resolving threads", async () => {
+    const { repository, remote } = await createRepositoryWithRemote();
+    const github = await fakePullRequestGitHub(remote, {
+      syncPullRequestHead: true,
+      reviewThreads: [
+        {
+          id: "thread-human-decision",
+          isResolved: false,
+          isOutdated: false,
+          path: "feature.txt",
+          line: 1,
+          body: "Apply the fix, but reviewer approval is still required.",
+        },
+      ],
+      reviewDecision: "CHANGES_REQUESTED",
+    });
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "review\n");
+      if (request.capsule.nodeId === "repair-review-1") {
+        await writeFile(join(request.repositoryPath, "feature.txt"), "review-fixed\n");
+        const remoteState = JSON.parse(await readFile(github.statePath, "utf8")) as {
+          reviewDecision: string;
+        };
+        remoteState.reviewDecision = "";
+        await writeFile(github.statePath, `${JSON.stringify(remoteState)}\n`);
+      }
+    });
+    const created = await createRun("Implement the feature and get the PR green", {
+      cwd: repository,
+      finishLine: "pr_green",
+    });
+
+    const state = await executeRun({
+      store: created.store,
+      adapter,
+      approve: true,
+      github,
+    });
+
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toContain("human_decision");
+    expect(state.waits[0]?.stickyHumanDecision).toMatchObject({
+      kind: "changes_requested",
+      snapshotId: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    expect(
+      (await created.store.loadEvents()).filter(
+        ({ type }) => type === "wait.human_decision_observed",
+      ),
+    ).toHaveLength(1);
+    expect(state.sideEffects.map(({ claim }) => claim.kind)).toEqual(
+      expect.arrayContaining(["github_pr_comment", "github_review_thread_resolve"]),
+    );
+    expect(adapter.calls).toEqual(["implement", "repair-review-1"]);
+  });
+
+  it("clears a sticky changes-requested decision only after explicit approval", async () => {
+    const { repository, remote } = await createRepositoryWithRemote();
+    const github = await fakePullRequestGitHub(remote, {
+      syncPullRequestHead: true,
+      reviewThreads: [
+        {
+          id: "thread-approved",
+          isResolved: false,
+          isOutdated: false,
+          path: "feature.txt",
+          line: 1,
+          body: "Apply the change before approval.",
+        },
+      ],
+      reviewDecision: "CHANGES_REQUESTED",
+    });
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "review\n");
+      if (request.capsule.nodeId === "repair-review-1") {
+        await writeFile(join(request.repositoryPath, "feature.txt"), "review-fixed\n");
+        const remoteState = JSON.parse(await readFile(github.statePath, "utf8")) as {
+          reviewDecision: string;
+        };
+        remoteState.reviewDecision = "APPROVED";
+        await writeFile(github.statePath, `${JSON.stringify(remoteState)}\n`);
+      }
+    });
+    const created = await createRun("Implement the feature and get the PR green", {
+      cwd: repository,
+      finishLine: "pr_green",
+    });
+
+    const state = await executeRun({
+      store: created.store,
+      adapter,
+      approve: true,
+      github,
+    });
+    const events = await created.store.loadEvents();
+
+    expect(state.status).toBe("completed");
+    expect(state.waits[0]?.stickyHumanDecision).toBeUndefined();
+    expect(events.filter(({ type }) => type === "wait.human_decision_observed")).toHaveLength(1);
+    expect(events.filter(({ type }) => type === "wait.human_decision_resolved")).toHaveLength(1);
+    expect(adapter.calls).toEqual(["implement", "repair-review-1"]);
+  });
+
+  it("reconciles review replies and resolutions across every mutation boundary", async () => {
+    const faultPoints: SideEffectBoundary[] = [
+      "before_claim",
+      "after_claim",
+      "after_precondition_reconcile",
+      "before_act",
+      "after_action_prepare",
+      "after_action_command",
+      "after_act",
+      "after_confirmation_reconcile",
+      "after_confirm",
+    ];
+    const actionKinds = ["github_pr_comment", "github_review_thread_resolve"] as const;
+
+    for (const actionKind of actionKinds) {
+      for (const faultPoint of faultPoints) {
+        const { repository, remote } = await createRepositoryWithRemote();
+        const github = await fakePullRequestGitHub(remote, {
+          syncPullRequestHead: true,
+          reviewThreads: [
+            {
+              id: `thread-${actionKind}-${faultPoint}`,
+              isResolved: false,
+              isOutdated: false,
+              path: "feature.txt",
+              line: 1,
+              body: "Apply the recovery-safe reviewed change.",
+            },
+          ],
+          reviewDecision: "",
+        });
+        const adapter = new FakeAdapter(async (request) => {
+          if (request.capsule.nodeId === "implement")
+            await writeFile(join(request.repositoryPath, "feature.txt"), "review\n");
+          if (request.capsule.nodeId === "repair-review-1")
+            await writeFile(join(request.repositoryPath, "feature.txt"), "review-fixed\n");
+        });
+        const created = await createRun("Implement the feature and get the PR green", {
+          cwd: repository,
+          finishLine: "pr_green",
+        });
+        let armed = true;
+        const boundary = async (point: SideEffectBoundary): Promise<void> => {
+          const state = await created.store.loadState();
+          const targetClaim = state.sideEffects.find(({ claim }) => claim.kind === actionKind);
+          const reply = state.sideEffects.find(({ claim }) => claim.kind === "github_pr_comment");
+          const atTarget =
+            targetClaim !== undefined ||
+            (point === "before_claim" &&
+              (actionKind === "github_pr_comment"
+                ? state.nodes["push-review-1"]?.status === "accepted"
+                : reply?.status === "confirmed"));
+          if (armed && atTarget && point === faultPoint) {
+            armed = false;
+            throw new Error(`Injected ${actionKind} termination at ${point}`);
+          }
+        };
+
+        await expect(
+          executeRun({
+            store: created.store,
+            adapter,
+            approve: true,
+            github,
+            sideEffectBoundary: boundary,
+          }),
+          `${actionKind}:${faultPoint}`,
+        ).rejects.toThrow(`Side-effect execution interrupted after ${faultPoint}`);
+        expect(armed, `${actionKind}:${faultPoint}`).toBe(false);
+
+        const completed = await executeRun({
+          store: created.store,
+          adapter,
+          github,
+          sideEffectBoundary: boundary,
+        });
+        const persisted = JSON.parse(await readFile(github.statePath, "utf8")) as {
+          reviewThreads: Array<{ isResolved: boolean; replies?: unknown[] }>;
+        };
+        const calls = (await readFile(github.logPath, "utf8"))
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as string[]);
+        const events = await created.store.loadEvents();
+
+        expect(completed.status, `${actionKind}:${faultPoint}`).toBe("completed");
+        expect(persisted.reviewThreads[0], `${actionKind}:${faultPoint}`).toMatchObject({
+          isResolved: true,
+          replies: [expect.any(Object)],
+        });
+        expect(
+          completed.sideEffects.filter(({ claim }) => claim.kind === actionKind),
+          `${actionKind}:${faultPoint}`,
+        ).toMatchObject([{ status: "confirmed" }]);
+        expect(
+          events.filter(
+            ({ type, data }) =>
+              type === "side_effect.claimed" &&
+              (data.claim as { kind?: string } | undefined)?.kind === actionKind,
+          ),
+          `${actionKind}:${faultPoint}`,
+        ).toHaveLength(1);
+        expect(
+          events.filter(
+            ({ type, data }) =>
+              type === "side_effect.confirmed" &&
+              data.actionId ===
+                completed.sideEffects.find(({ claim }) => claim.kind === actionKind)?.claim
+                  .actionId,
+          ),
+          `${actionKind}:${faultPoint}`,
+        ).toHaveLength(1);
+        expect(
+          calls.filter((args) =>
+            args.some((argument) =>
+              argument.includes(
+                actionKind === "github_pr_comment"
+                  ? "GraphcraftAddReviewReply"
+                  : "GraphcraftResolveReviewThread",
+              ),
+            ),
+          ),
+          `${actionKind}:${faultPoint}`,
+        ).toHaveLength(1);
+        expect(adapter.calls, `${actionKind}:${faultPoint}`).toEqual([
+          "implement",
+          "repair-review-1",
+        ]);
+      }
+    }
+  }, 240_000);
 
   it("resumes a confirmed review-repair push without repeating the mutation", async () => {
     const { repository, remote } = await createRepositoryWithRemote();
@@ -3421,6 +4124,155 @@ process.stdin.on("end", () => {
     expect(graph.nodes.find(({ id }) => id === "pr-green")?.dependsOn).toEqual(["push-ci-1"]);
     expect(state.sideEffects.filter(({ claim }) => claim.kind === "git_push")).toHaveLength(2);
   });
+
+  it.each(["STARTUP_FAILURE", "CANCELLED"] as const)(
+    "reruns one justified %s required check without a model repair",
+    async (conclusion) => {
+      const { repository, remote } = await createRepositoryWithRemote();
+      const github = await fakePullRequestGitHub(remote, {
+        syncPullRequestHead: true,
+        protected: true,
+        requiredStatusChecks: ["tests"],
+        checks: [
+          {
+            kind: "check_run",
+            id: "tests-check",
+            databaseId: 501,
+            name: "tests",
+            status: "COMPLETED",
+            conclusion,
+          },
+        ],
+      });
+      const adapter = new FakeAdapter(async (request) => {
+        if (request.capsule.nodeId === "implement")
+          await writeFile(join(request.repositoryPath, "feature.txt"), "rerun\n");
+      });
+      const created = await createRun("Implement the feature and get the PR green", {
+        cwd: repository,
+        finishLine: "pr_green",
+      });
+
+      const state = await executeRun({
+        store: created.store,
+        adapter,
+        approve: true,
+        github,
+      });
+      const persisted = JSON.parse(await readFile(github.statePath, "utf8")) as {
+        rerunCalls: number;
+      };
+
+      expect(state.status).toBe("completed");
+      expect(persisted.rerunCalls).toBe(1);
+      expect(adapter.calls).toEqual(["implement"]);
+      expect(
+        state.sideEffects.filter(({ claim }) => claim.kind === "github_check_rerun"),
+      ).toMatchObject([
+        {
+          status: "confirmed",
+          dispatchedAt: expect.any(String),
+          claim: {
+            precondition: {
+              databaseId: 501,
+              checkConclusion: conclusion,
+            },
+          },
+          result: { status: "COMPLETED", conclusion: "SUCCESS" },
+        },
+      ]);
+    },
+  );
+
+  it("reconciles a check rerun without issuing a possibly duplicate dispatch", async () => {
+    const faultPoints: SideEffectBoundary[] = [
+      "before_claim",
+      "after_claim",
+      "after_precondition_reconcile",
+      "before_act",
+      "after_action_prepare",
+      "after_action_command",
+      "after_act",
+      "after_confirmation_reconcile",
+      "after_confirm",
+    ];
+
+    for (const faultPoint of faultPoints) {
+      const { repository, remote } = await createRepositoryWithRemote();
+      const github = await fakePullRequestGitHub(remote, {
+        syncPullRequestHead: true,
+        protected: true,
+        requiredStatusChecks: ["tests"],
+        checks: [
+          {
+            kind: "check_run",
+            id: `tests-check-${faultPoint}`,
+            databaseId: 601,
+            name: "tests",
+            status: "COMPLETED",
+            conclusion: "STARTUP_FAILURE",
+          },
+        ],
+      });
+      const adapter = new FakeAdapter(async (request) => {
+        if (request.capsule.nodeId === "implement")
+          await writeFile(join(request.repositoryPath, "feature.txt"), "rerun-recovery\n");
+      });
+      const created = await createRun("Implement the feature and get the PR green", {
+        cwd: repository,
+        finishLine: "pr_green",
+      });
+      let armed = true;
+      const boundary = async (point: SideEffectBoundary): Promise<void> => {
+        const state = await created.store.loadState();
+        const claimed = state.sideEffects.some(({ claim }) => claim.kind === "github_check_rerun");
+        const atRerun =
+          claimed ||
+          (point === "before_claim" && state.nodes["pull-request"]?.status === "accepted");
+        if (armed && atRerun && point === faultPoint) {
+          armed = false;
+          throw new Error(`Injected check-rerun termination at ${point}`);
+        }
+      };
+
+      await expect(
+        executeRun({
+          store: created.store,
+          adapter,
+          approve: true,
+          github,
+          sideEffectBoundary: boundary,
+        }),
+        faultPoint,
+      ).rejects.toThrow(`Side-effect execution interrupted after ${faultPoint}`);
+      expect(armed, faultPoint).toBe(false);
+
+      const resumed = await executeRun({
+        store: created.store,
+        adapter,
+        github,
+        sideEffectBoundary: boundary,
+      });
+      const persisted = JSON.parse(await readFile(github.statePath, "utf8")) as {
+        rerunCalls: number;
+      };
+      const reruns = resumed.sideEffects.filter(({ claim }) => claim.kind === "github_check_rerun");
+
+      if (faultPoint === "after_action_prepare") {
+        expect(resumed.status, faultPoint).toBe("blocked");
+        expect(resumed.stopReason, faultPoint).toContain("possibly duplicate retry");
+        expect(persisted.rerunCalls, faultPoint).toBe(0);
+        expect(reruns, faultPoint).toMatchObject([
+          { status: "uncertain", retryable: false, dispatchedAt: expect.any(String) },
+        ]);
+      } else {
+        expect(resumed.status, faultPoint).toBe("completed");
+        expect(persisted.rerunCalls, faultPoint).toBe(1);
+        expect(reruns, faultPoint).toMatchObject([{ status: "confirmed" }]);
+      }
+      expect(adapter.calls, faultPoint).toEqual(["implement"]);
+    }
+  }, 180_000);
 
   it("stops instead of repeating an unchanged actionable CI repair", async () => {
     const { repository, remote } = await createRepositoryWithRemote();
@@ -3970,12 +4822,14 @@ process.stdin.on("end", () => {
     const invocationId = randomUUID();
     const hostSessionId = randomUUID();
     const baseline = evidenceSnapshot("before-interruption", []);
+    const scopeBaseline = await captureWorkspaceScopeSnapshot(workspace.path);
     await created.store.append("runtime", "invocation.started", {
       invocationId,
       nodeId: "implement",
       adapter: "test",
       capsuleHash: "persisted-capsule",
       baseline,
+      scopeBaseline,
     });
     await created.store.appendInvocationEvent(invocationId, {
       type: "started",
@@ -4009,12 +4863,14 @@ process.stdin.on("end", () => {
     const invocationId = randomUUID();
     const hostSessionId = randomUUID();
     const baseline = evidenceSnapshot("before-interruption", []);
+    const scopeBaseline = await captureWorkspaceScopeSnapshot(workspace.path);
     await created.store.append("runtime", "invocation.started", {
       invocationId,
       nodeId: "implement",
       adapter: "test",
       capsuleHash: "persisted-capsule",
       baseline,
+      scopeBaseline,
     });
     await created.store.append(
       "host",

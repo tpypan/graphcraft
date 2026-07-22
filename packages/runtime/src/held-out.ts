@@ -1,5 +1,7 @@
+import { execFile } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
+import { promisify } from "node:util";
 import {
   contentHash,
   createHeldOutProbePlan,
@@ -9,12 +11,43 @@ import {
   type ProbeResult,
 } from "@graphcraft/core";
 
+const execFileAsync = promisify(execFile);
+
 function relativeRepositoryPath(repositoryRoot: string, candidate: string): string | undefined {
   const root = resolve(repositoryRoot);
   const path = resolve(repositoryRoot, candidate);
   if (path !== root && !path.startsWith(`${root}${sep}`)) return undefined;
   const result = relative(root, path);
-  return result && !isAbsolute(result) ? result : undefined;
+  return result && !isAbsolute(result) ? result.split(sep).join("/") : undefined;
+}
+
+async function gitObjectValueHash(repositoryRoot: string, path: string): Promise<string> {
+  const { stdout } = await execFileAsync(
+    "git",
+    ["hash-object", `--path=${path.replaceAll("\\", "/")}`, resolve(repositoryRoot, path)],
+    { cwd: repositoryRoot, encoding: "utf8", maxBuffer: 1024 * 1024 },
+  );
+  const objectHash = stdout.trim();
+  if (!/^[a-f0-9]{40,64}$/.test(objectHash))
+    throw new Error(`Unable to establish held-out integrity for ${path}`);
+  return contentHash({ path, objectHash });
+}
+
+async function fileValueHash(
+  repositoryRoot: string,
+  path: string,
+  algorithm: "git_hash_object" | undefined,
+): Promise<string> {
+  if (algorithm === "git_hash_object") {
+    const details = await stat(resolve(repositoryRoot, path)).catch(() => undefined);
+    return details?.isFile()
+      ? await gitObjectValueHash(repositoryRoot, path)
+      : contentHash({ missing: true, path, algorithm });
+  }
+  const contents = await readFile(resolve(repositoryRoot, path)).catch(() => undefined);
+  return contents
+    ? contentHash({ path, contents: contents.toString("base64") })
+    : contentHash({ missing: true, path });
 }
 
 function possibleFileArguments(values: string[]): string[] {
@@ -38,11 +71,11 @@ async function fileIntegrity(
     if (!path) continue;
     const details = await stat(resolve(repositoryRoot, path)).catch(() => undefined);
     if (!details?.isFile()) continue;
-    const contents = await readFile(resolve(repositoryRoot, path));
     result.push({
       kind: "file",
       path,
-      valueHash: contentHash({ path, contents: contents.toString("base64") }),
+      algorithm: "git_hash_object",
+      valueHash: await fileValueHash(repositoryRoot, path, "git_hash_object"),
     });
   }
   return result;
@@ -124,12 +157,7 @@ export async function heldOutIntegrityFailures(
           ? contentHash({ path: integrity.path, script: integrity.script, value })
           : contentHash({ missing: true, path: integrity.path, script: integrity.script });
       } else {
-        const contents = await readFile(resolve(repositoryPath, integrity.path)).catch(
-          () => undefined,
-        );
-        actualHash = contents
-          ? contentHash({ path: integrity.path, contents: contents.toString("base64") })
-          : contentHash({ missing: true, path: integrity.path });
+        actualHash = await fileValueHash(repositoryPath, integrity.path, integrity.algorithm);
       }
       if (actualHash === integrity.valueHash) continue;
       changedKinds.add(integrity.kind);

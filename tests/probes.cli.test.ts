@@ -2,12 +2,14 @@ import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import { createRun } from "../packages/runtime/src/index.ts";
 
 const execFileAsync = promisify(execFile);
 const temporaryRoots: string[] = [];
+const tsxCli = fileURLToPath(import.meta.resolve("tsx/cli"));
 
 afterEach(async () => {
   await Promise.all(
@@ -43,8 +45,15 @@ describe("probe plan CLI", () => {
     const created = await createRun("Implement a substantial fixture acceptance scenario", {
       cwd: repository,
     });
-    const cli = join(process.cwd(), "node_modules", ".bin", "tsx");
-    const args = ["packages/cli/src/bin.ts", "probes", created.contract.runId, "-C", repository];
+    const cli = process.execPath;
+    const args = [
+      tsxCli,
+      "packages/cli/src/bin.ts",
+      "probes",
+      created.contract.runId,
+      "-C",
+      repository,
+    ];
     const shown = JSON.parse((await execFileAsync(cli, args)).stdout) as typeof created.probePlan;
     expect(shown.items).toEqual(created.probePlan.items);
 

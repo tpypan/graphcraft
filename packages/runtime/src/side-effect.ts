@@ -29,6 +29,7 @@ export interface ExecuteSideEffectInput {
   act: (claim: SideEffectClaim) => Promise<Record<string, unknown>>;
   boundary?: (point: SideEffectBoundary) => void | Promise<void>;
   revalidateConfirmed?: boolean;
+  durableDispatch?: boolean;
 }
 
 export class SideEffectBoundaryInterruption extends Error {
@@ -156,8 +157,25 @@ export async function executeSideEffect(
     );
     throw new Error(reason);
   }
+  if (input.durableDispatch && entry.dispatchedAt) {
+    const reason = `The dispatched ${claim.kind} ${claim.actionId} is not yet observable; refusing a possibly duplicate retry`;
+    await input.store.append(
+      "runtime",
+      "side_effect.failed",
+      { actionId: claim.actionId, reason, retryable: false, uncertain: true },
+      claim.actionId,
+    );
+    throw new Error(reason);
+  }
 
   await crossSideEffectBoundary(input.boundary, "before_act");
+  if (input.durableDispatch)
+    await input.store.append(
+      "runtime",
+      "side_effect.dispatched",
+      { actionId: claim.actionId },
+      claim.actionId,
+    );
   try {
     await input.act(claim);
   } catch (error) {

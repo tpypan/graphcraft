@@ -2,12 +2,14 @@ import { execFile, spawn } from "node:child_process";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import { createRun, RunStore } from "../packages/runtime/src/index.ts";
 
 const execFileAsync = promisify(execFile);
 const temporaryRoots: string[] = [];
+const tsxCli = fileURLToPath(import.meta.resolve("tsx/cli"));
 
 afterEach(async () => {
   await Promise.all(
@@ -73,8 +75,8 @@ async function runOwner(
   pidPath: string,
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   const child = spawn(
-    join(process.cwd(), "node_modules", ".bin", "tsx"),
-    ["tests/fixtures/control-runner.ts", repository, mode, pidPath],
+    process.execPath,
+    [tsxCli, "tests/fixtures/control-runner.ts", repository, mode, pidPath],
     { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] },
   );
   let stdout = "";
@@ -90,8 +92,8 @@ async function runOwner(
 
 async function controlCli(repository: string, action: "pause" | "stop"): Promise<void> {
   await execFileAsync(
-    join(process.cwd(), "node_modules", ".bin", "tsx"),
-    ["packages/cli/src/bin.ts", action, "-C", repository],
+    process.execPath,
+    [tsxCli, "packages/cli/src/bin.ts", action, "-C", repository],
     { cwd: process.cwd(), timeout: 10_000 },
   );
 }
@@ -116,7 +118,9 @@ describe("cross-process run control", () => {
     expect(pausedState.status).toBe("paused");
     expect(
       (await pausedRun.store.loadEvents()).find(
-        ({ type, data }) => type === "control.applied" && data.outcome === "forced",
+        ({ type, data }) =>
+          type === "control.applied" &&
+          data.outcome === (process.platform === "win32" ? "graceful" : "forced"),
       ),
     ).toBeDefined();
 

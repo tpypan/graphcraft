@@ -1,8 +1,9 @@
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  addGitHubReviewThreadReply,
   assertGitHubPushCapability,
   assertGitHubSnapshotCurrent,
   captureGitHubPullRequestSnapshot,
@@ -10,7 +11,10 @@ import {
   createGitHubPullRequest,
   listGitHubPullRequestsForHead,
   probeGitHub,
+  readGitHubReviewThread,
   readGitHubPullRequestIdentity,
+  rerequestGitHubCheckRun,
+  resolveGitHubReviewThread,
 } from "./index.ts";
 
 const temporaryRoots: string[] = [];
@@ -24,13 +28,14 @@ afterEach(async () => {
 async function fakeGitHub(state: Record<string, unknown> = {}): Promise<{
   cwd: string;
   command: string;
+  commandArgs: string[];
   env: NodeJS.ProcessEnv;
   statePath: string;
   logPath: string;
 }> {
   const cwd = await mkdtemp(join(tmpdir(), "graphcraft-github-test-"));
   temporaryRoots.push(cwd);
-  const command = join(cwd, "gh");
+  const script = join(cwd, "gh.cjs");
   const statePath = join(cwd, "state.json");
   const logPath = join(cwd, "calls.jsonl");
   await writeFile(
@@ -42,11 +47,35 @@ async function fakeGitHub(state: Record<string, unknown> = {}): Promise<{
       baseSha: "b".repeat(40),
       identityCalls: 0,
       pullRequests: [],
+      rerunCalls: 0,
+      reviewThread: {
+        id: "thread-action",
+        isResolved: false,
+        isOutdated: false,
+        path: "src/action.ts",
+        line: 12,
+        comments: [
+          {
+            id: "comment-action-1",
+            author: "reviewer",
+            body: "Please update this behavior",
+            url: "https://github.com/tpypan/graphcraft/pull/42#discussion_action_1",
+            createdAt: "2026-07-22T02:00:00.000Z",
+          },
+          {
+            id: "comment-action-2",
+            author: "reviewer",
+            body: "This is the latest request",
+            url: "https://github.com/tpypan/graphcraft/pull/42#discussion_action_2",
+            createdAt: "2026-07-22T02:01:00.000Z",
+          },
+        ],
+      },
       ...state,
     })}\n`,
   );
   await writeFile(
-    command,
+    script,
     `#!/usr/bin/env node
 const fs = require("node:fs");
 const args = process.argv.slice(2);
@@ -135,6 +164,11 @@ if (endpoint && endpoint.startsWith("repos/tpypan/graphcraft/branches/")) {
   } else send({ protected: state.protected !== false });
   process.exit(0);
 }
+if (endpoint === "repos/tpypan/graphcraft/check-runs/101/rerequest") {
+  state.rerunCalls += 1;
+  fs.writeFileSync(statePath, JSON.stringify(state) + "\\n");
+  process.exit(0);
+}
 if (args[1] !== "graphql") fail("unexpected api endpoint: " + endpoint);
 const fields = {};
 for (let index = 0; index < args.length - 1; index += 1) {
@@ -159,6 +193,63 @@ const identity = {
   reviewDecision: "CHANGES_REQUESTED",
   updatedAt: "2026-07-21T20:00:00.000Z",
 };
+if (query.includes("GraphcraftReviewThread")) {
+  const thread = state.reviewThread;
+  if (!thread || thread.id !== fields.threadId) send({ data: { node: null, rateLimit } });
+  else {
+    const start = fields.cursor ? Number(fields.cursor) : 0;
+    const size = state.paginateReviewThread ? 1 : 100;
+    const selected = thread.comments.slice(start, start + size);
+    const next = start + selected.length;
+    send({ data: { node: {
+      id: thread.id,
+      isResolved: thread.isResolved,
+      isOutdated: thread.isOutdated,
+      path: thread.path,
+      line: thread.line,
+      comments: {
+        nodes: selected.map((comment) => ({
+          id: comment.id,
+          author: comment.author ? { login: comment.author } : null,
+          body: comment.body,
+          url: comment.url,
+          createdAt: comment.createdAt,
+        })),
+        pageInfo: { hasNextPage: next < thread.comments.length, endCursor: next < thread.comments.length ? String(next) : null },
+      },
+    }, rateLimit } });
+  }
+  process.exit(0);
+}
+if (query.includes("GraphcraftAddReviewReply")) {
+  const thread = state.reviewThread;
+  if (!thread || thread.id !== fields.threadId) fail("review thread not found");
+  const comment = {
+    id: "comment-action-" + (thread.comments.length + 1),
+    author: "graphcraft",
+    body: fields.body,
+    url: "https://github.com/tpypan/graphcraft/pull/42#discussion_action_" + (thread.comments.length + 1),
+    createdAt: "2026-07-22T02:02:00.000Z",
+  };
+  thread.comments.push(comment);
+  fs.writeFileSync(statePath, JSON.stringify(state) + "\\n");
+  send({ data: { addPullRequestReviewThreadReply: {
+    clientMutationId: fields.clientMutationId,
+    comment: { id: comment.id, body: comment.body, url: comment.url },
+  } } });
+  process.exit(0);
+}
+if (query.includes("GraphcraftResolveReviewThread")) {
+  const thread = state.reviewThread;
+  if (!thread || thread.id !== fields.threadId) fail("review thread not found");
+  thread.isResolved = true;
+  fs.writeFileSync(statePath, JSON.stringify(state) + "\\n");
+  send({ data: { resolveReviewThread: {
+    clientMutationId: fields.clientMutationId,
+    thread: { id: thread.id, isResolved: true },
+  } } });
+  process.exit(0);
+}
 if (query.includes("GraphcraftPullRequestsByHead")) {
   const matching = state.pullRequests.filter((candidate) => candidate.headRefName === fields.head);
   const start = fields.cursor ? Number(fields.cursor) : 0;
@@ -237,7 +328,7 @@ if (query.includes("GraphcraftCommitChecks")) {
       statusCheckRollup: { contexts: {
         nodes: second
           ? [{ __typename: "StatusContext", id: "status-1", context: "lint", state: "PENDING", targetUrl: "https://github.com/checks/lint" }]
-          : [{ __typename: "CheckRun", id: "check-1", name: "tests", status: "COMPLETED", conclusion: "SUCCESS", detailsUrl: "https://github.com/checks/tests", app: { databaseId: 1 } }],
+          : [{ __typename: "CheckRun", id: "check-1", databaseId: 101, name: "tests", status: "COMPLETED", conclusion: "SUCCESS", detailsUrl: "https://github.com/checks/tests", app: { databaseId: 1 } }],
         pageInfo: { hasNextPage: !second, endCursor: second ? null : "check-next" },
       } },
     } },
@@ -258,10 +349,10 @@ if (query.includes("GraphcraftPullRequestIdentity")) {
 fail("unknown GraphQL operation");
 `,
   );
-  await chmod(command, 0o700);
   return {
     cwd,
-    command,
+    command: process.execPath,
+    commandArgs: [script],
     statePath,
     logPath,
     env: { ...process.env, GRAPHCRAFT_GH_STATE: statePath, GRAPHCRAFT_GH_LOG: logPath },
@@ -317,6 +408,55 @@ describe("GitHub capability and snapshot layer", () => {
         ),
       ),
     ).toBe(false);
+  });
+
+  it("paginates one review thread and confirms explicit reply and resolution mutations", async () => {
+    const fixture = await fakeGitHub({ paginateReviewThread: true });
+    const before = await readGitHubReviewThread(fixture, {
+      host: "github.com",
+      threadId: "thread-action",
+    });
+    const body = "Addressed and verified.\n\n<!-- Graphcraft-Action: reply-1 -->";
+    const reply = await addGitHubReviewThreadReply(fixture, {
+      host: "github.com",
+      threadId: "thread-action",
+      body,
+      clientMutationId: "reply-1",
+    });
+    const afterReply = await readGitHubReviewThread(fixture, {
+      host: "github.com",
+      threadId: "thread-action",
+    });
+    const resolved = await resolveGitHubReviewThread(fixture, {
+      host: "github.com",
+      threadId: "thread-action",
+      clientMutationId: "resolve-1",
+    });
+    const afterResolution = await readGitHubReviewThread(fixture, {
+      host: "github.com",
+      threadId: "thread-action",
+    });
+
+    expect(before.comments.map(({ id }) => id)).toEqual(["comment-action-1", "comment-action-2"]);
+    expect(reply).toMatchObject({ id: "comment-action-3", body });
+    expect(afterReply.comments.at(-1)).toMatchObject({ id: reply.id, body });
+    expect(resolved).toEqual({ id: "thread-action", isResolved: true });
+    expect(afterResolution.isResolved).toBe(true);
+  });
+
+  it("rerequests one check run through the explicit REST mutation", async () => {
+    const fixture = await fakeGitHub();
+
+    await rerequestGitHubCheckRun(fixture, {
+      host: "github.com",
+      nameWithOwner: "tpypan/graphcraft",
+      databaseId: 101,
+    });
+    const state = JSON.parse(await readFile(fixture.statePath, "utf8")) as {
+      rerunCalls: number;
+    };
+
+    expect(state.rerunCalls).toBe(1);
   });
 
   it("classifies exact-SHA review and CI lifecycle states deterministically", async () => {

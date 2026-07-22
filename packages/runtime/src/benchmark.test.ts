@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -48,6 +48,8 @@ function usage(input: number, output: number): TokenUsage {
 
 class BenchmarkAdapter implements HostAdapter {
   readonly id = "test" as const;
+
+  constructor(private readonly failureMessage?: string) {}
 
   async probe(): Promise<HostCapabilities> {
     return {
@@ -112,6 +114,10 @@ class BenchmarkAdapter implements HostAdapter {
   async *execute(request: WorkerRequest): AsyncIterable<HostEvent> {
     yield { type: "started", invocationId: request.invocationId };
     yield { type: "session", hostSessionId: request.invocationId };
+    if (this.failureMessage) {
+      yield { type: "error", message: this.failureMessage };
+      return;
+    }
     await writeFile(
       join(request.repositoryPath, "source.js"),
       "export const value = 'implemented';\n",
@@ -216,6 +222,36 @@ describe("benchmark harness", () => {
     });
     expect(resumed.report.status).toBe("complete");
     expect(resumed.report.results).toHaveLength(2);
+
+    const configuredSecret = "opaque-benchmark-secret-12345";
+    const previousSecret = process.env.GRAPHCRAFT_BENCHMARK_API_KEY;
+    const redactedOutputPath = join(root, "redacted-report.json");
+    process.env.GRAPHCRAFT_BENCHMARK_API_KEY = configuredSecret;
+    try {
+      const redacted = await runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: {
+          codex: new BenchmarkAdapter(
+            `Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz configured=${configuredSecret}`,
+          ),
+        },
+        policies,
+        seed: "redaction-seed",
+        repetitions: 1,
+        outputPath: redactedOutputPath,
+      });
+      const reportText = await readFile(redactedOutputPath, "utf8");
+      expect(reportText).toContain("[REDACTED]");
+      expect(JSON.stringify(redacted.report)).not.toContain(configuredSecret);
+      expect(reportText).not.toContain(configuredSecret);
+      expect(reportText).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz");
+      if (process.platform !== "win32")
+        expect((await stat(redactedOutputPath)).mode & 0o777).toBe(0o600);
+    } finally {
+      if (previousSecret === undefined) delete process.env.GRAPHCRAFT_BENCHMARK_API_KEY;
+      else process.env.GRAPHCRAFT_BENCHMARK_API_KEY = previousSecret;
+    }
 
     await expect(
       runBenchmark({

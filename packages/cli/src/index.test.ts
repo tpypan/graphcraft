@@ -1,15 +1,20 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { compileGraph, compileRunContract, createRunEvent, reduceEvents } from "@graphcraft/core";
 import type { ProbePlan } from "@graphcraft/core";
 import {
   GRAPHCRAFT_VERSION,
   assessTaskShape,
+  consoleObserver,
   contractView,
   prepareFinishLine,
+  recoveryHint,
   renderContract,
+  renderRunInspection,
+  renderRunList,
+  renderRunStatus,
   resolveGraphcraftHome,
   stageBundledMcp,
   stateView,
@@ -19,6 +24,7 @@ import {
 const temporaryRoots: string[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(
     temporaryRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })),
   );
@@ -61,6 +67,22 @@ describe("supervisor projection", () => {
 });
 
 describe("run approval", () => {
+  it("redacts secret-like observer output before writing to the terminal", () => {
+    const output: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((value) => output.push(String(value)));
+
+    consoleObserver(false)({
+      type: "host",
+      message:
+        "Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz from https://user:password@example.test/path?token=query-secret",
+    });
+
+    expect(output.join("\n")).toContain("[REDACTED]");
+    expect(output.join("\n")).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz");
+    expect(output.join("\n")).not.toContain("user:password");
+    expect(output.join("\n")).not.toContain("query-secret");
+  });
+
   it("uses task-shape evidence instead of request length for the small-task bypass", () => {
     expect(
       assessTaskShape(
@@ -277,5 +299,46 @@ describe("run approval", () => {
         reconciled: true,
       },
     });
+
+    const state = reduceEvents([created, usage]);
+    const rendered = renderRunStatus(state, contract, graph);
+    expect(rendered).toContain("Finish line   local_verified");
+    expect(rendered).toContain("Status        awaiting_approval");
+    expect(rendered).toContain("cached 2, uncached 8, output 4, reasoning 1, total 14");
+    expect(rendered).toContain(`graphcraft resume ${contract.runId.slice(0, 8)} --yes`);
+    expect(renderRunInspection({ state, contract, graph, graphHistory: [] })).toContain(
+      "Governance",
+    );
+  });
+
+  it("renders stable run selection and actionable recovery hints", () => {
+    const runs = renderRunList([
+      {
+        runId: "11111111-1111-4111-8111-111111111111",
+        task: "First task",
+        finishLine: "committed",
+        status: "completed",
+        updatedAt: "2026-07-22T12:00:00.000Z",
+      },
+      {
+        runId: "22222222-2222-4222-8222-222222222222",
+        task: "Second task",
+        finishLine: "pr_green",
+        status: "blocked",
+        updatedAt: "2026-07-22T11:00:00.000Z",
+      },
+    ]);
+
+    expect(runs).toContain("11111111");
+    expect(runs).toContain("22222222");
+    expect(runs).toContain("Use the displayed run prefix");
+    expect(recoveryHint("Run reference abc matched 0 runs")).toContain("graphcraft runs");
+    expect(recoveryHint("GitHub snapshot preflight failed: not authenticated")).toContain(
+      "graphcraft doctor",
+    );
+    expect(recoveryHint("Future storage version 999 is unsupported")).toContain("left unchanged");
+    expect(recoveryHint("The worktree is locked by another supervisor")).toContain(
+      "graphcraft supervisors",
+    );
   });
 });

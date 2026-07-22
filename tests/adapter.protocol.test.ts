@@ -244,10 +244,18 @@ describe("native host continuation protocol", () => {
       "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)",
       50,
     );
-    expect(forced).toMatchObject({
-      cause: "user_pause",
-      outcome: "forced",
-      requestedSignal: "SIGKILL",
-    });
+    expect(forced).toMatchObject(
+      process.platform === "win32"
+        ? {
+            cause: "user_pause",
+            outcome: "graceful",
+            requestedSignal: "SIGTERM",
+          }
+        : {
+            cause: "user_pause",
+            outcome: "forced",
+            requestedSignal: "SIGKILL",
+          },
+    );
   });
 });
