@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { compileGraph, compileRunContract, createRunEvent, reduceEvents } from "@graphcraft/core";
 import {
   GRAPHCRAFT_VERSION,
+  assessTaskShape,
   contractView,
   renderContract,
   resolveGraphcraftHome,
@@ -44,6 +45,23 @@ describe("package installation", () => {
 });
 
 describe("run approval", () => {
+  it("uses task-shape evidence instead of request length for the small-task bypass", () => {
+    expect(
+      assessTaskShape(
+        "Please update the wording in README.md so the installation requirement is clearer",
+      ),
+    ).toMatchObject({ bypass: true, signals: { pathCount: 1, localized: true } });
+    expect(assessTaskShape("Implement OAuth support")).toMatchObject({ bypass: false });
+    expect(assessTaskShape("Fix auth.ts and add regression tests")).toMatchObject({
+      bypass: false,
+      signals: { multipleSteps: true },
+    });
+    expect(assessTaskShape("Migrate every package and wait for CI")).toMatchObject({
+      bypass: false,
+      signals: { broadScope: true, durableWorkflow: true, externalWait: true },
+    });
+  });
+
   it("shows the persisted graph shape and executable completion proof", () => {
     const contract = compileRunContract("Implement a substantial feature", {
       root: "/tmp/example",

@@ -3,6 +3,7 @@ import { Command, Option } from "commander";
 import { readFile } from "node:fs/promises";
 import {
   askForApproval,
+  assessTaskShape,
   consoleObserver,
   contractView,
   createAdapter,
@@ -10,7 +11,6 @@ import {
   handleAction,
   installHost,
   renderContract,
-  shouldBypassGraph,
   stateView,
   storeFor,
   uninstallHost,
@@ -107,8 +107,11 @@ program
         finishLine?: "local_verified" | "committed";
       },
     ) => {
-      if (!options.force && shouldBypassGraph(task)) {
-        console.log("Graphcraft is not needed for this localized task. Use --force to override.");
+      const taskShape = assessTaskShape(task);
+      if (!options.force && taskShape.bypass) {
+        console.log(
+          `Graphcraft is not needed for this localized task (shape score ${taskShape.score}). Use --force to override.`,
+        );
         return;
       }
       if (/\b(push|open (?:a )?pr|pull request|pr green|merge|deploy)\b/i.test(task)) {

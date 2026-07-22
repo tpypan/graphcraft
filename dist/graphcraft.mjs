@@ -18384,6 +18384,21 @@ var TokenLedgerEntrySchema = external_exports.strictObject({
   recovered: external_exports.boolean().default(false),
   missing: external_exports.boolean().default(false)
 });
+var OptimizationDecisionSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  decisionId: external_exports.string().min(1),
+  kind: external_exports.enum(["graph_shape", "concurrency", "host_context"]),
+  choice: external_exports.enum(["fuse", "split", "preserve", "parallel", "sequential", "reuse", "fresh"]),
+  nodeIds: external_exports.array(external_exports.string().min(1)).min(1),
+  rationale: external_exports.string().min(1),
+  evidence: external_exports.array(external_exports.string().min(1)),
+  estimate: external_exports.strictObject({
+    modelCallsDelta: external_exports.number().int(),
+    contextCharactersDelta: external_exports.number().int(),
+    latencyTurnsDelta: external_exports.number().int()
+  }),
+  costBasis: external_exports.enum(["deterministic_static", "durable_receipts"])
+});
 var WorkerResultSchema = external_exports.strictObject({
   status: external_exports.enum(["completed", "blocked", "failed"]),
   summary: external_exports.string(),
@@ -18533,6 +18548,7 @@ var RunEventTypeSchema = external_exports.enum([
   "held_out.checked",
   "semantic.verdict",
   "tokens.recorded",
+  "optimizer.decided",
   "graph.amended"
 ]);
 var RunEventSchema = external_exports.strictObject({
@@ -18572,6 +18588,7 @@ var RunStateSchema = external_exports.strictObject({
   progressDecision: ProgressDecisionPacketSchema.optional(),
   tokens: TokenUsageSchema,
   tokenLedger: external_exports.array(TokenLedgerEntrySchema).default([]),
+  optimizationDecisions: external_exports.array(OptimizationDecisionSchema).default([]),
   controlDecisions: external_exports.array(ControlDecisionSchema),
   pendingDecision: ControlDecisionPacketSchema.optional(),
   stopReason: external_exports.string().optional(),
@@ -19038,8 +19055,221 @@ function compilePlannedGraph(contract, plan, requiredVerificationProbes, approve
   validateGraphPolicy(graph, contract, requiredVerificationProbes, approvedProbes);
   return graph;
 }
+function graphOptimizationDecision(input) {
+  return OptimizationDecisionSchema.parse({
+    schemaVersion: 1,
+    decisionId: randomUUID(),
+    costBasis: "deterministic_static",
+    ...input
+  });
+}
+function derivedScope(path2) {
+  const segments = path2.split("/").filter(Boolean);
+  if (segments.length <= 1) return path2;
+  return `${segments.slice(0, Math.min(2, segments.length - 1)).join("/")}/**`;
+}
+function safeSplitScopes(node2) {
+  if (node2.scope.length >= 2) return [...node2.scope].sort();
+  if (node2.contextSelector.relevantPaths.length < 9) return [];
+  return unique(
+    node2.contextSelector.relevantPaths.map(derivedScope).filter((scope) => node2.scope.some((boundary) => patternWithin(scope, boundary)))
+  ).sort();
+}
+function splitBroadNode(nodes) {
+  const target = nodes.find(
+    (node2) => node2.sideEffectClass === "workspace_write" && node2.completionProbes.length === 0 && (node2.scope.length >= 4 || node2.contextSelector.relevantPaths.length >= 9) && safeSplitScopes(node2).length >= 2
+  );
+  if (!target) return { nodes };
+  const scopes = safeSplitScopes(target);
+  const pivot = Math.ceil(scopes.length / 2);
+  const firstScopes = scopes.slice(0, pivot);
+  const finalScopes = scopes.slice(pivot);
+  if (finalScopes.length === 0) return { nodes };
+  const pathsFor = (selectedScopes) => target.contextSelector.relevantPaths.filter(
+    (path2) => selectedScopes.some((scope) => patternWithin(path2, scope))
+  );
+  let firstPaths = pathsFor(firstScopes);
+  let finalPaths = pathsFor(finalScopes);
+  if (firstPaths.length === 0 || finalPaths.length === 0) {
+    const pathPivot = Math.ceil(target.contextSelector.relevantPaths.length / 2);
+    firstPaths = target.contextSelector.relevantPaths.slice(0, pathPivot);
+    finalPaths = target.contextSelector.relevantPaths.slice(pathPivot);
+  }
+  if (firstPaths.length === 0 || finalPaths.length === 0) return { nodes };
+  let firstId = `${target.id}-slice-1`;
+  for (let suffix = 2; nodes.some(({ id }) => id === firstId); suffix += 1)
+    firstId = `${target.id}-slice-${suffix}`;
+  const first = {
+    ...target,
+    id: firstId,
+    objective: `${target.objective}
+Work only within this optimizer slice: ${firstScopes.join(", ")}`,
+    scope: firstScopes,
+    contextSelector: {
+      ...target.contextSelector,
+      relevantPaths: firstPaths
+    }
+  };
+  const final = {
+    ...target,
+    objective: `${target.objective}
+Complete the remaining optimizer slice: ${finalScopes.join(", ")}`,
+    dependsOn: [firstId],
+    scope: finalScopes,
+    contextSelector: {
+      ...target.contextSelector,
+      predecessorResults: [firstId],
+      relevantPaths: finalPaths
+    }
+  };
+  return {
+    nodes: nodes.flatMap((node2) => node2.id === target.id ? [first, final] : [node2]),
+    decision: graphOptimizationDecision({
+      kind: "graph_shape",
+      choice: "split",
+      nodeIds: [target.id, firstId],
+      rationale: "The write node crossed independently bounded scopes, so isolation value exceeds one additional host call.",
+      evidence: [
+        `${target.scope.length} declared scopes`,
+        `${target.contextSelector.relevantPaths.length} selected repository paths`,
+        `partitioned into ${firstScopes.length} and ${finalScopes.length} scopes`
+      ],
+      estimate: { modelCallsDelta: 1, contextCharactersDelta: 0, latencyTurnsDelta: 1 }
+    })
+  };
+}
+function fuseReadOnlyPair(nodes) {
+  for (const consumer of nodes) {
+    for (const dependencyId of consumer.dependsOn) {
+      const producer = nodes.find(({ id }) => id === dependencyId);
+      if (!producer) continue;
+      const dependents = nodes.filter(({ dependsOn: dependsOn2 }) => dependsOn2.includes(producer.id));
+      const relevantPaths = unique([
+        ...producer.contextSelector.relevantPaths,
+        ...consumer.contextSelector.relevantPaths
+      ]);
+      const scopes = unique([...producer.scope, ...consumer.scope]);
+      const overlappingContext = producer.contextSelector.relevantPaths.some(
+        (path2) => consumer.contextSelector.relevantPaths.includes(path2)
+      );
+      if (producer.sideEffectClass !== "none" || consumer.sideEffectClass !== "none" || [producer.kind, consumer.kind].some(
+        (kind) => ["verification", "commit", "wait"].includes(kind)
+      ) || dependents.length !== 1 || !overlappingContext || relevantPaths.length > 6 || scopes.length > 4 || producer.objective.length + consumer.objective.length > 4e3 || producer.completionProbes.length + consumer.completionProbes.length > 0)
+        continue;
+      const dependsOn = unique([
+        ...producer.dependsOn,
+        ...consumer.dependsOn.filter((id) => id !== producer.id)
+      ]);
+      const fused = {
+        ...consumer,
+        objective: `${producer.objective}
+Then: ${consumer.objective}`,
+        dependsOn,
+        scope: scopes,
+        contextSelector: {
+          ...consumer.contextSelector,
+          predecessorResults: unique([
+            ...producer.contextSelector.predecessorResults,
+            ...consumer.contextSelector.predecessorResults.filter((id) => id !== producer.id)
+          ]).filter((id) => dependsOn.includes(id)),
+          relevantPaths
+        },
+        progressProbes: uniqueProbes([...producer.progressProbes, ...consumer.progressProbes])
+      };
+      return {
+        nodes: nodes.filter(({ id }) => id !== producer.id).map(
+          (node2) => node2.id === consumer.id ? fused : {
+            ...node2,
+            dependsOn: node2.dependsOn.map((id) => id === producer.id ? consumer.id : id),
+            contextSelector: {
+              ...node2.contextSelector,
+              predecessorResults: node2.contextSelector.predecessorResults.map(
+                (id) => id === producer.id ? consumer.id : id
+              )
+            }
+          }
+        ),
+        decision: graphOptimizationDecision({
+          kind: "graph_shape",
+          choice: "fuse",
+          nodeIds: [producer.id, consumer.id],
+          rationale: "The adjacent read-only nodes selected overlapping bounded context and had no independent consumer, so another host boundary added more overhead than isolation.",
+          evidence: [
+            `${relevantPaths.length} combined selected paths`,
+            "one downstream consumer",
+            "no writes or completion probes"
+          ],
+          estimate: { modelCallsDelta: -1, contextCharactersDelta: 0, latencyTurnsDelta: -1 }
+        })
+      };
+    }
+  }
+  return { nodes };
+}
+function optimizeGraph(input) {
+  const original = GraphSchema.parse(input.graph);
+  const standardEdges = new Set(
+    runtimeControlEdges(original.anchors, original.nodes).map((edge) => edgeKey(edge))
+  );
+  const hasCustomControl = original.controlEdges.some((edge) => !standardEdges.has(edgeKey(edge)));
+  if (hasCustomControl)
+    return {
+      graph: original,
+      decisions: [
+        graphOptimizationDecision({
+          kind: "graph_shape",
+          choice: "preserve",
+          nodeIds: original.nodes.map(({ id }) => id),
+          rationale: "Custom control authority is preserved instead of being rewritten implicitly.",
+          evidence: ["graph contains non-runtime control edges"],
+          estimate: { modelCallsDelta: 0, contextCharactersDelta: 0, latencyTurnsDelta: 0 }
+        })
+      ]
+    };
+  let nodes = [...original.nodes];
+  const decisions = [];
+  while (true) {
+    const split = splitBroadNode(nodes);
+    nodes = split.nodes;
+    if (!split.decision) break;
+    decisions.push(split.decision);
+  }
+  while (true) {
+    const fused = fuseReadOnlyPair(nodes);
+    nodes = fused.nodes;
+    if (!fused.decision) break;
+    decisions.push(fused.decision);
+  }
+  const graph = GraphSchema.parse({
+    ...original,
+    nodes,
+    controlEdges: runtimeControlEdges(input.contract.acceptanceAnchors, nodes)
+  });
+  validateGraph(graph);
+  validateGraphPolicy(
+    graph,
+    input.contract,
+    input.requiredVerificationProbes,
+    input.approvedProbes ?? input.requiredVerificationProbes
+  );
+  if (decisions.length === 0)
+    decisions.push(
+      graphOptimizationDecision({
+        kind: "graph_shape",
+        choice: "preserve",
+        nodeIds: graph.nodes.map(({ id }) => id),
+        rationale: "No node crossed the bounded-context split threshold and no adjacent read-only pair had enough shared context to justify fusion.",
+        evidence: ["validated graph retained its task-specific isolation boundaries"],
+        estimate: { modelCallsDelta: 0, contextCharactersDelta: 0, latencyTurnsDelta: 0 }
+      })
+    );
+  return { graph, decisions };
+}
 function unique(values) {
   return [...new Set(values)];
+}
+function uniqueProbes(values) {
+  return [...new Map(values.map((probe) => [probe.id, probe])).values()];
 }
 function edgeKey(edge) {
   return `${edge.from}\0${edge.to}\0${edge.relation}`;
@@ -19755,6 +19985,7 @@ function reduceEvents(events) {
         progressTrajectory: [],
         tokens: unavailableTokenUsage(),
         tokenLedger: [],
+        optimizationDecisions: [],
         controlDecisions: [],
         updatedAt: event.timestamp
       };
@@ -19857,6 +20088,10 @@ function reduceEvents(events) {
         state.tokens = aggregateTokenUsage(state.tokenLedger.map(({ usage }) => usage));
         break;
       }
+      case "optimizer.decided":
+        state.optimizationDecisions.push(OptimizationDecisionSchema.parse(data.decision));
+        state.optimizationDecisions = state.optimizationDecisions.slice(-200);
+        break;
       case "graph.amended": {
         const addedNodeIds = Array.isArray(data.addedNodeIds) ? data.addedNodeIds.map((value) => String(value)) : [];
         const removedNodeIds = Array.isArray(data.removedNodeIds) ? data.removedNodeIds.map((value) => String(value)) : [];
@@ -22809,7 +23044,7 @@ async function recoverableInvocation(store, nodeId, repositoryPath, family) {
   );
   const transcript = await store.loadInvocationEvents(invocationId).catch(() => []);
   const transcriptSession = transcript.findLast((event) => event.type === "session");
-  const hostSessionId = session ? String(session.data.hostSessionId) : transcriptSession?.type === "session" ? transcriptSession.hostSessionId : void 0;
+  const hostSessionId = session ? String(session.data.hostSessionId) : transcriptSession?.type === "session" ? transcriptSession.hostSessionId : typeof started.data.reusedHostSessionId === "string" ? started.data.reusedHostSessionId : void 0;
   const baseline = persistedBaseline(started.data.baseline, family);
   return {
     adapterId: String(started.data.adapter ?? ""),
@@ -22918,6 +23153,13 @@ async function createRun(task, options) {
   }
   graph = applyProbePlan(graph, contract, graphProbePlan);
   graph = populateMissingGraphContext(graph, repositoryEvidence);
+  const optimized = optimizeGraph({
+    graph,
+    contract,
+    requiredVerificationProbes: completionProbes,
+    approvedProbes
+  });
+  graph = optimized.graph;
   await validatePlannedContext(graph, repository.root);
   const store = await RunStore.create(
     repository.root,
@@ -22926,6 +23168,8 @@ async function createRun(task, options) {
     probePlan,
     heldOutProbePlan
   );
+  for (const decision of optimized.decisions)
+    await store.append("runtime", "optimizer.decided", { decision }, decision.decisionId);
   await store.append("runtime", "tokens.recorded", {
     usage: deterministicTokenUsage(),
     phase: "graphcraft_overhead"
@@ -22980,7 +23224,7 @@ async function configureRunProbes(store, input) {
 }
 async function executeWorker(input) {
   let invocationId = input.resume?.invocationId ?? randomUUID7();
-  let resumeSessionId;
+  let resumeSessionId = input.reuseSession?.hostSessionId;
   if (input.resume) {
     await recordMissingUsage(input.store, input.resume, input.node, input.adapter.id);
     const reconciliation = await input.adapter.reconcile(input.resume);
@@ -23035,13 +23279,17 @@ async function executeWorker(input) {
     predecessorEvidence: input.predecessorEvidence ?? [],
     probeResults: input.probeResults ?? []
   });
-  if (!resumeSessionId) {
+  if (!input.resume || !resumeSessionId) {
     await input.store.append("runtime", "invocation.started", {
       invocationId,
       nodeId: input.node.id,
       adapter: input.adapter.id,
       capsuleHash,
-      baseline: input.baseline
+      baseline: input.baseline,
+      ...input.reuseSession ? {
+        reusedHostSessionId: input.reuseSession.hostSessionId,
+        reusedFromNodeId: input.reuseSession.sourceNodeId
+      } : {}
     });
   }
   let result;
@@ -23290,15 +23538,131 @@ function concurrencyConflict(graph, left, right) {
     return scopesOverlap(left, right) ? "overlapping_scope" : "shared_worktree";
   return void 0;
 }
+function runtimeOptimizationDecision(input) {
+  return OptimizationDecisionSchema.parse({
+    schemaVersion: 1,
+    decisionId: randomUUID7(),
+    ...input
+  });
+}
 function readyBatch(graph, state, maxWorkers) {
   const ready = readyRuntimeNodes(graph, state);
   const first = ready[0];
-  if (!first || maxWorkers === 1 || ["verification", "commit", "wait"].includes(first.kind))
-    return first ? [first] : [];
+  if (!first) return { nodes: [] };
+  if (maxWorkers === 1)
+    return {
+      nodes: [first],
+      decision: runtimeOptimizationDecision({
+        kind: "concurrency",
+        choice: "sequential",
+        nodeIds: [first.id],
+        rationale: "The approved worker ceiling is one, so concurrency cannot reduce latency.",
+        evidence: ["maxWorkers=1"],
+        estimate: { modelCallsDelta: 0, contextCharactersDelta: 0, latencyTurnsDelta: 0 },
+        costBasis: "deterministic_static"
+      })
+    };
+  if (["verification", "commit", "wait"].includes(first.kind))
+    return {
+      nodes: [first],
+      decision: runtimeOptimizationDecision({
+        kind: "concurrency",
+        choice: "sequential",
+        nodeIds: [first.id],
+        rationale: "Verification, waiting, and Git side effects retain a single authoritative order.",
+        evidence: [`${first.kind} nodes are serialized`],
+        estimate: { modelCallsDelta: 0, contextCharactersDelta: 0, latencyTurnsDelta: 0 },
+        costBasis: "deterministic_static"
+      })
+    };
   const second = ready.slice(1).find(
     (candidate) => !["verification", "commit", "wait"].includes(candidate.kind) && !concurrencyConflict(graph, first, candidate)
   );
-  return second ? [first, second] : [first];
+  if (!second)
+    return {
+      nodes: [first],
+      decision: runtimeOptimizationDecision({
+        kind: "concurrency",
+        choice: "sequential",
+        nodeIds: [first.id],
+        rationale: "No second ready node was both dependency-independent and free of control, scope, workspace, or Git conflicts.",
+        evidence: [`${ready.length} ready node${ready.length === 1 ? "" : "s"}`],
+        estimate: { modelCallsDelta: 0, contextCharactersDelta: 0, latencyTurnsDelta: 0 },
+        costBasis: "deterministic_static"
+      })
+    };
+  return {
+    nodes: [first, second],
+    decision: runtimeOptimizationDecision({
+      kind: "concurrency",
+      choice: "parallel",
+      nodeIds: [first.id, second.id],
+      rationale: "Two ready read-only nodes have independent dependencies and no control or mutation conflict, so overlap reduces one latency turn without adding a model call.",
+      evidence: ["sideEffectClass=none", "no dependency or control conflict"],
+      estimate: { modelCallsDelta: 0, contextCharactersDelta: 0, latencyTurnsDelta: -1 },
+      costBasis: "deterministic_static"
+    })
+  };
+}
+async function hostContextOptimization(store, graph, node2, adapterId) {
+  const sourceNodeId = node2.contextSelector.predecessorResults.length === 1 ? node2.contextSelector.predecessorResults[0] : void 0;
+  const source = sourceNodeId ? graph.nodes.find((candidate) => candidate.id === sourceNodeId) : void 0;
+  const sharedPaths = source ? source.contextSelector.relevantPaths.filter(
+    (path2) => node2.contextSelector.relevantPaths.includes(path2)
+  ) : [];
+  const minimumContext = source ? Math.min(
+    source.contextSelector.relevantPaths.length,
+    node2.contextSelector.relevantPaths.length
+  ) : 0;
+  const eligible = source !== void 0 && source.sideEffectClass === node2.sideEffectClass && !["verification", "commit", "wait"].includes(source.kind) && !["verification", "commit", "wait"].includes(node2.kind) && minimumContext > 0 && sharedPaths.length / minimumContext >= 0.5;
+  const events = eligible ? await store.loadEvents() : [];
+  const sourceUsage = eligible ? (await store.loadState()).tokenLedger.filter(
+    (entry) => entry.nodeId === sourceNodeId && !entry.missing && ["reported", "derived"].includes(entry.usage.availability.total)
+  ) : [];
+  const started = eligible ? events.findLast(
+    ({ type, data }) => type === "invocation.started" && data.nodeId === sourceNodeId && data.adapter === adapterId && typeof data.invocationId === "string"
+  ) : void 0;
+  const invocationId = started ? String(started.data.invocationId) : void 0;
+  const finished = invocationId ? events.findLast(
+    ({ type, data }) => type === "invocation.finished" && data.invocationId === invocationId && data.success === true
+  ) : void 0;
+  const session = invocationId ? events.findLast(
+    ({ type, data }) => type === "invocation.session" && data.invocationId === invocationId && typeof data.hostSessionId === "string"
+  ) : void 0;
+  const sourceTokenTotal = sourceUsage.reduce((sum, entry) => sum + entry.usage.total, 0);
+  if (eligible && finished && session && sourceNodeId && sourceTokenTotal > 0)
+    return {
+      decision: runtimeOptimizationDecision({
+        kind: "host_context",
+        choice: "reuse",
+        nodeIds: [sourceNodeId, node2.id],
+        rationale: "The dependent node uses the same authority class and materially overlapping paths, so preserving its exact host reasoning avoids rebuilding equivalent dependency context.",
+        evidence: [
+          `${sharedPaths.length}/${minimumContext} selected paths overlap`,
+          `completed ${adapterId} session is durable`,
+          `${sourceTokenTotal} reconciled source tokens across ${sourceUsage.length} receipt${sourceUsage.length === 1 ? "" : "s"}`
+        ],
+        estimate: { modelCallsDelta: 0, contextCharactersDelta: 0, latencyTurnsDelta: 0 },
+        costBasis: "durable_receipts"
+      }),
+      reuseSession: {
+        hostSessionId: String(session.data.hostSessionId),
+        sourceNodeId
+      }
+    };
+  return {
+    decision: runtimeOptimizationDecision({
+      kind: "host_context",
+      choice: "fresh",
+      nodeIds: sourceNodeId ? [sourceNodeId, node2.id] : [node2.id],
+      rationale: "A fresh host context keeps unrelated or differently authorized work isolated because no durable dependency session has enough selected-path overlap.",
+      evidence: [
+        source ? `${sharedPaths.length}/${minimumContext || 1} selected paths overlap; ${sourceUsage.length} reconciled source receipts` : "no single selected predecessor context"
+      ],
+      estimate: { modelCallsDelta: 0, contextCharactersDelta: 0, latencyTurnsDelta: 0 },
+      costBasis: "deterministic_static"
+    })
+  };
 }
 function repairAmendment(graph, verification, failures) {
   const repairCount = graph.nodes.filter((node2) => node2.id.startsWith("repair-verify-")).length;
@@ -23445,7 +23809,8 @@ async function executeWorkNode(input) {
     ...input.observer ? { observer: input.observer } : {},
     signal: input.signal,
     baseline,
-    ...input.recovery ? { resume: input.recovery } : {}
+    ...input.recovery ? { resume: input.recovery } : {},
+    ...input.reuseSession ? { reuseSession: input.reuseSession } : {}
   });
   if (input.signal.aborted)
     return {
@@ -23737,7 +24102,8 @@ async function executeRun(input) {
       graph = await input.store.loadGraph();
       if (["paused", "stopped", "blocked", "failed", "completed"].includes(state.status))
         return state;
-      const batch = readyBatch(graph, state, input.maxWorkers ?? 1);
+      const batchSelection = readyBatch(graph, state, input.maxWorkers ?? 1);
+      const batch = batchSelection.nodes;
       if (batch.length === 0) {
         const allAccepted = graph.nodes.every(
           (node2) => state.nodes[node2.id]?.status === "accepted"
@@ -23750,6 +24116,13 @@ async function executeRun(input) {
         }
         return await input.store.loadState();
       }
+      if (batchSelection.decision)
+        await input.store.append(
+          "runtime",
+          "optimizer.decided",
+          { decision: batchSelection.decision },
+          batchSelection.decision.decisionId
+        );
       for (const candidate of batch) {
         const scheduling = await evaluateControlScheduling(input.store, graph, state, candidate.id);
         if (!scheduling.allowed) {
@@ -23759,6 +24132,25 @@ async function executeRun(input) {
           });
           return await input.store.loadState();
         }
+      }
+      const reuseSessions = /* @__PURE__ */ new Map();
+      for (const candidate of batch) {
+        if (["verification", "commit"].includes(candidate.kind) || recoveries.has(candidate.id))
+          continue;
+        const contextOptimization = await hostContextOptimization(
+          input.store,
+          graph,
+          candidate,
+          input.adapter.id
+        );
+        await input.store.append(
+          "runtime",
+          "optimizer.decided",
+          { decision: contextOptimization.decision },
+          contextOptimization.decision.decisionId
+        );
+        if (contextOptimization.reuseSession)
+          reuseSessions.set(candidate.id, contextOptimization.reuseSession);
       }
       const batchId = randomUUID7();
       for (const candidate of batch) {
@@ -23789,7 +24181,8 @@ async function executeRun(input) {
               workspace,
               ...input.observer ? { observer: input.observer } : {},
               signal: batchSignal,
-              ...recoveries.get(candidate.id) ? { recovery: recoveries.get(candidate.id).record } : {}
+              ...recoveries.get(candidate.id) ? { recovery: recoveries.get(candidate.id).record } : {},
+              ...reuseSessions.get(candidate.id) ? { reuseSession: reuseSessions.get(candidate.id) } : {}
             });
             if (outcome2.status === "failed" && !batchAbort.signal.aborted)
               batchAbort.abort({
@@ -24083,7 +24476,8 @@ async function executeRun(input) {
         workspace,
         ...input.observer ? { observer: input.observer } : {},
         signal,
-        ...recoveries.get(current.id) ? { recovery: recoveries.get(current.id).record } : {}
+        ...recoveries.get(current.id) ? { recovery: recoveries.get(current.id).record } : {},
+        ...reuseSessions.get(current.id) ? { reuseSession: reuseSessions.get(current.id) } : {}
       });
       recoveries.delete(current.id);
       if (outcome.status === "interrupted")
@@ -24173,12 +24567,42 @@ async function uninstallHost(host) {
   if (host === "codex") await runHostCommand("codex", ["mcp", "remove", "graphcraft"]);
   else await runHostCommand("claude", ["mcp", "remove", "--scope", "user", "graphcraft"]);
 }
-function shouldBypassGraph(task) {
-  const words = task.trim().split(/\s+/).length;
-  const durableSignal = /\b(migrat|refactor|across|all |entire|investigat|audit|pull request|\bpr\b|ci|long[- ]running|resume)\b/i.test(
-    task
+function assessTaskShape(task) {
+  const value = task.trim();
+  const actionPatterns = [
+    /\bfix(?:e[sd]?|ing)?\b/i,
+    /\bimplement(?:ed|ing)?\b/i,
+    /\badd(?:ed|ing)?\b/i,
+    /\b(?:updat|chang|remov|renam|migrat|refactor|audit|investigat|verif|test|commit|push)\w*\b/i
+  ];
+  const actionCount = actionPatterns.filter((pattern) => pattern.test(value)).length;
+  const paths = value.match(
+    /(?:^|\s)(?:[\w.-]+\/)+(?:[\w.*-]+)|\b(?:README(?:\.md)?|AGENTS\.md|package\.json|tsconfig(?:\.[\w.-]+)?\.json)\b|\b[\w-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|md|json|ya?ml|toml)\b/g
+  ) ?? [];
+  const pathCount = new Set(paths.map((path2) => path2.trim())).size;
+  const broadScope = /\b(?:all|every|entire|across|repository-wide|codebase|multiple packages?|each)\b/i.test(value);
+  const durableWorkflow = /\b(?:migrat\w*|refactor\w*|audit\w*|investigat\w*|pull request|pr green|ci|resume|long[- ]running)\b/i.test(
+    value
   );
-  return words <= 8 && !durableSignal;
+  const externalWait = /\b(?:wait|poll|review feedback|required checks?|github|pull request|\bpr\b|deploy)\b/i.test(
+    value
+  );
+  const multipleSteps = actionCount > 1 || /\b(?:and then|then|followed by|after that)\b|[;,]/i.test(value);
+  const localized = pathCount === 1 || /\b(?:typo|wording|copy|comment|single file|one file|localized|localised)\b/i.test(value);
+  const score = actionCount + Math.min(pathCount, 3) + (broadScope ? 3 : 0) + (durableWorkflow ? 4 : 0) + (externalWait ? 4 : 0) + (multipleSteps ? 2 : 0);
+  return {
+    bypass: localized && actionCount <= 1 && pathCount <= 1 && !broadScope && !durableWorkflow && !externalWait && !multipleSteps,
+    score,
+    signals: {
+      actionCount,
+      pathCount,
+      localized,
+      broadScope,
+      durableWorkflow,
+      externalWait,
+      multipleSteps
+    }
+  };
 }
 function probeView(item) {
   const probe = item.probe;
@@ -24245,6 +24669,7 @@ function stateView(state, contract) {
     pendingDecision: state.pendingDecision,
     tokens: state.tokens,
     tokenReport: tokenCostReport(state.tokenLedger),
+    optimizationDecisions: state.optimizationDecisions,
     stopReason: state.stopReason,
     updatedAt: state.updatedAt
   };
@@ -24305,10 +24730,12 @@ async function handleAction(input) {
   }
   if (input.action === "run") {
     if (!input.task) throw new Error("task is required for action=run");
-    if (!input.force && shouldBypassGraph(input.task)) {
+    const taskShape = assessTaskShape(input.task);
+    if (!input.force && taskShape.bypass) {
       return {
         bypassed: true,
-        reason: "Graphcraft is not needed for this localized task; use force=true to override"
+        reason: "Graphcraft is not needed for this localized task; use force=true to override",
+        taskShape
       };
     }
     if (/\b(push|open (?:a )?pr|pull request|pr green|merge|deploy)\b/i.test(input.task)) {
@@ -24449,8 +24876,11 @@ program2.command("run").description("Compile and execute a durable task graph").
   ])
 ).action(
   async (task, options) => {
-    if (!options.force && shouldBypassGraph(task)) {
-      console.log("Graphcraft is not needed for this localized task. Use --force to override.");
+    const taskShape = assessTaskShape(task);
+    if (!options.force && taskShape.bypass) {
+      console.log(
+        `Graphcraft is not needed for this localized task (shape score ${taskShape.score}). Use --force to override.`
+      );
       return;
     }
     if (/\b(push|open (?:a )?pr|pull request|pr green|merge|deploy)\b/i.test(task)) {

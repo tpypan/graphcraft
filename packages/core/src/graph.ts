@@ -6,6 +6,7 @@ import type {
   GraphPlan,
   GraphAmendment,
   GraphAmendmentDiff,
+  OptimizationDecision,
   Permission,
   AcceptanceAnchor,
   ProbePlan,
@@ -16,6 +17,7 @@ import {
   GraphAmendmentSchema,
   GraphPlanSchema,
   GraphSchema,
+  OptimizationDecisionSchema,
   ProbePlanSchema,
   RunContractSchema,
 } from "./schemas.ts";
@@ -410,8 +412,263 @@ export function compilePlannedGraph(
   return graph;
 }
 
+function graphOptimizationDecision(
+  input: Omit<OptimizationDecision, "schemaVersion" | "decisionId" | "costBasis">,
+): OptimizationDecision {
+  return OptimizationDecisionSchema.parse({
+    schemaVersion: 1,
+    decisionId: randomUUID(),
+    costBasis: "deterministic_static",
+    ...input,
+  });
+}
+
+function derivedScope(path: string): string {
+  const segments = path.split("/").filter(Boolean);
+  if (segments.length <= 1) return path;
+  return `${segments.slice(0, Math.min(2, segments.length - 1)).join("/")}/**`;
+}
+
+function safeSplitScopes(node: GraphNode): string[] {
+  if (node.scope.length >= 2) return [...node.scope].sort();
+  if (node.contextSelector.relevantPaths.length < 9) return [];
+  return unique(
+    node.contextSelector.relevantPaths
+      .map(derivedScope)
+      .filter((scope) => node.scope.some((boundary) => patternWithin(scope, boundary))),
+  ).sort();
+}
+
+function splitBroadNode(nodes: GraphNode[]): {
+  nodes: GraphNode[];
+  decision?: OptimizationDecision;
+} {
+  const target = nodes.find(
+    (node) =>
+      node.sideEffectClass === "workspace_write" &&
+      node.completionProbes.length === 0 &&
+      (node.scope.length >= 4 || node.contextSelector.relevantPaths.length >= 9) &&
+      safeSplitScopes(node).length >= 2,
+  );
+  if (!target) return { nodes };
+  const scopes = safeSplitScopes(target);
+  const pivot = Math.ceil(scopes.length / 2);
+  const firstScopes = scopes.slice(0, pivot);
+  const finalScopes = scopes.slice(pivot);
+  if (finalScopes.length === 0) return { nodes };
+  const pathsFor = (selectedScopes: string[]) =>
+    target.contextSelector.relevantPaths.filter((path) =>
+      selectedScopes.some((scope) => patternWithin(path, scope)),
+    );
+  let firstPaths = pathsFor(firstScopes);
+  let finalPaths = pathsFor(finalScopes);
+  if (firstPaths.length === 0 || finalPaths.length === 0) {
+    const pathPivot = Math.ceil(target.contextSelector.relevantPaths.length / 2);
+    firstPaths = target.contextSelector.relevantPaths.slice(0, pathPivot);
+    finalPaths = target.contextSelector.relevantPaths.slice(pathPivot);
+  }
+  if (firstPaths.length === 0 || finalPaths.length === 0) return { nodes };
+  let firstId = `${target.id}-slice-1`;
+  for (let suffix = 2; nodes.some(({ id }) => id === firstId); suffix += 1)
+    firstId = `${target.id}-slice-${suffix}`;
+  const first: GraphNode = {
+    ...target,
+    id: firstId,
+    objective: `${target.objective}\nWork only within this optimizer slice: ${firstScopes.join(", ")}`,
+    scope: firstScopes,
+    contextSelector: {
+      ...target.contextSelector,
+      relevantPaths: firstPaths,
+    },
+  };
+  const final: GraphNode = {
+    ...target,
+    objective: `${target.objective}\nComplete the remaining optimizer slice: ${finalScopes.join(", ")}`,
+    dependsOn: [firstId],
+    scope: finalScopes,
+    contextSelector: {
+      ...target.contextSelector,
+      predecessorResults: [firstId],
+      relevantPaths: finalPaths,
+    },
+  };
+  return {
+    nodes: nodes.flatMap((node) => (node.id === target.id ? [first, final] : [node])),
+    decision: graphOptimizationDecision({
+      kind: "graph_shape",
+      choice: "split",
+      nodeIds: [target.id, firstId],
+      rationale:
+        "The write node crossed independently bounded scopes, so isolation value exceeds one additional host call.",
+      evidence: [
+        `${target.scope.length} declared scopes`,
+        `${target.contextSelector.relevantPaths.length} selected repository paths`,
+        `partitioned into ${firstScopes.length} and ${finalScopes.length} scopes`,
+      ],
+      estimate: { modelCallsDelta: 1, contextCharactersDelta: 0, latencyTurnsDelta: 1 },
+    }),
+  };
+}
+
+function fuseReadOnlyPair(nodes: GraphNode[]): {
+  nodes: GraphNode[];
+  decision?: OptimizationDecision;
+} {
+  for (const consumer of nodes) {
+    for (const dependencyId of consumer.dependsOn) {
+      const producer = nodes.find(({ id }) => id === dependencyId);
+      if (!producer) continue;
+      const dependents = nodes.filter(({ dependsOn }) => dependsOn.includes(producer.id));
+      const relevantPaths = unique([
+        ...producer.contextSelector.relevantPaths,
+        ...consumer.contextSelector.relevantPaths,
+      ]);
+      const scopes = unique([...producer.scope, ...consumer.scope]);
+      const overlappingContext = producer.contextSelector.relevantPaths.some((path) =>
+        consumer.contextSelector.relevantPaths.includes(path),
+      );
+      if (
+        producer.sideEffectClass !== "none" ||
+        consumer.sideEffectClass !== "none" ||
+        [producer.kind, consumer.kind].some((kind) =>
+          ["verification", "commit", "wait"].includes(kind),
+        ) ||
+        dependents.length !== 1 ||
+        !overlappingContext ||
+        relevantPaths.length > 6 ||
+        scopes.length > 4 ||
+        producer.objective.length + consumer.objective.length > 4_000 ||
+        producer.completionProbes.length + consumer.completionProbes.length > 0
+      )
+        continue;
+      const dependsOn = unique([
+        ...producer.dependsOn,
+        ...consumer.dependsOn.filter((id) => id !== producer.id),
+      ]);
+      const fused: GraphNode = {
+        ...consumer,
+        objective: `${producer.objective}\nThen: ${consumer.objective}`,
+        dependsOn,
+        scope: scopes,
+        contextSelector: {
+          ...consumer.contextSelector,
+          predecessorResults: unique([
+            ...producer.contextSelector.predecessorResults,
+            ...consumer.contextSelector.predecessorResults.filter((id) => id !== producer.id),
+          ]).filter((id) => dependsOn.includes(id)),
+          relevantPaths,
+        },
+        progressProbes: uniqueProbes([...producer.progressProbes, ...consumer.progressProbes]),
+      };
+      return {
+        nodes: nodes
+          .filter(({ id }) => id !== producer.id)
+          .map((node) =>
+            node.id === consumer.id
+              ? fused
+              : {
+                  ...node,
+                  dependsOn: node.dependsOn.map((id) => (id === producer.id ? consumer.id : id)),
+                  contextSelector: {
+                    ...node.contextSelector,
+                    predecessorResults: node.contextSelector.predecessorResults.map((id) =>
+                      id === producer.id ? consumer.id : id,
+                    ),
+                  },
+                },
+          ),
+        decision: graphOptimizationDecision({
+          kind: "graph_shape",
+          choice: "fuse",
+          nodeIds: [producer.id, consumer.id],
+          rationale:
+            "The adjacent read-only nodes selected overlapping bounded context and had no independent consumer, so another host boundary added more overhead than isolation.",
+          evidence: [
+            `${relevantPaths.length} combined selected paths`,
+            "one downstream consumer",
+            "no writes or completion probes",
+          ],
+          estimate: { modelCallsDelta: -1, contextCharactersDelta: 0, latencyTurnsDelta: -1 },
+        }),
+      };
+    }
+  }
+  return { nodes };
+}
+
+export function optimizeGraph(input: {
+  graph: Graph;
+  contract: RunContract;
+  requiredVerificationProbes: ProbeSpec[];
+  approvedProbes?: ProbeSpec[];
+}): { graph: Graph; decisions: OptimizationDecision[] } {
+  const original = GraphSchema.parse(input.graph);
+  const standardEdges = new Set(
+    runtimeControlEdges(original.anchors, original.nodes).map((edge) => edgeKey(edge)),
+  );
+  const hasCustomControl = original.controlEdges.some((edge) => !standardEdges.has(edgeKey(edge)));
+  if (hasCustomControl)
+    return {
+      graph: original,
+      decisions: [
+        graphOptimizationDecision({
+          kind: "graph_shape",
+          choice: "preserve",
+          nodeIds: original.nodes.map(({ id }) => id),
+          rationale: "Custom control authority is preserved instead of being rewritten implicitly.",
+          evidence: ["graph contains non-runtime control edges"],
+          estimate: { modelCallsDelta: 0, contextCharactersDelta: 0, latencyTurnsDelta: 0 },
+        }),
+      ],
+    };
+
+  let nodes = [...original.nodes];
+  const decisions: OptimizationDecision[] = [];
+  while (true) {
+    const split = splitBroadNode(nodes);
+    nodes = split.nodes;
+    if (!split.decision) break;
+    decisions.push(split.decision);
+  }
+  while (true) {
+    const fused = fuseReadOnlyPair(nodes);
+    nodes = fused.nodes;
+    if (!fused.decision) break;
+    decisions.push(fused.decision);
+  }
+  const graph = GraphSchema.parse({
+    ...original,
+    nodes,
+    controlEdges: runtimeControlEdges(input.contract.acceptanceAnchors, nodes),
+  });
+  validateGraph(graph);
+  validateGraphPolicy(
+    graph,
+    input.contract,
+    input.requiredVerificationProbes,
+    input.approvedProbes ?? input.requiredVerificationProbes,
+  );
+  if (decisions.length === 0)
+    decisions.push(
+      graphOptimizationDecision({
+        kind: "graph_shape",
+        choice: "preserve",
+        nodeIds: graph.nodes.map(({ id }) => id),
+        rationale:
+          "No node crossed the bounded-context split threshold and no adjacent read-only pair had enough shared context to justify fusion.",
+        evidence: ["validated graph retained its task-specific isolation boundaries"],
+        estimate: { modelCallsDelta: 0, contextCharactersDelta: 0, latencyTurnsDelta: 0 },
+      }),
+    );
+  return { graph, decisions };
+}
+
 function unique(values: string[]): string[] {
   return [...new Set(values)];
+}
+
+function uniqueProbes(values: ProbeSpec[]): ProbeSpec[] {
+  return [...new Map(values.map((probe) => [probe.id, probe])).values()];
 }
 
 function edgeKey(edge: Graph["controlEdges"][number]): string {

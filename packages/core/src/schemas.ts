@@ -438,6 +438,22 @@ export const TokenLedgerEntrySchema = z.strictObject({
   missing: z.boolean().default(false),
 });
 
+export const OptimizationDecisionSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  decisionId: z.string().min(1),
+  kind: z.enum(["graph_shape", "concurrency", "host_context"]),
+  choice: z.enum(["fuse", "split", "preserve", "parallel", "sequential", "reuse", "fresh"]),
+  nodeIds: z.array(z.string().min(1)).min(1),
+  rationale: z.string().min(1),
+  evidence: z.array(z.string().min(1)),
+  estimate: z.strictObject({
+    modelCallsDelta: z.number().int(),
+    contextCharactersDelta: z.number().int(),
+    latencyTurnsDelta: z.number().int(),
+  }),
+  costBasis: z.enum(["deterministic_static", "durable_receipts"]),
+});
+
 export const WorkerResultSchema = z.strictObject({
   status: z.enum(["completed", "blocked", "failed"]),
   summary: z.string(),
@@ -597,6 +613,7 @@ export const RunEventTypeSchema = z.enum([
   "held_out.checked",
   "semantic.verdict",
   "tokens.recorded",
+  "optimizer.decided",
   "graph.amended",
 ]);
 
@@ -641,6 +658,7 @@ export const RunStateSchema = z.strictObject({
   progressDecision: ProgressDecisionPacketSchema.optional(),
   tokens: TokenUsageSchema,
   tokenLedger: z.array(TokenLedgerEntrySchema).default([]),
+  optimizationDecisions: z.array(OptimizationDecisionSchema).default([]),
   controlDecisions: z.array(ControlDecisionSchema),
   pendingDecision: ControlDecisionPacketSchema.optional(),
   stopReason: z.string().optional(),
@@ -701,6 +719,7 @@ export type TokenUsage = z.infer<typeof TokenUsageSchema>;
 export type TokenAvailabilityStatus = z.infer<typeof TokenAvailabilityStatusSchema>;
 export type TokenAttributionPhase = z.infer<typeof TokenAttributionPhaseSchema>;
 export type TokenLedgerEntry = z.infer<typeof TokenLedgerEntrySchema>;
+export type OptimizationDecision = z.infer<typeof OptimizationDecisionSchema>;
 export type WorkerResult = z.infer<typeof WorkerResultSchema>;
 export type ContextCapsule = z.infer<typeof ContextCapsuleSchema>;
 export type ContextSelectionReceipt = z.infer<typeof ContextSelectionReceiptSchema>;

@@ -114,13 +114,80 @@ export async function uninstallHost(host: HostName): Promise<void> {
   else await runHostCommand("claude", ["mcp", "remove", "--scope", "user", "graphcraft"]);
 }
 
-export function shouldBypassGraph(task: string): boolean {
-  const words = task.trim().split(/\s+/).length;
-  const durableSignal =
-    /\b(migrat|refactor|across|all |entire|investigat|audit|pull request|\bpr\b|ci|long[- ]running|resume)\b/i.test(
-      task,
+export interface TaskShapeAssessment {
+  bypass: boolean;
+  score: number;
+  signals: {
+    actionCount: number;
+    pathCount: number;
+    localized: boolean;
+    broadScope: boolean;
+    durableWorkflow: boolean;
+    externalWait: boolean;
+    multipleSteps: boolean;
+  };
+}
+
+export function assessTaskShape(task: string): TaskShapeAssessment {
+  const value = task.trim();
+  const actionPatterns = [
+    /\bfix(?:e[sd]?|ing)?\b/i,
+    /\bimplement(?:ed|ing)?\b/i,
+    /\badd(?:ed|ing)?\b/i,
+    /\b(?:updat|chang|remov|renam|migrat|refactor|audit|investigat|verif|test|commit|push)\w*\b/i,
+  ];
+  const actionCount = actionPatterns.filter((pattern) => pattern.test(value)).length;
+  const paths =
+    value.match(
+      /(?:^|\s)(?:[\w.-]+\/)+(?:[\w.*-]+)|\b(?:README(?:\.md)?|AGENTS\.md|package\.json|tsconfig(?:\.[\w.-]+)?\.json)\b|\b[\w-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|md|json|ya?ml|toml)\b/g,
+    ) ?? [];
+  const pathCount = new Set(paths.map((path) => path.trim())).size;
+  const broadScope =
+    /\b(?:all|every|entire|across|repository-wide|codebase|multiple packages?|each)\b/i.test(value);
+  const durableWorkflow =
+    /\b(?:migrat\w*|refactor\w*|audit\w*|investigat\w*|pull request|pr green|ci|resume|long[- ]running)\b/i.test(
+      value,
     );
-  return words <= 8 && !durableSignal;
+  const externalWait =
+    /\b(?:wait|poll|review feedback|required checks?|github|pull request|\bpr\b|deploy)\b/i.test(
+      value,
+    );
+  const multipleSteps =
+    actionCount > 1 || /\b(?:and then|then|followed by|after that)\b|[;,]/i.test(value);
+  const localized =
+    pathCount === 1 ||
+    /\b(?:typo|wording|copy|comment|single file|one file|localized|localised)\b/i.test(value);
+  const score =
+    actionCount +
+    Math.min(pathCount, 3) +
+    (broadScope ? 3 : 0) +
+    (durableWorkflow ? 4 : 0) +
+    (externalWait ? 4 : 0) +
+    (multipleSteps ? 2 : 0);
+  return {
+    bypass:
+      localized &&
+      actionCount <= 1 &&
+      pathCount <= 1 &&
+      !broadScope &&
+      !durableWorkflow &&
+      !externalWait &&
+      !multipleSteps,
+    score,
+    signals: {
+      actionCount,
+      pathCount,
+      localized,
+      broadScope,
+      durableWorkflow,
+      externalWait,
+      multipleSteps,
+    },
+  };
+}
+
+export function shouldBypassGraph(task: string): boolean {
+  return assessTaskShape(task).bypass;
 }
 
 function probeView(item: ProbePlan["items"][number]): Record<string, unknown> {
@@ -203,6 +270,7 @@ export function stateView(state: RunState, contract: RunContract): Record<string
     pendingDecision: state.pendingDecision,
     tokens: state.tokens,
     tokenReport: tokenCostReport(state.tokenLedger),
+    optimizationDecisions: state.optimizationDecisions,
     stopReason: state.stopReason,
     updatedAt: state.updatedAt,
   };
@@ -302,10 +370,12 @@ export async function handleAction(input: McpActionInput): Promise<Record<string
 
   if (input.action === "run") {
     if (!input.task) throw new Error("task is required for action=run");
-    if (!input.force && shouldBypassGraph(input.task)) {
+    const taskShape = assessTaskShape(input.task);
+    if (!input.force && taskShape.bypass) {
       return {
         bypassed: true,
         reason: "Graphcraft is not needed for this localized task; use force=true to override",
+        taskShape,
       };
     }
     if (/\b(push|open (?:a )?pr|pull request|pr green|merge|deploy)\b/i.test(input.task)) {

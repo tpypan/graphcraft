@@ -2,6 +2,7 @@ import type { RunContract, RunEvent, RunState } from "./schemas.ts";
 import {
   ControlDecisionPacketSchema,
   ControlDecisionSchema,
+  OptimizationDecisionSchema,
   ProgressDecisionPacketSchema,
   ProgressTrajectoryEntrySchema,
   RunContractSchema,
@@ -51,6 +52,7 @@ export function reduceEvents(events: RunEvent[]): RunState {
         progressTrajectory: [],
         tokens: unavailableTokenUsage(),
         tokenLedger: [],
+        optimizationDecisions: [],
         controlDecisions: [],
         updatedAt: event.timestamp,
       };
@@ -165,6 +167,10 @@ export function reduceEvents(events: RunEvent[]): RunState {
         state.tokens = aggregateTokenUsage(state.tokenLedger.map(({ usage }) => usage));
         break;
       }
+      case "optimizer.decided":
+        state.optimizationDecisions.push(OptimizationDecisionSchema.parse(data.decision));
+        state.optimizationDecisions = state.optimizationDecisions.slice(-200);
+        break;
       case "graph.amended": {
         const addedNodeIds = Array.isArray(data.addedNodeIds)
           ? data.addedNodeIds.map((value) => String(value))

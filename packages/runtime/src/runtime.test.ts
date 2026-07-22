@@ -342,6 +342,7 @@ class FaultInjectingRunStore extends RunStore {
   constructor(
     store: RunStore,
     private readonly faultPoint: InvocationFaultPoint,
+    private readonly targetNodeId = "implement",
   ) {
     super(store.repositoryRoot, store.runId);
   }
@@ -359,12 +360,12 @@ class FaultInjectingRunStore extends RunStore {
     const event = await super.append(actor, type, data, causationId);
     if (
       type === "invocation.started" &&
-      data.nodeId === "implement" &&
+      data.nodeId === this.targetNodeId &&
       typeof data.invocationId === "string"
     )
       this.implementationInvocations.add(data.invocationId);
     const implementationNodeEvent =
-      data.nodeId === "implement" &&
+      data.nodeId === this.targetNodeId &&
       ["node.started", "invocation.started", "node.progress", "node.accepted"].includes(type);
     const implementationInvocationEvent =
       this.implementationInvocations.has(causationId) &&
@@ -1458,6 +1459,15 @@ describe("durable runtime", () => {
     expect(new Set(readStarts.map(({ data }) => data.batchId)).size).toBe(1);
     expect(readStarts.every(({ data }) => data.batchSize === 2)).toBe(true);
     expect(writeStarts.every(({ data }) => data.batchSize === 1)).toBe(true);
+    expect(state.optimizationDecisions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "concurrency",
+          choice: "parallel",
+          nodeIds: ["inspect-a", "inspect-b"],
+        }),
+      ]),
+    );
     expect(
       adapter.requests.find(({ capsule }) => capsule.nodeId === "write-a")?.capsule,
     ).toMatchObject({
@@ -1500,6 +1510,88 @@ describe("durable runtime", () => {
         .filter(({ type }) => type === "node.started")
         .every(({ data }) => data.batchSize === 1 && data.maxWorkers === 1),
     ).toBe(true);
+  });
+
+  it("reuses a durable host context only for tightly dependent equivalent reasoning", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+    });
+    const created = await createRun("Implement a substantial context reuse feature", {
+      cwd: repository,
+      planner: adapter,
+    });
+    await created.store.append("user", "run.approved", { approved: true });
+    const investigation = created.graph.nodes.find(({ id }) => id === "investigate")!;
+    const replacement = (id: string, dependsOn: string[]) => ({
+      id,
+      kind: investigation.kind,
+      objective: `Complete ${id} using the same bounded evidence`,
+      dependsOn,
+      scope: investigation.scope,
+      contextSelector: {
+        ...investigation.contextSelector,
+        predecessorResults: dependsOn,
+      },
+      progressProbes: investigation.progressProbes,
+      completionProbes: investigation.completionProbes,
+      sideEffectClass: investigation.sideEffectClass,
+    });
+    await amendRunGraph(
+      created.store,
+      {
+        schemaVersion: 1,
+        amendmentId: randomUUID(),
+        operations: [
+          {
+            operation: "split",
+            targetId: investigation.id,
+            replacements: [
+              replacement("inspect-context", []),
+              replacement("reason-context", ["inspect-context"]),
+            ],
+          },
+        ],
+        evidence: ["The second read depends directly on the first read's repository reasoning"],
+        rationale:
+          "Exercise a dependency where rereading equivalent context has no isolation value",
+        changedStrategy: "Continue the exact read-only host context for the dependent reasoning",
+        falsifiableExpectation: "Only the second read resumes the first read's durable session",
+      },
+      "runtime",
+    );
+
+    const faultStore = new FaultInjectingRunStore(
+      created.store,
+      "invocation.started",
+      "reason-context",
+    );
+    await expect(executeRun({ store: faultStore, adapter })).rejects.toThrow(
+      "Injected process termination after invocation.started",
+    );
+    const state = await executeRun({ store: created.store, adapter });
+    const first = adapter.requests.find(({ capsule }) => capsule.nodeId === "inspect-context")!;
+    const second = adapter.requests.find(({ capsule }) => capsule.nodeId === "reason-context")!;
+    const implementation = adapter.requests.find(({ capsule }) => capsule.nodeId === "implement")!;
+
+    expect(state.status).toBe("completed");
+    expect(second.resumeSessionId).toBe(first.invocationId);
+    expect(implementation.resumeSessionId).toBeUndefined();
+    expect(state.optimizationDecisions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "host_context",
+          choice: "reuse",
+          nodeIds: ["inspect-context", "reason-context"],
+        }),
+        expect.objectContaining({
+          kind: "host_context",
+          choice: "fresh",
+          nodeIds: ["implement"],
+        }),
+      ]),
+    );
   });
 
   it("cancels and quarantines a sibling when a parallel read violates its authority", async () => {

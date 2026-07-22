@@ -18,6 +18,7 @@ import {
   evidenceSnapshot,
   graphPlanShape,
   MAX_CONTEXT_CAPSULE_CHARACTERS,
+  optimizeGraph,
   resolveHeldOutProbes,
   reduceEvents,
   semanticVerdictJsonSchema,
@@ -299,6 +300,147 @@ describe("run contracts and graphs", () => {
       to: "verify",
       relation: "owns_target",
     });
+  });
+
+  it("fuses bounded adjacent reads when their host boundary costs more than isolation", () => {
+    const contract = compileRunContract("Implement a substantial reporting feature", repository);
+    const verificationProbe = {
+      id: "tests",
+      kind: "command" as const,
+      command: "npm",
+      args: ["test"],
+      expectedExitCode: 0,
+      timeoutMs: 1_000,
+    };
+    const planned = (
+      id: string,
+      kind: GraphPlan["nodes"][number]["kind"],
+      dependsOn: string[],
+      sideEffectClass: GraphPlan["nodes"][number]["sideEffectClass"],
+    ): GraphPlan["nodes"][number] => ({
+      id,
+      kind,
+      objective: `Complete ${id}`,
+      dependsOn,
+      scope: ["src/**"],
+      contextSelector: {
+        includeRepositoryInstructions: true,
+        predecessorResults: dependsOn,
+        relevantPaths: ["src/report.ts", "src/report.test.ts"],
+      },
+      progressProbes: [],
+      completionProbes: kind === "verification" ? [verificationProbe] : [],
+      sideEffectClass,
+    });
+    const graph = compilePlannedGraph(
+      contract,
+      {
+        schemaVersion: 1,
+        family: "feature",
+        nodes: [
+          planned("inspect", "investigation", [], "none"),
+          planned("decide", "decision", ["inspect"], "none"),
+          planned("implement", "implementation", ["decide"], "workspace_write"),
+          planned("verify", "verification", ["implement"], "none"),
+        ],
+      },
+      [verificationProbe],
+    );
+
+    const optimized = optimizeGraph({
+      graph,
+      contract,
+      requiredVerificationProbes: [verificationProbe],
+    });
+
+    expect(optimized.graph.nodes.map(({ id }) => id)).not.toContain("inspect");
+    expect(optimized.graph.nodes.find(({ id }) => id === "decide")).toMatchObject({
+      dependsOn: [],
+      objective: expect.stringContaining("Complete inspect"),
+    });
+    expect(optimized.decisions).toEqual([
+      expect.objectContaining({ choice: "fuse", nodeIds: ["inspect", "decide"] }),
+    ]);
+    expect(() => validateGraph(optimized.graph)).not.toThrow();
+  });
+
+  it("splits a broad write across safe scopes while preserving terminal proof", () => {
+    const contract = compileRunContract("Implement a substantial package feature", repository);
+    const verificationProbe = {
+      id: "tests",
+      kind: "command" as const,
+      command: "npm",
+      args: ["test"],
+      expectedExitCode: 0,
+      timeoutMs: 1_000,
+    };
+    const graph = compilePlannedGraph(
+      contract,
+      {
+        schemaVersion: 1,
+        family: "feature",
+        nodes: [
+          {
+            id: "implement",
+            kind: "implementation",
+            objective: "Implement four independently scoped packages",
+            dependsOn: [],
+            scope: ["packages/a/**", "packages/b/**", "packages/c/**", "packages/d/**"],
+            contextSelector: {
+              includeRepositoryInstructions: true,
+              predecessorResults: [],
+              relevantPaths: [
+                "packages/a/src.ts",
+                "packages/b/src.ts",
+                "packages/c/src.ts",
+                "packages/d/src.ts",
+              ],
+            },
+            progressProbes: [],
+            completionProbes: [],
+            sideEffectClass: "workspace_write",
+          },
+          {
+            id: "verify",
+            kind: "verification",
+            objective: "Verify the complete package feature",
+            dependsOn: ["implement"],
+            scope: ["**/*"],
+            contextSelector: {
+              includeRepositoryInstructions: true,
+              predecessorResults: ["implement"],
+              relevantPaths: ["package.json"],
+            },
+            progressProbes: [],
+            completionProbes: [verificationProbe],
+            sideEffectClass: "none",
+          },
+        ],
+      },
+      [verificationProbe],
+    );
+
+    const optimized = optimizeGraph({
+      graph,
+      contract,
+      requiredVerificationProbes: [verificationProbe],
+    });
+
+    expect(optimized.graph.nodes.find(({ id }) => id === "implement-slice-1")).toMatchObject({
+      scope: ["packages/a/**", "packages/b/**"],
+      dependsOn: [],
+    });
+    expect(optimized.graph.nodes.find(({ id }) => id === "implement")).toMatchObject({
+      scope: ["packages/c/**", "packages/d/**"],
+      dependsOn: ["implement-slice-1"],
+      completionProbes: [],
+    });
+    expect(optimized.graph.nodes.find(({ id }) => id === "verify")?.completionProbes).toEqual([
+      verificationProbe,
+    ]);
+    expect(optimized.decisions).toEqual([
+      expect.objectContaining({ choice: "split", nodeIds: ["implement", "implement-slice-1"] }),
+    ]);
   });
 
   it("applies add, supersede, split, fuse, and dependency amendments under contract policy", () => {
