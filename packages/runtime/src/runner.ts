@@ -350,45 +350,52 @@ async function executeWorker(input: {
   let termination: HostTermination | undefined;
 
   let artifact = join(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
-  try {
-    for await (const event of input.adapter.execute(
-      {
-        invocationId,
-        repositoryPath: input.workspace.path,
-        capsule,
-        allowedTools:
-          input.node.sideEffectClass === "workspace_write" ? ["read", "write", "shell"] : ["read"],
-        ...(resumeSessionId ? { resumeSessionId } : {}),
-      },
-      input.signal,
-    )) {
+  const execution = input.adapter.execute(
+    {
+      invocationId,
+      repositoryPath: input.workspace.path,
+      capsule,
+      allowedTools:
+        input.node.sideEffectClass === "workspace_write" ? ["read", "write", "shell"] : ["read"],
+      ...(resumeSessionId ? { resumeSessionId } : {}),
+    },
+    input.signal,
+  );
+  const iterator = execution[Symbol.asyncIterator]();
+  while (true) {
+    let next: IteratorResult<HostEvent>;
+    try {
+      next = await iterator.next();
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : String(cause);
+      errorCause = "host_crash";
+      const event: HostEvent = { type: "error", message: error, cause: errorCause };
       artifact = await input.store.appendInvocationEvent(invocationId, event);
-      if (event.type === "session") {
-        await input.store.append(
-          "host",
-          "invocation.session",
-          { invocationId, nodeId: input.node.id, hostSessionId: event.hostSessionId },
-          invocationId,
-        );
-      }
-      if (event.type === "message") input.observer?.({ type: "host", message: event.text });
-      if (event.type === "tool")
-        input.observer?.({ type: "host", message: `${event.name} ${event.summary}`.trim() });
-      if (event.type === "usage") {
-        await input.store.append("host", "tokens.recorded", { usage: event.usage }, invocationId);
-      }
-      if (event.type === "result") result = WorkerResultSchema.parse(event.result);
-      if (event.type === "terminated") termination = event.termination;
-      if (event.type === "error") {
-        error = event.message;
-        if (event.cause === "host_crash" || event.cause === "timeout") errorCause = event.cause;
-      }
+      break;
     }
-  } catch (cause) {
-    error = cause instanceof Error ? cause.message : String(cause);
-    errorCause = "host_crash";
-    const event: HostEvent = { type: "error", message: error, cause: errorCause };
+    if (next.done) break;
+    const event = next.value;
     artifact = await input.store.appendInvocationEvent(invocationId, event);
+    if (event.type === "session") {
+      await input.store.append(
+        "host",
+        "invocation.session",
+        { invocationId, nodeId: input.node.id, hostSessionId: event.hostSessionId },
+        invocationId,
+      );
+    }
+    if (event.type === "message") input.observer?.({ type: "host", message: event.text });
+    if (event.type === "tool")
+      input.observer?.({ type: "host", message: `${event.name} ${event.summary}`.trim() });
+    if (event.type === "usage") {
+      await input.store.append("host", "tokens.recorded", { usage: event.usage }, invocationId);
+    }
+    if (event.type === "result") result = WorkerResultSchema.parse(event.result);
+    if (event.type === "terminated") termination = event.termination;
+    if (event.type === "error") {
+      error = event.message;
+      if (event.cause === "host_crash" || event.cause === "timeout") errorCause = event.cause;
+    }
   }
   await input.store.append(
     "runtime",
