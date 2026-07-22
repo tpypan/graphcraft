@@ -32,7 +32,7 @@ export interface RepositoryIdentity {
 }
 
 export interface ContractOptions {
-  finishLine?: "local_verified" | "committed" | "pushed";
+  finishLine?: "local_verified" | "committed" | "pushed" | "pr_open";
   include?: string[];
   exclude?: string[];
 }
@@ -47,7 +47,10 @@ export function classifyTask(task: string): TaskFamily {
   return "feature";
 }
 
-export function inferFinishLine(task: string): "local_verified" | "committed" | "pushed" {
+export function inferFinishLine(
+  task: string,
+): "local_verified" | "committed" | "pushed" | "pr_open" {
+  if (/\b(?:open|create)(?:\s+(?:a|the))?\s+(?:pr|pull request)\b/i.test(task)) return "pr_open";
   if (
     /\bpush(?:ed|ing)?\s+(?:(?:the|this)\s+)?(?:(?:verified|accepted)\s+)?(?:branch|commit|changes|result)\b|\bpush(?:ed|ing)?\s+to\s+(?:origin|github|the remote)\b/i.test(
       task,
@@ -69,8 +72,9 @@ export function compileRunContract(
     "run_commands",
     "create_worktree",
   ];
-  if (finishKind === "committed" || finishKind === "pushed") permissions.push("commit");
-  if (finishKind === "pushed") permissions.push("push", "github_read", "github_write");
+  if (["committed", "pushed", "pr_open"].includes(finishKind)) permissions.push("commit");
+  if (finishKind === "pushed" || finishKind === "pr_open")
+    permissions.push("push", "github_read", "github_write");
 
   return RunContractSchema.parse({
     schemaVersion: 1,
@@ -208,7 +212,7 @@ export function compileGraph(contract: RunContract, verificationProbes: ProbeSpe
     }),
   ];
 
-  if (contract.finishLine.kind === "committed" || contract.finishLine.kind === "pushed") {
+  if (["committed", "pushed", "pr_open"].includes(contract.finishLine.kind)) {
     nodes.push(
       node({
         id: "commit",
@@ -220,13 +224,25 @@ export function compileGraph(contract: RunContract, verificationProbes: ProbeSpe
     );
   }
 
-  if (contract.finishLine.kind === "pushed") {
+  if (contract.finishLine.kind === "pushed" || contract.finishLine.kind === "pr_open") {
     nodes.push(
       node({
         id: "push",
         kind: "push",
         objective: "Push the accepted commit to the run's approved remote branch without force",
         dependsOn: ["commit"],
+        sideEffectClass: "external",
+      }),
+    );
+  }
+
+  if (contract.finishLine.kind === "pr_open") {
+    nodes.push(
+      node({
+        id: "pull-request",
+        kind: "pull_request",
+        objective: "Open or recover the pull request for the exact pushed run branch",
+        dependsOn: ["push"],
         sideEffectClass: "external",
       }),
     );
@@ -314,13 +330,19 @@ export function validateGraphPolicy(
   const terminal = terminalNodes[0]!;
   const commitNodes = graph.nodes.filter((candidate) => candidate.kind === "commit");
   const pushNodes = graph.nodes.filter((candidate) => candidate.kind === "push");
+  const pullRequestNodes = graph.nodes.filter((candidate) => candidate.kind === "pull_request");
   if (contract.finishLine.kind === "local_verified") {
-    if (commitNodes.length > 0 || pushNodes.length > 0)
-      throw new Error("A local_verified plan cannot contain commit or push nodes");
+    if (commitNodes.length > 0 || pushNodes.length > 0 || pullRequestNodes.length > 0)
+      throw new Error("A local_verified plan cannot contain commit, push, or pull-request nodes");
     if (terminal.kind !== "verification")
       throw new Error("A local_verified plan must end in a verification node");
   } else if (contract.finishLine.kind === "committed") {
-    if (commitNodes.length !== 1 || pushNodes.length > 0 || terminal.kind !== "commit")
+    if (
+      commitNodes.length !== 1 ||
+      pushNodes.length > 0 ||
+      pullRequestNodes.length > 0 ||
+      terminal.kind !== "commit"
+    )
       throw new Error("A committed plan must end in exactly one commit node");
     if (
       terminal.dependsOn.length !== 1 ||
@@ -330,7 +352,12 @@ export function validateGraphPolicy(
       throw new Error("The terminal commit node must directly depend on one verification node");
     }
   } else if (contract.finishLine.kind === "pushed") {
-    if (commitNodes.length !== 1 || pushNodes.length !== 1 || terminal.kind !== "push")
+    if (
+      commitNodes.length !== 1 ||
+      pushNodes.length !== 1 ||
+      pullRequestNodes.length > 0 ||
+      terminal.kind !== "push"
+    )
       throw new Error("A pushed plan must end in exactly one push after one commit");
     const commit = commitNodes[0]!;
     if (terminal.dependsOn.length !== 1 || terminal.dependsOn[0] !== commit.id)
@@ -340,6 +367,25 @@ export function validateGraphPolicy(
       graph.nodes.find((candidate) => candidate.id === commit.dependsOn[0])?.kind !== "verification"
     )
       throw new Error("The pushed commit node must directly depend on one verification node");
+  } else if (contract.finishLine.kind === "pr_open") {
+    if (
+      commitNodes.length !== 1 ||
+      pushNodes.length !== 1 ||
+      pullRequestNodes.length !== 1 ||
+      terminal.kind !== "pull_request"
+    )
+      throw new Error("A pr_open plan must end in exactly one pull request after push and commit");
+    const push = pushNodes[0]!;
+    const commit = commitNodes[0]!;
+    if (terminal.dependsOn.length !== 1 || terminal.dependsOn[0] !== push.id)
+      throw new Error("The terminal pull-request node must directly depend on the push node");
+    if (push.dependsOn.length !== 1 || push.dependsOn[0] !== commit.id)
+      throw new Error("The PR push node must directly depend on the commit node");
+    if (
+      commit.dependsOn.length !== 1 ||
+      graph.nodes.find((candidate) => candidate.id === commit.dependsOn[0])?.kind !== "verification"
+    )
+      throw new Error("The PR commit node must directly depend on one verification node");
   } else {
     throw new Error(`Finish line ${contract.finishLine.kind} is not executable locally`);
   }
@@ -383,7 +429,7 @@ export function validateGraphPolicy(
       throw new Error(`Planned node ${item.id} attempted to omit repository instructions`);
     if (
       item.sideEffectClass === "external" &&
-      (item.kind !== "push" ||
+      (!["push", "pull_request"].includes(item.kind) ||
         !contract.permissions.includes("push") ||
         !contract.permissions.includes("github_write"))
     )
@@ -401,6 +447,8 @@ export function validateGraphPolicy(
       throw new Error(`Commit node ${item.id} must use the git_commit side-effect class`);
     if (item.kind === "push" && item.sideEffectClass !== "external")
       throw new Error(`Push node ${item.id} must use the external side-effect class`);
+    if (item.kind === "pull_request" && item.sideEffectClass !== "external")
+      throw new Error(`Pull-request node ${item.id} must use the external side-effect class`);
     if (item.scope.length === 0 || item.scope.some((pattern) => !safeRelativePattern(pattern)))
       throw new Error(`Planned node ${item.id} contains an unsafe repository scope`);
     if (
@@ -588,7 +636,7 @@ function fuseReadOnlyPair(nodes: GraphNode[]): {
         producer.sideEffectClass !== "none" ||
         consumer.sideEffectClass !== "none" ||
         [producer.kind, consumer.kind].some((kind) =>
-          ["verification", "commit", "push", "wait"].includes(kind),
+          ["verification", "commit", "push", "pull_request", "wait"].includes(kind),
         ) ||
         dependents.length !== 1 ||
         !overlappingContext ||
@@ -957,7 +1005,7 @@ function verificationNode(graph: Graph): GraphNode {
   );
   while (
     candidate &&
-    (candidate.kind === "commit" || candidate.kind === "push") &&
+    ["commit", "push", "pull_request"].includes(candidate.kind) &&
     candidate.dependsOn.length === 1
   )
     candidate = graph.nodes.find((node) => node.id === candidate!.dependsOn[0]);
@@ -986,7 +1034,9 @@ export function applyProbePlan(graph: Graph, contract: RunContract, input: Probe
         : nodes.find((node) => node.sideEffectClass === "workspace_write");
     const target =
       preferred ??
-      nodes.find((node) => !["verification", "commit", "push", "wait"].includes(node.kind));
+      nodes.find(
+        (node) => !["verification", "commit", "push", "pull_request", "wait"].includes(node.kind),
+      );
     if (!target) throw new Error(`No executable node can own progress probe ${item.probe.id}`);
     target.progressProbes.push(item.probe);
   }

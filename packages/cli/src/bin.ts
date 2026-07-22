@@ -225,6 +225,7 @@ program
       "local_verified",
       "committed",
       "pushed",
+      "pr_open",
     ]),
   )
   .action(
@@ -448,8 +449,11 @@ program
       const graph = await store.loadGraph();
       const probePlan = await store.loadProbePlan();
       const state = await store.loadState();
-      if (state.status === "awaiting_approval" && contract.finishLine.kind === "pushed")
-        await prepareFinishLine(contract.task, store.repositoryRoot, "pushed");
+      if (
+        state.status === "awaiting_approval" &&
+        (contract.finishLine.kind === "pushed" || contract.finishLine.kind === "pr_open")
+      )
+        await prepareFinishLine(contract.task, store.repositoryRoot, contract.finishLine.kind);
       const approved =
         state.status !== "awaiting_approval" ||
         options.yes ||

@@ -101,6 +101,9 @@ importers:
       '@graphcraft/core':
         specifier: workspace:^
         version: link:../core
+      '@graphcraft/github':
+        specifier: workspace:^
+        version: link:../github
       '@graphcraft/probes':
         specifier: workspace:^
         version: link:../probes

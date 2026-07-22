@@ -9,6 +9,7 @@ export * from "./migration.ts";
 export * from "./repository.ts";
 export * from "./runner.ts";
 export * from "./side-effect.ts";
+export * from "./github.ts";
 export * from "./store.ts";
 export * from "./supervisor.ts";
 export * from "./wait.ts";

@@ -100,6 +100,40 @@ describe("run contracts and graphs", () => {
     });
   });
 
+  it("infers a pr_open contract with a terminal pull-request node", () => {
+    const contract = compileRunContract(
+      "Implement the migration and open a pull request",
+      repository,
+    );
+    const graph = compileGraph(contract, [
+      {
+        id: "tests",
+        kind: "command",
+        command: "npm",
+        args: ["test"],
+        expectedExitCode: 0,
+        timeoutMs: 1_000,
+      },
+    ]);
+
+    expect(contract.finishLine.kind).toBe("pr_open");
+    expect(contract.permissions).toEqual(
+      expect.arrayContaining(["commit", "push", "github_read", "github_write"]),
+    );
+    expect(graph.nodes.map(({ id }) => id)).toEqual([
+      "implement",
+      "verify",
+      "commit",
+      "push",
+      "pull-request",
+    ]);
+    expect(graph.nodes.at(-1)).toMatchObject({
+      kind: "pull_request",
+      dependsOn: ["push"],
+      sideEffectClass: "external",
+    });
+  });
+
   it("replaces held-out scoring implementations with integrity-bound graph references", () => {
     const runId = randomUUID();
     const hiddenCommand = {

@@ -6,6 +6,7 @@
   "exports": "./src/index.ts",
   "dependencies": {
     "@graphcraft/core": "workspace:^",
+    "@graphcraft/github": "workspace:^",
     "@graphcraft/probes": "workspace:^"
   }
 }

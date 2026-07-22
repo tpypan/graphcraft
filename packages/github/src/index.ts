@@ -563,10 +563,64 @@ const IdentityResponseSchema = z.strictObject({
   }),
 });
 
+export const GitHubPullRequestCandidateSchema = z.strictObject({
+  number: z.number().int().positive(),
+  url: z.string().url(),
+  title: z.string(),
+  body: z.string(),
+  state: z.string().min(1),
+  isDraft: z.boolean(),
+  headRefName: z.string().min(1),
+  baseRefName: z.string().min(1),
+  headSha: z.string().min(7),
+  baseSha: z.string().min(7),
+});
+
+export type GitHubPullRequestCandidate = z.infer<typeof GitHubPullRequestCandidateSchema>;
+
+const PullRequestsByHeadResponseSchema = z.strictObject({
+  data: z.strictObject({
+    repository: z.strictObject({
+      pullRequests: z.strictObject({
+        nodes: z.array(
+          z.strictObject({
+            number: z.number().int().positive(),
+            url: z.string().url(),
+            title: z.string(),
+            body: z.string(),
+            state: z.string().min(1),
+            isDraft: z.boolean(),
+            headRefName: z.string().min(1),
+            baseRefName: z.string().min(1),
+            headRefOid: z.string().min(7),
+            baseRefOid: z.string().min(7),
+          }),
+        ),
+        pageInfo: PageInfoSchema,
+      }),
+    }),
+    rateLimit: RateLimitSchema,
+  }),
+});
+
+const PullRequestMutationIdentitySchema = z.strictObject({
+  number: z.number().int().positive(),
+  url: z.string().url(),
+  title: z.string(),
+  body: z.string(),
+  state: z.string().min(1),
+  isDraft: z.boolean(),
+  headRefName: z.string().min(1),
+  baseRefName: z.string().min(1),
+  headRefOid: z.string().min(7),
+  baseRefOid: z.string().min(7),
+});
+
 const THREADS_QUERY = `query GraphcraftPullRequestThreads($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){url viewerPermission pullRequest(number:$number){number url title state isDraft headRefName baseRefName headRefOid baseRefOid mergeable reviewDecision updatedAt reviewThreads(first:100,after:$cursor){nodes{id isResolved isOutdated path line comments(last:1){totalCount nodes{id author{login} body url createdAt}}} pageInfo{hasNextPage endCursor}}}} rateLimit{cost remaining resetAt}}`;
 const REVIEWS_QUERY = `query GraphcraftPullRequestReviews($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid baseRefOid reviews(first:100,after:$cursor){nodes{id state author{login} commit{oid} submittedAt} pageInfo{hasNextPage endCursor}}}} rateLimit{cost remaining resetAt}}`;
 const CHECKS_QUERY = `query GraphcraftCommitChecks($owner:String!,$name:String!,$head:GitObjectID!,$cursor:String){repository(owner:$owner,name:$name){object(oid:$head){... on Commit{oid statusCheckRollup{contexts(first:100,after:$cursor){nodes{__typename ... on CheckRun{id name status conclusion detailsUrl app{databaseId}} ... on StatusContext{id context state targetUrl}} pageInfo{hasNextPage endCursor}}}}}} rateLimit{cost remaining resetAt}}`;
 const IDENTITY_QUERY = `query GraphcraftPullRequestIdentity($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid baseRefOid}} rateLimit{cost remaining resetAt}}`;
+const PULL_REQUESTS_BY_HEAD_QUERY = `query GraphcraftPullRequestsByHead($owner:String!,$name:String!,$head:String!,$cursor:String){repository(owner:$owner,name:$name){pullRequests(first:100,after:$cursor,headRefName:$head,states:[OPEN,CLOSED,MERGED],orderBy:{field:UPDATED_AT,direction:DESC}){nodes{number url title body state isDraft headRefName baseRefName headRefOid baseRefOid} pageInfo{hasNextPage endCursor}}} rateLimit{cost remaining resetAt}}`;
 
 async function graphql(
   options: GitHubCommandOptions,
@@ -580,6 +634,103 @@ async function graphql(
     args.push(typeof value === "number" ? "-F" : "-f", `${name}=${value}`);
   }
   return await jsonCommand(options, args);
+}
+
+export async function listGitHubPullRequestsForHead(
+  options: GitHubCommandOptions,
+  input: { host: string; nameWithOwner: string; headRefName: string },
+): Promise<GitHubPullRequestCandidate[]> {
+  const { owner, name } = repositoryParts(input.nameWithOwner);
+  const pullRequests: GitHubPullRequestCandidate[] = [];
+  let cursor: string | undefined;
+  do {
+    const response = PullRequestsByHeadResponseSchema.parse(
+      await graphql(options, input.host, PULL_REQUESTS_BY_HEAD_QUERY, {
+        owner,
+        name,
+        head: input.headRefName,
+        cursor,
+      }),
+    );
+    const connection = response.data.repository.pullRequests;
+    pullRequests.push(
+      ...connection.nodes.map((pullRequest) =>
+        GitHubPullRequestCandidateSchema.parse({
+          number: pullRequest.number,
+          url: pullRequest.url,
+          title: pullRequest.title,
+          body: pullRequest.body,
+          state: pullRequest.state,
+          isDraft: pullRequest.isDraft,
+          headRefName: pullRequest.headRefName,
+          baseRefName: pullRequest.baseRefName,
+          headSha: pullRequest.headRefOid,
+          baseSha: pullRequest.baseRefOid,
+        }),
+      ),
+    );
+    cursor = connection.pageInfo.hasNextPage
+      ? (connection.pageInfo.endCursor ?? undefined)
+      : undefined;
+    if (connection.pageInfo.hasNextPage && !cursor)
+      throw new Error("GitHub pull-request pagination omitted its next cursor");
+  } while (cursor);
+  return pullRequests;
+}
+
+export async function readGitHubPullRequestIdentity(
+  options: GitHubCommandOptions,
+  input: { nameWithOwner: string; number: number },
+): Promise<GitHubPullRequestCandidate> {
+  const value = PullRequestMutationIdentitySchema.parse(
+    await jsonCommand(options, [
+      "pr",
+      "view",
+      String(input.number),
+      "--repo",
+      input.nameWithOwner,
+      "--json",
+      "number,url,title,body,state,isDraft,headRefName,baseRefName,headRefOid,baseRefOid",
+    ]),
+  );
+  return GitHubPullRequestCandidateSchema.parse({
+    number: value.number,
+    url: value.url,
+    title: value.title,
+    body: value.body,
+    state: value.state,
+    isDraft: value.isDraft,
+    headRefName: value.headRefName,
+    baseRefName: value.baseRefName,
+    headSha: value.headRefOid,
+    baseSha: value.baseRefOid,
+  });
+}
+
+export async function createGitHubPullRequest(
+  options: GitHubCommandOptions,
+  input: {
+    nameWithOwner: string;
+    headRefName: string;
+    baseRefName: string;
+    title: string;
+    body: string;
+  },
+): Promise<void> {
+  await runCommand(options, [
+    "pr",
+    "create",
+    "--repo",
+    input.nameWithOwner,
+    "--head",
+    input.headRefName,
+    "--base",
+    input.baseRefName,
+    "--title",
+    input.title,
+    "--body",
+    input.body,
+  ]);
 }
 
 function assertBound(

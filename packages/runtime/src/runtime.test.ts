@@ -170,6 +170,123 @@ async function createRepositoryWithRemote(): Promise<{ repository: string; remot
   return { repository, remote };
 }
 
+async function fakePullRequestGitHub(
+  remote: string,
+  initial: Record<string, unknown> = {},
+): Promise<{
+  command: string;
+  env: NodeJS.ProcessEnv;
+  statePath: string;
+  logPath: string;
+}> {
+  const root = await mkdtemp(join(tmpdir(), "graphcraft-runtime-github-test-"));
+  temporaryRoots.push(root);
+  const command = join(root, "gh");
+  const statePath = join(root, "state.json");
+  const logPath = join(root, "calls.jsonl");
+  await writeFile(
+    statePath,
+    `${JSON.stringify({
+      remote,
+      permission: "WRITE",
+      pullRequests: [],
+      createCalls: 0,
+      ...initial,
+    })}\n`,
+  );
+  await writeFile(
+    command,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const { execFileSync } = require("node:child_process");
+const args = process.argv.slice(2);
+const statePath = process.env.GRAPHCRAFT_RUNTIME_GH_STATE;
+const logPath = process.env.GRAPHCRAFT_RUNTIME_GH_LOG;
+const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+fs.appendFileSync(logPath, JSON.stringify(args) + "\\n");
+const save = () => fs.writeFileSync(statePath, JSON.stringify(state) + "\\n");
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+const fail = (message, code = 1) => { process.stderr.write(message + "\\n"); process.exit(code); };
+const value = (flag) => args[args.indexOf(flag) + 1];
+const sha = (branch) => execFileSync("git", ["--git-dir", state.remote, "rev-parse", "refs/heads/" + branch], { encoding: "utf8" }).trim();
+if (args[0] === "--version") { console.log("gh version 2.80.0"); process.exit(0); }
+if (args[0] === "auth") { console.log("github.com authenticated"); process.exit(0); }
+if (args[0] === "repo" && args[1] === "view") {
+  send({ nameWithOwner: "tpypan/fixture", url: "https://github.com/tpypan/fixture", viewerPermission: state.permission, defaultBranchRef: { name: "main" } });
+  process.exit(0);
+}
+if (args[0] === "pr" && args[1] === "create") {
+  const headRefName = value("--head");
+  if (state.pullRequests.some((candidate) => candidate.headRefName === headRefName && candidate.state === "OPEN"))
+    fail("a pull request for this branch already exists");
+  const number = 100 + state.pullRequests.length;
+  const pullRequest = {
+    number,
+    url: "https://github.com/tpypan/fixture/pull/" + number,
+    title: value("--title"),
+    body: value("--body"),
+    state: "OPEN",
+    isDraft: false,
+    headRefName,
+    baseRefName: value("--base"),
+    headSha: sha(headRefName),
+    baseSha: sha(value("--base")),
+  };
+  state.pullRequests.push(pullRequest);
+  state.createCalls += 1;
+  save();
+  if (state.failAfterCreate) fail("simulated response loss after creation");
+  console.log(pullRequest.url);
+  process.exit(0);
+}
+if (args[0] === "pr" && args[1] === "view") {
+  const number = Number(args[2]);
+  const pullRequest = state.pullRequests.find((candidate) => candidate.number === number);
+  if (!pullRequest) fail("pull request not found");
+  send({ ...pullRequest, headRefOid: pullRequest.headSha, baseRefOid: pullRequest.baseSha, headSha: undefined, baseSha: undefined });
+  process.exit(0);
+}
+if (args[0] !== "api") fail("unexpected command: " + args.join(" "));
+const endpoint = args.find((candidate, index) => index > 0 && !candidate.startsWith("-") && args[index - 1] !== "--hostname" && args[index - 1] !== "-f" && args[index - 1] !== "-F");
+if (endpoint && endpoint.startsWith("repos/tpypan/fixture/branches/")) {
+  if (endpoint.endsWith("/protection")) send({ required_status_checks: null, required_pull_request_reviews: null });
+  else send({ protected: false });
+  process.exit(0);
+}
+if (args[1] !== "graphql") fail("unexpected api endpoint: " + endpoint);
+const fields = {};
+for (let index = 0; index < args.length - 1; index += 1) {
+  if (args[index] === "-f" || args[index] === "-F") {
+    const [key, ...parts] = args[index + 1].split("=");
+    fields[key] = parts.join("=");
+  }
+}
+const query = fields.query || "";
+const rateLimit = { cost: 1, remaining: 4999, resetAt: "2027-01-15T08:00:00.000Z" };
+if (query.includes("GraphcraftPullRequestsByHead")) {
+  const matching = state.pullRequests.filter((candidate) => candidate.headRefName === fields.head);
+  send({ data: { repository: { pullRequests: {
+    nodes: matching.map((pullRequest) => ({ ...pullRequest, headRefOid: pullRequest.headSha, baseRefOid: pullRequest.baseSha, headSha: undefined, baseSha: undefined })),
+    pageInfo: { hasNextPage: false, endCursor: null },
+  } }, rateLimit } });
+  process.exit(0);
+}
+fail("unknown GraphQL operation");
+`,
+  );
+  await chmod(command, 0o700);
+  return {
+    command,
+    statePath,
+    logPath,
+    env: {
+      ...process.env,
+      GRAPHCRAFT_RUNTIME_GH_STATE: statePath,
+      GRAPHCRAFT_RUNTIME_GH_LOG: logPath,
+    },
+  };
+}
+
 class FakeAdapter implements HostAdapter {
   readonly id: HostAdapter["id"];
   readonly calls: string[] = [];
@@ -272,7 +389,8 @@ class FakeAdapter implements HostAdapter {
     ];
     if (
       request.contract.finishLine.kind === "committed" ||
-      request.contract.finishLine.kind === "pushed"
+      request.contract.finishLine.kind === "pushed" ||
+      request.contract.finishLine.kind === "pr_open"
     ) {
       nodes.push({
         id: "commit",
@@ -290,7 +408,10 @@ class FakeAdapter implements HostAdapter {
         sideEffectClass: "git_commit",
       });
     }
-    if (request.contract.finishLine.kind === "pushed") {
+    if (
+      request.contract.finishLine.kind === "pushed" ||
+      request.contract.finishLine.kind === "pr_open"
+    ) {
       nodes.push({
         id: "push",
         kind: "push",
@@ -300,6 +421,23 @@ class FakeAdapter implements HostAdapter {
         contextSelector: {
           includeRepositoryInstructions: true,
           predecessorResults: ["commit"],
+          relevantPaths: [],
+        },
+        progressProbes: [],
+        completionProbes: [],
+        sideEffectClass: "external",
+      });
+    }
+    if (request.contract.finishLine.kind === "pr_open") {
+      nodes.push({
+        id: "pull-request",
+        kind: "pull_request",
+        objective: "Open or recover the exact pull request",
+        dependsOn: ["push"],
+        scope: ["**/*"],
+        contextSelector: {
+          includeRepositoryInstructions: true,
+          predecessorResults: ["push"],
           relevantPaths: [],
         },
         progressProbes: [],
@@ -2536,6 +2674,338 @@ process.stdin.on("end", () => {
       status: "failed",
       retryable: true,
     });
+  });
+
+  it("opens one exact pull request after the accepted normal push", async () => {
+    const { repository, remote } = await createRepositoryWithRemote();
+    const github = await fakePullRequestGitHub(remote);
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "pull request\n");
+    });
+    const created = await createRun("Implement the feature and open a pull request", {
+      cwd: repository,
+      finishLine: "pr_open",
+      planner: adapter,
+    });
+    const state = await executeRun({
+      store: created.store,
+      adapter,
+      approve: true,
+      github,
+    });
+    const workspace = await created.store.loadWorkspace<{ branch: string }>();
+    const persisted = JSON.parse(await readFile(github.statePath, "utf8")) as {
+      createCalls: number;
+      pullRequests: Array<Record<string, unknown>>;
+    };
+    const pullRequest = state.sideEffects.find(({ claim }) => claim.kind === "github_pr_create");
+
+    expect(state.status).toBe("completed");
+    expect(state.nodes["pull-request"]?.status).toBe("accepted");
+    expect(state.sideEffects.map(({ claim }) => claim.kind)).toEqual([
+      "git_commit",
+      "git_push",
+      "github_pr_create",
+    ]);
+    expect(pullRequest).toMatchObject({
+      status: "confirmed",
+      result: { number: 100, state: "OPEN" },
+      claim: {
+        precondition: { headRefName: workspace.branch, baseRefName: "main" },
+      },
+    });
+    expect(persisted.createCalls).toBe(1);
+    expect(persisted.pullRequests).toMatchObject([
+      {
+        number: 100,
+        state: "OPEN",
+        headRefName: workspace.branch,
+        baseRefName: "main",
+      },
+    ]);
+    expect(String(persisted.pullRequests[0]?.body)).toContain(
+      `Graphcraft-Action: ${pullRequest?.claim.idempotencyKey}`,
+    );
+  });
+
+  it("reconciles one pull-request creation across every side-effect boundary", async () => {
+    const faultPoints: SideEffectBoundary[] = [
+      "before_claim",
+      "after_claim",
+      "after_precondition_reconcile",
+      "before_act",
+      "after_action_prepare",
+      "after_action_command",
+      "after_act",
+      "after_confirmation_reconcile",
+      "after_confirm",
+      "after_node_acceptance",
+    ];
+
+    for (const faultPoint of faultPoints) {
+      const { repository, remote } = await createRepositoryWithRemote();
+      const github = await fakePullRequestGitHub(remote);
+      const adapter = new FakeAdapter(async (request) => {
+        if (request.capsule.nodeId === "implement")
+          await writeFile(join(request.repositoryPath, "feature.txt"), "pull request\n");
+      });
+      const created = await createRun("Implement the feature and open a pull request", {
+        cwd: repository,
+        finishLine: "pr_open",
+      });
+      const pullRequestBoundaries: SideEffectBoundary[] = [];
+      let armed = true;
+      const boundary = async (point: SideEffectBoundary): Promise<void> => {
+        const state = await created.store.loadState();
+        const claimed = state.sideEffects.some(({ claim }) => claim.kind === "github_pr_create");
+        const atPullRequest =
+          claimed ||
+          (point === "before_claim" && state.nodes.push?.status === "accepted" && !claimed);
+        if (!atPullRequest) return;
+        pullRequestBoundaries.push(point);
+        if (armed && point === faultPoint) {
+          armed = false;
+          throw new Error(`Injected pull-request termination at ${point}`);
+        }
+      };
+      await expect(
+        executeRun({
+          store: created.store,
+          adapter,
+          approve: true,
+          github,
+          sideEffectBoundary: boundary,
+        }),
+        faultPoint,
+      ).rejects.toThrow(`Side-effect execution interrupted after ${faultPoint}`);
+      expect(armed, faultPoint).toBe(false);
+
+      const completed = await executeRun({
+        store: created.store,
+        adapter,
+        github,
+        sideEffectBoundary: boundary,
+      });
+      const persisted = JSON.parse(await readFile(github.statePath, "utf8")) as {
+        createCalls: number;
+        pullRequests: unknown[];
+      };
+      const events = await created.store.loadEvents();
+
+      expect(completed.status, faultPoint).toBe("completed");
+      expect(persisted.createCalls, faultPoint).toBe(1);
+      expect(persisted.pullRequests, faultPoint).toHaveLength(1);
+      expect(
+        completed.sideEffects.filter(({ claim }) => claim.kind === "github_pr_create"),
+        faultPoint,
+      ).toMatchObject([{ status: "confirmed", result: { state: "OPEN" } }]);
+      expect(
+        events.filter(
+          ({ type, data }) =>
+            type === "side_effect.claimed" &&
+            (data.claim as { kind?: string } | undefined)?.kind === "github_pr_create",
+        ),
+        faultPoint,
+      ).toHaveLength(1);
+      expect(
+        events.filter(
+          ({ type, data }) => type === "node.accepted" && data.nodeId === "pull-request",
+        ),
+        faultPoint,
+      ).toHaveLength(1);
+      expect(
+        pullRequestBoundaries.filter((point) => point === "after_action_command"),
+        faultPoint,
+      ).toHaveLength(1);
+    }
+  }, 180_000);
+
+  it("recovers an existing exact pull request without creating another", async () => {
+    const { repository, remote } = await createRepositoryWithRemote();
+    const github = await fakePullRequestGitHub(remote);
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "pull request\n");
+    });
+    const created = await createRun("Implement the feature and open a pull request", {
+      cwd: repository,
+      finishLine: "pr_open",
+    });
+    let armed = true;
+    await expect(
+      executeRun({
+        store: created.store,
+        adapter,
+        approve: true,
+        github,
+        sideEffectBoundary: async (point) => {
+          const state = await created.store.loadState();
+          if (armed && point === "before_claim" && state.nodes.push?.status === "accepted") {
+            armed = false;
+            throw new Error("Stop before the pull-request claim");
+          }
+        },
+      }),
+    ).rejects.toThrow("Side-effect execution interrupted after before_claim");
+    const workspace = await created.store.loadWorkspace<{ path: string; branch: string }>();
+    const { stdout: headSha } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+      cwd: workspace.path,
+    });
+    const { stdout: baseSha } = await execFileAsync(
+      "git",
+      ["--git-dir", remote, "rev-parse", "refs/heads/main"],
+      { cwd: repository },
+    );
+    const persisted = JSON.parse(await readFile(github.statePath, "utf8")) as {
+      createCalls: number;
+      pullRequests: Array<Record<string, unknown>>;
+    };
+    persisted.pullRequests.push(
+      {
+        number: 76,
+        url: "https://github.com/tpypan/fixture/pull/76",
+        title: "Closed history",
+        body: "Previously closed",
+        state: "CLOSED",
+        isDraft: false,
+        headRefName: workspace.branch,
+        baseRefName: "main",
+        headSha: headSha.trim(),
+        baseSha: baseSha.trim(),
+      },
+      {
+        number: 77,
+        url: "https://github.com/tpypan/fixture/pull/77",
+        title: "Existing exact PR",
+        body: "Created outside Graphcraft",
+        state: "OPEN",
+        isDraft: false,
+        headRefName: workspace.branch,
+        baseRefName: "main",
+        headSha: headSha.trim(),
+        baseSha: baseSha.trim(),
+      },
+    );
+    await writeFile(github.statePath, `${JSON.stringify(persisted)}\n`);
+
+    const completed = await executeRun({ store: created.store, adapter, github });
+    const finalState = JSON.parse(await readFile(github.statePath, "utf8")) as {
+      createCalls: number;
+      pullRequests: unknown[];
+    };
+
+    expect(completed.status).toBe("completed");
+    expect(finalState.createCalls).toBe(0);
+    expect(finalState.pullRequests).toHaveLength(2);
+    expect(
+      completed.sideEffects.find(({ claim }) => claim.kind === "github_pr_create"),
+    ).toMatchObject({ status: "confirmed", result: { number: 77 } });
+  });
+
+  it("reconciles a lost create response from the action marker", async () => {
+    const { repository, remote } = await createRepositoryWithRemote();
+    const github = await fakePullRequestGitHub(remote, { failAfterCreate: true });
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "pull request\n");
+    });
+    const created = await createRun("Implement the feature and open a pull request", {
+      cwd: repository,
+      finishLine: "pr_open",
+    });
+
+    const completed = await executeRun({
+      store: created.store,
+      adapter,
+      approve: true,
+      github,
+    });
+    const persisted = JSON.parse(await readFile(github.statePath, "utf8")) as {
+      createCalls: number;
+      pullRequests: unknown[];
+    };
+
+    expect(completed.status).toBe("completed");
+    expect(persisted.createCalls).toBe(1);
+    expect(persisted.pullRequests).toHaveLength(1);
+  });
+
+  it("refuses a concurrent unmarked PR after claim and base movement after confirmation", async () => {
+    for (const faultPoint of ["after_claim", "after_confirm"] as const) {
+      const { repository, remote } = await createRepositoryWithRemote();
+      const github = await fakePullRequestGitHub(remote);
+      const adapter = new FakeAdapter(async (request) => {
+        if (request.capsule.nodeId === "implement")
+          await writeFile(join(request.repositoryPath, "feature.txt"), "pull request\n");
+      });
+      const created = await createRun("Implement the feature and open a pull request", {
+        cwd: repository,
+        finishLine: "pr_open",
+      });
+      let armed = true;
+      await expect(
+        executeRun({
+          store: created.store,
+          adapter,
+          approve: true,
+          github,
+          sideEffectBoundary: async (point) => {
+            const state = await created.store.loadState();
+            const atPullRequest = state.sideEffects.some(
+              ({ claim }) => claim.kind === "github_pr_create",
+            );
+            if (armed && atPullRequest && point === faultPoint) {
+              armed = false;
+              throw new Error(`Injected pull-request termination at ${point}`);
+            }
+          },
+        }),
+      ).rejects.toThrow(`Side-effect execution interrupted after ${faultPoint}`);
+      const workspace = await created.store.loadWorkspace<{ path: string; branch: string }>();
+      if (faultPoint === "after_claim") {
+        const { stdout: headSha } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+          cwd: workspace.path,
+        });
+        const { stdout: baseSha } = await execFileAsync(
+          "git",
+          ["--git-dir", remote, "rev-parse", "refs/heads/main"],
+          { cwd: repository },
+        );
+        const persisted = JSON.parse(await readFile(github.statePath, "utf8")) as {
+          pullRequests: Array<Record<string, unknown>>;
+        };
+        persisted.pullRequests.push({
+          number: 88,
+          url: "https://github.com/tpypan/fixture/pull/88",
+          title: "Concurrent PR",
+          body: "No action marker",
+          state: "OPEN",
+          isDraft: false,
+          headRefName: workspace.branch,
+          baseRefName: "main",
+          headSha: headSha.trim(),
+          baseSha: baseSha.trim(),
+        });
+        await writeFile(github.statePath, `${JSON.stringify(persisted)}\n`);
+      } else {
+        const { stdout: headSha } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+          cwd: workspace.path,
+        });
+        await execFileAsync(
+          "git",
+          ["--git-dir", remote, "update-ref", "refs/heads/main", headSha.trim()],
+          { cwd: repository },
+        );
+      }
+
+      const state = await executeRun({ store: created.store, adapter, github });
+      const pullRequest = state.sideEffects.find(({ claim }) => claim.kind === "github_pr_create");
+
+      expect(state.status, faultPoint).toBe("blocked");
+      expect(state.nodes["pull-request"]?.status, faultPoint).toBe("failed");
+      expect(pullRequest, faultPoint).toMatchObject({ status: "uncertain", retryable: false });
+    }
   });
 
   it("rebuilds a corrupted materialized state from hashed events", async () => {

@@ -6,7 +6,10 @@ import {
   assertGitHubPushCapability,
   assertGitHubSnapshotCurrent,
   captureGitHubPullRequestSnapshot,
+  createGitHubPullRequest,
+  listGitHubPullRequestsForHead,
   probeGitHub,
+  readGitHubPullRequestIdentity,
 } from "./index.ts";
 
 const temporaryRoots: string[] = [];
@@ -37,6 +40,7 @@ async function fakeGitHub(state: Record<string, unknown> = {}): Promise<{
       headSha: "a".repeat(40),
       baseSha: "b".repeat(40),
       identityCalls: 0,
+      pullRequests: [],
       ...state,
     })}\n`,
   );
@@ -65,7 +69,49 @@ if (args[0] === "repo" && args[1] === "view") {
   });
   process.exit(0);
 }
-if (args[0] === "pr" && args[1] === "view") { send({ number: 42 }); process.exit(0); }
+if (args[0] === "pr" && args[1] === "view") {
+  const fields = args[args.indexOf("--json") + 1];
+  if (fields === "number") { send({ number: 42 }); process.exit(0); }
+  const number = Number(args[2]);
+  const pullRequest = state.pullRequests.find((candidate) => candidate.number === number);
+  if (!pullRequest) fail("pull request not found");
+  send({
+    number: pullRequest.number,
+    url: pullRequest.url,
+    title: pullRequest.title,
+    body: pullRequest.body,
+    state: pullRequest.state,
+    isDraft: pullRequest.isDraft,
+    headRefName: pullRequest.headRefName,
+    baseRefName: pullRequest.baseRefName,
+    headRefOid: pullRequest.headSha,
+    baseRefOid: pullRequest.baseSha,
+  });
+  process.exit(0);
+}
+if (args[0] === "pr" && args[1] === "create") {
+  const value = (flag) => args[args.indexOf(flag) + 1];
+  const headRefName = value("--head");
+  if (state.pullRequests.some((candidate) => candidate.headRefName === headRefName && candidate.state === "OPEN"))
+    fail("a pull request for this branch already exists");
+  const number = 100 + state.pullRequests.length;
+  const pullRequest = {
+    number,
+    url: "https://github.com/tpypan/graphcraft/pull/" + number,
+    title: value("--title"),
+    body: value("--body"),
+    state: "OPEN",
+    isDraft: false,
+    headRefName,
+    baseRefName: value("--base"),
+    headSha: state.headSha,
+    baseSha: state.baseSha,
+  };
+  state.pullRequests.push(pullRequest);
+  fs.writeFileSync(statePath, JSON.stringify(state) + "\\n");
+  console.log(pullRequest.url);
+  process.exit(0);
+}
 if (args[0] !== "api") fail("unexpected command: " + args.join(" "));
 const endpoint = args.find((value, index) => index > 0 && !value.startsWith("-") && args[index - 1] !== "--hostname" && args[index - 1] !== "-f" && args[index - 1] !== "-F");
 if (endpoint === "rate_limit") {
@@ -112,6 +158,27 @@ const identity = {
   reviewDecision: "CHANGES_REQUESTED",
   updatedAt: "2026-07-21T20:00:00.000Z",
 };
+if (query.includes("GraphcraftPullRequestsByHead")) {
+  const matching = state.pullRequests.filter((candidate) => candidate.headRefName === fields.head);
+  const start = fields.cursor ? Number(fields.cursor) : 0;
+  const size = state.paginatePullRequests ? 1 : 100;
+  const selected = matching.slice(start, start + size);
+  const next = start + selected.length;
+  send({ data: {
+    repository: { pullRequests: {
+      nodes: selected.map((pullRequest) => ({
+        ...pullRequest,
+        headRefOid: pullRequest.headSha,
+        baseRefOid: pullRequest.baseSha,
+        headSha: undefined,
+        baseSha: undefined,
+      })),
+      pageInfo: { hasNextPage: next < matching.length, endCursor: next < matching.length ? String(next) : null },
+    } },
+    rateLimit,
+  } });
+  process.exit(0);
+}
 if (query.includes("GraphcraftPullRequestThreads")) {
   const second = fields.cursor === "thread-next";
   send({ data: {
@@ -314,5 +381,87 @@ describe("GitHub capability and snapshot layer", () => {
       canWrite: true,
       readyForSnapshot: true,
     });
+  });
+
+  it("fully paginates head-branch pull requests and exposes one explicit create mutation", async () => {
+    const headRefName = "graphcraft/run-branch";
+    const existing = await fakeGitHub({
+      paginatePullRequests: true,
+      pullRequests: [
+        {
+          number: 7,
+          url: "https://github.com/tpypan/graphcraft/pull/7",
+          title: "First",
+          body: "first",
+          state: "CLOSED",
+          isDraft: false,
+          headRefName,
+          baseRefName: "main",
+          headSha: "a".repeat(40),
+          baseSha: "b".repeat(40),
+        },
+        {
+          number: 8,
+          url: "https://github.com/tpypan/graphcraft/pull/8",
+          title: "Second",
+          body: "second",
+          state: "OPEN",
+          isDraft: false,
+          headRefName,
+          baseRefName: "main",
+          headSha: "a".repeat(40),
+          baseSha: "b".repeat(40),
+        },
+      ],
+    });
+    await expect(
+      listGitHubPullRequestsForHead(existing, {
+        host: "github.com",
+        nameWithOwner: "tpypan/graphcraft",
+        headRefName,
+      }),
+    ).resolves.toHaveLength(2);
+    const existingCalls = (await readFile(existing.logPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    expect(
+      existingCalls.filter((args) =>
+        args.some((argument) => argument.includes("GraphcraftPullRequestsByHead")),
+      ),
+    ).toHaveLength(2);
+
+    const created = await fakeGitHub();
+    await createGitHubPullRequest(created, {
+      nameWithOwner: "tpypan/graphcraft",
+      headRefName,
+      baseRefName: "main",
+      title: "Create durable PR",
+      body: "<!-- Graphcraft-Action: graphcraft-test -->",
+    });
+    const candidates = await listGitHubPullRequestsForHead(created, {
+      host: "github.com",
+      nameWithOwner: "tpypan/graphcraft",
+      headRefName,
+    });
+    expect(candidates).toMatchObject([
+      { number: 100, state: "OPEN", headRefName, baseRefName: "main" },
+    ]);
+    await expect(
+      readGitHubPullRequestIdentity(created, {
+        nameWithOwner: "tpypan/graphcraft",
+        number: 100,
+      }),
+    ).resolves.toMatchObject({ number: 100, state: "OPEN" });
+    const createCalls = (await readFile(created.logPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    expect(createCalls.filter((args) => args[0] === "pr" && args[1] === "create")).toHaveLength(1);
+    expect(
+      createCalls.some((args) =>
+        args.some((argument) => /^(?:close|comment|merge|reopen|rerun|resolve)$/.test(argument)),
+      ),
+    ).toBe(false);
   });
 });

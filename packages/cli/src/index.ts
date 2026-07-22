@@ -194,24 +194,29 @@ export function shouldBypassGraph(task: string): boolean {
   return assessTaskShape(task).bypass;
 }
 
-export type ExecutableFinishLine = "local_verified" | "committed" | "pushed";
+export type ExecutableFinishLine = "local_verified" | "committed" | "pushed" | "pr_open";
 
 export async function prepareFinishLine(
   task: string,
   cwd: string,
   requested?: ExecutableFinishLine,
 ): Promise<ExecutableFinishLine> {
-  if (/\b(open (?:a )?pr|pull request|pr green|merge|deploy)\b/i.test(task))
+  if (
+    /\b(pr green|merge|deploy|force[- ]?push)\b|\brebase\b.{0,40}\b(?:published|remote)\s+branch\b/i.test(
+      task,
+    )
+  )
     throw new Error(
-      "Graphcraft supports local_verified, committed, and pushed finish lines. It will not silently narrow a requested PR, merge, or deployment outcome.",
+      "Graphcraft supports local_verified, committed, pushed, and pr_open finish lines. It will not infer PR-green, force-push, published-branch rebase, merge, or deployment authority.",
     );
   const inferred = inferFinishLine(task);
-  if (inferred === "pushed" && requested && requested !== "pushed")
+  if (["pushed", "pr_open"].includes(inferred) && requested && requested !== inferred)
     throw new Error(
-      "The requested task includes a push outcome, so Graphcraft will not silently narrow it to a local finish line.",
+      `The requested task includes a ${inferred} outcome, so Graphcraft will not silently narrow it to ${requested}.`,
     );
   const finishLine = requested ?? inferred;
-  if (finishLine === "pushed") await assertGitHubPushCapability({ cwd });
+  if (finishLine === "pushed" || finishLine === "pr_open")
+    await assertGitHubPushCapability({ cwd });
   return finishLine;
 }
 
@@ -508,7 +513,10 @@ export async function handleAction(input: McpActionInput): Promise<Record<string
     if (state.status === "awaiting_approval" && !input.approve) {
       return { approvalRequired: true, contract: contractView(contract, graph, probePlan) };
     }
-    if (state.status === "awaiting_approval" && contract.finishLine.kind === "pushed")
+    if (
+      state.status === "awaiting_approval" &&
+      (contract.finishLine.kind === "pushed" || contract.finishLine.kind === "pr_open")
+    )
       await assertGitHubPushCapability({ cwd: store.repositoryRoot });
     const resumed = await executeRun({
       store,

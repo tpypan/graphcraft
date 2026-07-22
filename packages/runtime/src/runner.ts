@@ -87,10 +87,16 @@ import {
   heldOutIntegrityFailures,
 } from "./held-out.ts";
 import { assessRunProgress, createProgressDecisionPacket } from "./trajectory.ts";
+import {
+  createPullRequestClaim,
+  performPullRequestCreation,
+  reconcilePullRequest,
+  type GitHubExecutionOptions,
+} from "./github.ts";
 
 export interface CreateRunOptions {
   cwd: string;
-  finishLine?: "local_verified" | "committed" | "pushed";
+  finishLine?: "local_verified" | "committed" | "pushed" | "pr_open";
   planner?: GraphPlanner;
   signal?: AbortSignal;
 }
@@ -112,6 +118,7 @@ function populateMissingGraphContext(
     nodes: graph.nodes.map((node) =>
       node.kind === "commit" ||
       node.kind === "push" ||
+      node.kind === "pull_request" ||
       node.contextSelector.relevantPaths.length > 0
         ? node
         : {
@@ -254,7 +261,7 @@ async function recordMissingUsage(
 
 async function validatePlannedContext(graph: Graph, repositoryPath: string): Promise<void> {
   for (const node of graph.nodes) {
-    if (node.kind === "commit" || node.kind === "push") continue;
+    if (node.kind === "commit" || node.kind === "push" || node.kind === "pull_request") continue;
     if (node.contextSelector.relevantPaths.length === 0)
       throw new Error(`Planned node ${node.id} did not select repository evidence`);
     for (const relevantPath of node.contextSelector.relevantPaths) {
@@ -824,7 +831,7 @@ function readyBatch(
         costBasis: "deterministic_static",
       }),
     };
-  if (["verification", "commit", "push", "wait"].includes(first.kind))
+  if (["verification", "commit", "push", "pull_request", "wait"].includes(first.kind))
     return {
       nodes: [first],
       decision: runtimeOptimizationDecision({
@@ -842,7 +849,7 @@ function readyBatch(
     .slice(1)
     .find(
       (candidate) =>
-        !["verification", "commit", "push", "wait"].includes(candidate.kind) &&
+        !["verification", "commit", "push", "pull_request", "wait"].includes(candidate.kind) &&
         !concurrencyConflict(graph, first, candidate),
     );
   if (!second)
@@ -904,8 +911,8 @@ async function hostContextOptimization(
   const eligible =
     source !== undefined &&
     source.sideEffectClass === node.sideEffectClass &&
-    !["verification", "commit", "push", "wait"].includes(source.kind) &&
-    !["verification", "commit", "push", "wait"].includes(node.kind) &&
+    !["verification", "commit", "push", "pull_request", "wait"].includes(source.kind) &&
+    !["verification", "commit", "push", "pull_request", "wait"].includes(node.kind) &&
     minimumContext > 0 &&
     sharedPaths.length / minimumContext >= 0.5;
   const events = eligible ? await store.loadEvents() : [];
@@ -1397,6 +1404,7 @@ export async function executeRun(input: {
   maxWorkers?: 1 | 2;
   superviseWaits?: boolean;
   sideEffectBoundary?: (point: SideEffectBoundary) => void | Promise<void>;
+  github?: GitHubExecutionOptions;
 }): Promise<RunState> {
   const externalSignal = input.signal ?? new AbortController().signal;
   const contract = await input.store.loadContract();
@@ -1596,7 +1604,7 @@ export async function executeRun(input: {
       const reuseSessions = new Map<string, { hostSessionId: string; sourceNodeId: string }>();
       for (const candidate of batch) {
         if (
-          ["verification", "commit", "push", "wait"].includes(candidate.kind) ||
+          ["verification", "commit", "push", "pull_request", "wait"].includes(candidate.kind) ||
           recoveries.has(candidate.id)
         )
           continue;
@@ -2082,6 +2090,65 @@ export async function executeRun(input: {
             sha: result.sha,
             remote: result.remote,
             branch: result.branch,
+            sideEffectActionId: proposedClaim.actionId,
+          });
+          await crossSideEffectBoundary(input.sideEffectBoundary, "after_node_acceptance");
+        } catch (error) {
+          if (error instanceof SideEffectBoundaryInterruption) throw error;
+          await input.store.append("runtime", "node.failed", {
+            nodeId: current.id,
+            reason: (error as Error).message,
+          });
+          await input.store.append("runtime", "run.blocked", { reason: (error as Error).message });
+          return await input.store.loadState();
+        }
+        continue;
+      }
+
+      if (current.kind === "pull_request") {
+        const control = await evaluateSuccessfulControl({
+          store: input.store,
+          graph,
+          node: current,
+          rationale: "The exact pushed branch is ready for the approved pull-request boundary",
+          evidence: state.latestProgressEvidence,
+        });
+        if (!control.allowed) {
+          const reason = control.reason ?? `Control graph blocked pull-request node ${current.id}`;
+          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+          await input.store.append("runtime", "run.blocked", {
+            reason,
+            ...(control.packet ? { decisionPacket: control.packet } : {}),
+          });
+          return await input.store.loadState();
+        }
+        try {
+          const existingClaim = (await input.store.loadState()).sideEffects.find(
+            ({ claim }) => claim.nodeId === current.id && claim.kind === "github_pr_create",
+          )?.claim;
+          const proposedClaim =
+            existingClaim ??
+            (await createPullRequestClaim(workspace, contract, current.id, input.github));
+          const result = await executeSideEffect({
+            store: input.store,
+            claim: proposedClaim,
+            reconcile: async (claim) => await reconcilePullRequest(workspace, claim, input.github),
+            act: async (claim) =>
+              await performPullRequestCreation(
+                workspace,
+                claim,
+                input.github,
+                input.sideEffectBoundary,
+              ),
+            revalidateConfirmed: true,
+            ...(input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}),
+          });
+          await input.store.append("runtime", "node.accepted", {
+            nodeId: current.id,
+            pullRequestNumber: result.number,
+            pullRequestUrl: result.url,
+            headSha: result.headSha,
+            baseSha: result.baseSha,
             sideEffectActionId: proposedClaim.actionId,
           });
           await crossSideEffectBoundary(input.sideEffectBoundary, "after_node_acceptance");
