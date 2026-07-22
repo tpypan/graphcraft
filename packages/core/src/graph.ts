@@ -306,11 +306,14 @@ function validateProbePolicy(
   if (
     (probe.kind === "command" ||
       probe.kind === "repository_inventory" ||
+      probe.kind === "github_snapshot" ||
       probe.kind === "held_out") &&
     !approvedProbes.some((allowed) => sameProbe(allowed, probe))
   ) {
     throw new Error(`Probe ${probe.id} is not an approved deterministic probe`);
   }
+  if (probe.kind === "github_snapshot" && !contract.permissions.includes("github_read"))
+    throw new Error(`Probe ${probe.id} exceeds the approved GitHub read permission`);
 }
 
 export function validateGraphPolicy(
@@ -478,6 +481,11 @@ export function validateGraphPolicy(
     }
     if (item.kind !== "verification" && item.completionProbes.length > 0)
       throw new Error(`Only verification nodes may contain completion probes`);
+    if (
+      item.progressProbes.some(({ kind }) => kind === "github_snapshot") &&
+      item.kind !== "pull_request"
+    )
+      throw new Error(`Only pull-request nodes may contain GitHub snapshot probes`);
     for (const probe of [...item.progressProbes, ...item.completionProbes]) {
       validateProbePolicy(probe, contract, approvedProbes);
     }
@@ -1029,9 +1037,11 @@ export function applyProbePlan(graph: Graph, contract: RunContract, input: Probe
   }));
   for (const item of plan.items.filter(({ phase }) => phase === "progress")) {
     const preferred =
-      item.purpose === "inventory"
-        ? nodes.find((node) => ["investigation", "decision", "diagnostic"].includes(node.kind))
-        : nodes.find((node) => node.sideEffectClass === "workspace_write");
+      item.probe.kind === "github_snapshot"
+        ? nodes.find((node) => node.kind === "pull_request")
+        : item.purpose === "inventory"
+          ? nodes.find((node) => ["investigation", "decision", "diagnostic"].includes(node.kind))
+          : nodes.find((node) => node.sideEffectClass === "workspace_write");
     const target =
       preferred ??
       nodes.find(
@@ -1058,7 +1068,11 @@ export function probePlanFromGraph(graph: Graph): ProbePlan {
       ...node.progressProbes.map((probe) => ({
         phase: "progress" as const,
         purpose:
-          probe.kind === "repository_inventory" ? ("inventory" as const) : ("focused" as const),
+          probe.kind === "repository_inventory"
+            ? ("inventory" as const)
+            : probe.kind === "github_snapshot"
+              ? ("acceptance" as const)
+              : ("focused" as const),
         source: `Recovered from graph node ${node.id}`,
         probe,
       })),

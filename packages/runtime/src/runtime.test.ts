@@ -32,6 +32,7 @@ import type {
   Graph,
   PlanningRequest,
   PlanningResult,
+  ProbePlan,
   ProbeResult,
   ReconciliationResult,
   RunEvent,
@@ -191,6 +192,11 @@ async function fakePullRequestGitHub(
       permission: "WRITE",
       pullRequests: [],
       createCalls: 0,
+      protected: false,
+      requiredStatusChecks: [],
+      checks: [],
+      reviewThreads: [],
+      reviews: [],
       ...initial,
     })}\n`,
   );
@@ -242,15 +248,27 @@ if (args[0] === "pr" && args[1] === "create") {
 if (args[0] === "pr" && args[1] === "view") {
   const number = Number(args[2]);
   const pullRequest = state.pullRequests.find((candidate) => candidate.number === number);
-  if (!pullRequest) fail("pull request not found");
+  if (!pullRequest) fail("pull request not found for pr view " + args[2]);
   send({ ...pullRequest, headRefOid: pullRequest.headSha, baseRefOid: pullRequest.baseSha, headSha: undefined, baseSha: undefined });
   process.exit(0);
 }
 if (args[0] !== "api") fail("unexpected command: " + args.join(" "));
 const endpoint = args.find((candidate, index) => index > 0 && !candidate.startsWith("-") && args[index - 1] !== "--hostname" && args[index - 1] !== "-f" && args[index - 1] !== "-F");
+if (endpoint === "rate_limit") {
+  send({ resources: {
+    core: { limit: 5000, used: 10, remaining: 4990, reset: 1800000000 },
+    graphql: { limit: 5000, used: 20, remaining: 4980, reset: 1800000000 },
+  } });
+  process.exit(0);
+}
 if (endpoint && endpoint.startsWith("repos/tpypan/fixture/branches/")) {
-  if (endpoint.endsWith("/protection")) send({ required_status_checks: null, required_pull_request_reviews: null });
-  else send({ protected: false });
+  if (endpoint.endsWith("/protection")) send({
+    required_status_checks: state.requiredStatusChecks.length
+      ? { contexts: state.requiredStatusChecks, checks: state.requiredStatusChecks.map((context) => ({ context, app_id: null })) }
+      : null,
+    required_pull_request_reviews: state.requireReviews ? { required_approving_review_count: 1 } : null,
+  });
+  else send({ protected: state.protected });
   process.exit(0);
 }
 if (args[1] !== "graphql") fail("unexpected api endpoint: " + endpoint);
@@ -268,6 +286,87 @@ if (query.includes("GraphcraftPullRequestsByHead")) {
   send({ data: { repository: { pullRequests: {
     nodes: matching.map((pullRequest) => ({ ...pullRequest, headRefOid: pullRequest.headSha, baseRefOid: pullRequest.baseSha, headSha: undefined, baseSha: undefined })),
     pageInfo: { hasNextPage: false, endCursor: null },
+  } }, rateLimit } });
+  process.exit(0);
+}
+const pullRequest = query.includes("GraphcraftCommitChecks")
+  ? state.pullRequests.find((candidate) => candidate.headSha === fields.head)
+  : state.pullRequests.find((candidate) => candidate.number === Number(fields.number));
+const identity = pullRequest && {
+  number: pullRequest.number,
+  url: pullRequest.url,
+  title: pullRequest.title,
+  state: pullRequest.state,
+  isDraft: pullRequest.isDraft,
+  headRefName: pullRequest.headRefName,
+  baseRefName: pullRequest.baseRefName,
+  headRefOid: pullRequest.headSha,
+  baseRefOid: pullRequest.baseSha,
+  mergeable: state.mergeable || "MERGEABLE",
+  reviewDecision: state.reviewDecision || null,
+  updatedAt: "2026-07-22T04:00:00.000Z",
+};
+if (query.includes("GraphcraftPullRequestThreads")) {
+  if (!identity) fail("pull request not found for GraphQL number " + fields.number);
+  send({ data: { repository: {
+    url: "https://github.com/tpypan/fixture",
+    viewerPermission: state.permission,
+    pullRequest: { ...identity, reviewThreads: {
+      nodes: state.reviewThreads.map((thread) => ({
+        id: thread.id,
+        isResolved: thread.isResolved,
+        isOutdated: thread.isOutdated,
+        path: thread.path,
+        line: thread.line,
+        comments: { totalCount: 1, nodes: [{
+          id: "comment-" + thread.id,
+          author: { login: "reviewer" },
+          body: thread.body || "untrusted review text",
+          url: "https://github.com/tpypan/fixture/pull/" + identity.number + "#discussion_" + thread.id,
+          createdAt: "2026-07-22T04:00:00.000Z",
+        }] },
+      })),
+      pageInfo: { hasNextPage: false, endCursor: null },
+    } },
+  }, rateLimit } });
+  process.exit(0);
+}
+if (query.includes("GraphcraftPullRequestReviews")) {
+  if (!identity) fail("pull request not found for GraphQL number " + fields.number);
+  send({ data: { repository: { pullRequest: {
+    headRefOid: identity.headRefOid,
+    baseRefOid: identity.baseRefOid,
+    reviews: {
+      nodes: state.reviews.map((review) => ({
+        id: review.id,
+        state: review.state,
+        author: { login: review.author || "reviewer" },
+        commit: { oid: identity.headRefOid },
+        submittedAt: "2026-07-22T04:00:00.000Z",
+      })),
+      pageInfo: { hasNextPage: false, endCursor: null },
+    },
+  } }, rateLimit } });
+  process.exit(0);
+}
+if (query.includes("GraphcraftCommitChecks")) {
+  if (!identity) fail("pull request not found for GraphQL number " + fields.number);
+  send({ data: { repository: { object: {
+    oid: identity.headRefOid,
+    statusCheckRollup: { contexts: {
+      nodes: state.checks.map((check) => check.kind === "status_context"
+        ? { __typename: "StatusContext", id: check.id, context: check.name, state: check.state, targetUrl: "https://github.com/checks/" + check.id }
+        : { __typename: "CheckRun", id: check.id, name: check.name, status: check.status, conclusion: check.conclusion, detailsUrl: "https://github.com/checks/" + check.id, app: null }),
+      pageInfo: { hasNextPage: false, endCursor: null },
+    } },
+  } }, rateLimit } });
+  process.exit(0);
+}
+if (query.includes("GraphcraftPullRequestIdentity")) {
+  if (!identity) fail("pull request not found for GraphQL number " + fields.number);
+  send({ data: { repository: { pullRequest: {
+    headRefOid: identity.headRefOid,
+    baseRefOid: identity.baseRefOid,
   } }, rateLimit } });
   process.exit(0);
 }
@@ -2678,7 +2777,36 @@ process.stdin.on("end", () => {
 
   it("opens one exact pull request after the accepted normal push", async () => {
     const { repository, remote } = await createRepositoryWithRemote();
-    const github = await fakePullRequestGitHub(remote);
+    const github = await fakePullRequestGitHub(remote, {
+      protected: true,
+      requiredStatusChecks: ["tests", "lint"],
+      checks: [
+        {
+          kind: "check_run",
+          id: "tests-check",
+          name: "tests",
+          status: "COMPLETED",
+          conclusion: "SUCCESS",
+        },
+        {
+          kind: "status_context",
+          id: "lint-status",
+          name: "lint",
+          state: "PENDING",
+        },
+      ],
+      reviewThreads: [
+        {
+          id: "thread-1",
+          isResolved: false,
+          isOutdated: false,
+          path: "feature.txt",
+          line: 1,
+          body: "UNTRUSTED_REVIEW_BODY",
+        },
+      ],
+      reviewDecision: "CHANGES_REQUESTED",
+    });
     const adapter = new FakeAdapter(async (request) => {
       if (request.capsule.nodeId === "implement")
         await writeFile(join(request.repositoryPath, "feature.txt"), "pull request\n");
@@ -2700,8 +2828,21 @@ process.stdin.on("end", () => {
       pullRequests: Array<Record<string, unknown>>;
     };
     const pullRequest = state.sideEffects.find(({ claim }) => claim.kind === "github_pr_create");
+    const lifecyclePlan = created.probePlan.items.find(
+      ({ probe }) => probe.kind === "github_snapshot",
+    );
+    const lifecycleNode = created.graph.nodes.find(({ kind }) => kind === "pull_request");
+    const lifecycleEvent = (await created.store.loadEvents()).findLast(
+      ({ type, data }) => type === "node.progress" && data.nodeId === "pull-request",
+    );
+    const lifecycleResult = (
+      lifecycleEvent?.data.probeResults as Array<ProbeResult> | undefined
+    )?.[0];
+    const lifecycleArtifact = lifecycleResult?.artifact
+      ? await readFile(lifecycleResult.artifact, "utf8")
+      : "";
 
-    expect(state.status).toBe("completed");
+    expect(state.status, state.stopReason).toBe("completed");
     expect(state.nodes["pull-request"]?.status).toBe("accepted");
     expect(state.sideEffects.map(({ claim }) => claim.kind)).toEqual([
       "git_commit",
@@ -2727,6 +2868,113 @@ process.stdin.on("end", () => {
     expect(String(persisted.pullRequests[0]?.body)).toContain(
       `Graphcraft-Action: ${pullRequest?.claim.idempotencyKey}`,
     );
+    expect(lifecyclePlan).toMatchObject({
+      phase: "progress",
+      purpose: "acceptance",
+      probe: {
+        id: "pull-request-lifecycle",
+        kind: "github_snapshot",
+        pullRequest: "run_branch",
+        expectedState: "open",
+        requiredChecks: "observe",
+        reviewThreads: "observe",
+      },
+    });
+    expect(lifecycleNode?.progressProbes).toEqual([lifecyclePlan?.probe]);
+    expect(lifecycleResult).toMatchObject({
+      kind: "github_snapshot",
+      passed: true,
+      metrics: {
+        requiredChecksTotal: 2,
+        requiredChecksSucceeded: 1,
+        requiredChecksPending: 1,
+        requiredChecksFailing: 0,
+        unresolvedReviewThreads: 1,
+      },
+    });
+    expect(lifecycleArtifact).toContain('"contentTrust": "untrusted_external"');
+    expect(lifecycleArtifact).not.toContain("UNTRUSTED_REVIEW_BODY");
+    expect(lifecycleArtifact).not.toContain("Implement the feature and open a pull request");
+  });
+
+  it("enforces approved required-check and review-thread lifecycle conditions", async () => {
+    const { repository, remote } = await createRepositoryWithRemote();
+    const github = await fakePullRequestGitHub(remote, {
+      protected: true,
+      requiredStatusChecks: ["tests"],
+      checks: [
+        {
+          kind: "check_run",
+          id: "tests-check",
+          name: "tests",
+          status: "IN_PROGRESS",
+          conclusion: null,
+        },
+      ],
+      reviewThreads: [
+        {
+          id: "thread-1",
+          isResolved: false,
+          isOutdated: false,
+          path: "feature.txt",
+          line: 1,
+        },
+      ],
+    });
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "pull request\n");
+    });
+    const created = await createRun("Implement the feature and open a pull request", {
+      cwd: repository,
+      finishLine: "pr_open",
+    });
+    const strictPlan: ProbePlan = {
+      ...created.probePlan,
+      items: created.probePlan.items.map((item) =>
+        item.probe.kind === "github_snapshot"
+          ? {
+              ...item,
+              probe: {
+                ...item.probe,
+                requiredChecks: "success",
+                reviewThreads: "resolved",
+              },
+            }
+          : item,
+      ),
+    };
+    await configureRunProbes(created.store, strictPlan);
+
+    const state = await executeRun({
+      store: created.store,
+      adapter,
+      approve: true,
+      github,
+    });
+    const lifecycleEvent = (await created.store.loadEvents()).findLast(
+      ({ type, data }) => type === "node.progress" && data.nodeId === "pull-request",
+    );
+    const lifecycleResult = (
+      lifecycleEvent?.data.probeResults as Array<ProbeResult> | undefined
+    )?.[0];
+
+    expect(state.status).toBe("blocked");
+    expect(state.nodes["pull-request"]?.status).toBe("failed");
+    expect(state.sideEffects.find(({ claim }) => claim.kind === "github_pr_create")).toMatchObject({
+      status: "confirmed",
+      result: { number: 100 },
+    });
+    expect(lifecycleResult).toMatchObject({
+      kind: "github_snapshot",
+      passed: false,
+      metrics: {
+        requiredChecksPending: 1,
+        requiredChecksFailing: 0,
+        unresolvedReviewThreads: 1,
+      },
+    });
+    expect(state.stopReason).toContain("lifecycle evidence did not satisfy");
   });
 
   it("reconciles one pull-request creation across every side-effect boundary", async () => {

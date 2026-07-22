@@ -38,12 +38,14 @@ import {
   type RunContract,
   type RunControlRequest,
   type RunState,
+  type SideEffectClaim,
   type TokenUsage,
   type SemanticVerdict,
   type WorkerResult,
 } from "@graphcraft/core";
 import {
   discoverProbePlan,
+  runProbe,
   runProcess,
   runProbes,
   validateProbePlan,
@@ -88,6 +90,7 @@ import {
 } from "./held-out.ts";
 import { assessRunProgress, createProgressDecisionPacket } from "./trajectory.ts";
 import {
+  capturePullRequestLifecycleProbe,
   createPullRequestClaim,
   performPullRequestCreation,
   reconcilePullRequest,
@@ -287,13 +290,15 @@ export async function createRun(
   probePlan: ProbePlan;
 }> {
   const repository = await discoverRepository(options.cwd);
-  const [probePlan, repositoryEvidence] = await Promise.all([
-    discoverProbePlan(repository.root, task, repository.baseSha),
-    discoverPlanningEvidence(repository.root, task),
-  ]);
   const contract = compileRunContract(task, repository, {
     ...(options.finishLine ? { finishLine: options.finishLine } : {}),
   });
+  const [probePlan, repositoryEvidence] = await Promise.all([
+    discoverProbePlan(repository.root, task, repository.baseSha, {
+      ...(contract.finishLine.kind === "pr_open" ? { finishLine: "pr_open" } : {}),
+    }),
+    discoverPlanningEvidence(repository.root, task),
+  ]);
   const heldOutProbePlan = await createRuntimeHeldOutProbePlan(
     contract.runId,
     probePlan,
@@ -611,8 +616,32 @@ async function captureProbes(
   workspace: RunWorkspace,
   observer: RunObserver | undefined,
   signal: AbortSignal,
+  githubLifecycle?: {
+    contract: RunContract;
+    claim: SideEffectClaim;
+    result: Record<string, unknown>;
+    options?: GitHubExecutionOptions;
+  },
 ): Promise<ExecutedProbe[]> {
-  const executed = await runProbes(specs, workspace.path, signal);
+  const executed: ExecutedProbe[] = [];
+  for (const spec of specs) {
+    if (spec.kind === "github_snapshot") {
+      if (!githubLifecycle)
+        throw new Error(`GitHub snapshot probe ${spec.id} has no pull-request binding`);
+      executed.push(
+        await capturePullRequestLifecycleProbe(
+          workspace,
+          githubLifecycle.contract,
+          githubLifecycle.claim,
+          githubLifecycle.result,
+          spec,
+          githubLifecycle.options,
+        ),
+      );
+    } else {
+      executed.push(await runProbe(spec, workspace.path, signal));
+    }
+  }
   for (const probe of executed) {
     observer?.({
       type: "probe",
@@ -2143,6 +2172,61 @@ export async function executeRun(input: {
             revalidateConfirmed: true,
             ...(input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}),
           });
+          const lifecycle = await captureProbes(
+            input.store,
+            current.progressProbes,
+            workspace,
+            input.observer,
+            signal,
+            {
+              contract,
+              claim: proposedClaim,
+              result,
+              ...(input.github ? { options: input.github } : {}),
+            },
+          );
+          if (signal.aborted) return await finishInterruption(current.id);
+          const lifecycleEvidence = lifecycle.map(({ result: probe }) => probe.summary);
+          if (lifecycle.some(({ result: probe }) => !probe.passed)) {
+            const reason = `Pull-request lifecycle evidence did not satisfy the approved probe: ${lifecycleEvidence.join("; ")}`;
+            await input.store.append("probe", "node.progress", {
+              nodeId: current.id,
+              classification: "blocked",
+              summary: reason,
+              evidence: lifecycleEvidence,
+              probeResults: lifecycle.map(({ result: probe }) => probe),
+            });
+            await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+            await input.store.append("runtime", "run.blocked", { reason });
+            return await input.store.loadState();
+          }
+          if (lifecycle.length > 0) {
+            const acceptance = await evaluateSuccessfulControl({
+              store: input.store,
+              graph,
+              node: current,
+              rationale:
+                "The authoritative SHA-bound GitHub lifecycle probe satisfied the approved pull-request boundary",
+              evidence: lifecycleEvidence,
+            });
+            if (!acceptance.allowed) {
+              const reason =
+                acceptance.reason ?? `Control graph blocked pull-request node ${current.id}`;
+              await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+              await input.store.append("runtime", "run.blocked", {
+                reason,
+                ...(acceptance.packet ? { decisionPacket: acceptance.packet } : {}),
+              });
+              return await input.store.loadState();
+            }
+            await input.store.append("probe", "node.progress", {
+              nodeId: current.id,
+              classification: "done",
+              summary: lifecycleEvidence.join("; "),
+              evidence: lifecycleEvidence,
+              probeResults: lifecycle.map(({ result: probe }) => probe),
+            });
+          }
           await input.store.append("runtime", "node.accepted", {
             nodeId: current.id,
             pullRequestNumber: result.number,

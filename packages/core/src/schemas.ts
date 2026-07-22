@@ -98,11 +98,21 @@ export const RepositoryInventoryProbeSchema = z.strictObject({
   terms: z.array(z.string().min(1)).min(1),
 });
 
+export const GitHubSnapshotProbeSchema = z.strictObject({
+  id: z.string().min(1),
+  kind: z.literal("github_snapshot"),
+  pullRequest: z.literal("run_branch"),
+  expectedState: z.literal("open"),
+  requiredChecks: z.enum(["observe", "success"]),
+  reviewThreads: z.enum(["observe", "resolved"]),
+});
+
 export const ExecutableProbeSchema = z.union([
   CommandProbeSchema,
   FileProbeSchema,
   GitDiffProbeSchema,
   RepositoryInventoryProbeSchema,
+  GitHubSnapshotProbeSchema,
 ]);
 
 export const HeldOutProbeReferenceSchema = z.strictObject({
@@ -158,7 +168,7 @@ export const HeldOutProbePlanSchema = z.strictObject({
 
 export const ProbeResultSchema = z.strictObject({
   probeId: z.string().min(1),
-  kind: z.enum(["command", "file", "git_diff", "repository_inventory"]),
+  kind: z.enum(["command", "file", "git_diff", "repository_inventory", "github_snapshot"]),
   passed: z.boolean(),
   signature: z.string().min(1),
   summary: z.string(),

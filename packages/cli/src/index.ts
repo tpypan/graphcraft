@@ -238,6 +238,14 @@ function probeView(item: ProbePlan["items"][number]): Record<string, unknown> {
     ...(probe.kind === "file" ? { path: probe.path } : {}),
     ...(probe.kind === "git_diff" ? { baseSha: probe.baseSha } : {}),
     ...(probe.kind === "repository_inventory" ? { paths: probe.paths, terms: probe.terms } : {}),
+    ...(probe.kind === "github_snapshot"
+      ? {
+          pullRequest: probe.pullRequest,
+          expectedState: probe.expectedState,
+          requiredChecks: probe.requiredChecks,
+          reviewThreads: probe.reviewThreads,
+        }
+      : {}),
   };
 }
 

@@ -108,6 +108,9 @@ export async function runProbe(
     };
   }
 
+  if (spec.kind === "github_snapshot")
+    throw new Error(`GitHub snapshot probe ${spec.id} must be executed by the runtime`);
+
   const diff = await runProcess(
     "git",
     ["diff", "--no-ext-diff", "--name-status", spec.baseSha, "--"],
@@ -343,6 +346,8 @@ export async function validateProbePlan(
     keys.add(key);
     if (item.probe.kind === "held_out")
       throw new Error("User-editable probe plans cannot contain held-out references");
+    if (item.probe.kind === "github_snapshot" && item.phase !== "progress")
+      throw new Error(`GitHub snapshot probe ${item.probe.id} must be progress evidence`);
     if (item.probe.kind === "command") {
       if (item.probe.timeoutMs > 1_800_000)
         throw new Error(`Probe ${item.probe.id} exceeds the 30 minute timeout limit`);
@@ -372,6 +377,9 @@ export async function discoverProbePlan(
   repositoryPath: string,
   task: string,
   baseSha: string,
+  options: {
+    finishLine?: "local_verified" | "committed" | "pushed" | "pr_open";
+  } = {},
 ): Promise<ProbePlan> {
   const family = classifyTask(task);
   const terms = taskTerms(task);
@@ -401,6 +409,22 @@ export async function discoverProbePlan(
       },
     },
   ];
+
+  if (options.finishLine === "pr_open") {
+    items.push({
+      phase: "progress",
+      purpose: "acceptance",
+      source: "Authoritative SHA-bound GitHub snapshot for the approved run branch",
+      probe: {
+        id: "pull-request-lifecycle",
+        kind: "github_snapshot",
+        pullRequest: "run_branch",
+        expectedState: "open",
+        requiredChecks: "observe",
+        reviewThreads: "observe",
+      },
+    });
+  }
 
   const selected = selectPackageCandidates(
     await packageCandidates(repositoryPath, family, inventoryTerms),

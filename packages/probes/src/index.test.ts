@@ -135,6 +135,31 @@ describe("task-specific probe planning", () => {
     expect(second.result.summary).toContain("No tracked files match");
   });
 
+  it("adds a runtime-owned GitHub lifecycle probe only for a PR finish line", async () => {
+    const { root, sha } = await createRepository();
+    const local = await discoverProbePlan(root, "Add a checkout workflow", sha);
+    const pullRequest = await discoverProbePlan(root, "Add a checkout workflow", sha, {
+      finishLine: "pr_open",
+    });
+    const lifecycle = pullRequest.items.find(({ probe }) => probe.kind === "github_snapshot");
+
+    expect(local.items.some(({ probe }) => probe.kind === "github_snapshot")).toBe(false);
+    expect(lifecycle).toMatchObject({
+      phase: "progress",
+      purpose: "acceptance",
+      probe: {
+        id: "pull-request-lifecycle",
+        kind: "github_snapshot",
+        pullRequest: "run_branch",
+        expectedState: "open",
+        requiredChecks: "observe",
+        reviewThreads: "observe",
+      },
+    });
+    if (!lifecycle) throw new Error("Expected a lifecycle probe");
+    await expect(runProbe(lifecycle.probe, root)).rejects.toThrow(/executed by the runtime/);
+  });
+
   it("keeps raw command output out of model-visible probe summaries", async () => {
     const { root } = await createRepository();
     await writeFile(join(root, "noisy.mjs"), `console.error("${"failure ".repeat(1_000)}");\n`);

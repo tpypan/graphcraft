@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { compileGraph, compileRunContract, createRunEvent, reduceEvents } from "@graphcraft/core";
+import type { ProbePlan } from "@graphcraft/core";
 import {
   GRAPHCRAFT_VERSION,
   assessTaskShape,
@@ -159,11 +160,41 @@ describe("run approval", () => {
         timeoutMs: 1_000,
       },
     ]);
-    const rendered = renderContract(contract, graph);
+    const probePlan: ProbePlan = {
+      schemaVersion: 1,
+      family: "feature",
+      items: [
+        {
+          phase: "progress",
+          purpose: "acceptance",
+          source: "GitHub lifecycle",
+          probe: {
+            id: "pull-request-lifecycle",
+            kind: "github_snapshot",
+            pullRequest: "run_branch",
+            expectedState: "open",
+            requiredChecks: "observe",
+            reviewThreads: "observe",
+          },
+        },
+      ],
+    };
+    const rendered = renderContract(contract, graph, probePlan);
 
     expect(rendered).toContain("Finish line    pr_open");
-    expect(contractView(contract, graph)).toMatchObject({
+    expect(rendered).toContain("pull-request-lifecycle");
+    expect(contractView(contract, graph, probePlan)).toMatchObject({
       planShape: "implement → verify → commit → push → pull-request",
+      progressProbes: [
+        {
+          id: "pull-request-lifecycle",
+          kind: "github_snapshot",
+          pullRequest: "run_branch",
+          expectedState: "open",
+          requiredChecks: "observe",
+          reviewThreads: "observe",
+        },
+      ],
     });
   });
 

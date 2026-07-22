@@ -18270,11 +18270,20 @@ var RepositoryInventoryProbeSchema = external_exports.strictObject({
   paths: external_exports.array(external_exports.string().min(1)).min(1),
   terms: external_exports.array(external_exports.string().min(1)).min(1)
 });
+var GitHubSnapshotProbeSchema = external_exports.strictObject({
+  id: external_exports.string().min(1),
+  kind: external_exports.literal("github_snapshot"),
+  pullRequest: external_exports.literal("run_branch"),
+  expectedState: external_exports.literal("open"),
+  requiredChecks: external_exports.enum(["observe", "success"]),
+  reviewThreads: external_exports.enum(["observe", "resolved"])
+});
 var ExecutableProbeSchema = external_exports.union([
   CommandProbeSchema,
   FileProbeSchema,
   GitDiffProbeSchema,
-  RepositoryInventoryProbeSchema
+  RepositoryInventoryProbeSchema,
+  GitHubSnapshotProbeSchema
 ]);
 var HeldOutProbeReferenceSchema = external_exports.strictObject({
   id: external_exports.string().min(1),
@@ -18322,7 +18331,7 @@ var HeldOutProbePlanSchema = external_exports.strictObject({
 });
 var ProbeResultSchema = external_exports.strictObject({
   probeId: external_exports.string().min(1),
-  kind: external_exports.enum(["command", "file", "git_diff", "repository_inventory"]),
+  kind: external_exports.enum(["command", "file", "git_diff", "repository_inventory", "github_snapshot"]),
   passed: external_exports.boolean(),
   signature: external_exports.string().min(1),
   summary: external_exports.string(),
@@ -19486,9 +19495,11 @@ function validateProbePolicy(probe, contract, approvedProbes) {
   if (probe.kind === "repository_inventory" && probe.paths.some((path2) => !safeRelativePattern(path2))) {
     throw new Error(`Probe ${probe.id} contains an unsafe inventory path`);
   }
-  if ((probe.kind === "command" || probe.kind === "repository_inventory" || probe.kind === "held_out") && !approvedProbes.some((allowed) => sameProbe(allowed, probe))) {
+  if ((probe.kind === "command" || probe.kind === "repository_inventory" || probe.kind === "github_snapshot" || probe.kind === "held_out") && !approvedProbes.some((allowed) => sameProbe(allowed, probe))) {
     throw new Error(`Probe ${probe.id} is not an approved deterministic probe`);
   }
+  if (probe.kind === "github_snapshot" && !contract.permissions.includes("github_read"))
+    throw new Error(`Probe ${probe.id} exceeds the approved GitHub read permission`);
 }
 function validateGraphPolicy(graph, contract, requiredVerificationProbes, approvedProbes = requiredVerificationProbes) {
   if (graph.family !== classifyTask(contract.task))
@@ -19593,6 +19604,8 @@ function validateGraphPolicy(graph, contract, requiredVerificationProbes, approv
     }
     if (item.kind !== "verification" && item.completionProbes.length > 0)
       throw new Error(`Only verification nodes may contain completion probes`);
+    if (item.progressProbes.some(({ kind }) => kind === "github_snapshot") && item.kind !== "pull_request")
+      throw new Error(`Only pull-request nodes may contain GitHub snapshot probes`);
     for (const probe of [...item.progressProbes, ...item.completionProbes]) {
       validateProbePolicy(probe, contract, approvedProbes);
     }
@@ -20043,7 +20056,7 @@ function applyProbePlan(graph, contract, input) {
     completionProbes: item.id === targetVerificationId ? completion.map(({ probe }) => probe) : []
   }));
   for (const item of plan.items.filter(({ phase }) => phase === "progress")) {
-    const preferred = item.purpose === "inventory" ? nodes.find((node2) => ["investigation", "decision", "diagnostic"].includes(node2.kind)) : nodes.find((node2) => node2.sideEffectClass === "workspace_write");
+    const preferred = item.probe.kind === "github_snapshot" ? nodes.find((node2) => node2.kind === "pull_request") : item.purpose === "inventory" ? nodes.find((node2) => ["investigation", "decision", "diagnostic"].includes(node2.kind)) : nodes.find((node2) => node2.sideEffectClass === "workspace_write");
     const target = preferred ?? nodes.find(
       (node2) => !["verification", "commit", "push", "pull_request", "wait"].includes(node2.kind)
     );
@@ -20065,7 +20078,7 @@ function probePlanFromGraph(graph) {
     items: graph.nodes.flatMap((node2) => [
       ...node2.progressProbes.map((probe) => ({
         phase: "progress",
-        purpose: probe.kind === "repository_inventory" ? "inventory" : "focused",
+        purpose: probe.kind === "repository_inventory" ? "inventory" : probe.kind === "github_snapshot" ? "acceptance" : "focused",
         source: `Recovered from graph node ${node2.id}`,
         probe
       })),
@@ -22415,6 +22428,21 @@ async function currentBinding(input) {
     baseSha: response.data.repository.pullRequest.baseRefOid
   };
 }
+async function assertGitHubSnapshotCurrent(options, snapshot) {
+  const parsed = GitHubPullRequestSnapshotSchema.parse(snapshot);
+  const { owner, name } = repositoryParts(parsed.repository.nameWithOwner);
+  const current = await currentBinding({
+    options,
+    host: parsed.repository.host,
+    owner,
+    name,
+    number: parsed.pullRequest.number
+  });
+  if (current.headSha !== parsed.binding.headSha || current.baseSha !== parsed.binding.baseSha)
+    throw new Error(
+      `GitHub snapshot ${parsed.snapshotId} is stale: ${parsed.binding.headSha}/${parsed.binding.baseSha} changed to ${current.headSha}/${current.baseSha}`
+    );
+}
 async function captureGitHubPullRequestSnapshot(options) {
   const capability = await probeGitHub(options);
   if (!capability.readyForSnapshot || !capability.host || !capability.nameWithOwner)
@@ -22854,6 +22882,8 @@ async function runProbe(spec, repositoryPath, signal) {
       output: inventory.stdout
     };
   }
+  if (spec.kind === "github_snapshot")
+    throw new Error(`GitHub snapshot probe ${spec.id} must be executed by the runtime`);
   const diff = await runProcess(
     "git",
     ["diff", "--no-ext-diff", "--name-status", spec.baseSha, "--"],
@@ -23022,6 +23052,8 @@ async function validateProbePlan(input, repositoryPath) {
     keys.add(key);
     if (item.probe.kind === "held_out")
       throw new Error("User-editable probe plans cannot contain held-out references");
+    if (item.probe.kind === "github_snapshot" && item.phase !== "progress")
+      throw new Error(`GitHub snapshot probe ${item.probe.id} must be progress evidence`);
     if (item.probe.kind === "command") {
       if (item.probe.timeoutMs > 18e5)
         throw new Error(`Probe ${item.probe.id} exceeds the 30 minute timeout limit`);
@@ -23043,7 +23075,7 @@ async function validateProbePlan(input, repositoryPath) {
   }
   return plan;
 }
-async function discoverProbePlan(repositoryPath, task, baseSha) {
+async function discoverProbePlan(repositoryPath, task, baseSha, options = {}) {
   const family = classifyTask(task);
   const terms = taskTerms(task);
   const inventoryTerms = terms.length ? terms : [family];
@@ -23072,6 +23104,21 @@ async function discoverProbePlan(repositoryPath, task, baseSha) {
       }
     }
   ];
+  if (options.finishLine === "pr_open") {
+    items.push({
+      phase: "progress",
+      purpose: "acceptance",
+      source: "Authoritative SHA-bound GitHub snapshot for the approved run branch",
+      probe: {
+        id: "pull-request-lifecycle",
+        kind: "github_snapshot",
+        pullRequest: "run_branch",
+        expectedState: "open",
+        requiredChecks: "observe",
+        reviewThreads: "observe"
+      }
+    });
+  }
   const selected = selectPackageCandidates(
     await packageCandidates(repositoryPath, family, inventoryTerms)
   );
@@ -25395,6 +25442,136 @@ async function performPullRequestCreation(workspace, claim, options = {}, bounda
   await crossSideEffectBoundary(boundary, "after_action_command");
   return { created: true };
 }
+function lifecycleProjection(snapshot) {
+  return {
+    schemaVersion: 1,
+    contentTrust: snapshot.contentTrust,
+    snapshotId: snapshot.snapshotId,
+    repository: {
+      nameWithOwner: snapshot.repository.nameWithOwner,
+      host: snapshot.repository.host,
+      viewerPermission: snapshot.repository.viewerPermission
+    },
+    pullRequest: {
+      number: snapshot.pullRequest.number,
+      url: snapshot.pullRequest.url,
+      state: snapshot.pullRequest.state,
+      isDraft: snapshot.pullRequest.isDraft,
+      headRefName: snapshot.pullRequest.headRefName,
+      baseRefName: snapshot.pullRequest.baseRefName,
+      headSha: snapshot.pullRequest.headSha,
+      baseSha: snapshot.pullRequest.baseSha,
+      mergeable: snapshot.pullRequest.mergeable,
+      ...snapshot.pullRequest.reviewDecision ? { reviewDecision: snapshot.pullRequest.reviewDecision } : {},
+      updatedAt: snapshot.pullRequest.updatedAt
+    },
+    binding: snapshot.binding,
+    branchProtection: snapshot.branchProtection,
+    requiredChecks: snapshot.requiredChecks,
+    checks: snapshot.checks.map(({ id, kind, name, status: status2, conclusion, appId }) => ({
+      id,
+      kind,
+      name,
+      status: status2,
+      ...conclusion ? { conclusion } : {},
+      ...appId !== void 0 ? { appId } : {}
+    })),
+    reviewThreads: snapshot.reviewThreads.map(
+      ({ id, isResolved, isOutdated, path: path2, line, commentCount, latestComment }) => ({
+        id,
+        isResolved,
+        isOutdated,
+        ...path2 ? { path: path2 } : {},
+        ...line !== void 0 ? { line } : {},
+        commentCount,
+        ...latestComment ? {
+          latestComment: {
+            id: latestComment.id,
+            url: latestComment.url,
+            createdAt: latestComment.createdAt
+          }
+        } : {}
+      })
+    ),
+    reviews: snapshot.reviews,
+    rateLimit: snapshot.rateLimit
+  };
+}
+async function capturePullRequestLifecycleProbe(workspace, contract, claim, result, spec, options = {}) {
+  if (claim.kind !== "github_pr_create")
+    throw new Error(`Side effect ${claim.actionId} is not a pull-request creation`);
+  const expected = pullRequestPrecondition(claim);
+  const number4 = result.number;
+  if (typeof number4 !== "number" || !Number.isInteger(number4) || number4 <= 0)
+    throw new Error(`Pull-request result for ${claim.actionId} has no valid number`);
+  const started = performance.now();
+  const github = commandOptions(workspace, options);
+  const snapshot = await captureGitHubPullRequestSnapshot({ ...github, pullRequest: number4 });
+  await assertGitHubSnapshotCurrent(github, snapshot);
+  const expectedState = spec.expectedState.toUpperCase();
+  const exactBinding = contract.finishLine.kind === "pr_open" && expected.baseRefName === contract.repository.baseRef && snapshot.repository.host === expected.host && snapshot.repository.nameWithOwner === expected.nameWithOwner && snapshot.pullRequest.number === number4 && snapshot.pullRequest.headRefName === expected.headRefName && snapshot.pullRequest.baseRefName === expected.baseRefName && snapshot.binding.headSha === expected.headSha && snapshot.binding.baseSha === expected.baseSha && result.headSha === expected.headSha && result.baseSha === expected.baseSha;
+  const requiredSuccess = snapshot.requiredChecks.filter(({ state }) => state === "success");
+  const requiredPending = snapshot.requiredChecks.filter(({ state }) => state === "pending");
+  const requiredFailing = snapshot.requiredChecks.filter(
+    ({ state }) => ["failure", "missing", "unknown"].includes(state)
+  );
+  const unresolvedThreads = snapshot.reviewThreads.filter(
+    ({ isResolved, isOutdated }) => !isResolved && !isOutdated
+  );
+  const stateMatches = snapshot.pullRequest.state.toUpperCase() === expectedState;
+  const checksMatch = spec.requiredChecks === "observe" || requiredPending.length === 0 && requiredFailing.length === 0 && requiredSuccess.length === snapshot.requiredChecks.length;
+  const reviewsMatch = spec.reviewThreads === "observe" || unresolvedThreads.length === 0;
+  const passed = exactBinding && stateMatches && checksMatch && reviewsMatch;
+  const stableEvidence = {
+    repository: snapshot.repository.nameWithOwner,
+    number: snapshot.pullRequest.number,
+    state: snapshot.pullRequest.state,
+    isDraft: snapshot.pullRequest.isDraft,
+    headRefName: snapshot.pullRequest.headRefName,
+    baseRefName: snapshot.pullRequest.baseRefName,
+    headSha: snapshot.binding.headSha,
+    baseSha: snapshot.binding.baseSha,
+    mergeable: snapshot.pullRequest.mergeable,
+    reviewDecision: snapshot.pullRequest.reviewDecision ?? null,
+    requiredChecks: snapshot.requiredChecks,
+    reviewThreads: snapshot.reviewThreads.map(
+      ({ id, isResolved, isOutdated, path: path2, line, commentCount }) => ({
+        id,
+        isResolved,
+        isOutdated,
+        path: path2 ?? null,
+        line: line ?? null,
+        commentCount
+      })
+    ),
+    reviews: snapshot.reviews
+  };
+  const summary = [
+    `PR #${number4} is ${snapshot.pullRequest.state} at ${snapshot.binding.headSha}/${snapshot.binding.baseSha}`,
+    `${requiredSuccess.length} required checks succeeded, ${requiredPending.length} pending, ${requiredFailing.length} failing or missing`,
+    `${unresolvedThreads.length} unresolved current review threads`,
+    `mergeability is ${snapshot.pullRequest.mergeable}`
+  ].join("; ");
+  return {
+    result: {
+      probeId: spec.id,
+      kind: spec.kind,
+      passed,
+      signature: contentHash(stableEvidence),
+      summary,
+      durationMs: Math.round(performance.now() - started),
+      metrics: {
+        requiredChecksTotal: snapshot.requiredChecks.length,
+        requiredChecksSucceeded: requiredSuccess.length,
+        requiredChecksPending: requiredPending.length,
+        requiredChecksFailing: requiredFailing.length,
+        unresolvedReviewThreads: unresolvedThreads.length
+      }
+    },
+    output: `${JSON.stringify(lifecycleProjection(snapshot), null, 2)}
+`
+  };
+}
 
 // packages/runtime/src/runner.ts
 function populateMissingGraphContext(graph, repositoryEvidence) {
@@ -25512,13 +25689,15 @@ async function validatePlannedContext(graph, repositoryPath) {
 }
 async function createRun(task, options) {
   const repository = await discoverRepository(options.cwd);
-  const [probePlan, repositoryEvidence] = await Promise.all([
-    discoverProbePlan(repository.root, task, repository.baseSha),
-    discoverPlanningEvidence(repository.root, task)
-  ]);
   const contract = compileRunContract(task, repository, {
     ...options.finishLine ? { finishLine: options.finishLine } : {}
   });
+  const [probePlan, repositoryEvidence] = await Promise.all([
+    discoverProbePlan(repository.root, task, repository.baseSha, {
+      ...contract.finishLine.kind === "pr_open" ? { finishLine: "pr_open" } : {}
+    }),
+    discoverPlanningEvidence(repository.root, task)
+  ]);
   const heldOutProbePlan = await createRuntimeHeldOutProbePlan(
     contract.runId,
     probePlan,
@@ -25793,8 +25972,26 @@ async function executeWorker(input) {
     artifact
   };
 }
-async function captureProbes(store, specs, workspace, observer, signal) {
-  const executed = await runProbes(specs, workspace.path, signal);
+async function captureProbes(store, specs, workspace, observer, signal, githubLifecycle) {
+  const executed = [];
+  for (const spec of specs) {
+    if (spec.kind === "github_snapshot") {
+      if (!githubLifecycle)
+        throw new Error(`GitHub snapshot probe ${spec.id} has no pull-request binding`);
+      executed.push(
+        await capturePullRequestLifecycleProbe(
+          workspace,
+          githubLifecycle.contract,
+          githubLifecycle.claim,
+          githubLifecycle.result,
+          spec,
+          githubLifecycle.options
+        )
+      );
+    } else {
+      executed.push(await runProbe(spec, workspace.path, signal));
+    }
+  }
   for (const probe of executed) {
     observer?.({
       type: "probe",
@@ -27028,6 +27225,59 @@ async function executeRun(input) {
             revalidateConfirmed: true,
             ...input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}
           });
+          const lifecycle = await captureProbes(
+            input.store,
+            current.progressProbes,
+            workspace,
+            input.observer,
+            signal,
+            {
+              contract,
+              claim: proposedClaim,
+              result,
+              ...input.github ? { options: input.github } : {}
+            }
+          );
+          if (signal.aborted) return await finishInterruption(current.id);
+          const lifecycleEvidence = lifecycle.map(({ result: probe }) => probe.summary);
+          if (lifecycle.some(({ result: probe }) => !probe.passed)) {
+            const reason = `Pull-request lifecycle evidence did not satisfy the approved probe: ${lifecycleEvidence.join("; ")}`;
+            await input.store.append("probe", "node.progress", {
+              nodeId: current.id,
+              classification: "blocked",
+              summary: reason,
+              evidence: lifecycleEvidence,
+              probeResults: lifecycle.map(({ result: probe }) => probe)
+            });
+            await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+            await input.store.append("runtime", "run.blocked", { reason });
+            return await input.store.loadState();
+          }
+          if (lifecycle.length > 0) {
+            const acceptance = await evaluateSuccessfulControl({
+              store: input.store,
+              graph,
+              node: current,
+              rationale: "The authoritative SHA-bound GitHub lifecycle probe satisfied the approved pull-request boundary",
+              evidence: lifecycleEvidence
+            });
+            if (!acceptance.allowed) {
+              const reason = acceptance.reason ?? `Control graph blocked pull-request node ${current.id}`;
+              await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+              await input.store.append("runtime", "run.blocked", {
+                reason,
+                ...acceptance.packet ? { decisionPacket: acceptance.packet } : {}
+              });
+              return await input.store.loadState();
+            }
+            await input.store.append("probe", "node.progress", {
+              nodeId: current.id,
+              classification: "done",
+              summary: lifecycleEvidence.join("; "),
+              evidence: lifecycleEvidence,
+              probeResults: lifecycle.map(({ result: probe }) => probe)
+            });
+          }
           await input.store.append("runtime", "node.accepted", {
             nodeId: current.id,
             pullRequestNumber: result.number,
@@ -27854,7 +28104,13 @@ function probeView(item) {
     } : {},
     ...probe.kind === "file" ? { path: probe.path } : {},
     ...probe.kind === "git_diff" ? { baseSha: probe.baseSha } : {},
-    ...probe.kind === "repository_inventory" ? { paths: probe.paths, terms: probe.terms } : {}
+    ...probe.kind === "repository_inventory" ? { paths: probe.paths, terms: probe.terms } : {},
+    ...probe.kind === "github_snapshot" ? {
+      pullRequest: probe.pullRequest,
+      expectedState: probe.expectedState,
+      requiredChecks: probe.requiredChecks,
+      reviewThreads: probe.reviewThreads
+    } : {}
   };
 }
 function contractView(contract, graph, inputProbePlan) {

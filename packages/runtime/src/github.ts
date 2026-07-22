@@ -1,12 +1,15 @@
-import { runProcess } from "@graphcraft/probes";
+import { runProcess, type ExecutedProbe } from "@graphcraft/probes";
 import {
   SideEffectClaimSchema,
   contentHash,
+  type ExecutableProbe,
   type RunContract,
   type SideEffectClaim,
 } from "@graphcraft/core";
 import {
+  assertGitHubSnapshotCurrent,
   assertGitHubPushCapability,
+  captureGitHubPullRequestSnapshot,
   createGitHubPullRequest,
   listGitHubPullRequestsForHead,
   readGitHubPullRequestIdentity,
@@ -405,4 +408,166 @@ export async function performPullRequestCreation(
   });
   await crossSideEffectBoundary(boundary, "after_action_command");
   return { created: true };
+}
+
+type GitHubSnapshotProbe = Extract<ExecutableProbe, { kind: "github_snapshot" }>;
+
+function lifecycleProjection(
+  snapshot: Awaited<ReturnType<typeof captureGitHubPullRequestSnapshot>>,
+): Record<string, unknown> {
+  return {
+    schemaVersion: 1,
+    contentTrust: snapshot.contentTrust,
+    snapshotId: snapshot.snapshotId,
+    repository: {
+      nameWithOwner: snapshot.repository.nameWithOwner,
+      host: snapshot.repository.host,
+      viewerPermission: snapshot.repository.viewerPermission,
+    },
+    pullRequest: {
+      number: snapshot.pullRequest.number,
+      url: snapshot.pullRequest.url,
+      state: snapshot.pullRequest.state,
+      isDraft: snapshot.pullRequest.isDraft,
+      headRefName: snapshot.pullRequest.headRefName,
+      baseRefName: snapshot.pullRequest.baseRefName,
+      headSha: snapshot.pullRequest.headSha,
+      baseSha: snapshot.pullRequest.baseSha,
+      mergeable: snapshot.pullRequest.mergeable,
+      ...(snapshot.pullRequest.reviewDecision
+        ? { reviewDecision: snapshot.pullRequest.reviewDecision }
+        : {}),
+      updatedAt: snapshot.pullRequest.updatedAt,
+    },
+    binding: snapshot.binding,
+    branchProtection: snapshot.branchProtection,
+    requiredChecks: snapshot.requiredChecks,
+    checks: snapshot.checks.map(({ id, kind, name, status, conclusion, appId }) => ({
+      id,
+      kind,
+      name,
+      status,
+      ...(conclusion ? { conclusion } : {}),
+      ...(appId !== undefined ? { appId } : {}),
+    })),
+    reviewThreads: snapshot.reviewThreads.map(
+      ({ id, isResolved, isOutdated, path, line, commentCount, latestComment }) => ({
+        id,
+        isResolved,
+        isOutdated,
+        ...(path ? { path } : {}),
+        ...(line !== undefined ? { line } : {}),
+        commentCount,
+        ...(latestComment
+          ? {
+              latestComment: {
+                id: latestComment.id,
+                url: latestComment.url,
+                createdAt: latestComment.createdAt,
+              },
+            }
+          : {}),
+      }),
+    ),
+    reviews: snapshot.reviews,
+    rateLimit: snapshot.rateLimit,
+  };
+}
+
+export async function capturePullRequestLifecycleProbe(
+  workspace: RunWorkspace,
+  contract: RunContract,
+  claim: SideEffectClaim,
+  result: Record<string, unknown>,
+  spec: GitHubSnapshotProbe,
+  options: GitHubExecutionOptions = {},
+): Promise<ExecutedProbe> {
+  if (claim.kind !== "github_pr_create")
+    throw new Error(`Side effect ${claim.actionId} is not a pull-request creation`);
+  const expected = pullRequestPrecondition(claim);
+  const number = result.number;
+  if (typeof number !== "number" || !Number.isInteger(number) || number <= 0)
+    throw new Error(`Pull-request result for ${claim.actionId} has no valid number`);
+  const started = performance.now();
+  const github = commandOptions(workspace, options);
+  const snapshot = await captureGitHubPullRequestSnapshot({ ...github, pullRequest: number });
+  await assertGitHubSnapshotCurrent(github, snapshot);
+
+  const expectedState = spec.expectedState.toUpperCase();
+  const exactBinding =
+    contract.finishLine.kind === "pr_open" &&
+    expected.baseRefName === contract.repository.baseRef &&
+    snapshot.repository.host === expected.host &&
+    snapshot.repository.nameWithOwner === expected.nameWithOwner &&
+    snapshot.pullRequest.number === number &&
+    snapshot.pullRequest.headRefName === expected.headRefName &&
+    snapshot.pullRequest.baseRefName === expected.baseRefName &&
+    snapshot.binding.headSha === expected.headSha &&
+    snapshot.binding.baseSha === expected.baseSha &&
+    result.headSha === expected.headSha &&
+    result.baseSha === expected.baseSha;
+  const requiredSuccess = snapshot.requiredChecks.filter(({ state }) => state === "success");
+  const requiredPending = snapshot.requiredChecks.filter(({ state }) => state === "pending");
+  const requiredFailing = snapshot.requiredChecks.filter(({ state }) =>
+    ["failure", "missing", "unknown"].includes(state),
+  );
+  const unresolvedThreads = snapshot.reviewThreads.filter(
+    ({ isResolved, isOutdated }) => !isResolved && !isOutdated,
+  );
+  const stateMatches = snapshot.pullRequest.state.toUpperCase() === expectedState;
+  const checksMatch =
+    spec.requiredChecks === "observe" ||
+    (requiredPending.length === 0 &&
+      requiredFailing.length === 0 &&
+      requiredSuccess.length === snapshot.requiredChecks.length);
+  const reviewsMatch = spec.reviewThreads === "observe" || unresolvedThreads.length === 0;
+  const passed = exactBinding && stateMatches && checksMatch && reviewsMatch;
+  const stableEvidence = {
+    repository: snapshot.repository.nameWithOwner,
+    number: snapshot.pullRequest.number,
+    state: snapshot.pullRequest.state,
+    isDraft: snapshot.pullRequest.isDraft,
+    headRefName: snapshot.pullRequest.headRefName,
+    baseRefName: snapshot.pullRequest.baseRefName,
+    headSha: snapshot.binding.headSha,
+    baseSha: snapshot.binding.baseSha,
+    mergeable: snapshot.pullRequest.mergeable,
+    reviewDecision: snapshot.pullRequest.reviewDecision ?? null,
+    requiredChecks: snapshot.requiredChecks,
+    reviewThreads: snapshot.reviewThreads.map(
+      ({ id, isResolved, isOutdated, path, line, commentCount }) => ({
+        id,
+        isResolved,
+        isOutdated,
+        path: path ?? null,
+        line: line ?? null,
+        commentCount,
+      }),
+    ),
+    reviews: snapshot.reviews,
+  };
+  const summary = [
+    `PR #${number} is ${snapshot.pullRequest.state} at ${snapshot.binding.headSha}/${snapshot.binding.baseSha}`,
+    `${requiredSuccess.length} required checks succeeded, ${requiredPending.length} pending, ${requiredFailing.length} failing or missing`,
+    `${unresolvedThreads.length} unresolved current review threads`,
+    `mergeability is ${snapshot.pullRequest.mergeable}`,
+  ].join("; ");
+  return {
+    result: {
+      probeId: spec.id,
+      kind: spec.kind,
+      passed,
+      signature: contentHash(stableEvidence),
+      summary,
+      durationMs: Math.round(performance.now() - started),
+      metrics: {
+        requiredChecksTotal: snapshot.requiredChecks.length,
+        requiredChecksSucceeded: requiredSuccess.length,
+        requiredChecksPending: requiredPending.length,
+        requiredChecksFailing: requiredFailing.length,
+        unresolvedReviewThreads: unresolvedThreads.length,
+      },
+    },
+    output: `${JSON.stringify(lifecycleProjection(snapshot), null, 2)}\n`,
+  };
 }
