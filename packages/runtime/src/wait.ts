@@ -75,7 +75,7 @@ async function observe(
   wait: WaitRuntimeState,
   workspacePath: string,
   now: number,
-): Promise<{ satisfied: boolean; evidence: string[] }> {
+): Promise<{ satisfied: boolean; evidence: string[]; signature?: string }> {
   const condition = wait.condition;
   if (condition.kind === "time") {
     const satisfied = now >= Date.parse(condition.wakeAt);
@@ -95,6 +95,7 @@ async function observe(
     const absent = signature === contentHash({ kind: "absent", path: condition.path });
     return {
       satisfied: !absent,
+      signature,
       evidence: [
         absent ? `${condition.path} does not exist` : `${condition.path} now exists (${signature})`,
       ],
@@ -103,6 +104,7 @@ async function observe(
   const satisfied = signature !== wait.baselineSignature;
   return {
     satisfied,
+    signature,
     evidence: [
       satisfied
         ? `${condition.path} changed from ${wait.baselineSignature} to ${signature}`
@@ -134,7 +136,11 @@ export async function evaluateWaitNode(input: {
     await input.store.append(
       "runtime",
       "wait.satisfied",
-      { nodeId: input.node.id, evidence: observation.evidence },
+      {
+        nodeId: input.node.id,
+        evidence: observation.evidence,
+        ...(observation.signature ? { signature: observation.signature } : {}),
+      },
       input.node.id,
     );
     return { status: "satisfied", evidence: observation.evidence };
@@ -145,16 +151,27 @@ export async function evaluateWaitNode(input: {
     await input.store.append(
       "runtime",
       "wait.timed_out",
-      { nodeId: input.node.id, evidence },
+      {
+        nodeId: input.node.id,
+        evidence,
+        ...(observation.signature ? { signature: observation.signature } : {}),
+      },
       input.node.id,
     );
     return { status: "timed_out", evidence };
   }
   const wakeAt = nextWakeAt(wait.condition, now);
+  if (observation.signature && wait.lastSignature === observation.signature)
+    return { status: "waiting", nextWakeAt: wakeAt, evidence: observation.evidence };
   await input.store.append(
     "runtime",
     "wait.observed",
-    { nodeId: input.node.id, nextWakeAt: wakeAt, evidence: observation.evidence },
+    {
+      nodeId: input.node.id,
+      nextWakeAt: wakeAt,
+      evidence: observation.evidence,
+      ...(observation.signature ? { signature: observation.signature } : {}),
+    },
     input.node.id,
   );
   return { status: "waiting", nextWakeAt: wakeAt, evidence: observation.evidence };

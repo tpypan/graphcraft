@@ -51,18 +51,26 @@ import {
 } from "./governance.ts";
 import { RunLock } from "./lock.ts";
 import { createRunWorkspace, discoverPlanningEvidence } from "./repository.ts";
-import { RunStore } from "./store.ts";
+import {
+  RUN_METADATA_MAX_BYTES,
+  RUN_WORKSPACE_MAX_BYTES,
+  RunStore,
+  RunStoreLimitError,
+} from "./store.ts";
 import { amendRunGraph } from "./amendment.ts";
 import { assessRunProgress, createProgressDecisionPacket } from "./trajectory.ts";
 import { captureWorkspaceScopeSnapshot } from "./scope.ts";
 import type { SideEffectBoundary } from "./side-effect.ts";
 import { evaluateGitHubLifecycleWait } from "./github.ts";
+import { evaluateWaitNode } from "./wait.ts";
 import {
+  enforceSupervisorLogLimit,
   inspectSupervisorRecord,
   isProcessAlive,
   latestSupervisor,
   listSupervisorRecords,
   startDetachedSupervisor,
+  SUPERVISOR_LOG_MAX_BYTES,
 } from "./supervisor.ts";
 
 const execFileAsync = promisify(execFile);
@@ -743,6 +751,28 @@ class FakeAdapter implements HostAdapter {
   }
 }
 
+class OversizedResultAdapter extends FakeAdapter {
+  readonly hostileValue = "hostile-worker-result-".repeat(2_000);
+
+  constructor() {
+    super(async () => undefined);
+  }
+
+  override async *execute(request: WorkerRequest, _signal: AbortSignal): AsyncIterable<HostEvent> {
+    yield { type: "started", invocationId: request.invocationId };
+    yield { type: "session", hostSessionId: request.invocationId };
+    yield {
+      type: "result",
+      result: {
+        status: "completed",
+        summary: this.hostileValue,
+        changedPaths: [],
+        evidence: [],
+      },
+    };
+  }
+}
+
 class WaitPlannerAdapter extends FakeAdapter {
   constructor(
     private readonly condition: WaitCondition,
@@ -1035,6 +1065,56 @@ describe("durable runtime", () => {
     ).toHaveLength(1);
   });
 
+  it("coalesces unchanged local wait observations after the first durable signature", async () => {
+    const repository = await createRepository();
+    const adapter = new WaitPlannerAdapter(
+      { kind: "file_exists", path: "ready.flag", pollIntervalMs: 250 },
+      async () => undefined,
+    );
+    const created = await createRun("Implement a substantial feature after a stable signal", {
+      cwd: repository,
+      planner: adapter,
+    });
+    const waiting = await executeRun({ store: created.store, adapter, approve: true });
+    const workspace = await created.store.loadWorkspace<{ path: string }>();
+    const waitNode = created.graph.nodes.find(({ id }) => id === "await-signal");
+    const durableWait = waiting.waits.find(({ nodeId }) => nodeId === "await-signal");
+    if (!waitNode || !durableWait) throw new Error("Missing durable local wait fixture");
+    const observationsBefore = (await created.store.loadEvents()).filter(
+      ({ type }) => type === "wait.observed",
+    ).length;
+
+    const repeated = await evaluateWaitNode({
+      store: created.store,
+      node: waitNode,
+      workspacePath: workspace.path,
+      now: Date.parse(durableWait.nextWakeAt) + 1,
+    });
+    if (repeated.status !== "waiting") throw new Error("Local wait did not remain waiting");
+    const restarted = new RunStore(repository, created.contract.runId);
+    const repeatedAfterRestart = await evaluateWaitNode({
+      store: restarted,
+      node: waitNode,
+      workspacePath: workspace.path,
+      now: Date.parse(repeated.nextWakeAt) + 1,
+    });
+    const state = await restarted.loadState();
+    const observationsAfter = (await restarted.loadEvents()).filter(
+      ({ type }) => type === "wait.observed",
+    ).length;
+
+    expect(repeatedAfterRestart.status).toBe("waiting");
+    expect(Date.parse(repeated.nextWakeAt)).toBeGreaterThan(Date.parse(durableWait.nextWakeAt));
+    expect(state.waits[0]).toMatchObject({
+      observations: 1,
+      lastSignature: expect.stringMatching(/^[a-f0-9]{64}$/),
+      nextWakeAt: durableWait.nextWakeAt,
+    });
+    expect(observationsBefore).toBe(1);
+    expect(observationsAfter).toBe(observationsBefore);
+    expect(adapter.calls).toEqual([]);
+  });
+
   it("keeps a file-change baseline across runtime restart", async () => {
     const repository = await createRepository();
     await writeFile(join(repository, "signal.txt"), "before\n");
@@ -1176,6 +1256,28 @@ describe("durable runtime", () => {
     ).toHaveLength(1);
   });
 
+  it("bounds a supervisor log while retaining its newest diagnostic tail", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-supervisor-log-test-"));
+    temporaryRoots.push(root);
+    const logPath = join(root, "supervisor.log");
+    await writeFile(
+      logPath,
+      Buffer.concat([
+        Buffer.alloc(SUPERVISOR_LOG_MAX_BYTES + 1_024, 0x78),
+        Buffer.from("\nretained supervisor diagnostic tail\n"),
+      ]),
+      { mode: 0o600 },
+    );
+
+    enforceSupervisorLogLimit(logPath);
+
+    const log = await readFile(logPath, "utf8");
+    expect(Buffer.byteLength(log)).toBeLessThanOrEqual(SUPERVISOR_LOG_MAX_BYTES);
+    expect(log).toContain("Graphcraft supervisor log truncated");
+    expect(log).toContain("retained supervisor diagnostic tail");
+    if (process.platform !== "win32") expect((await stat(logPath)).mode & 0o777).toBe(0o600);
+  });
+
   it.skipIf(process.platform === "win32")(
     "detaches, exposes, and replaces a stale supervisor in a repository path with spaces",
     async () => {
@@ -1280,14 +1382,28 @@ process.stdin.on("end", () => {
         );
         const workspace = await created.store.loadWorkspace<{ path: string }>();
         await writeFile(join(workspace.path, "ready.flag"), "ready\n");
-        await waitFor(async () => (await created.store.loadState()).status === "completed", 15_000);
+        try {
+          await waitFor(
+            async () => (await created.store.loadState()).status === "completed",
+            15_000,
+          );
+        } catch (error) {
+          throw new Error(
+            `${(error as Error).message}\nSupervisor log:\n${await readFile(second.logPath, "utf8")}`,
+          );
+        }
         await waitFor(
           async () =>
             (await latestSupervisor(repositoryRoot, created.contract.runId))?.runStatus ===
             "completed",
           10_000,
         );
+        await waitFor(() => !isProcessAlive(second.pid), 10_000);
         activePid = undefined;
+
+        const supervisorLog = await readFile(second.logPath, "utf8");
+        expect(Buffer.byteLength(supervisorLog)).toBeLessThanOrEqual(SUPERVISOR_LOG_MAX_BYTES);
+        expect(supervisorLog).toContain("implemented fixture");
 
         const records = await listSupervisorRecords(repositoryRoot, created.contract.runId);
         expect(records).toHaveLength(2);
@@ -1479,6 +1595,168 @@ process.stdin.on("end", () => {
     await writeFile(created.store.eventsPath(), `${lines.join("\n")}\n`);
 
     await expect(created.store.loadHeldOutProbePlan()).rejects.toThrow(/event hash/i);
+  });
+
+  it("blocks once before an oversized event can enter the durable log or state", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a substantial persistence limit feature", {
+      cwd: repository,
+    });
+    const before = await readFile(created.store.eventsPath(), "utf8");
+    const existingEventBytes = Math.max(
+      ...before
+        .trimEnd()
+        .split("\n")
+        .map((line) => Buffer.byteLength(`${line}\n`)),
+    );
+    const store = new RunStore(repository, created.contract.runId, {
+      maxEventBytes: existingEventBytes + 256,
+      blockedEventReserveBytes: 1_024,
+    });
+    const rejectedValue = `oversized-event-value-${"x".repeat(store.limits.maxEventBytes + 1)}`;
+    const beforeCount = before.trimEnd().split("\n").length;
+
+    const firstError = await store
+      .append("runtime", "run.paused", { reason: rejectedValue })
+      .catch((error: unknown) => error);
+
+    expect(firstError).toBeInstanceOf(RunStoreLimitError);
+    expect(firstError).toMatchObject({ kind: "event", blockerPersisted: true });
+    const afterFirstFailure = await readFile(store.eventsPath(), "utf8");
+    const events = await store.loadEvents();
+    expect(events).toHaveLength(beforeCount + 1);
+    expect(events.at(-1)).toMatchObject({
+      type: "run.blocked",
+      data: { persistenceLimit: "event" },
+    });
+    expect(afterFirstFailure).not.toContain(rejectedValue.slice(0, 512));
+    expect((await store.loadState()).status).toBe("blocked");
+
+    const repeatedError = await store
+      .append("runtime", "run.blocked", { reason: "Duplicate blocker" })
+      .catch((error: unknown) => error);
+    expect(repeatedError).toMatchObject({ kind: "event", blockerPersisted: true });
+    expect(await readFile(store.eventsPath(), "utf8")).toBe(afterFirstFailure);
+  });
+
+  it("reserves event-log capacity for one durable persistence blocker", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a substantial event log limit feature", {
+      cwd: repository,
+    });
+    const before = await readFile(created.store.eventsPath(), "utf8");
+    const store = new RunStore(repository, created.contract.runId, {
+      maxEventLogBytes: Buffer.byteLength(before) + 1_024,
+      blockedEventReserveBytes: 1_024,
+    });
+    const beforeCount = before.trimEnd().split("\n").length;
+
+    const error = await store
+      .append("runtime", "run.approved", { approved: true })
+      .catch((cause: unknown) => cause);
+
+    expect(error).toBeInstanceOf(RunStoreLimitError);
+    expect(error).toMatchObject({ kind: "event_log", blockerPersisted: true });
+    const after = await readFile(store.eventsPath(), "utf8");
+    expect(Buffer.byteLength(after)).toBeLessThanOrEqual(store.limits.maxEventLogBytes);
+    expect(await store.loadEvents()).toHaveLength(beforeCount + 1);
+    expect((await store.loadState()).status).toBe("blocked");
+  });
+
+  it("returns the durable blocked state when execution reaches a persistence limit", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a substantial execution limit feature", {
+      cwd: repository,
+    });
+    const before = await readFile(created.store.eventsPath(), "utf8");
+    const store = new RunStore(repository, created.contract.runId, {
+      maxEventLogBytes: Buffer.byteLength(before) + 1_024,
+      blockedEventReserveBytes: 1_024,
+    });
+    const adapter = new FakeAdapter(async () => undefined);
+
+    const blocked = await executeRun({ store, adapter, approve: true });
+
+    expect(blocked).toMatchObject({
+      status: "blocked",
+      stopReason:
+        "Graphcraft blocked this run before durable run storage exceeded its configured size limit.",
+    });
+    const afterFirstExecution = await readFile(store.eventsPath(), "utf8");
+    expect((await store.loadEvents()).filter(({ type }) => type === "run.blocked")).toHaveLength(1);
+
+    const resumed = await executeRun({ store, adapter, approve: true });
+
+    expect(resumed).toEqual(blocked);
+    expect(await readFile(store.eventsPath(), "utf8")).toBe(afterFirstExecution);
+  });
+
+  it("refuses an oversized event log through the bounded descriptor read", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a substantial bounded read feature", {
+      cwd: repository,
+    });
+    const before = await readFile(created.store.eventsPath());
+    const store = new RunStore(repository, created.contract.runId, {
+      maxEventLogBytes: before.byteLength + 1_024,
+      blockedEventReserveBytes: 512,
+    });
+    await writeFile(store.eventsPath(), Buffer.concat([before, Buffer.alloc(1_025, 0x78)]));
+
+    const error = await store.loadEvents().catch((cause: unknown) => cause);
+
+    expect(error).toBeInstanceOf(RunStoreLimitError);
+    expect(error).toMatchObject({ kind: "event_log", blockerPersisted: false });
+  });
+
+  it("rejects state growth before append and rebuilds an oversized materialized view", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a substantial state limit feature", {
+      cwd: repository,
+    });
+    const statePath = join(created.store.runRoot, "state.json");
+    const baselineStateBytes = Buffer.byteLength(await readFile(statePath, "utf8"));
+    const store = new RunStore(repository, created.contract.runId, {
+      maxStateBytes: baselineStateBytes + 512,
+      blockedEventReserveBytes: 1_024,
+    });
+
+    const error = await store
+      .append("runtime", "run.paused", { reason: "state-growth-".repeat(1_024) })
+      .catch((cause: unknown) => cause);
+
+    expect(error).toBeInstanceOf(RunStoreLimitError);
+    expect(error).toMatchObject({ kind: "state", blockerPersisted: true });
+    expect((await store.loadState()).status).toBe("blocked");
+    expect(Buffer.byteLength(await readFile(statePath))).toBeLessThanOrEqual(
+      store.limits.maxStateBytes,
+    );
+
+    await writeFile(statePath, Buffer.alloc(store.limits.maxStateBytes + 1, 0x78));
+    const rebuilt = await store.loadState();
+    expect(rebuilt.status).toBe("blocked");
+    expect(JSON.parse(await readFile(statePath, "utf8"))).toEqual(rebuilt);
+  });
+
+  it("bounds metadata reads while recovering an oversized graph projection", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a substantial metadata limit feature", {
+      cwd: repository,
+    });
+    const graphPath = join(created.store.runRoot, "graph.json");
+    await writeFile(graphPath, Buffer.alloc(RUN_METADATA_MAX_BYTES + 1, 0x78));
+
+    const graph = await created.store.loadGraph();
+
+    expect(graph).toEqual(created.graph);
+    expect((await stat(graphPath)).size).toBeLessThanOrEqual(RUN_METADATA_MAX_BYTES);
+
+    const workspacePath = join(created.store.runRoot, "workspace.json");
+    await writeFile(workspacePath, Buffer.alloc(RUN_WORKSPACE_MAX_BYTES + 1, 0x78));
+    await expect(created.store.loadWorkspace()).rejects.toThrow(/bounded read limit/);
+    await expect(
+      created.store.writeWorkspace({ path: "x".repeat(RUN_WORKSPACE_MAX_BYTES) }),
+    ).rejects.toThrow(/Run workspace requires/);
   });
 
   it("stops on an unsupported isolated semantic progress verdict", async () => {
@@ -2498,6 +2776,7 @@ process.stdin.on("end", () => {
       if (request.capsule.nodeId.startsWith("inspect-")) {
         activeReads += 1;
         maximumReads = Math.max(maximumReads, activeReads);
+        await waitFor(() => activeReads === 2, 5_000);
         await new Promise<void>((resolve) => setTimeout(resolve, 40));
         activeReads -= 1;
       }
@@ -3494,6 +3773,100 @@ process.stdin.on("end", () => {
     expect(completed.tokens.total).toBe(tokensBeforeWake);
   });
 
+  it("coalesces unchanged GitHub snapshots after durable maximum backoff", async () => {
+    const { repository, remote } = await createRepositoryWithRemote();
+    const github = await fakePullRequestGitHub(remote, {
+      protected: true,
+      requiredStatusChecks: ["tests"],
+      checks: [
+        {
+          kind: "check_run",
+          id: "tests-check",
+          name: "tests",
+          status: "IN_PROGRESS",
+          conclusion: null,
+        },
+      ],
+    });
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "pending\n");
+    });
+    const created = await createRun("Implement the feature and get the PR green", {
+      cwd: repository,
+      finishLine: "pr_green",
+    });
+    const waiting = await executeRun({
+      store: created.store,
+      adapter,
+      approve: true,
+      github,
+    });
+    const workspace = await created.store.loadWorkspace<{
+      path: string;
+      branch: string;
+      created: boolean;
+    }>();
+    const waitNode = created.graph.nodes.find(({ id }) => id === "pr-green");
+    let nextWakeAt = waiting.waits.find(({ nodeId }) => nodeId === "pr-green")?.nextWakeAt;
+    if (!waitNode || !nextWakeAt) throw new Error("Missing GitHub wait fixture");
+
+    for (let index = 0; index < 4; index += 1) {
+      const outcome = await evaluateGitHubLifecycleWait({
+        store: created.store,
+        node: waitNode,
+        workspace,
+        contract: created.contract,
+        options: github,
+        now: Date.parse(nextWakeAt) + 1,
+      });
+      if (outcome.status !== "waiting") throw new Error("GitHub fixture stopped waiting");
+      nextWakeAt = outcome.nextWakeAt;
+    }
+
+    const saturated = await created.store.loadState();
+    const durableNextWakeAt = saturated.waits[0]?.nextWakeAt;
+    if (!durableNextWakeAt) throw new Error("Missing saturated GitHub wake time");
+    const observationsBefore = (await created.store.loadEvents()).filter(
+      ({ type }) => type === "wait.observed",
+    ).length;
+    const coalesced = await evaluateGitHubLifecycleWait({
+      store: created.store,
+      node: waitNode,
+      workspace,
+      contract: created.contract,
+      options: github,
+      now: Date.parse(durableNextWakeAt) + 1,
+    });
+    if (coalesced.status !== "waiting") throw new Error("GitHub fixture stopped waiting");
+    const restarted = new RunStore(repository, created.contract.runId);
+    const coalescedAfterRestart = await evaluateGitHubLifecycleWait({
+      store: restarted,
+      node: waitNode,
+      workspace,
+      contract: created.contract,
+      options: github,
+      now: Date.parse(coalesced.nextWakeAt) + 1,
+    });
+    const durableAfter = await restarted.loadState();
+    const observationsAfter = (await restarted.loadEvents()).filter(
+      ({ type }) => type === "wait.observed",
+    ).length;
+
+    expect(saturated.waits[0]).toMatchObject({ observations: 5 });
+    expect(Date.parse(nextWakeAt) - Date.parse(saturated.waits[0]!.updatedAt)).toBeGreaterThan(
+      299_000,
+    );
+    expect(coalescedAfterRestart.status).toBe("waiting");
+    expect(durableAfter.waits[0]).toMatchObject({
+      observations: 5,
+      nextWakeAt: durableNextWakeAt,
+      lastSignature: saturated.waits[0]?.lastSignature,
+    });
+    expect(observationsBefore).toBe(5);
+    expect(observationsAfter).toBe(observationsBefore);
+  });
+
   it("rebinds a moved base without mutating the exact PR head", async () => {
     const { repository, remote } = await createRepositoryWithRemote();
     const github = await fakePullRequestGitHub(remote, {
@@ -3857,138 +4230,142 @@ process.stdin.on("end", () => {
     expect(adapter.calls).toEqual(["implement", "repair-review-1"]);
   });
 
-  it("reconciles review replies and resolutions across every mutation boundary", async () => {
-    const faultPoints: SideEffectBoundary[] = [
-      "before_claim",
-      "after_claim",
-      "after_precondition_reconcile",
-      "before_act",
-      "after_action_prepare",
-      "after_action_command",
-      "after_act",
-      "after_confirmation_reconcile",
-      "after_confirm",
-    ];
-    const actionKinds = ["github_pr_comment", "github_review_thread_resolve"] as const;
+  it(
+    "reconciles review replies and resolutions across every mutation boundary",
+    async () => {
+      const faultPoints: SideEffectBoundary[] = [
+        "before_claim",
+        "after_claim",
+        "after_precondition_reconcile",
+        "before_act",
+        "after_action_prepare",
+        "after_action_command",
+        "after_act",
+        "after_confirmation_reconcile",
+        "after_confirm",
+      ];
+      const actionKinds = ["github_pr_comment", "github_review_thread_resolve"] as const;
 
-    for (const actionKind of actionKinds) {
-      for (const faultPoint of faultPoints) {
-        const { repository, remote } = await createRepositoryWithRemote();
-        const github = await fakePullRequestGitHub(remote, {
-          syncPullRequestHead: true,
-          reviewThreads: [
-            {
-              id: `thread-${actionKind}-${faultPoint}`,
-              isResolved: false,
-              isOutdated: false,
-              path: "feature.txt",
-              line: 1,
-              body: "Apply the recovery-safe reviewed change.",
-            },
-          ],
-          reviewDecision: "",
-        });
-        const adapter = new FakeAdapter(async (request) => {
-          if (request.capsule.nodeId === "implement")
-            await writeFile(join(request.repositoryPath, "feature.txt"), "review\n");
-          if (request.capsule.nodeId === "repair-review-1")
-            await writeFile(join(request.repositoryPath, "feature.txt"), "review-fixed\n");
-        });
-        const created = await createRun("Implement the feature and get the PR green", {
-          cwd: repository,
-          finishLine: "pr_green",
-        });
-        let armed = true;
-        const boundary = async (point: SideEffectBoundary): Promise<void> => {
-          const state = await created.store.loadState();
-          const targetClaim = state.sideEffects.find(({ claim }) => claim.kind === actionKind);
-          const reply = state.sideEffects.find(({ claim }) => claim.kind === "github_pr_comment");
-          const atTarget =
-            targetClaim !== undefined ||
-            (point === "before_claim" &&
-              (actionKind === "github_pr_comment"
-                ? state.nodes["push-review-1"]?.status === "accepted"
-                : reply?.status === "confirmed"));
-          if (armed && atTarget && point === faultPoint) {
-            armed = false;
-            throw new Error(`Injected ${actionKind} termination at ${point}`);
-          }
-        };
+      for (const actionKind of actionKinds) {
+        for (const faultPoint of faultPoints) {
+          const { repository, remote } = await createRepositoryWithRemote();
+          const github = await fakePullRequestGitHub(remote, {
+            syncPullRequestHead: true,
+            reviewThreads: [
+              {
+                id: `thread-${actionKind}-${faultPoint}`,
+                isResolved: false,
+                isOutdated: false,
+                path: "feature.txt",
+                line: 1,
+                body: "Apply the recovery-safe reviewed change.",
+              },
+            ],
+            reviewDecision: "",
+          });
+          const adapter = new FakeAdapter(async (request) => {
+            if (request.capsule.nodeId === "implement")
+              await writeFile(join(request.repositoryPath, "feature.txt"), "review\n");
+            if (request.capsule.nodeId === "repair-review-1")
+              await writeFile(join(request.repositoryPath, "feature.txt"), "review-fixed\n");
+          });
+          const created = await createRun("Implement the feature and get the PR green", {
+            cwd: repository,
+            finishLine: "pr_green",
+          });
+          let armed = true;
+          const boundary = async (point: SideEffectBoundary): Promise<void> => {
+            const state = await created.store.loadState();
+            const targetClaim = state.sideEffects.find(({ claim }) => claim.kind === actionKind);
+            const reply = state.sideEffects.find(({ claim }) => claim.kind === "github_pr_comment");
+            const atTarget =
+              targetClaim !== undefined ||
+              (point === "before_claim" &&
+                (actionKind === "github_pr_comment"
+                  ? state.nodes["push-review-1"]?.status === "accepted"
+                  : reply?.status === "confirmed"));
+            if (armed && atTarget && point === faultPoint) {
+              armed = false;
+              throw new Error(`Injected ${actionKind} termination at ${point}`);
+            }
+          };
 
-        await expect(
-          executeRun({
+          await expect(
+            executeRun({
+              store: created.store,
+              adapter,
+              approve: true,
+              github,
+              sideEffectBoundary: boundary,
+            }),
+            `${actionKind}:${faultPoint}`,
+          ).rejects.toThrow(`Side-effect execution interrupted after ${faultPoint}`);
+          expect(armed, `${actionKind}:${faultPoint}`).toBe(false);
+
+          const completed = await executeRun({
             store: created.store,
             adapter,
-            approve: true,
             github,
             sideEffectBoundary: boundary,
-          }),
-          `${actionKind}:${faultPoint}`,
-        ).rejects.toThrow(`Side-effect execution interrupted after ${faultPoint}`);
-        expect(armed, `${actionKind}:${faultPoint}`).toBe(false);
+          });
+          const persisted = JSON.parse(await readFile(github.statePath, "utf8")) as {
+            reviewThreads: Array<{ isResolved: boolean; replies?: unknown[] }>;
+          };
+          const calls = (await readFile(github.logPath, "utf8"))
+            .trim()
+            .split("\n")
+            .filter(Boolean)
+            .map((line) => JSON.parse(line) as string[]);
+          const events = await created.store.loadEvents();
 
-        const completed = await executeRun({
-          store: created.store,
-          adapter,
-          github,
-          sideEffectBoundary: boundary,
-        });
-        const persisted = JSON.parse(await readFile(github.statePath, "utf8")) as {
-          reviewThreads: Array<{ isResolved: boolean; replies?: unknown[] }>;
-        };
-        const calls = (await readFile(github.logPath, "utf8"))
-          .trim()
-          .split("\n")
-          .filter(Boolean)
-          .map((line) => JSON.parse(line) as string[]);
-        const events = await created.store.loadEvents();
-
-        expect(completed.status, `${actionKind}:${faultPoint}`).toBe("completed");
-        expect(persisted.reviewThreads[0], `${actionKind}:${faultPoint}`).toMatchObject({
-          isResolved: true,
-          replies: [expect.any(Object)],
-        });
-        expect(
-          completed.sideEffects.filter(({ claim }) => claim.kind === actionKind),
-          `${actionKind}:${faultPoint}`,
-        ).toMatchObject([{ status: "confirmed" }]);
-        expect(
-          events.filter(
-            ({ type, data }) =>
-              type === "side_effect.claimed" &&
-              (data.claim as { kind?: string } | undefined)?.kind === actionKind,
-          ),
-          `${actionKind}:${faultPoint}`,
-        ).toHaveLength(1);
-        expect(
-          events.filter(
-            ({ type, data }) =>
-              type === "side_effect.confirmed" &&
-              data.actionId ===
-                completed.sideEffects.find(({ claim }) => claim.kind === actionKind)?.claim
-                  .actionId,
-          ),
-          `${actionKind}:${faultPoint}`,
-        ).toHaveLength(1);
-        expect(
-          calls.filter((args) =>
-            args.some((argument) =>
-              argument.includes(
-                actionKind === "github_pr_comment"
-                  ? "GraphcraftAddReviewReply"
-                  : "GraphcraftResolveReviewThread",
+          expect(completed.status, `${actionKind}:${faultPoint}`).toBe("completed");
+          expect(persisted.reviewThreads[0], `${actionKind}:${faultPoint}`).toMatchObject({
+            isResolved: true,
+            replies: [expect.any(Object)],
+          });
+          expect(
+            completed.sideEffects.filter(({ claim }) => claim.kind === actionKind),
+            `${actionKind}:${faultPoint}`,
+          ).toMatchObject([{ status: "confirmed" }]);
+          expect(
+            events.filter(
+              ({ type, data }) =>
+                type === "side_effect.claimed" &&
+                (data.claim as { kind?: string } | undefined)?.kind === actionKind,
+            ),
+            `${actionKind}:${faultPoint}`,
+          ).toHaveLength(1);
+          expect(
+            events.filter(
+              ({ type, data }) =>
+                type === "side_effect.confirmed" &&
+                data.actionId ===
+                  completed.sideEffects.find(({ claim }) => claim.kind === actionKind)?.claim
+                    .actionId,
+            ),
+            `${actionKind}:${faultPoint}`,
+          ).toHaveLength(1);
+          expect(
+            calls.filter((args) =>
+              args.some((argument) =>
+                argument.includes(
+                  actionKind === "github_pr_comment"
+                    ? "GraphcraftAddReviewReply"
+                    : "GraphcraftResolveReviewThread",
+                ),
               ),
             ),
-          ),
-          `${actionKind}:${faultPoint}`,
-        ).toHaveLength(1);
-        expect(adapter.calls, `${actionKind}:${faultPoint}`).toEqual([
-          "implement",
-          "repair-review-1",
-        ]);
+            `${actionKind}:${faultPoint}`,
+          ).toHaveLength(1);
+          expect(adapter.calls, `${actionKind}:${faultPoint}`).toEqual([
+            "implement",
+            "repair-review-1",
+          ]);
+        }
       }
-    }
-  }, 240_000);
+    },
+    process.platform === "darwin" ? 600_000 : 240_000,
+  );
 
   it("resumes a confirmed review-repair push without repeating the mutation", async () => {
     const { repository, remote } = await createRepositoryWithRemote();
@@ -4610,6 +4987,21 @@ process.stdin.on("end", () => {
     );
   });
 
+  it("rejects a valid-looking materialized state that disagrees with hashed events", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    const statePath = join(created.store.runRoot, "state.json");
+    const materialized = JSON.parse(await readFile(statePath, "utf8")) as Record<string, unknown>;
+    await writeFile(statePath, `${JSON.stringify({ ...materialized, status: "completed" })}\n`);
+
+    const state = await created.store.loadState();
+
+    expect(state.status).toBe("awaiting_approval");
+    expect(JSON.parse(await readFile(statePath, "utf8"))).toEqual(state);
+  });
+
   it.each(["0.1.0", "0.1.1"])(
     "migrates released %s pre-manifest storage once, backs it up, and resumes it",
     async (release) => {
@@ -4638,7 +5030,7 @@ process.stdin.on("end", () => {
         legacyStore.graphcraftRoot,
         "migration-backups",
         legacyStore.runId,
-        "0-to-1",
+        "0-to-2",
       );
       const [contract, graph, probePlan, events] = await Promise.all([
         legacyStore.loadContract(),
@@ -4648,7 +5040,7 @@ process.stdin.on("end", () => {
       ]);
 
       expect(manifest).toMatchObject({
-        schemaVersion: 1,
+        schemaVersion: 2,
         migratedFrom: 0,
         formats: {
           contract: 1,
@@ -4663,13 +5055,31 @@ process.stdin.on("end", () => {
           rawArtifacts: 1,
           controlRequests: 1,
           locks: 1,
+          artifactInventory: 1,
+          artifactPolicy: 1,
         },
       });
       expect(contract.runId).toBe(fixture.runId);
       expect(graph.runId).toBe(fixture.runId);
       expect(probePlan.family).toBe(graph.family);
       expect(events).toHaveLength(12);
-      expect(await snapshotFiles(backupRoot)).toEqual(releasedSnapshot);
+      const backupSnapshot = await snapshotFiles(backupRoot);
+      expect(backupSnapshot).toMatchObject(releasedSnapshot);
+      expect(Object.keys(backupSnapshot).sort()).toEqual(
+        [...Object.keys(releasedSnapshot), ".backup-complete.json"].sort(),
+      );
+      expect(
+        JSON.parse(
+          Buffer.from(backupSnapshot[".backup-complete.json"]!, "base64").toString("utf8"),
+        ),
+      ).toMatchObject({
+        schemaVersion: 1,
+        kind: "graphcraft_storage_migration_backup",
+        runId: fixture.runId,
+        sourceVersion: 0,
+        targetVersion: 2,
+        treeDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+      });
 
       const adapter = new FakeAdapter(async () => {
         throw new Error("a completed released run must not invoke a worker during resume");
@@ -4678,6 +5088,92 @@ process.stdin.on("end", () => {
         "completed",
       );
       expect(adapter.calls).toHaveLength(0);
+    },
+  );
+
+  it.each(["configure probes", "amend graph", "decide control"] as const)(
+    "prepares legacy storage before direct %s run-lock ownership",
+    async (operation) => {
+      const repository = await createRepository();
+      const created = await createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+      });
+      const storagePath = join(created.store.runRoot, "storage.json");
+      const current = JSON.parse(await readFile(storagePath, "utf8")) as {
+        formats: Record<string, number>;
+      };
+      const formats = Object.fromEntries(
+        Object.entries(current.formats).filter(
+          ([key]) => key !== "artifactInventory" && key !== "artifactPolicy",
+        ),
+      );
+      await rm(join(created.store.runRoot, "artifact-inventory.json"));
+      await writeFile(
+        storagePath,
+        `${JSON.stringify({
+          schemaVersion: 1,
+          runId: created.store.runId,
+          migratedFrom: 1,
+          formats,
+        })}\n`,
+      );
+      const reopened = new RunStore(repository, created.store.runId);
+
+      if (operation === "configure probes") {
+        await configureRunProbes(reopened, created.probePlan);
+      } else if (operation === "amend graph") {
+        const firstNode = created.graph.nodes[0]!;
+        await expect(
+          amendRunGraph(
+            reopened,
+            {
+              schemaVersion: 1,
+              amendmentId: randomUUID(),
+              operations: [
+                {
+                  operation: "dependency_change",
+                  targetId: firstNode.id,
+                  dependsOn: firstNode.dependsOn,
+                },
+              ],
+              evidence: ["Direct API migration lock-order regression test"],
+              rationale: "Exercise storage preparation before amendment lock ownership",
+              changedStrategy: "Keep dependencies unchanged after reopening legacy storage",
+              falsifiableExpectation: "The awaiting-approval guard runs after migration",
+            },
+            "user",
+          ),
+        ).rejects.toThrow(/awaiting_approval/);
+      } else {
+        const decided = await decideRunControl(reopened, {
+          sourceId: "user-outcome",
+          targetId: "verify",
+          verdict: "approve",
+          rationale: "Approve the unchanged user-owned finish line",
+        });
+        expect(decided.controlDecisions).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ sourceId: "user-outcome", targetId: "verify" }),
+          ]),
+        );
+      }
+
+      expect(JSON.parse(await readFile(storagePath, "utf8"))).toMatchObject({
+        schemaVersion: 2,
+        migratedFrom: 1,
+      });
+      expect(
+        await readFile(
+          join(
+            created.store.graphcraftRoot,
+            "migration-backups",
+            created.store.runId,
+            "1-to-2",
+            "storage.json",
+          ),
+          "utf8",
+        ),
+      ).toContain('"schemaVersion":1');
     },
   );
 
@@ -4706,7 +5202,7 @@ process.stdin.on("end", () => {
           created.store.graphcraftRoot,
           "migration-backups",
           created.store.runId,
-          "0-to-1",
+          "0-to-2",
           "events.jsonl",
         ),
         "utf8",
@@ -4786,6 +5282,27 @@ process.stdin.on("end", () => {
     expect(state.stopReason).toMatch(/not authenticated/);
     expect(adapter.calls).toHaveLength(0);
     await expect(created.store.loadWorkspace()).rejects.toThrow();
+  });
+
+  it("rejects an oversized worker result before it can enlarge durable events or state", async () => {
+    const repository = await createRepository();
+    const adapter = new OversizedResultAdapter();
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toContain("invalid or oversized structured event");
+    const events = await readFile(created.store.eventsPath(), "utf8");
+    const materialized = await readFile(join(created.store.runRoot, "state.json"), "utf8");
+    const hostilePrefix = adapter.hostileValue.slice(0, 256);
+    expect(events).not.toContain(hostilePrefix);
+    expect(materialized).not.toContain(hostilePrefix);
+    expect(Buffer.byteLength(events)).toBeLessThan(256 * 1024);
+    expect(Buffer.byteLength(materialized)).toBeLessThan(256 * 1024);
+    expect((await created.store.loadArtifactInventory()).storedBytes).toBeLessThan(256 * 1024);
   });
 
   it("recovers an interrupted running node in the existing worktree", async () => {
@@ -4914,120 +5431,127 @@ process.stdin.on("end", () => {
     ).toBeDefined();
   });
 
-  it("recovers across the complete durable invocation fault matrix on both host identities", async () => {
-    const faultPoints: InvocationFaultPoint[] = [
-      "node.started",
-      "invocation.started",
-      "host.started",
-      "host.session",
-      "invocation.session",
-      "host.usage",
-      "tokens.recorded",
-      "host.result",
-      "invocation.finished",
-      "node.progress",
-      "node.accepted",
-    ];
+  it(
+    "recovers across the complete durable invocation fault matrix on both host identities",
+    async () => {
+      const faultPoints: InvocationFaultPoint[] = [
+        "node.started",
+        "invocation.started",
+        "host.started",
+        "host.session",
+        "invocation.session",
+        "host.usage",
+        "tokens.recorded",
+        "host.result",
+        "invocation.finished",
+        "node.progress",
+        "node.accepted",
+      ];
 
-    for (const adapterId of ["codex", "claude"] as const) {
-      for (const faultPoint of faultPoints) {
-        const repository = await createRepository();
-        const adapter = new FakeAdapter(
-          async (request) => {
-            if (request.capsule.nodeId === "implement")
-              await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
-          },
-          true,
-          undefined,
-          undefined,
-          adapterId,
-        );
-        const created = await createRun("Implement a substantial feature across the fixture", {
-          cwd: repository,
-          planner: adapter,
-        });
-        const faultStore = new FaultInjectingRunStore(created.store, faultPoint);
+      for (const adapterId of ["codex", "claude"] as const) {
+        for (const faultPoint of faultPoints) {
+          const repository = await createRepository();
+          const adapter = new FakeAdapter(
+            async (request) => {
+              if (request.capsule.nodeId === "implement")
+                await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+            },
+            true,
+            undefined,
+            undefined,
+            adapterId,
+          );
+          const created = await createRun("Implement a substantial feature across the fixture", {
+            cwd: repository,
+            planner: adapter,
+          });
+          const faultStore = new FaultInjectingRunStore(created.store, faultPoint);
 
-        await expect(
-          executeRun({ store: faultStore, adapter, approve: true }),
-          `${adapterId} at ${faultPoint}`,
-        ).rejects.toThrow(`Injected process termination after ${faultPoint}`);
-        expect(faultStore.injected, `${adapterId} at ${faultPoint}`).toBe(true);
+          await expect(
+            executeRun({ store: faultStore, adapter, approve: true }),
+            `${adapterId} at ${faultPoint}`,
+          ).rejects.toThrow(`Injected process termination after ${faultPoint}`);
+          expect(faultStore.injected, `${adapterId} at ${faultPoint}`).toBe(true);
 
-        const stateAtCrash = await created.store.loadState();
-        const decisionsAtCrash = stateAtCrash.controlDecisions.map(({ decisionId }) => decisionId);
-        const implementationRequestsAtCrash = adapter.requests.filter(
-          ({ capsule }) => capsule.nodeId === "implement",
-        ).length;
-        const completed = await executeRun({ store: created.store, adapter });
-        const events = await created.store.loadEvents();
-        const implementationRequests = adapter.requests.filter(
-          ({ capsule }) => capsule.nodeId === "implement",
-        );
-        const implementationStarts = events.filter(
-          ({ type, data }) => type === "invocation.started" && data.nodeId === "implement",
-        );
-        const firstInvocationId = String(implementationStarts[0]?.data.invocationId ?? "");
-        const acceptanceCounts = new Map<string, number>();
-        for (const { type, data } of events) {
-          if (type !== "node.accepted") continue;
-          const nodeId = String(data.nodeId);
-          acceptanceCounts.set(nodeId, (acceptanceCounts.get(nodeId) ?? 0) + 1);
-        }
+          const stateAtCrash = await created.store.loadState();
+          const decisionsAtCrash = stateAtCrash.controlDecisions.map(
+            ({ decisionId }) => decisionId,
+          );
+          const implementationRequestsAtCrash = adapter.requests.filter(
+            ({ capsule }) => capsule.nodeId === "implement",
+          ).length;
+          const completed = await executeRun({ store: created.store, adapter });
+          const events = await created.store.loadEvents();
+          const implementationRequests = adapter.requests.filter(
+            ({ capsule }) => capsule.nodeId === "implement",
+          );
+          const implementationStarts = events.filter(
+            ({ type, data }) => type === "invocation.started" && data.nodeId === "implement",
+          );
+          const firstInvocationId = String(implementationStarts[0]?.data.invocationId ?? "");
+          const acceptanceCounts = new Map<string, number>();
+          for (const { type, data } of events) {
+            if (type !== "node.accepted") continue;
+            const nodeId = String(data.nodeId);
+            acceptanceCounts.set(nodeId, (acceptanceCounts.get(nodeId) ?? 0) + 1);
+          }
 
-        expect(completed.status, `${adapterId} at ${faultPoint}`).toBe("completed");
-        expect(acceptanceCounts.get("implement"), `${adapterId} at ${faultPoint}`).toBe(1);
-        expect(
-          [...acceptanceCounts.values()].every((count) => count === 1),
-          `${adapterId} at ${faultPoint}`,
-        ).toBe(true);
-        expect(
-          completed.controlDecisions.map(({ decisionId }) => decisionId),
-          `${adapterId} at ${faultPoint}`,
-        ).toEqual(expect.arrayContaining(decisionsAtCrash));
+          expect(completed.status, `${adapterId} at ${faultPoint}`).toBe("completed");
+          expect(acceptanceCounts.get("implement"), `${adapterId} at ${faultPoint}`).toBe(1);
+          expect(
+            [...acceptanceCounts.values()].every((count) => count === 1),
+            `${adapterId} at ${faultPoint}`,
+          ).toBe(true);
+          expect(
+            completed.controlDecisions.map(({ decisionId }) => decisionId),
+            `${adapterId} at ${faultPoint}`,
+          ).toEqual(expect.arrayContaining(decisionsAtCrash));
 
-        if (
-          ["host.session", "invocation.session", "host.usage", "tokens.recorded"].includes(
-            faultPoint,
+          if (
+            ["host.session", "invocation.session", "host.usage", "tokens.recorded"].includes(
+              faultPoint,
+            )
+          ) {
+            expect(implementationRequests, `${adapterId} at ${faultPoint}`).toHaveLength(2);
+            expect(
+              implementationRequests[1]?.resumeSessionId,
+              `${adapterId} at ${faultPoint}`,
+            ).toBe(firstInvocationId);
+            expect(implementationRequests[1]?.invocationId, `${adapterId} at ${faultPoint}`).toBe(
+              firstInvocationId,
+            );
+          }
+
+          if (faultPoint === "invocation.started" || faultPoint === "host.started") {
+            expect(implementationStarts, `${adapterId} at ${faultPoint}`).toHaveLength(2);
+            expect(implementationRequests.at(-1)?.resumeSessionId).toBeUndefined();
+            expect(implementationRequests.length - implementationRequestsAtCrash).toBe(1);
+          }
+
+          if (
+            ["host.result", "invocation.finished", "node.progress", "node.accepted"].includes(
+              faultPoint,
+            )
           )
-        ) {
-          expect(implementationRequests, `${adapterId} at ${faultPoint}`).toHaveLength(2);
-          expect(implementationRequests[1]?.resumeSessionId, `${adapterId} at ${faultPoint}`).toBe(
-            firstInvocationId,
+            expect(implementationRequests.length, `${adapterId} at ${faultPoint}`).toBe(
+              implementationRequestsAtCrash,
+            );
+
+          const recoveredUsage = events.filter(
+            ({ type, data, causationId }) =>
+              type === "tokens.recorded" &&
+              causationId === firstInvocationId &&
+              data.recovered === true,
           );
-          expect(implementationRequests[1]?.invocationId, `${adapterId} at ${faultPoint}`).toBe(
-            firstInvocationId,
-          );
+          if (faultPoint === "host.usage")
+            expect(recoveredUsage, `${adapterId} at ${faultPoint}`).toHaveLength(1);
+          if (faultPoint === "tokens.recorded")
+            expect(recoveredUsage, `${adapterId} at ${faultPoint}`).toHaveLength(0);
         }
-
-        if (faultPoint === "invocation.started" || faultPoint === "host.started") {
-          expect(implementationStarts, `${adapterId} at ${faultPoint}`).toHaveLength(2);
-          expect(implementationRequests.at(-1)?.resumeSessionId).toBeUndefined();
-          expect(implementationRequests.length - implementationRequestsAtCrash).toBe(1);
-        }
-
-        if (
-          ["host.result", "invocation.finished", "node.progress", "node.accepted"].includes(
-            faultPoint,
-          )
-        )
-          expect(implementationRequests.length, `${adapterId} at ${faultPoint}`).toBe(
-            implementationRequestsAtCrash,
-          );
-
-        const recoveredUsage = events.filter(
-          ({ type, data, causationId }) =>
-            type === "tokens.recorded" &&
-            causationId === firstInvocationId &&
-            data.recovered === true,
-        );
-        if (faultPoint === "host.usage")
-          expect(recoveredUsage, `${adapterId} at ${faultPoint}`).toHaveLength(1);
-        if (faultPoint === "tokens.recorded")
-          expect(recoveredUsage, `${adapterId} at ${faultPoint}`).toHaveLength(0);
       }
-    }
-  }, 60_000);
+    },
+    process.platform === "darwin" ? 180_000 : 60_000,
+  );
 
   it("coordinates an active pause, checkpoints termination, and resumes the same session", async () => {
     const repository = await createRepository();

@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   applyGraphAmendment,
+  artifactPathCanonicalKey,
+  ArtifactInventorySchema,
   classifyProgress,
   classifyTask,
   contextCapsuleCharacters,
@@ -16,19 +18,23 @@ import {
   createHeldOutProbePlan,
   createRunEvent,
   evidenceSnapshot,
+  GraphPlanSchema,
   graphPlanShape,
   MAX_CONTEXT_CAPSULE_CHARACTERS,
   optimizeGraph,
   resolveHeldOutProbes,
   reduceEvents,
   semanticVerdictJsonSchema,
+  SemanticVerdictSchema,
   tokenCostReport,
   validateGraph,
   verifyRunEvent,
   workerVisibleProbePlan,
   workerResultJsonSchema,
+  WorkerResultSchema,
   type GraphPlan,
   type GraphAmendment,
+  type ArtifactInventory,
   type ProbeResult,
   type ProbePlan,
 } from "./index.ts";
@@ -234,6 +240,201 @@ describe("run contracts and graphs", () => {
     });
   });
 
+  it("bounds worker results before they can enter durable runtime state", () => {
+    const valid = {
+      status: "completed" as const,
+      summary: "bounded result",
+      changedPaths: ["src/index.ts"],
+      evidence: ["focused tests passed"],
+    };
+    expect(WorkerResultSchema.parse(valid)).toEqual(valid);
+    expect(
+      WorkerResultSchema.safeParse({ ...valid, summary: "x".repeat(16 * 1024 + 1) }).success,
+    ).toBe(false);
+    expect(
+      WorkerResultSchema.safeParse({
+        ...valid,
+        changedPaths: Array.from({ length: 257 }, (_, index) => `src/${index}.ts`),
+      }).success,
+    ).toBe(false);
+    expect(
+      WorkerResultSchema.safeParse({
+        ...valid,
+        evidence: Array.from({ length: 65 }, () => "evidence"),
+      }).success,
+    ).toBe(false);
+  });
+
+  it("bounds model-planned graphs before they can enter durable runtime state", () => {
+    const node: GraphPlan["nodes"][number] = {
+      id: "implement",
+      kind: "implementation",
+      objective: "Implement the bounded change",
+      dependsOn: [],
+      scope: ["src/**"],
+      contextSelector: {
+        includeRepositoryInstructions: true,
+        predecessorResults: [],
+        relevantPaths: ["src"],
+      },
+      progressProbes: [],
+      completionProbes: [],
+      sideEffectClass: "workspace_write",
+    };
+    const valid: GraphPlan = { schemaVersion: 1, family: "feature", nodes: [node] };
+    expect(GraphPlanSchema.parse(valid)).toEqual(valid);
+    expect(
+      GraphPlanSchema.safeParse({
+        ...valid,
+        nodes: [{ ...node, objective: "x".repeat(16 * 1024 + 1) }],
+      }).success,
+    ).toBe(false);
+    expect(
+      GraphPlanSchema.safeParse({
+        ...valid,
+        nodes: Array.from({ length: 65 }, (_, index) => ({ ...node, id: `node-${index}` })),
+      }).success,
+    ).toBe(false);
+    expect(
+      GraphPlanSchema.safeParse({
+        ...valid,
+        nodes: Array.from({ length: 64 }, (_, index) => ({
+          ...node,
+          id: `node-${index}`,
+          objective: "x".repeat(16 * 1024),
+        })),
+      }).success,
+    ).toBe(false);
+  });
+
+  it("bounds semantic verdicts before they can enter durable runtime state", () => {
+    const valid = {
+      verdict: "supported" as const,
+      evidence: ["Focused tests passed"],
+      rationale: "The declared acceptance evidence is satisfied.",
+      uncertainty: 0,
+    };
+    expect(SemanticVerdictSchema.parse(valid)).toEqual(valid);
+    expect(
+      SemanticVerdictSchema.safeParse({ ...valid, rationale: "x".repeat(16 * 1024 + 1) }).success,
+    ).toBe(false);
+    expect(
+      SemanticVerdictSchema.safeParse({
+        ...valid,
+        evidence: Array.from({ length: 65 }, () => "evidence"),
+      }).success,
+    ).toBe(false);
+    expect(
+      SemanticVerdictSchema.safeParse({ ...valid, evidence: ["x".repeat(4 * 1024 + 1)] }).success,
+    ).toBe(false);
+  });
+
+  it("rejects contradictory durable artifact inventories at the core schema boundary", () => {
+    const timestamp = "2026-07-22T00:00:00.000Z";
+    const valid: ArtifactInventory = {
+      schemaVersion: 1,
+      runId: randomUUID(),
+      policy: {
+        ordinaryArtifactBytes: 1024,
+        identityArtifactBytes: 1024,
+        capsuleBytes: 1024,
+        invocationTranscriptBytes: 4096,
+        invocationReservedBytes: 1024,
+        runArtifactBytes: 8192,
+        runReservedBytes: 2048,
+      },
+      sourceBytes: 5,
+      storedBytes: 5,
+      omittedBytes: 0,
+      entries: [
+        {
+          path: "artifacts/result.txt",
+          kind: "artifact",
+          format: "text",
+          disposition: "stored",
+          sourceBytes: 5,
+          storedBytes: 5,
+          omittedBytes: 0,
+          truncated: false,
+          legacy: false,
+          storedHash: "a".repeat(64),
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        },
+      ],
+      updatedAt: timestamp,
+    };
+    expect(ArtifactInventorySchema.parse(valid)).toEqual(valid);
+    const [entry] = valid.entries;
+    if (!entry) throw new Error("Expected an artifact inventory entry");
+    const { storedHash: _storedHash, ...withoutStoredHash } = entry;
+    const invalid: unknown[] = [
+      { ...valid, entries: [{ ...entry, path: "artifacts/../escape.txt" }] },
+      {
+        ...valid,
+        sourceBytes: 10,
+        storedBytes: 10,
+        entries: [entry, { ...entry }],
+      },
+      { ...valid, storedBytes: 0 },
+      { ...valid, entries: [withoutStoredHash] },
+      {
+        ...valid,
+        entries: [{ ...entry, disposition: "truncated", truncated: true }],
+      },
+      {
+        ...valid,
+        policy: { ...valid.policy, invocationReservedBytes: 4096 },
+      },
+      {
+        ...valid,
+        policy: { ...valid.policy, runReservedBytes: 512 },
+      },
+      {
+        ...valid,
+        sourceBytes: 10,
+        storedBytes: 10,
+        entries: [entry, { ...entry, path: "artifacts/RESULT.txt" }],
+      },
+      { ...valid, entries: [{ ...entry, path: "artifacts/cafe\u0301.txt" }] },
+      {
+        ...valid,
+        policy: { ...valid.policy, runArtifactBytes: 5, runReservedBytes: 1 },
+        storedBytes: 6,
+        sourceBytes: 6,
+        entries: [{ ...entry, sourceBytes: 6, storedBytes: 6 }],
+      },
+    ];
+    for (const value of invalid)
+      expect(ArtifactInventorySchema.safeParse(value).success).toBe(false);
+  });
+
+  it("uses one normalized cross-platform identity for artifact-owned paths", () => {
+    expect(artifactPathCanonicalKey("artifacts/Reports/Case.txt")).toBe(
+      "ARTIFACTS/REPORTS/CASE.TXT",
+    );
+    expect(artifactPathCanonicalKey("artifacts/Reports/Case.txt")).toBe(
+      artifactPathCanonicalKey("artifacts/reports/case.TXT"),
+    );
+    expect(artifactPathCanonicalKey("artifacts/Café.txt")).toBe(
+      artifactPathCanonicalKey("artifacts/café.TXT"),
+    );
+
+    for (const path of [
+      "artifacts/cafe\u0301.txt",
+      "artifacts/NUL.txt",
+      "artifacts/COM1.log",
+      "artifacts/name:stream",
+      "artifacts/trailing.",
+      "artifacts/trailing ",
+      "artifacts/bad?.txt",
+      "artifacts/bad\u0001.txt",
+      "artifacts/lone-\ud800.txt",
+      "reports/not-owned.txt",
+    ])
+      expect(artifactPathCanonicalKey(path), path).toBeUndefined();
+  });
+
   it("bounds every worker context capsule before host execution", () => {
     const contract = compileRunContract("Implement a substantial context feature", repository);
     const graph = compileGraph(contract, [
@@ -306,7 +507,7 @@ describe("run contracts and graphs", () => {
     ]) {
       const serialized = JSON.stringify(schema);
       expect(serialized).not.toMatch(
-        /"(?:oneOf|default|format|maximum|minimum|minItems|minLength|pattern)"/,
+        /"(?:oneOf|default|format|maxItems|maxLength|maximum|minItems|minLength|minimum|pattern)"/,
       );
       assertRequiredProperties(schema);
     }

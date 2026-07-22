@@ -10,7 +10,11 @@ import {
   type ProbeResult,
   type ProbeSpec,
 } from "@graphcraft/core";
-import { runProcess, type ProcessResult } from "./process.ts";
+import {
+  DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM,
+  runProcess,
+  type ProcessResult,
+} from "./process.ts";
 
 export interface ExecutedProbe {
   result: ProbeResult;
@@ -19,7 +23,17 @@ export interface ExecutedProbe {
 
 function compactOutput(result: ProcessResult): string {
   const value = [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join("\n");
-  return value.length > 1_000 ? `${value.slice(0, 1_000)}\n…` : value;
+  const truncated = (["stdout", "stderr"] as const).flatMap((stream) => {
+    const capture = result.capture[stream];
+    return capture.truncated
+      ? [`${stream} retained ${capture.retainedBytes} of ${capture.observedBytes} bytes`]
+      : [];
+  });
+  if (truncated.length === 0) return value.length > 1_000 ? `${value.slice(0, 1_000)}\n…` : value;
+  const note = `[Output truncated by Graphcraft: ${truncated.join("; ")}]`;
+  const available = Math.max(0, 1_000 - note.length - 2);
+  const prefix = value.slice(0, available);
+  return `${prefix}${value.length > available ? "\n…" : ""}\n${note}`;
 }
 
 export async function runProbe(
@@ -34,6 +48,8 @@ export async function runProbe(
     const processResult = await runProcess(spec.command, spec.args, {
       cwd: spec.cwd ? resolve(repositoryPath, spec.cwd) : repositoryPath,
       timeoutMs: spec.timeoutMs,
+      maxOutputBytesPerStream: DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM,
+      outputOverflow: "truncate",
       ...(signal ? { signal } : {}),
     });
     const output = [processResult.stdout, processResult.stderr].filter(Boolean).join("\n");
@@ -46,6 +62,8 @@ export async function runProbe(
         signature: contentHash({
           exitCode: processResult.exitCode,
           output: compactOutput(processResult),
+          stdoutDigest: processResult.capture.stdout.digest,
+          stderrDigest: processResult.capture.stderr.digest,
         }),
         summary: processResult.timedOut
           ? `Timed out after ${spec.timeoutMs}ms`
@@ -496,4 +514,14 @@ export async function discoverVerificationProbes(repositoryPath: string): Promis
   return plan.items.filter(({ phase }) => phase === "completion").map(({ probe }) => probe);
 }
 
-export { runProcess, type ProcessResult } from "./process.ts";
+export {
+  DEFAULT_PROCESS_OUTPUT_BYTES_PER_STREAM,
+  DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM,
+  ProcessOutputLimitError,
+  runProcess,
+  type ProcessCaptureMetadata,
+  type ProcessOutputOverflow,
+  type ProcessResult,
+  type ProcessStreamCapture,
+  type RunProcessOptions,
+} from "./process.ts";

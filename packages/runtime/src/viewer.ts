@@ -1,6 +1,4 @@
 import { createServer, type Server, type ServerResponse } from "node:http";
-import { open, readdir, realpath, stat } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tokenCostReport, type RunEvent } from "@graphcraft/core";
 import { RunStore } from "./store.ts";
 import { redactString, redactValue } from "./redaction.ts";
@@ -38,37 +36,60 @@ function compactEventData(event: RunEvent): Record<string, unknown> {
   return redactValue(compact) as Record<string, unknown>;
 }
 
-async function listArtifactFiles(root: string): Promise<Array<{ path: string; size: number }>> {
-  const files: Array<{ path: string; size: number }> = [];
-  const visit = async (directory: string): Promise<void> => {
-    const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
-    for (const entry of entries) {
-      const absolute = join(directory, entry.name);
-      if (entry.isDirectory()) await visit(absolute);
-      else if (entry.isFile()) {
-        const metadata = await stat(absolute);
-        files.push({ path: relative(root, absolute).split(sep).join("/"), size: metadata.size });
-      }
-    }
-  };
-  await visit(root);
-  return files.sort((left, right) => left.path.localeCompare(right.path));
-}
+type ViewerProjection = [
+  Awaited<ReturnType<RunStore["loadContract"]>>,
+  Awaited<ReturnType<RunStore["loadGraph"]>>,
+  Awaited<ReturnType<RunStore["loadState"]>>,
+  RunEvent[],
+  Awaited<ReturnType<RunStore["loadGraphHistory"]>>,
+  Awaited<ReturnType<RunStore["loadProbePlan"]>>,
+  Awaited<ReturnType<RunStore["loadArtifactInventory"]>>,
+];
 
 export async function createViewerSnapshot(store: RunStore): Promise<Record<string, unknown>> {
-  const [contract, graph, state, events, graphHistory, probePlan] = await Promise.all([
-    store.loadContract(),
-    store.loadGraph(),
-    store.loadState(),
-    store.loadEvents(),
-    store.loadGraphHistory(),
-    store.loadProbePlan(),
-  ]);
-  const artifactRoot = join(store.runRoot, "artifacts");
-  const artifacts = (await listArtifactFiles(artifactRoot)).map((artifact) => ({
-    ...artifact,
-    href: `/artifacts/${artifact.path.split("/").map(encodeURIComponent).join("/")}`,
-  }));
+  let projection: ViewerProjection | undefined;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const before = await store.loadEvents();
+    const [contract, graph, state, graphHistory, probePlan, artifactInventory] = await Promise.all([
+      store.loadContract(),
+      store.loadGraph(),
+      store.loadState(),
+      store.loadGraphHistory(),
+      store.loadProbePlan(),
+      store.loadArtifactInventory(),
+    ]);
+    const events = await store.loadEvents();
+    const beforeRevision = `${before.length}:${before.at(-1)?.hash ?? "empty"}`;
+    const afterRevision = `${events.length}:${events.at(-1)?.hash ?? "empty"}`;
+    if (beforeRevision === afterRevision) {
+      projection = [contract, graph, state, events, graphHistory, probePlan, artifactInventory];
+      break;
+    }
+  }
+  if (!projection)
+    throw new Error("Durable run state changed too often to build one consistent viewer snapshot");
+  const [contract, graph, state, events, graphHistory, probePlan, artifactInventory] = projection;
+  const artifacts = artifactInventory.entries
+    .filter(({ path }) => path.startsWith("artifacts/"))
+    .map((entry) => {
+      const path = entry.path.slice("artifacts/".length);
+      return {
+        path,
+        size: entry.storedBytes,
+        kind: entry.kind,
+        format: entry.format,
+        sourceBytes: entry.sourceBytes,
+        storedBytes: entry.storedBytes,
+        omittedBytes: entry.omittedBytes,
+        truncated: entry.truncated,
+        disposition: entry.disposition,
+        legacy: entry.legacy,
+        ...(entry.reason ? { reason: entry.reason } : {}),
+        ...(entry.storedHash
+          ? { href: `/artifacts/${path.split("/").map(encodeURIComponent).join("/")}` }
+          : {}),
+      };
+    });
   const progressByNode = new Map<string, RunEvent>();
   const contextByNode = new Map<string, Record<string, unknown>>();
   for (const event of events) {
@@ -164,6 +185,7 @@ export async function createViewerSnapshot(store: RunStore): Promise<Record<stri
     waits: state.waits,
     sideEffects: state.sideEffects,
     decision: state.pendingDecision,
+    artifactInventory,
     artifacts,
   }) as Record<string, unknown>;
 }
@@ -184,36 +206,6 @@ function send(
   response.end(body);
 }
 
-async function artifactPath(store: RunStore, encodedPath: string): Promise<string> {
-  const artifactRoot = await realpath(join(store.runRoot, "artifacts"));
-  const requested = resolve(artifactRoot, decodeURIComponent(encodedPath));
-  const target = await realpath(requested);
-  const pathFromRoot = relative(artifactRoot, target);
-  if (!pathFromRoot || pathFromRoot.startsWith(`..${sep}`) || isAbsolute(pathFromRoot))
-    throw new Error("Artifact path leaves the run artifact directory");
-  return target;
-}
-
-async function readArtifactPreview(path: string): Promise<{
-  bytes: Buffer;
-  originalBytes: number;
-  truncated: boolean;
-}> {
-  const handle = await open(path, "r");
-  try {
-    const metadata = await handle.stat();
-    const buffer = Buffer.alloc(MAX_ARTIFACT_BYTES + 1);
-    const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, 0);
-    return {
-      bytes: buffer.subarray(0, Math.min(bytesRead, MAX_ARTIFACT_BYTES)),
-      originalBytes: metadata.size,
-      truncated: metadata.size > MAX_ARTIFACT_BYTES || bytesRead > MAX_ARTIFACT_BYTES,
-    };
-  } finally {
-    await handle.close();
-  }
-}
-
 export interface RunViewer {
   url: string;
   host: typeof LOOPBACK_HOST;
@@ -229,8 +221,13 @@ export async function startRunViewer(input: {
   const port = input.port ?? 0;
   if (!Number.isInteger(port) || port < 0 || port > 65_535)
     throw new Error("Viewer port must be an integer from 0 through 65535");
+  let expectedAuthority: string | undefined;
   const server = createServer(async (request, response) => {
     try {
+      if (!expectedAuthority || request.headers.host !== expectedAuthority) {
+        send(response, 421, "Viewer authority rejected\n", "text/plain; charset=utf-8");
+        return;
+      }
       if (request.method !== "GET" && request.method !== "HEAD") {
         send(response, 405, "Read-only viewer\n", "text/plain; charset=utf-8");
         return;
@@ -251,8 +248,8 @@ export async function startRunViewer(input: {
         return;
       }
       if (url.pathname.startsWith("/artifacts/")) {
-        const path = await artifactPath(input.store, url.pathname.slice("/artifacts/".length));
-        const preview = await readArtifactPreview(path);
+        const relativePath = decodeURIComponent(url.pathname.slice("/artifacts/".length));
+        const preview = await input.store.readArtifactPreview(relativePath, MAX_ARTIFACT_BYTES);
         const text = preview.bytes.toString("utf8");
         response.setHeader("x-graphcraft-truncated", String(preview.truncated));
         response.setHeader("x-graphcraft-original-bytes", String(preview.originalBytes));
@@ -266,12 +263,8 @@ export async function startRunViewer(input: {
       }
       send(response, 404, "Not found\n", "text/plain; charset=utf-8");
     } catch (error) {
-      send(
-        response,
-        500,
-        `Viewer read failed: ${error instanceof Error ? error.message : String(error)}\n`,
-        "text/plain; charset=utf-8",
-      );
+      void error;
+      send(response, 500, "Viewer read failed\n", "text/plain; charset=utf-8");
     }
   });
   await new Promise<void>((resolveListen, reject) => {
@@ -283,6 +276,7 @@ export async function startRunViewer(input: {
   });
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Viewer did not bind a TCP port");
+  expectedAuthority = `${LOOPBACK_HOST}:${address.port}`;
   const url = `http://${LOOPBACK_HOST}:${address.port}/`;
   return {
     url,
@@ -311,7 +305,7 @@ const VIEWER_HTML = String.raw`<!doctype html>
 <section id="timeline" class="view"><div class="panel"><h2>Durable event timeline</h2><div id="filters" class="filters"></div><div id="event-list" class="timeline"></div></div></section>
 <section id="revisions" class="view"><div class="panel"><h2>Graph revisions</h2><div id="revision-list"></div></div></section>
 <section id="tokens" class="view"><div class="panel"><h2>Token cost by phase</h2><div id="token-list"></div></div></section>
-<section id="artifacts" class="view"><div class="panel"><h2>Local artifacts</h2><p class="meta">Opened on demand; contents are redacted and capped at 1 MiB.</p><div id="artifact-list" class="artifact-list"></div><p><a class="download" href="/api/export" download="graphcraft-run-report.json">Export redacted run report</a></p></div></section></main>
+<section id="artifacts" class="view"><div class="panel"><h2>Local artifacts</h2><p class="meta">Redacted before bounded storage. Source, stored, and omitted byte counts come from the durable artifact inventory.</p><div id="artifact-summary" class="meta"></div><div id="artifact-list" class="artifact-list"></div><p><a class="download" href="/api/export" download="graphcraft-run-report.json">Export redacted run report</a></p></div></section></main>
 <script>
 const $=id=>document.getElementById(id), ns='http://www.w3.org/2000/svg'; let snapshot, selected, filter='all';
 const el=(name,attrs={})=>{const n=document.createElementNS(ns,name);for(const[k,v]of Object.entries(attrs))n.setAttribute(k,String(v));return n};
@@ -322,7 +316,7 @@ function selectNode(id){selected=id;const n=snapshot.nodes.find(n=>n.id===id)||s
 function renderTimeline(){const categories=['all',...new Set(snapshot.timeline.map(e=>e.category))];$('filters').textContent='';categories.forEach(c=>{const b=document.createElement('button');b.textContent=c;b.className=c===filter?'active':'';b.onclick=()=>{filter=c;renderTimeline()};$('filters').append(b)});$('event-list').textContent='';snapshot.timeline.filter(e=>filter==='all'||e.category===filter).forEach(e=>{const d=document.createElement('div');d.className='event '+e.category;const title=document.createElement('div');title.textContent=e.sequence+'. '+e.type;const meta=document.createElement('small');meta.textContent=e.timestamp+' · '+e.actor;const pre=document.createElement('pre');pre.textContent=JSON.stringify(e.data,null,2);d.append(title,meta,pre);$('event-list').append(d)})}
 function renderRevisions(){const root=$('revision-list');root.textContent='';if(!snapshot.revisions.length){root.textContent='No amendments. Revision 1 is the approved graph.';root.className='empty';return}snapshot.revisions.forEach(r=>{const p=document.createElement('pre');p.textContent=JSON.stringify(r,null,2);root.append(p)})}
 function renderTokens(){const root=$('token-list');root.textContent='';const report=snapshot.tokenReport||{};const groups=[['Cumulative',{all:report.totals||{}}],['By phase',report.byPhase||{}],['By node',report.byNode||{}]];const all=groups.flatMap(([,rows])=>Object.values(rows));const max=Math.max(1,...all.map(v=>v.total||0));if(!report.receipts){root.textContent='No token receipts.';root.className='empty';return}groups.forEach(([heading,rows])=>{const h=document.createElement('h3');h.textContent=heading;root.append(h);Object.entries(rows).forEach(([name,value])=>{const row=document.createElement('div');row.className='token-row';const label=document.createElement('span');label.textContent=name;const bar=document.createElement('div');bar.className='bar';const fill=document.createElement('i');fill.style.width=100*(value.total||0)/max+'%';bar.append(fill);const number=document.createElement('code');number.textContent='cached '+(value.cachedInput||0)+' · uncached '+(value.uncachedInput||0)+' · output '+(value.output||0)+' · reasoning '+(value.reasoning||0)+' · total '+(value.total||0);row.append(label,bar,number);root.append(row)})})}
-function renderArtifacts(){const root=$('artifact-list');root.textContent='';if(!snapshot.artifacts.length){root.textContent='No artifacts.';root.className='empty';return}snapshot.artifacts.forEach(a=>{const link=document.createElement('a');link.href=a.href;link.target='_blank';link.rel='noopener';link.textContent=a.path+' ('+a.size+' bytes)';root.append(link)})}
+function renderArtifacts(){const root=$('artifact-list'),inventory=snapshot.artifactInventory;$('artifact-summary').textContent=inventory?'Stored '+inventory.storedBytes+' of '+inventory.sourceBytes+' source bytes; '+inventory.omittedBytes+' omitted.':'';root.textContent='';if(!snapshot.artifacts.length){root.textContent='No artifacts.';root.className='empty';return}snapshot.artifacts.forEach(a=>{const item=a.href?document.createElement('a'):document.createElement('span');if(a.href){item.href=a.href;item.target='_blank';item.rel='noopener'}const omitted=a.omittedBytes?' · '+a.omittedBytes+' omitted':'';item.textContent=a.path+' ('+a.storedBytes+'/'+a.sourceBytes+' bytes'+omitted+(a.reason?' · '+a.reason:'')+')';root.append(item)})}
 function render(){const r=snapshot.run;$('run-meta').textContent=r.task+' · '+r.finishLine+' · '+r.id;$('status').textContent=r.status;renderGraph();renderTimeline();renderRevisions();renderTokens();renderArtifacts()}
 async function refresh(){try{const response=await fetch('/api/snapshot',{cache:'no-store'});if(!response.ok)throw new Error(await response.text());const next=await response.json();const changed=!snapshot||snapshot.run.updatedAt!==next.run.updatedAt||snapshot.timeline.length!==next.timeline.length;snapshot=next;if(changed)render()}catch(error){$('run-meta').textContent='Viewer refresh failed: '+error.message}}
 refresh();setInterval(refresh,1500);

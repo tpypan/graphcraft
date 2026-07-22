@@ -1,5 +1,4 @@
 import { spawn } from "node:child_process";
-import { createInterface } from "node:readline";
 import {
   ChildTerminationController,
   GraphPlanSchema,
@@ -26,6 +25,15 @@ import {
   type SemanticVerificationResult,
   type WorkerRequest,
 } from "@graphcraft/core";
+import {
+  ADAPTER_STDERR_LIMIT_BYTES,
+  BoundedTextCapture,
+  captureStderr,
+  protocolLineLimitError,
+  readBoundedProtocolLines,
+  structuredOutputExceedsLimit,
+  structuredOutputLimitError,
+} from "./protocol.ts";
 
 function parseResult(value: unknown) {
   if (typeof value === "object" && value !== null) {
@@ -73,14 +81,15 @@ export function claudeUsage(value: unknown) {
 async function claudeVersion(): Promise<{ installed: boolean; version?: string }> {
   return await new Promise((resolve) => {
     const child = spawn("claude", ["--version"], { stdio: ["ignore", "pipe", "ignore"] });
-    let output = "";
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      output += chunk;
-    });
+    const output = new BoundedTextCapture(ADAPTER_STDERR_LIMIT_BYTES);
+    child.stdout.on("data", (chunk: Buffer | string) => output.append(chunk));
     child.once("error", () => resolve({ installed: false }));
     child.once("close", (code) =>
-      resolve(code === 0 ? { installed: true, version: output.trim() } : { installed: false }),
+      resolve(
+        code === 0 && !output.overflowed
+          ? { installed: true, version: output.text().trim() }
+          : { installed: false },
+      ),
     );
   });
 }
@@ -90,15 +99,16 @@ async function claudeAuthenticated(): Promise<boolean> {
     const child = spawn("claude", ["auth", "status", "--json"], {
       stdio: ["ignore", "pipe", "ignore"],
     });
-    let output = "";
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      output += chunk;
-    });
+    const output = new BoundedTextCapture(ADAPTER_STDERR_LIMIT_BYTES);
+    child.stdout.on("data", (chunk: Buffer | string) => output.append(chunk));
     child.once("error", () => resolve(false));
     child.once("close", (code) => {
+      if (output.overflowed) {
+        resolve(false);
+        return;
+      }
       try {
-        const status = JSON.parse(output) as { loggedIn?: boolean };
+        const status = JSON.parse(output.text()) as { loggedIn?: boolean };
         resolve(code === 0 && status.loggedIn === true);
       } catch {
         resolve(false);
@@ -138,33 +148,40 @@ export class ClaudeAdapter implements HostAdapter {
       child.kill("SIGTERM");
     };
     signal.addEventListener("abort", abort, { once: true });
-    let stderr = "";
+    let protocolExceededLimit = false;
+    let structuredExceededLimit = false;
     let plan: ReturnType<typeof GraphPlanSchema.parse> | undefined;
     let usage: ReturnType<typeof claudeUsage> | undefined;
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
+    const stderr = captureStderr(child.stderr);
     try {
-      const lines = createInterface({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
-      for await (const line of lines) {
-        if (!line.trim()) continue;
+      for await (const line of readBoundedProtocolLines(child.stdout)) {
+        if (line.overflowed) {
+          protocolExceededLimit = true;
+          continue;
+        }
+        if (protocolExceededLimit || !line.text?.trim()) continue;
         let event: Record<string, unknown>;
         try {
-          event = JSON.parse(line) as Record<string, unknown>;
+          event = JSON.parse(line.text) as Record<string, unknown>;
         } catch {
           continue;
         }
         if (event.type === "result") {
-          plan = parsePlan(event.structured_output ?? event.result);
+          const candidate = event.structured_output ?? event.result;
+          structuredExceededLimit = structuredOutputExceedsLimit(candidate);
+          plan = structuredExceededLimit ? undefined : parsePlan(candidate);
           usage = claudeUsage(event.usage);
         }
       }
       const exitCode = await exitPromise;
       if (signal.aborted) throw new Error("Claude planning invocation aborted");
+      if (protocolExceededLimit) throw protocolLineLimitError("Claude");
+      if (structuredExceededLimit) {
+        throw structuredOutputLimitError("Claude", "structured graph plan");
+      }
       if (exitCode !== 0 || !plan) {
         throw new Error(
-          stderr.trim() || `Claude exited ${exitCode} without a valid structured graph plan`,
+          stderr.text().trim() || `Claude exited ${exitCode} without a valid structured graph plan`,
         );
       }
       return { plan, ...(usage ? { usage } : {}) };
@@ -188,34 +205,42 @@ export class ClaudeAdapter implements HostAdapter {
         child.once("close", (code, closeSignal) => resolve({ code, signal: closeSignal })),
     );
     const terminationController = new ChildTerminationController(child, signal);
-    let stderr = "";
+    let protocolExceededLimit = false;
+    let structuredExceededLimit = false;
     let verdict: ReturnType<typeof SemanticVerdictSchema.parse> | undefined;
     let usage: ReturnType<typeof claudeUsage> | undefined;
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
+    const stderr = captureStderr(child.stderr);
     try {
-      const lines = createInterface({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
-      for await (const line of lines) {
-        if (!line.trim()) continue;
+      for await (const line of readBoundedProtocolLines(child.stdout)) {
+        if (line.overflowed) {
+          protocolExceededLimit = true;
+          continue;
+        }
+        if (protocolExceededLimit || !line.text?.trim()) continue;
         let event: Record<string, unknown>;
         try {
-          event = JSON.parse(line) as Record<string, unknown>;
+          event = JSON.parse(line.text) as Record<string, unknown>;
         } catch {
           continue;
         }
         if (event.type === "result") {
-          verdict = parseSemanticVerdict(event.structured_output ?? event.result);
+          const candidate = event.structured_output ?? event.result;
+          structuredExceededLimit = structuredOutputExceedsLimit(candidate);
+          verdict = structuredExceededLimit ? undefined : parseSemanticVerdict(candidate);
           usage = claudeUsage(event.usage);
         }
       }
       const exit = await exitPromise;
       const termination = terminationController.finish(exit.code, exit.signal);
       if (termination) throw new HostTerminationError(termination);
+      if (protocolExceededLimit) throw protocolLineLimitError("Claude");
+      if (structuredExceededLimit) {
+        throw structuredOutputLimitError("Claude", "semantic verdict");
+      }
       if (exit.code !== 0 || !verdict) {
         throw new Error(
-          stderr.trim() || `Claude exited ${exit.code ?? 1} without a valid semantic verdict`,
+          stderr.text().trim() ||
+            `Claude exited ${exit.code ?? 1} without a valid semantic verdict`,
         );
       }
       return { verdict, ...(usage ? { usage } : {}) };
@@ -237,66 +262,87 @@ export class ClaudeAdapter implements HostAdapter {
         child.once("close", (code, closeSignal) => resolve({ code, signal: closeSignal })),
     );
     const terminationController = new ChildTerminationController(child, signal);
-    yield { type: "started", invocationId: request.invocationId };
-    let stderr = "";
+    let protocolExceededLimit = false;
+    let structuredExceededLimit = false;
     let finalResult: ReturnType<typeof WorkerResultSchema.parse> | undefined;
     let observedSessionId: string | undefined;
     let sessionReported = false;
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
+    const stderr = captureStderr(child.stderr);
+    const protocolLines = readBoundedProtocolLines(child.stdout)[Symbol.asyncIterator]();
+    let nextProtocolLine = protocolLines.next();
 
-    const lines = createInterface({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
-    for await (const line of lines) {
-      if (!line.trim()) continue;
-      let event: Record<string, unknown>;
-      try {
-        event = JSON.parse(line) as Record<string, unknown>;
-      } catch {
-        continue;
-      }
-      const type = String(event.type ?? "");
-      if (typeof event.session_id === "string") observedSessionId = event.session_id;
-      if (!sessionReported && observedSessionId && (type === "assistant" || type === "result")) {
-        sessionReported = true;
-        yield { type: "session", hostSessionId: observedSessionId };
-      }
-      if (type === "assistant") {
-        const message = event.message as Record<string, unknown> | undefined;
-        const blocks = Array.isArray(message?.content) ? message.content : [];
-        for (const value of blocks) {
-          const block = value as Record<string, unknown>;
-          if (block.type === "text") yield { type: "message", text: String(block.text ?? "") };
-          if (block.type === "tool_use") {
-            yield { type: "tool", name: String(block.name ?? "tool"), summary: "tool call" };
+    yield { type: "started", invocationId: request.invocationId };
+
+    try {
+      while (true) {
+        const next = await nextProtocolLine;
+        if (next.done) break;
+        nextProtocolLine = protocolLines.next();
+        const line = next.value;
+        if (line.overflowed) {
+          protocolExceededLimit = true;
+          continue;
+        }
+        if (protocolExceededLimit || !line.text?.trim()) continue;
+        let event: Record<string, unknown>;
+        try {
+          event = JSON.parse(line.text) as Record<string, unknown>;
+        } catch {
+          continue;
+        }
+        const type = String(event.type ?? "");
+        if (typeof event.session_id === "string") observedSessionId = event.session_id;
+        if (!sessionReported && observedSessionId && (type === "assistant" || type === "result")) {
+          sessionReported = true;
+          yield { type: "session", hostSessionId: observedSessionId };
+        }
+        if (type === "assistant") {
+          const message = event.message as Record<string, unknown> | undefined;
+          const blocks = Array.isArray(message?.content) ? message.content : [];
+          for (const value of blocks) {
+            const block = value as Record<string, unknown>;
+            if (block.type === "text") yield { type: "message", text: String(block.text ?? "") };
+            if (block.type === "tool_use") {
+              yield { type: "tool", name: String(block.name ?? "tool"), summary: "tool call" };
+            }
           }
         }
+        if (type === "result") {
+          const candidate = event.structured_output ?? event.result;
+          structuredExceededLimit = structuredOutputExceedsLimit(candidate);
+          finalResult = structuredExceededLimit ? undefined : parseResult(candidate);
+          yield {
+            type: "usage",
+            usage: claudeUsage(event.usage),
+          };
+        }
       }
-      if (type === "result") {
-        finalResult = parseResult(event.structured_output ?? event.result);
-        yield {
-          type: "usage",
-          usage: claudeUsage(event.usage),
-        };
-      }
-    }
 
-    const exit = await exitPromise;
-    const termination = terminationController.finish(exit.code, exit.signal);
-    if (termination) {
-      yield { type: "terminated", termination };
-    } else if (exit.code !== 0 || !finalResult) {
-      yield {
-        type: "error",
-        message:
-          stderr.trim() || `Claude exited ${exit.code ?? 1} without a valid structured result`,
-        cause: "host_crash",
-      };
-    } else {
-      yield { type: "result", result: finalResult };
+      const exit = await exitPromise;
+      const termination = terminationController.finish(exit.code, exit.signal);
+      if (termination) {
+        yield { type: "terminated", termination };
+      } else if (protocolExceededLimit) {
+        yield { type: "error", message: protocolLineLimitError("Claude").message };
+      } else if (structuredExceededLimit) {
+        yield {
+          type: "error",
+          message: structuredOutputLimitError("Claude", "structured result").message,
+        };
+      } else if (exit.code !== 0 || !finalResult) {
+        yield {
+          type: "error",
+          message:
+            stderr.text().trim() ||
+            `Claude exited ${exit.code ?? 1} without a valid structured result`,
+          cause: "host_crash",
+        };
+      } else {
+        yield { type: "result", result: finalResult };
+      }
+    } finally {
+      terminationController.dispose();
     }
-    terminationController.dispose();
   }
 
   async reconcile(invocation: InvocationRecord): Promise<ReconciliationResult> {

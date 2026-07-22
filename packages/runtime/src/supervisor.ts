@@ -1,7 +1,18 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, open, readFile, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  fsyncSync,
+  ftruncateSync,
+  lstatSync,
+  openSync,
+  readSync,
+  writeSync,
+} from "node:fs";
+import { open, readdir } from "node:fs/promises";
+import { dirname, join, relative, resolve } from "node:path";
 import {
   SupervisorRecordSchema,
   type HostAdapter,
@@ -11,6 +22,12 @@ import {
 import { writeJsonAtomic } from "./json.ts";
 import { redactString } from "./redaction.ts";
 import { RunLock } from "./lock.ts";
+import {
+  ensurePrivateDirectory,
+  hardenPrivateFile,
+  readPrivateFileBounded,
+  validatePrivatePath,
+} from "./secure-fs.ts";
 import { executeRun, type RunObserver } from "./runner.ts";
 import { RunStore } from "./store.ts";
 
@@ -26,12 +43,124 @@ export interface SupervisorInspection extends SupervisorRecord {
   health: "starting" | "running" | "exited" | "failed" | "stale";
 }
 
+const KIB = 1024;
+export const SUPERVISOR_LOG_MAX_BYTES = 64 * KIB;
+const SUPERVISOR_LOG_RETAIN_BYTES = 32 * KIB;
+const SUPERVISOR_RECORD_MAX_BYTES = 64 * KIB;
+const SUPERVISOR_MESSAGE_MAX_BYTES = 16 * KIB;
+const SUPERVISOR_LOG_TRUNCATION_MARKER = Buffer.from(
+  `[Graphcraft supervisor log truncated; retaining the most recent ${SUPERVISOR_LOG_RETAIN_BYTES} bytes]\n`,
+);
+
+function graphcraftRoot(repositoryRoot: string): string {
+  return join(repositoryRoot, ".graphcraft");
+}
+
 function supervisorRoot(repositoryRoot: string, runId: string): string {
-  return join(repositoryRoot, ".graphcraft", "supervisors", runId);
+  return join(graphcraftRoot(repositoryRoot), "supervisors", runId);
 }
 
 function supervisorRecordPath(repositoryRoot: string, runId: string, supervisorId: string): string {
   return join(supervisorRoot(repositoryRoot, runId), `${supervisorId}.json`);
+}
+
+function compactSupervisorLog(logPath: string): void {
+  const before = lstatSync(logPath);
+  if (before.isSymbolicLink() || !before.isFile() || before.nlink > 1)
+    throw new Error("Supervisor log is not a private regular file");
+  if (before.size <= SUPERVISOR_LOG_MAX_BYTES) return;
+  const noFollow = process.platform === "win32" ? 0 : fsConstants.O_NOFOLLOW;
+  const descriptor = openSync(logPath, fsConstants.O_RDWR | noFollow);
+  try {
+    const status = fstatSync(descriptor);
+    if (
+      !status.isFile() ||
+      status.nlink > 1 ||
+      status.dev !== before.dev ||
+      status.ino !== before.ino
+    )
+      throw new Error("Supervisor log changed while being opened");
+    if (status.size <= SUPERVISOR_LOG_MAX_BYTES) return;
+
+    const retainedBytes = Math.min(status.size, SUPERVISOR_LOG_RETAIN_BYTES);
+    const retained = Buffer.allocUnsafe(retainedBytes);
+    let readBytes = 0;
+    while (readBytes < retained.length) {
+      const count = readSync(
+        descriptor,
+        retained,
+        readBytes,
+        retained.length - readBytes,
+        status.size - retained.length + readBytes,
+      );
+      if (count === 0) break;
+      readBytes += count;
+    }
+    let start = 0;
+    while (start < readBytes && (retained[start]! & 0xc0) === 0x80) start += 1;
+    const payload = Buffer.concat([
+      SUPERVISOR_LOG_TRUNCATION_MARKER,
+      retained.subarray(start, readBytes),
+    ]);
+
+    ftruncateSync(descriptor, 0);
+    let written = 0;
+    while (written < payload.length)
+      written += writeSync(descriptor, payload, written, payload.length - written, written);
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+export function enforceSupervisorLogLimit(logPath: string): void {
+  compactSupervisorLog(logPath);
+}
+
+function maintainSupervisorLog(logPath: string): void {
+  try {
+    enforceSupervisorLogLimit(logPath);
+  } catch (error) {
+    console.error(`Supervisor log maintenance failed: ${redactString(String(error))}`);
+  }
+}
+
+function processOutputTargetsLog(logPath: string): boolean {
+  try {
+    const output = fstatSync(process.stdout.fd);
+    const log = lstatSync(logPath);
+    return output.dev === log.dev && output.ino === log.ino;
+  } catch {
+    return false;
+  }
+}
+
+async function readSupervisorRecord(path: string, ownedRoot: string): Promise<SupervisorRecord> {
+  const source = await readPrivateFileBounded(path, SUPERVISOR_RECORD_MAX_BYTES, ownedRoot);
+  return SupervisorRecordSchema.parse(JSON.parse(source.toString("utf8")));
+}
+
+function boundedSupervisorMessage(message: string): string {
+  const redacted = redactString(message);
+  if (Buffer.byteLength(redacted) <= SUPERVISOR_MESSAGE_MAX_BYTES) return redacted;
+  const marker = "\n[Graphcraft supervisor message truncated]";
+  const available = SUPERVISOR_MESSAGE_MAX_BYTES - Buffer.byteLength(marker);
+  let prefix = "";
+  let bytes = 0;
+  for (const character of redacted) {
+    const characterBytes = Buffer.byteLength(character);
+    if (bytes + characterBytes > available) break;
+    prefix += character;
+    bytes += characterBytes;
+  }
+  return `${prefix}${marker}`;
+}
+
+function assertSupervisorRecordFits(record: SupervisorRecord): void {
+  if (Buffer.byteLength(`${JSON.stringify(record, null, 2)}\n`) > SUPERVISOR_RECORD_MAX_BYTES)
+    throw new Error(
+      `Supervisor record exceeds its ${SUPERVISOR_RECORD_MAX_BYTES}-byte persistence limit`,
+    );
 }
 
 export function isProcessAlive(pid: number): boolean {
@@ -47,9 +176,12 @@ export async function listSupervisorRecords(
   repositoryRoot: string,
   runId: string,
 ): Promise<SupervisorRecord[]> {
+  const root = supervisorRoot(repositoryRoot, runId);
+  const ownedRoot = graphcraftRoot(repositoryRoot);
   let entries;
   try {
-    entries = await readdir(supervisorRoot(repositoryRoot, runId), { withFileTypes: true });
+    await validatePrivatePath(ownedRoot, relative(ownedRoot, root));
+    entries = await readdir(root, { withFileTypes: true });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
     throw error;
@@ -57,13 +189,11 @@ export async function listSupervisorRecords(
   const records = await Promise.all(
     entries
       .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
-      .map(async (entry) =>
-        SupervisorRecordSchema.parse(
-          JSON.parse(
-            await readFile(join(supervisorRoot(repositoryRoot, runId), entry.name), "utf8"),
-          ),
-        ),
-      ),
+      .map(async (entry) => {
+        const path = join(root, entry.name);
+        await validatePrivatePath(ownedRoot, relative(ownedRoot, path));
+        return await readSupervisorRecord(path, ownedRoot);
+      }),
   );
   return records.sort(
     (left, right) =>
@@ -101,10 +231,12 @@ async function waitForSupervisorRecord(
   timeoutMs = 5_000,
 ): Promise<SupervisorRecord> {
   const path = supervisorRecordPath(repositoryRoot, runId, supervisorId);
+  const ownedRoot = graphcraftRoot(repositoryRoot);
   const deadline = Date.now() + timeoutMs;
   while (true) {
+    await hardenPrivateFile(path, ownedRoot);
     try {
-      return SupervisorRecordSchema.parse(JSON.parse(await readFile(path, "utf8")));
+      return await readSupervisorRecord(path, ownedRoot);
     } catch (error) {
       if (Date.now() >= deadline) throw error;
       await new Promise<void>((resolve) => setTimeout(resolve, 25));
@@ -126,11 +258,14 @@ async function launchDetachedSupervisor(input: {
     );
 
   const supervisorId = randomUUID();
+  const ownedRoot = graphcraftRoot(input.repositoryRoot);
   const root = supervisorRoot(input.repositoryRoot, input.runId);
   const logPath = join(root, `${supervisorId}.log`);
-  await mkdir(root, { recursive: true });
+  await ensurePrivateDirectory(ownedRoot);
+  await ensurePrivateDirectory(root, ownedRoot);
+  await hardenPrivateFile(logPath, ownedRoot);
   const log = await open(logPath, "a", 0o600);
-  await chmod(logPath, 0o600);
+  await hardenPrivateFile(logPath, ownedRoot);
   let child;
   try {
     child = spawn(
@@ -177,10 +312,11 @@ async function launchDetachedSupervisor(input: {
       logPath,
       ...(previous ? { replacesSupervisorId: previous.supervisorId } : {}),
     });
-    await writeJsonAtomic(
-      supervisorRecordPath(input.repositoryRoot, input.runId, supervisorId),
-      record,
-    );
+    assertSupervisorRecordFits(record);
+    const recordPath = supervisorRecordPath(input.repositoryRoot, input.runId, supervisorId);
+    await hardenPrivateFile(recordPath, ownedRoot);
+    await writeJsonAtomic(recordPath, record);
+    await hardenPrivateFile(recordPath, ownedRoot);
     child.unref();
     return record;
   } catch (error) {
@@ -215,6 +351,7 @@ class SupervisorLease {
   private constructor(
     private record: SupervisorRecord,
     private readonly path: string,
+    private readonly ownedRoot: string,
   ) {}
 
   static async open(
@@ -229,7 +366,18 @@ class SupervisorLease {
       throw new Error(
         `Supervisor ${supervisorId} expected PID ${record.pid}, received ${process.pid}`,
       );
-    return new SupervisorLease(record, supervisorRecordPath(repositoryRoot, runId, supervisorId));
+    const expectedLogPath = join(supervisorRoot(repositoryRoot, runId), `${supervisorId}.log`);
+    if (resolve(record.logPath) !== resolve(expectedLogPath))
+      throw new Error(`Supervisor ${supervisorId} has an invalid log path`);
+    return new SupervisorLease(
+      record,
+      supervisorRecordPath(repositoryRoot, runId, supervisorId),
+      graphcraftRoot(repositoryRoot),
+    );
+  }
+
+  logPath(): string {
+    return this.record.logPath;
   }
 
   async update(
@@ -242,10 +390,17 @@ class SupervisorLease {
       this.record = SupervisorRecordSchema.parse({
         ...this.record,
         ...patch,
+        ...(patch.message !== undefined
+          ? { message: boundedSupervisorMessage(patch.message) }
+          : {}),
         heartbeatAt: patch.heartbeatAt ?? now,
         updatedAt: now,
       });
+      assertSupervisorRecordFits(this.record);
+      await ensurePrivateDirectory(dirname(this.path), this.ownedRoot);
+      await hardenPrivateFile(this.path, this.ownedRoot);
       await writeJsonAtomic(this.path, this.record);
+      await hardenPrivateFile(this.path, this.ownedRoot);
     });
     this.tail = operation.catch(() => undefined);
     await operation;
@@ -266,9 +421,13 @@ export async function superviseRun(input: {
     input.supervisorId,
   );
   await lease.update({ status: "running", message: "Supervisor owns the run lock lifecycle" });
+  const logPath = lease.logPath();
+  maintainSupervisorLog(logPath);
+  if (processOutputTargetsLog(logPath)) process.once("exit", () => maintainSupervisorLog(logPath));
   const heartbeat = setInterval(() => {
     void lease
       .update({ heartbeatAt: new Date().toISOString() })
+      .then(() => maintainSupervisorLog(logPath))
       .catch((error: unknown) =>
         console.error(`Supervisor heartbeat failed: ${redactString(String(error))}`),
       );
@@ -282,9 +441,17 @@ export async function superviseRun(input: {
       signal: input.signal,
       superviseWaits: true,
       maxWorkers: input.maxWorkers ?? 1,
-      ...(input.observer ? { observer: input.observer } : {}),
+      ...(input.observer
+        ? {
+            observer: (event) => {
+              input.observer!(event);
+              maintainSupervisorLog(logPath);
+            },
+          }
+        : {}),
     });
     clearInterval(heartbeat);
+    maintainSupervisorLog(logPath);
     const endedAt = new Date().toISOString();
     await lease.update({
       status: "exited",
@@ -295,6 +462,7 @@ export async function superviseRun(input: {
     return state;
   } catch (error) {
     clearInterval(heartbeat);
+    maintainSupervisorLog(logPath);
     await lease.update({
       status: "failed",
       endedAt: new Date().toISOString(),

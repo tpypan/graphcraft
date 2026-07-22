@@ -469,6 +469,7 @@ export async function decideRunControl(
   store: RunStore,
   input: UserControlDecisionInput,
 ): Promise<RunState> {
+  await store.prepareStorage();
   const lock = new RunLock(join(store.graphcraftRoot, "locks", `${store.runId}.lock`));
   await lock.acquire();
   try {

@@ -1,11 +1,12 @@
-import { appendFile, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { constants as fsConstants, type BigIntStats } from "node:fs";
+import { lstat, open, readdir } from "node:fs/promises";
+import { join, relative, resolve } from "node:path";
 import {
+  ArtifactInventorySchema,
   GraphSchema,
   GraphAmendmentRecordSchema,
   GraphRevisionRecordSchema,
   HeldOutProbePlanSchema,
-  HostEventSchema,
   ProbePlanSchema,
   RunContractSchema,
   RunEventSchema,
@@ -18,6 +19,7 @@ import {
   validateHeldOutProbePlan,
   verifyRunEvent,
   type Graph,
+  type ArtifactInventory,
   type GraphRevisionRecord,
   type HostEvent,
   type HeldOutProbePlan,
@@ -26,34 +28,214 @@ import {
   type RunEvent,
   type RunState,
 } from "@graphcraft/core";
-import { writeJsonAtomic } from "./json.ts";
+import { syncDirectory, writeJsonAtomic } from "./json.ts";
 import { ensureCurrentRunStorage, writeCurrentRunStorageManifest } from "./migration.ts";
 import { assertPersistenceSafe, redactTextBytes, redactValue } from "./redaction.ts";
+import { RunArtifactStore, type ArtifactPreview } from "./artifact-policy.ts";
+import {
+  ensurePrivateDirectory,
+  hardenPrivateFile,
+  readPrivateFileBounded,
+  validatePrivatePath,
+} from "./secure-fs.ts";
+
+const MEBIBYTE = 1024 * 1024;
+
+export const RUN_EVENT_MAX_BYTES = 4 * MEBIBYTE;
+export const RUN_EVENT_LOG_MAX_BYTES = 64 * MEBIBYTE;
+export const RUN_STATE_MAX_BYTES = 16 * MEBIBYTE;
+export const RUN_BLOCKED_EVENT_RESERVE_BYTES = 64 * 1024;
+export const RUN_METADATA_MAX_BYTES = 4 * MEBIBYTE;
+export const RUN_WORKSPACE_MAX_BYTES = 64 * 1024;
+
+export interface RunStoreLimits {
+  maxEventBytes: number;
+  maxEventLogBytes: number;
+  maxStateBytes: number;
+  blockedEventReserveBytes: number;
+}
+
+export type RunStoreLimitKind = "event" | "event_log" | "state";
+
+export class RunStoreLimitError extends Error {
+  blockerPersisted = false;
+
+  constructor(
+    readonly kind: RunStoreLimitKind,
+    readonly attemptedBytes: number,
+    readonly limitBytes: number,
+  ) {
+    super(
+      `Run ${kind.replace("_", " ")} would require ${attemptedBytes} serialized bytes, exceeding the ${limitBytes}-byte limit`,
+    );
+    this.name = "RunStoreLimitError";
+  }
+}
+
+const PERSISTENCE_LIMIT_BLOCK_REASON =
+  "Graphcraft blocked this run before durable run storage exceeded its configured size limit.";
+
+function normalizeLimits(input: Partial<RunStoreLimits>): RunStoreLimits {
+  const limits: RunStoreLimits = {
+    maxEventBytes: input.maxEventBytes ?? RUN_EVENT_MAX_BYTES,
+    maxEventLogBytes: input.maxEventLogBytes ?? RUN_EVENT_LOG_MAX_BYTES,
+    maxStateBytes: input.maxStateBytes ?? RUN_STATE_MAX_BYTES,
+    blockedEventReserveBytes: input.blockedEventReserveBytes ?? RUN_BLOCKED_EVENT_RESERVE_BYTES,
+  };
+  for (const [name, value] of Object.entries(limits)) {
+    if (!Number.isSafeInteger(value) || value <= 0)
+      throw new Error(`RunStore ${name} must be a positive safe integer`);
+  }
+  if (limits.blockedEventReserveBytes >= limits.maxEventLogBytes)
+    throw new Error("RunStore blocked-event reserve must be smaller than the event-log limit");
+  return limits;
+}
+
+function serializedEvent(event: RunEvent): string {
+  return `${JSON.stringify(event)}\n`;
+}
+
+function serializedStateBytes(state: RunState): number {
+  return Buffer.byteLength(`${JSON.stringify(state, null, 2)}\n`);
+}
+
+function serializedJsonBytes(value: unknown): number {
+  return Buffer.byteLength(`${JSON.stringify(redactValue(value), null, 2)}\n`);
+}
+
+function isPersistenceLimitBlocker(event: RunEvent | undefined): boolean {
+  return (
+    event?.type === "run.blocked" &&
+    ["event", "event_log", "state"].includes(String(event.data.persistenceLimit))
+  );
+}
+
+function assertEventLogFile(path: string, status: BigIntStats): void {
+  if (!status.isFile()) throw new Error(`Run event log is not a regular file: ${path}`);
+  if (status.nlink > 1n) throw new Error(`Run event log is multiply linked: ${path}`);
+}
+
+function sameFileIdentity(left: BigIntStats, right: BigIntStats): boolean {
+  if (left.ino !== 0n && right.ino !== 0n) return left.dev === right.dev && left.ino === right.ino;
+  return left.dev === right.dev && left.birthtimeNs === right.birthtimeNs;
+}
+
+function optionalHeldOutProbePlan(value: unknown): HeldOutProbePlan | undefined {
+  const parsed = HeldOutProbePlanSchema.safeParse(value);
+  if (!parsed.success) return undefined;
+  try {
+    return validateHeldOutProbePlan(parsed.data);
+  } catch {
+    return undefined;
+  }
+}
 
 export class RunStore {
   readonly repositoryRoot: string;
   readonly runId: string;
   readonly graphcraftRoot: string;
   readonly runRoot: string;
+  readonly limits: RunStoreLimits;
+  private readonly artifactStore: RunArtifactStore;
   private appendTail: Promise<void> = Promise.resolve();
   private initializing = false;
   private storageReady: Promise<unknown> | undefined;
 
-  constructor(repositoryRoot: string, runId: string) {
+  constructor(repositoryRoot: string, runId: string, limits: Partial<RunStoreLimits> = {}) {
     this.repositoryRoot = repositoryRoot;
     this.runId = runId;
     this.graphcraftRoot = join(repositoryRoot, ".graphcraft");
     this.runRoot = join(this.graphcraftRoot, "runs", runId);
+    this.limits = normalizeLimits(limits);
+    this.artifactStore = new RunArtifactStore(this.runRoot, runId);
+    const blocker = this.createPersistenceLimitBlocker(1, "event_log");
+    const blockerBytes = Buffer.byteLength(serializedEvent(blocker));
+    if (blockerBytes > this.limits.maxEventBytes)
+      throw new Error("RunStore per-event limit cannot fit its durable blocked event");
+    if (blockerBytes > this.limits.blockedEventReserveBytes)
+      throw new Error("RunStore blocked-event reserve cannot fit its durable blocked event");
   }
 
-  private async ensureStorage(): Promise<void> {
+  private async validateStorageRoot(): Promise<void> {
+    const graphcraftRoot = resolve(this.graphcraftRoot);
+    const runRoot = resolve(this.runRoot);
+    const validated = await validatePrivatePath(graphcraftRoot, relative(graphcraftRoot, runRoot));
+    if (validated !== runRoot)
+      throw new Error(`Run storage path escaped the Graphcraft state directory: ${this.runRoot}`);
+  }
+
+  async prepareStorage(): Promise<void> {
+    await this.validateStorageRoot();
     if (this.initializing) return;
-    this.storageReady ??= ensureCurrentRunStorage({
+    const ready = (this.storageReady ??= ensureCurrentRunStorage({
       graphcraftRoot: this.graphcraftRoot,
       runRoot: this.runRoot,
       runId: this.runId,
-    });
-    await this.storageReady;
+    }));
+    try {
+      await ready;
+      await this.validateStorageRoot();
+    } catch (error) {
+      if (this.storageReady === ready) this.storageReady = undefined;
+      throw error;
+    }
+  }
+
+  private async ensureStorage(): Promise<void> {
+    await this.prepareStorage();
+  }
+
+  private assertJsonProjectionFits(value: unknown, maximumBytes: number, label: string): void {
+    const bytes = serializedJsonBytes(value);
+    if (bytes > maximumBytes)
+      throw new Error(`${label} requires ${bytes} serialized bytes, exceeding ${maximumBytes}`);
+  }
+
+  private async writeBoundedJson(
+    relativePath: string,
+    value: unknown,
+    maximumBytes: number,
+    label: string,
+  ): Promise<void> {
+    const persisted = redactValue(value);
+    this.assertJsonProjectionFits(persisted, maximumBytes, label);
+    await writeJsonAtomic(join(this.runRoot, relativePath), persisted);
+  }
+
+  private async readBoundedJson(relativePath: string, maximumBytes: number): Promise<unknown> {
+    const bytes = await readPrivateFileBounded(
+      join(this.runRoot, relativePath),
+      maximumBytes,
+      this.runRoot,
+    );
+    return JSON.parse(bytes.toString("utf8"));
+  }
+
+  private async readOptionalBoundedJson(
+    relativePath: string,
+    maximumBytes: number,
+  ): Promise<unknown | undefined> {
+    let bytes: Buffer;
+    try {
+      bytes = await readPrivateFileBounded(
+        join(this.runRoot, relativePath),
+        maximumBytes,
+        this.runRoot,
+      );
+    } catch (error) {
+      if (
+        (error as NodeJS.ErrnoException).code === "ENOENT" ||
+        (error as Error).message.includes("bounded read limit")
+      )
+        return undefined;
+      throw error;
+    }
+    try {
+      return JSON.parse(bytes.toString("utf8"));
+    } catch (error) {
+      if (error instanceof SyntaxError) return undefined;
+      throw error;
+    }
   }
 
   static async create(
@@ -62,8 +244,9 @@ export class RunStore {
     graph: Graph,
     inputProbePlan?: ProbePlan,
     inputHeldOutProbePlan?: HeldOutProbePlan,
+    limits: Partial<RunStoreLimits> = {},
   ): Promise<RunStore> {
-    const store = new RunStore(repositoryRoot, contract.runId);
+    const store = new RunStore(repositoryRoot, contract.runId, limits);
     store.initializing = true;
     const persistedContract = RunContractSchema.parse(redactValue(contract));
     const persistedGraph = GraphSchema.parse(redactValue(graph));
@@ -73,18 +256,6 @@ export class RunStore {
       : createHeldOutProbePlan(contract.runId, probePlan);
     assertPersistenceSafe(probePlan, "Probe plan");
     assertPersistenceSafe(heldOutProbePlan, "Held-out probe plan");
-    await Promise.all([
-      mkdir(join(store.runRoot, "artifacts"), { recursive: true }),
-      mkdir(join(store.runRoot, "capsules"), { recursive: true }),
-      mkdir(join(store.runRoot, "reports"), { recursive: true }),
-      mkdir(join(store.graphcraftRoot, "locks"), { recursive: true }),
-    ]);
-    await Promise.all([
-      store.saveContract(persistedContract),
-      store.saveGraph(persistedGraph),
-      store.saveProbePlan(probePlan),
-      store.saveHeldOutProbePlan(heldOutProbePlan),
-    ]);
     const event = createRunEvent({
       sequence: 1,
       actor: "runtime",
@@ -98,12 +269,35 @@ export class RunStore {
         nodeIds: graph.nodes.map(({ id }) => id),
       },
     });
-    await writeFile(store.eventsPath(), `${JSON.stringify(event)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    await store.materialize([event]);
-    await writeCurrentRunStorageManifest(store.runRoot, store.runId, 1);
+    const eventLine = serializedEvent(event);
+    store.assertNormalEventCapacity(0, eventLine);
+    const state = RunStateSchema.parse(reduceEvents([event]));
+    store.assertNormalStateCapacity(state, event.sequence + 1);
+    store.assertJsonProjectionFits(persistedContract, RUN_METADATA_MAX_BYTES, "Run contract");
+    store.assertJsonProjectionFits(persistedGraph, RUN_METADATA_MAX_BYTES, "Run graph");
+    store.assertJsonProjectionFits(probePlan, RUN_METADATA_MAX_BYTES, "Probe plan");
+    store.assertJsonProjectionFits(heldOutProbePlan, RUN_METADATA_MAX_BYTES, "Held-out probe plan");
+    await ensurePrivateDirectory(store.graphcraftRoot);
+    await Promise.all([
+      ensurePrivateDirectory(join(store.graphcraftRoot, "runs")),
+      ensurePrivateDirectory(join(store.graphcraftRoot, "locks")),
+    ]);
+    await ensurePrivateDirectory(store.runRoot);
+    await Promise.all([
+      ensurePrivateDirectory(join(store.runRoot, "artifacts")),
+      ensurePrivateDirectory(join(store.runRoot, "capsules")),
+      ensurePrivateDirectory(join(store.runRoot, "reports")),
+    ]);
+    await store.artifactStore.initialize();
+    await Promise.all([
+      store.saveContract(persistedContract),
+      store.saveGraph(persistedGraph),
+      store.saveProbePlan(probePlan),
+      store.saveHeldOutProbePlan(heldOutProbePlan),
+    ]);
+    await store.appendEventLine(eventLine, 0);
+    await store.writeMaterializedState(state);
+    await writeCurrentRunStorageManifest(store.runRoot, store.runId, 2);
     store.initializing = false;
     return store;
   }
@@ -112,24 +306,141 @@ export class RunStore {
     return join(this.runRoot, "events.jsonl");
   }
 
+  private createPersistenceLimitBlocker(sequence: number, kind: RunStoreLimitKind): RunEvent {
+    return createRunEvent({
+      sequence,
+      actor: "runtime",
+      causationId: this.runId,
+      type: "run.blocked",
+      data: {
+        reason: PERSISTENCE_LIMIT_BLOCK_REASON,
+        persistenceLimit: kind,
+      },
+    });
+  }
+
+  private persistenceBlockedState(state: RunState, blocker: RunEvent): RunState {
+    const { progressDecision: _progressDecision, ...rest } = state;
+    return RunStateSchema.parse({
+      ...rest,
+      status: "blocked",
+      stopReason: PERSISTENCE_LIMIT_BLOCK_REASON,
+      lastEventSequence: blocker.sequence,
+      updatedAt: blocker.timestamp,
+    });
+  }
+
+  private assertBlockerEventFits(blockerLine: string): void {
+    const bytes = Buffer.byteLength(blockerLine);
+    if (bytes > this.limits.maxEventBytes)
+      throw new Error("RunStore per-event limit cannot fit its durable blocked event");
+    if (bytes > this.limits.blockedEventReserveBytes)
+      throw new Error("RunStore blocked-event reserve cannot fit its durable blocked event");
+  }
+
+  private assertNormalEventCapacity(currentLogBytes: number, eventLine: string): void {
+    const eventBytes = Buffer.byteLength(eventLine);
+    if (eventBytes > this.limits.maxEventBytes)
+      throw new RunStoreLimitError("event", eventBytes, this.limits.maxEventBytes);
+    const normalLogLimit = this.limits.maxEventLogBytes - this.limits.blockedEventReserveBytes;
+    const candidateLogBytes = currentLogBytes + eventBytes;
+    if (candidateLogBytes > normalLogLimit)
+      throw new RunStoreLimitError("event_log", candidateLogBytes, normalLogLimit);
+  }
+
+  private assertNormalStateCapacity(state: RunState, blockerSequence: number): void {
+    const stateBytes = serializedStateBytes(state);
+    if (stateBytes > this.limits.maxStateBytes)
+      throw new RunStoreLimitError("state", stateBytes, this.limits.maxStateBytes);
+
+    const blocker = this.createPersistenceLimitBlocker(blockerSequence, "state");
+    this.assertBlockerEventFits(serializedEvent(blocker));
+    const blockedStateBytes = serializedStateBytes(this.persistenceBlockedState(state, blocker));
+    if (blockedStateBytes > this.limits.maxStateBytes)
+      throw new RunStoreLimitError("state", blockedStateBytes, this.limits.maxStateBytes);
+  }
+
+  private async appendEventLine(line: string, expectedLogBytes: number): Promise<void> {
+    await validatePrivatePath(this.runRoot, "events.jsonl");
+    let created = false;
+    let observed: BigIntStats | undefined;
+    let handle;
+    const noFollow = process.platform === "win32" ? 0 : fsConstants.O_NOFOLLOW;
+    try {
+      handle = await open(
+        this.eventsPath(),
+        fsConstants.O_WRONLY |
+          fsConstants.O_APPEND |
+          fsConstants.O_CREAT |
+          fsConstants.O_EXCL |
+          noFollow,
+        0o600,
+      );
+      created = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      await validatePrivatePath(this.runRoot, "events.jsonl");
+      observed = await lstat(this.eventsPath(), { bigint: true });
+      assertEventLogFile(this.eventsPath(), observed);
+      handle = await open(
+        this.eventsPath(),
+        fsConstants.O_WRONLY | fsConstants.O_APPEND | noFollow,
+        0o600,
+      );
+    }
+    try {
+      const before = await handle.stat({ bigint: true });
+      assertEventLogFile(this.eventsPath(), before);
+      if (observed && !sameFileIdentity(observed, before))
+        throw new Error("Run event log changed before its append descriptor was opened");
+      const pathBefore = await lstat(this.eventsPath(), { bigint: true });
+      assertEventLogFile(this.eventsPath(), pathBefore);
+      if (!sameFileIdentity(before, pathBefore))
+        throw new Error("Run event log path changed before append");
+      if (before.size !== BigInt(expectedLogBytes))
+        throw new Error("Run event log size changed before append");
+      await handle.writeFile(line, "utf8");
+      await handle.sync();
+      const after = await handle.stat({ bigint: true });
+      const pathAfter = await lstat(this.eventsPath(), { bigint: true });
+      assertEventLogFile(this.eventsPath(), after);
+      assertEventLogFile(this.eventsPath(), pathAfter);
+      if (!sameFileIdentity(after, pathAfter))
+        throw new Error("Run event log path changed during append");
+      if (after.size !== before.size + BigInt(Buffer.byteLength(line)))
+        throw new Error("Run event log append did not persist exactly one event line");
+    } finally {
+      await handle.close();
+    }
+    await hardenPrivateFile(this.eventsPath(), this.runRoot);
+    if (created) await syncDirectory(this.runRoot);
+  }
+
   async saveContract(contract: RunContract): Promise<void> {
     await this.ensureStorage();
-    await writeJsonAtomic(
-      join(this.runRoot, "contract.json"),
+    await this.writeBoundedJson(
+      "contract.json",
       RunContractSchema.parse(redactValue(contract)),
+      RUN_METADATA_MAX_BYTES,
+      "Run contract",
     );
   }
 
   async loadContract(): Promise<RunContract> {
     await this.ensureStorage();
     return RunContractSchema.parse(
-      JSON.parse(await readFile(join(this.runRoot, "contract.json"), "utf8")),
+      await this.readBoundedJson("contract.json", RUN_METADATA_MAX_BYTES),
     );
   }
 
   async saveGraph(graph: Graph): Promise<void> {
     await this.ensureStorage();
-    await writeJsonAtomic(join(this.runRoot, "graph.json"), GraphSchema.parse(redactValue(graph)));
+    await this.writeBoundedJson(
+      "graph.json",
+      GraphSchema.parse(redactValue(graph)),
+      RUN_METADATA_MAX_BYTES,
+      "Run graph",
+    );
   }
 
   async loadGraph(): Promise<Graph> {
@@ -141,19 +452,25 @@ export class RunStore {
     )?.data.graph;
     if (eventGraph) {
       const graph = GraphSchema.parse(eventGraph);
-      const materialized = await readFile(join(this.runRoot, "graph.json"), "utf8")
-        .then((value) => GraphSchema.parse(JSON.parse(value)))
-        .catch(() => undefined);
+      const parsedMaterialized = GraphSchema.safeParse(
+        await this.readOptionalBoundedJson("graph.json", RUN_METADATA_MAX_BYTES),
+      );
+      const materialized = parsedMaterialized.success ? parsedMaterialized.data : undefined;
       if (JSON.stringify(materialized) !== JSON.stringify(graph)) await this.saveGraph(graph);
       return graph;
     }
-    return GraphSchema.parse(JSON.parse(await readFile(join(this.runRoot, "graph.json"), "utf8")));
+    return GraphSchema.parse(await this.readBoundedJson("graph.json", RUN_METADATA_MAX_BYTES));
   }
 
   async saveProbePlan(probePlan: ProbePlan): Promise<void> {
     await this.ensureStorage();
     assertPersistenceSafe(probePlan, "Probe plan");
-    await writeJsonAtomic(join(this.runRoot, "probe-plan.json"), ProbePlanSchema.parse(probePlan));
+    await this.writeBoundedJson(
+      "probe-plan.json",
+      ProbePlanSchema.parse(probePlan),
+      RUN_METADATA_MAX_BYTES,
+      "Probe plan",
+    );
   }
 
   async loadProbePlan(): Promise<ProbePlan> {
@@ -165,28 +482,30 @@ export class RunStore {
     )?.data.probePlan;
     if (eventPlan) {
       const probePlan = ProbePlanSchema.parse(eventPlan);
-      const materialized = await readFile(join(this.runRoot, "probe-plan.json"), "utf8")
-        .then((value) => ProbePlanSchema.parse(JSON.parse(value)))
-        .catch(() => undefined);
+      const parsedMaterialized = ProbePlanSchema.safeParse(
+        await this.readOptionalBoundedJson("probe-plan.json", RUN_METADATA_MAX_BYTES),
+      );
+      const materialized = parsedMaterialized.success ? parsedMaterialized.data : undefined;
       if (JSON.stringify(materialized) !== JSON.stringify(probePlan))
         await this.saveProbePlan(probePlan);
       return probePlan;
     }
-    try {
-      return ProbePlanSchema.parse(
-        JSON.parse(await readFile(join(this.runRoot, "probe-plan.json"), "utf8")),
-      );
-    } catch {
-      return probePlanFromGraph(await this.loadGraph());
-    }
+    const parsedMaterialized = ProbePlanSchema.safeParse(
+      await this.readOptionalBoundedJson("probe-plan.json", RUN_METADATA_MAX_BYTES),
+    );
+    return parsedMaterialized.success
+      ? parsedMaterialized.data
+      : probePlanFromGraph(await this.loadGraph());
   }
 
   async saveHeldOutProbePlan(heldOutProbePlan: HeldOutProbePlan): Promise<void> {
     await this.ensureStorage();
     assertPersistenceSafe(heldOutProbePlan, "Held-out probe plan");
-    await writeJsonAtomic(
-      join(this.runRoot, "held-out-probes.json"),
+    await this.writeBoundedJson(
+      "held-out-probes.json",
       validateHeldOutProbePlan(heldOutProbePlan),
+      RUN_METADATA_MAX_BYTES,
+      "Held-out probe plan",
     );
   }
 
@@ -200,51 +519,104 @@ export class RunStore {
     )?.data.heldOutProbePlan;
     if (eventPlan) {
       const heldOutProbePlan = validateHeldOutProbePlan(HeldOutProbePlanSchema.parse(eventPlan));
-      const materialized = await readFile(join(this.runRoot, "held-out-probes.json"), "utf8")
-        .then((value) => validateHeldOutProbePlan(HeldOutProbePlanSchema.parse(JSON.parse(value))))
-        .catch(() => undefined);
+      const materialized = optionalHeldOutProbePlan(
+        await this.readOptionalBoundedJson("held-out-probes.json", RUN_METADATA_MAX_BYTES),
+      );
       if (JSON.stringify(materialized) !== JSON.stringify(heldOutProbePlan))
         await this.saveHeldOutProbePlan(heldOutProbePlan);
       return heldOutProbePlan;
     }
-    try {
-      return validateHeldOutProbePlan(
-        HeldOutProbePlanSchema.parse(
-          JSON.parse(await readFile(join(this.runRoot, "held-out-probes.json"), "utf8")),
-        ),
-      );
-    } catch {
-      return createHeldOutProbePlan(this.runId, await this.loadProbePlan());
-    }
+    return (
+      optionalHeldOutProbePlan(
+        await this.readOptionalBoundedJson("held-out-probes.json", RUN_METADATA_MAX_BYTES),
+      ) ?? createHeldOutProbePlan(this.runId, await this.loadProbePlan())
+    );
   }
 
-  async loadEvents(): Promise<RunEvent[]> {
+  private async loadEventLog(): Promise<{ events: RunEvent[]; bytes: number }> {
     await this.ensureStorage();
-    const content = await readFile(this.eventsPath(), "utf8");
-    const events = content
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => RunEventSchema.parse(JSON.parse(line)));
+    await validatePrivatePath(this.runRoot, "events.jsonl");
+    let contentBytes: Buffer;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        contentBytes = await readPrivateFileBounded(
+          this.eventsPath(),
+          this.limits.maxEventLogBytes,
+          this.runRoot,
+        );
+        break;
+      } catch (error) {
+        if ((error as Error).message.includes("bounded read limit"))
+          throw new RunStoreLimitError(
+            "event_log",
+            this.limits.maxEventLogBytes + 1,
+            this.limits.maxEventLogBytes,
+          );
+        const message = error instanceof Error ? error.message : "";
+        if (
+          attempt >= 7 ||
+          (message !== "Private file changed before its bounded read" &&
+            message !== "Private file changed during its bounded read")
+        )
+          throw error;
+        await new Promise<void>((resolveRetry) => setImmediate(resolveRetry));
+      }
+    }
+    const bytes = contentBytes.byteLength;
+    const content = contentBytes.toString("utf8");
+    const lines = content.split("\n").filter(Boolean);
+    const events = lines.map((line) => {
+      const lineBytes = Buffer.byteLength(`${line}\n`);
+      if (lineBytes > this.limits.maxEventBytes)
+        throw new RunStoreLimitError("event", lineBytes, this.limits.maxEventBytes);
+      return RunEventSchema.parse(JSON.parse(line));
+    });
     for (const [index, event] of events.entries()) {
       verifyRunEvent(event);
       if (event.sequence !== index + 1)
         throw new Error(`Expected event sequence ${index + 1}, received ${event.sequence}`);
     }
-    return events;
+    return { events, bytes };
+  }
+
+  async loadEvents(): Promise<RunEvent[]> {
+    return (await this.loadEventLog()).events;
   }
 
   async loadState(): Promise<RunState> {
     await this.ensureStorage();
+    const events = await this.loadEvents();
+    const authoritative = RunStateSchema.parse(reduceEvents(events));
+    const authoritativeBytes = serializedStateBytes(authoritative);
+    if (authoritativeBytes > this.limits.maxStateBytes)
+      throw new RunStoreLimitError("state", authoritativeBytes, this.limits.maxStateBytes);
+    const statePath = join(this.runRoot, "state.json");
+    let materialized: RunState | undefined;
+    let materializedBytes: Buffer | undefined;
     try {
-      const value = JSON.parse(await readFile(join(this.runRoot, "state.json"), "utf8")) as Record<
-        string,
-        unknown
-      >;
-      if (!("tokenLedger" in value)) return await this.rebuildViews();
-      return RunStateSchema.parse(value);
-    } catch {
-      return await this.rebuildViews();
+      materializedBytes = await readPrivateFileBounded(
+        statePath,
+        this.limits.maxStateBytes,
+        this.runRoot,
+      );
+    } catch (error) {
+      if (
+        (error as NodeJS.ErrnoException).code !== "ENOENT" &&
+        !(error as Error).message.includes("bounded read limit")
+      )
+        throw error;
     }
+    if (materializedBytes) {
+      try {
+        const parsed = RunStateSchema.safeParse(JSON.parse(materializedBytes.toString("utf8")));
+        materialized = parsed.success ? parsed.data : undefined;
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+      }
+    }
+    if (!materialized || contentHash(materialized) !== contentHash(authoritative))
+      await this.writeMaterializedState(authoritative);
+    return authoritative;
   }
 
   async append(
@@ -255,7 +627,20 @@ export class RunStore {
   ): Promise<RunEvent> {
     await this.ensureStorage();
     const operation = this.appendTail.then(async () => {
-      const events = await this.loadEvents();
+      const { events, bytes: currentLogBytes } = await this.loadEventLog();
+      const previous = events.at(-1);
+      if (isPersistenceLimitBlocker(previous)) {
+        const kind = String(previous?.data.persistenceLimit) as RunStoreLimitKind;
+        const limitBytes =
+          kind === "event"
+            ? this.limits.maxEventBytes
+            : kind === "state"
+              ? this.limits.maxStateBytes
+              : this.limits.maxEventLogBytes - this.limits.blockedEventReserveBytes;
+        const error = new RunStoreLimitError(kind, limitBytes + 1, limitBytes);
+        error.blockerPersisted = true;
+        throw error;
+      }
       const event = createRunEvent({
         sequence: events.length + 1,
         actor,
@@ -263,9 +648,19 @@ export class RunStore {
         type,
         data: redactValue(data) as Record<string, unknown>,
       });
-      await appendFile(this.eventsPath(), `${JSON.stringify(event)}\n`, "utf8");
-      events.push(event);
-      await this.materialize(events);
+      const eventLine = serializedEvent(event);
+      let state: RunState;
+      try {
+        this.assertNormalEventCapacity(currentLogBytes, eventLine);
+        state = RunStateSchema.parse(reduceEvents([...events, event]));
+        this.assertNormalStateCapacity(state, event.sequence + 1);
+      } catch (error) {
+        if (!(error instanceof RunStoreLimitError)) throw error;
+        await this.persistPersistenceLimitBlocker(events, currentLogBytes, error);
+        throw error;
+      }
+      await this.appendEventLine(eventLine, currentLogBytes);
+      await this.writeMaterializedState(state);
       return event;
     });
     this.appendTail = operation.then(
@@ -273,6 +668,32 @@ export class RunStore {
       () => undefined,
     );
     return await operation;
+  }
+
+  private async persistPersistenceLimitBlocker(
+    events: RunEvent[],
+    currentLogBytes: number,
+    limitError: RunStoreLimitError,
+  ): Promise<void> {
+    const previous = events.at(-1);
+    if (isPersistenceLimitBlocker(previous)) {
+      limitError.blockerPersisted = true;
+      return;
+    }
+    const blocker = this.createPersistenceLimitBlocker(events.length + 1, limitError.kind);
+    const blockerLine = serializedEvent(blocker);
+    this.assertBlockerEventFits(blockerLine);
+    const blockerBytes = Buffer.byteLength(blockerLine);
+    const blockedLogBytes = currentLogBytes + blockerBytes;
+    if (blockedLogBytes > this.limits.maxEventLogBytes)
+      throw new RunStoreLimitError("event_log", blockedLogBytes, this.limits.maxEventLogBytes);
+    const state = RunStateSchema.parse(reduceEvents([...events, blocker]));
+    const stateBytes = serializedStateBytes(state);
+    if (stateBytes > this.limits.maxStateBytes)
+      throw new RunStoreLimitError("state", stateBytes, this.limits.maxStateBytes);
+    await this.appendEventLine(blockerLine, currentLogBytes);
+    limitError.blockerPersisted = true;
+    await this.writeMaterializedState(state);
   }
 
   async rebuildViews(): Promise<RunState> {
@@ -306,32 +727,17 @@ export class RunStore {
 
   async writeArtifact(relativePath: string, value: string | Uint8Array): Promise<string> {
     await this.ensureStorage();
-    const path = join(this.runRoot, "artifacts", relativePath);
-    await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, redactTextBytes(value), { mode: 0o600 });
-    return path;
+    return (await this.artifactStore.writeArtifact(relativePath, value)).path;
   }
 
   async appendInvocationEvent(invocationId: string, event: HostEvent): Promise<string> {
     await this.ensureStorage();
-    const path = join(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
-    await mkdir(dirname(path), { recursive: true });
-    const persistedEvent = HostEventSchema.parse(redactValue(event));
-    await appendFile(path, `${JSON.stringify(persistedEvent)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    return path;
+    return (await this.artifactStore.appendInvocationEvent(invocationId, event)).path;
   }
 
   async loadInvocationEvents(invocationId: string): Promise<HostEvent[]> {
     await this.ensureStorage();
-    const path = join(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
-    const content = await readFile(path, "utf8");
-    return content
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => HostEventSchema.parse(JSON.parse(line)));
+    return await this.artifactStore.loadInvocationEvents(invocationId);
   }
 
   async loadGraphHistory(): Promise<GraphRevisionRecord[]> {
@@ -397,13 +803,12 @@ export class RunStore {
     const persistedValue = redactValue(value);
     if (contentHash(persistedValue) !== hash)
       throw new Error("Context capsule must be redacted before content addressing");
-    const path = join(this.runRoot, "capsules", `${hash}.json`);
-    const reused = await readFile(path, "utf8")
-      .then((existing) => contentHash(JSON.parse(existing)) === hash)
-      .catch(() => false);
-    if (reused) return { path, reused: true };
-    await writeJsonAtomic(path, persistedValue);
-    return { path, reused: false };
+    const result = await this.artifactStore.writeIdentityArtifact({
+      relativePath: `capsules/${hash}.json`,
+      value: `${JSON.stringify(persistedValue, null, 2)}\n`,
+      kind: "capsule",
+    });
+    return { path: result.path, reused: result.reused };
   }
 
   async writeContentAddressedArtifact(
@@ -416,30 +821,45 @@ export class RunStore {
       throw new Error("Content-addressed artifact category or extension is invalid");
     const bytes = redactTextBytes(value);
     const hash = contentHash({ contents: bytes.toString("base64") });
-    const path = join(this.runRoot, "artifacts", category, `${hash}.${extension}`);
-    const reused = await readFile(path)
-      .then((existing) => Buffer.compare(existing, bytes) === 0)
-      .catch(() => false);
-    if (reused) return { path, hash, reused: true };
-    await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, bytes, { mode: 0o600 });
-    return { path, hash, reused: false };
+    const result = await this.artifactStore.writeIdentityArtifact({
+      relativePath: `artifacts/${category}/${hash}.${extension}`,
+      value: bytes,
+      kind: "content_addressed",
+    });
+    return { path: result.path, hash, reused: result.reused };
+  }
+
+  async loadArtifactInventory(): Promise<ArtifactInventory> {
+    await this.ensureStorage();
+    return ArtifactInventorySchema.parse(await this.artifactStore.inventory());
+  }
+
+  async readArtifactPreview(relativePath: string, maxBytes: number): Promise<ArtifactPreview> {
+    await this.ensureStorage();
+    return await this.artifactStore.readArtifactPreview(`artifacts/${relativePath}`, maxBytes);
   }
 
   async writeWorkspace(value: unknown): Promise<void> {
     await this.ensureStorage();
-    await writeJsonAtomic(join(this.runRoot, "workspace.json"), value);
+    await this.writeBoundedJson("workspace.json", value, RUN_WORKSPACE_MAX_BYTES, "Run workspace");
   }
 
   async loadWorkspace<T>(): Promise<T> {
     await this.ensureStorage();
-    return JSON.parse(await readFile(join(this.runRoot, "workspace.json"), "utf8")) as T;
+    return (await this.readBoundedJson("workspace.json", RUN_WORKSPACE_MAX_BYTES)) as T;
   }
 
   private async materialize(events: RunEvent[]): Promise<RunState> {
-    const state = reduceEvents(events);
-    await writeJsonAtomic(join(this.runRoot, "state.json"), state);
+    const state = RunStateSchema.parse(reduceEvents(events));
+    await this.writeMaterializedState(state);
     return state;
+  }
+
+  private async writeMaterializedState(state: RunState): Promise<void> {
+    const bytes = serializedStateBytes(state);
+    if (bytes > this.limits.maxStateBytes)
+      throw new RunStoreLimitError("state", bytes, this.limits.maxStateBytes);
+    await writeJsonAtomic(join(this.runRoot, "state.json"), state);
   }
 }
 

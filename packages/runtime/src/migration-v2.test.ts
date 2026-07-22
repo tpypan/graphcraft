@@ -1,0 +1,1118 @@
+import { createHash } from "node:crypto";
+import {
+  appendFile,
+  chmod,
+  link,
+  lstat,
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  symlink,
+  truncate,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, relative } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { MAX_ARTIFACT_INVENTORY_BYTES, type ArtifactInventory } from "@graphcraft/core";
+import { RunLock } from "./lock.ts";
+import {
+  CURRENT_RUN_STORAGE_VERSION,
+  LEGACY_MIGRATION_DESTINATION_LIMITS,
+  LEGACY_MIGRATION_RESOURCE_LIMITS,
+  ensureCurrentRunStorage,
+  writeCurrentRunStorageManifest,
+} from "./migration.ts";
+import {
+  RUN_BLOCKED_EVENT_RESERVE_BYTES,
+  RUN_EVENT_LOG_MAX_BYTES,
+  RUN_EVENT_MAX_BYTES,
+  RUN_METADATA_MAX_BYTES,
+  RUN_STATE_MAX_BYTES,
+  RUN_WORKSPACE_MAX_BYTES,
+  RunStore,
+} from "./store.ts";
+
+const roots: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true })));
+});
+
+interface LegacyFixture {
+  graphcraftRoot: string;
+  runRoot: string;
+  runId: string;
+  largeArtifact: Buffer;
+}
+
+const v1Formats = {
+  contract: 1,
+  graph: 1,
+  probePlan: 1,
+  heldOutProbes: 1,
+  events: 1,
+  state: 1,
+  workspace: 1,
+  capsules: 1,
+  invocationEvents: 1,
+  semanticReports: 1,
+  rawArtifacts: 1,
+  controlRequests: 1,
+  locks: 1,
+} as const;
+
+async function createLegacyFixture(runId: string, sourceVersion: 0 | 1): Promise<LegacyFixture> {
+  const root = await mkdtemp(join(tmpdir(), "graphcraft-migration-v2-test-"));
+  roots.push(root);
+  const graphcraftRoot = join(root, ".graphcraft");
+  const runRoot = join(graphcraftRoot, "runs", runId);
+  await Promise.all([
+    mkdir(join(runRoot, "artifacts", "logs"), { recursive: true, mode: 0o755 }),
+    mkdir(join(runRoot, "capsules"), { recursive: true, mode: 0o755 }),
+    mkdir(join(runRoot, "reports"), { recursive: true, mode: 0o755 }),
+  ]);
+  const largeArtifact = Buffer.alloc(2 * 1024 * 1024, "a");
+  await Promise.all([
+    writeFile(join(runRoot, "events.jsonl"), '{"legacy":true}\n', { mode: 0o644 }),
+    writeFile(join(runRoot, "state.json"), '{"legacy":"state"}\n', { mode: 0o644 }),
+    writeFile(join(runRoot, "artifacts", "logs", "large.log"), largeArtifact, {
+      mode: 0o644,
+    }),
+    writeFile(join(runRoot, "capsules", "legacy.json"), '{"legacy":"capsule"}\n', {
+      mode: 0o644,
+    }),
+  ]);
+  if (sourceVersion === 1)
+    await writeFile(
+      join(runRoot, "storage.json"),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        runId,
+        migratedFrom: 1,
+        formats: v1Formats,
+      })}\n`,
+      { mode: 0o644 },
+    );
+  if (process.platform !== "win32") {
+    await chmod(graphcraftRoot, 0o755);
+    await chmod(join(graphcraftRoot, "runs"), 0o755);
+    await chmod(runRoot, 0o755);
+  }
+  return { graphcraftRoot, runRoot, runId, largeArtifact };
+}
+
+function digest(value: Buffer): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+async function fileSnapshot(root: string): Promise<Record<string, string>> {
+  const snapshot: Record<string, string> = {};
+  const visit = async (directory: string): Promise<void> => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      const key = relative(root, path);
+      if (key === ".backup-complete.json") continue;
+      if (entry.isDirectory()) {
+        snapshot[key] = "directory";
+        await visit(path);
+      } else if (entry.isFile()) {
+        const contents = await readFile(path);
+        snapshot[key] = `file:${contents.length}:${digest(contents)}`;
+      }
+    }
+  };
+  await visit(root);
+  return snapshot;
+}
+
+async function treeSnapshot(root: string): Promise<Record<string, string>> {
+  const snapshot: Record<string, string> = {};
+  const visit = async (directory: string): Promise<void> => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      const metadata = await lstat(path);
+      const key = relative(root, path);
+      if (entry.isDirectory()) {
+        snapshot[key] = `directory:${metadata.mode}:${metadata.mtimeMs}`;
+        await visit(path);
+      } else if (entry.isFile()) {
+        const contents = await readFile(path);
+        snapshot[key] =
+          `file:${metadata.mode}:${metadata.mtimeMs}:${contents.length}:${digest(contents)}`;
+      } else {
+        snapshot[key] = `other:${metadata.mode}:${metadata.mtimeMs}`;
+      }
+    }
+  };
+  await visit(root);
+  return snapshot;
+}
+
+async function exists(path: string): Promise<boolean> {
+  return await lstat(path)
+    .then(() => true)
+    .catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    });
+}
+
+async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await predicate())) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for migration state");
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+describe("run storage schema v2 migration", () => {
+  it("keeps mirrored migration destination limits aligned with RunStore", () => {
+    expect(LEGACY_MIGRATION_DESTINATION_LIMITS).toEqual({
+      maximumEventBytes: RUN_EVENT_MAX_BYTES,
+      maximumEventLogBytes: RUN_EVENT_LOG_MAX_BYTES,
+      blockedEventReserveBytes: RUN_BLOCKED_EVENT_RESERVE_BYTES,
+      maximumStateBytes: RUN_STATE_MAX_BYTES,
+      maximumMetadataBytes: RUN_METADATA_MAX_BYTES,
+      maximumWorkspaceBytes: RUN_WORKSPACE_MAX_BYTES,
+    });
+  });
+
+  it("concurrently migrates manifestless v0 after a complete backup without truncating artifacts", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000001", 0);
+    const formattedJson = Buffer.from('{\n  "message": "harmless legacy metadata"\n}\n');
+    const formattedPath = join(fixture.runRoot, "artifacts", "logs", "metadata.json");
+    await writeFile(formattedPath, formattedJson);
+    const before = await fileSnapshot(fixture.runRoot);
+    const input = {
+      graphcraftRoot: fixture.graphcraftRoot,
+      runRoot: fixture.runRoot,
+      runId: fixture.runId,
+    };
+
+    const [first, second] = await Promise.all([
+      ensureCurrentRunStorage(input),
+      ensureCurrentRunStorage(input),
+    ]);
+
+    expect(first).toEqual(second);
+    expect(first).toMatchObject({
+      schemaVersion: CURRENT_RUN_STORAGE_VERSION,
+      runId: fixture.runId,
+      migratedFrom: 0,
+      formats: { artifactInventory: 1, artifactPolicy: 1 },
+    });
+    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "0-to-2");
+    expect(await fileSnapshot(backupRoot)).toEqual(before);
+    expect(await readdir(join(fixture.graphcraftRoot, "migration-backups", fixture.runId))).toEqual(
+      ["0-to-2"],
+    );
+
+    const artifactPath = join(fixture.runRoot, "artifacts", "logs", "large.log");
+    const storedArtifact = await readFile(artifactPath);
+    expect(storedArtifact).toEqual(fixture.largeArtifact);
+    expect(await readFile(formattedPath)).toEqual(formattedJson);
+    expect(await readFile(join(backupRoot, "artifacts", "logs", "metadata.json"))).toEqual(
+      formattedJson,
+    );
+    const inventory = JSON.parse(
+      await readFile(join(fixture.runRoot, "artifact-inventory.json"), "utf8"),
+    ) as ArtifactInventory;
+    expect(inventory.entries).toContainEqual(
+      expect.objectContaining({
+        path: "artifacts/logs/large.log",
+        disposition: "legacy",
+        sourceBytes: fixture.largeArtifact.length,
+        storedBytes: fixture.largeArtifact.length,
+        omittedBytes: 0,
+        truncated: false,
+        legacy: true,
+        reason: "legacy_migration",
+      }),
+    );
+    if (process.platform !== "win32") {
+      expect((await lstat(fixture.runRoot)).mode & 0o777).toBe(0o700);
+      expect((await lstat(artifactPath)).mode & 0o777).toBe(0o600);
+      expect((await lstat(backupRoot)).mode & 0o777).toBe(0o700);
+    }
+
+    const migrated = await treeSnapshot(fixture.graphcraftRoot);
+    expect(await ensureCurrentRunStorage(input)).toEqual(first);
+    expect(await treeSnapshot(fixture.graphcraftRoot)).toEqual(migrated);
+  });
+
+  it("migrates validated v1 through a complete 1-to-2 backup and publishes v2 last", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000002", 1);
+    const before = await fileSnapshot(fixture.runRoot);
+    const input = {
+      graphcraftRoot: fixture.graphcraftRoot,
+      runRoot: fixture.runRoot,
+      runId: fixture.runId,
+    };
+
+    const [migrated, concurrent] = await Promise.all([
+      ensureCurrentRunStorage(input),
+      ensureCurrentRunStorage(input),
+    ]);
+
+    expect(concurrent).toEqual(migrated);
+    expect(migrated).toMatchObject({ schemaVersion: 2, migratedFrom: 1 });
+    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "1-to-2");
+    expect(await fileSnapshot(backupRoot)).toEqual(before);
+    expect(JSON.parse(await readFile(join(backupRoot, "storage.json"), "utf8"))).toMatchObject({
+      schemaVersion: 1,
+      runId: fixture.runId,
+    });
+    expect(await exists(join(backupRoot, "artifact-inventory.json"))).toBe(false);
+    expect(JSON.parse(await readFile(join(fixture.runRoot, "storage.json"), "utf8"))).toMatchObject(
+      {
+        schemaVersion: 2,
+        migratedFrom: 1,
+        formats: { artifactInventory: 1, artifactPolicy: 1 },
+      },
+    );
+  });
+
+  it("refuses to duplicate or publish a credential-bearing legacy run", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000011", 0);
+    const credential = `ghp_${"migrationsecret".repeat(2)}`;
+    const secretContents = Buffer.from(`legacy credential: ${credential}\n`);
+    const secretPath = join(fixture.runRoot, "artifacts", "logs", "credential.log");
+    await writeFile(secretPath, secretContents);
+    const before = await treeSnapshot(fixture.runRoot);
+
+    let failure: unknown;
+    try {
+      await ensureCurrentRunStorage({
+        graphcraftRoot: fixture.graphcraftRoot,
+        runRoot: fixture.runRoot,
+        runId: fixture.runId,
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe(
+      "Legacy run contains secret-like material and cannot migrate safely; scrub or delete the affected legacy content before retrying",
+    );
+    expect((failure as Error).message).not.toContain(credential);
+    expect(await treeSnapshot(fixture.runRoot)).toEqual(before);
+    expect(await readFile(secretPath)).toEqual(secretContents);
+    expect(await exists(join(fixture.graphcraftRoot, "migration-backups"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "storage.json"))).toBe(false);
+
+    const secretSignature = `file:${secretContents.length}:${digest(secretContents)}`;
+    expect(
+      Object.values(await fileSnapshot(fixture.graphcraftRoot)).filter(
+        (signature) => signature === secretSignature,
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("refuses short credential values nested under sensitive JSON keys", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000013", 0);
+    const secretContents = Buffer.from(
+      '{\n  "account": { "password": "hunter2" },\n  "api_key": "shortsecret"\n}\n',
+    );
+    const secretPath = join(fixture.runRoot, "artifacts", "logs", "credentials.json");
+    await writeFile(secretPath, secretContents);
+    const before = await treeSnapshot(fixture.runRoot);
+
+    await expect(
+      ensureCurrentRunStorage({
+        graphcraftRoot: fixture.graphcraftRoot,
+        runRoot: fixture.runRoot,
+        runId: fixture.runId,
+      }),
+    ).rejects.toThrow(
+      "Legacy run contains secret-like material and cannot migrate safely; scrub or delete the affected legacy content before retrying",
+    );
+
+    expect(await treeSnapshot(fixture.runRoot)).toEqual(before);
+    expect(await readFile(secretPath)).toEqual(secretContents);
+    expect(await exists(join(fixture.graphcraftRoot, "migration-backups"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "storage.json"))).toBe(false);
+  });
+
+  it("refuses short credential values in embedded legacy JSON fragments", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000014", 0);
+    const secretContents = Buffer.from('prefix {"api_key":"shortsecret"} suffix\n');
+    const secretPath = join(fixture.runRoot, "artifacts", "logs", "embedded.log");
+    await writeFile(secretPath, secretContents);
+    const before = await treeSnapshot(fixture.runRoot);
+
+    await expect(
+      ensureCurrentRunStorage({
+        graphcraftRoot: fixture.graphcraftRoot,
+        runRoot: fixture.runRoot,
+        runId: fixture.runId,
+      }),
+    ).rejects.toThrow(/Legacy run contains secret-like material and cannot migrate safely/);
+
+    expect(await treeSnapshot(fixture.runRoot)).toEqual(before);
+    expect(await readFile(secretPath)).toEqual(secretContents);
+    expect(await exists(join(fixture.graphcraftRoot, "migration-backups"))).toBe(false);
+  });
+
+  it("refuses short credential values in a legacy JSONL stream", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000017", 0);
+    const secretContents = Buffer.from('{"message":"safe"}\n{"nested":{"password":"hunter2"}}\n');
+    const secretPath = join(fixture.runRoot, "artifacts", "logs", "credentials.jsonl");
+    await writeFile(secretPath, secretContents);
+
+    await expect(
+      ensureCurrentRunStorage({
+        graphcraftRoot: fixture.graphcraftRoot,
+        runRoot: fixture.runRoot,
+        runId: fixture.runId,
+      }),
+    ).rejects.toThrow(/Legacy run contains secret-like material and cannot migrate safely/);
+
+    expect(await readFile(secretPath)).toEqual(secretContents);
+    expect(await exists(join(fixture.graphcraftRoot, "migration-backups"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "storage.json"))).toBe(false);
+  });
+
+  it("refuses an oversized legacy file before reading or backing it up", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000012", 0);
+    const oversizedPath = join(fixture.runRoot, "artifacts", "logs", "oversized.bin");
+    await writeFile(oversizedPath, "x");
+    await truncate(oversizedPath, 64 * 1024 * 1024 + 1);
+
+    await expect(
+      ensureCurrentRunStorage({
+        graphcraftRoot: fixture.graphcraftRoot,
+        runRoot: fixture.runRoot,
+        runId: fixture.runId,
+      }),
+    ).rejects.toThrow(/larger than the 67108864-byte safe migration scan limit/);
+
+    expect((await lstat(oversizedPath)).size).toBe(64 * 1024 * 1024 + 1);
+    expect(await exists(join(fixture.graphcraftRoot, "migration-backups"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "storage.json"))).toBe(false);
+  });
+
+  it("refuses aggregate legacy artifacts that would consume the recovery reserve", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000015", 0);
+    const first = join(fixture.runRoot, "artifacts", "logs", "aggregate-a.bin");
+    const second = join(fixture.runRoot, "capsules", "aggregate-b.bin");
+    await Promise.all([writeFile(first, "x"), writeFile(second, "x")]);
+    await Promise.all([truncate(first, 30 * 1024 * 1024), truncate(second, 30 * 1024 * 1024)]);
+
+    await expect(
+      ensureCurrentRunStorage({
+        graphcraftRoot: fixture.graphcraftRoot,
+        runRoot: fixture.runRoot,
+        runId: fixture.runId,
+      }),
+    ).rejects.toThrow(/safe artifact migration limit/);
+
+    expect((await lstat(first)).size).toBe(30 * 1024 * 1024);
+    expect((await lstat(second)).size).toBe(30 * 1024 * 1024);
+    expect(await exists(join(fixture.graphcraftRoot, "migration-backups"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "storage.json"))).toBe(false);
+  });
+
+  it("refuses excessive non-artifact run bytes before content reads or backup publication", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000020", 1);
+    const storagePath = join(fixture.runRoot, "storage.json");
+    const storageBefore = await readFile(storagePath);
+    const first = join(fixture.runRoot, "legacy-state-a.bin");
+    const second = join(fixture.runRoot, "legacy-state-b.bin");
+    await Promise.all([
+      writeFile(first, '{"password":"hunter2"}\n'),
+      writeFile(second, "non-artifact state\n"),
+    ]);
+    await Promise.all([
+      truncate(first, LEGACY_MIGRATION_RESOURCE_LIMITS.maximumFileBytes),
+      truncate(second, LEGACY_MIGRATION_RESOURCE_LIMITS.maximumFileBytes),
+    ]);
+
+    await expect(
+      ensureCurrentRunStorage({
+        graphcraftRoot: fixture.graphcraftRoot,
+        runRoot: fixture.runRoot,
+        runId: fixture.runId,
+      }),
+    ).rejects.toThrow(
+      new RegExp(
+        `${LEGACY_MIGRATION_RESOURCE_LIMITS.maximumRunBytes}-byte whole-run safe migration limit`,
+      ),
+    );
+
+    expect((await lstat(first)).size).toBe(LEGACY_MIGRATION_RESOURCE_LIMITS.maximumFileBytes);
+    expect((await lstat(second)).size).toBe(LEGACY_MIGRATION_RESOURCE_LIMITS.maximumFileBytes);
+    expect(await readFile(storagePath)).toEqual(storageBefore);
+    expect(await exists(join(fixture.graphcraftRoot, "migration-backups"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
+  });
+
+  it("refuses excessive legacy file count before content reads or backup publication", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000021", 1);
+    const storagePath = join(fixture.runRoot, "storage.json");
+    const storageBefore = await readFile(storagePath);
+    const stateRoot = join(fixture.runRoot, "legacy-state-files");
+    await mkdir(stateRoot);
+    for (
+      let offset = 0;
+      offset <= LEGACY_MIGRATION_RESOURCE_LIMITS.maximumFileCount;
+      offset += 128
+    ) {
+      await Promise.all(
+        Array.from(
+          {
+            length: Math.min(128, LEGACY_MIGRATION_RESOURCE_LIMITS.maximumFileCount + 1 - offset),
+          },
+          async (_, index) => {
+            const position = offset + index;
+            await writeFile(
+              join(stateRoot, `${String(position).padStart(5, "0")}.json`),
+              position === 0 ? '{"password":"hunter2"}\n' : "",
+            );
+          },
+        ),
+      );
+    }
+
+    await expect(
+      ensureCurrentRunStorage({
+        graphcraftRoot: fixture.graphcraftRoot,
+        runRoot: fixture.runRoot,
+        runId: fixture.runId,
+      }),
+    ).rejects.toThrow(
+      new RegExp(`${LEGACY_MIGRATION_RESOURCE_LIMITS.maximumFileCount}-file safe migration limit`),
+    );
+
+    expect(await readFile(join(stateRoot, "00000.json"), "utf8")).toContain("hunter2");
+    expect(await readFile(storagePath)).toEqual(storageBefore);
+    expect(await exists(join(fixture.graphcraftRoot, "migration-backups"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
+  }, 30_000);
+
+  it("finishes whole-tree metadata preflight before scanning earlier secret-bearing content", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000018", 0);
+    const secretPath = join(fixture.runRoot, "artifacts", "logs", "a-secret.json");
+    await writeFile(secretPath, '{"password":"hunter2"}\n');
+    const statePath = join(fixture.runRoot, "state.json");
+    const outsideState = join(dirname(fixture.graphcraftRoot), "outside-legacy-state.json");
+    await rename(statePath, outsideState);
+    await link(outsideState, statePath);
+
+    await expect(
+      ensureCurrentRunStorage({
+        graphcraftRoot: fixture.graphcraftRoot,
+        runRoot: fixture.runRoot,
+        runId: fixture.runId,
+      }),
+    ).rejects.toThrow(/multiply linked file/i);
+
+    expect(await readFile(secretPath, "utf8")).toContain("hunter2");
+    expect(await exists(join(fixture.graphcraftRoot, "migration-backups"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
+  });
+
+  it("refuses a secret-bearing legacy path without copying or disclosing it", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000019", 0);
+    const credential = `ghp_${"a".repeat(30)}`;
+    const secretPath = join(fixture.runRoot, "artifacts", "logs", `${credential}.txt`);
+    await writeFile(secretPath, "safe contents\n");
+
+    const failure = await ensureCurrentRunStorage({
+      graphcraftRoot: fixture.graphcraftRoot,
+      runRoot: fixture.runRoot,
+      runId: fixture.runId,
+    }).catch((error: unknown) => error);
+
+    expect(String(failure)).toMatch(/secret-like path/);
+    expect(String(failure)).not.toContain(credential);
+    expect(await readFile(secretPath, "utf8")).toBe("safe contents\n");
+    expect(await exists(join(fixture.graphcraftRoot, "migration-backups"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
+  });
+
+  it("refuses a multiply linked legacy event log before reading or backing up shared bytes", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000016", 0);
+    const eventsPath = join(fixture.runRoot, "events.jsonl");
+    const outsideEvents = join(dirname(fixture.graphcraftRoot), "outside-legacy-events.jsonl");
+    await rename(eventsPath, outsideEvents);
+    await link(outsideEvents, eventsPath);
+    const before = await readFile(outsideEvents);
+
+    await expect(
+      ensureCurrentRunStorage({
+        graphcraftRoot: fixture.graphcraftRoot,
+        runRoot: fixture.runRoot,
+        runId: fixture.runId,
+      }),
+    ).rejects.toThrow(/multiply linked file/i);
+
+    expect(await readFile(outsideEvents)).toEqual(before);
+    expect(await exists(join(fixture.graphcraftRoot, "migration-backups"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "storage.json"))).toBe(false);
+  });
+
+  it("rejects a reserved backup marker in the legacy root before creating a backup", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000027", 0);
+    const markerPath = join(fixture.runRoot, ".backup-complete.json");
+    await writeFile(markerPath, '{"untrusted":true}\n');
+
+    await expect(
+      ensureCurrentRunStorage({
+        graphcraftRoot: fixture.graphcraftRoot,
+        runRoot: fixture.runRoot,
+        runId: fixture.runId,
+      }),
+    ).rejects.toThrow(/reserved root file \.backup-complete\.json/);
+
+    expect(await readFile(markerPath, "utf8")).toBe('{"untrusted":true}\n');
+    expect(await exists(join(fixture.graphcraftRoot, "migration-backups"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "storage.json"))).toBe(false);
+  });
+
+  it("binds backup copying to the exact preflight tree snapshot", async () => {
+    const mutations: Array<{
+      name: string;
+      apply(fixture: LegacyFixture): Promise<void>;
+    }> = [
+      {
+        name: "added entry",
+        apply: async (fixture) => {
+          await writeFile(join(fixture.runRoot, "added-after-preflight.txt"), "new bytes\n");
+        },
+      },
+      {
+        name: "changed entry",
+        apply: async (fixture) => {
+          await appendFile(join(fixture.runRoot, "state.json"), '{"changed":true}\n');
+        },
+      },
+      {
+        name: "removed entry",
+        apply: async (fixture) => {
+          await rm(join(fixture.runRoot, "state.json"));
+        },
+      },
+    ];
+
+    for (const [index, mutation] of mutations.entries()) {
+      const fixture = await createLegacyFixture(
+        `20000000-0000-4000-8000-${String(28 + index).padStart(12, "0")}`,
+        0,
+      );
+      let applied = false;
+      await expect(
+        ensureCurrentRunStorage({
+          graphcraftRoot: fixture.graphcraftRoot,
+          runRoot: fixture.runRoot,
+          runId: fixture.runId,
+          onBoundary: async (boundary) => {
+            if (boundary !== "after_preflight") return;
+            applied = true;
+            await mutation.apply(fixture);
+          },
+        }),
+        mutation.name,
+      ).rejects.toThrow(/changed after migration preflight|changed during backup copy/);
+      expect(applied, mutation.name).toBe(true);
+      expect(
+        await exists(join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "0-to-2")),
+        mutation.name,
+      ).toBe(false);
+      expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
+      expect(await exists(join(fixture.runRoot, "storage.json"))).toBe(false);
+    }
+  });
+
+  it.each([
+    [
+      "event line",
+      "events.jsonl",
+      LEGACY_MIGRATION_DESTINATION_LIMITS.maximumEventBytes + 1,
+      /event log contains a line exceeding/,
+    ],
+    [
+      "normal event-log budget",
+      "events.jsonl",
+      LEGACY_MIGRATION_DESTINATION_LIMITS.maximumEventLogBytes -
+        LEGACY_MIGRATION_DESTINATION_LIMITS.blockedEventReserveBytes +
+        1,
+      /event log exceeds/,
+    ],
+    [
+      "materialized state",
+      "state.json",
+      LEGACY_MIGRATION_DESTINATION_LIMITS.maximumStateBytes + 1,
+      /materialized state exceeds/,
+    ],
+    [
+      "contract metadata",
+      "contract.json",
+      LEGACY_MIGRATION_DESTINATION_LIMITS.maximumMetadataBytes + 1,
+      /contract\.json exceeds/,
+    ],
+    [
+      "graph metadata",
+      "graph.json",
+      LEGACY_MIGRATION_DESTINATION_LIMITS.maximumMetadataBytes + 1,
+      /graph\.json exceeds/,
+    ],
+    [
+      "probe-plan metadata",
+      "probe-plan.json",
+      LEGACY_MIGRATION_DESTINATION_LIMITS.maximumMetadataBytes + 1,
+      /probe-plan\.json exceeds/,
+    ],
+    [
+      "held-out metadata",
+      "held-out-probes.json",
+      LEGACY_MIGRATION_DESTINATION_LIMITS.maximumMetadataBytes + 1,
+      /held-out-probes\.json exceeds/,
+    ],
+    [
+      "workspace projection",
+      "workspace.json",
+      LEGACY_MIGRATION_DESTINATION_LIMITS.maximumWorkspaceBytes + 1,
+      /workspace projection exceeds/,
+    ],
+  ])("refuses legacy %s beyond the v2 destination cap", async (_label, path, bytes, error) => {
+    const suffix = String(31 + roots.length).padStart(12, "0");
+    const fixture = await createLegacyFixture(`20000000-0000-4000-8000-${suffix}`, 0);
+    const target = join(fixture.runRoot, path);
+    await writeFile(target, "x");
+    await truncate(target, bytes);
+
+    await expect(
+      ensureCurrentRunStorage({
+        graphcraftRoot: fixture.graphcraftRoot,
+        runRoot: fixture.runRoot,
+        runId: fixture.runId,
+      }),
+    ).rejects.toThrow(error);
+
+    expect((await lstat(target)).size).toBe(bytes);
+    expect(await exists(join(fixture.graphcraftRoot, "migration-backups"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "storage.json"))).toBe(false);
+  });
+
+  it("waits for a legacy writer and includes its final locked event in the backup", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000007", 1);
+    const runLockPath = join(fixture.graphcraftRoot, "locks", `${fixture.runId}.lock`);
+    const migrationLockPath = join(
+      fixture.graphcraftRoot,
+      "locks",
+      `${fixture.runId}.migration.lock`,
+    );
+    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "1-to-2");
+    const writerLock = new RunLock(runLockPath);
+    await writerLock.acquire();
+    const migrating = ensureCurrentRunStorage({
+      graphcraftRoot: fixture.graphcraftRoot,
+      runRoot: fixture.runRoot,
+      runId: fixture.runId,
+    });
+
+    await waitFor(async () => await exists(migrationLockPath));
+    try {
+      expect(await exists(backupRoot)).toBe(false);
+      expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
+      await appendFile(join(fixture.runRoot, "events.jsonl"), '{"writer":"final"}\n');
+    } finally {
+      await writerLock.release();
+    }
+
+    await expect(migrating).resolves.toMatchObject({ schemaVersion: 2, migratedFrom: 1 });
+    expect(await readFile(join(backupRoot, "events.jsonl"), "utf8")).toContain(
+      '{"writer":"final"}',
+    );
+    expect(await exists(runLockPath)).toBe(false);
+    expect(await exists(migrationLockPath)).toBe(false);
+  });
+
+  it("publishes the v2 manifest last and safely retries an interrupted migration", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000008", 1);
+    const input = {
+      graphcraftRoot: fixture.graphcraftRoot,
+      runRoot: fixture.runRoot,
+      runId: fixture.runId,
+    };
+    let observedBoundary = false;
+
+    await expect(
+      ensureCurrentRunStorage({
+        ...input,
+        onBoundary: async (boundary) => {
+          if (boundary !== "before_manifest") return;
+          expect(
+            JSON.parse(await readFile(join(fixture.runRoot, "storage.json"), "utf8")),
+          ).toMatchObject({ schemaVersion: 1 });
+          expect(
+            JSON.parse(await readFile(join(fixture.runRoot, "artifact-inventory.json"), "utf8")),
+          ).toMatchObject({ runId: fixture.runId });
+          observedBoundary = true;
+          throw new Error("Injected interruption before manifest publication");
+        },
+      }),
+    ).rejects.toThrow(/Injected interruption/);
+
+    expect(observedBoundary).toBe(true);
+    expect(JSON.parse(await readFile(join(fixture.runRoot, "storage.json"), "utf8"))).toMatchObject(
+      { schemaVersion: 1 },
+    );
+    expect(
+      await exists(join(fixture.graphcraftRoot, "locks", `${fixture.runId}.migration.lock`)),
+    ).toBe(false);
+    expect(await exists(join(fixture.graphcraftRoot, "locks", `${fixture.runId}.lock`))).toBe(
+      false,
+    );
+
+    await expect(ensureCurrentRunStorage(input)).resolves.toMatchObject({
+      schemaVersion: 2,
+      migratedFrom: 1,
+    });
+    expect(
+      await fileSnapshot(
+        join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "1-to-2"),
+      ),
+    ).not.toHaveProperty("artifact-inventory.json");
+  });
+
+  it("publishes a complete reusable backup before any v2 run projection", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000022", 1);
+    const input = {
+      graphcraftRoot: fixture.graphcraftRoot,
+      runRoot: fixture.runRoot,
+      runId: fixture.runId,
+    };
+    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "1-to-2");
+    let observedBoundary = false;
+
+    await expect(
+      ensureCurrentRunStorage({
+        ...input,
+        onBoundary: async (boundary) => {
+          if (boundary !== "after_backup") return;
+          observedBoundary = true;
+          expect(await exists(join(backupRoot, ".backup-complete.json"))).toBe(true);
+          expect(await fileSnapshot(backupRoot)).toEqual(await fileSnapshot(fixture.runRoot));
+          expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
+          expect(
+            JSON.parse(await readFile(join(fixture.runRoot, "storage.json"), "utf8")),
+          ).toMatchObject({ schemaVersion: 1 });
+          throw new Error("Injected interruption after durable backup publication");
+        },
+      }),
+    ).rejects.toThrow(/after durable backup publication/);
+
+    expect(observedBoundary).toBe(true);
+    expect(await exists(join(backupRoot, ".backup-complete.json"))).toBe(true);
+    await expect(ensureCurrentRunStorage(input)).resolves.toMatchObject({
+      schemaVersion: 2,
+      migratedFrom: 1,
+    });
+  });
+
+  it("binds manifest publication to the exact durable migrated inventory", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000039", 1);
+    const input = {
+      graphcraftRoot: fixture.graphcraftRoot,
+      runRoot: fixture.runRoot,
+      runId: fixture.runId,
+    };
+    const inventoryPath = join(fixture.runRoot, "artifact-inventory.json");
+    let mutated = false;
+
+    await expect(
+      ensureCurrentRunStorage({
+        ...input,
+        onBoundary: async (boundary) => {
+          if (boundary !== "after_inventory") return;
+          const inventory = JSON.parse(await readFile(inventoryPath, "utf8")) as ArtifactInventory;
+          inventory.updatedAt = "2000-01-01T00:00:00.000Z";
+          await writeFile(inventoryPath, `${JSON.stringify(inventory, null, 2)}\n`);
+          mutated = true;
+        },
+      }),
+    ).rejects.toThrow(/artifact inventory changed after durable migration/);
+
+    expect(mutated).toBe(true);
+    expect(JSON.parse(await readFile(join(fixture.runRoot, "storage.json"), "utf8"))).toMatchObject(
+      { schemaVersion: 1 },
+    );
+    expect(
+      await exists(join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "1-to-2")),
+    ).toBe(true);
+
+    await expect(ensureCurrentRunStorage(input)).resolves.toMatchObject({
+      schemaVersion: 2,
+      migratedFrom: 1,
+    });
+  });
+
+  it("refuses direct legacy-manifest publication without the backed-up migration path", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000026", 1);
+    const storageBefore = await readFile(join(fixture.runRoot, "storage.json"));
+
+    await expect(writeCurrentRunStorageManifest(fixture.runRoot, fixture.runId, 1)).rejects.toThrow(
+      /only be published after verified backup migration/,
+    );
+
+    expect(await readFile(join(fixture.runRoot, "storage.json"))).toEqual(storageBefore);
+    expect(await exists(join(fixture.graphcraftRoot, "migration-backups"))).toBe(false);
+  });
+
+  it("rejects a stale protected backup after a post-fault legacy append", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000010", 1);
+    const input = {
+      graphcraftRoot: fixture.graphcraftRoot,
+      runRoot: fixture.runRoot,
+      runId: fixture.runId,
+    };
+    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "1-to-2");
+    const staleBackupRoot = join(
+      fixture.graphcraftRoot,
+      "migration-backups",
+      fixture.runId,
+      "1-to-2.stale",
+    );
+
+    await expect(
+      ensureCurrentRunStorage({
+        ...input,
+        onBoundary: (boundary) => {
+          if (boundary !== "before_manifest") return;
+          throw new Error("Injected interruption after inventory publication");
+        },
+      }),
+    ).rejects.toThrow(/Injected interruption/);
+    const protectedBackup = await treeSnapshot(backupRoot);
+
+    await appendFile(join(fixture.runRoot, "events.jsonl"), '{"writer":"post-fault"}\n');
+    const changedLegacyRun = await treeSnapshot(fixture.runRoot);
+
+    await expect(ensureCurrentRunStorage(input)).rejects.toThrow(
+      /backup does not match the current legacy run tree.*stale protected backup/,
+    );
+    expect(await treeSnapshot(fixture.runRoot)).toEqual(changedLegacyRun);
+    expect(await treeSnapshot(backupRoot)).toEqual(protectedBackup);
+    expect(JSON.parse(await readFile(join(fixture.runRoot, "storage.json"), "utf8"))).toMatchObject(
+      { schemaVersion: 1 },
+    );
+
+    // Model explicit repair by preserving the stale backup elsewhere and
+    // removing the migration-owned intermediate. The rebuilt exact backup must
+    // include the legacy writer's append.
+    await rename(backupRoot, staleBackupRoot);
+    await rm(join(fixture.runRoot, "artifact-inventory.json"));
+    await expect(ensureCurrentRunStorage(input)).resolves.toMatchObject({
+      schemaVersion: 2,
+      migratedFrom: 1,
+    });
+    expect(await readFile(join(backupRoot, "events.jsonl"), "utf8")).toContain(
+      '{"writer":"post-fault"}',
+    );
+    expect(await exists(join(backupRoot, "artifact-inventory.json"))).toBe(false);
+    expect(await treeSnapshot(staleBackupRoot)).toEqual(protectedBackup);
+  });
+
+  it("refuses an oversized storage manifest before allocating or mutating", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000023", 0);
+    const storagePath = join(fixture.runRoot, "storage.json");
+    await writeFile(storagePath, "{");
+    await truncate(storagePath, 64 * 1024 + 1);
+
+    await expect(
+      ensureCurrentRunStorage({
+        graphcraftRoot: fixture.graphcraftRoot,
+        runRoot: fixture.runRoot,
+        runId: fixture.runId,
+      }),
+    ).rejects.toThrow(/unreadable storage manifest.*65536-byte bounded read limit/);
+
+    expect((await lstat(storagePath)).size).toBe(64 * 1024 + 1);
+    expect(await exists(join(fixture.graphcraftRoot, "locks"))).toBe(false);
+    expect(await exists(join(fixture.graphcraftRoot, "migration-backups"))).toBe(false);
+  });
+
+  it("refuses an oversized current-v2 artifact inventory without reconstructing it", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000024", 0);
+    const input = {
+      graphcraftRoot: fixture.graphcraftRoot,
+      runRoot: fixture.runRoot,
+      runId: fixture.runId,
+    };
+    await ensureCurrentRunStorage(input);
+    const storageBefore = await readFile(join(fixture.runRoot, "storage.json"));
+    const inventoryPath = join(fixture.runRoot, "artifact-inventory.json");
+    await writeFile(inventoryPath, "{");
+    await truncate(inventoryPath, MAX_ARTIFACT_INVENTORY_BYTES + 1);
+
+    await expect(ensureCurrentRunStorage(input)).rejects.toThrow(
+      new RegExp(
+        `invalid schema-v2 artifact inventory.*${MAX_ARTIFACT_INVENTORY_BYTES}-byte read limit`,
+      ),
+    );
+
+    expect((await lstat(inventoryPath)).size).toBe(MAX_ARTIFACT_INVENTORY_BYTES + 1);
+    expect(await readFile(join(fixture.runRoot, "storage.json"))).toEqual(storageBefore);
+  });
+
+  it("refuses an oversized backup completion marker without trusting the backup", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000025", 0);
+    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "0-to-2");
+    const completionPath = join(backupRoot, ".backup-complete.json");
+    await mkdir(backupRoot, { recursive: true });
+    await writeFile(completionPath, "{");
+    await truncate(completionPath, 64 * 1024 + 1);
+
+    await expect(
+      ensureCurrentRunStorage({
+        graphcraftRoot: fixture.graphcraftRoot,
+        runRoot: fixture.runRoot,
+        runId: fixture.runId,
+      }),
+    ).rejects.toThrow(/backup is incomplete or unverified.*65536-byte bounded read limit/);
+
+    expect((await lstat(completionPath)).size).toBe(64 * 1024 + 1);
+    expect(await exists(join(fixture.runRoot, "storage.json"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
+  });
+
+  it("accepts a current v2 manifest without changing the owned tree", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000003", 0);
+    const input = {
+      graphcraftRoot: fixture.graphcraftRoot,
+      runRoot: fixture.runRoot,
+      runId: fixture.runId,
+    };
+    const expected = await ensureCurrentRunStorage(input);
+    const before = await treeSnapshot(fixture.graphcraftRoot);
+
+    const current = await ensureCurrentRunStorage(input);
+
+    expect(current).toEqual(expected);
+    expect(await treeSnapshot(fixture.graphcraftRoot)).toEqual(before);
+  });
+
+  it("rejects a symlinked or junctioned runs directory after storage was prepared", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000011", 0);
+    const repositoryRoot = dirname(fixture.graphcraftRoot);
+    const store = new RunStore(repositoryRoot, fixture.runId);
+    await store.prepareStorage();
+    const runsRoot = join(fixture.graphcraftRoot, "runs");
+    const outsideRuns = join(repositoryRoot, "outside-runs");
+    await rename(runsRoot, outsideRuns);
+    await symlink(outsideRuns, runsRoot, process.platform === "win32" ? "junction" : "dir");
+
+    await expect(store.prepareStorage()).rejects.toThrow(/symbolic link/i);
+    expect(await exists(join(outsideRuns, fixture.runId, "storage.json"))).toBe(true);
+  });
+
+  it("refuses a multiply linked event log before reading or appending shared bytes", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000012", 0);
+    await ensureCurrentRunStorage({
+      graphcraftRoot: fixture.graphcraftRoot,
+      runRoot: fixture.runRoot,
+      runId: fixture.runId,
+    });
+    const eventsPath = join(fixture.runRoot, "events.jsonl");
+    const outsideEvents = join(dirname(fixture.graphcraftRoot), "outside-events.jsonl");
+    await rename(eventsPath, outsideEvents);
+    await link(outsideEvents, eventsPath);
+    const before = await readFile(outsideEvents, "utf8");
+    const store = new RunStore(dirname(fixture.graphcraftRoot), fixture.runId);
+
+    await expect(store.loadEvents()).rejects.toThrow(/multiply linked file/i);
+    await expect(
+      store.append("runtime", "run.blocked", { reason: "must not be appended" }),
+    ).rejects.toThrow(/multiply linked file/i);
+    expect(await readFile(outsideEvents, "utf8")).toBe(before);
+  });
+
+  it("fails closed on a corrupt current-v2 inventory without reconstructing it", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000006", 0);
+    const input = {
+      graphcraftRoot: fixture.graphcraftRoot,
+      runRoot: fixture.runRoot,
+      runId: fixture.runId,
+    };
+    await ensureCurrentRunStorage(input);
+    await writeFile(join(fixture.runRoot, "artifact-inventory.json"), "{}\n");
+    const before = await treeSnapshot(fixture.graphcraftRoot);
+
+    await expect(ensureCurrentRunStorage(input)).rejects.toThrow(
+      /invalid schema-v2 artifact inventory/,
+    );
+
+    expect(await treeSnapshot(fixture.graphcraftRoot)).toEqual(before);
+  });
+
+  it("refuses a preseeded backup directory without a valid completion marker and digest", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000005", 0);
+    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "0-to-2");
+    await mkdir(backupRoot, { recursive: true });
+    await writeFile(join(backupRoot, "untrusted.txt"), "not a complete backup\n");
+    const before = await treeSnapshot(fixture.runRoot);
+
+    await expect(
+      ensureCurrentRunStorage({
+        graphcraftRoot: fixture.graphcraftRoot,
+        runRoot: fixture.runRoot,
+        runId: fixture.runId,
+      }),
+    ).rejects.toThrow(/backup is incomplete or unverified/);
+
+    expect(await treeSnapshot(fixture.runRoot)).toEqual(before);
+    expect(await exists(join(fixture.runRoot, "storage.json"))).toBe(false);
+    expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
+  });
+
+  it("allows the same store to retry storage preparation after a repairable failure", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000009", 0);
+    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "0-to-2");
+    await mkdir(backupRoot, { recursive: true });
+    await writeFile(join(backupRoot, "incomplete.txt"), "repairable test fixture\n");
+    const store = new RunStore(dirname(fixture.graphcraftRoot), fixture.runId);
+
+    await expect(store.prepareStorage()).rejects.toThrow(/backup is incomplete or unverified/);
+    await rm(backupRoot, { recursive: true });
+
+    await expect(store.prepareStorage()).resolves.toBeUndefined();
+    expect(JSON.parse(await readFile(join(fixture.runRoot, "storage.json"), "utf8"))).toMatchObject(
+      { schemaVersion: 2, migratedFrom: 0 },
+    );
+  });
+
+  it("refuses a future manifest before creating locks, backups, or changing run files", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000004", 0);
+    await writeFile(
+      join(fixture.runRoot, "storage.json"),
+      `${JSON.stringify({ schemaVersion: 999, runId: fixture.runId })}\n`,
+    );
+    const before = await treeSnapshot(fixture.graphcraftRoot);
+
+    await expect(
+      ensureCurrentRunStorage({
+        graphcraftRoot: fixture.graphcraftRoot,
+        runRoot: fixture.runRoot,
+        runId: fixture.runId,
+      }),
+    ).rejects.toThrow(/future storage schema 999.*No files were changed/);
+
+    expect(await treeSnapshot(fixture.graphcraftRoot)).toEqual(before);
+    expect(await exists(join(fixture.graphcraftRoot, "locks"))).toBe(false);
+    expect(await exists(join(fixture.graphcraftRoot, "migration-backups"))).toBe(false);
+  });
+});

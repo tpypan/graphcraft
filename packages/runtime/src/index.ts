@@ -1,4 +1,5 @@
 export * from "./amendment.ts";
+export * from "./artifact-policy.ts";
 export * from "./benchmark.ts";
 export * from "./control.ts";
 export * from "./context.ts";
@@ -8,8 +9,10 @@ export * from "./lock.ts";
 export * from "./migration.ts";
 export * from "./repository.ts";
 export * from "./redaction.ts";
+export * from "./retention.ts";
 export * from "./runner.ts";
 export * from "./side-effect.ts";
+export * from "./secure-fs.ts";
 export * from "./scope.ts";
 export * from "./github.ts";
 export * from "./store.ts";

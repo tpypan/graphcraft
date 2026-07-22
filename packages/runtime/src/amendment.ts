@@ -126,6 +126,7 @@ export async function amendRunGraph(
   input: GraphAmendment,
   actor: "runtime" | "user" = "runtime",
 ): Promise<RunGraphAmendmentResult> {
+  await store.prepareStorage();
   const lock = new RunLock(join(store.graphcraftRoot, "locks", `${store.runId}.lock`));
   await lock.acquire();
   try {

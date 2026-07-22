@@ -1584,6 +1584,15 @@ export type GitHubLifecycleWaitOutcome =
       lifecycle?: CapturedPullRequestLifecycle;
     };
 
+const MAX_GITHUB_WAIT_BACKOFF_MS = 300_000;
+
+function githubWaitBackoffMs(pollIntervalMs: number, observations: number): number {
+  return Math.min(
+    pollIntervalMs * 2 ** Math.min(Math.max(0, observations - 1), 4),
+    MAX_GITHUB_WAIT_BACKOFF_MS,
+  );
+}
+
 export async function evaluateGitHubLifecycleWait(input: {
   store: RunStore;
   node: GraphNode;
@@ -1833,13 +1842,15 @@ export async function evaluateGitHubLifecycleWait(input: {
   }
 
   const observations = wait.observations + 1;
-  const delay = Math.min(
-    condition.pollIntervalMs * 2 ** Math.min(Math.max(0, observations - 1), 4),
-    300_000,
-  );
+  const delay = githubWaitBackoffMs(condition.pollIntervalMs, observations);
   const nextWakeAt = new Date(
     condition.timeoutAt ? Math.min(now + delay, Date.parse(condition.timeoutAt)) : now + delay,
   ).toISOString();
+  const unchangedAtDurableMaximumBackoff =
+    wait.lastSignature === lifecycle.classification.signature &&
+    githubWaitBackoffMs(condition.pollIntervalMs, wait.observations) === MAX_GITHUB_WAIT_BACKOFF_MS;
+  if (unchangedAtDurableMaximumBackoff)
+    return { status: "waiting", nextWakeAt, evidence, lifecycle };
   await input.store.append(
     "runtime",
     "wait.observed",

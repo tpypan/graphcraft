@@ -49,7 +49,8 @@ Graphcraft displays a concise run contract before doing work. Use `--yes` only w
 - Lets the selected host propose a task-specific execution graph from bounded repository evidence, then validates and displays the actual plan before approval.
 - Keeps the finish line, permissions, repository policy, and acceptance anchors outside worker control.
 - Creates an isolated Git worktree without stashing, cleaning, or resetting the current checkout. Repeatable `--include` and `--exclude` globs become enforced runtime policy: actual tracked, untracked, and explicitly excluded ignored paths are content-snapshotted around every worker, while unauthorized HEAD, branch, index, read-only, or node-scope changes block acceptance and remain preserved for inspection.
-- Stores a hashed append-only event log and rebuildable state under the repository's local `.graphcraft/` directory.
+- Stores a hashed append-only event log and rebuildable state under the repository's local `.graphcraft/` directory. Individual events, the event log, and the materialized state have explicit growth limits; Graphcraft reserves enough log capacity to persist one accurate blocker before refusing further appends.
+- Applies one durable artifact policy to logs, transcripts, capsules, reports, and content-addressed evidence. Ordinary artifacts are redacted before sizing and safely truncated with source/stored-byte metadata, identity-bound artifacts fail closed instead of changing hashes, and a bounded inventory plus recoverable publication journal keeps run-wide quotas inspectable across interruption.
 - Redacts known credential formats, authorization headers, credential-bearing URLs, password assignments, private keys, and configured sensitive environment values before model-visible summaries, durable events/transcripts/artifacts/reports, terminal/MCP output, and viewer/export responses. Integrity-hashed probe definitions reject secret-like content instead of being silently rewritten.
 - Gives each worker a grounded, size-bounded context capsule, records what was selected, omitted, and reused, and never replays raw transcripts or probe logs.
 - Infers deterministic, task-family-specific progress and completion probes from repository evidence, then lets users inspect or replace the versioned probe plan before approval.
@@ -87,6 +88,8 @@ graphcraft pause [run]
 graphcraft resume [run] [--background]
 graphcraft supervisors [run]
 graphcraft stop [run]
+graphcraft delete <run> [--yes]
+graphcraft prune --completed-before <date> [--keep <count>] [--confirm-run <id>...] [--yes]
 graphcraft trace [run]
 graphcraft view [run] [--no-open] [--port <port>]
 graphcraft doctor
@@ -98,6 +101,8 @@ graphcraft uninstall --host <codex|claude>
 `runs`, `status`, `inspect`, and `trace` are concise human-readable views by default. Pass `--json` when a script or another tool needs the stable structured form. `runs` orders durable runs by their last update and prints an unambiguous run prefix that every run-specific command accepts.
 
 `--background` detaches only after contract approval. `status` shows the current supervisor and `supervisors` shows every supervisor instance, including stale replacements and local log paths. A machine restart does not auto-launch a process; rerun `graphcraft resume <run> --background` to recover the persisted wait and continue without repeating accepted work. Filesystem wait paths are resolved inside the isolated worktree, whose exact path is exposed with the wait state.
+
+`delete` and `prune` remove only Graphcraft-owned run state, never the preserved worktree or its branch. Both commands are read-only dry runs unless `--yes` is supplied. Deletion requires the exact reviewed run ID; pruning additionally requires every selected run ID through repeatable `--confirm-run` options and revalidates terminal state, cutoff, locks, and supervisors before removal.
 
 `github-snapshot` itself is read-only. The separate `pushed`, `pr_open`, and `pr_green` finish lines perform only the approved normal push and optional PR creation after GitHub preflight. `pr_green` adds token-free lifecycle polling, bounded reverified repair pushes, exact review replies and resolutions, and one justified rerun for a rerunnable infrastructure or cancelled check. Unchanged repair signatures, non-rerunnable checks, sticky human decisions, uncertain mutations, and base conflicts stop with classified evidence. These finish lines never force-push, reopen, rebase a published branch, merge, deploy, or edit an unrelated PR.
 

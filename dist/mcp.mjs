@@ -2984,7 +2984,7 @@ var require_compile = __commonJS({
       const schOrFunc = root.refs[ref];
       if (schOrFunc)
         return schOrFunc;
-      let _sch = resolve6.call(this, root, ref);
+      let _sch = resolve11.call(this, root, ref);
       if (_sch === void 0) {
         const schema = (_a3 = root.localRefs) === null || _a3 === void 0 ? void 0 : _a3[ref];
         const { schemaId } = this.opts;
@@ -3011,7 +3011,7 @@ var require_compile = __commonJS({
     function sameSchemaEnv(s1, s2) {
       return s1.schema === s2.schema && s1.root === s2.root && s1.baseId === s2.baseId;
     }
-    function resolve6(root, ref) {
+    function resolve11(root, ref) {
       let sch;
       while (typeof (sch = this.refs[ref]) == "string")
         ref = sch;
@@ -3642,55 +3642,55 @@ var require_fast_uri = __commonJS({
       }
       return uri;
     }
-    function resolve6(baseURI, relativeURI, options) {
+    function resolve11(baseURI, relativeURI, options) {
       const schemelessOptions = options ? Object.assign({ scheme: "null" }, options) : { scheme: "null" };
       const resolved = resolveComponent(parse3(baseURI, schemelessOptions), parse3(relativeURI, schemelessOptions), schemelessOptions, true);
       schemelessOptions.skipEscape = true;
       return serialize(resolved, schemelessOptions);
     }
-    function resolveComponent(base, relative3, options, skipNormalization) {
+    function resolveComponent(base, relative7, options, skipNormalization) {
       const target = {};
       if (!skipNormalization) {
         base = parse3(serialize(base, options), options);
-        relative3 = parse3(serialize(relative3, options), options);
+        relative7 = parse3(serialize(relative7, options), options);
       }
       options = options || {};
-      if (!options.tolerant && relative3.scheme) {
-        target.scheme = relative3.scheme;
-        target.userinfo = relative3.userinfo;
-        target.host = relative3.host;
-        target.port = relative3.port;
-        target.path = removeDotSegments(relative3.path || "");
-        target.query = relative3.query;
+      if (!options.tolerant && relative7.scheme) {
+        target.scheme = relative7.scheme;
+        target.userinfo = relative7.userinfo;
+        target.host = relative7.host;
+        target.port = relative7.port;
+        target.path = removeDotSegments(relative7.path || "");
+        target.query = relative7.query;
       } else {
-        if (relative3.userinfo !== void 0 || relative3.host !== void 0 || relative3.port !== void 0) {
-          target.userinfo = relative3.userinfo;
-          target.host = relative3.host;
-          target.port = relative3.port;
-          target.path = removeDotSegments(relative3.path || "");
-          target.query = relative3.query;
+        if (relative7.userinfo !== void 0 || relative7.host !== void 0 || relative7.port !== void 0) {
+          target.userinfo = relative7.userinfo;
+          target.host = relative7.host;
+          target.port = relative7.port;
+          target.path = removeDotSegments(relative7.path || "");
+          target.query = relative7.query;
         } else {
-          if (!relative3.path) {
+          if (!relative7.path) {
             target.path = base.path;
-            if (relative3.query !== void 0) {
-              target.query = relative3.query;
+            if (relative7.query !== void 0) {
+              target.query = relative7.query;
             } else {
               target.query = base.query;
             }
           } else {
-            if (relative3.path[0] === "/") {
-              target.path = removeDotSegments(relative3.path);
+            if (relative7.path[0] === "/") {
+              target.path = removeDotSegments(relative7.path);
             } else {
               if ((base.userinfo !== void 0 || base.host !== void 0 || base.port !== void 0) && !base.path) {
-                target.path = "/" + relative3.path;
+                target.path = "/" + relative7.path;
               } else if (!base.path) {
-                target.path = relative3.path;
+                target.path = relative7.path;
               } else {
-                target.path = base.path.slice(0, base.path.lastIndexOf("/") + 1) + relative3.path;
+                target.path = base.path.slice(0, base.path.lastIndexOf("/") + 1) + relative7.path;
               }
               target.path = removeDotSegments(target.path);
             }
-            target.query = relative3.query;
+            target.query = relative7.query;
           }
           target.userinfo = base.userinfo;
           target.host = base.host;
@@ -3698,7 +3698,7 @@ var require_fast_uri = __commonJS({
         }
         target.scheme = base.scheme;
       }
-      target.fragment = relative3.fragment;
+      target.fragment = relative7.fragment;
       return target;
     }
     function equal(uriA, uriB, options) {
@@ -3906,7 +3906,7 @@ var require_fast_uri = __commonJS({
     var fastUri = {
       SCHEMES,
       normalize,
-      resolve: resolve6,
+      resolve: resolve11,
       resolveComponent,
       equal,
       serialize,
@@ -23021,12 +23021,12 @@ var StdioServerTransport = class {
     this.onclose?.();
   }
   send(message) {
-    return new Promise((resolve6) => {
+    return new Promise((resolve11) => {
       const json2 = serializeMessage(message);
       if (this._stdout.write(json2)) {
-        resolve6();
+        resolve11();
       } else {
-        this._stdout.once("drain", resolve6);
+        this._stdout.once("drain", resolve11);
       }
     });
   }
@@ -23446,18 +23446,18 @@ var ParseStatus = class _ParseStatus {
     if (this.value !== "aborted")
       this.value = "aborted";
   }
-  static mergeArray(status2, results) {
+  static mergeArray(status3, results) {
     const arrayValue = [];
     for (const s of results) {
       if (s.status === "aborted")
         return INVALID;
       if (s.status === "dirty")
-        status2.dirty();
+        status3.dirty();
       arrayValue.push(s.value);
     }
-    return { status: status2.value, value: arrayValue };
+    return { status: status3.value, value: arrayValue };
   }
-  static async mergeObjectAsync(status2, pairs) {
+  static async mergeObjectAsync(status3, pairs) {
     const syncPairs = [];
     for (const pair of pairs) {
       const key = await pair.key;
@@ -23467,9 +23467,9 @@ var ParseStatus = class _ParseStatus {
         value
       });
     }
-    return _ParseStatus.mergeObjectSync(status2, syncPairs);
+    return _ParseStatus.mergeObjectSync(status3, syncPairs);
   }
-  static mergeObjectSync(status2, pairs) {
+  static mergeObjectSync(status3, pairs) {
     const finalObject = {};
     for (const pair of pairs) {
       const { key, value } = pair;
@@ -23478,14 +23478,14 @@ var ParseStatus = class _ParseStatus {
       if (value.status === "aborted")
         return INVALID;
       if (key.status === "dirty")
-        status2.dirty();
+        status3.dirty();
       if (value.status === "dirty")
-        status2.dirty();
+        status3.dirty();
       if (key.value !== "__proto__" && (typeof value.value !== "undefined" || pair.alwaysSet)) {
         finalObject[key.value] = value.value;
       }
     }
-    return { status: status2.value, value: finalObject };
+    return { status: status3.value, value: finalObject };
   }
 };
 var INVALID = Object.freeze({
@@ -23945,7 +23945,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
       });
       return INVALID;
     }
-    const status2 = new ParseStatus();
+    const status3 = new ParseStatus();
     let ctx = void 0;
     for (const check2 of this._def.checks) {
       if (check2.kind === "min") {
@@ -23959,7 +23959,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             exact: false,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "max") {
         if (input.data.length > check2.value) {
@@ -23972,7 +23972,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             exact: false,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "length") {
         const tooBig = input.data.length > check2.value;
@@ -23998,7 +23998,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
               message: check2.message
             });
           }
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "email") {
         if (!emailRegex.test(input.data)) {
@@ -24008,7 +24008,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "emoji") {
         if (!emojiRegex) {
@@ -24021,7 +24021,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "uuid") {
         if (!uuidRegex.test(input.data)) {
@@ -24031,7 +24031,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "nanoid") {
         if (!nanoidRegex.test(input.data)) {
@@ -24041,7 +24041,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "cuid") {
         if (!cuidRegex.test(input.data)) {
@@ -24051,7 +24051,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "cuid2") {
         if (!cuid2Regex.test(input.data)) {
@@ -24061,7 +24061,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "ulid") {
         if (!ulidRegex.test(input.data)) {
@@ -24071,7 +24071,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "url") {
         try {
@@ -24083,7 +24083,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "regex") {
         check2.regex.lastIndex = 0;
@@ -24095,7 +24095,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "trim") {
         input.data = input.data.trim();
@@ -24107,7 +24107,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             validation: { includes: check2.value, position: check2.position },
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "toLowerCase") {
         input.data = input.data.toLowerCase();
@@ -24121,7 +24121,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             validation: { startsWith: check2.value },
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "endsWith") {
         if (!input.data.endsWith(check2.value)) {
@@ -24131,7 +24131,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             validation: { endsWith: check2.value },
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "datetime") {
         const regex = datetimeRegex(check2);
@@ -24142,7 +24142,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             validation: "datetime",
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "date") {
         const regex = dateRegex;
@@ -24153,7 +24153,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             validation: "date",
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "time") {
         const regex = timeRegex(check2);
@@ -24164,7 +24164,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             validation: "time",
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "duration") {
         if (!durationRegex.test(input.data)) {
@@ -24174,7 +24174,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "ip") {
         if (!isValidIP(input.data, check2.version)) {
@@ -24184,7 +24184,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "jwt") {
         if (!isValidJWT2(input.data, check2.alg)) {
@@ -24194,7 +24194,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "cidr") {
         if (!isValidCidr(input.data, check2.version)) {
@@ -24204,7 +24204,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "base64") {
         if (!base64Regex.test(input.data)) {
@@ -24214,7 +24214,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "base64url") {
         if (!base64urlRegex.test(input.data)) {
@@ -24224,13 +24224,13 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else {
         util.assertNever(check2);
       }
     }
-    return { status: status2.value, value: input.data };
+    return { status: status3.value, value: input.data };
   }
   _regex(regex, validation, message) {
     return this.refinement((data) => regex.test(data), {
@@ -24506,7 +24506,7 @@ var ZodNumber2 = class _ZodNumber extends ZodType2 {
       return INVALID;
     }
     let ctx = void 0;
-    const status2 = new ParseStatus();
+    const status3 = new ParseStatus();
     for (const check2 of this._def.checks) {
       if (check2.kind === "int") {
         if (!util.isInteger(input.data)) {
@@ -24517,7 +24517,7 @@ var ZodNumber2 = class _ZodNumber extends ZodType2 {
             received: "float",
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "min") {
         const tooSmall = check2.inclusive ? input.data < check2.value : input.data <= check2.value;
@@ -24531,7 +24531,7 @@ var ZodNumber2 = class _ZodNumber extends ZodType2 {
             exact: false,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "max") {
         const tooBig = check2.inclusive ? input.data > check2.value : input.data >= check2.value;
@@ -24545,7 +24545,7 @@ var ZodNumber2 = class _ZodNumber extends ZodType2 {
             exact: false,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "multipleOf") {
         if (floatSafeRemainder2(input.data, check2.value) !== 0) {
@@ -24555,7 +24555,7 @@ var ZodNumber2 = class _ZodNumber extends ZodType2 {
             multipleOf: check2.value,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "finite") {
         if (!Number.isFinite(input.data)) {
@@ -24564,13 +24564,13 @@ var ZodNumber2 = class _ZodNumber extends ZodType2 {
             code: ZodIssueCode2.not_finite,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else {
         util.assertNever(check2);
       }
     }
-    return { status: status2.value, value: input.data };
+    return { status: status3.value, value: input.data };
   }
   gte(value, message) {
     return this.setLimit("min", value, true, errorUtil.toString(message));
@@ -24735,7 +24735,7 @@ var ZodBigInt2 = class _ZodBigInt extends ZodType2 {
       return this._getInvalidInput(input);
     }
     let ctx = void 0;
-    const status2 = new ParseStatus();
+    const status3 = new ParseStatus();
     for (const check2 of this._def.checks) {
       if (check2.kind === "min") {
         const tooSmall = check2.inclusive ? input.data < check2.value : input.data <= check2.value;
@@ -24748,7 +24748,7 @@ var ZodBigInt2 = class _ZodBigInt extends ZodType2 {
             inclusive: check2.inclusive,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "max") {
         const tooBig = check2.inclusive ? input.data > check2.value : input.data >= check2.value;
@@ -24761,7 +24761,7 @@ var ZodBigInt2 = class _ZodBigInt extends ZodType2 {
             inclusive: check2.inclusive,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "multipleOf") {
         if (input.data % check2.value !== BigInt(0)) {
@@ -24771,13 +24771,13 @@ var ZodBigInt2 = class _ZodBigInt extends ZodType2 {
             multipleOf: check2.value,
             message: check2.message
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else {
         util.assertNever(check2);
       }
     }
-    return { status: status2.value, value: input.data };
+    return { status: status3.value, value: input.data };
   }
   _getInvalidInput(input) {
     const ctx = this._getOrReturnCtx(input);
@@ -24935,7 +24935,7 @@ var ZodDate2 = class _ZodDate extends ZodType2 {
       });
       return INVALID;
     }
-    const status2 = new ParseStatus();
+    const status3 = new ParseStatus();
     let ctx = void 0;
     for (const check2 of this._def.checks) {
       if (check2.kind === "min") {
@@ -24949,7 +24949,7 @@ var ZodDate2 = class _ZodDate extends ZodType2 {
             minimum: check2.value,
             type: "date"
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (check2.kind === "max") {
         if (input.data.getTime() > check2.value) {
@@ -24962,14 +24962,14 @@ var ZodDate2 = class _ZodDate extends ZodType2 {
             maximum: check2.value,
             type: "date"
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else {
         util.assertNever(check2);
       }
     }
     return {
-      status: status2.value,
+      status: status3.value,
       value: new Date(input.data.getTime())
     };
   }
@@ -25155,7 +25155,7 @@ ZodVoid2.create = (params) => {
 };
 var ZodArray2 = class _ZodArray extends ZodType2 {
   _parse(input) {
-    const { ctx, status: status2 } = this._processInputParams(input);
+    const { ctx, status: status3 } = this._processInputParams(input);
     const def = this._def;
     if (ctx.parsedType !== ZodParsedType.array) {
       addIssueToContext(ctx, {
@@ -25178,7 +25178,7 @@ var ZodArray2 = class _ZodArray extends ZodType2 {
           exact: true,
           message: def.exactLength.message
         });
-        status2.dirty();
+        status3.dirty();
       }
     }
     if (def.minLength !== null) {
@@ -25191,7 +25191,7 @@ var ZodArray2 = class _ZodArray extends ZodType2 {
           exact: false,
           message: def.minLength.message
         });
-        status2.dirty();
+        status3.dirty();
       }
     }
     if (def.maxLength !== null) {
@@ -25204,20 +25204,20 @@ var ZodArray2 = class _ZodArray extends ZodType2 {
           exact: false,
           message: def.maxLength.message
         });
-        status2.dirty();
+        status3.dirty();
       }
     }
     if (ctx.common.async) {
       return Promise.all([...ctx.data].map((item, i) => {
         return def.type._parseAsync(new ParseInputLazyPath(ctx, item, ctx.path, i));
       })).then((result2) => {
-        return ParseStatus.mergeArray(status2, result2);
+        return ParseStatus.mergeArray(status3, result2);
       });
     }
     const result = [...ctx.data].map((item, i) => {
       return def.type._parseSync(new ParseInputLazyPath(ctx, item, ctx.path, i));
     });
-    return ParseStatus.mergeArray(status2, result);
+    return ParseStatus.mergeArray(status3, result);
   }
   get element() {
     return this._def.type;
@@ -25306,7 +25306,7 @@ var ZodObject2 = class _ZodObject extends ZodType2 {
       });
       return INVALID;
     }
-    const { status: status2, ctx } = this._processInputParams(input);
+    const { status: status3, ctx } = this._processInputParams(input);
     const { shape, keys: shapeKeys } = this._getCached();
     const extraKeys = [];
     if (!(this._def.catchall instanceof ZodNever2 && this._def.unknownKeys === "strip")) {
@@ -25341,7 +25341,7 @@ var ZodObject2 = class _ZodObject extends ZodType2 {
             code: ZodIssueCode2.unrecognized_keys,
             keys: extraKeys
           });
-          status2.dirty();
+          status3.dirty();
         }
       } else if (unknownKeys === "strip") {
       } else {
@@ -25375,10 +25375,10 @@ var ZodObject2 = class _ZodObject extends ZodType2 {
         }
         return syncPairs;
       }).then((syncPairs) => {
-        return ParseStatus.mergeObjectSync(status2, syncPairs);
+        return ParseStatus.mergeObjectSync(status3, syncPairs);
       });
     } else {
-      return ParseStatus.mergeObjectSync(status2, pairs);
+      return ParseStatus.mergeObjectSync(status3, pairs);
     }
   }
   get shape() {
@@ -25856,7 +25856,7 @@ function mergeValues2(a, b) {
 }
 var ZodIntersection2 = class extends ZodType2 {
   _parse(input) {
-    const { status: status2, ctx } = this._processInputParams(input);
+    const { status: status3, ctx } = this._processInputParams(input);
     const handleParsed = (parsedLeft, parsedRight) => {
       if (isAborted(parsedLeft) || isAborted(parsedRight)) {
         return INVALID;
@@ -25869,9 +25869,9 @@ var ZodIntersection2 = class extends ZodType2 {
         return INVALID;
       }
       if (isDirty(parsedLeft) || isDirty(parsedRight)) {
-        status2.dirty();
+        status3.dirty();
       }
-      return { status: status2.value, value: merged.data };
+      return { status: status3.value, value: merged.data };
     };
     if (ctx.common.async) {
       return Promise.all([
@@ -25909,7 +25909,7 @@ ZodIntersection2.create = (left, right, params) => {
 };
 var ZodTuple2 = class _ZodTuple extends ZodType2 {
   _parse(input) {
-    const { status: status2, ctx } = this._processInputParams(input);
+    const { status: status3, ctx } = this._processInputParams(input);
     if (ctx.parsedType !== ZodParsedType.array) {
       addIssueToContext(ctx, {
         code: ZodIssueCode2.invalid_type,
@@ -25937,7 +25937,7 @@ var ZodTuple2 = class _ZodTuple extends ZodType2 {
         exact: false,
         type: "array"
       });
-      status2.dirty();
+      status3.dirty();
     }
     const items = [...ctx.data].map((item, itemIndex) => {
       const schema = this._def.items[itemIndex] || this._def.rest;
@@ -25947,10 +25947,10 @@ var ZodTuple2 = class _ZodTuple extends ZodType2 {
     }).filter((x) => !!x);
     if (ctx.common.async) {
       return Promise.all(items).then((results) => {
-        return ParseStatus.mergeArray(status2, results);
+        return ParseStatus.mergeArray(status3, results);
       });
     } else {
-      return ParseStatus.mergeArray(status2, items);
+      return ParseStatus.mergeArray(status3, items);
     }
   }
   get items() {
@@ -25982,7 +25982,7 @@ var ZodRecord2 = class _ZodRecord extends ZodType2 {
     return this._def.valueType;
   }
   _parse(input) {
-    const { status: status2, ctx } = this._processInputParams(input);
+    const { status: status3, ctx } = this._processInputParams(input);
     if (ctx.parsedType !== ZodParsedType.object) {
       addIssueToContext(ctx, {
         code: ZodIssueCode2.invalid_type,
@@ -26002,9 +26002,9 @@ var ZodRecord2 = class _ZodRecord extends ZodType2 {
       });
     }
     if (ctx.common.async) {
-      return ParseStatus.mergeObjectAsync(status2, pairs);
+      return ParseStatus.mergeObjectAsync(status3, pairs);
     } else {
-      return ParseStatus.mergeObjectSync(status2, pairs);
+      return ParseStatus.mergeObjectSync(status3, pairs);
     }
   }
   get element() {
@@ -26035,7 +26035,7 @@ var ZodMap2 = class extends ZodType2 {
     return this._def.valueType;
   }
   _parse(input) {
-    const { status: status2, ctx } = this._processInputParams(input);
+    const { status: status3, ctx } = this._processInputParams(input);
     if (ctx.parsedType !== ZodParsedType.map) {
       addIssueToContext(ctx, {
         code: ZodIssueCode2.invalid_type,
@@ -26062,11 +26062,11 @@ var ZodMap2 = class extends ZodType2 {
             return INVALID;
           }
           if (key.status === "dirty" || value.status === "dirty") {
-            status2.dirty();
+            status3.dirty();
           }
           finalMap.set(key.value, value.value);
         }
-        return { status: status2.value, value: finalMap };
+        return { status: status3.value, value: finalMap };
       });
     } else {
       const finalMap = /* @__PURE__ */ new Map();
@@ -26077,11 +26077,11 @@ var ZodMap2 = class extends ZodType2 {
           return INVALID;
         }
         if (key.status === "dirty" || value.status === "dirty") {
-          status2.dirty();
+          status3.dirty();
         }
         finalMap.set(key.value, value.value);
       }
-      return { status: status2.value, value: finalMap };
+      return { status: status3.value, value: finalMap };
     }
   }
 };
@@ -26095,7 +26095,7 @@ ZodMap2.create = (keyType, valueType, params) => {
 };
 var ZodSet2 = class _ZodSet extends ZodType2 {
   _parse(input) {
-    const { status: status2, ctx } = this._processInputParams(input);
+    const { status: status3, ctx } = this._processInputParams(input);
     if (ctx.parsedType !== ZodParsedType.set) {
       addIssueToContext(ctx, {
         code: ZodIssueCode2.invalid_type,
@@ -26115,7 +26115,7 @@ var ZodSet2 = class _ZodSet extends ZodType2 {
           exact: false,
           message: def.minSize.message
         });
-        status2.dirty();
+        status3.dirty();
       }
     }
     if (def.maxSize !== null) {
@@ -26128,7 +26128,7 @@ var ZodSet2 = class _ZodSet extends ZodType2 {
           exact: false,
           message: def.maxSize.message
         });
-        status2.dirty();
+        status3.dirty();
       }
     }
     const valueType = this._def.valueType;
@@ -26138,10 +26138,10 @@ var ZodSet2 = class _ZodSet extends ZodType2 {
         if (element.status === "aborted")
           return INVALID;
         if (element.status === "dirty")
-          status2.dirty();
+          status3.dirty();
         parsedSet.add(element.value);
       }
-      return { status: status2.value, value: parsedSet };
+      return { status: status3.value, value: parsedSet };
     }
     const elements = [...ctx.data.values()].map((item, i) => valueType._parse(new ParseInputLazyPath(ctx, item, ctx.path, i)));
     if (ctx.common.async) {
@@ -26472,15 +26472,15 @@ var ZodEffects = class extends ZodType2 {
     return this._def.schema._def.typeName === ZodFirstPartyTypeKind2.ZodEffects ? this._def.schema.sourceType() : this._def.schema;
   }
   _parse(input) {
-    const { status: status2, ctx } = this._processInputParams(input);
+    const { status: status3, ctx } = this._processInputParams(input);
     const effect = this._def.effect || null;
     const checkCtx = {
       addIssue: (arg) => {
         addIssueToContext(ctx, arg);
         if (arg.fatal) {
-          status2.abort();
+          status3.abort();
         } else {
-          status2.dirty();
+          status3.dirty();
         }
       },
       get path() {
@@ -26492,7 +26492,7 @@ var ZodEffects = class extends ZodType2 {
       const processed = effect.transform(ctx.data, checkCtx);
       if (ctx.common.async) {
         return Promise.resolve(processed).then(async (processed2) => {
-          if (status2.value === "aborted")
+          if (status3.value === "aborted")
             return INVALID;
           const result = await this._def.schema._parseAsync({
             data: processed2,
@@ -26503,12 +26503,12 @@ var ZodEffects = class extends ZodType2 {
             return INVALID;
           if (result.status === "dirty")
             return DIRTY(result.value);
-          if (status2.value === "dirty")
+          if (status3.value === "dirty")
             return DIRTY(result.value);
           return result;
         });
       } else {
-        if (status2.value === "aborted")
+        if (status3.value === "aborted")
           return INVALID;
         const result = this._def.schema._parseSync({
           data: processed,
@@ -26519,7 +26519,7 @@ var ZodEffects = class extends ZodType2 {
           return INVALID;
         if (result.status === "dirty")
           return DIRTY(result.value);
-        if (status2.value === "dirty")
+        if (status3.value === "dirty")
           return DIRTY(result.value);
         return result;
       }
@@ -26544,17 +26544,17 @@ var ZodEffects = class extends ZodType2 {
         if (inner.status === "aborted")
           return INVALID;
         if (inner.status === "dirty")
-          status2.dirty();
+          status3.dirty();
         executeRefinement(inner.value);
-        return { status: status2.value, value: inner.value };
+        return { status: status3.value, value: inner.value };
       } else {
         return this._def.schema._parseAsync({ data: ctx.data, path: ctx.path, parent: ctx }).then((inner) => {
           if (inner.status === "aborted")
             return INVALID;
           if (inner.status === "dirty")
-            status2.dirty();
+            status3.dirty();
           return executeRefinement(inner.value).then(() => {
-            return { status: status2.value, value: inner.value };
+            return { status: status3.value, value: inner.value };
           });
         });
       }
@@ -26572,13 +26572,13 @@ var ZodEffects = class extends ZodType2 {
         if (result instanceof Promise) {
           throw new Error(`Asynchronous transform encountered during synchronous parse operation. Use .parseAsync instead.`);
         }
-        return { status: status2.value, value: result };
+        return { status: status3.value, value: result };
       } else {
         return this._def.schema._parseAsync({ data: ctx.data, path: ctx.path, parent: ctx }).then((base) => {
           if (!isValid(base))
             return INVALID;
           return Promise.resolve(effect.transform(base.value, checkCtx)).then((result) => ({
-            status: status2.value,
+            status: status3.value,
             value: result
           }));
         });
@@ -26756,7 +26756,7 @@ var ZodBranded = class extends ZodType2 {
 };
 var ZodPipeline = class _ZodPipeline extends ZodType2 {
   _parse(input) {
-    const { status: status2, ctx } = this._processInputParams(input);
+    const { status: status3, ctx } = this._processInputParams(input);
     if (ctx.common.async) {
       const handleAsync = async () => {
         const inResult = await this._def.in._parseAsync({
@@ -26767,7 +26767,7 @@ var ZodPipeline = class _ZodPipeline extends ZodType2 {
         if (inResult.status === "aborted")
           return INVALID;
         if (inResult.status === "dirty") {
-          status2.dirty();
+          status3.dirty();
           return DIRTY(inResult.value);
         } else {
           return this._def.out._parseAsync({
@@ -26787,7 +26787,7 @@ var ZodPipeline = class _ZodPipeline extends ZodType2 {
       if (inResult.status === "aborted")
         return INVALID;
       if (inResult.status === "dirty") {
-        status2.dirty();
+        status3.dirty();
         return {
           status: "dirty",
           value: inResult.value
@@ -27099,8 +27099,8 @@ function getLiteralValue(schema) {
 }
 
 // node_modules/.pnpm/@modelcontextprotocol+sdk@1.29.0_zod@4.4.3/node_modules/@modelcontextprotocol/sdk/dist/esm/experimental/tasks/interfaces.js
-function isTerminal(status2) {
-  return status2 === "completed" || status2 === "failed" || status2 === "cancelled";
+function isTerminal(status3) {
+  return status3 === "completed" || status3 === "failed" || status3 === "cancelled";
 }
 
 // node_modules/.pnpm/zod-to-json-schema@3.25.2_zod@4.4.3/node_modules/zod-to-json-schema/dist/esm/Options.js
@@ -28929,7 +28929,7 @@ var Protocol = class {
           return;
         }
         const pollInterval = task2.pollInterval ?? this._options?.defaultTaskPollInterval ?? 1e3;
-        await new Promise((resolve6) => setTimeout(resolve6, pollInterval));
+        await new Promise((resolve11) => setTimeout(resolve11, pollInterval));
         options?.signal?.throwIfAborted();
       }
     } catch (error51) {
@@ -28946,7 +28946,7 @@ var Protocol = class {
    */
   request(request, resultSchema, options) {
     const { relatedRequestId, resumptionToken, onresumptiontoken, task, relatedTask } = options ?? {};
-    return new Promise((resolve6, reject) => {
+    return new Promise((resolve11, reject) => {
       const earlyReject = (error51) => {
         reject(error51);
       };
@@ -29024,7 +29024,7 @@ var Protocol = class {
           if (!parseResult2.success) {
             reject(parseResult2.error);
           } else {
-            resolve6(parseResult2.data);
+            resolve11(parseResult2.data);
           }
         } catch (error51) {
           reject(error51);
@@ -29285,12 +29285,12 @@ var Protocol = class {
       }
     } catch {
     }
-    return new Promise((resolve6, reject) => {
+    return new Promise((resolve11, reject) => {
       if (signal.aborted) {
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
         return;
       }
-      const timeoutId = setTimeout(resolve6, interval);
+      const timeoutId = setTimeout(resolve11, interval);
       signal.addEventListener("abort", () => {
         clearTimeout(timeoutId);
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
@@ -29319,8 +29319,8 @@ var Protocol = class {
         }
         return task;
       },
-      storeTaskResult: async (taskId, status2, result) => {
-        await taskStore.storeTaskResult(taskId, status2, result, sessionId);
+      storeTaskResult: async (taskId, status3, result) => {
+        await taskStore.storeTaskResult(taskId, status3, result, sessionId);
         const task = await taskStore.getTask(taskId, sessionId);
         if (task) {
           const notification = TaskStatusNotificationSchema.parse({
@@ -29336,15 +29336,15 @@ var Protocol = class {
       getTaskResult: (taskId) => {
         return taskStore.getTaskResult(taskId, sessionId);
       },
-      updateTaskStatus: async (taskId, status2, statusMessage) => {
+      updateTaskStatus: async (taskId, status3, statusMessage) => {
         const task = await taskStore.getTask(taskId, sessionId);
         if (!task) {
           throw new McpError(ErrorCode.InvalidParams, `Task "${taskId}" not found - it may have been cleaned up`);
         }
         if (isTerminal(task.status)) {
-          throw new McpError(ErrorCode.InvalidParams, `Cannot update task "${taskId}" from terminal status "${task.status}" to "${status2}". Terminal states (completed, failed, cancelled) cannot transition to other states.`);
+          throw new McpError(ErrorCode.InvalidParams, `Cannot update task "${taskId}" from terminal status "${task.status}" to "${status3}". Terminal states (completed, failed, cancelled) cannot transition to other states.`);
         }
-        await taskStore.updateTaskStatus(taskId, status2, statusMessage, sessionId);
+        await taskStore.updateTaskStatus(taskId, status3, statusMessage, sessionId);
         const updatedTask = await taskStore.getTask(taskId, sessionId);
         if (updatedTask) {
           const notification = TaskStatusNotificationSchema.parse({
@@ -30390,7 +30390,7 @@ var McpServer = class {
     let task = createTaskResult.task;
     const pollInterval = task.pollInterval ?? 5e3;
     while (task.status !== "completed" && task.status !== "failed" && task.status !== "cancelled") {
-      await new Promise((resolve6) => setTimeout(resolve6, pollInterval));
+      await new Promise((resolve11) => setTimeout(resolve11, pollInterval));
       const updatedTask = await extra.taskStore.getTask(taskId);
       if (!updatedTask) {
         throw new McpError(ErrorCode.InternalError, `Task ${taskId} not found during polling`);
@@ -30959,7 +30959,7 @@ var EMPTY_COMPLETION_RESULT = {
 };
 
 // packages/cli/src/index.ts
-import { createInterface as createInterface3 } from "node:readline/promises";
+import { createInterface } from "node:readline/promises";
 
 // package.json
 var package_default = {
@@ -31031,7 +31031,6 @@ import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createInterface } from "node:readline";
 
 // packages/core/src/adapter.ts
 function reconcilePersistedInvocation(invocation) {
@@ -31325,14 +31324,91 @@ var GraphNodeSchema = external_exports.strictObject({
   waitCondition: WaitConditionSchema.optional(),
   status: NodeStatusSchema
 });
+var MAX_MODEL_GRAPH_PLAN_CHARACTERS = 1024 * 1024;
+var MAX_MODEL_GRAPH_NODES = 64;
+var MAX_MODEL_NODE_IDENTIFIER_CHARACTERS = 128;
+var MAX_MODEL_NODE_OBJECTIVE_CHARACTERS = 16 * 1024;
+var MAX_MODEL_NODE_REFERENCES = 64;
+var MAX_MODEL_NODE_PATHS = 256;
+var MAX_MODEL_PATH_CHARACTERS = 4 * 1024;
+var MAX_MODEL_NODE_PROBES = 64;
+var MAX_MODEL_PROBE_COMMAND_CHARACTERS = 4 * 1024;
+var MAX_MODEL_PROBE_ARGUMENTS = 256;
+var MAX_MODEL_PROBE_ARGUMENT_CHARACTERS = 4 * 1024;
+var MAX_MODEL_PROBE_TERMS = 256;
+var MAX_MODEL_PROBE_TERM_CHARACTERS = 1024;
+var ModelOutputProbeSpecSchema = external_exports.union([
+  CommandProbeSchema.extend({
+    id: external_exports.string().min(1).max(MAX_MODEL_NODE_IDENTIFIER_CHARACTERS),
+    command: external_exports.string().min(1).max(MAX_MODEL_PROBE_COMMAND_CHARACTERS),
+    args: external_exports.array(external_exports.string().max(MAX_MODEL_PROBE_ARGUMENT_CHARACTERS)).max(MAX_MODEL_PROBE_ARGUMENTS).default([]),
+    cwd: external_exports.string().max(MAX_MODEL_PATH_CHARACTERS).optional(),
+    platforms: external_exports.array(external_exports.enum(["darwin", "linux", "win32"])).min(1).max(3).optional()
+  }),
+  FileProbeSchema.extend({
+    id: external_exports.string().min(1).max(MAX_MODEL_NODE_IDENTIFIER_CHARACTERS),
+    path: external_exports.string().min(1).max(MAX_MODEL_PATH_CHARACTERS),
+    contains: external_exports.string().min(1).max(MAX_MODEL_PROBE_COMMAND_CHARACTERS).optional()
+  }),
+  GitDiffProbeSchema.extend({
+    id: external_exports.string().min(1).max(MAX_MODEL_NODE_IDENTIFIER_CHARACTERS),
+    baseSha: external_exports.string().min(1).max(MAX_MODEL_NODE_IDENTIFIER_CHARACTERS)
+  }),
+  RepositoryInventoryProbeSchema.extend({
+    id: external_exports.string().min(1).max(MAX_MODEL_NODE_IDENTIFIER_CHARACTERS),
+    paths: external_exports.array(external_exports.string().min(1).max(MAX_MODEL_PATH_CHARACTERS)).min(1).max(MAX_MODEL_NODE_PATHS),
+    terms: external_exports.array(external_exports.string().min(1).max(MAX_MODEL_PROBE_TERM_CHARACTERS)).min(1).max(MAX_MODEL_PROBE_TERMS)
+  }),
+  GitHubSnapshotProbeSchema.extend({
+    id: external_exports.string().min(1).max(MAX_MODEL_NODE_IDENTIFIER_CHARACTERS)
+  }),
+  HeldOutProbeReferenceSchema.extend({
+    id: external_exports.string().min(1).max(MAX_MODEL_NODE_IDENTIFIER_CHARACTERS)
+  })
+]);
+var ModelOutputWaitConditionSchema = external_exports.discriminatedUnion("kind", [
+  external_exports.strictObject({ kind: external_exports.literal("time"), wakeAt: external_exports.iso.datetime() }),
+  external_exports.strictObject({
+    kind: external_exports.literal("file_exists"),
+    path: external_exports.string().min(1).max(MAX_MODEL_PATH_CHARACTERS),
+    pollIntervalMs: external_exports.number().int().min(250).max(3e5),
+    timeoutAt: external_exports.iso.datetime().optional()
+  }),
+  external_exports.strictObject({
+    kind: external_exports.literal("file_changed"),
+    path: external_exports.string().min(1).max(MAX_MODEL_PATH_CHARACTERS),
+    pollIntervalMs: external_exports.number().int().min(250).max(3e5),
+    timeoutAt: external_exports.iso.datetime().optional()
+  }),
+  external_exports.strictObject({
+    kind: external_exports.literal("github_pull_request"),
+    pollIntervalMs: external_exports.number().int().min(1e3).max(3e5),
+    timeoutAt: external_exports.iso.datetime().optional()
+  })
+]);
 var PlannedGraphNodeSchema = GraphNodeSchema.omit({
   outputSchema: true,
   status: true
+}).extend({
+  id: external_exports.string().min(1).max(MAX_MODEL_NODE_IDENTIFIER_CHARACTERS),
+  objective: external_exports.string().min(1).max(MAX_MODEL_NODE_OBJECTIVE_CHARACTERS),
+  dependsOn: external_exports.array(external_exports.string().max(MAX_MODEL_NODE_IDENTIFIER_CHARACTERS)).max(MAX_MODEL_NODE_REFERENCES),
+  scope: external_exports.array(external_exports.string().max(MAX_MODEL_PATH_CHARACTERS)).max(MAX_MODEL_NODE_PATHS),
+  contextSelector: external_exports.strictObject({
+    includeRepositoryInstructions: external_exports.boolean(),
+    predecessorResults: external_exports.array(external_exports.string().max(MAX_MODEL_NODE_IDENTIFIER_CHARACTERS)).max(MAX_MODEL_NODE_REFERENCES),
+    relevantPaths: external_exports.array(external_exports.string().max(MAX_MODEL_PATH_CHARACTERS)).max(MAX_MODEL_NODE_PATHS)
+  }),
+  progressProbes: external_exports.array(ModelOutputProbeSpecSchema).max(MAX_MODEL_NODE_PROBES),
+  completionProbes: external_exports.array(ModelOutputProbeSpecSchema).max(MAX_MODEL_NODE_PROBES),
+  waitCondition: ModelOutputWaitConditionSchema.optional()
 });
 var GraphPlanSchema = external_exports.strictObject({
   schemaVersion: external_exports.literal(1),
   family: external_exports.enum(["bug", "feature", "migration", "refactor", "audit"]),
-  nodes: external_exports.array(PlannedGraphNodeSchema).min(1)
+  nodes: external_exports.array(PlannedGraphNodeSchema).min(1).max(MAX_MODEL_GRAPH_NODES)
+}).refine((plan) => JSON.stringify(plan).length <= MAX_MODEL_GRAPH_PLAN_CHARACTERS, {
+  message: `Graph plan exceeds ${MAX_MODEL_GRAPH_PLAN_CHARACTERS} characters`
 });
 var GraphAmendmentOperationSchema = external_exports.discriminatedUnion("operation", [
   external_exports.strictObject({
@@ -31572,12 +31648,19 @@ var SupervisorRecordSchema = external_exports.strictObject({
   replacesSupervisorId: external_exports.uuid().optional(),
   message: external_exports.string().optional()
 });
+var MAX_HOST_EVENT_TEXT_CHARACTERS = 256 * 1024;
+var MAX_HOST_EVENT_DETAIL_CHARACTERS = 16 * 1024;
+var MAX_HOST_IDENTIFIER_CHARACTERS = 4 * 1024;
+var MAX_WORKER_CHANGED_PATHS = 256;
+var MAX_WORKER_PATH_CHARACTERS = 1024;
+var MAX_WORKER_EVIDENCE_ITEMS = 64;
+var MAX_WORKER_EVIDENCE_CHARACTERS = 4 * 1024;
 var WorkerResultSchema = external_exports.strictObject({
   status: external_exports.enum(["completed", "blocked", "failed"]),
-  summary: external_exports.string(),
-  changedPaths: external_exports.array(external_exports.string()),
-  evidence: external_exports.array(external_exports.string()),
-  nextSuggestedObjective: external_exports.string().optional()
+  summary: external_exports.string().max(MAX_HOST_EVENT_DETAIL_CHARACTERS),
+  changedPaths: external_exports.array(external_exports.string().max(MAX_WORKER_PATH_CHARACTERS)).max(MAX_WORKER_CHANGED_PATHS),
+  evidence: external_exports.array(external_exports.string().max(MAX_WORKER_EVIDENCE_CHARACTERS)).max(MAX_WORKER_EVIDENCE_ITEMS),
+  nextSuggestedObjective: external_exports.string().max(MAX_HOST_EVENT_DETAIL_CHARACTERS).optional()
 });
 var ContextCapsuleSchema = external_exports.strictObject({
   schemaVersion: external_exports.literal(1),
@@ -31643,8 +31726,8 @@ var SemanticVerifierContextSchema = external_exports.strictObject({
 });
 var SemanticVerdictSchema = external_exports.strictObject({
   verdict: external_exports.enum(["supported", "unsupported", "uncertain"]),
-  evidence: external_exports.array(external_exports.string()),
-  rationale: external_exports.string().min(1),
+  evidence: external_exports.array(external_exports.string().max(4 * 1024)).max(64),
+  rationale: external_exports.string().min(1).max(16 * 1024),
   uncertainty: external_exports.number().min(0).max(1)
 });
 var HostCapabilitiesSchema = external_exports.strictObject({
@@ -31681,16 +31764,29 @@ var RunControlRequestSchema = external_exports.strictObject({
   requestedByPid: external_exports.number().int().positive()
 });
 var HostEventSchema = external_exports.discriminatedUnion("type", [
-  external_exports.strictObject({ type: external_exports.literal("started"), invocationId: external_exports.string() }),
-  external_exports.strictObject({ type: external_exports.literal("session"), hostSessionId: external_exports.string().min(1) }),
-  external_exports.strictObject({ type: external_exports.literal("message"), text: external_exports.string() }),
-  external_exports.strictObject({ type: external_exports.literal("tool"), name: external_exports.string(), summary: external_exports.string() }),
+  external_exports.strictObject({
+    type: external_exports.literal("started"),
+    invocationId: external_exports.string().max(MAX_HOST_IDENTIFIER_CHARACTERS)
+  }),
+  external_exports.strictObject({
+    type: external_exports.literal("session"),
+    hostSessionId: external_exports.string().min(1).max(MAX_HOST_IDENTIFIER_CHARACTERS)
+  }),
+  external_exports.strictObject({
+    type: external_exports.literal("message"),
+    text: external_exports.string().max(MAX_HOST_EVENT_TEXT_CHARACTERS)
+  }),
+  external_exports.strictObject({
+    type: external_exports.literal("tool"),
+    name: external_exports.string().max(256),
+    summary: external_exports.string().max(MAX_HOST_EVENT_DETAIL_CHARACTERS)
+  }),
   external_exports.strictObject({ type: external_exports.literal("result"), result: WorkerResultSchema }),
   external_exports.strictObject({ type: external_exports.literal("usage"), usage: TokenUsageSchema }),
   external_exports.strictObject({ type: external_exports.literal("terminated"), termination: HostTerminationSchema }),
   external_exports.strictObject({
     type: external_exports.literal("error"),
-    message: external_exports.string(),
+    message: external_exports.string().max(MAX_HOST_EVENT_DETAIL_CHARACTERS),
     cause: InterruptionCauseSchema.optional()
   })
 ]);
@@ -31784,26 +31880,228 @@ var RunStateSchema = external_exports.strictObject({
   stopReason: external_exports.string().optional(),
   updatedAt: external_exports.iso.datetime()
 });
-var RunStorageManifestSchema = external_exports.strictObject({
+var RunStorageFormatsV1Schema = external_exports.strictObject({
+  contract: external_exports.literal(1),
+  graph: external_exports.literal(1),
+  probePlan: external_exports.literal(1),
+  heldOutProbes: external_exports.literal(1).default(1),
+  events: external_exports.literal(1),
+  state: external_exports.literal(1),
+  workspace: external_exports.literal(1),
+  capsules: external_exports.literal(1),
+  invocationEvents: external_exports.literal(1),
+  semanticReports: external_exports.literal(1),
+  rawArtifacts: external_exports.literal(1),
+  controlRequests: external_exports.literal(1),
+  locks: external_exports.literal(1)
+});
+var ArtifactKindSchema = external_exports.enum([
+  "artifact",
+  "invocation_transcript",
+  "invocation_recovery",
+  "content_addressed",
+  "capsule"
+]);
+var ArtifactFormatSchema = external_exports.enum(["binary", "text", "json", "jsonl"]);
+var ArtifactDispositionSchema = external_exports.enum([
+  "stored",
+  "truncated",
+  "omitted",
+  "rejected",
+  "legacy"
+]);
+var ArtifactInventoryReasonSchema = external_exports.enum([
+  "artifact_limit",
+  "identity_limit",
+  "transcript_reserve",
+  "run_quota",
+  "legacy_migration",
+  "missing_on_disk"
+]);
+var MAX_ARTIFACT_PATH_CHARACTERS = 4 * 1024;
+var MAX_ARTIFACT_INVENTORY_BYTES = 8 * 1024 * 1024;
+var MAX_ARTIFACT_INVENTORY_PATH_BYTES = 1024 * 1024;
+var WINDOWS_INVALID_ARTIFACT_SEGMENT = /[\u0000-\u001f<>:"|?*]/u;
+var WINDOWS_RESERVED_ARTIFACT_SEGMENT = /^(?:aux|clock\$|con|conin\$|conout\$|nul|prn|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/iu;
+var UNPAIRED_SURROGATE = /[\ud800-\udfff]/u;
+var UTF8_ENCODER = new TextEncoder();
+function artifactInventorySerializedBytes(value) {
+  return UTF8_ENCODER.encode(`${JSON.stringify(value, null, 2)}
+`).byteLength;
+}
+function artifactPathCanonicalKey(path) {
+  if (path.length === 0 || path.length > MAX_ARTIFACT_PATH_CHARACTERS || path !== path.normalize("NFC") || path.startsWith("/") || path.includes("\\") || /^[a-z]:/i.test(path) || UNPAIRED_SURROGATE.test(path))
+    return void 0;
+  const parts = path.split("/");
+  if (parts[0] !== "artifacts" && parts[0] !== "capsules" || parts.length < 2 || parts.some(
+    (part) => part.length === 0 || part === "." || part === ".." || /[. ]$/u.test(part) || WINDOWS_INVALID_ARTIFACT_SEGMENT.test(part) || WINDOWS_RESERVED_ARTIFACT_SEGMENT.test(part)
+  ))
+    return void 0;
+  return parts.map((part) => part.toUpperCase().normalize("NFC")).join("/");
+}
+var ArtifactInventoryEntrySchema = external_exports.strictObject({
+  path: external_exports.string().min(1).max(MAX_ARTIFACT_PATH_CHARACTERS),
+  kind: ArtifactKindSchema,
+  format: ArtifactFormatSchema,
+  disposition: ArtifactDispositionSchema,
+  sourceBytes: external_exports.number().int().nonnegative(),
+  storedBytes: external_exports.number().int().nonnegative(),
+  omittedBytes: external_exports.number().int().nonnegative(),
+  truncated: external_exports.boolean(),
+  legacy: external_exports.boolean(),
+  sourceHash: external_exports.string().regex(/^[a-f0-9]{64}$/).optional(),
+  storedHash: external_exports.string().regex(/^[a-f0-9]{64}$/).optional(),
+  reason: ArtifactInventoryReasonSchema.optional(),
+  createdAt: external_exports.iso.datetime(),
+  updatedAt: external_exports.iso.datetime()
+});
+var ArtifactPolicySchema = external_exports.strictObject({
+  ordinaryArtifactBytes: external_exports.number().int().positive(),
+  identityArtifactBytes: external_exports.number().int().positive(),
+  capsuleBytes: external_exports.number().int().positive(),
+  invocationTranscriptBytes: external_exports.number().int().positive(),
+  invocationReservedBytes: external_exports.number().int().positive(),
+  runArtifactBytes: external_exports.number().int().positive(),
+  runReservedBytes: external_exports.number().int().positive()
+}).superRefine((policy, context) => {
+  if (policy.invocationReservedBytes >= policy.invocationTranscriptBytes)
+    context.addIssue({
+      code: "custom",
+      path: ["invocationReservedBytes"],
+      message: "invocation reserve is not smaller than its transcript limit"
+    });
+  if (policy.runReservedBytes >= policy.runArtifactBytes)
+    context.addIssue({
+      code: "custom",
+      path: ["runReservedBytes"],
+      message: "run reserve is not smaller than its run quota"
+    });
+  if (policy.runReservedBytes < policy.invocationReservedBytes)
+    context.addIssue({
+      code: "custom",
+      path: ["runReservedBytes"],
+      message: "run reserve is smaller than the invocation recovery reserve"
+    });
+});
+var ArtifactMutationJournalSchema = external_exports.strictObject({
   schemaVersion: external_exports.literal(1),
   runId: external_exports.uuid(),
-  migratedFrom: external_exports.union([external_exports.literal(0), external_exports.literal(1)]),
-  formats: external_exports.strictObject({
-    contract: external_exports.literal(1),
-    graph: external_exports.literal(1),
-    probePlan: external_exports.literal(1),
-    heldOutProbes: external_exports.literal(1).default(1),
-    events: external_exports.literal(1),
-    state: external_exports.literal(1),
-    workspace: external_exports.literal(1),
-    capsules: external_exports.literal(1),
-    invocationEvents: external_exports.literal(1),
-    semanticReports: external_exports.literal(1),
-    rawArtifacts: external_exports.literal(1),
-    controlRequests: external_exports.literal(1),
-    locks: external_exports.literal(1)
-  })
+  mutationId: external_exports.uuid(),
+  action: external_exports.enum(["write", "delete", "unchanged"]),
+  previousInventoryHash: external_exports.string().regex(/^[a-f0-9]{64}$/),
+  nextInventoryHash: external_exports.string().regex(/^[a-f0-9]{64}$/),
+  path: external_exports.string().min(1).max(MAX_ARTIFACT_PATH_CHARACTERS),
+  previousEntry: ArtifactInventoryEntrySchema.optional(),
+  nextEntry: ArtifactInventoryEntrySchema,
+  createdAt: external_exports.iso.datetime()
+}).superRefine((journal, context) => {
+  if (artifactPathCanonicalKey(journal.path) === void 0)
+    context.addIssue({
+      code: "custom",
+      path: ["path"],
+      message: "mutation path is not a portable artifact-owned path"
+    });
+  if (journal.nextEntry.path !== journal.path)
+    context.addIssue({
+      code: "custom",
+      path: ["nextEntry", "path"],
+      message: "next entry path does not match the mutation path"
+    });
+  if (journal.previousEntry && journal.previousEntry.path !== journal.path)
+    context.addIssue({
+      code: "custom",
+      path: ["previousEntry", "path"],
+      message: "previous entry path does not match the mutation path"
+    });
 });
+var ArtifactInventorySchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  runId: external_exports.uuid(),
+  policy: ArtifactPolicySchema,
+  sourceBytes: external_exports.number().int().nonnegative(),
+  storedBytes: external_exports.number().int().nonnegative(),
+  omittedBytes: external_exports.number().int().nonnegative(),
+  entries: external_exports.array(ArtifactInventoryEntrySchema).max(16 * 1024),
+  updatedAt: external_exports.iso.datetime()
+}).superRefine((inventory, context) => {
+  const paths = /* @__PURE__ */ new Set();
+  let pathBytes = 0;
+  let sourceBytes = 0;
+  let storedBytes = 0;
+  let omittedBytes = 0;
+  for (const [index, entry] of inventory.entries.entries()) {
+    const issue2 = (message, field) => context.addIssue({
+      code: "custom",
+      path: ["entries", index, ...field ? [field] : []],
+      message
+    });
+    const pathKey = artifactPathCanonicalKey(entry.path);
+    if (pathKey === void 0)
+      issue2(`entry path is not a portable artifact-owned path: ${entry.path}`, "path");
+    else if (paths.has(pathKey))
+      issue2(`entry path aliases another portable path: ${entry.path}`, "path");
+    else paths.add(pathKey);
+    pathBytes += UTF8_ENCODER.encode(entry.path).byteLength;
+    if (entry.sourceBytes !== entry.storedBytes + entry.omittedBytes)
+      issue2(`entry byte totals do not reconcile: ${entry.path}`);
+    if ((entry.storedBytes > 0 || entry.disposition === "stored" || entry.disposition === "legacy") && !entry.storedHash)
+      issue2(`stored entry lacks a content hash: ${entry.path}`, "storedHash");
+    if (entry.truncated && (entry.omittedBytes === 0 || entry.storedBytes >= entry.sourceBytes))
+      issue2(`entry truncation metadata is contradictory: ${entry.path}`, "truncated");
+    if (entry.disposition === "stored" && (entry.storedBytes !== entry.sourceBytes || entry.omittedBytes !== 0 || entry.truncated))
+      issue2(`stored disposition is contradictory: ${entry.path}`, "disposition");
+    if (entry.disposition === "truncated" && (entry.storedBytes === 0 || entry.omittedBytes === 0 || !entry.truncated))
+      issue2(`truncated disposition is contradictory: ${entry.path}`, "disposition");
+    if ((entry.disposition === "omitted" || entry.disposition === "rejected") && entry.storedBytes !== 0)
+      issue2(`${entry.disposition} disposition stores bytes: ${entry.path}`, "disposition");
+    if (entry.disposition === "legacy" && (!entry.legacy || entry.reason !== "legacy_migration" || entry.storedBytes !== entry.sourceBytes || entry.omittedBytes !== 0 || entry.truncated))
+      issue2(`legacy disposition is contradictory: ${entry.path}`, "disposition");
+    sourceBytes += entry.sourceBytes;
+    storedBytes += entry.storedBytes;
+    omittedBytes += entry.omittedBytes;
+    if (![sourceBytes, storedBytes, omittedBytes].every(Number.isSafeInteger))
+      issue2("aggregate byte totals exceed safe integer precision");
+  }
+  if (pathBytes > MAX_ARTIFACT_INVENTORY_PATH_BYTES)
+    context.addIssue({
+      code: "custom",
+      path: ["entries"],
+      message: "artifact inventory path metadata exceeds its byte limit"
+    });
+  else if (artifactInventorySerializedBytes(inventory) > MAX_ARTIFACT_INVENTORY_BYTES)
+    context.addIssue({
+      code: "custom",
+      message: "serialized artifact inventory exceeds its byte limit"
+    });
+  if (inventory.sourceBytes !== sourceBytes || inventory.storedBytes !== storedBytes || inventory.omittedBytes !== omittedBytes)
+    context.addIssue({
+      code: "custom",
+      message: "aggregate byte totals do not match entries"
+    });
+  if (inventory.storedBytes > inventory.policy.runArtifactBytes)
+    context.addIssue({
+      code: "custom",
+      path: ["storedBytes"],
+      message: "stored bytes exceed the persisted run quota"
+    });
+});
+var RunStorageManifestSchema = external_exports.discriminatedUnion("schemaVersion", [
+  external_exports.strictObject({
+    schemaVersion: external_exports.literal(1),
+    runId: external_exports.uuid(),
+    migratedFrom: external_exports.union([external_exports.literal(0), external_exports.literal(1)]),
+    formats: RunStorageFormatsV1Schema
+  }),
+  external_exports.strictObject({
+    schemaVersion: external_exports.literal(2),
+    runId: external_exports.uuid(),
+    migratedFrom: external_exports.union([external_exports.literal(0), external_exports.literal(1), external_exports.literal(2)]),
+    formats: RunStorageFormatsV1Schema.extend({
+      artifactInventory: external_exports.literal(1),
+      artifactPolicy: external_exports.literal(1)
+    })
+  })
+]);
 var workerResultJsonSchema = external_exports.toJSONSchema(WorkerResultSchema, { target: "draft-7" });
 var graphPlanJsonSchema = external_exports.toJSONSchema(GraphPlanSchema, { target: "draft-7" });
 var semanticVerdictJsonSchema = external_exports.toJSONSchema(SemanticVerdictSchema, {
@@ -32764,9 +33062,9 @@ function applyGraphAmendment(input) {
   const target = (id) => {
     const item = nodes.find((candidate) => candidate.id === id);
     if (!item) throw new Error(`Amendment references unknown node ${id}`);
-    const status2 = input.nodeStatuses[id]?.status;
-    if (status2 === "accepted") throw new Error(`Accepted node ${id} is immutable`);
-    if (status2 === "running")
+    const status3 = input.nodeStatuses[id]?.status;
+    if (status3 === "accepted") throw new Error(`Accepted node ${id} is immutable`);
+    if (status3 === "running")
       throw new Error(`Running node ${id} must be checkpointed before amendment`);
     return item;
   };
@@ -32874,8 +33172,8 @@ function applyGraphAmendment(input) {
     input.requiredVerificationProbes,
     input.approvedProbes ?? input.requiredVerificationProbes
   );
-  for (const [id, status2] of Object.entries(input.nodeStatuses)) {
-    if (status2.status !== "accepted") continue;
+  for (const [id, status3] of Object.entries(input.nodeStatuses)) {
+    if (status3.status !== "accepted") continue;
     if (JSON.stringify(originalById.get(id)) !== JSON.stringify(graph.nodes.find((item) => item.id === id)))
       throw new Error(`Accepted node ${id} was changed by the amendment`);
   }
@@ -33825,6 +34123,120 @@ var ChildTerminationController = class {
   }
 };
 
+// packages/adapter-codex/src/protocol.ts
+var KIB = 1024;
+var MIB = 1024 * KIB;
+var ADAPTER_STDERR_LIMIT_BYTES = 8 * KIB;
+var ADAPTER_PROTOCOL_LINE_LIMIT_BYTES = 2 * MIB;
+var ADAPTER_STRUCTURED_OUTPUT_LIMIT_BYTES = MIB;
+function decodeUtf8Prefix(source) {
+  for (let trim = 0; trim <= Math.min(3, source.length); trim += 1) {
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(
+        source.subarray(0, source.length - trim)
+      );
+    } catch {
+    }
+  }
+  return source.toString("utf8");
+}
+var BoundedTextCapture = class {
+  constructor(limitBytes) {
+    this.limitBytes = limitBytes;
+  }
+  limitBytes;
+  chunks = [];
+  observedBytes = 0;
+  retainedBytes = 0;
+  append(chunk) {
+    const source = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+    this.observedBytes += source.length;
+    const available = Math.max(0, this.limitBytes - this.retainedBytes);
+    if (available === 0) return;
+    const retained = Buffer.from(source.subarray(0, available));
+    this.chunks.push(retained);
+    this.retainedBytes += retained.length;
+  }
+  get overflowed() {
+    return this.observedBytes > this.limitBytes;
+  }
+  text() {
+    const prefix = decodeUtf8Prefix(Buffer.concat(this.chunks, this.retainedBytes));
+    if (!this.overflowed) return prefix;
+    const separator = prefix.length > 0 && !prefix.endsWith("\n") ? "\n" : "";
+    return `${prefix}${separator}[Graphcraft truncated host stderr after ${this.limitBytes} bytes]`;
+  }
+};
+function captureStderr(stream) {
+  const capture = new BoundedTextCapture(ADAPTER_STDERR_LIMIT_BYTES);
+  stream.on("data", (chunk) => capture.append(chunk));
+  return capture;
+}
+var LineAccumulator = class {
+  chunks = [];
+  observedBytes = 0;
+  retainedBytes = 0;
+  append(source) {
+    this.observedBytes += source.length;
+    const available = Math.max(0, ADAPTER_PROTOCOL_LINE_LIMIT_BYTES - this.retainedBytes);
+    if (available === 0) return;
+    const retained = Buffer.from(source.subarray(0, available));
+    this.chunks.push(retained);
+    this.retainedBytes += retained.length;
+  }
+  finish() {
+    const observedBytes = this.observedBytes;
+    const overflowed = observedBytes > ADAPTER_PROTOCOL_LINE_LIMIT_BYTES;
+    if (overflowed) return { observedBytes, overflowed };
+    let source = Buffer.concat(this.chunks, this.retainedBytes);
+    if (source.at(-1) === 13) source = source.subarray(0, -1);
+    return { observedBytes, overflowed, text: source.toString("utf8") };
+  }
+  get empty() {
+    return this.observedBytes === 0;
+  }
+};
+async function* readBoundedProtocolLines(stream) {
+  let line = new LineAccumulator();
+  for await (const chunk of stream) {
+    const source = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    let offset = 0;
+    while (offset < source.length) {
+      const newline = source.indexOf(10, offset);
+      if (newline === -1) {
+        line.append(source.subarray(offset));
+        break;
+      }
+      line.append(source.subarray(offset, newline));
+      yield line.finish();
+      line = new LineAccumulator();
+      offset = newline + 1;
+    }
+  }
+  if (!line.empty) yield line.finish();
+}
+function structuredOutputExceedsLimit(value) {
+  if (typeof value === "string") {
+    return Buffer.byteLength(value) > ADAPTER_STRUCTURED_OUTPUT_LIMIT_BYTES;
+  }
+  try {
+    const serialized = JSON.stringify(value);
+    return typeof serialized === "string" && Buffer.byteLength(serialized) > ADAPTER_STRUCTURED_OUTPUT_LIMIT_BYTES;
+  } catch {
+    return false;
+  }
+}
+function protocolLineLimitError(host) {
+  return new Error(
+    `${host} protocol line exceeded the ${ADAPTER_PROTOCOL_LINE_LIMIT_BYTES}-byte limit; output was rejected`
+  );
+}
+function structuredOutputLimitError(host, kind) {
+  return new Error(
+    `${host} ${kind} exceeded the ${ADAPTER_STRUCTURED_OUTPUT_LIMIT_BYTES}-byte structured-output limit; output was rejected`
+  );
+}
+
 // packages/adapter-codex/src/index.ts
 function omitNullObjectProperties(value) {
   if (Array.isArray(value)) return value.map((item) => omitNullObjectProperties(item));
@@ -33873,34 +34285,30 @@ function codexUsage(value) {
   return normalizeTokenUsage("codex", value);
 }
 async function commandVersion(command) {
-  return await new Promise((resolve6) => {
+  return await new Promise((resolve11) => {
     const child = spawn(command, ["--version"], { stdio: ["ignore", "pipe", "ignore"] });
-    let output = "";
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      output += chunk;
-    });
-    child.once("error", () => resolve6({ installed: false }));
+    const output = new BoundedTextCapture(ADAPTER_STDERR_LIMIT_BYTES);
+    child.stdout.on("data", (chunk) => output.append(chunk));
+    child.once("error", () => resolve11({ installed: false }));
     child.once(
       "close",
-      (code) => resolve6(code === 0 ? { installed: true, version: output.trim() } : { installed: false })
+      (code) => resolve11(
+        code === 0 && !output.overflowed ? { installed: true, version: output.text().trim() } : { installed: false }
+      )
     );
   });
 }
 async function codexAuthenticated() {
-  return await new Promise((resolve6) => {
+  return await new Promise((resolve11) => {
     const child = spawn("codex", ["login", "status"], { stdio: ["ignore", "pipe", "pipe"] });
-    let output = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      output += chunk;
-    });
-    child.stderr.on("data", (chunk) => {
-      output += chunk;
-    });
-    child.once("error", () => resolve6(false));
-    child.once("close", (code) => resolve6(code === 0 && !/not logged in/i.test(output)));
+    const output = new BoundedTextCapture(ADAPTER_STDERR_LIMIT_BYTES);
+    child.stdout.on("data", (chunk) => output.append(chunk));
+    child.stderr.on("data", (chunk) => output.append(chunk));
+    child.once("error", () => resolve11(false));
+    child.once(
+      "close",
+      (code) => resolve11(code === 0 && !output.overflowed && !/not logged in/i.test(output.text()))
+    );
   });
 }
 var CodexAdapter = class {
@@ -33931,7 +34339,7 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve6) => child.once("close", (code) => resolve6(code ?? 1))
+      (resolve11) => child.once("close", (code) => resolve11(code ?? 1))
     );
     const abort = () => {
       child.kill("SIGTERM");
@@ -33939,33 +34347,41 @@ var CodexAdapter = class {
     signal.addEventListener("abort", abort, { once: true });
     child.stdin.end(renderPlannerPrompt(request));
     let lastMessage = "";
-    let stderr = "";
+    let lastMessageExceededLimit = false;
+    let protocolExceededLimit = false;
     let usage;
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
+    const stderr = captureStderr(child.stderr);
     try {
-      const lines = createInterface({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
-      for await (const line of lines) {
-        if (!line.trim()) continue;
+      for await (const line of readBoundedProtocolLines(child.stdout)) {
+        if (line.overflowed) {
+          protocolExceededLimit = true;
+          continue;
+        }
+        if (protocolExceededLimit || !line.text?.trim()) continue;
         let event;
         try {
-          event = JSON.parse(line);
+          event = JSON.parse(line.text);
         } catch {
           continue;
         }
         const item = event.item;
-        if (event.type === "item.completed" && item?.type === "agent_message")
-          lastMessage = String(item.text ?? "");
+        if (event.type === "item.completed" && item?.type === "agent_message") {
+          const candidate = String(item.text ?? "");
+          lastMessageExceededLimit = structuredOutputExceedsLimit(candidate);
+          lastMessage = lastMessageExceededLimit ? "" : candidate;
+        }
         if (event.type === "turn.completed") usage = codexUsage(event.usage);
       }
       const exitCode = await exitPromise;
       if (signal.aborted) throw new Error("Codex planning invocation aborted");
+      if (protocolExceededLimit) throw protocolLineLimitError("Codex");
+      if (lastMessageExceededLimit) {
+        throw structuredOutputLimitError("Codex", "structured graph plan");
+      }
       const plan = parseGraphPlan(lastMessage);
       if (exitCode !== 0 || !plan) {
         throw new Error(
-          stderr.trim() || `Codex exited ${exitCode} without a valid structured graph plan`
+          stderr.text().trim() || `Codex exited ${exitCode} without a valid structured graph plan`
         );
       }
       return { plan, ...usage ? { usage } : {} };
@@ -33985,39 +34401,47 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve6) => child.once("close", (code, closeSignal) => resolve6({ code, signal: closeSignal }))
+      (resolve11) => child.once("close", (code, closeSignal) => resolve11({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderSemanticVerifierPrompt(request.context));
     let lastMessage = "";
-    let stderr = "";
+    let lastMessageExceededLimit = false;
+    let protocolExceededLimit = false;
     let usage;
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
+    const stderr = captureStderr(child.stderr);
     try {
-      const lines = createInterface({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
-      for await (const line of lines) {
-        if (!line.trim()) continue;
+      for await (const line of readBoundedProtocolLines(child.stdout)) {
+        if (line.overflowed) {
+          protocolExceededLimit = true;
+          continue;
+        }
+        if (protocolExceededLimit || !line.text?.trim()) continue;
         let event;
         try {
-          event = JSON.parse(line);
+          event = JSON.parse(line.text);
         } catch {
           continue;
         }
         const item = event.item;
-        if (event.type === "item.completed" && item?.type === "agent_message")
-          lastMessage = String(item.text ?? "");
+        if (event.type === "item.completed" && item?.type === "agent_message") {
+          const candidate = String(item.text ?? "");
+          lastMessageExceededLimit = structuredOutputExceedsLimit(candidate);
+          lastMessage = lastMessageExceededLimit ? "" : candidate;
+        }
         if (event.type === "turn.completed") usage = codexUsage(event.usage);
       }
       const exit = await exitPromise;
       const termination = terminationController.finish(exit.code, exit.signal);
       if (termination) throw new HostTerminationError(termination);
+      if (protocolExceededLimit) throw protocolLineLimitError("Codex");
+      if (lastMessageExceededLimit) {
+        throw structuredOutputLimitError("Codex", "semantic verdict");
+      }
       const verdict = parseSemanticVerdict(lastMessage);
       if (exit.code !== 0 || !verdict) {
         throw new Error(
-          stderr.trim() || `Codex exited ${exit.code ?? 1} without a valid semantic verdict`
+          stderr.text().trim() || `Codex exited ${exit.code ?? 1} without a valid semantic verdict`
         );
       }
       return { verdict, ...usage ? { usage } : {} };
@@ -34038,26 +34462,33 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve6) => child.once("close", (code, closeSignal) => resolve6({ code, signal: closeSignal }))
+      (resolve11) => child.once("close", (code, closeSignal) => resolve11({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderWorkerPrompt(request.capsule));
-    yield { type: "started", invocationId: request.invocationId };
     let lastMessage = "";
-    let stderr = "";
+    let lastMessageExceededLimit = false;
+    let protocolExceededLimit = false;
     let observedSessionId;
     let sessionReported = false;
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
+    const stderr = captureStderr(child.stderr);
+    const protocolLines = readBoundedProtocolLines(child.stdout)[Symbol.asyncIterator]();
+    let nextProtocolLine = protocolLines.next();
+    yield { type: "started", invocationId: request.invocationId };
     try {
-      const lines = createInterface({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
-      for await (const line of lines) {
-        if (!line.trim()) continue;
+      while (true) {
+        const next = await nextProtocolLine;
+        if (next.done) break;
+        nextProtocolLine = protocolLines.next();
+        const line = next.value;
+        if (line.overflowed) {
+          protocolExceededLimit = true;
+          continue;
+        }
+        if (protocolExceededLimit || !line.text?.trim()) continue;
         let event;
         try {
-          event = JSON.parse(line);
+          event = JSON.parse(line.text);
         } catch {
           continue;
         }
@@ -34070,8 +34501,10 @@ var CodexAdapter = class {
           yield { type: "session", hostSessionId: observedSessionId };
         }
         if (type === "item.completed" && item?.type === "agent_message") {
-          lastMessage = String(item.text ?? "");
-          yield { type: "message", text: lastMessage };
+          const candidate = String(item.text ?? "");
+          lastMessageExceededLimit = structuredOutputExceedsLimit(candidate);
+          lastMessage = lastMessageExceededLimit ? "" : candidate;
+          if (!lastMessageExceededLimit) yield { type: "message", text: lastMessage };
         } else if ((type === "item.started" || type === "item.completed") && item?.type) {
           yield {
             type: "tool",
@@ -34091,11 +34524,22 @@ var CodexAdapter = class {
         yield { type: "terminated", termination };
         return;
       }
+      if (protocolExceededLimit) {
+        yield { type: "error", message: protocolLineLimitError("Codex").message };
+        return;
+      }
+      if (lastMessageExceededLimit) {
+        yield {
+          type: "error",
+          message: structuredOutputLimitError("Codex", "structured result").message
+        };
+        return;
+      }
       const result = parseJsonResult(lastMessage);
       if (exit.code !== 0 || !result) {
         yield {
           type: "error",
-          message: stderr.trim() || `Codex exited ${exit.code ?? 1} without a valid structured result`,
+          message: stderr.text().trim() || `Codex exited ${exit.code ?? 1} without a valid structured result`,
           cause: "host_crash"
         };
         return;
@@ -34176,7 +34620,122 @@ function codexSemanticVerifierArgs(request, schemaPath, policy) {
 
 // packages/adapter-claude/src/index.ts
 import { spawn as spawn2 } from "node:child_process";
-import { createInterface as createInterface2 } from "node:readline";
+
+// packages/adapter-claude/src/protocol.ts
+var KIB2 = 1024;
+var MIB2 = 1024 * KIB2;
+var ADAPTER_STDERR_LIMIT_BYTES2 = 8 * KIB2;
+var ADAPTER_PROTOCOL_LINE_LIMIT_BYTES2 = 2 * MIB2;
+var ADAPTER_STRUCTURED_OUTPUT_LIMIT_BYTES2 = MIB2;
+function decodeUtf8Prefix2(source) {
+  for (let trim = 0; trim <= Math.min(3, source.length); trim += 1) {
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(
+        source.subarray(0, source.length - trim)
+      );
+    } catch {
+    }
+  }
+  return source.toString("utf8");
+}
+var BoundedTextCapture2 = class {
+  constructor(limitBytes) {
+    this.limitBytes = limitBytes;
+  }
+  limitBytes;
+  chunks = [];
+  observedBytes = 0;
+  retainedBytes = 0;
+  append(chunk) {
+    const source = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+    this.observedBytes += source.length;
+    const available = Math.max(0, this.limitBytes - this.retainedBytes);
+    if (available === 0) return;
+    const retained = Buffer.from(source.subarray(0, available));
+    this.chunks.push(retained);
+    this.retainedBytes += retained.length;
+  }
+  get overflowed() {
+    return this.observedBytes > this.limitBytes;
+  }
+  text() {
+    const prefix = decodeUtf8Prefix2(Buffer.concat(this.chunks, this.retainedBytes));
+    if (!this.overflowed) return prefix;
+    const separator = prefix.length > 0 && !prefix.endsWith("\n") ? "\n" : "";
+    return `${prefix}${separator}[Graphcraft truncated host stderr after ${this.limitBytes} bytes]`;
+  }
+};
+function captureStderr2(stream) {
+  const capture = new BoundedTextCapture2(ADAPTER_STDERR_LIMIT_BYTES2);
+  stream.on("data", (chunk) => capture.append(chunk));
+  return capture;
+}
+var LineAccumulator2 = class {
+  chunks = [];
+  observedBytes = 0;
+  retainedBytes = 0;
+  append(source) {
+    this.observedBytes += source.length;
+    const available = Math.max(0, ADAPTER_PROTOCOL_LINE_LIMIT_BYTES2 - this.retainedBytes);
+    if (available === 0) return;
+    const retained = Buffer.from(source.subarray(0, available));
+    this.chunks.push(retained);
+    this.retainedBytes += retained.length;
+  }
+  finish() {
+    const observedBytes = this.observedBytes;
+    const overflowed = observedBytes > ADAPTER_PROTOCOL_LINE_LIMIT_BYTES2;
+    if (overflowed) return { observedBytes, overflowed };
+    let source = Buffer.concat(this.chunks, this.retainedBytes);
+    if (source.at(-1) === 13) source = source.subarray(0, -1);
+    return { observedBytes, overflowed, text: source.toString("utf8") };
+  }
+  get empty() {
+    return this.observedBytes === 0;
+  }
+};
+async function* readBoundedProtocolLines2(stream) {
+  let line = new LineAccumulator2();
+  for await (const chunk of stream) {
+    const source = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    let offset = 0;
+    while (offset < source.length) {
+      const newline = source.indexOf(10, offset);
+      if (newline === -1) {
+        line.append(source.subarray(offset));
+        break;
+      }
+      line.append(source.subarray(offset, newline));
+      yield line.finish();
+      line = new LineAccumulator2();
+      offset = newline + 1;
+    }
+  }
+  if (!line.empty) yield line.finish();
+}
+function structuredOutputExceedsLimit2(value) {
+  if (typeof value === "string") {
+    return Buffer.byteLength(value) > ADAPTER_STRUCTURED_OUTPUT_LIMIT_BYTES2;
+  }
+  try {
+    const serialized = JSON.stringify(value);
+    return typeof serialized === "string" && Buffer.byteLength(serialized) > ADAPTER_STRUCTURED_OUTPUT_LIMIT_BYTES2;
+  } catch {
+    return false;
+  }
+}
+function protocolLineLimitError2(host) {
+  return new Error(
+    `${host} protocol line exceeded the ${ADAPTER_PROTOCOL_LINE_LIMIT_BYTES2}-byte limit; output was rejected`
+  );
+}
+function structuredOutputLimitError2(host, kind) {
+  return new Error(
+    `${host} ${kind} exceeded the ${ADAPTER_STRUCTURED_OUTPUT_LIMIT_BYTES2}-byte structured-output limit; output was rejected`
+  );
+}
+
+// packages/adapter-claude/src/index.ts
 function parseResult(value) {
   if (typeof value === "object" && value !== null) {
     const parsed = WorkerResultSchema.safeParse(value);
@@ -34217,37 +34776,37 @@ function claudeUsage(value) {
   return normalizeTokenUsage("claude", value);
 }
 async function claudeVersion() {
-  return await new Promise((resolve6) => {
+  return await new Promise((resolve11) => {
     const child = spawn2("claude", ["--version"], { stdio: ["ignore", "pipe", "ignore"] });
-    let output = "";
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      output += chunk;
-    });
-    child.once("error", () => resolve6({ installed: false }));
+    const output = new BoundedTextCapture2(ADAPTER_STDERR_LIMIT_BYTES2);
+    child.stdout.on("data", (chunk) => output.append(chunk));
+    child.once("error", () => resolve11({ installed: false }));
     child.once(
       "close",
-      (code) => resolve6(code === 0 ? { installed: true, version: output.trim() } : { installed: false })
+      (code) => resolve11(
+        code === 0 && !output.overflowed ? { installed: true, version: output.text().trim() } : { installed: false }
+      )
     );
   });
 }
 async function claudeAuthenticated() {
-  return await new Promise((resolve6) => {
+  return await new Promise((resolve11) => {
     const child = spawn2("claude", ["auth", "status", "--json"], {
       stdio: ["ignore", "pipe", "ignore"]
     });
-    let output = "";
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      output += chunk;
-    });
-    child.once("error", () => resolve6(false));
+    const output = new BoundedTextCapture2(ADAPTER_STDERR_LIMIT_BYTES2);
+    child.stdout.on("data", (chunk) => output.append(chunk));
+    child.once("error", () => resolve11(false));
     child.once("close", (code) => {
+      if (output.overflowed) {
+        resolve11(false);
+        return;
+      }
       try {
-        const status2 = JSON.parse(output);
-        resolve6(code === 0 && status2.loggedIn === true);
+        const status3 = JSON.parse(output.text());
+        resolve11(code === 0 && status3.loggedIn === true);
       } catch {
-        resolve6(false);
+        resolve11(false);
       }
     });
   });
@@ -34277,39 +34836,46 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve6) => child.once("close", (code) => resolve6(code ?? 1))
+      (resolve11) => child.once("close", (code) => resolve11(code ?? 1))
     );
     const abort = () => {
       child.kill("SIGTERM");
     };
     signal.addEventListener("abort", abort, { once: true });
-    let stderr = "";
+    let protocolExceededLimit = false;
+    let structuredExceededLimit = false;
     let plan;
     let usage;
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
+    const stderr = captureStderr2(child.stderr);
     try {
-      const lines = createInterface2({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
-      for await (const line of lines) {
-        if (!line.trim()) continue;
+      for await (const line of readBoundedProtocolLines2(child.stdout)) {
+        if (line.overflowed) {
+          protocolExceededLimit = true;
+          continue;
+        }
+        if (protocolExceededLimit || !line.text?.trim()) continue;
         let event;
         try {
-          event = JSON.parse(line);
+          event = JSON.parse(line.text);
         } catch {
           continue;
         }
         if (event.type === "result") {
-          plan = parsePlan(event.structured_output ?? event.result);
+          const candidate = event.structured_output ?? event.result;
+          structuredExceededLimit = structuredOutputExceedsLimit2(candidate);
+          plan = structuredExceededLimit ? void 0 : parsePlan(candidate);
           usage = claudeUsage(event.usage);
         }
       }
       const exitCode = await exitPromise;
       if (signal.aborted) throw new Error("Claude planning invocation aborted");
+      if (protocolExceededLimit) throw protocolLineLimitError2("Claude");
+      if (structuredExceededLimit) {
+        throw structuredOutputLimitError2("Claude", "structured graph plan");
+      }
       if (exitCode !== 0 || !plan) {
         throw new Error(
-          stderr.trim() || `Claude exited ${exitCode} without a valid structured graph plan`
+          stderr.text().trim() || `Claude exited ${exitCode} without a valid structured graph plan`
         );
       }
       return { plan, ...usage ? { usage } : {} };
@@ -34325,37 +34891,44 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve6) => child.once("close", (code, closeSignal) => resolve6({ code, signal: closeSignal }))
+      (resolve11) => child.once("close", (code, closeSignal) => resolve11({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
-    let stderr = "";
+    let protocolExceededLimit = false;
+    let structuredExceededLimit = false;
     let verdict;
     let usage;
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
+    const stderr = captureStderr2(child.stderr);
     try {
-      const lines = createInterface2({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
-      for await (const line of lines) {
-        if (!line.trim()) continue;
+      for await (const line of readBoundedProtocolLines2(child.stdout)) {
+        if (line.overflowed) {
+          protocolExceededLimit = true;
+          continue;
+        }
+        if (protocolExceededLimit || !line.text?.trim()) continue;
         let event;
         try {
-          event = JSON.parse(line);
+          event = JSON.parse(line.text);
         } catch {
           continue;
         }
         if (event.type === "result") {
-          verdict = parseSemanticVerdict2(event.structured_output ?? event.result);
+          const candidate = event.structured_output ?? event.result;
+          structuredExceededLimit = structuredOutputExceedsLimit2(candidate);
+          verdict = structuredExceededLimit ? void 0 : parseSemanticVerdict2(candidate);
           usage = claudeUsage(event.usage);
         }
       }
       const exit = await exitPromise;
       const termination = terminationController.finish(exit.code, exit.signal);
       if (termination) throw new HostTerminationError(termination);
+      if (protocolExceededLimit) throw protocolLineLimitError2("Claude");
+      if (structuredExceededLimit) {
+        throw structuredOutputLimitError2("Claude", "semantic verdict");
+      }
       if (exit.code !== 0 || !verdict) {
         throw new Error(
-          stderr.trim() || `Claude exited ${exit.code ?? 1} without a valid semantic verdict`
+          stderr.text().trim() || `Claude exited ${exit.code ?? 1} without a valid semantic verdict`
         );
       }
       return { verdict, ...usage ? { usage } : {} };
@@ -34372,66 +34945,85 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve6) => child.once("close", (code, closeSignal) => resolve6({ code, signal: closeSignal }))
+      (resolve11) => child.once("close", (code, closeSignal) => resolve11({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
-    yield { type: "started", invocationId: request.invocationId };
-    let stderr = "";
+    let protocolExceededLimit = false;
+    let structuredExceededLimit = false;
     let finalResult;
     let observedSessionId;
     let sessionReported = false;
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
-    const lines = createInterface2({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
-    for await (const line of lines) {
-      if (!line.trim()) continue;
-      let event;
-      try {
-        event = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      const type = String(event.type ?? "");
-      if (typeof event.session_id === "string") observedSessionId = event.session_id;
-      if (!sessionReported && observedSessionId && (type === "assistant" || type === "result")) {
-        sessionReported = true;
-        yield { type: "session", hostSessionId: observedSessionId };
-      }
-      if (type === "assistant") {
-        const message = event.message;
-        const blocks = Array.isArray(message?.content) ? message.content : [];
-        for (const value of blocks) {
-          const block = value;
-          if (block.type === "text") yield { type: "message", text: String(block.text ?? "") };
-          if (block.type === "tool_use") {
-            yield { type: "tool", name: String(block.name ?? "tool"), summary: "tool call" };
+    const stderr = captureStderr2(child.stderr);
+    const protocolLines = readBoundedProtocolLines2(child.stdout)[Symbol.asyncIterator]();
+    let nextProtocolLine = protocolLines.next();
+    yield { type: "started", invocationId: request.invocationId };
+    try {
+      while (true) {
+        const next = await nextProtocolLine;
+        if (next.done) break;
+        nextProtocolLine = protocolLines.next();
+        const line = next.value;
+        if (line.overflowed) {
+          protocolExceededLimit = true;
+          continue;
+        }
+        if (protocolExceededLimit || !line.text?.trim()) continue;
+        let event;
+        try {
+          event = JSON.parse(line.text);
+        } catch {
+          continue;
+        }
+        const type = String(event.type ?? "");
+        if (typeof event.session_id === "string") observedSessionId = event.session_id;
+        if (!sessionReported && observedSessionId && (type === "assistant" || type === "result")) {
+          sessionReported = true;
+          yield { type: "session", hostSessionId: observedSessionId };
+        }
+        if (type === "assistant") {
+          const message = event.message;
+          const blocks = Array.isArray(message?.content) ? message.content : [];
+          for (const value of blocks) {
+            const block = value;
+            if (block.type === "text") yield { type: "message", text: String(block.text ?? "") };
+            if (block.type === "tool_use") {
+              yield { type: "tool", name: String(block.name ?? "tool"), summary: "tool call" };
+            }
           }
         }
+        if (type === "result") {
+          const candidate = event.structured_output ?? event.result;
+          structuredExceededLimit = structuredOutputExceedsLimit2(candidate);
+          finalResult = structuredExceededLimit ? void 0 : parseResult(candidate);
+          yield {
+            type: "usage",
+            usage: claudeUsage(event.usage)
+          };
+        }
       }
-      if (type === "result") {
-        finalResult = parseResult(event.structured_output ?? event.result);
+      const exit = await exitPromise;
+      const termination = terminationController.finish(exit.code, exit.signal);
+      if (termination) {
+        yield { type: "terminated", termination };
+      } else if (protocolExceededLimit) {
+        yield { type: "error", message: protocolLineLimitError2("Claude").message };
+      } else if (structuredExceededLimit) {
         yield {
-          type: "usage",
-          usage: claudeUsage(event.usage)
+          type: "error",
+          message: structuredOutputLimitError2("Claude", "structured result").message
         };
+      } else if (exit.code !== 0 || !finalResult) {
+        yield {
+          type: "error",
+          message: stderr.text().trim() || `Claude exited ${exit.code ?? 1} without a valid structured result`,
+          cause: "host_crash"
+        };
+      } else {
+        yield { type: "result", result: finalResult };
       }
+    } finally {
+      terminationController.dispose();
     }
-    const exit = await exitPromise;
-    const termination = terminationController.finish(exit.code, exit.signal);
-    if (termination) {
-      yield { type: "terminated", termination };
-    } else if (exit.code !== 0 || !finalResult) {
-      yield {
-        type: "error",
-        message: stderr.trim() || `Claude exited ${exit.code ?? 1} without a valid structured result`,
-        cause: "host_crash"
-      };
-    } else {
-      yield { type: "result", result: finalResult };
-    }
-    terminationController.dispose();
   }
   async reconcile(invocation) {
     return reconcilePersistedInvocation(invocation);
@@ -34679,7 +35271,7 @@ var GitHubCommandError = class extends Error {
 async function runCommand(options, args) {
   const command = options.command ?? "gh";
   const commandArgs = [...options.commandArgs ?? [], ...args];
-  return await new Promise((resolve6, reject) => {
+  return await new Promise((resolve11, reject) => {
     const child = spawn3(command, commandArgs, {
       cwd: options.cwd,
       env: options.env ?? process.env,
@@ -34727,7 +35319,7 @@ async function runCommand(options, args) {
       if (forceTimer) clearTimeout(forceTimer);
       if (failure) return reject(new GitHubCommandError(failure, exitCode ?? 1));
       const code = exitCode ?? 1;
-      if (code === 0) resolve6({ stdout, stderr });
+      if (code === 0) resolve11({ stdout, stderr });
       else
         reject(
           new GitHubCommandError(
@@ -35536,7 +36128,7 @@ function requiredCheckBucket(required2, checks) {
   if (required2.state === "missing" || required2.state === "unknown") return "missing";
   const observations = required2.matchingCheckIds.map((id) => checks.get(id)).filter((value) => value !== void 0);
   const signals = observations.map(
-    ({ conclusion, status: status2 }) => (conclusion ?? status2).toUpperCase()
+    ({ conclusion, status: status3 }) => (conclusion ?? status3).toUpperCase()
   );
   if (signals.some((value) => ["FAILURE", "TIMED_OUT", "ACTION_REQUIRED"].includes(value)))
     return "actionable";
@@ -35593,22 +36185,22 @@ function classifyGitHubPullRequestLifecycle(snapshotInput, expectedInput) {
     cancelled: ids("cancelled"),
     pending: [.../* @__PURE__ */ new Set([...ids("pending"), ...ids("missing")])].sort()
   };
-  let status2;
-  if (!exactBinding) status2 = "stale";
-  else if (snapshot.pullRequest.state.toUpperCase() !== "OPEN") status2 = "blocked";
-  else if (snapshot.pullRequest.isDraft) status2 = "human_decision";
-  else if (unresolvedThreadIds.length > 0) status2 = "review_required";
-  else if (snapshot.pullRequest.reviewDecision === "CHANGES_REQUESTED") status2 = "human_decision";
+  let status3;
+  if (!exactBinding) status3 = "stale";
+  else if (snapshot.pullRequest.state.toUpperCase() !== "OPEN") status3 = "blocked";
+  else if (snapshot.pullRequest.isDraft) status3 = "human_decision";
+  else if (unresolvedThreadIds.length > 0) status3 = "review_required";
+  else if (snapshot.pullRequest.reviewDecision === "CHANGES_REQUESTED") status3 = "human_decision";
   else if (snapshot.pullRequest.mergeable.toUpperCase() === "CONFLICTING")
-    status2 = "actionable_failure";
-  else if (counts.requiredChecksActionableFailure > 0) status2 = "actionable_failure";
-  else if (counts.requiredChecksInfrastructureFailure > 0) status2 = "infrastructure_failure";
-  else if (counts.requiredChecksCancelled > 0) status2 = "cancelled";
+    status3 = "actionable_failure";
+  else if (counts.requiredChecksActionableFailure > 0) status3 = "actionable_failure";
+  else if (counts.requiredChecksInfrastructureFailure > 0) status3 = "infrastructure_failure";
+  else if (counts.requiredChecksCancelled > 0) status3 = "cancelled";
   else if (counts.requiredChecksPending > 0 || counts.requiredChecksMissingOrUnknown > 0 || currentApprovals < requiredApprovals || snapshot.pullRequest.reviewDecision === "REVIEW_REQUIRED" || snapshot.pullRequest.mergeable.toUpperCase() === "UNKNOWN")
-    status2 = "waiting";
-  else status2 = "green";
+    status3 = "waiting";
+  else status3 = "green";
   const stableEvidence = {
-    status: status2,
+    status: status3,
     binding: {
       host: snapshot.repository.host,
       nameWithOwner: snapshot.repository.nameWithOwner,
@@ -35637,14 +36229,14 @@ function classifyGitHubPullRequestLifecycle(snapshotInput, expectedInput) {
     latestReviews
   };
   const evidence = [
-    `Lifecycle status is ${status2} for PR #${snapshot.pullRequest.number} at ${snapshot.binding.headSha}/${snapshot.binding.baseSha}`,
+    `Lifecycle status is ${status3} for PR #${snapshot.pullRequest.number} at ${snapshot.binding.headSha}/${snapshot.binding.baseSha}`,
     `${counts.requiredChecksSucceeded}/${counts.requiredChecksTotal} required checks succeeded; ${counts.requiredChecksPending} pending, ${counts.requiredChecksActionableFailure} actionable, ${counts.requiredChecksInfrastructureFailure} infrastructure, ${counts.requiredChecksCancelled} cancelled, ${counts.requiredChecksMissingOrUnknown} missing or unknown`,
     `${counts.unresolvedReviewThreads} unresolved current review threads; ${counts.currentApprovals}/${counts.requiredApprovals} required approvals observed`
   ];
   return GitHubPullRequestLifecycleClassificationSchema.parse({
     schemaVersion: 1,
     snapshotId: snapshot.snapshotId,
-    status: status2,
+    status: status3,
     counts,
     checkIds,
     unresolvedThreadIds,
@@ -35737,21 +36329,27 @@ async function captureGitHubPullRequestSnapshot(options) {
 }
 
 // packages/runtime/src/amendment.ts
-import { join as join2 } from "node:path";
+import { join as join3 } from "node:path";
 
 // packages/runtime/src/lock.ts
 import { hostname as hostname3 } from "node:os";
 import { randomUUID as randomUUID3 } from "node:crypto";
-import { mkdir as mkdir2, open, readFile, stat, unlink } from "node:fs/promises";
-import { dirname as dirname2 } from "node:path";
+import { open as open3, stat, unlink } from "node:fs/promises";
+import { basename, dirname as dirname3 } from "node:path";
 
 // packages/runtime/src/json.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
-import { mkdir, rename, writeFile as writeFile2 } from "node:fs/promises";
+import { mkdir, open, rename, rm as rm2 } from "node:fs/promises";
 import { dirname } from "node:path";
 
 // packages/runtime/src/redaction.ts
 var secretKey = /(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|passwd|credential)/i;
+var quotedJsonMemberPattern = /("(?:\\.|[^"\\])*")(\s*:\s*)("(?:\\.|[^"\\])*")/g;
+var quotedAssignmentPatterns = [
+  /\b((?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*[=:]\s*)("(?:\\.|[^"\\])*")/g,
+  /\b((?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*[=:]\s*)('(?:\\.|[^'\\])*')/g
+];
+var unquotedAssignmentPattern = /\b((?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*[=:]\s*)([^\s,;"']+)/g;
 var secretPatterns = [
   /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g,
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
@@ -35761,9 +36359,8 @@ var secretPatterns = [
   /\bAKIA[A-Z0-9]{16}\b/g,
   /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g,
   /\bAuthorization\s*:\s*(?:Bearer|Basic)\s+[^\s,;"'\])}]+/gi,
-  /\b(?:token|password|passwd|secret|api[_-]?key|access[_-]?token)\s*[=:]\s*[^\s,;"'\])}]+/gi,
   /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi,
-  /([?&](?:access_token|refresh_token|token|api[_-]?key|password|secret)=)[^&#\s"'\])}]+/gi
+  /([?&](?:access_token|refresh_token|token|api[_-]?key|password|secret)=)(?:\[REDACTED\]|[^&#\s"'\])}]+)/gi
 ];
 function configuredSensitiveValues() {
   return [
@@ -35775,6 +36372,23 @@ function configuredSensitiveValues() {
 function redactString(value, configured = configuredSensitiveValues()) {
   let result = value;
   for (const sensitive of configured) result = result.split(sensitive).join("[REDACTED]");
+  result = result.replace(
+    quotedJsonMemberPattern,
+    (match, encodedKey, separator, encodedValue) => {
+      try {
+        const key = JSON.parse(encodedKey);
+        if (!secretKey.test(key) || JSON.parse(encodedValue) === "[REDACTED]") return match;
+      } catch {
+        return match;
+      }
+      return `${encodedKey}${separator}"[REDACTED]"`;
+    }
+  );
+  for (const pattern of quotedAssignmentPatterns)
+    result = result.replace(
+      pattern,
+      (match, prefix, key, encodedValue) => !secretKey.test(key) || encodedValue === '"[REDACTED]"' || encodedValue === "'[REDACTED]'" ? match : `${prefix}${encodedValue[0]}[REDACTED]${encodedValue[0]}`
+    );
   for (const pattern of secretPatterns)
     result = result.replace(pattern, (match, schemeOrPrefix) => {
       if (match.includes("://") && schemeOrPrefix) return `${schemeOrPrefix}[REDACTED]@`;
@@ -35782,28 +36396,182 @@ function redactString(value, configured = configuredSensitiveValues()) {
         return `${schemeOrPrefix}[REDACTED]`;
       return "[REDACTED]";
     });
+  result = result.replace(
+    unquotedAssignmentPattern,
+    (match, prefix, key, assignmentValue) => !secretKey.test(key) || assignmentValue === "[REDACTED]" ? match : `${prefix}[REDACTED]`
+  );
   return result;
 }
-function redact(value, key, configured) {
+var MAX_STRUCTURED_REDACTION_DEPTH = 512;
+function redact(value, key, configured, depth = 0) {
+  if (depth > MAX_STRUCTURED_REDACTION_DEPTH)
+    throw new Error("Structured value exceeds the safe redaction depth");
   if (secretKey.test(key)) return "[REDACTED]";
   if (typeof value === "string") return redactString(value, configured);
-  if (Array.isArray(value)) return value.map((item) => redact(item, "", configured));
+  if (Array.isArray(value)) return value.map((item) => redact(item, "", configured, depth + 1));
   if (value && typeof value === "object")
     return Object.fromEntries(
-      Object.entries(value).map(([name, item]) => [name, redact(item, name, configured)])
+      Object.entries(value).map(([name, item]) => [
+        name,
+        redact(item, name, configured, depth + 1)
+      ])
     );
   return value;
 }
 function redactValue(value) {
   return redact(value, "", configuredSensitiveValues());
 }
+function skipJsonWhitespace(source, start) {
+  let index = start;
+  while (index < source.length && /[\t\n\r ]/u.test(source[index])) index += 1;
+  return index;
+}
+function scanJsonString(source, start) {
+  let index = start + 1;
+  while (index < source.length) {
+    if (source[index] === "\\") {
+      index += 2;
+      continue;
+    }
+    if (source[index] === '"') return index + 1;
+    index += 1;
+  }
+  throw new Error("Validated JSON string was unexpectedly unterminated");
+}
+function redactJsonTokens(source, configured) {
+  const replacements = [];
+  let scanValue;
+  const scanObject = (start, collect) => {
+    let index = skipJsonWhitespace(source, start + 1);
+    if (source[index] === "}") return index + 1;
+    while (index < source.length) {
+      const keyStart = index;
+      const keyEnd = scanJsonString(source, keyStart);
+      const key = JSON.parse(source.slice(keyStart, keyEnd));
+      const redactedKey = redactString(key, configured);
+      if (collect && redactedKey !== key)
+        replacements.push({ start: keyStart, end: keyEnd, value: JSON.stringify(redactedKey) });
+      index = skipJsonWhitespace(source, keyEnd);
+      index = skipJsonWhitespace(source, index + 1);
+      const valueStart = index;
+      const sensitive = collect && secretKey.test(key);
+      const valueEnd = scanValue(valueStart, collect && !sensitive);
+      if (sensitive && JSON.parse(source.slice(valueStart, valueEnd)) !== "[REDACTED]")
+        replacements.push({ start: valueStart, end: valueEnd, value: '"[REDACTED]"' });
+      index = skipJsonWhitespace(source, valueEnd);
+      if (source[index] === "}") return index + 1;
+      index = skipJsonWhitespace(source, index + 1);
+    }
+    throw new Error("Validated JSON object was unexpectedly unterminated");
+  };
+  const scanArray = (start, collect) => {
+    let index = skipJsonWhitespace(source, start + 1);
+    if (source[index] === "]") return index + 1;
+    while (index < source.length) {
+      index = skipJsonWhitespace(source, scanValue(index, collect));
+      if (source[index] === "]") return index + 1;
+      index = skipJsonWhitespace(source, index + 1);
+    }
+    throw new Error("Validated JSON array was unexpectedly unterminated");
+  };
+  scanValue = (start, collect) => {
+    const index = skipJsonWhitespace(source, start);
+    if (source[index] === "{") return scanObject(index, collect);
+    if (source[index] === "[") return scanArray(index, collect);
+    if (source[index] === '"') {
+      const end2 = scanJsonString(source, index);
+      if (collect) {
+        const value = JSON.parse(source.slice(index, end2));
+        const redacted = redactString(value, configured);
+        if (redacted !== value)
+          replacements.push({ start: index, end: end2, value: JSON.stringify(redacted) });
+      }
+      return end2;
+    }
+    let end = index;
+    while (end < source.length && !/[\t\n\r ,\]}]/u.test(source[end])) end += 1;
+    return end;
+  };
+  scanValue(source.startsWith("\uFEFF") ? 1 : 0, true);
+  if (replacements.length === 0) return source;
+  const chunks = [];
+  let cursor = 0;
+  for (const replacement of replacements.sort((left, right) => left.start - right.start)) {
+    if (replacement.start < cursor)
+      throw new Error("Validated JSON produced overlapping redaction ranges");
+    chunks.push(source.slice(cursor, replacement.start), replacement.value);
+    cursor = replacement.end;
+  }
+  chunks.push(source.slice(cursor));
+  return chunks.join("");
+}
+function replaceJsonValue(source, value, configured) {
+  const bom = source.startsWith("\uFEFF") ? "\uFEFF" : "";
+  const body = bom ? source.slice(1) : source;
+  const leading = body.match(/^[\t\n\r ]*/u)?.[0] ?? "";
+  const trailing = body.match(/[\t\n\r ]*$/u)?.[0] ?? "";
+  const tokenRedacted = redactJsonTokens(JSON.stringify(value), configured);
+  const serialized = redactString(tokenRedacted, configured) === tokenRedacted ? tokenRedacted : JSON.stringify("[REDACTED]");
+  return `${bom}${leading}${serialized}${trailing}`;
+}
+function redactJsonDocument(source, configured) {
+  const bom = source.startsWith("\uFEFF") ? source.slice(1) : source;
+  let parsed;
+  try {
+    parsed = JSON.parse(bom);
+  } catch (error51) {
+    if (!(error51 instanceof SyntaxError)) throw error51;
+    return { matched: false, value: source };
+  }
+  const redacted = redact(parsed, "", configured);
+  if (JSON.stringify(redacted) !== JSON.stringify(parsed))
+    return { matched: true, value: replaceJsonValue(source, redacted, configured) };
+  const tokenRedacted = redactJsonTokens(source, configured);
+  return {
+    matched: true,
+    value: redactString(tokenRedacted, configured) === tokenRedacted ? tokenRedacted : replaceJsonValue(source, "[REDACTED]", configured)
+  };
+}
+function redactJsonLines(source, configured) {
+  const parts = source.split(/(\r\n|\n|\r)/u);
+  let records = 0;
+  let changed = false;
+  for (let index = 0; index < parts.length; index += 2) {
+    const line = parts[index];
+    if (/^[\t ]*$/u.test(line)) continue;
+    const redacted = redactJsonDocument(line, configured);
+    if (!redacted.matched) return { matched: false, value: source };
+    records += 1;
+    if (redacted.value !== line) {
+      parts[index] = redacted.value;
+      changed = true;
+    }
+  }
+  return {
+    matched: records > 0,
+    value: changed ? parts.join("") : source
+  };
+}
 function redactTextBytes(value) {
   const bytes = typeof value === "string" ? Buffer.from(value) : Buffer.from(value);
+  let text;
   try {
-    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    return Buffer.from(redactString(text));
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
   } catch {
     return Buffer.from(redactString(bytes.toString("latin1")), "latin1");
+  }
+  try {
+    const configured = configuredSensitiveValues();
+    const document = redactJsonDocument(text, configured);
+    if (document.matched) return Buffer.from(document.value);
+    const lines = redactJsonLines(text, configured);
+    if (!lines.matched) return Buffer.from(redactString(text, configured));
+    if (redactString(lines.value, configured) === lines.value) return Buffer.from(lines.value);
+    const bom = text.startsWith("\uFEFF") ? "\uFEFF" : "";
+    const ending = text.endsWith("\r\n") ? "\r\n" : text.endsWith("\r") ? "\r" : "\n";
+    return Buffer.from(`${bom}"[REDACTED]"${ending}`);
+  } catch (error51) {
+    throw new Error("Text could not be redacted safely", { cause: error51 });
   }
 }
 function assertPersistenceSafe(value, label) {
@@ -35815,15 +36583,579 @@ function assertPersistenceSafe(value, label) {
 async function writeJsonAtomic(path, value) {
   await mkdir(dirname(path), { recursive: true });
   const temporaryPath = `${path}.${process.pid}.${randomUUID2()}.tmp`;
-  await writeFile2(temporaryPath, `${JSON.stringify(redactValue(value), null, 2)}
-`, {
-    encoding: "utf8",
-    mode: 384
+  try {
+    const handle = await open(temporaryPath, "wx", 384);
+    try {
+      await handle.writeFile(`${JSON.stringify(redactValue(value), null, 2)}
+`, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await replacePathAtomic(temporaryPath, path);
+  } catch (error51) {
+    await rm2(temporaryPath, { force: true }).catch(() => void 0);
+    throw error51;
+  }
+}
+async function syncDirectory(path) {
+  if (process.platform === "win32") return;
+  const handle = await open(path, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+async function replacePathAtomic(temporaryPath, path) {
+  const retryable = /* @__PURE__ */ new Set(["EACCES", "EBUSY", "EPERM"]);
+  const deadline = Date.now() + 2e3;
+  let delayMs = 5;
+  while (true) {
+    try {
+      await rename(temporaryPath, path);
+      break;
+    } catch (error51) {
+      if (!retryable.has(error51.code ?? "") || Date.now() >= deadline)
+        throw error51;
+      await new Promise((resolve11) => setTimeout(resolve11, delayMs));
+      delayMs = Math.min(100, delayMs * 2);
+    }
+  }
+  const sourceDirectory = dirname(temporaryPath);
+  const targetDirectory = dirname(path);
+  await syncDirectory(targetDirectory);
+  if (sourceDirectory !== targetDirectory) await syncDirectory(sourceDirectory);
+}
+
+// packages/runtime/src/secure-fs.ts
+import { spawn as spawn4 } from "node:child_process";
+import { constants as fsConstants } from "node:fs";
+import { chmod, lstat, mkdir as mkdir2, open as open2, readdir } from "node:fs/promises";
+import { dirname as dirname2, isAbsolute as isAbsolute2, join as join2, relative, resolve, sep, win32 } from "node:path";
+var PRIVATE_DIRECTORY_MODE = 448;
+var PRIVATE_FILE_MODE = 384;
+var WINDOWS_ACL_TIMEOUT_MS = 12e4;
+var WINDOWS_ACL_OUTPUT_LIMIT_BYTES = 64 * 1024;
+var WINDOWS_ACL_CACHE_LIMIT = 4096;
+var DARWIN_ACL_TIMEOUT_MS = 3e4;
+var DARWIN_ACL_BATCH_MAX_ENTRIES = 256;
+var DARWIN_ACL_BATCH_MAX_ARGUMENT_BYTES = 64 * 1024;
+var DARWIN_ACL_CACHE_LIMIT = 4096;
+var supportsPosixModes = process.platform !== "win32";
+var hardenedWindowsEntries = /* @__PURE__ */ new Map();
+var hardenedDarwinEntries = /* @__PURE__ */ new Map();
+var WINDOWS_OWNER_ONLY_ACL_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version 3.0
+[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+
+try {
+  $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+  if ($null -eq $sid) { throw 'The current Windows identity has no SID' }
+  $targets = [System.Collections.Generic.List[object]]::new()
+  foreach ($rawLine in ([Console]::In.ReadToEnd() -split [char]10)) {
+    $line = $rawLine.TrimEnd([char]13)
+    if ($line.Length -eq 0) { continue }
+    $separator = $line.IndexOf([char]9)
+    if ($separator -ne 1) { throw 'Malformed Graphcraft ACL target record' }
+    $kind = $line.Substring(0, 1)
+    $path = [System.Text.Encoding]::UTF8.GetString(
+      [System.Convert]::FromBase64String($line.Substring($separator + 1))
+    )
+    if ([String]::IsNullOrEmpty($path)) { throw 'Empty Graphcraft ACL target path' }
+
+    $attributes = [System.IO.File]::GetAttributes($path)
+    if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+      throw 'Graphcraft private tree contains a reparse point'
+    }
+    $isDirectory = ($attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+    if (($kind -eq 'D') -ne $isDirectory) {
+      throw 'Graphcraft ACL target changed filesystem kind'
+    }
+    if ($kind -ne 'D' -and $kind -ne 'F') {
+      throw 'Unsupported Graphcraft ACL target kind'
+    }
+    $targets.Add([pscustomobject]@{ Path = $path; IsDirectory = $isDirectory })
+  }
+  if ($targets.Count -eq 0) { throw 'No Graphcraft ACL targets were supplied' }
+
+  foreach ($target in $targets) {
+    $attributes = [System.IO.File]::GetAttributes($target.Path)
+    if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+      throw 'Graphcraft ACL target became a reparse point'
+    }
+    $isDirectory = ($attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+    if ($isDirectory -ne $target.IsDirectory) {
+      throw 'Graphcraft ACL target changed filesystem kind'
+    }
+
+    if ($isDirectory) {
+      $item = [System.IO.DirectoryInfo]::new($target.Path)
+      $security = [System.Security.AccessControl.DirectorySecurity]::new()
+      $inheritance = ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit)
+    } else {
+      $item = [System.IO.FileInfo]::new($target.Path)
+      $security = [System.Security.AccessControl.FileSecurity]::new()
+      $inheritance = [System.Security.AccessControl.InheritanceFlags]::None
+    }
+    $security.SetAccessRuleProtection($true, $false)
+    $security.SetOwner($sid)
+    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+      $sid,
+      [System.Security.AccessControl.FileSystemRights]::FullControl,
+      $inheritance,
+      [System.Security.AccessControl.PropagationFlags]::None,
+      [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    [void]$security.AddAccessRule($rule)
+    $item.SetAccessControl($security)
+
+    $item.Refresh()
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+      throw 'Graphcraft ACL target became a reparse point during enforcement'
+    }
+    $sections = ([System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner)
+    $verified = $item.GetAccessControl($sections)
+    $owner = $verified.GetOwner([System.Security.Principal.SecurityIdentifier])
+    $rules = @($verified.GetAccessRules(
+      $true,
+      $true,
+      [System.Security.Principal.SecurityIdentifier]
+    ))
+    if (-not $verified.AreAccessRulesProtected -or $owner.Value -ne $sid.Value -or
+        $rules.Count -ne 1 -or $rules[0].IsInherited -or
+        $rules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+        $rules[0].FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl -or
+        $rules[0].InheritanceFlags -ne $inheritance -or
+        $rules[0].PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None -or
+        $rules[0].IdentityReference.Value -ne $sid.Value) {
+      throw 'Graphcraft owner-only ACL verification failed'
+    }
+  }
+  [Console]::Out.WriteLine("GRAPHCRAFT_ACL_OK:$($targets.Count)")
+} catch {
+  [Console]::Error.WriteLine("Graphcraft Windows ACL enforcement failed: $($_.Exception.Message)")
+  exit 1
+}
+`;
+var WINDOWS_OWNER_ONLY_ACL_COMMAND = Buffer.from(
+  WINDOWS_OWNER_ONLY_ACL_SCRIPT,
+  "utf16le"
+).toString("base64");
+function isMissing(error51) {
+  return error51.code === "ENOENT";
+}
+function sameFileSnapshot(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+}
+function assertPrivateRegularFile(path, status3) {
+  if (status3.isSymbolicLink()) rejectSymbolicLink(path);
+  if (!status3.isFile()) throw new Error(`Private file path is not a regular file: ${path}`);
+  if (status3.nlink > 1n) rejectMultiplyLinkedFile(path);
+}
+function rejectSymbolicLink(path) {
+  throw new Error(`Refusing to harden symbolic link: ${path}`);
+}
+function rejectMultiplyLinkedFile(path) {
+  throw new Error(`Refusing to harden multiply linked file: ${path}`);
+}
+function windowsPowerShellExecutable() {
+  const systemRoot = process.env.SystemRoot;
+  if (!systemRoot || systemRoot.includes("\0") || !win32.isAbsolute(systemRoot))
+    throw new Error(
+      "Unable to locate the trusted Windows PowerShell runtime for private-state ACL enforcement"
+    );
+  return win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+}
+function rememberWindowsEntry(path, fingerprint) {
+  if (fingerprint === void 0) return;
+  hardenedWindowsEntries.delete(path);
+  hardenedWindowsEntries.set(path, fingerprint);
+  while (hardenedWindowsEntries.size > WINDOWS_ACL_CACHE_LIMIT) {
+    const oldest = hardenedWindowsEntries.keys().next().value;
+    if (oldest === void 0) break;
+    hardenedWindowsEntries.delete(oldest);
+  }
+}
+function rememberDarwinEntry(path, fingerprint) {
+  if (fingerprint === void 0) return;
+  hardenedDarwinEntries.delete(path);
+  hardenedDarwinEntries.set(path, fingerprint);
+  while (hardenedDarwinEntries.size > DARWIN_ACL_CACHE_LIMIT) {
+    const oldest = hardenedDarwinEntries.keys().next().value;
+    if (oldest === void 0) break;
+    hardenedDarwinEntries.delete(oldest);
+  }
+}
+async function inspectPrivateEntry(path) {
+  const status3 = await lstat(path, { bigint: true });
+  const fingerprint = status3.ino === 0n ? void 0 : `${status3.dev}:${status3.ino}:${status3.birthtimeNs}:${status3.ctimeNs}`;
+  if (status3.isSymbolicLink()) rejectSymbolicLink(path);
+  if (status3.isFile()) {
+    if (status3.nlink > 1n) rejectMultiplyLinkedFile(path);
+    return { entry: { kind: "file", path }, fingerprint };
+  }
+  if (!status3.isDirectory())
+    throw new Error(`Private tree contains an unsupported filesystem entry: ${path}`);
+  return { entry: { kind: "directory", path }, fingerprint };
+}
+async function collectPrivateTree(root) {
+  const entries = [];
+  const visit = async (path) => {
+    const { entry } = await inspectPrivateEntry(path);
+    entries.push(entry);
+    if (entry.kind === "directory")
+      for (const name of await readdir(path)) await visit(join2(path, name));
+  };
+  await visit(root);
+  return entries;
+}
+async function runWindowsAclBatch(entries) {
+  if (entries.length === 0) return;
+  const payload = `${entries.map(
+    ({ kind, path }) => `${kind === "directory" ? "D" : "F"}	${Buffer.from(path, "utf8").toString("base64")}`
+  ).join("\n")}
+`;
+  const expectedOutput = `GRAPHCRAFT_ACL_OK:${entries.length}`;
+  await new Promise((resolveBatch, rejectBatch) => {
+    const child = spawn4(
+      windowsPowerShellExecutable(),
+      [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+        WINDOWS_OWNER_ONLY_ACL_COMMAND
+      ],
+      {
+        windowsHide: true,
+        shell: false,
+        stdio: ["pipe", "pipe", "pipe"]
+      }
+    );
+    const stdout = [];
+    const stderr = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    const reject = (error51) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.kill();
+      rejectBatch(error51);
+    };
+    const capture = (target, stream, chunk) => {
+      if (stream === "stdout") stdoutBytes += chunk.length;
+      else stderrBytes += chunk.length;
+      if (stdoutBytes > WINDOWS_ACL_OUTPUT_LIMIT_BYTES || stderrBytes > WINDOWS_ACL_OUTPUT_LIMIT_BYTES) {
+        reject(new Error("Windows ACL helper exceeded its bounded output limit"));
+        return;
+      }
+      target.push(Buffer.from(chunk));
+    };
+    child.stdout.on("data", (chunk) => capture(stdout, "stdout", chunk));
+    child.stderr.on("data", (chunk) => capture(stderr, "stderr", chunk));
+    child.stdin.on("error", () => void 0);
+    child.once(
+      "error",
+      (error51) => reject(
+        new Error("Unable to start trusted Windows ACL enforcement", {
+          cause: error51
+        })
+      )
+    );
+    child.once("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const output = Buffer.concat(stdout).toString("utf8").trim();
+      const errorOutput = Buffer.concat(stderr).toString("utf8").trim();
+      if (code !== 0 || output !== expectedOutput) {
+        rejectBatch(
+          new Error(
+            `Unable to enforce owner-only Windows permissions on Graphcraft state${errorOutput ? `: ${errorOutput}` : ""}`
+          )
+        );
+        return;
+      }
+      resolveBatch();
+    });
+    const timer = setTimeout(
+      () => reject(new Error("Windows ACL enforcement timed out")),
+      WINDOWS_ACL_TIMEOUT_MS
+    );
+    timer.unref();
+    child.stdin.end(payload, "utf8");
   });
-  await rename(temporaryPath, path);
+}
+async function hardenWindowsEntries(entries, force = false) {
+  if (supportsPosixModes || entries.length === 0) return;
+  const pending = [];
+  for (const entry of entries) {
+    const inspected = await inspectPrivateEntry(entry.path);
+    if (inspected.entry.kind !== entry.kind)
+      throw new Error(`Private ACL target changed filesystem kind: ${entry.path}`);
+    if (force || inspected.fingerprint === void 0 || hardenedWindowsEntries.get(entry.path) !== inspected.fingerprint)
+      pending.push(entry);
+  }
+  if (pending.length === 0) return;
+  await runWindowsAclBatch(pending);
+  for (const entry of pending) {
+    const inspected = await inspectPrivateEntry(entry.path);
+    if (inspected.entry.kind !== entry.kind)
+      throw new Error(`Private ACL target changed filesystem kind: ${entry.path}`);
+    rememberWindowsEntry(entry.path, inspected.fingerprint);
+  }
+}
+async function runDarwinAclBatch(paths) {
+  if (paths.length === 0) return;
+  await new Promise((resolveAcl, rejectAcl) => {
+    const child = spawn4("/bin/chmod", ["-N", ...paths], {
+      shell: false,
+      stdio: "ignore"
+    });
+    let settled = false;
+    const finish = (error51) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error51) rejectAcl(error51);
+      else resolveAcl();
+    };
+    const timer = setTimeout(() => {
+      child.kill();
+      finish(new Error("Timed out removing macOS ACLs from Graphcraft private paths"));
+    }, DARWIN_ACL_TIMEOUT_MS);
+    timer.unref();
+    child.once(
+      "error",
+      (error51) => finish(
+        new Error("Unable to remove macOS ACLs from Graphcraft private paths", { cause: error51 })
+      )
+    );
+    child.once("close", (code) => {
+      if (code !== 0)
+        finish(new Error("Unable to remove macOS ACLs from Graphcraft private paths"));
+      else finish();
+    });
+  });
+}
+async function removeDarwinAcls(entries) {
+  if (process.platform !== "darwin") return;
+  let batch = [];
+  let argumentBytes = 0;
+  for (const { path } of entries) {
+    const pathBytes = Buffer.byteLength(path) + 1;
+    if (pathBytes > DARWIN_ACL_BATCH_MAX_ARGUMENT_BYTES)
+      throw new Error(`macOS ACL target path exceeds its bounded argument limit: ${path}`);
+    if (batch.length >= DARWIN_ACL_BATCH_MAX_ENTRIES || argumentBytes + pathBytes > DARWIN_ACL_BATCH_MAX_ARGUMENT_BYTES) {
+      await runDarwinAclBatch(batch);
+      batch = [];
+      argumentBytes = 0;
+    }
+    batch.push(path);
+    argumentBytes += pathBytes;
+  }
+  await runDarwinAclBatch(batch);
+}
+async function hardenPosixEntries(entries, force = false) {
+  let pending = entries;
+  if (process.platform === "darwin") {
+    pending = [];
+    for (const entry of entries) {
+      const inspected = await inspectPrivateEntry(entry.path);
+      if (inspected.entry.kind !== entry.kind)
+        throw new Error(`Private ACL target changed filesystem kind: ${entry.path}`);
+      if (force || inspected.fingerprint === void 0 || hardenedDarwinEntries.get(entry.path) !== inspected.fingerprint)
+        pending.push(entry);
+    }
+  }
+  await removeDarwinAcls(pending);
+  for (const entry of pending)
+    await chmod(
+      entry.path,
+      entry.kind === "directory" ? PRIVATE_DIRECTORY_MODE : PRIVATE_FILE_MODE
+    );
+  if (process.platform === "darwin")
+    for (const entry of pending) {
+      const inspected = await inspectPrivateEntry(entry.path);
+      if (inspected.entry.kind !== entry.kind)
+        throw new Error(`Private ACL target changed filesystem kind: ${entry.path}`);
+      rememberDarwinEntry(entry.path, inspected.fingerprint);
+    }
+}
+function privatePathSegments(relativePath) {
+  if (isAbsolute2(relativePath))
+    throw new Error(`Private path must be relative to its owned root: ${relativePath}`);
+  const segments = relativePath.split(process.platform === "win32" ? /[\\/]/ : /\//).filter((segment) => segment.length > 0);
+  if (segments.some((segment) => segment === "." || segment === ".."))
+    throw new Error(`Private path escapes or aliases its owned root: ${relativePath}`);
+  return segments;
+}
+async function validatePrivatePath(ownedRoot, relativePath) {
+  const root = resolve(ownedRoot);
+  const segments = privatePathSegments(relativePath);
+  const absolute = resolve(root, ...segments);
+  const requested = resolve(root, relativePath);
+  if (absolute !== requested)
+    throw new Error(`Private path validation changed the requested path: ${relativePath}`);
+  const relation = relative(root, absolute);
+  if (relation === ".." || relation.startsWith(`..${sep}`) || isAbsolute2(relation))
+    throw new Error(`Private path escapes its owned root: ${relativePath}`);
+  const rootStatus = await lstat(root);
+  if (rootStatus.isSymbolicLink()) rejectSymbolicLink(root);
+  if (!rootStatus.isDirectory()) throw new Error(`Private root is not a directory: ${root}`);
+  let current = root;
+  for (const [index, segment] of segments.entries()) {
+    current = join2(current, segment);
+    let status3;
+    try {
+      status3 = await lstat(current);
+    } catch (error51) {
+      if (isMissing(error51)) return absolute;
+      throw error51;
+    }
+    if (status3.isSymbolicLink()) rejectSymbolicLink(current);
+    if (status3.isFile() && status3.nlink > 1) rejectMultiplyLinkedFile(current);
+    const final = index === segments.length - 1;
+    if (!final && !status3.isDirectory())
+      throw new Error(`Private path component is not a directory: ${current}`);
+    if (final && !status3.isDirectory() && !status3.isFile())
+      throw new Error(`Private path contains an unsupported filesystem entry: ${current}`);
+  }
+  return absolute;
+}
+async function readPrivateFileBounded(path, maximumBytes, ownedRoot) {
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0)
+    throw new Error("Private file read limit must be a non-negative safe integer");
+  const absolute = resolve(path);
+  if (ownedRoot !== void 0)
+    await validatePrivatePath(ownedRoot, relative(resolve(ownedRoot), absolute));
+  const noFollow = process.platform === "win32" ? 0 : fsConstants.O_NOFOLLOW;
+  for (let replacementAttempt = 0; ; replacementAttempt += 1) {
+    try {
+      const observed = await lstat(absolute, { bigint: true });
+      assertPrivateRegularFile(absolute, observed);
+      if (observed.size > BigInt(maximumBytes))
+        throw new Error(`Private file exceeds its ${maximumBytes}-byte bounded read limit`);
+      const handle = await open2(absolute, fsConstants.O_RDONLY | noFollow);
+      try {
+        const before = await handle.stat({ bigint: true });
+        assertPrivateRegularFile(absolute, before);
+        if (!sameFileSnapshot(observed, before))
+          throw new Error("Private file changed before its bounded read");
+        if (before.size > BigInt(maximumBytes))
+          throw new Error(`Private file exceeds its ${maximumBytes}-byte bounded read limit`);
+        const expectedBytes = Number(before.size);
+        const bytes = Buffer.alloc(expectedBytes);
+        let offset = 0;
+        while (offset < expectedBytes) {
+          const { bytesRead } = await handle.read(bytes, offset, expectedBytes - offset, offset);
+          if (bytesRead === 0) break;
+          offset += bytesRead;
+        }
+        const after = await handle.stat({ bigint: true });
+        if (offset !== expectedBytes || !sameFileSnapshot(before, after))
+          throw new Error("Private file changed during its bounded read");
+        return bytes;
+      } finally {
+        await handle.close();
+      }
+    } catch (error51) {
+      if (replacementAttempt >= 3 || !(error51 instanceof Error) || error51.message !== "Private file changed before its bounded read")
+        throw error51;
+      await new Promise((resolveRetry) => setImmediate(resolveRetry));
+    }
+  }
+}
+async function ensurePrivateDirectory(path, ownedRoot = path) {
+  const absolute = resolve(path);
+  const root = resolve(ownedRoot);
+  const relativePath = relative(root, absolute);
+  if (absolute !== root) await validatePrivatePath(root, relativePath);
+  const missingDirectories = [];
+  let candidate = absolute;
+  while (true) {
+    try {
+      await lstat(candidate);
+      break;
+    } catch (error51) {
+      if (!isMissing(error51)) throw error51;
+      missingDirectories.push(candidate);
+      const parent = dirname2(candidate);
+      if (parent === candidate)
+        throw new Error(`Private directory has no existing ancestor: ${absolute}`);
+      candidate = parent;
+    }
+  }
+  await mkdir2(absolute, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+  if (absolute !== root) await validatePrivatePath(root, relativePath);
+  const status3 = await lstat(absolute);
+  if (status3.isSymbolicLink()) rejectSymbolicLink(path);
+  if (!status3.isDirectory()) throw new Error(`Private directory path is not a directory: ${path}`);
+  const directories = [root];
+  let current = root;
+  for (const segment of privatePathSegments(relativePath)) {
+    current = join2(current, segment);
+    directories.push(current);
+  }
+  if (supportsPosixModes) {
+    await hardenPosixEntries(
+      directories.map((directory) => ({ kind: "directory", path: directory }))
+    );
+  } else {
+    await hardenWindowsEntries(
+      directories.map((directory) => ({ kind: "directory", path: directory }))
+    );
+  }
+  for (const directory of missingDirectories.reverse()) {
+    await syncDirectory(directory);
+    await syncDirectory(dirname2(directory));
+  }
+}
+async function hardenPrivateFile(path, ownedRoot) {
+  const absolute = resolve(path);
+  if (ownedRoot !== void 0)
+    await validatePrivatePath(ownedRoot, relative(resolve(ownedRoot), absolute));
+  let status3;
+  try {
+    status3 = await lstat(absolute);
+  } catch (error51) {
+    if (isMissing(error51)) return;
+    throw error51;
+  }
+  if (status3.isSymbolicLink()) rejectSymbolicLink(path);
+  if (!status3.isFile()) throw new Error(`Private file path is not a regular file: ${path}`);
+  if (status3.nlink > 1) rejectMultiplyLinkedFile(path);
+  try {
+    if (supportsPosixModes) await hardenPosixEntries([{ kind: "file", path: absolute }]);
+    else await hardenWindowsEntries([{ kind: "file", path: absolute }]);
+  } catch (error51) {
+    try {
+      await lstat(absolute);
+    } catch (inspectionError) {
+      if (isMissing(inspectionError)) return;
+      throw inspectionError;
+    }
+    throw error51;
+  }
+}
+async function hardenPrivateTree(root, ownedRoot = root) {
+  const absoluteRoot = resolve(root);
+  await validatePrivatePath(ownedRoot, relative(resolve(ownedRoot), absoluteRoot));
+  const entries = await collectPrivateTree(absoluteRoot);
+  if (!supportsPosixModes) {
+    await hardenWindowsEntries(entries, true);
+    return;
+  }
+  await hardenPosixEntries(entries, true);
 }
 
 // packages/runtime/src/lock.ts
+var LOCK_RECORD_MAX_BYTES = 64 * 1024;
 function processExists(pid) {
   try {
     process.kill(pid, 0);
@@ -35832,18 +37164,34 @@ function processExists(pid) {
     return error51.code === "EPERM";
   }
 }
+function lockOwnedRoot(path) {
+  let candidate = dirname3(path);
+  while (true) {
+    if (basename(candidate) === ".graphcraft") return candidate;
+    const parent = dirname3(candidate);
+    if (parent === candidate) return dirname3(path);
+    candidate = parent;
+  }
+}
+async function readLockRecord(path, ownedRoot) {
+  return (await readPrivateFileBounded(path, LOCK_RECORD_MAX_BYTES, ownedRoot)).toString("utf8");
+}
 var RunLock = class {
   path;
+  ownedRoot;
   token = randomUUID3();
   heartbeat;
   heartbeatWrite = Promise.resolve();
   constructor(path) {
     this.path = path;
+    this.ownedRoot = lockOwnedRoot(path);
   }
   async acquire(staleAfterMs = 3e4) {
-    await mkdir2(dirname2(this.path), { recursive: true });
+    await ensurePrivateDirectory(this.ownedRoot);
+    await ensurePrivateDirectory(dirname3(this.path), this.ownedRoot);
+    await hardenPrivateFile(this.path, this.ownedRoot);
     try {
-      const handle = await open(this.path, "wx", 384);
+      const handle = await open3(this.path, "wx", 384);
       const acquiredAt = (/* @__PURE__ */ new Date()).toISOString();
       try {
         await handle.writeFile(
@@ -35860,12 +37208,13 @@ var RunLock = class {
       } finally {
         await handle.close();
       }
+      await hardenPrivateFile(this.path, this.ownedRoot);
     } catch (error51) {
       if (error51.code !== "EEXIST") throw error51;
       let record2;
       let observed = "";
       try {
-        observed = await readFile(this.path, "utf8");
+        observed = await readLockRecord(this.path, this.ownedRoot);
         record2 = JSON.parse(observed);
       } catch {
       }
@@ -35874,7 +37223,7 @@ var RunLock = class {
       const liveLocalProcess = record2 !== void 0 && sameHost && processExists(record2.pid);
       if (liveLocalProcess || !sameHost && heartbeatAge < staleAfterMs)
         throw new Error("Graphcraft run is already active");
-      const current = await readFile(this.path, "utf8").catch(
+      const current = await readLockRecord(this.path, this.ownedRoot).catch(
         (readError) => {
           if (readError.code === "ENOENT") return void 0;
           throw readError;
@@ -35894,13 +37243,17 @@ var RunLock = class {
   async release() {
     if (this.heartbeat) clearInterval(this.heartbeat);
     await this.heartbeatWrite.catch(() => void 0);
+    await hardenPrivateFile(this.path, this.ownedRoot);
     try {
-      const current = JSON.parse(await readFile(this.path, "utf8"));
+      const current = JSON.parse(await readLockRecord(this.path, this.ownedRoot));
       if (current.token === this.token) await unlink(this.path);
     } catch {
     }
   }
   async writeRecord(heartbeatAt) {
+    await ensurePrivateDirectory(this.ownedRoot);
+    await ensurePrivateDirectory(dirname3(this.path), this.ownedRoot);
+    await hardenPrivateFile(this.path, this.ownedRoot);
     const record2 = {
       token: this.token,
       pid: process.pid,
@@ -35909,11 +37262,12 @@ var RunLock = class {
       heartbeatAt
     };
     try {
-      const current = JSON.parse(await readFile(this.path, "utf8"));
+      const current = JSON.parse(await readLockRecord(this.path, this.ownedRoot));
       record2.acquiredAt = current.token === this.token ? current.acquiredAt : heartbeatAt;
     } catch {
     }
     await writeJsonAtomic(this.path, record2);
+    await hardenPrivateFile(this.path, this.ownedRoot);
   }
 };
 
@@ -36005,7 +37359,8 @@ async function applyRunGraphAmendmentLocked(store, input, actor) {
   return { graph: applied.graph, amendment: record2 };
 }
 async function amendRunGraph(store, input, actor = "runtime") {
-  const lock = new RunLock(join2(store.graphcraftRoot, "locks", `${store.runId}.lock`));
+  await store.prepareStorage();
+  const lock = new RunLock(join3(store.graphcraftRoot, "locks", `${store.runId}.lock`));
   await lock.acquire();
   try {
     return await applyRunGraphAmendmentLocked(store, input, actor);
@@ -36014,54 +37369,1512 @@ async function amendRunGraph(store, input, actor = "runtime") {
   }
 }
 
+// packages/runtime/src/artifact-policy.ts
+import { createHash as createHash2, randomUUID as randomUUID4 } from "node:crypto";
+import { constants as fsConstants2 } from "node:fs";
+import { lstat as lstat2, open as open4, readdir as readdir2, rmdir, unlink as unlink2 } from "node:fs/promises";
+import { basename as basename2, dirname as dirname4, isAbsolute as isAbsolute3, join as join4, posix, resolve as resolve2, win32 as win322 } from "node:path";
+import { isDeepStrictEqual } from "node:util";
+var MIB3 = 1024 * 1024;
+var ATOMIC_STAGING_DIRECTORY = ".artifact-staging";
+var MUTATION_JOURNAL_PATH = "artifact-mutation.json";
+var MUTATION_PAYLOAD_PATH = "artifact-mutation.payload";
+var DEFAULT_ARTIFACT_POLICY = Object.freeze({
+  ordinaryArtifactBytes: MIB3,
+  identityArtifactBytes: MIB3,
+  capsuleBytes: MIB3,
+  invocationTranscriptBytes: 8 * MIB3,
+  invocationReservedBytes: 2 * MIB3,
+  runArtifactBytes: 64 * MIB3,
+  runReservedBytes: 8 * MIB3
+});
+var RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+function now() {
+  return (/* @__PURE__ */ new Date()).toISOString();
+}
+function bytesHash(bytes) {
+  return contentHash({ contents: Buffer.from(bytes).toString("base64") });
+}
+function formatForPath(path) {
+  const extension = posix.extname(path).toLowerCase();
+  if (extension === ".json") return "json";
+  if (extension === ".jsonl") return "jsonl";
+  if ([".log", ".txt", ".md", ".diff", ".patch"].includes(extension)) return "text";
+  return "binary";
+}
+function validatePortableRelativePath(path) {
+  if (path.length === 0 || path.includes("\0") || isAbsolute3(path) || posix.isAbsolute(path) || win322.isAbsolute(path) || /^[a-z]:/i.test(path) || path.startsWith("\\\\") || path.includes("\\"))
+    throw new Error(`Artifact path must be a portable relative path: ${path}`);
+  const parts = path.split("/");
+  if (parts.some((part) => part.length === 0 || part === "." || part === ".."))
+    throw new Error(`Artifact path contains an unsafe segment: ${path}`);
+  return parts;
+}
+function validateNewRelativePath(path) {
+  const parts = validatePortableRelativePath(path);
+  if (redactTextBytes(path).toString("utf8") !== path)
+    throw new Error("Artifact path contains sensitive content and cannot be persisted");
+  return parts;
+}
+function validateNewArtifactPath(path) {
+  validateNewRelativePath(path);
+  const key = artifactPathCanonicalKey(path);
+  if (key === void 0)
+    throw new Error("Artifact path must be a normalized portable artifact-owned path");
+  return key;
+}
+function assertNoArtifactPathAlias(inventory, path) {
+  const key = artifactPathCanonicalKey(path);
+  if (key === void 0)
+    throw new Error("Artifact path must be a normalized portable artifact-owned path");
+  const alias = inventory.entries.find(
+    (entry) => entry.path !== path && artifactPathCanonicalKey(entry.path) === key
+  );
+  if (alias) throw new Error("Artifact path aliases an existing portable artifact path");
+}
+function validateArtifactInventory(value) {
+  return ArtifactInventorySchema.parse(value);
+}
+function assertRegularPrivateTarget(path, status3) {
+  if (status3.isSymbolicLink()) throw new Error(`Refusing symbolic-link artifact target: ${path}`);
+  if (!status3.isFile()) throw new Error(`Artifact target is not a regular file: ${path}`);
+  if (typeof status3.nlink === "bigint" ? status3.nlink > 1n : status3.nlink > 1)
+    throw new Error(`Refusing multiply-linked artifact target: ${path}`);
+}
+function isMissing2(error51) {
+  return error51.code === "ENOENT";
+}
+async function targetStatus(path) {
+  try {
+    return await lstat2(path);
+  } catch (error51) {
+    if (isMissing2(error51)) return void 0;
+    throw error51;
+  }
+}
+function sameFileSnapshot2(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+}
+async function readBoundedArtifactInventory(path) {
+  const observed = await lstat2(path, { bigint: true });
+  assertRegularPrivateTarget(path, observed);
+  if (observed.size > BigInt(MAX_ARTIFACT_INVENTORY_BYTES))
+    throw new Error(
+      `Artifact inventory exceeds its ${MAX_ARTIFACT_INVENTORY_BYTES}-byte read limit`
+    );
+  const handle = await open4(path, fsConstants2.O_RDONLY | fsConstants2.O_NOFOLLOW);
+  try {
+    const before = await handle.stat({ bigint: true });
+    assertRegularPrivateTarget(path, before);
+    if (!sameFileSnapshot2(observed, before))
+      throw new Error("Artifact inventory changed before its bounded read");
+    if (before.size > BigInt(MAX_ARTIFACT_INVENTORY_BYTES))
+      throw new Error(
+        `Artifact inventory exceeds its ${MAX_ARTIFACT_INVENTORY_BYTES}-byte read limit`
+      );
+    const expectedBytes = Number(before.size);
+    const bytes = Buffer.alloc(expectedBytes + 1);
+    let length = 0;
+    while (length < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, length, bytes.length - length, length);
+      if (bytesRead === 0) break;
+      length += bytesRead;
+    }
+    const after = await handle.stat({ bigint: true });
+    if (!sameFileSnapshot2(before, after) || length !== expectedBytes)
+      throw new Error("Artifact inventory changed during its bounded read");
+    return validateArtifactInventory(JSON.parse(bytes.subarray(0, length).toString("utf8")));
+  } finally {
+    await handle.close();
+  }
+}
+async function resolvePrivatePath(root, relativePath, createParents) {
+  const parts = validatePortableRelativePath(relativePath);
+  await ensurePrivateDirectory(root);
+  let directory = root;
+  for (const part of parts.slice(0, -1)) {
+    directory = join4(directory, part);
+    const existing2 = await targetStatus(directory);
+    if (!existing2) {
+      if (!createParents) throw new Error(`Artifact parent does not exist: ${directory}`);
+      await ensurePrivateDirectory(directory);
+      continue;
+    }
+    if (existing2.isSymbolicLink())
+      throw new Error(`Refusing symbolic-link artifact parent: ${directory}`);
+    if (!existing2.isDirectory())
+      throw new Error(`Artifact parent is not a directory: ${directory}`);
+    await ensurePrivateDirectory(directory);
+  }
+  const target = join4(root, ...parts);
+  const existing = await targetStatus(target);
+  if (existing) assertRegularPrivateTarget(target, existing);
+  return target;
+}
+async function atomicWrite(root, relativePath, bytes) {
+  const path = await resolvePrivatePath(root, relativePath, true);
+  const stagingRoot = join4(root, ATOMIC_STAGING_DIRECTORY);
+  await ensurePrivateDirectory(stagingRoot, root);
+  const temporaryPath = join4(stagingRoot, `${randomUUID4()}.tmp`);
+  try {
+    const handle = await open4(temporaryPath, "wx", 384);
+    try {
+      await handle.writeFile(bytes);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await hardenPrivateFile(temporaryPath, root);
+    await resolvePrivatePath(root, relativePath, true);
+    await replacePathAtomic(temporaryPath, path);
+    await hardenPrivateFile(path, root);
+    return path;
+  } catch (error51) {
+    const removed = await unlink2(temporaryPath).then(
+      () => true,
+      (unlinkError) => {
+        if (isMissing2(unlinkError)) return false;
+        throw unlinkError;
+      }
+    );
+    if (removed) await syncDirectory(stagingRoot);
+    throw error51;
+  }
+}
+async function cleanupAtomicStaging(root) {
+  const stagingRoot = join4(root, ATOMIC_STAGING_DIRECTORY);
+  const existing = await targetStatus(stagingRoot);
+  if (!existing) return;
+  if (existing.isSymbolicLink())
+    throw new Error(`Refusing symbolic-link artifact staging directory: ${stagingRoot}`);
+  if (!existing.isDirectory())
+    throw new Error(`Artifact staging path is not a directory: ${stagingRoot}`);
+  await ensurePrivateDirectory(stagingRoot, root);
+  let removedEntry = false;
+  for (const item of await readdir2(stagingRoot, { withFileTypes: true })) {
+    const path = join4(stagingRoot, item.name);
+    if (!item.isFile() || item.isSymbolicLink())
+      throw new Error(`Unsupported entry in artifact staging directory: ${path}`);
+    assertRegularPrivateTarget(path, await lstat2(path));
+    const removed = await unlink2(path).then(
+      () => true,
+      (error51) => {
+        if (isMissing2(error51)) return false;
+        throw error51;
+      }
+    );
+    removedEntry ||= removed;
+  }
+  if (removedEntry) await syncDirectory(stagingRoot);
+  const removedDirectory = await rmdir(stagingRoot).then(
+    () => true,
+    (error51) => {
+      if (isMissing2(error51)) return false;
+      throw error51;
+    }
+  );
+  if (removedDirectory) await syncDirectory(dirname4(stagingRoot));
+}
+async function removePrivateFile(root, relativePath) {
+  const path = await resolvePrivatePath(root, relativePath, false).catch((error51) => {
+    if (isMissing2(error51)) return void 0;
+    throw error51;
+  });
+  if (path) {
+    const removed = await unlink2(path).then(
+      () => true,
+      (error51) => {
+        if (isMissing2(error51)) return false;
+        throw error51;
+      }
+    );
+    if (removed) await syncDirectory(dirname4(path));
+  }
+}
+function utf8Prefix(bytes, limit) {
+  let end = Math.min(bytes.length, Math.max(0, limit));
+  while (end > 0) {
+    try {
+      new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, end));
+      return bytes.subarray(0, end);
+    } catch {
+      end -= 1;
+    }
+  }
+  return Buffer.alloc(0);
+}
+function jsonEnvelope(source, limit) {
+  const sourceText = source.toString("utf8");
+  const render = (preview) => Buffer.from(
+    `${JSON.stringify({
+      schemaVersion: 1,
+      graphcraftArtifact: {
+        truncated: true,
+        sourceBytes: source.length,
+        note: "Content omitted by the local artifact policy; see artifact-inventory.json"
+      },
+      preview
+    })}
+`
+  );
+  if (render("").length > limit) return void 0;
+  let low = 0;
+  let high = sourceText.length;
+  let best = render("");
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    let preview = sourceText.slice(0, middle);
+    if (new RegExp("\\p{Surrogate}$", "u").test(preview)) preview = preview.slice(0, -1);
+    const candidate = render(preview);
+    if (candidate.length <= limit) {
+      best = candidate;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return best;
+}
+function jsonLinesEnvelope(source, limit) {
+  const metadata = JSON.stringify({
+    type: "graphcraft.truncation",
+    sourceBytes: source.length,
+    note: "Records omitted by the local artifact policy; see artifact-inventory.json"
+  });
+  if (Buffer.byteLength(`${metadata}
+`) > limit) return void 0;
+  const kept = [];
+  let used = Buffer.byteLength(`${metadata}
+`);
+  for (const line of source.toString("utf8").split("\n")) {
+    if (!line) continue;
+    try {
+      JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const bytes = Buffer.byteLength(`${line}
+`);
+    if (used + bytes > limit) break;
+    kept.push(line);
+    used += bytes;
+  }
+  return Buffer.from(`${kept.join("\n")}${kept.length > 0 ? "\n" : ""}${metadata}
+`);
+}
+function truncateArtifact(source, format, limit) {
+  if (source.length <= limit) return source;
+  if (format === "json") return jsonEnvelope(source, limit);
+  if (format === "jsonl") return jsonLinesEnvelope(source, limit);
+  if (limit <= 0) return void 0;
+  return format === "text" ? utf8Prefix(source, limit) : source.subarray(0, limit);
+}
+function compactHostEvent(event, limit) {
+  const line = (value) => Buffer.from(`${JSON.stringify(value)}
+`);
+  const original = line(event);
+  if (original.length <= limit) return original;
+  const marker = "[TRUNCATED BY GRAPHCRAFT ARTIFACT POLICY]";
+  const candidates = [];
+  switch (event.type) {
+    case "message":
+      candidates.push({ type: "message", text: marker });
+      break;
+    case "tool":
+      candidates.push({ type: "tool", name: event.name.slice(0, 256), summary: marker });
+      break;
+    case "result":
+      candidates.push({
+        type: "result",
+        result: {
+          status: event.result.status,
+          summary: `${event.result.summary.slice(0, 16384)}
+${marker}`,
+          changedPaths: event.result.changedPaths.slice(0, 256).map((value) => value.slice(0, 4096)),
+          evidence: event.result.evidence.slice(0, 64).map((value) => value.slice(0, 4096)),
+          ...event.result.nextSuggestedObjective ? { nextSuggestedObjective: event.result.nextSuggestedObjective.slice(0, 16384) } : {}
+        }
+      });
+      candidates.push({
+        type: "result",
+        result: {
+          status: event.result.status,
+          summary: marker,
+          changedPaths: [],
+          evidence: []
+        }
+      });
+      break;
+    case "session":
+      candidates.push({ type: "session", hostSessionId: event.hostSessionId.slice(0, 4096) });
+      break;
+    case "error":
+      candidates.push({
+        type: "error",
+        message: `${event.message.slice(0, 16384)}
+${marker}`,
+        ...event.cause ? { cause: event.cause } : {}
+      });
+      candidates.push({
+        type: "error",
+        message: marker,
+        ...event.cause ? { cause: event.cause } : {}
+      });
+      break;
+    case "started":
+      candidates.push({ type: "started", invocationId: event.invocationId.slice(0, 4096) });
+      break;
+    case "usage":
+    case "terminated":
+      candidates.push(event);
+      break;
+  }
+  return candidates.map(line).find((candidate) => candidate.length <= limit);
+}
+function hostEventOfType(value, type) {
+  const event = HostEventSchema.parse(value);
+  if (event.type !== type) throw new Error(`Expected invocation ${type} event`);
+  return event;
+}
+function recoveryEvents(checkpoint) {
+  return [
+    ...checkpoint.session ? [checkpoint.session] : [],
+    ...checkpoint.usage,
+    ...checkpoint.result ? [checkpoint.result] : [],
+    ...checkpoint.error ? [checkpoint.error] : [],
+    ...checkpoint.terminated ? [checkpoint.terminated] : []
+  ];
+}
+function assertInvocationEventIdentity(event, expectedInvocationId) {
+  if (event.type === "started" && event.invocationId !== expectedInvocationId)
+    throw new Error(
+      `Invocation started event belongs to ${event.invocationId}, not ${expectedInvocationId}`
+    );
+}
+function parseRecoveryCheckpoint(value, expectedInvocationId) {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    throw new Error("Invocation recovery checkpoint is not an object");
+  const source = value;
+  if (source.schemaVersion !== 1 || typeof source.invocationId !== "string")
+    throw new Error("Invocation recovery checkpoint has an unsupported schema");
+  if (source.invocationId !== expectedInvocationId)
+    throw new Error(
+      `Invocation recovery checkpoint belongs to ${source.invocationId}, not ${expectedInvocationId}`
+    );
+  if (!Array.isArray(source.usage))
+    throw new Error("Invocation recovery checkpoint usage is not an array");
+  const events = {
+    ...source.session ? { session: hostEventOfType(source.session, "session") } : {},
+    usage: source.usage.map((event) => hostEventOfType(event, "usage")),
+    ...source.result ? { result: hostEventOfType(source.result, "result") } : {},
+    ...source.error ? { error: hostEventOfType(source.error, "error") } : {},
+    ...source.terminated ? { terminated: hostEventOfType(source.terminated, "terminated") } : {}
+  };
+  if (typeof source.updatedAt !== "string" || !Number.isFinite(Date.parse(source.updatedAt)))
+    throw new Error("Invocation recovery checkpoint timestamp is invalid");
+  return {
+    schemaVersion: 1,
+    invocationId: source.invocationId,
+    ...events,
+    updatedAt: source.updatedAt
+  };
+}
+function updateRecoveryCheckpoint(invocationId, previous, event) {
+  const checkpoint = previous ?? {
+    schemaVersion: 1,
+    invocationId,
+    usage: [],
+    updatedAt: now()
+  };
+  switch (event.type) {
+    case "session":
+      return { ...checkpoint, session: event, updatedAt: now() };
+    case "usage":
+      return { ...checkpoint, usage: [...checkpoint.usage, event], updatedAt: now() };
+    case "result":
+      return { ...checkpoint, result: event, updatedAt: now() };
+    case "error":
+      return { ...checkpoint, error: event, updatedAt: now() };
+    case "terminated":
+      return { ...checkpoint, terminated: event, updatedAt: now() };
+    default:
+      return checkpoint;
+  }
+}
+function boundedRecoveryCheckpoint(checkpoint, limit) {
+  const serialize = (value) => Buffer.from(`${JSON.stringify(value, null, 2)}
+`);
+  const source = serialize(checkpoint);
+  if (source.length <= limit) return { source, stored: source };
+  const compact = (event, eventLimit) => {
+    if (!event) return void 0;
+    const line = compactHostEvent(event, eventLimit);
+    return line ? HostEventSchema.parse(JSON.parse(line.toString("utf8"))) : void 0;
+  };
+  const session = compact(checkpoint.session, 8 * 1024);
+  const result = compact(checkpoint.result, Math.max(256, Math.floor(limit / 2)));
+  const error51 = compact(checkpoint.error, Math.max(128, Math.floor(limit / 4)));
+  let candidate = {
+    schemaVersion: 1,
+    invocationId: checkpoint.invocationId,
+    ...session ? { session } : {},
+    usage: checkpoint.usage.slice(-1024),
+    ...result ? { result } : {},
+    ...error51 ? { error: error51 } : {},
+    ...checkpoint.terminated ? { terminated: checkpoint.terminated } : {},
+    updatedAt: checkpoint.updatedAt
+  };
+  let stored = serialize(candidate);
+  while (stored.length > limit && candidate.usage.length > 0) {
+    candidate = { ...candidate, usage: candidate.usage.slice(1) };
+    stored = serialize(candidate);
+  }
+  if (stored.length > limit && candidate.result) {
+    const minimal = compactHostEvent(candidate.result, 256);
+    if (minimal)
+      candidate = {
+        ...candidate,
+        result: hostEventOfType(JSON.parse(minimal.toString("utf8")), "result")
+      };
+    else {
+      const { result: _result, ...withoutResult } = candidate;
+      candidate = withoutResult;
+    }
+    stored = serialize(candidate);
+  }
+  if (stored.length > limit)
+    throw new Error("Invocation recovery checkpoint cannot fit its reserved artifact capacity");
+  return { source, stored };
+}
+function inventoryTotals(inventory, updatedAt = now()) {
+  const entries = [...inventory.entries].sort((left, right) => left.path.localeCompare(right.path));
+  return validateArtifactInventory({
+    ...inventory,
+    sourceBytes: entries.reduce((total, entry) => total + entry.sourceBytes, 0),
+    storedBytes: entries.reduce((total, entry) => total + entry.storedBytes, 0),
+    omittedBytes: entries.reduce((total, entry) => total + entry.omittedBytes, 0),
+    entries,
+    updatedAt
+  });
+}
+function emptyInventory(runId, policy) {
+  return ArtifactInventorySchema.parse({
+    schemaVersion: 1,
+    runId,
+    policy,
+    sourceBytes: 0,
+    storedBytes: 0,
+    omittedBytes: 0,
+    entries: [],
+    updatedAt: now()
+  });
+}
+function entryFor(path, kind, format, source, stored, previous, reason, disposition) {
+  const timestamp = now();
+  const hasStoredBytes = stored !== void 0;
+  return {
+    path,
+    kind,
+    format,
+    disposition: disposition ?? (!hasStoredBytes ? "omitted" : stored.length < source.length ? "truncated" : "stored"),
+    sourceBytes: source.length,
+    storedBytes: stored?.length ?? 0,
+    omittedBytes: Math.max(0, source.length - (stored?.length ?? 0)),
+    truncated: Boolean(hasStoredBytes && stored.length < source.length),
+    legacy: false,
+    sourceHash: bytesHash(source),
+    ...hasStoredBytes ? { storedHash: bytesHash(stored) } : {},
+    ...reason ? { reason } : {},
+    createdAt: previous?.createdAt ?? timestamp,
+    updatedAt: timestamp
+  };
+}
+var RunArtifactStore = class {
+  constructor(runRoot, runId, policy = DEFAULT_ARTIFACT_POLICY, publicationHook) {
+    this.runRoot = runRoot;
+    this.runId = runId;
+    this.policy = policy;
+    this.publicationHook = publicationHook;
+    if (!RUN_ID_PATTERN.test(runId)) throw new Error(`Invalid Graphcraft run ID: ${runId}`);
+    ArtifactPolicySchema.parse(policy);
+    if (policy.invocationReservedBytes >= policy.invocationTranscriptBytes)
+      throw new Error("Invocation artifact reserve must be smaller than the transcript limit");
+    if (policy.runReservedBytes >= policy.runArtifactBytes)
+      throw new Error("Run artifact reserve must be smaller than the run quota");
+    if (policy.runReservedBytes < policy.invocationReservedBytes)
+      throw new Error("Run artifact reserve must cover the invocation recovery reserve");
+    const runParent = dirname4(resolve2(runRoot));
+    const lockRoot = basename2(runParent) === "runs" ? dirname4(runParent) : runParent;
+    this.mutationLockPath = join4(lockRoot, "locks", `${runId}.artifacts.lock`);
+  }
+  runRoot;
+  runId;
+  policy;
+  publicationHook;
+  inventoryRelativePath = "artifact-inventory.json";
+  mutationLockPath;
+  tail = Promise.resolve();
+  validatedFiles = /* @__PURE__ */ new Map();
+  async acquireMutationLock() {
+    while (true) {
+      const lock = new RunLock(this.mutationLockPath);
+      try {
+        await lock.acquire();
+        return lock;
+      } catch (error51) {
+        if (error51.code === "ENOENT") continue;
+        if (!(error51 instanceof Error) || !error51.message.includes("already active")) throw error51;
+      }
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+  }
+  serializeMutation(operation) {
+    const current = this.tail.then(async () => {
+      const lock = await this.acquireMutationLock();
+      try {
+        await cleanupAtomicStaging(this.runRoot);
+        await this.recoverPendingMutation();
+        try {
+          return await operation();
+        } finally {
+          await cleanupAtomicStaging(this.runRoot);
+        }
+      } finally {
+        await lock.release();
+      }
+    });
+    this.tail = current.then(
+      () => void 0,
+      () => void 0
+    );
+    return current;
+  }
+  async persistInventory(inventory) {
+    const value = validateArtifactInventory(inventory);
+    if (value.runId !== this.runId)
+      throw new Error(`Artifact inventory belongs to ${value.runId}, not ${this.runId}`);
+    if (artifactInventorySerializedBytes(value) > MAX_ARTIFACT_INVENTORY_BYTES)
+      throw new Error("Serialized artifact inventory exceeds its byte limit");
+    const bytes = Buffer.from(`${JSON.stringify(value, null, 2)}
+`);
+    await atomicWrite(this.runRoot, this.inventoryRelativePath, bytes);
+    return value;
+  }
+  async rawInventory() {
+    const path = await resolvePrivatePath(this.runRoot, this.inventoryRelativePath, false).catch(
+      (error51) => {
+        if (isMissing2(error51) || String(error51).includes("does not exist")) return void 0;
+        throw error51;
+      }
+    );
+    if (!path) return emptyInventory(this.runId, this.policy);
+    const parsed = await readBoundedArtifactInventory(path).catch((error51) => {
+      if (isMissing2(error51)) return void 0;
+      throw error51;
+    });
+    if (parsed === void 0) return emptyInventory(this.runId, this.policy);
+    if (parsed.runId !== this.runId)
+      throw new Error(`Artifact inventory belongs to ${parsed.runId}, not ${this.runId}`);
+    return parsed;
+  }
+  async readMutationJournal() {
+    const path = await resolvePrivatePath(this.runRoot, MUTATION_JOURNAL_PATH, false).catch(
+      (error51) => {
+        if (isMissing2(error51) || String(error51).includes("does not exist")) return void 0;
+        throw error51;
+      }
+    );
+    if (!path) return void 0;
+    const source = await readPrivateFileBounded(path, 128 * 1024, this.runRoot).catch((error51) => {
+      if (isMissing2(error51)) return void 0;
+      throw error51;
+    });
+    if (!source) return void 0;
+    const journal = ArtifactMutationJournalSchema.parse(JSON.parse(source.toString("utf8")));
+    if (journal.runId !== this.runId)
+      throw new Error(`Artifact mutation journal belongs to ${journal.runId}, not ${this.runId}`);
+    if (artifactPathCanonicalKey(journal.path) === void 0)
+      throw new Error("Artifact mutation journal path is not portable");
+    return journal;
+  }
+  expectedTarget(entry) {
+    if (!entry || entry.storedBytes === 0 && entry.disposition !== "stored" && entry.disposition !== "legacy")
+      return void 0;
+    if (!entry.storedHash)
+      throw new Error(`Artifact inventory entry lacks a stored hash: ${entry.path}`);
+    return { bytes: entry.storedBytes, hash: entry.storedHash };
+  }
+  assertMutationAction(journal) {
+    const previous = this.expectedTarget(journal.previousEntry);
+    const next = this.expectedTarget(journal.nextEntry);
+    if (journal.action === "write" && !next)
+      throw new Error("Artifact write mutation does not describe stored target bytes");
+    if (journal.action === "delete" && (!previous || next))
+      throw new Error("Artifact delete mutation does not describe a stored-to-absent transition");
+    if (journal.action === "unchanged" && !isDeepStrictEqual(previous, next))
+      throw new Error("Artifact metadata mutation changes target bytes without a write action");
+  }
+  async readTarget(relativePath, expectedSizes) {
+    const path = await resolvePrivatePath(this.runRoot, relativePath, false).catch((error51) => {
+      if (isMissing2(error51) || String(error51).includes("does not exist")) return void 0;
+      throw error51;
+    });
+    if (!path) return void 0;
+    const maximumBytes = Math.max(0, ...expectedSizes);
+    const contents = await readPrivateFileBounded(path, maximumBytes, this.runRoot).catch(
+      (error51) => {
+        if (isMissing2(error51)) return void 0;
+        throw error51;
+      }
+    );
+    if (!contents) return void 0;
+    if (!expectedSizes.has(contents.length)) return { bytes: contents.length };
+    return { bytes: contents.length, hash: bytesHash(contents) };
+  }
+  targetMatches(actual, entry) {
+    const expected = this.expectedTarget(entry);
+    return expected ? actual?.bytes === expected.bytes && actual.hash === expected.hash : actual === void 0;
+  }
+  async assertTargetMatches(relativePath, entry, expectedSizes, message) {
+    const target = await this.readTarget(relativePath, expectedSizes);
+    if (!this.targetMatches(target, entry)) throw new Error(message);
+  }
+  async cleanupMutationFiles() {
+    await removePrivateFile(this.runRoot, MUTATION_JOURNAL_PATH);
+    await removePrivateFile(this.runRoot, MUTATION_PAYLOAD_PATH);
+  }
+  async recoverPendingMutation() {
+    const journal = await this.readMutationJournal();
+    if (!journal) {
+      await removePrivateFile(this.runRoot, MUTATION_PAYLOAD_PATH);
+      return;
+    }
+    this.assertMutationAction(journal);
+    const inventory = await this.rawInventory();
+    const inventoryHash = contentHash(inventory);
+    const currentEntry = inventory.entries.find(({ path }) => path === journal.path);
+    const currentIsPrevious = inventoryHash === journal.previousInventoryHash && isDeepStrictEqual(currentEntry, journal.previousEntry);
+    const currentIsNext = inventoryHash === journal.nextInventoryHash && isDeepStrictEqual(currentEntry, journal.nextEntry);
+    if (!currentIsPrevious && !currentIsNext)
+      throw new Error(
+        `Artifact mutation ${journal.mutationId} does not match an exact durable inventory snapshot; recovery stopped without changing files`
+      );
+    const expectedSizes = new Set(
+      [this.expectedTarget(journal.previousEntry), this.expectedTarget(journal.nextEntry)].filter((value) => value !== void 0).map(({ bytes }) => bytes)
+    );
+    const target = await this.readTarget(journal.path, expectedSizes);
+    if (currentIsNext) {
+      if (!this.targetMatches(target, journal.nextEntry))
+        throw new Error(
+          `Artifact ${journal.path} does not match its completed mutation; recovery stopped without changing files`
+        );
+      await this.cleanupMutationFiles();
+      return;
+    }
+    const targetIsPrevious = this.targetMatches(target, journal.previousEntry);
+    const targetIsNext = this.targetMatches(target, journal.nextEntry);
+    if (!targetIsPrevious && !targetIsNext)
+      throw new Error(
+        `Artifact ${journal.path} changed after its mutation was journaled; recovery stopped without changing files`
+      );
+    const nextInventory = this.replaceEntry(inventory, journal.nextEntry, journal.createdAt);
+    if (contentHash(nextInventory) !== journal.nextInventoryHash)
+      throw new Error(
+        `Artifact mutation ${journal.mutationId} does not reproduce its next inventory snapshot; recovery stopped without changing files`
+      );
+    if (journal.action === "write" && !targetIsNext) {
+      const payloadPath = await resolvePrivatePath(this.runRoot, MUTATION_PAYLOAD_PATH, false);
+      const expected = this.expectedTarget(journal.nextEntry);
+      if (!expected) throw new Error("Artifact mutation payload has no journaled target bytes");
+      const payload = await readPrivateFileBounded(payloadPath, expected.bytes, this.runRoot);
+      if (payload.length !== expected.bytes)
+        throw new Error("Artifact mutation payload size does not match its journal");
+      if (bytesHash(payload) !== expected.hash)
+        throw new Error("Artifact mutation payload hash does not match its journal");
+      await atomicWrite(this.runRoot, journal.path, payload);
+    } else if (journal.action === "delete" && !targetIsNext) {
+      await removePrivateFile(this.runRoot, journal.path);
+    }
+    if (contentHash(await this.rawInventory()) !== journal.previousInventoryHash)
+      throw new Error(
+        `Artifact mutation ${journal.mutationId} inventory changed during recovery; recovery stopped without changing inventory metadata`
+      );
+    await this.assertTargetMatches(
+      journal.path,
+      journal.nextEntry,
+      expectedSizes,
+      `Artifact ${journal.path} changed before its inventory was recovered; recovery stopped without cleaning mutation evidence`
+    );
+    await this.persistInventory(nextInventory);
+    if (contentHash(await this.rawInventory()) !== journal.nextInventoryHash)
+      throw new Error(
+        `Artifact mutation ${journal.mutationId} inventory changed while it was recovered; recovery stopped without cleaning mutation evidence`
+      );
+    await this.assertTargetMatches(
+      journal.path,
+      journal.nextEntry,
+      expectedSizes,
+      `Artifact ${journal.path} changed while its inventory was recovered; recovery stopped without cleaning mutation evidence`
+    );
+    if (contentHash(await this.rawInventory()) !== journal.nextInventoryHash)
+      throw new Error(
+        `Artifact mutation ${journal.mutationId} inventory changed after it was recovered; recovery stopped without cleaning mutation evidence`
+      );
+    await this.cleanupMutationFiles();
+  }
+  async initialize() {
+    return await this.serializeMutation(async () => {
+      await ensurePrivateDirectory(this.runRoot);
+      const inventory = await this.rawInventory();
+      return await this.persistInventory(inventory);
+    });
+  }
+  async inventory() {
+    return await this.serializeMutation(
+      async () => await this.reconcile(await this.rawInventory())
+    );
+  }
+  async readArtifactPreview(relativePath, maxBytes) {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > MIB3)
+      throw new Error(`Artifact preview limit must be an integer from 0 through ${MIB3}`);
+    return await this.serializeMutation(async () => {
+      const parts = validatePortableRelativePath(relativePath);
+      if (parts[0] !== "artifacts" || parts.length < 2)
+        throw new Error("Artifact preview path is not artifact-owned");
+      const inventory = await this.rawInventory();
+      const entry = inventory.entries.find(({ path: path2 }) => path2 === relativePath);
+      const expected = this.expectedTarget(entry);
+      if (!entry || !expected)
+        throw new Error("Artifact preview is not represented by stored inventory bytes");
+      const path = await resolvePrivatePath(this.runRoot, relativePath, false);
+      const handle = await open4(path, fsConstants2.O_RDONLY | fsConstants2.O_NOFOLLOW);
+      try {
+        const before = await handle.stat();
+        if (!before.isFile() || before.nlink > 1)
+          throw new Error("Artifact preview target is not a private regular file");
+        if (!Number.isSafeInteger(before.size) || before.size !== expected.bytes)
+          throw new Error("Artifact preview size does not match its durable inventory");
+        const preview = Buffer.alloc(Math.min(before.size, maxBytes));
+        const chunkBuffer = Buffer.alloc(Math.min(64 * 1024, Math.max(1, before.size)));
+        const digest = createHash2("sha256").update('{"contents":"');
+        let carry = Buffer.alloc(0);
+        let position = 0;
+        while (position < before.size) {
+          const requested = Math.min(chunkBuffer.length, before.size - position);
+          const { bytesRead } = await handle.read(chunkBuffer, 0, requested, position);
+          if (bytesRead === 0)
+            throw new Error("Artifact preview ended before its durable inventory size");
+          const chunk = chunkBuffer.subarray(0, bytesRead);
+          if (position < preview.length)
+            chunk.copy(preview, position, 0, Math.min(bytesRead, preview.length - position));
+          const base64Input = carry.length > 0 ? Buffer.concat([carry, chunk]) : chunk;
+          const completeLength = base64Input.length - base64Input.length % 3;
+          if (completeLength > 0)
+            digest.update(base64Input.subarray(0, completeLength).toString("base64"));
+          carry = Buffer.from(base64Input.subarray(completeLength));
+          position += bytesRead;
+        }
+        digest.update(carry.toString("base64")).update('"}');
+        const after = await handle.stat();
+        if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs)
+          throw new Error("Artifact preview changed while it was being verified");
+        if (digest.digest("hex") !== expected.hash)
+          throw new Error("Artifact preview hash does not match its durable inventory");
+        return {
+          bytes: preview,
+          originalBytes: before.size,
+          truncated: before.size > maxBytes
+        };
+      } finally {
+        await handle.close();
+      }
+    });
+  }
+  async migrateLegacy() {
+    return await this.serializeMutation(async () => {
+      const inventory = await this.scanLegacy(emptyInventory(this.runId, this.policy));
+      await hardenPrivateTree(this.runRoot);
+      return await this.persistInventory(inventory);
+    });
+  }
+  async scanFiles(rootRelative) {
+    const root = join4(this.runRoot, rootRelative);
+    const exists = await targetStatus(root);
+    if (!exists) return [];
+    if (exists.isSymbolicLink()) throw new Error(`Refusing symbolic-link artifact root: ${root}`);
+    if (!exists.isDirectory()) throw new Error(`Artifact root is not a directory: ${root}`);
+    const files = [];
+    const visit = async (directory, relativeDirectory) => {
+      for (const item of await readdir2(directory, { withFileTypes: true })) {
+        const absolute = join4(directory, item.name);
+        const relativePath = `${relativeDirectory}/${item.name}`;
+        if (item.isSymbolicLink())
+          throw new Error(`Refusing symbolic link in artifact tree: ${absolute}`);
+        if (item.isDirectory()) {
+          await visit(absolute, relativePath);
+          continue;
+        }
+        if (!item.isFile()) throw new Error(`Unsupported entry in artifact tree: ${absolute}`);
+        const metadata = await lstat2(absolute);
+        assertRegularPrivateTarget(absolute, metadata);
+        files.push({
+          path: relativePath,
+          bytes: metadata.size,
+          modifiedMs: metadata.mtimeMs,
+          changedMs: metadata.ctimeMs,
+          inode: metadata.ino
+        });
+      }
+    };
+    await visit(root, rootRelative);
+    return files;
+  }
+  async scanLegacy(inventory) {
+    const files = [...await this.scanFiles("artifacts"), ...await this.scanFiles("capsules")];
+    const legacyLimit = inventory.policy.runArtifactBytes - inventory.policy.runReservedBytes;
+    const legacyBytes = files.reduce((total, file2) => total + file2.bytes, 0);
+    if (legacyBytes > legacyLimit)
+      throw new Error(
+        `Legacy run contains more than the ${legacyLimit}-byte safe artifact migration limit; prune legacy artifacts before retrying`
+      );
+    const byPath = new Map(inventory.entries.map((entry) => [entry.path, entry]));
+    for (const file2 of files) {
+      validateNewArtifactPath(file2.path);
+      const absolute = await resolvePrivatePath(this.runRoot, file2.path, false);
+      const contents = await readPrivateFileBounded(absolute, file2.bytes, this.runRoot);
+      if (contents.length !== file2.bytes)
+        throw new Error(`Artifact ${file2.path} changed while its legacy metadata was scanned`);
+      const storedHash = bytesHash(contents);
+      const previous = byPath.get(file2.path);
+      if (previous) {
+        if (previous.storedBytes === file2.bytes && previous.reason !== "missing_on_disk") {
+          if (previous.storedHash && previous.storedHash !== storedHash)
+            throw new Error(
+              `Artifact ${file2.path} hash does not match its legacy inventory; no inventory metadata was changed`
+            );
+          if (previous.storedHash) continue;
+          byPath.set(file2.path, { ...previous, storedHash, updatedAt: now() });
+          continue;
+        }
+        const sourceBytes = Math.max(previous.sourceBytes, file2.bytes);
+        const restored = previous.reason === "missing_on_disk";
+        const { reason: _previousReason, ...previousWithoutReason } = previous;
+        byPath.set(file2.path, {
+          ...restored ? previousWithoutReason : previous,
+          storedBytes: file2.bytes,
+          storedHash,
+          omittedBytes: Math.max(0, sourceBytes - file2.bytes),
+          truncated: file2.bytes < sourceBytes,
+          disposition: previous.legacy && file2.bytes === sourceBytes ? "legacy" : file2.bytes < sourceBytes ? "truncated" : "stored",
+          ...file2.bytes === 0 ? { reason: "missing_on_disk" } : {},
+          updatedAt: now()
+        });
+        continue;
+      }
+      const timestamp = now();
+      byPath.set(file2.path, {
+        path: file2.path,
+        kind: file2.path.startsWith("capsules/") ? "capsule" : file2.path.startsWith("artifacts/invocations/") ? "invocation_transcript" : "artifact",
+        format: formatForPath(file2.path),
+        disposition: "legacy",
+        sourceBytes: file2.bytes,
+        storedBytes: file2.bytes,
+        storedHash,
+        omittedBytes: 0,
+        truncated: false,
+        legacy: true,
+        reason: "legacy_migration",
+        createdAt: timestamp,
+        updatedAt: timestamp
+      });
+    }
+    const actual = new Set(files.map(({ path }) => path));
+    for (const [path, previous] of byPath) {
+      if (actual.has(path) || ["rejected", "omitted"].includes(previous.disposition)) continue;
+      byPath.set(path, {
+        ...previous,
+        disposition: "omitted",
+        storedBytes: 0,
+        omittedBytes: previous.sourceBytes,
+        truncated: previous.sourceBytes > 0,
+        reason: "missing_on_disk",
+        updatedAt: now()
+      });
+    }
+    return inventoryTotals({ ...inventory, entries: [...byPath.values()] });
+  }
+  async reconcile(inventory) {
+    const files = [...await this.scanFiles("artifacts"), ...await this.scanFiles("capsules")];
+    const entries = new Map(inventory.entries.map((entry) => [entry.path, entry]));
+    const actualPaths = new Set(files.map(({ path }) => path));
+    for (const file2 of files) {
+      const entry = entries.get(file2.path);
+      if (!entry)
+        throw new Error(
+          `Artifact ${file2.path} is not represented in the durable inventory; an interrupted or external write must be resolved before continuing`
+        );
+      const expected = this.expectedTarget(entry);
+      if (!expected || expected.bytes !== file2.bytes || entry.disposition === "rejected")
+        throw new Error(
+          `Artifact ${file2.path} does not match its durable inventory; no inventory metadata was changed`
+        );
+      const fingerprint = `${file2.bytes}:${file2.modifiedMs}:${file2.changedMs}:${file2.inode}:${expected.hash}`;
+      if (this.validatedFiles.get(file2.path) === fingerprint) continue;
+      const absolute = join4(this.runRoot, ...validatePortableRelativePath(file2.path));
+      if (bytesHash(await readPrivateFileBounded(absolute, expected.bytes, this.runRoot)) !== expected.hash)
+        throw new Error(
+          `Artifact ${file2.path} hash does not match its durable inventory; no inventory metadata was changed`
+        );
+      this.validatedFiles.set(file2.path, fingerprint);
+    }
+    for (const entry of inventory.entries) {
+      if ((entry.storedBytes > 0 || entry.disposition === "stored" || entry.disposition === "legacy") && !actualPaths.has(entry.path))
+        throw new Error(
+          `Artifact ${entry.path} is missing from disk; no inventory metadata was changed`
+        );
+    }
+    return inventory;
+  }
+  replaceEntry(inventory, entry, updatedAt = now()) {
+    return inventoryTotals(
+      {
+        ...inventory,
+        entries: [...inventory.entries.filter(({ path }) => path !== entry.path), entry]
+      },
+      updatedAt
+    );
+  }
+  async publishEntryMutation(input) {
+    assertNoArtifactPathAlias(input.inventory, input.entry.path);
+    const previousEntry = input.inventory.entries.find(({ path }) => path === input.entry.path);
+    const mutationTimestamp = now();
+    const nextInventory = this.replaceEntry(input.inventory, input.entry, mutationTimestamp);
+    const journal = ArtifactMutationJournalSchema.parse({
+      schemaVersion: 1,
+      runId: this.runId,
+      mutationId: randomUUID4(),
+      action: input.action,
+      previousInventoryHash: contentHash(input.inventory),
+      nextInventoryHash: contentHash(nextInventory),
+      path: input.entry.path,
+      ...previousEntry ? { previousEntry } : {},
+      nextEntry: input.entry,
+      createdAt: mutationTimestamp
+    });
+    this.assertMutationAction(journal);
+    if (input.action === "write") {
+      const expected = this.expectedTarget(input.entry);
+      if (!input.bytes || !expected || input.bytes.length !== expected.bytes)
+        throw new Error("Artifact mutation bytes do not match the inventory entry size");
+      if (bytesHash(input.bytes) !== expected.hash)
+        throw new Error("Artifact mutation bytes do not match the inventory entry hash");
+      await atomicWrite(this.runRoot, MUTATION_PAYLOAD_PATH, input.bytes);
+    } else if (input.bytes) {
+      throw new Error("Artifact mutation bytes require a write action");
+    }
+    await this.publicationHook?.({
+      boundary: "after_payload",
+      mutationId: journal.mutationId,
+      path: journal.path,
+      action: journal.action
+    });
+    await atomicWrite(
+      this.runRoot,
+      MUTATION_JOURNAL_PATH,
+      Buffer.from(`${JSON.stringify(journal, null, 2)}
+`)
+    );
+    await this.publicationHook?.({
+      boundary: "after_journal",
+      mutationId: journal.mutationId,
+      path: journal.path,
+      action: journal.action
+    });
+    if (contentHash(await this.rawInventory()) !== journal.previousInventoryHash)
+      throw new Error(
+        `Artifact ${input.entry.path} inventory changed while its mutation was being published; recovery stopped without changing files`
+      );
+    const expectedSizes = new Set(
+      [this.expectedTarget(previousEntry), this.expectedTarget(input.entry)].filter((value) => value !== void 0).map(({ bytes }) => bytes)
+    );
+    const target = await this.readTarget(input.entry.path, expectedSizes);
+    if (!this.targetMatches(target, previousEntry))
+      throw new Error(
+        `Artifact ${input.entry.path} changed while its mutation was being published; recovery stopped without changing files`
+      );
+    if (input.action === "write") await atomicWrite(this.runRoot, input.entry.path, input.bytes);
+    else if (input.action === "delete") await removePrivateFile(this.runRoot, input.entry.path);
+    await this.publicationHook?.({
+      boundary: "after_target",
+      mutationId: journal.mutationId,
+      path: journal.path,
+      action: journal.action
+    });
+    if (contentHash(await this.rawInventory()) !== journal.previousInventoryHash)
+      throw new Error(
+        `Artifact ${input.entry.path} inventory changed before its mutation inventory was published; recovery stopped without changing files`
+      );
+    await this.assertTargetMatches(
+      input.entry.path,
+      input.entry,
+      expectedSizes,
+      `Artifact ${input.entry.path} changed before its mutation inventory was published; recovery stopped without cleaning mutation evidence`
+    );
+    const persisted = await this.persistInventory(nextInventory);
+    if (contentHash(await this.rawInventory()) !== journal.nextInventoryHash)
+      throw new Error(
+        `Artifact mutation ${journal.mutationId} inventory changed while it was published; recovery stopped without cleaning mutation evidence`
+      );
+    await this.assertTargetMatches(
+      input.entry.path,
+      input.entry,
+      expectedSizes,
+      `Artifact ${input.entry.path} changed while its mutation inventory was published; recovery stopped without cleaning mutation evidence`
+    );
+    await this.publicationHook?.({
+      boundary: "after_inventory",
+      mutationId: journal.mutationId,
+      path: journal.path,
+      action: journal.action
+    });
+    if (contentHash(await this.rawInventory()) !== journal.nextInventoryHash)
+      throw new Error(
+        `Artifact mutation ${journal.mutationId} inventory changed after it was published; recovery stopped without cleaning mutation evidence`
+      );
+    await this.assertTargetMatches(
+      input.entry.path,
+      input.entry,
+      expectedSizes,
+      `Artifact ${input.entry.path} changed after its mutation inventory was published; recovery stopped without cleaning mutation evidence`
+    );
+    if (contentHash(await this.rawInventory()) !== journal.nextInventoryHash)
+      throw new Error(
+        `Artifact mutation ${journal.mutationId} inventory changed before mutation evidence cleanup; recovery stopped without cleaning mutation evidence`
+      );
+    await this.cleanupMutationFiles();
+    return persisted;
+  }
+  async writeArtifact(relativePath, value) {
+    return await this.serializeMutation(async () => {
+      validateNewRelativePath(relativePath);
+      const inventoryPath = `artifacts/${relativePath}`;
+      validateNewArtifactPath(inventoryPath);
+      const inventory = await this.reconcile(await this.rawInventory());
+      assertNoArtifactPathAlias(inventory, inventoryPath);
+      const previous = inventory.entries.find(({ path }) => path === inventoryPath);
+      const source = redactTextBytes(value);
+      const format = formatForPath(relativePath);
+      const baseStored = inventory.storedBytes - (previous?.storedBytes ?? 0);
+      const runAvailable = Math.max(
+        0,
+        inventory.policy.runArtifactBytes - inventory.policy.runReservedBytes - baseStored
+      );
+      const limit = Math.min(inventory.policy.ordinaryArtifactBytes, runAvailable);
+      const stored = truncateArtifact(source, format, limit);
+      const reason = source.length <= limit ? void 0 : runAvailable < inventory.policy.ordinaryArtifactBytes ? "run_quota" : "artifact_limit";
+      const entry = entryFor(inventoryPath, "artifact", format, source, stored, previous, reason);
+      await this.publishEntryMutation({
+        inventory,
+        entry,
+        action: stored !== void 0 ? "write" : this.expectedTarget(previous) ? "delete" : "unchanged",
+        ...stored !== void 0 ? { bytes: stored } : {}
+      });
+      return {
+        path: join4(this.runRoot, ...validatePortableRelativePath(inventoryPath)),
+        stored: entry.storedBytes > 0,
+        truncated: entry.truncated,
+        sourceBytes: entry.sourceBytes,
+        storedBytes: entry.storedBytes
+      };
+    });
+  }
+  async writeIdentityArtifact(input) {
+    return await this.serializeMutation(async () => {
+      validateNewArtifactPath(input.relativePath);
+      const inventory = await this.reconcile(await this.rawInventory());
+      assertNoArtifactPathAlias(inventory, input.relativePath);
+      const previous = inventory.entries.find(({ path: path2 }) => path2 === input.relativePath);
+      const source = redactTextBytes(input.value);
+      const perFileLimit = input.kind === "capsule" ? inventory.policy.capsuleBytes : inventory.policy.identityArtifactBytes;
+      const baseStored = inventory.storedBytes - (previous?.storedBytes ?? 0);
+      const runAvailable = Math.max(
+        0,
+        inventory.policy.runArtifactBytes - inventory.policy.runReservedBytes - baseStored
+      );
+      const reason = source.length > perFileLimit ? "identity_limit" : source.length > runAvailable ? "run_quota" : void 0;
+      if (reason) {
+        const message = `${input.kind === "capsule" ? "Context capsule" : "Content-addressed artifact"} exceeds the ${reason === "run_quota" ? "run quota" : `${perFileLimit}-byte identity limit`}; identity-bound data is never truncated`;
+        if (previous?.storedBytes)
+          throw new Error(`${message}; the existing identity artifact was preserved`);
+        const rejected = entryFor(
+          input.relativePath,
+          input.kind,
+          formatForPath(input.relativePath),
+          source,
+          void 0,
+          previous,
+          reason,
+          "rejected"
+        );
+        await this.publishEntryMutation({ inventory, entry: rejected, action: "unchanged" });
+        throw new Error(message);
+      }
+      const path = await resolvePrivatePath(this.runRoot, input.relativePath, true);
+      const existing = await readPrivateFileBounded(path, perFileLimit, this.runRoot).catch(
+        (error51) => {
+          if (isMissing2(error51)) return void 0;
+          throw error51;
+        }
+      );
+      if (existing && Buffer.compare(existing, source) !== 0)
+        throw new Error(
+          `Identity artifact path already contains different bytes: ${input.relativePath}`
+        );
+      const entry = entryFor(
+        input.relativePath,
+        input.kind,
+        formatForPath(input.relativePath),
+        source,
+        source,
+        previous
+      );
+      await this.publishEntryMutation({
+        inventory,
+        entry,
+        action: existing ? "unchanged" : "write",
+        ...!existing ? { bytes: source } : {}
+      });
+      return {
+        path,
+        reused: Boolean(existing),
+        stored: true,
+        truncated: false,
+        sourceBytes: source.length,
+        storedBytes: source.length
+      };
+    });
+  }
+  async appendInvocationEvent(invocationId, event) {
+    if (!/^[a-z0-9][a-z0-9._-]{0,127}$/i.test(invocationId))
+      throw new Error(`Invalid invocation ID: ${invocationId}`);
+    const persistedEvent = HostEventSchema.parse(redactValue(event));
+    assertInvocationEventIdentity(persistedEvent, invocationId);
+    return await this.serializeMutation(async () => {
+      const sourceLine = Buffer.from(`${JSON.stringify(persistedEvent)}
+`);
+      const relativePath = `artifacts/invocations/${invocationId}.jsonl`;
+      validateNewArtifactPath(relativePath);
+      const recovery = ["session", "result", "usage", "error", "terminated"].includes(
+        persistedEvent.type
+      );
+      let inventory = await this.reconcile(await this.rawInventory());
+      const policy = inventory.policy;
+      if (recovery) {
+        const checkpointPath = `artifacts/invocations/${invocationId}.recovery.json`;
+        validateNewArtifactPath(checkpointPath);
+        const previousEntry = inventory.entries.find(({ path: path2 }) => path2 === checkpointPath);
+        const checkpointAbsolute = await resolvePrivatePath(this.runRoot, checkpointPath, true);
+        const previousCheckpoint = await readPrivateFileBounded(
+          checkpointAbsolute,
+          policy.invocationReservedBytes,
+          this.runRoot
+        ).then(
+          (value) => parseRecoveryCheckpoint(JSON.parse(value.toString("utf8")), invocationId)
+        ).catch((error51) => {
+          if (isMissing2(error51)) return void 0;
+          throw error51;
+        });
+        const checkpoint = updateRecoveryCheckpoint(
+          invocationId,
+          previousCheckpoint,
+          persistedEvent
+        );
+        const bounded = boundedRecoveryCheckpoint(checkpoint, policy.invocationReservedBytes);
+        const baseStored2 = inventory.storedBytes - (previousEntry?.storedBytes ?? 0);
+        if (bounded.stored.length > policy.runArtifactBytes - baseStored2)
+          throw new Error("Run artifact quota cannot preserve invocation recovery state");
+        const checkpointEntry = entryFor(
+          checkpointPath,
+          "invocation_recovery",
+          "json",
+          bounded.source,
+          bounded.stored,
+          previousEntry,
+          bounded.source.length > bounded.stored.length ? "artifact_limit" : void 0
+        );
+        inventory = await this.publishEntryMutation({
+          inventory,
+          entry: checkpointEntry,
+          action: "write",
+          bytes: bounded.stored
+        });
+      }
+      const previous = inventory.entries.find(({ path: path2 }) => path2 === relativePath);
+      const path = await resolvePrivatePath(this.runRoot, relativePath, true);
+      const existing = await readPrivateFileBounded(
+        path,
+        policy.invocationTranscriptBytes,
+        this.runRoot
+      ).catch((error51) => {
+        if (isMissing2(error51)) return Buffer.alloc(0);
+        throw error51;
+      });
+      const transcriptLimit = recovery ? policy.invocationTranscriptBytes : policy.invocationTranscriptBytes - policy.invocationReservedBytes;
+      const runLimit = recovery ? policy.runArtifactBytes : policy.runArtifactBytes - policy.runReservedBytes;
+      const baseStored = inventory.storedBytes - (previous?.storedBytes ?? 0);
+      const available = Math.max(
+        0,
+        Math.min(transcriptLimit - existing.length, runLimit - baseStored - existing.length)
+      );
+      const storedLine = compactHostEvent(persistedEvent, available);
+      const stored = storedLine ? Buffer.concat([existing, storedLine]) : existing;
+      const timestamp = now();
+      const sourceBytes = (previous?.sourceBytes ?? existing.length) + sourceLine.length;
+      const omittedBytes = Math.max(0, sourceBytes - stored.length);
+      const newlyOmittedBytes = Math.max(0, sourceLine.length - (storedLine?.length ?? 0));
+      const reason = omittedBytes === 0 ? void 0 : newlyOmittedBytes === 0 && previous?.reason ? previous.reason : baseStored + existing.length >= runLimit ? "run_quota" : recovery ? "artifact_limit" : "transcript_reserve";
+      const entry = {
+        path: relativePath,
+        kind: "invocation_transcript",
+        format: "jsonl",
+        disposition: stored.length === 0 ? "omitted" : omittedBytes > 0 ? "truncated" : "stored",
+        sourceBytes,
+        storedBytes: stored.length,
+        omittedBytes,
+        truncated: omittedBytes > 0,
+        legacy: false,
+        storedHash: bytesHash(stored),
+        ...reason ? { reason } : {},
+        createdAt: previous?.createdAt ?? timestamp,
+        updatedAt: timestamp
+      };
+      await this.publishEntryMutation({
+        inventory,
+        entry,
+        action: storedLine ? "write" : "unchanged",
+        ...storedLine ? { bytes: stored } : {}
+      });
+      return {
+        path,
+        stored: storedLine !== void 0,
+        truncated: omittedBytes > 0,
+        sourceBytes,
+        storedBytes: stored.length
+      };
+    });
+  }
+  async loadInvocationEvents(invocationId) {
+    if (!/^[a-z0-9][a-z0-9._-]{0,127}$/i.test(invocationId))
+      throw new Error(`Invalid invocation ID: ${invocationId}`);
+    return await this.serializeMutation(async () => {
+      const inventory = await this.reconcile(await this.rawInventory());
+      const transcriptPath = `artifacts/invocations/${invocationId}.jsonl`;
+      const checkpointPath = `artifacts/invocations/${invocationId}.recovery.json`;
+      const transcript = await resolvePrivatePath(this.runRoot, transcriptPath, false).then(
+        async (path) => (await readPrivateFileBounded(
+          path,
+          inventory.policy.invocationTranscriptBytes,
+          this.runRoot
+        )).toString("utf8")
+      ).then(
+        (content) => content.split("\n").filter(Boolean).map((line) => {
+          const event = HostEventSchema.parse(JSON.parse(line));
+          assertInvocationEventIdentity(event, invocationId);
+          return event;
+        })
+      ).catch((error51) => {
+        if (isMissing2(error51) || String(error51).includes("does not exist"))
+          return [];
+        throw error51;
+      });
+      const checkpoint = await resolvePrivatePath(this.runRoot, checkpointPath, false).then(
+        async (path) => parseRecoveryCheckpoint(
+          JSON.parse(
+            (await readPrivateFileBounded(
+              path,
+              inventory.policy.invocationReservedBytes,
+              this.runRoot
+            )).toString("utf8")
+          ),
+          invocationId
+        )
+      ).catch((error51) => {
+        if (isMissing2(error51) || String(error51).includes("does not exist")) return void 0;
+        throw error51;
+      });
+      if (!checkpoint) return transcript;
+      const merged = [...transcript];
+      const counts = /* @__PURE__ */ new Map();
+      for (const item of transcript) {
+        const key = JSON.stringify(item);
+        counts.set(key, (counts.get(key) ?? 0) + 1);
+      }
+      for (const item of recoveryEvents(checkpoint)) {
+        const key = JSON.stringify(item);
+        const remaining = counts.get(key) ?? 0;
+        if (remaining > 0) {
+          counts.set(key, remaining - 1);
+          continue;
+        }
+        merged.push(item);
+      }
+      return merged;
+    });
+  }
+};
+
 // packages/probes/src/index.ts
-import { access, readFile as readFile2, stat as stat2 } from "node:fs/promises";
+import { access, readFile, stat as stat3 } from "node:fs/promises";
 import { constants } from "node:fs";
-import { dirname as dirname3, join as join3, resolve, sep } from "node:path";
+import { dirname as dirname5, join as join5, resolve as resolve3, sep as sep2 } from "node:path";
 
 // packages/probes/src/process.ts
-import { spawn as spawn4 } from "node:child_process";
+import { spawn as spawn5 } from "node:child_process";
+import { createHash as createHash3 } from "node:crypto";
+var MIB4 = 1024 * 1024;
+var DEFAULT_PROCESS_OUTPUT_BYTES_PER_STREAM = 8 * MIB4;
+var DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM = MIB4;
+var ProcessOutputLimitError = class extends Error {
+  stream;
+  capture;
+  constructor(stream, capture) {
+    const limit = capture[stream].limitBytes;
+    super(`Subprocess ${stream} exceeded the ${limit}-byte capture limit; output was rejected`);
+    this.name = "ProcessOutputLimitError";
+    this.stream = stream;
+    this.capture = capture;
+  }
+};
+function decodeUtf8Prefix3(source) {
+  for (let trim = 0; trim <= Math.min(3, source.length); trim += 1) {
+    const end = source.length - trim;
+    try {
+      const text = new TextDecoder("utf-8", { fatal: true }).decode(source.subarray(0, end));
+      return { bytes: end, text };
+    } catch {
+    }
+  }
+  return { bytes: source.length, text: source.toString("utf8") };
+}
+function truncationMarker(stream, capture) {
+  return `[GRAPHCRAFT ${stream.toUpperCase()} TRUNCATED: retained ${capture.retainedBytes} of ${capture.observedBytes} bytes]`;
+}
+var BoundedStreamCapture = class {
+  constructor(limitBytes) {
+    this.limitBytes = limitBytes;
+  }
+  limitBytes;
+  chunks = [];
+  digest = createHash3("sha256");
+  observedBytes = 0;
+  retainedBytes = 0;
+  append(chunk) {
+    this.digest.update(chunk);
+    this.observedBytes += chunk.length;
+    const available = Math.max(0, this.limitBytes - this.retainedBytes);
+    if (available > 0) {
+      const retained = Buffer.from(chunk.subarray(0, available));
+      this.chunks.push(retained);
+      this.retainedBytes += retained.length;
+    }
+    return this.observedBytes > this.limitBytes;
+  }
+  finish(stream) {
+    const decoded = decodeUtf8Prefix3(Buffer.concat(this.chunks, this.retainedBytes));
+    const metadata = {
+      limitBytes: this.limitBytes,
+      observedBytes: this.observedBytes,
+      retainedBytes: decoded.bytes,
+      omittedBytes: Math.max(0, this.observedBytes - decoded.bytes),
+      truncated: decoded.bytes < this.observedBytes,
+      digest: this.digest.digest("hex")
+    };
+    if (!metadata.truncated) return { text: decoded.text, metadata };
+    const separator = decoded.text.length > 0 && !decoded.text.endsWith("\n") ? "\n" : "";
+    return {
+      text: `${decoded.text}${separator}${truncationMarker(stream, metadata)}
+`,
+      metadata
+    };
+  }
+};
 async function runProcess(command, args, options) {
   const started = performance.now();
   const timeoutMs = options.timeoutMs ?? 12e4;
-  return await new Promise((resolve6, reject) => {
-    const child = spawn4(command, args, {
+  const maxOutputBytesPerStream = options.maxOutputBytesPerStream ?? DEFAULT_PROCESS_OUTPUT_BYTES_PER_STREAM;
+  const outputOverflow = options.outputOverflow ?? "reject";
+  if (!Number.isSafeInteger(maxOutputBytesPerStream) || maxOutputBytesPerStream <= 0)
+    throw new Error("Subprocess output capture limit must be a positive safe integer");
+  return await new Promise((resolve11, reject) => {
+    const child = spawn5(command, args, {
       cwd: options.cwd,
       env: { ...process.env, ...options.env, NO_COLOR: "1", FORCE_COLOR: "0" },
       shell: false,
       stdio: ["ignore", "pipe", "pipe"]
     });
-    let stdout = "";
-    let stderr = "";
+    const stdoutCapture = new BoundedStreamCapture(maxOutputBytesPerStream);
+    const stderrCapture = new BoundedStreamCapture(maxOutputBytesPerStream);
     let timedOut = false;
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
-    child.once("error", reject);
+    let overflowStream;
+    let settled = false;
+    let escalationTimer;
+    const terminateWithEscalation = () => {
+      child.kill("SIGTERM");
+      if (escalationTimer) return;
+      escalationTimer = setTimeout(() => child.kill("SIGKILL"), 2e3);
+      escalationTimer.unref();
+    };
+    const capture = (stream, target, chunk) => {
+      const overflowed = target.append(chunk);
+      if (overflowed && outputOverflow === "reject" && !overflowStream) {
+        overflowStream = stream;
+        terminateWithEscalation();
+      }
+    };
+    child.stdout.on("data", (chunk) => capture("stdout", stdoutCapture, chunk));
+    child.stderr.on("data", (chunk) => capture("stderr", stderrCapture, chunk));
     const abort = () => {
       child.kill("SIGTERM");
     };
     options.signal?.addEventListener("abort", abort, { once: true });
+    if (options.signal?.aborted) abort();
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 2e3).unref();
+      terminateWithEscalation();
     }, timeoutMs);
     timer.unref();
-    child.once("close", (code) => {
+    const cleanup = () => {
       clearTimeout(timer);
+      if (escalationTimer) clearTimeout(escalationTimer);
       options.signal?.removeEventListener("abort", abort);
-      resolve6({
+    };
+    child.once("error", (error51) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error51);
+    });
+    child.once("close", (code) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      const stdout = stdoutCapture.finish("stdout");
+      const stderr = stderrCapture.finish("stderr");
+      const captureMetadata = {
+        stdout: stdout.metadata,
+        stderr: stderr.metadata
+      };
+      if (overflowStream) {
+        reject(new ProcessOutputLimitError(overflowStream, captureMetadata));
+        return;
+      }
+      resolve11({
         exitCode: code ?? (timedOut ? 124 : 1),
-        stdout,
-        stderr,
+        stdout: stdout.text,
+        stderr: stderr.text,
         durationMs: Math.round(performance.now() - started),
-        timedOut
+        timedOut,
+        capture: captureMetadata
       });
     });
   });
@@ -36070,8 +38883,17 @@ async function runProcess(command, args, options) {
 // packages/probes/src/index.ts
 function compactOutput(result) {
   const value = [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join("\n");
-  return value.length > 1e3 ? `${value.slice(0, 1e3)}
+  const truncated = ["stdout", "stderr"].flatMap((stream) => {
+    const capture = result.capture[stream];
+    return capture.truncated ? [`${stream} retained ${capture.retainedBytes} of ${capture.observedBytes} bytes`] : [];
+  });
+  if (truncated.length === 0) return value.length > 1e3 ? `${value.slice(0, 1e3)}
 \u2026` : value;
+  const note = `[Output truncated by Graphcraft: ${truncated.join("; ")}]`;
+  const available = Math.max(0, 1e3 - note.length - 2);
+  const prefix = value.slice(0, available);
+  return `${prefix}${value.length > available ? "\n\u2026" : ""}
+${note}`;
 }
 async function runProbe(spec, repositoryPath, signal) {
   const started = performance.now();
@@ -36079,8 +38901,10 @@ async function runProbe(spec, repositoryPath, signal) {
     throw new Error(`Held-out probe ${spec.id} must be resolved by the runtime`);
   if (spec.kind === "command") {
     const processResult = await runProcess(spec.command, spec.args, {
-      cwd: spec.cwd ? resolve(repositoryPath, spec.cwd) : repositoryPath,
+      cwd: spec.cwd ? resolve3(repositoryPath, spec.cwd) : repositoryPath,
       timeoutMs: spec.timeoutMs,
+      maxOutputBytesPerStream: DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM,
+      outputOverflow: "truncate",
       ...signal ? { signal } : {}
     });
     const output2 = [processResult.stdout, processResult.stderr].filter(Boolean).join("\n");
@@ -36092,7 +38916,9 @@ async function runProbe(spec, repositoryPath, signal) {
         passed: passed2,
         signature: contentHash({
           exitCode: processResult.exitCode,
-          output: compactOutput(processResult)
+          output: compactOutput(processResult),
+          stdoutDigest: processResult.capture.stdout.digest,
+          stderrDigest: processResult.capture.stderr.digest
         }),
         summary: processResult.timedOut ? `Timed out after ${spec.timeoutMs}ms` : `${spec.command} exited ${processResult.exitCode}${compactOutput(processResult) ? `: ${compactOutput(processResult)}` : ""}`,
         durationMs: processResult.durationMs
@@ -36101,7 +38927,7 @@ async function runProbe(spec, repositoryPath, signal) {
     };
   }
   if (spec.kind === "file") {
-    const path = resolve(repositoryPath, spec.path);
+    const path = resolve3(repositoryPath, spec.path);
     let exists = true;
     try {
       await access(path, constants.F_OK);
@@ -36109,7 +38935,7 @@ async function runProbe(spec, repositoryPath, signal) {
       exists = false;
     }
     let contains = true;
-    if (exists && spec.contains) contains = (await readFile2(path, "utf8")).includes(spec.contains);
+    if (exists && spec.contains) contains = (await readFile(path, "utf8")).includes(spec.contains);
     const passed2 = exists === spec.shouldExist && contains;
     const summary = `${spec.path} ${exists ? "exists" : "does not exist"}${spec.contains ? ` and ${contains ? "contains" : "does not contain"} the required text` : ""}`;
     return {
@@ -36180,15 +39006,15 @@ async function runProbes(specs, repositoryPath, signal) {
   return results;
 }
 async function workspaceDigest(repositoryPath) {
-  const [status2, diff] = await Promise.all([
+  const [status3, diff] = await Promise.all([
     runProcess("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
       cwd: repositoryPath
     }),
     runProcess("git", ["diff", "--no-ext-diff", "--binary", "HEAD", "--"], { cwd: repositoryPath })
   ]);
-  if (status2.exitCode !== 0 || diff.exitCode !== 0)
+  if (status3.exitCode !== 0 || diff.exitCode !== 0)
     throw new Error("Unable to capture repository state");
-  return contentHash({ status: status2.stdout, diff: diff.stdout });
+  return contentHash({ status: status3.stdout, diff: diff.stdout });
 }
 var probeStopWords = /* @__PURE__ */ new Set([
   "across",
@@ -36259,11 +39085,11 @@ async function packageCandidates(repositoryPath, family, terms) {
   const tracked = await runProcess("git", ["ls-files"], { cwd: repositoryPath });
   if (tracked.exitCode !== 0) return [];
   const manifests = tracked.stdout.split("\n").filter((path) => path === "package.json" || path.endsWith("/package.json")).slice(0, 100);
-  const rootManifest = manifests.includes("package.json") ? JSON.parse(await readFile2(join3(repositoryPath, "package.json"), "utf8")) : void 0;
+  const rootManifest = manifests.includes("package.json") ? JSON.parse(await readFile(join5(repositoryPath, "package.json"), "utf8")) : void 0;
   const candidates = [];
   for (const manifestPath of manifests) {
-    const manifest2 = JSON.parse(await readFile2(join3(repositoryPath, manifestPath), "utf8"));
-    const directory = dirname3(manifestPath) === "." ? void 0 : dirname3(manifestPath);
+    const manifest2 = JSON.parse(await readFile(join5(repositoryPath, manifestPath), "utf8"));
+    const directory = dirname5(manifestPath) === "." ? void 0 : dirname5(manifestPath);
     const relevant = !directory || terms.some(
       (term) => directory.toLowerCase().includes(term) || manifest2.name?.toLowerCase().includes(term)
     );
@@ -36303,9 +39129,9 @@ function selectPackageCandidates(candidates) {
   );
 }
 function withinRepository(repositoryPath, candidate) {
-  const root = resolve(repositoryPath);
-  const path = resolve(repositoryPath, candidate);
-  return path === root || path.startsWith(`${root}${sep}`);
+  const root = resolve3(repositoryPath);
+  const path = resolve3(repositoryPath, candidate);
+  return path === root || path.startsWith(`${root}${sep2}`);
 }
 async function validateProbePlan(input, repositoryPath) {
   const plan = ProbePlanSchema.parse(input);
@@ -36328,7 +39154,7 @@ async function validateProbePlan(input, repositoryPath) {
       const cwd = item.probe.cwd ?? ".";
       if (!withinRepository(repositoryPath, cwd))
         throw new Error(`Probe ${item.probe.id} escapes the repository working directory`);
-      const directory = await stat2(resolve(repositoryPath, cwd)).catch(() => void 0);
+      const directory = await stat3(resolve3(repositoryPath, cwd)).catch(() => void 0);
       if (!directory?.isDirectory())
         throw new Error(`Probe ${item.probe.id} uses missing working directory ${cwd}`);
     }
@@ -36393,7 +39219,7 @@ async function discoverProbePlan(repositoryPath, task, baseSha, options = {}) {
     items.push(completion);
   }
   try {
-    await access(join3(repositoryPath, "pyproject.toml"));
+    await access(join5(repositoryPath, "pyproject.toml"));
     items.push({
       phase: "completion",
       purpose: "regression",
@@ -36411,7 +39237,7 @@ async function discoverProbePlan(repositoryPath, task, baseSha, options = {}) {
   } catch {
   }
   try {
-    await access(join3(repositoryPath, "go.mod"));
+    await access(join5(repositoryPath, "go.mod"));
     items.push({
       phase: "completion",
       purpose: "regression",
@@ -36440,28 +39266,43 @@ async function discoverProbePlan(repositoryPath, task, baseSha, options = {}) {
 }
 
 // packages/runtime/src/runner.ts
-import { randomUUID as randomUUID7 } from "node:crypto";
-import { join as join9 } from "node:path";
+import { randomUUID as randomUUID8 } from "node:crypto";
+import { join as join11 } from "node:path";
 
 // packages/runtime/src/control.ts
-import { randomUUID as randomUUID4 } from "node:crypto";
-import { readFile as readFile3, unlink as unlink2 } from "node:fs/promises";
-import { join as join4 } from "node:path";
+import { randomUUID as randomUUID5 } from "node:crypto";
+import { unlink as unlink3 } from "node:fs/promises";
+import { dirname as dirname6, join as join6 } from "node:path";
+var CONTROL_REQUEST_MAX_BYTES = 64 * 1024;
 var RunControlChannel = class {
-  constructor(graphcraftRoot, runId) {
-    this.graphcraftRoot = graphcraftRoot;
+  constructor(graphcraftRoot2, runId) {
+    this.graphcraftRoot = graphcraftRoot2;
     this.runId = runId;
-    this.path = join4(graphcraftRoot, "controls", `${runId}.json`);
+    this.path = join6(graphcraftRoot2, "controls", `${runId}.json`);
   }
   graphcraftRoot;
   runId;
   path;
+  storageReady;
+  async ensureStorage() {
+    this.storageReady ??= (async () => {
+      await ensurePrivateDirectory(this.graphcraftRoot);
+      await ensurePrivateDirectory(dirname6(this.path), this.graphcraftRoot);
+    })();
+    try {
+      await this.storageReady;
+    } catch (error51) {
+      this.storageReady = void 0;
+      throw error51;
+    }
+  }
   async request(action, reason) {
+    await this.ensureStorage();
     const existing = await this.read();
     if (existing?.action === "stop" && action === "pause") return existing;
     const request = RunControlRequestSchema.parse({
       schemaVersion: 1,
-      requestId: randomUUID4(),
+      requestId: randomUUID5(),
       runId: this.runId,
       action,
       cause: action === "pause" ? "user_pause" : "user_stop",
@@ -36469,12 +39310,32 @@ var RunControlChannel = class {
       requestedAt: (/* @__PURE__ */ new Date()).toISOString(),
       requestedByPid: process.pid
     });
+    if (Buffer.byteLength(`${JSON.stringify(request, null, 2)}
+`) > CONTROL_REQUEST_MAX_BYTES)
+      throw new Error(
+        `Run control request exceeds its ${CONTROL_REQUEST_MAX_BYTES}-byte persistence limit`
+      );
+    await hardenPrivateFile(this.path, this.graphcraftRoot);
     await writeJsonAtomic(this.path, request);
+    await hardenPrivateFile(this.path, this.graphcraftRoot);
     return request;
   }
   async read() {
+    await this.ensureStorage();
+    await hardenPrivateFile(this.path, this.graphcraftRoot);
+    let serialized;
     try {
-      return RunControlRequestSchema.parse(JSON.parse(await readFile3(this.path, "utf8")));
+      serialized = await readPrivateFileBounded(
+        this.path,
+        CONTROL_REQUEST_MAX_BYTES,
+        this.graphcraftRoot
+      );
+    } catch (error51) {
+      if (error51.code === "ENOENT") return void 0;
+      throw error51;
+    }
+    try {
+      return RunControlRequestSchema.parse(JSON.parse(serialized.toString("utf8")));
     } catch {
       return void 0;
     }
@@ -36503,9 +39364,10 @@ var RunControlChannel = class {
     };
   }
   async clear(requestId) {
+    await this.ensureStorage();
     const current = await this.read();
     if (current?.requestId !== requestId) return;
-    await unlink2(this.path).catch((error51) => {
+    await unlink3(this.path).catch((error51) => {
       if (error51.code !== "ENOENT") throw error51;
     });
   }
@@ -36519,7 +39381,7 @@ async function requestRunControl(store, action, reason = action === "pause" ? "P
   if (targetReached(action, state)) return state;
   const channel = new RunControlChannel(store.graphcraftRoot, store.runId);
   const request = await channel.request(action, reason);
-  const lockPath = join4(store.graphcraftRoot, "locks", `${store.runId}.lock`);
+  const lockPath = join6(store.graphcraftRoot, "locks", `${store.runId}.lock`);
   const deadline = Date.now() + waitMs;
   while (Date.now() <= deadline) {
     const lock = new RunLock(lockPath);
@@ -36549,7 +39411,7 @@ async function requestRunControl(store, action, reason = action === "pause" ? "P
       if (!(error51 instanceof Error) || error51.message !== "Graphcraft run is already active")
         throw error51;
     }
-    await new Promise((resolve6) => setTimeout(resolve6, 50));
+    await new Promise((resolve11) => setTimeout(resolve11, 50));
   }
   throw new Error(
     `The active Graphcraft process did not acknowledge ${action} within ${waitMs}ms; the durable request remains pending`
@@ -36557,8 +39419,8 @@ async function requestRunControl(store, action, reason = action === "pause" ? "P
 }
 
 // packages/runtime/src/governance.ts
-import { randomUUID as randomUUID5 } from "node:crypto";
-import { join as join5 } from "node:path";
+import { randomUUID as randomUUID6 } from "node:crypto";
+import { join as join7 } from "node:path";
 function decisionFor(state, sourceId, targetId) {
   const explicit = state.controlDecisions.findLast(
     (decision) => decision.sourceId === sourceId && decision.targetId === targetId
@@ -36569,7 +39431,7 @@ function decisionFor(state, sourceId, targetId) {
     return void 0;
   return ControlDecisionSchema.parse({
     schemaVersion: 1,
-    decisionId: randomUUID5(),
+    decisionId: randomUUID6(),
     sourceId,
     targetId,
     verdict: sourceState.status === "accepted" ? "approve" : "veto",
@@ -36603,7 +39465,7 @@ async function recordRuntimeControlDecision(input) {
     throw new Error(`Verifier source ${input.sourceId} is not owned by a held-out evaluator`);
   const decision = ControlDecisionSchema.parse({
     schemaVersion: 1,
-    decisionId: randomUUID5(),
+    decisionId: randomUUID6(),
     sourceId: input.sourceId,
     targetId: input.targetId,
     verdict: input.verdict,
@@ -36626,7 +39488,7 @@ async function recordRunApprovalDecisions(store, graph) {
       store,
       ControlDecisionSchema.parse({
         schemaVersion: 1,
-        decisionId: randomUUID5(),
+        decisionId: randomUUID6(),
         sourceId: edge.from,
         targetId: edge.to,
         verdict: "approve",
@@ -36641,7 +39503,7 @@ async function recordRunApprovalDecisions(store, graph) {
 }
 function packet(input) {
   return ControlDecisionPacketSchema.parse({
-    packetId: randomUUID5(),
+    packetId: randomUUID6(),
     targetId: input.targetId,
     invariant: "A controlled node cannot run or be accepted without resolved authority",
     conflict: input.conflict,
@@ -36899,7 +39761,8 @@ async function evaluateControlAcceptance(store, graph, state, targetId, evidence
   return { allowed: true };
 }
 async function decideRunControl(store, input) {
-  const lock = new RunLock(join5(store.graphcraftRoot, "locks", `${store.runId}.lock`));
+  await store.prepareStorage();
+  const lock = new RunLock(join7(store.graphcraftRoot, "locks", `${store.runId}.lock`));
   await lock.acquire();
   try {
     const [graph, state] = await Promise.all([store.loadGraph(), store.loadState()]);
@@ -36922,7 +39785,7 @@ async function decideRunControl(store, input) {
       throw new Error(`Replacement decision ${input.replaces} is not current`);
     const decision = ControlDecisionSchema.parse({
       schemaVersion: 1,
-      decisionId: randomUUID5(),
+      decisionId: randomUUID6(),
       sourceId: input.sourceId,
       targetId: input.targetId,
       verdict: input.verdict,
@@ -36941,8 +39804,8 @@ async function decideRunControl(store, input) {
 }
 
 // packages/runtime/src/repository.ts
-import { appendFile, lstat, mkdir as mkdir3, readFile as readFile4, readlink } from "node:fs/promises";
-import { basename, dirname as dirname4, isAbsolute as isAbsolute2, join as join6, resolve as resolve2 } from "node:path";
+import { appendFile, lstat as lstat3, mkdir as mkdir3, readFile as readFile2, readlink } from "node:fs/promises";
+import { basename as basename3, dirname as dirname7, isAbsolute as isAbsolute4, join as join8, resolve as resolve4 } from "node:path";
 
 // packages/runtime/src/side-effect.ts
 var SideEffectBoundaryInterruption = class extends Error {
@@ -37202,7 +40065,7 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
   ) : [];
   const taskMatches = await Promise.all(
     matchedPaths.map(async (path) => {
-      const content = await readFile4(join6(repositoryRoot, path), "utf8").catch(() => "");
+      const content = await readFile2(join8(repositoryRoot, path), "utf8").catch(() => "");
       const normalized = content.toLowerCase();
       const score = searchTerms.filter((term) => normalized.includes(term)).length;
       const pathScore = searchTerms.filter((term) => path.toLowerCase().includes(term)).length;
@@ -37227,7 +40090,7 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
   for (const path of baselinePaths) {
     if (remainingCharacters <= 0 || files.length >= 7) break;
     if (files.some((file2) => file2.path === path)) continue;
-    const content = await readFile4(join6(repositoryRoot, path), "utf8").catch(() => "");
+    const content = await readFile2(join8(repositoryRoot, path), "utf8").catch(() => "");
     const limit = Math.min(2e3, remainingCharacters);
     const selected = content.slice(0, limit);
     files.push({ path, content: selected, truncated: selected.length < content.length });
@@ -37243,12 +40106,12 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
 }
 async function ensureGraphcraftIgnored(repositoryRoot) {
   const rawExcludePath = await git(repositoryRoot, ["rev-parse", "--git-path", "info/exclude"]);
-  const excludePath = isAbsolute2(rawExcludePath) ? rawExcludePath : resolve2(repositoryRoot, rawExcludePath);
+  const excludePath = isAbsolute4(rawExcludePath) ? rawExcludePath : resolve4(repositoryRoot, rawExcludePath);
   let content = "";
   try {
-    content = await readFile4(excludePath, "utf8");
+    content = await readFile2(excludePath, "utf8");
   } catch {
-    await mkdir3(dirname4(excludePath), { recursive: true });
+    await mkdir3(dirname7(excludePath), { recursive: true });
   }
   if (!content.split("\n").includes(".graphcraft/"))
     await appendFile(excludePath, "\n.graphcraft/\n", "utf8");
@@ -37258,11 +40121,11 @@ function slug(task) {
 }
 async function createRunWorkspace(contract) {
   const branch = `graphcraft/${contract.runId.slice(0, 8)}-${slug(contract.task)}`;
-  const parent = join6(
-    dirname4(contract.repository.root),
-    `.${basename(contract.repository.root)}-graphcraft-worktrees`
+  const parent = join8(
+    dirname7(contract.repository.root),
+    `.${basename3(contract.repository.root)}-graphcraft-worktrees`
   );
-  const path = join6(parent, contract.runId);
+  const path = join8(parent, contract.runId);
   await mkdir3(parent, { recursive: true });
   const registered = await git(contract.repository.root, ["worktree", "list", "--porcelain"]);
   if (registered.includes(`worktree ${path}`)) return { path, branch, created: false };
@@ -37290,8 +40153,8 @@ async function commitContentDigest(repositoryPath) {
   ].sort();
   const changes = await Promise.all(
     paths.map(async (path) => {
-      const absolutePath = join6(repositoryPath, path);
-      const stats = await lstat(absolutePath).catch(() => void 0);
+      const absolutePath = join8(repositoryPath, path);
+      const stats = await lstat3(absolutePath).catch(() => void 0);
       if (!stats) return { path, kind: "absent" };
       if (stats.isSymbolicLink())
         return { path, kind: "symlink", target: await readlink(absolutePath) };
@@ -37300,7 +40163,7 @@ async function commitContentDigest(repositoryPath) {
           path,
           kind: "file",
           executable: (stats.mode & 73) !== 0,
-          contents: (await readFile4(absolutePath)).toString("base64")
+          contents: (await readFile2(absolutePath)).toString("base64")
         };
       return { path, kind: "other" };
     })
@@ -37344,8 +40207,8 @@ async function performAtomicCommit(workspace, claim, task, boundary) {
   const current = await captureCommitPrecondition(workspace);
   if (current.expectedHead !== expected.expectedHead || current.branch !== expected.branch || current.contentDigest !== expected.contentDigest)
     throw new Error(`Commit precondition changed for side effect ${claim.actionId}`);
-  const status2 = await git(workspace.path, ["status", "--porcelain=v1"]);
-  if (!status2) throw new Error("No accepted changes are available to commit");
+  const status3 = await git(workspace.path, ["status", "--porcelain=v1"]);
+  if (!status3) throw new Error("No accepted changes are available to commit");
   await git(workspace.path, ["add", "-A"]);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
   const summary = task.replace(/\s+/g, " ").slice(0, 64);
@@ -37516,13 +40379,36 @@ async function reconcileAtomicPush(workspace, claim) {
 }
 
 // packages/runtime/src/store.ts
-import { appendFile as appendFile2, mkdir as mkdir4, readFile as readFile6, readdir, writeFile as writeFile3 } from "node:fs/promises";
-import { dirname as dirname5, join as join8 } from "node:path";
+import { constants as fsConstants4 } from "node:fs";
+import { lstat as lstat5, open as open6, readdir as readdir4 } from "node:fs/promises";
+import { join as join10, relative as relative3, resolve as resolve6 } from "node:path";
 
 // packages/runtime/src/migration.ts
-import { cp, readFile as readFile5 } from "node:fs/promises";
-import { join as join7 } from "node:path";
-var CURRENT_RUN_STORAGE_VERSION = 1;
+import { createHash as createHash4 } from "node:crypto";
+import { constants as fsConstants3 } from "node:fs";
+import { lstat as lstat4, mkdir as mkdir4, open as open5, readdir as readdir3, rename as rename2, rm as rm3 } from "node:fs/promises";
+import { join as join9, relative as relative2, resolve as resolve5 } from "node:path";
+import { isDeepStrictEqual as isDeepStrictEqual2 } from "node:util";
+var CURRENT_RUN_STORAGE_VERSION = 2;
+var BACKUP_COMPLETION_FILE = ".backup-complete.json";
+var ARTIFACT_INVENTORY_FILE = "artifact-inventory.json";
+var MIB5 = 1024 * 1024;
+var MIGRATION_DESCRIPTOR_MAX_BYTES = 64 * 1024;
+var MIGRATION_COPY_CHUNK_BYTES = 64 * 1024;
+var LEGACY_MIGRATION_DESTINATION_LIMITS = Object.freeze({
+  maximumEventBytes: 4 * MIB5,
+  maximumEventLogBytes: 64 * MIB5,
+  blockedEventReserveBytes: 64 * 1024,
+  maximumStateBytes: 16 * MIB5,
+  maximumMetadataBytes: 4 * MIB5,
+  maximumWorkspaceBytes: 64 * 1024
+});
+var LEGACY_MIGRATION_RESOURCE_LIMITS = Object.freeze({
+  maximumFileBytes: 64 * MIB5,
+  maximumRunBytes: 128 * MIB5,
+  maximumFileCount: 4 * 1024,
+  maximumEntryCount: 8 * 1024
+});
 function manifest(runId, migratedFrom) {
   return RunStorageManifestSchema.parse({
     schemaVersion: CURRENT_RUN_STORAGE_VERSION,
@@ -37541,103 +40427,943 @@ function manifest(runId, migratedFrom) {
       semanticReports: 1,
       rawArtifacts: 1,
       controlRequests: 1,
-      locks: 1
+      locks: 1,
+      artifactInventory: 1,
+      artifactPolicy: 1
     }
   });
 }
 function runStorageManifestPath(runRoot) {
-  return join7(runRoot, "storage.json");
+  return join9(runRoot, "storage.json");
 }
-async function writeCurrentRunStorageManifest(runRoot, runId, migratedFrom) {
+async function validateRunStorageRoot(input) {
+  const graphcraftRoot2 = resolve5(input.graphcraftRoot);
+  const runRoot = resolve5(input.runRoot);
+  const validated = await validatePrivatePath(graphcraftRoot2, relative2(graphcraftRoot2, runRoot));
+  if (validated !== runRoot)
+    throw new Error(`Run storage path escaped the Graphcraft state directory: ${input.runRoot}`);
+}
+async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom) {
   const value = manifest(runId, migratedFrom);
-  await writeJsonAtomic(runStorageManifestPath(runRoot), value);
+  await ensurePrivateDirectory(runRoot);
+  const path = runStorageManifestPath(runRoot);
+  await writeJsonAtomic(path, value);
+  await hardenPrivateFile(path, runRoot);
   return value;
 }
-async function ensureCurrentRunStorage(input) {
-  const path = runStorageManifestPath(input.runRoot);
-  let raw;
-  try {
-    raw = JSON.parse(await readFile5(path, "utf8"));
-  } catch (error51) {
-    if (error51.code !== "ENOENT")
-      throw new Error(
-        `Run ${input.runId} has an unreadable storage manifest: ${error51.message}`
-      );
-  }
-  if (raw !== void 0) {
-    const version2 = typeof raw === "object" && raw !== null ? raw.schemaVersion : void 0;
-    if (typeof version2 === "number" && version2 > CURRENT_RUN_STORAGE_VERSION)
-      throw new Error(
-        `Run ${input.runId} uses future storage schema ${version2}; this Graphcraft supports through ${CURRENT_RUN_STORAGE_VERSION}. No files were changed.`
-      );
-    if (version2 !== CURRENT_RUN_STORAGE_VERSION)
-      throw new Error(
-        `Run ${input.runId} uses unsupported storage schema ${String(version2)}; no migration path is available. No files were changed.`
-      );
-    const parsed = RunStorageManifestSchema.parse(raw);
-    if (parsed.runId !== input.runId)
-      throw new Error(`Run storage manifest belongs to ${parsed.runId}, not ${input.runId}`);
-    return parsed;
-  }
-  await readFile5(join7(input.runRoot, "events.jsonl"), "utf8").catch((error51) => {
+async function writeCurrentRunStorageManifest(runRoot, runId, migratedFrom) {
+  if (migratedFrom !== CURRENT_RUN_STORAGE_VERSION)
     throw new Error(
-      `Legacy run ${input.runId} cannot migrate because events.jsonl is unavailable: ${error51.message}`
+      "Legacy storage manifests can only be published after verified backup migration"
+    );
+  return await persistCurrentRunStorageManifest(runRoot, runId, migratedFrom);
+}
+async function readRawManifest(runRoot, runId) {
+  try {
+    return JSON.parse(
+      (await readPrivateFileBounded(
+        runStorageManifestPath(runRoot),
+        MIGRATION_DESCRIPTOR_MAX_BYTES,
+        runRoot
+      )).toString("utf8")
+    );
+  } catch (error51) {
+    if (error51.code === "ENOENT") return void 0;
+    throw new Error(
+      `Run ${runId} has an unreadable storage manifest: ${error51 instanceof Error ? error51.message : String(error51)}. No files were changed.`
+    );
+  }
+}
+async function inspectStorage(runRoot, runId) {
+  const raw = await readRawManifest(runRoot, runId);
+  if (raw === void 0) return { version: 0 };
+  const version2 = typeof raw === "object" && raw !== null ? raw.schemaVersion : void 0;
+  if (typeof version2 === "number" && version2 > CURRENT_RUN_STORAGE_VERSION)
+    throw new Error(
+      `Run ${runId} uses future storage schema ${version2}; this Graphcraft supports through ${CURRENT_RUN_STORAGE_VERSION}. No files were changed.`
+    );
+  if (version2 !== 1 && version2 !== CURRENT_RUN_STORAGE_VERSION)
+    throw new Error(
+      `Run ${runId} uses unsupported storage schema ${String(version2)}; no migration path is available. No files were changed.`
+    );
+  let parsed;
+  try {
+    parsed = RunStorageManifestSchema.parse(raw);
+  } catch (error51) {
+    throw new Error(
+      `Run ${runId} has an invalid storage schema ${version2}: ${error51 instanceof Error ? error51.message : String(error51)}. No files were changed.`
+    );
+  }
+  if (parsed.runId !== runId)
+    throw new Error(
+      `Run storage manifest belongs to ${parsed.runId}, not ${runId}. No files were changed.`
+    );
+  if (parsed.schemaVersion !== CURRENT_RUN_STORAGE_VERSION) return { version: 1 };
+  try {
+    await validatePrivatePath(runRoot, ARTIFACT_INVENTORY_FILE);
+    const inventory = await readBoundedArtifactInventory(join9(runRoot, ARTIFACT_INVENTORY_FILE));
+    if (inventory.runId !== runId)
+      throw new Error(`artifact inventory belongs to ${inventory.runId}`);
+  } catch (error51) {
+    throw new Error(
+      `Run ${runId} has an invalid schema-v2 artifact inventory: ${error51 instanceof Error ? error51.message : String(error51)}. No files were changed.`
+    );
+  }
+  return { version: 2, manifest: parsed };
+}
+function isActiveLockError(error51) {
+  return error51 instanceof Error && error51.message.includes("already active");
+}
+async function acquireMigrationLock(input) {
+  const lockPath = join9(input.graphcraftRoot, "locks", `${input.runId}.migration.lock`);
+  while (true) {
+    await validateRunStorageRoot(input);
+    const storage = await inspectStorage(input.runRoot, input.runId);
+    if (storage.version === CURRENT_RUN_STORAGE_VERSION) return { manifest: storage.manifest };
+    const lock = new RunLock(lockPath);
+    try {
+      await lock.acquire();
+      return { lock };
+    } catch (error51) {
+      if (!isActiveLockError(error51)) throw error51;
+    }
+    await new Promise((resolve11) => setTimeout(resolve11, 25));
+  }
+}
+async function acquireActiveAwareLock(path) {
+  while (true) {
+    const lock = new RunLock(path);
+    try {
+      await lock.acquire();
+      return lock;
+    } catch (error51) {
+      if (!isActiveLockError(error51)) throw error51;
+    }
+    await new Promise((resolve11) => setTimeout(resolve11, 25));
+  }
+}
+async function status2(path) {
+  try {
+    return await lstat4(path);
+  } catch (error51) {
+    if (error51.code === "ENOENT") return void 0;
+    throw error51;
+  }
+}
+function legacyMetadataFingerprint(metadata) {
+  return [
+    metadata.dev,
+    metadata.ino,
+    metadata.mode,
+    metadata.nlink,
+    metadata.size,
+    metadata.mtimeNs,
+    metadata.ctimeNs
+  ].join(":");
+}
+function assertLegacyFileMetadata(metadata, expected, stage) {
+  if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.nlink > 1n)
+    throw new Error(
+      `Legacy file ${expected.relativePath} became unsafe ${stage}; no backup was created`
+    );
+  if (metadata.size !== BigInt(expected.bytes) || legacyMetadataFingerprint(metadata) !== expected.fingerprint)
+    throw new Error(`Legacy file ${expected.relativePath} changed ${stage}; no backup was created`);
+}
+function assertLegacyDirectoryMetadata(metadata, expected, stage) {
+  if (metadata.isSymbolicLink() || !metadata.isDirectory())
+    throw new Error(
+      `Legacy directory ${expected.relativePath} became unsafe ${stage}; no backup was created`
+    );
+  if (legacyMetadataFingerprint(metadata) !== expected.fingerprint)
+    throw new Error(
+      `Legacy directory ${expected.relativePath} changed ${stage}; no backup was created`
+    );
+}
+function legacyMetadataView(metadata) {
+  return {
+    rootFingerprint: metadata.rootFingerprint,
+    entries: metadata.entries.map((entry) => ({
+      kind: entry.kind,
+      relativePath: entry.relativePath,
+      fingerprint: entry.fingerprint,
+      ...entry.kind === "file" ? { bytes: entry.bytes } : {}
+    }))
+  };
+}
+function legacySnapshotView(snapshot) {
+  return {
+    rootFingerprint: snapshot.rootFingerprint,
+    entries: snapshot.entries.map((entry) => ({
+      kind: entry.kind,
+      relativePath: entry.relativePath,
+      fingerprint: entry.fingerprint,
+      ...entry.kind === "file" ? { bytes: entry.bytes, hash: entry.hash } : {}
+    })),
+    digest: snapshot.digest
+  };
+}
+function legacySnapshotContents(snapshot) {
+  return {
+    entries: snapshot.entries.map(
+      (entry) => entry.kind === "directory" ? { kind: entry.kind, relativePath: entry.relativePath } : {
+        kind: entry.kind,
+        relativePath: entry.relativePath,
+        bytes: entry.bytes,
+        hash: entry.hash
+      }
+    ),
+    digest: snapshot.digest
+  };
+}
+function legacyTreeDigest(entries, ignoredRootName) {
+  const values = entries.filter(
+    (entry) => ignoredRootName === void 0 || entry.relativePath !== ignoredRootName || entry.relativePath.includes("/")
+  ).map(
+    (entry) => entry.kind === "directory" ? `directory:${entry.relativePath}` : `file:${entry.relativePath}:${entry.bytes}:${entry.hash}`
+  );
+  return createHash4("sha256").update(JSON.stringify(values)).digest("hex");
+}
+async function scanLegacyTreeMetadata(root, options) {
+  const rootMetadata = await lstat4(root, { bigint: true });
+  if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory())
+    throw new Error("Storage migration cannot scan an unsafe legacy run root");
+  let entryCount = 0;
+  let fileCount = 0;
+  const entries = [];
+  const visit = async (directory, relativeDirectory) => {
+    const names = (await readdir3(directory)).sort((left, right) => left.localeCompare(right));
+    for (const name of names) {
+      if (relativeDirectory.length === 0 && name === options.ignoredRootName) continue;
+      if (relativeDirectory.length === 0 && options.rejectBackupMarker && name === BACKUP_COMPLETION_FILE)
+        throw new Error(
+          `Legacy run contains reserved root file ${BACKUP_COMPLETION_FILE}; remove it before retrying`
+        );
+      const path = join9(directory, name);
+      const relativePath = relativeDirectory ? `${relativeDirectory}/${name}` : name;
+      entryCount += 1;
+      if (entryCount > LEGACY_MIGRATION_RESOURCE_LIMITS.maximumEntryCount)
+        throw new Error(
+          `Legacy run contains more than the ${LEGACY_MIGRATION_RESOURCE_LIMITS.maximumEntryCount}-entry safe migration limit; prune legacy run state before retrying`
+        );
+      const metadata = await lstat4(path, { bigint: true });
+      if (metadata.isSymbolicLink())
+        throw new Error("Storage migration cannot scan a symbolic link; no backup was created");
+      if (metadata.isDirectory()) {
+        entries.push({
+          kind: "directory",
+          path,
+          relativePath,
+          fingerprint: legacyMetadataFingerprint(metadata)
+        });
+        await visit(path, relativePath);
+        continue;
+      }
+      if (!metadata.isFile())
+        throw new Error(
+          "Storage migration cannot scan an unsupported entry; no backup was created"
+        );
+      if (metadata.nlink > 1n)
+        throw new Error(
+          "Storage migration cannot scan a multiply linked file; no backup was created"
+        );
+      if (fileCount >= LEGACY_MIGRATION_RESOURCE_LIMITS.maximumFileCount)
+        throw new Error(
+          `Legacy run contains more than the ${LEGACY_MIGRATION_RESOURCE_LIMITS.maximumFileCount}-file safe migration limit; prune legacy run state before retrying`
+        );
+      fileCount += 1;
+      const bytes = Number(metadata.size);
+      if (!Number.isSafeInteger(bytes))
+        throw new Error("Legacy run contains a file with an unsafe byte length");
+      entries.push({
+        kind: "file",
+        path,
+        relativePath,
+        bytes,
+        fingerprint: legacyMetadataFingerprint(metadata)
+      });
+    }
+  };
+  await visit(root, "");
+  return { rootFingerprint: legacyMetadataFingerprint(rootMetadata), entries };
+}
+function assertLegacyResourceLimits(metadata) {
+  const files = metadata.entries.filter(
+    (entry) => entry.kind === "file"
+  );
+  const artifactLimit = DEFAULT_ARTIFACT_POLICY.runArtifactBytes - DEFAULT_ARTIFACT_POLICY.runReservedBytes;
+  for (const { relativePath } of metadata.entries)
+    if (!redactTextBytes(relativePath).equals(Buffer.from(relativePath, "utf8")))
+      throw new Error(
+        "Legacy run contains a secret-like path and cannot migrate safely; rename or delete the affected legacy content before retrying"
+      );
+  const oversized = files.find(
+    ({ bytes }) => bytes > LEGACY_MIGRATION_RESOURCE_LIMITS.maximumFileBytes
+  );
+  if (oversized)
+    throw new Error(
+      `Legacy run contains a file larger than the ${LEGACY_MIGRATION_RESOURCE_LIMITS.maximumFileBytes}-byte safe migration scan limit; remove or reduce oversized legacy content before retrying`
+    );
+  const runBytes = files.reduce((total, file2) => total + BigInt(file2.bytes), 0n);
+  if (runBytes > BigInt(LEGACY_MIGRATION_RESOURCE_LIMITS.maximumRunBytes))
+    throw new Error(
+      `Legacy run contains more than the ${LEGACY_MIGRATION_RESOURCE_LIMITS.maximumRunBytes}-byte whole-run safe migration limit; prune legacy run state before retrying`
+    );
+  const artifactBytes = files.filter(
+    ({ relativePath }) => relativePath.startsWith("artifacts/") || relativePath.startsWith("capsules/")
+  ).reduce((total, file2) => total + BigInt(file2.bytes), 0n);
+  if (artifactBytes > BigInt(artifactLimit))
+    throw new Error(
+      `Legacy run contains more than the ${artifactLimit}-byte safe artifact migration limit; prune legacy artifacts before retrying`
+    );
+}
+function assertLegacyDestinationLimits(metadata) {
+  const files = new Map(
+    metadata.entries.filter((entry) => entry.kind === "file").map((entry) => [entry.relativePath, entry])
+  );
+  const assertFileLimit = (path, limit, label) => {
+    const file2 = files.get(path);
+    if (file2 && file2.bytes > limit)
+      throw new Error(
+        `Legacy ${label} exceeds the ${limit}-byte current-storage publication limit`
+      );
+  };
+  const normalEventLogBytes = LEGACY_MIGRATION_DESTINATION_LIMITS.maximumEventLogBytes - LEGACY_MIGRATION_DESTINATION_LIMITS.blockedEventReserveBytes;
+  assertFileLimit("events.jsonl", normalEventLogBytes, "event log");
+  assertFileLimit(
+    "state.json",
+    LEGACY_MIGRATION_DESTINATION_LIMITS.maximumStateBytes,
+    "materialized state"
+  );
+  for (const path of ["contract.json", "graph.json", "probe-plan.json", "held-out-probes.json"])
+    assertFileLimit(path, LEGACY_MIGRATION_DESTINATION_LIMITS.maximumMetadataBytes, path);
+  assertFileLimit(
+    "workspace.json",
+    LEGACY_MIGRATION_DESTINATION_LIMITS.maximumWorkspaceBytes,
+    "workspace projection"
+  );
+}
+function advanceLegacyEventLineLength(chunk, previousLength) {
+  let length = previousLength;
+  for (const byte of chunk) {
+    length += 1;
+    if (byte !== 10) continue;
+    if (length > LEGACY_MIGRATION_DESTINATION_LIMITS.maximumEventBytes)
+      throw new Error(
+        `Legacy event log contains a line exceeding the ${LEGACY_MIGRATION_DESTINATION_LIMITS.maximumEventBytes}-byte current-storage publication limit`
+      );
+    length = 0;
+  }
+  return length;
+}
+async function readLegacySnapshotFile(expected, options) {
+  assertLegacyFileMetadata(
+    await lstat4(expected.path, { bigint: true }),
+    expected,
+    "before opening"
+  );
+  const noFollow = process.platform === "win32" ? 0 : fsConstants3.O_NOFOLLOW;
+  const handle = await open5(expected.path, fsConstants3.O_RDONLY | noFollow);
+  const hash2 = createHash4("sha256");
+  const redactionChunks = options.scanRedaction ? [] : void 0;
+  const buffer = Buffer.alloc(Math.min(MIGRATION_COPY_CHUNK_BYTES, Math.max(1, expected.bytes)));
+  let position = 0;
+  let eventLineLength = 0;
+  try {
+    assertLegacyFileMetadata(await handle.stat({ bigint: true }), expected, "when opened");
+    while (position < expected.bytes) {
+      const requested = Math.min(buffer.length, expected.bytes - position);
+      const { bytesRead } = await handle.read(buffer, 0, requested, position);
+      if (bytesRead === 0)
+        throw new Error(
+          `Legacy file ${expected.relativePath} changed while being read; no backup was created`
+        );
+      const chunk = buffer.subarray(0, bytesRead);
+      hash2.update(chunk);
+      if (redactionChunks) redactionChunks.push(Buffer.from(chunk));
+      if (options.enforceDestinationLimits && expected.relativePath === "events.jsonl")
+        eventLineLength = advanceLegacyEventLineLength(chunk, eventLineLength);
+      position += bytesRead;
+    }
+    const extra = Buffer.alloc(1);
+    if ((await handle.read(extra, 0, 1, position)).bytesRead !== 0)
+      throw new Error(
+        `Legacy file ${expected.relativePath} changed while being read; no backup was created`
+      );
+    assertLegacyFileMetadata(await handle.stat({ bigint: true }), expected, "while being read");
+    assertLegacyFileMetadata(
+      await lstat4(expected.path, { bigint: true }),
+      expected,
+      "after reading"
+    );
+  } finally {
+    await handle.close();
+  }
+  if (position !== expected.bytes)
+    throw new Error(
+      `Legacy file ${expected.relativePath} changed while being read; no backup was created`
+    );
+  if (options.enforceDestinationLimits && expected.relativePath === "events.jsonl" && eventLineLength > 0 && eventLineLength + 1 > LEGACY_MIGRATION_DESTINATION_LIMITS.maximumEventBytes)
+    throw new Error(
+      `Legacy event log contains a line exceeding the ${LEGACY_MIGRATION_DESTINATION_LIMITS.maximumEventBytes}-byte current-storage publication limit`
+    );
+  if (redactionChunks) {
+    const source = Buffer.concat(redactionChunks, expected.bytes);
+    if (!redactTextBytes(source).equals(source))
+      throw new Error(
+        "Legacy run contains secret-like material and cannot migrate safely; scrub or delete the affected legacy content before retrying"
+      );
+  }
+  return hash2.digest("hex");
+}
+async function captureLegacyTreeSnapshot(root, options = {}) {
+  const metadata = await scanLegacyTreeMetadata(root, options);
+  assertLegacyResourceLimits(metadata);
+  if (options.enforceDestinationLimits) assertLegacyDestinationLimits(metadata);
+  const entries = [];
+  const files = [];
+  for (const entry of metadata.entries) {
+    if (entry.kind === "directory") {
+      entries.push(entry);
+      continue;
+    }
+    const file2 = { ...entry, hash: await readLegacySnapshotFile(entry, options) };
+    entries.push(file2);
+    files.push(file2);
+  }
+  const after = await scanLegacyTreeMetadata(root, options);
+  if (!isDeepStrictEqual2(legacyMetadataView(metadata), legacyMetadataView(after)))
+    throw new Error("Legacy run tree changed during migration preflight; no backup was created");
+  return {
+    rootFingerprint: metadata.rootFingerprint,
+    entries,
+    files,
+    digest: legacyTreeDigest(entries)
+  };
+}
+async function assertLegacyTreeRedactionSafe(root) {
+  return await captureLegacyTreeSnapshot(root, {
+    rejectBackupMarker: true,
+    scanRedaction: true,
+    enforceDestinationLimits: true
+  });
+}
+function parseBackupCompletion(value, input) {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    throw new Error("backup completion marker is not an object");
+  const marker = value;
+  if (marker.schemaVersion !== 1 || marker.kind !== "graphcraft_storage_migration_backup" || marker.runId !== input.runId || marker.sourceVersion !== input.sourceVersion || marker.targetVersion !== CURRENT_RUN_STORAGE_VERSION || typeof marker.treeDigest !== "string" || !/^[a-f0-9]{64}$/.test(marker.treeDigest))
+    throw new Error("backup completion marker does not match this migration");
+  return marker;
+}
+async function validateCompleteBackup(backupRoot, input) {
+  let marker;
+  try {
+    marker = parseBackupCompletion(
+      JSON.parse(
+        (await readPrivateFileBounded(
+          join9(backupRoot, BACKUP_COMPLETION_FILE),
+          MIGRATION_DESCRIPTOR_MAX_BYTES,
+          backupRoot
+        )).toString("utf8")
+      ),
+      input
+    );
+  } catch (error51) {
+    throw new Error(
+      `Existing storage migration backup is incomplete or unverified: ${error51 instanceof Error ? error51.message : String(error51)}`
+    );
+  }
+  const snapshot = await captureLegacyTreeSnapshot(backupRoot, {
+    ignoredRootName: BACKUP_COMPLETION_FILE
+  });
+  for (const requiredPath of [
+    "events.jsonl",
+    ...input.sourceVersion === 1 ? ["storage.json"] : []
+  ]) {
+    const entry = snapshot.entries.find(({ relativePath }) => relativePath === requiredPath);
+    if (entry?.kind !== "file")
+      throw new Error(`Existing storage migration backup lacks required file: ${requiredPath}`);
+  }
+  if (snapshot.digest !== marker.treeDigest)
+    throw new Error("Existing storage migration backup digest does not match its contents");
+  return { marker, snapshot };
+}
+async function hasMigrationOwnedInventory(runRoot, backupSnapshot, runId) {
+  const inventoryPath = join9(runRoot, ARTIFACT_INVENTORY_FILE);
+  const inventoryStatus = await status2(inventoryPath);
+  if (!inventoryStatus) return false;
+  if (inventoryStatus.isSymbolicLink() || !inventoryStatus.isFile())
+    throw new Error(`Storage migration intermediate inventory is unsafe: ${inventoryPath}`);
+  if (backupSnapshot.entries.some(({ relativePath }) => relativePath === ARTIFACT_INVENTORY_FILE))
+    return false;
+  let inventory;
+  try {
+    inventory = await readBoundedArtifactInventory(inventoryPath);
+  } catch (error51) {
+    throw new Error(
+      `Storage migration intermediate inventory is invalid: ${error51 instanceof Error ? error51.message : String(error51)}`
+    );
+  }
+  if (inventory.runId !== runId)
+    throw new Error(
+      `Storage migration intermediate inventory belongs to ${inventory.runId}, not ${runId}`
+    );
+  if (inventory.entries.some(
+    (entry) => !entry.legacy || entry.disposition !== "legacy" || entry.reason !== "legacy_migration" || entry.truncated || entry.omittedBytes !== 0 || entry.sourceBytes !== entry.storedBytes
+  ))
+    throw new Error(
+      "Storage migration intermediate inventory was not produced by legacy migration"
+    );
+  return true;
+}
+async function validateBackupMatchesLegacyRun(input) {
+  if (input.sourceSnapshot.digest === input.marker.treeDigest) return;
+  if (await hasMigrationOwnedInventory(input.runRoot, input.backupSnapshot, input.runId) && legacyTreeDigest(input.sourceSnapshot.entries, ARTIFACT_INVENTORY_FILE) === input.marker.treeDigest)
+    return;
+  throw new Error(
+    "Existing storage migration backup does not match the current legacy run tree; refusing to reuse a stale protected backup"
+  );
+}
+function backupEntryFingerprint(metadata) {
+  return [
+    metadata.dev,
+    metadata.ino,
+    metadata.mode,
+    metadata.nlink,
+    metadata.size,
+    metadata.mtimeMs,
+    metadata.ctimeMs
+  ].join(":");
+}
+async function syncBackupFile(path, observed) {
+  if (observed.isSymbolicLink() || !observed.isFile() || observed.nlink > 1)
+    throw new Error(`Storage migration backup payload is unsafe: ${path}`);
+  const expected = backupEntryFingerprint(observed);
+  const noFollow = process.platform === "win32" ? 0 : fsConstants3.O_NOFOLLOW;
+  const handle = await open5(path, fsConstants3.O_RDWR | noFollow);
+  try {
+    const before = await handle.stat();
+    if (before.isSymbolicLink() || !before.isFile() || before.nlink > 1 || backupEntryFingerprint(before) !== expected)
+      throw new Error(`Storage migration backup payload changed before fsync: ${path}`);
+    await handle.sync();
+    const after = await handle.stat();
+    const current = await lstat4(path);
+    if (backupEntryFingerprint(after) !== expected || backupEntryFingerprint(current) !== expected)
+      throw new Error(`Storage migration backup payload changed during fsync: ${path}`);
+  } finally {
+    await handle.close();
+  }
+}
+async function syncBackupTree(root) {
+  const visit = async (directory) => {
+    const observed = await lstat4(directory);
+    if (observed.isSymbolicLink() || !observed.isDirectory())
+      throw new Error(`Storage migration backup directory is unsafe: ${directory}`);
+    const expected = backupEntryFingerprint(observed);
+    for (const name of (await readdir3(directory)).sort(
+      (left, right) => left.localeCompare(right)
+    )) {
+      const path = join9(directory, name);
+      const metadata = await lstat4(path);
+      if (metadata.isDirectory() && !metadata.isSymbolicLink()) await visit(path);
+      else await syncBackupFile(path, metadata);
+    }
+    if (backupEntryFingerprint(await lstat4(directory)) !== expected)
+      throw new Error(`Storage migration backup directory changed during fsync: ${directory}`);
+    await syncDirectory(directory);
+  };
+  await visit(root);
+}
+async function writeAll(handle, chunk, position) {
+  let written = 0;
+  while (written < chunk.length) {
+    const result = await handle.write(chunk, written, chunk.length - written, position + written);
+    if (result.bytesWritten === 0)
+      throw new Error("Storage migration backup destination stopped accepting bytes");
+    written += result.bytesWritten;
+  }
+}
+async function copyLegacySnapshotFile(source, destinationPath) {
+  assertLegacyFileMetadata(
+    await lstat4(source.path, { bigint: true }),
+    source,
+    "before backup copy"
+  );
+  const noFollow = process.platform === "win32" ? 0 : fsConstants3.O_NOFOLLOW;
+  const sourceHandle = await open5(source.path, fsConstants3.O_RDONLY | noFollow);
+  let destinationHandle;
+  try {
+    assertLegacyFileMetadata(
+      await sourceHandle.stat({ bigint: true }),
+      source,
+      "when opened for backup copy"
+    );
+    destinationHandle = await open5(
+      destinationPath,
+      fsConstants3.O_WRONLY | fsConstants3.O_CREAT | fsConstants3.O_EXCL | noFollow,
+      384
+    );
+    const hash2 = createHash4("sha256");
+    const buffer = Buffer.alloc(Math.min(MIGRATION_COPY_CHUNK_BYTES, Math.max(1, source.bytes)));
+    let position = 0;
+    while (position < source.bytes) {
+      const requested = Math.min(buffer.length, source.bytes - position);
+      const { bytesRead } = await sourceHandle.read(buffer, 0, requested, position);
+      if (bytesRead === 0)
+        throw new Error(
+          `Legacy file ${source.relativePath} changed during backup copy; no backup was created`
+        );
+      const chunk = buffer.subarray(0, bytesRead);
+      hash2.update(chunk);
+      await writeAll(destinationHandle, chunk, position);
+      position += bytesRead;
+    }
+    const extra = Buffer.alloc(1);
+    if ((await sourceHandle.read(extra, 0, 1, position)).bytesRead !== 0)
+      throw new Error(
+        `Legacy file ${source.relativePath} changed during backup copy; no backup was created`
+      );
+    assertLegacyFileMetadata(
+      await sourceHandle.stat({ bigint: true }),
+      source,
+      "during backup copy"
+    );
+    assertLegacyFileMetadata(
+      await lstat4(source.path, { bigint: true }),
+      source,
+      "after backup copy"
+    );
+    if (position !== source.bytes || hash2.digest("hex") !== source.hash)
+      throw new Error(
+        `Legacy file ${source.relativePath} content changed during backup copy; no backup was created`
+      );
+    await destinationHandle.sync();
+    const destination = await destinationHandle.stat({ bigint: true });
+    const destinationPathMetadata = await lstat4(destinationPath, { bigint: true });
+    if (destination.isSymbolicLink() || !destination.isFile() || destination.nlink > 1n || destination.size !== BigInt(source.bytes) || legacyMetadataFingerprint(destination) !== legacyMetadataFingerprint(destinationPathMetadata))
+      throw new Error(
+        `Storage migration backup destination changed while copying ${source.relativePath}`
+      );
+  } finally {
+    await destinationHandle?.close().catch(() => void 0);
+    await sourceHandle.close();
+  }
+}
+async function copyLegacySnapshot(sourceRoot, temporaryRoot, snapshot) {
+  await mkdir4(temporaryRoot, { mode: 448 });
+  for (const entry of snapshot.entries) {
+    if (entry.kind !== "directory") continue;
+    assertLegacyDirectoryMetadata(
+      await lstat4(entry.path, { bigint: true }),
+      entry,
+      "before backup copy"
+    );
+    await mkdir4(join9(temporaryRoot, ...entry.relativePath.split("/")), { mode: 448 });
+  }
+  for (const file2 of snapshot.files)
+    await copyLegacySnapshotFile(file2, join9(temporaryRoot, ...file2.relativePath.split("/")));
+  const sourceAfterCopy = await captureLegacyTreeSnapshot(sourceRoot, {
+    rejectBackupMarker: true,
+    enforceDestinationLimits: true
+  });
+  if (!isDeepStrictEqual2(legacySnapshotView(sourceAfterCopy), legacySnapshotView(snapshot)))
+    throw new Error("Legacy run tree changed during backup copy; no backup was created");
+  const copied = await captureLegacyTreeSnapshot(temporaryRoot);
+  if (!isDeepStrictEqual2(legacySnapshotContents(copied), legacySnapshotContents(snapshot)))
+    throw new Error("Storage migration backup digest does not match the preflight snapshot");
+}
+async function ensureCompleteBackup(input, sourceSnapshot) {
+  const verifiedSource = await captureLegacyTreeSnapshot(input.runRoot, {
+    rejectBackupMarker: true,
+    enforceDestinationLimits: true
+  });
+  if (!isDeepStrictEqual2(legacySnapshotView(verifiedSource), legacySnapshotView(sourceSnapshot)))
+    throw new Error("Legacy run tree changed after migration preflight; no backup was created");
+  await ensurePrivateDirectory(input.graphcraftRoot);
+  await validatePrivatePath(input.graphcraftRoot, relative2(input.graphcraftRoot, input.runRoot));
+  const backupBase = join9(input.graphcraftRoot, "migration-backups");
+  const backupParent = join9(backupBase, input.runId);
+  await ensurePrivateDirectory(backupBase, input.graphcraftRoot);
+  await ensurePrivateDirectory(backupParent, input.graphcraftRoot);
+  const step = `${input.sourceVersion}-to-${CURRENT_RUN_STORAGE_VERSION}`;
+  const backupRoot = join9(backupParent, step);
+  const existing = await status2(backupRoot);
+  if (existing) {
+    if (existing.isSymbolicLink() || !existing.isDirectory())
+      throw new Error(`Storage migration backup target is unsafe: ${backupRoot}`);
+    const validated = await validateCompleteBackup(backupRoot, input);
+    await validateBackupMatchesLegacyRun({
+      runRoot: input.runRoot,
+      runId: input.runId,
+      marker: validated.marker,
+      backupSnapshot: validated.snapshot,
+      sourceSnapshot
+    });
+    await hardenPrivateTree(backupRoot, input.graphcraftRoot);
+    await syncBackupTree(backupRoot);
+    await syncDirectory(backupParent);
+    return backupRoot;
+  }
+  const temporaryRoot = join9(backupParent, `.${step}.tmp`);
+  const staleTemporary = await status2(temporaryRoot);
+  if (staleTemporary) {
+    if (staleTemporary.isSymbolicLink() || !staleTemporary.isDirectory())
+      throw new Error(`Storage migration temporary backup target is unsafe: ${temporaryRoot}`);
+    await rm3(temporaryRoot, { recursive: true, force: true });
+    await syncDirectory(backupParent);
+  }
+  try {
+    await copyLegacySnapshot(input.runRoot, temporaryRoot, sourceSnapshot);
+    await hardenPrivateTree(temporaryRoot, input.graphcraftRoot);
+    await syncBackupTree(temporaryRoot);
+    const completion = {
+      schemaVersion: 1,
+      kind: "graphcraft_storage_migration_backup",
+      runId: input.runId,
+      sourceVersion: input.sourceVersion,
+      targetVersion: CURRENT_RUN_STORAGE_VERSION,
+      treeDigest: sourceSnapshot.digest
+    };
+    const completionPath = join9(temporaryRoot, BACKUP_COMPLETION_FILE);
+    await writeJsonAtomic(completionPath, completion);
+    await hardenPrivateFile(completionPath, temporaryRoot);
+    await syncBackupFile(completionPath, await lstat4(completionPath));
+    await syncDirectory(temporaryRoot);
+    await rename2(temporaryRoot, backupRoot);
+    await syncDirectory(backupParent);
+    return backupRoot;
+  } catch (error51) {
+    await rm3(temporaryRoot, { recursive: true, force: true }).then(async () => await syncDirectory(backupParent)).catch(() => void 0);
+    throw error51;
+  }
+}
+async function validateLegacyRun(runRoot, runId) {
+  await validatePrivatePath(runRoot, "events.jsonl").catch((error51) => {
+    throw new Error(
+      `Legacy run ${runId} cannot migrate because events.jsonl is unsafe: ${error51 instanceof Error ? error51.message : String(error51)}`
     );
   });
-  const lock = new RunLock(join7(input.graphcraftRoot, "locks", `${input.runId}.migration.lock`));
+  await lstat4(join9(runRoot, "events.jsonl")).catch((error51) => {
+    throw new Error(
+      `Legacy run ${runId} cannot migrate because events.jsonl is unavailable: ${error51 instanceof Error ? error51.message : String(error51)}`
+    );
+  });
+}
+async function assertMigratedInventoryCurrent(artifactStore, expected) {
+  const current = await artifactStore.inventory();
+  if (!isDeepStrictEqual2(current, expected))
+    throw new Error(
+      "Storage migration artifact inventory changed after durable migration; refusing manifest publication"
+    );
+}
+async function ensureCurrentRunStorage(input) {
+  await validateRunStorageRoot(input);
+  const initial = await inspectStorage(input.runRoot, input.runId);
+  if (initial.version === CURRENT_RUN_STORAGE_VERSION) return initial.manifest;
+  await validateLegacyRun(input.runRoot, input.runId);
+  const acquisition = await acquireMigrationLock(input);
+  if (acquisition.manifest) return acquisition.manifest;
+  const migrationLock = acquisition.lock;
+  let runLock;
   try {
-    await lock.acquire();
-  } catch (error51) {
-    if (!(error51 instanceof Error) || !error51.message.includes("already active")) throw error51;
-    const deadline = Date.now() + 5e3;
-    while (Date.now() <= deadline) {
-      const migrated = await readFile5(path, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
-      if (migrated) return migrated;
-      await new Promise((resolve6) => setTimeout(resolve6, 10));
-    }
-    throw new Error(`Timed out waiting for storage migration of run ${input.runId}`);
-  }
-  try {
-    const migrated = await readFile5(path, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
-    if (migrated) return migrated;
-    const backupRoot = join7(input.graphcraftRoot, "migration-backups", input.runId, "0-to-1");
-    await cp(input.runRoot, backupRoot, {
-      recursive: true,
-      force: true,
-      errorOnExist: false
-    });
-    return await writeCurrentRunStorageManifest(input.runRoot, input.runId, 0);
+    runLock = await acquireActiveAwareLock(
+      join9(input.graphcraftRoot, "locks", `${input.runId}.lock`)
+    );
+    await validateRunStorageRoot(input);
+    const storage = await inspectStorage(input.runRoot, input.runId);
+    if (storage.version === CURRENT_RUN_STORAGE_VERSION) return storage.manifest;
+    await validateLegacyRun(input.runRoot, input.runId);
+    const sourceSnapshot = await assertLegacyTreeRedactionSafe(input.runRoot);
+    await input.onBoundary?.("after_preflight");
+    const backupInput = {
+      graphcraftRoot: input.graphcraftRoot,
+      runRoot: input.runRoot,
+      runId: input.runId,
+      sourceVersion: storage.version
+    };
+    await ensureCompleteBackup(backupInput, sourceSnapshot);
+    await input.onBoundary?.("after_backup");
+    const artifactStore = new RunArtifactStore(input.runRoot, input.runId);
+    const migratedInventory = await artifactStore.migrateLegacy();
+    await assertMigratedInventoryCurrent(artifactStore, migratedInventory);
+    await hardenPrivateTree(input.runRoot, input.graphcraftRoot);
+    await input.onBoundary?.("after_inventory");
+    await assertMigratedInventoryCurrent(artifactStore, migratedInventory);
+    await input.onBoundary?.("before_manifest");
+    const prePublicationSnapshot = await assertLegacyTreeRedactionSafe(input.runRoot);
+    await ensureCompleteBackup(backupInput, prePublicationSnapshot);
+    await assertMigratedInventoryCurrent(artifactStore, migratedInventory);
+    return await persistCurrentRunStorageManifest(input.runRoot, input.runId, storage.version);
   } finally {
-    await lock.release();
+    try {
+      if (runLock) await runLock.release();
+    } finally {
+      await migrationLock.release();
+    }
   }
 }
 
 // packages/runtime/src/store.ts
+var MEBIBYTE = 1024 * 1024;
+var RUN_EVENT_MAX_BYTES = 4 * MEBIBYTE;
+var RUN_EVENT_LOG_MAX_BYTES = 64 * MEBIBYTE;
+var RUN_STATE_MAX_BYTES = 16 * MEBIBYTE;
+var RUN_BLOCKED_EVENT_RESERVE_BYTES = 64 * 1024;
+var RUN_METADATA_MAX_BYTES = 4 * MEBIBYTE;
+var RUN_WORKSPACE_MAX_BYTES = 64 * 1024;
+var RunStoreLimitError = class extends Error {
+  constructor(kind, attemptedBytes, limitBytes) {
+    super(
+      `Run ${kind.replace("_", " ")} would require ${attemptedBytes} serialized bytes, exceeding the ${limitBytes}-byte limit`
+    );
+    this.kind = kind;
+    this.attemptedBytes = attemptedBytes;
+    this.limitBytes = limitBytes;
+    this.name = "RunStoreLimitError";
+  }
+  kind;
+  attemptedBytes;
+  limitBytes;
+  blockerPersisted = false;
+};
+var PERSISTENCE_LIMIT_BLOCK_REASON = "Graphcraft blocked this run before durable run storage exceeded its configured size limit.";
+function normalizeLimits(input) {
+  const limits = {
+    maxEventBytes: input.maxEventBytes ?? RUN_EVENT_MAX_BYTES,
+    maxEventLogBytes: input.maxEventLogBytes ?? RUN_EVENT_LOG_MAX_BYTES,
+    maxStateBytes: input.maxStateBytes ?? RUN_STATE_MAX_BYTES,
+    blockedEventReserveBytes: input.blockedEventReserveBytes ?? RUN_BLOCKED_EVENT_RESERVE_BYTES
+  };
+  for (const [name, value] of Object.entries(limits)) {
+    if (!Number.isSafeInteger(value) || value <= 0)
+      throw new Error(`RunStore ${name} must be a positive safe integer`);
+  }
+  if (limits.blockedEventReserveBytes >= limits.maxEventLogBytes)
+    throw new Error("RunStore blocked-event reserve must be smaller than the event-log limit");
+  return limits;
+}
+function serializedEvent(event) {
+  return `${JSON.stringify(event)}
+`;
+}
+function serializedStateBytes(state) {
+  return Buffer.byteLength(`${JSON.stringify(state, null, 2)}
+`);
+}
+function serializedJsonBytes(value) {
+  return Buffer.byteLength(`${JSON.stringify(redactValue(value), null, 2)}
+`);
+}
+function isPersistenceLimitBlocker(event) {
+  return event?.type === "run.blocked" && ["event", "event_log", "state"].includes(String(event.data.persistenceLimit));
+}
+function assertEventLogFile(path, status3) {
+  if (!status3.isFile()) throw new Error(`Run event log is not a regular file: ${path}`);
+  if (status3.nlink > 1n) throw new Error(`Run event log is multiply linked: ${path}`);
+}
+function sameFileIdentity(left, right) {
+  if (left.ino !== 0n && right.ino !== 0n) return left.dev === right.dev && left.ino === right.ino;
+  return left.dev === right.dev && left.birthtimeNs === right.birthtimeNs;
+}
+function optionalHeldOutProbePlan(value) {
+  const parsed = HeldOutProbePlanSchema.safeParse(value);
+  if (!parsed.success) return void 0;
+  try {
+    return validateHeldOutProbePlan(parsed.data);
+  } catch {
+    return void 0;
+  }
+}
 var RunStore = class _RunStore {
   repositoryRoot;
   runId;
   graphcraftRoot;
   runRoot;
+  limits;
+  artifactStore;
   appendTail = Promise.resolve();
   initializing = false;
   storageReady;
-  constructor(repositoryRoot, runId) {
+  constructor(repositoryRoot, runId, limits = {}) {
     this.repositoryRoot = repositoryRoot;
     this.runId = runId;
-    this.graphcraftRoot = join8(repositoryRoot, ".graphcraft");
-    this.runRoot = join8(this.graphcraftRoot, "runs", runId);
+    this.graphcraftRoot = join10(repositoryRoot, ".graphcraft");
+    this.runRoot = join10(this.graphcraftRoot, "runs", runId);
+    this.limits = normalizeLimits(limits);
+    this.artifactStore = new RunArtifactStore(this.runRoot, runId);
+    const blocker = this.createPersistenceLimitBlocker(1, "event_log");
+    const blockerBytes = Buffer.byteLength(serializedEvent(blocker));
+    if (blockerBytes > this.limits.maxEventBytes)
+      throw new Error("RunStore per-event limit cannot fit its durable blocked event");
+    if (blockerBytes > this.limits.blockedEventReserveBytes)
+      throw new Error("RunStore blocked-event reserve cannot fit its durable blocked event");
   }
-  async ensureStorage() {
+  async validateStorageRoot() {
+    const graphcraftRoot2 = resolve6(this.graphcraftRoot);
+    const runRoot = resolve6(this.runRoot);
+    const validated = await validatePrivatePath(graphcraftRoot2, relative3(graphcraftRoot2, runRoot));
+    if (validated !== runRoot)
+      throw new Error(`Run storage path escaped the Graphcraft state directory: ${this.runRoot}`);
+  }
+  async prepareStorage() {
+    await this.validateStorageRoot();
     if (this.initializing) return;
-    this.storageReady ??= ensureCurrentRunStorage({
+    const ready = this.storageReady ??= ensureCurrentRunStorage({
       graphcraftRoot: this.graphcraftRoot,
       runRoot: this.runRoot,
       runId: this.runId
     });
-    await this.storageReady;
+    try {
+      await ready;
+      await this.validateStorageRoot();
+    } catch (error51) {
+      if (this.storageReady === ready) this.storageReady = void 0;
+      throw error51;
+    }
   }
-  static async create(repositoryRoot, contract, graph, inputProbePlan, inputHeldOutProbePlan) {
-    const store = new _RunStore(repositoryRoot, contract.runId);
+  async ensureStorage() {
+    await this.prepareStorage();
+  }
+  assertJsonProjectionFits(value, maximumBytes, label) {
+    const bytes = serializedJsonBytes(value);
+    if (bytes > maximumBytes)
+      throw new Error(`${label} requires ${bytes} serialized bytes, exceeding ${maximumBytes}`);
+  }
+  async writeBoundedJson(relativePath, value, maximumBytes, label) {
+    const persisted = redactValue(value);
+    this.assertJsonProjectionFits(persisted, maximumBytes, label);
+    await writeJsonAtomic(join10(this.runRoot, relativePath), persisted);
+  }
+  async readBoundedJson(relativePath, maximumBytes) {
+    const bytes = await readPrivateFileBounded(
+      join10(this.runRoot, relativePath),
+      maximumBytes,
+      this.runRoot
+    );
+    return JSON.parse(bytes.toString("utf8"));
+  }
+  async readOptionalBoundedJson(relativePath, maximumBytes) {
+    let bytes;
+    try {
+      bytes = await readPrivateFileBounded(
+        join10(this.runRoot, relativePath),
+        maximumBytes,
+        this.runRoot
+      );
+    } catch (error51) {
+      if (error51.code === "ENOENT" || error51.message.includes("bounded read limit"))
+        return void 0;
+      throw error51;
+    }
+    try {
+      return JSON.parse(bytes.toString("utf8"));
+    } catch (error51) {
+      if (error51 instanceof SyntaxError) return void 0;
+      throw error51;
+    }
+  }
+  static async create(repositoryRoot, contract, graph, inputProbePlan, inputHeldOutProbePlan, limits = {}) {
+    const store = new _RunStore(repositoryRoot, contract.runId, limits);
     store.initializing = true;
     const persistedContract = RunContractSchema.parse(redactValue(contract));
     const persistedGraph = GraphSchema.parse(redactValue(graph));
@@ -37645,18 +41371,6 @@ var RunStore = class _RunStore {
     const heldOutProbePlan = inputHeldOutProbePlan ? validateHeldOutProbePlan(inputHeldOutProbePlan) : createHeldOutProbePlan(contract.runId, probePlan);
     assertPersistenceSafe(probePlan, "Probe plan");
     assertPersistenceSafe(heldOutProbePlan, "Held-out probe plan");
-    await Promise.all([
-      mkdir4(join8(store.runRoot, "artifacts"), { recursive: true }),
-      mkdir4(join8(store.runRoot, "capsules"), { recursive: true }),
-      mkdir4(join8(store.runRoot, "reports"), { recursive: true }),
-      mkdir4(join8(store.graphcraftRoot, "locks"), { recursive: true })
-    ]);
-    await Promise.all([
-      store.saveContract(persistedContract),
-      store.saveGraph(persistedGraph),
-      store.saveProbePlan(probePlan),
-      store.saveHeldOutProbePlan(heldOutProbePlan)
-    ]);
     const event = createRunEvent({
       sequence: 1,
       actor: "runtime",
@@ -37670,35 +41384,163 @@ var RunStore = class _RunStore {
         nodeIds: graph.nodes.map(({ id }) => id)
       }
     });
-    await writeFile3(store.eventsPath(), `${JSON.stringify(event)}
-`, {
-      encoding: "utf8",
-      mode: 384
-    });
-    await store.materialize([event]);
-    await writeCurrentRunStorageManifest(store.runRoot, store.runId, 1);
+    const eventLine = serializedEvent(event);
+    store.assertNormalEventCapacity(0, eventLine);
+    const state = RunStateSchema.parse(reduceEvents([event]));
+    store.assertNormalStateCapacity(state, event.sequence + 1);
+    store.assertJsonProjectionFits(persistedContract, RUN_METADATA_MAX_BYTES, "Run contract");
+    store.assertJsonProjectionFits(persistedGraph, RUN_METADATA_MAX_BYTES, "Run graph");
+    store.assertJsonProjectionFits(probePlan, RUN_METADATA_MAX_BYTES, "Probe plan");
+    store.assertJsonProjectionFits(heldOutProbePlan, RUN_METADATA_MAX_BYTES, "Held-out probe plan");
+    await ensurePrivateDirectory(store.graphcraftRoot);
+    await Promise.all([
+      ensurePrivateDirectory(join10(store.graphcraftRoot, "runs")),
+      ensurePrivateDirectory(join10(store.graphcraftRoot, "locks"))
+    ]);
+    await ensurePrivateDirectory(store.runRoot);
+    await Promise.all([
+      ensurePrivateDirectory(join10(store.runRoot, "artifacts")),
+      ensurePrivateDirectory(join10(store.runRoot, "capsules")),
+      ensurePrivateDirectory(join10(store.runRoot, "reports"))
+    ]);
+    await store.artifactStore.initialize();
+    await Promise.all([
+      store.saveContract(persistedContract),
+      store.saveGraph(persistedGraph),
+      store.saveProbePlan(probePlan),
+      store.saveHeldOutProbePlan(heldOutProbePlan)
+    ]);
+    await store.appendEventLine(eventLine, 0);
+    await store.writeMaterializedState(state);
+    await writeCurrentRunStorageManifest(store.runRoot, store.runId, 2);
     store.initializing = false;
     return store;
   }
   eventsPath() {
-    return join8(this.runRoot, "events.jsonl");
+    return join10(this.runRoot, "events.jsonl");
+  }
+  createPersistenceLimitBlocker(sequence, kind) {
+    return createRunEvent({
+      sequence,
+      actor: "runtime",
+      causationId: this.runId,
+      type: "run.blocked",
+      data: {
+        reason: PERSISTENCE_LIMIT_BLOCK_REASON,
+        persistenceLimit: kind
+      }
+    });
+  }
+  persistenceBlockedState(state, blocker) {
+    const { progressDecision: _progressDecision, ...rest } = state;
+    return RunStateSchema.parse({
+      ...rest,
+      status: "blocked",
+      stopReason: PERSISTENCE_LIMIT_BLOCK_REASON,
+      lastEventSequence: blocker.sequence,
+      updatedAt: blocker.timestamp
+    });
+  }
+  assertBlockerEventFits(blockerLine) {
+    const bytes = Buffer.byteLength(blockerLine);
+    if (bytes > this.limits.maxEventBytes)
+      throw new Error("RunStore per-event limit cannot fit its durable blocked event");
+    if (bytes > this.limits.blockedEventReserveBytes)
+      throw new Error("RunStore blocked-event reserve cannot fit its durable blocked event");
+  }
+  assertNormalEventCapacity(currentLogBytes, eventLine) {
+    const eventBytes = Buffer.byteLength(eventLine);
+    if (eventBytes > this.limits.maxEventBytes)
+      throw new RunStoreLimitError("event", eventBytes, this.limits.maxEventBytes);
+    const normalLogLimit = this.limits.maxEventLogBytes - this.limits.blockedEventReserveBytes;
+    const candidateLogBytes = currentLogBytes + eventBytes;
+    if (candidateLogBytes > normalLogLimit)
+      throw new RunStoreLimitError("event_log", candidateLogBytes, normalLogLimit);
+  }
+  assertNormalStateCapacity(state, blockerSequence) {
+    const stateBytes = serializedStateBytes(state);
+    if (stateBytes > this.limits.maxStateBytes)
+      throw new RunStoreLimitError("state", stateBytes, this.limits.maxStateBytes);
+    const blocker = this.createPersistenceLimitBlocker(blockerSequence, "state");
+    this.assertBlockerEventFits(serializedEvent(blocker));
+    const blockedStateBytes = serializedStateBytes(this.persistenceBlockedState(state, blocker));
+    if (blockedStateBytes > this.limits.maxStateBytes)
+      throw new RunStoreLimitError("state", blockedStateBytes, this.limits.maxStateBytes);
+  }
+  async appendEventLine(line, expectedLogBytes) {
+    await validatePrivatePath(this.runRoot, "events.jsonl");
+    let created = false;
+    let observed;
+    let handle;
+    const noFollow = process.platform === "win32" ? 0 : fsConstants4.O_NOFOLLOW;
+    try {
+      handle = await open6(
+        this.eventsPath(),
+        fsConstants4.O_WRONLY | fsConstants4.O_APPEND | fsConstants4.O_CREAT | fsConstants4.O_EXCL | noFollow,
+        384
+      );
+      created = true;
+    } catch (error51) {
+      if (error51.code !== "EEXIST") throw error51;
+      await validatePrivatePath(this.runRoot, "events.jsonl");
+      observed = await lstat5(this.eventsPath(), { bigint: true });
+      assertEventLogFile(this.eventsPath(), observed);
+      handle = await open6(
+        this.eventsPath(),
+        fsConstants4.O_WRONLY | fsConstants4.O_APPEND | noFollow,
+        384
+      );
+    }
+    try {
+      const before = await handle.stat({ bigint: true });
+      assertEventLogFile(this.eventsPath(), before);
+      if (observed && !sameFileIdentity(observed, before))
+        throw new Error("Run event log changed before its append descriptor was opened");
+      const pathBefore = await lstat5(this.eventsPath(), { bigint: true });
+      assertEventLogFile(this.eventsPath(), pathBefore);
+      if (!sameFileIdentity(before, pathBefore))
+        throw new Error("Run event log path changed before append");
+      if (before.size !== BigInt(expectedLogBytes))
+        throw new Error("Run event log size changed before append");
+      await handle.writeFile(line, "utf8");
+      await handle.sync();
+      const after = await handle.stat({ bigint: true });
+      const pathAfter = await lstat5(this.eventsPath(), { bigint: true });
+      assertEventLogFile(this.eventsPath(), after);
+      assertEventLogFile(this.eventsPath(), pathAfter);
+      if (!sameFileIdentity(after, pathAfter))
+        throw new Error("Run event log path changed during append");
+      if (after.size !== before.size + BigInt(Buffer.byteLength(line)))
+        throw new Error("Run event log append did not persist exactly one event line");
+    } finally {
+      await handle.close();
+    }
+    await hardenPrivateFile(this.eventsPath(), this.runRoot);
+    if (created) await syncDirectory(this.runRoot);
   }
   async saveContract(contract) {
     await this.ensureStorage();
-    await writeJsonAtomic(
-      join8(this.runRoot, "contract.json"),
-      RunContractSchema.parse(redactValue(contract))
+    await this.writeBoundedJson(
+      "contract.json",
+      RunContractSchema.parse(redactValue(contract)),
+      RUN_METADATA_MAX_BYTES,
+      "Run contract"
     );
   }
   async loadContract() {
     await this.ensureStorage();
     return RunContractSchema.parse(
-      JSON.parse(await readFile6(join8(this.runRoot, "contract.json"), "utf8"))
+      await this.readBoundedJson("contract.json", RUN_METADATA_MAX_BYTES)
     );
   }
   async saveGraph(graph) {
     await this.ensureStorage();
-    await writeJsonAtomic(join8(this.runRoot, "graph.json"), GraphSchema.parse(redactValue(graph)));
+    await this.writeBoundedJson(
+      "graph.json",
+      GraphSchema.parse(redactValue(graph)),
+      RUN_METADATA_MAX_BYTES,
+      "Run graph"
+    );
   }
   async loadGraph() {
     await this.ensureStorage();
@@ -37708,16 +41550,24 @@ var RunStore = class _RunStore {
     )?.data.graph;
     if (eventGraph) {
       const graph = GraphSchema.parse(eventGraph);
-      const materialized = await readFile6(join8(this.runRoot, "graph.json"), "utf8").then((value) => GraphSchema.parse(JSON.parse(value))).catch(() => void 0);
+      const parsedMaterialized = GraphSchema.safeParse(
+        await this.readOptionalBoundedJson("graph.json", RUN_METADATA_MAX_BYTES)
+      );
+      const materialized = parsedMaterialized.success ? parsedMaterialized.data : void 0;
       if (JSON.stringify(materialized) !== JSON.stringify(graph)) await this.saveGraph(graph);
       return graph;
     }
-    return GraphSchema.parse(JSON.parse(await readFile6(join8(this.runRoot, "graph.json"), "utf8")));
+    return GraphSchema.parse(await this.readBoundedJson("graph.json", RUN_METADATA_MAX_BYTES));
   }
   async saveProbePlan(probePlan) {
     await this.ensureStorage();
     assertPersistenceSafe(probePlan, "Probe plan");
-    await writeJsonAtomic(join8(this.runRoot, "probe-plan.json"), ProbePlanSchema.parse(probePlan));
+    await this.writeBoundedJson(
+      "probe-plan.json",
+      ProbePlanSchema.parse(probePlan),
+      RUN_METADATA_MAX_BYTES,
+      "Probe plan"
+    );
   }
   async loadProbePlan() {
     await this.ensureStorage();
@@ -37727,25 +41577,27 @@ var RunStore = class _RunStore {
     )?.data.probePlan;
     if (eventPlan) {
       const probePlan = ProbePlanSchema.parse(eventPlan);
-      const materialized = await readFile6(join8(this.runRoot, "probe-plan.json"), "utf8").then((value) => ProbePlanSchema.parse(JSON.parse(value))).catch(() => void 0);
+      const parsedMaterialized2 = ProbePlanSchema.safeParse(
+        await this.readOptionalBoundedJson("probe-plan.json", RUN_METADATA_MAX_BYTES)
+      );
+      const materialized = parsedMaterialized2.success ? parsedMaterialized2.data : void 0;
       if (JSON.stringify(materialized) !== JSON.stringify(probePlan))
         await this.saveProbePlan(probePlan);
       return probePlan;
     }
-    try {
-      return ProbePlanSchema.parse(
-        JSON.parse(await readFile6(join8(this.runRoot, "probe-plan.json"), "utf8"))
-      );
-    } catch {
-      return probePlanFromGraph(await this.loadGraph());
-    }
+    const parsedMaterialized = ProbePlanSchema.safeParse(
+      await this.readOptionalBoundedJson("probe-plan.json", RUN_METADATA_MAX_BYTES)
+    );
+    return parsedMaterialized.success ? parsedMaterialized.data : probePlanFromGraph(await this.loadGraph());
   }
   async saveHeldOutProbePlan(heldOutProbePlan) {
     await this.ensureStorage();
     assertPersistenceSafe(heldOutProbePlan, "Held-out probe plan");
-    await writeJsonAtomic(
-      join8(this.runRoot, "held-out-probes.json"),
-      validateHeldOutProbePlan(heldOutProbePlan)
+    await this.writeBoundedJson(
+      "held-out-probes.json",
+      validateHeldOutProbePlan(heldOutProbePlan),
+      RUN_METADATA_MAX_BYTES,
+      "Held-out probe plan"
     );
   }
   async loadHeldOutProbePlan() {
@@ -37756,46 +41608,106 @@ var RunStore = class _RunStore {
     )?.data.heldOutProbePlan;
     if (eventPlan) {
       const heldOutProbePlan = validateHeldOutProbePlan(HeldOutProbePlanSchema.parse(eventPlan));
-      const materialized = await readFile6(join8(this.runRoot, "held-out-probes.json"), "utf8").then((value) => validateHeldOutProbePlan(HeldOutProbePlanSchema.parse(JSON.parse(value)))).catch(() => void 0);
+      const materialized = optionalHeldOutProbePlan(
+        await this.readOptionalBoundedJson("held-out-probes.json", RUN_METADATA_MAX_BYTES)
+      );
       if (JSON.stringify(materialized) !== JSON.stringify(heldOutProbePlan))
         await this.saveHeldOutProbePlan(heldOutProbePlan);
       return heldOutProbePlan;
     }
-    try {
-      return validateHeldOutProbePlan(
-        HeldOutProbePlanSchema.parse(
-          JSON.parse(await readFile6(join8(this.runRoot, "held-out-probes.json"), "utf8"))
-        )
-      );
-    } catch {
-      return createHeldOutProbePlan(this.runId, await this.loadProbePlan());
-    }
+    return optionalHeldOutProbePlan(
+      await this.readOptionalBoundedJson("held-out-probes.json", RUN_METADATA_MAX_BYTES)
+    ) ?? createHeldOutProbePlan(this.runId, await this.loadProbePlan());
   }
-  async loadEvents() {
+  async loadEventLog() {
     await this.ensureStorage();
-    const content = await readFile6(this.eventsPath(), "utf8");
-    const events = content.split("\n").filter(Boolean).map((line) => RunEventSchema.parse(JSON.parse(line)));
+    await validatePrivatePath(this.runRoot, "events.jsonl");
+    let contentBytes;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        contentBytes = await readPrivateFileBounded(
+          this.eventsPath(),
+          this.limits.maxEventLogBytes,
+          this.runRoot
+        );
+        break;
+      } catch (error51) {
+        if (error51.message.includes("bounded read limit"))
+          throw new RunStoreLimitError(
+            "event_log",
+            this.limits.maxEventLogBytes + 1,
+            this.limits.maxEventLogBytes
+          );
+        const message = error51 instanceof Error ? error51.message : "";
+        if (attempt >= 7 || message !== "Private file changed before its bounded read" && message !== "Private file changed during its bounded read")
+          throw error51;
+        await new Promise((resolveRetry) => setImmediate(resolveRetry));
+      }
+    }
+    const bytes = contentBytes.byteLength;
+    const content = contentBytes.toString("utf8");
+    const lines = content.split("\n").filter(Boolean);
+    const events = lines.map((line) => {
+      const lineBytes = Buffer.byteLength(`${line}
+`);
+      if (lineBytes > this.limits.maxEventBytes)
+        throw new RunStoreLimitError("event", lineBytes, this.limits.maxEventBytes);
+      return RunEventSchema.parse(JSON.parse(line));
+    });
     for (const [index, event] of events.entries()) {
       verifyRunEvent(event);
       if (event.sequence !== index + 1)
         throw new Error(`Expected event sequence ${index + 1}, received ${event.sequence}`);
     }
-    return events;
+    return { events, bytes };
+  }
+  async loadEvents() {
+    return (await this.loadEventLog()).events;
   }
   async loadState() {
     await this.ensureStorage();
+    const events = await this.loadEvents();
+    const authoritative = RunStateSchema.parse(reduceEvents(events));
+    const authoritativeBytes = serializedStateBytes(authoritative);
+    if (authoritativeBytes > this.limits.maxStateBytes)
+      throw new RunStoreLimitError("state", authoritativeBytes, this.limits.maxStateBytes);
+    const statePath = join10(this.runRoot, "state.json");
+    let materialized;
+    let materializedBytes;
     try {
-      const value = JSON.parse(await readFile6(join8(this.runRoot, "state.json"), "utf8"));
-      if (!("tokenLedger" in value)) return await this.rebuildViews();
-      return RunStateSchema.parse(value);
-    } catch {
-      return await this.rebuildViews();
+      materializedBytes = await readPrivateFileBounded(
+        statePath,
+        this.limits.maxStateBytes,
+        this.runRoot
+      );
+    } catch (error51) {
+      if (error51.code !== "ENOENT" && !error51.message.includes("bounded read limit"))
+        throw error51;
     }
+    if (materializedBytes) {
+      try {
+        const parsed = RunStateSchema.safeParse(JSON.parse(materializedBytes.toString("utf8")));
+        materialized = parsed.success ? parsed.data : void 0;
+      } catch (error51) {
+        if (!(error51 instanceof SyntaxError)) throw error51;
+      }
+    }
+    if (!materialized || contentHash(materialized) !== contentHash(authoritative))
+      await this.writeMaterializedState(authoritative);
+    return authoritative;
   }
   async append(actor, type, data, causationId = this.runId) {
     await this.ensureStorage();
     const operation = this.appendTail.then(async () => {
-      const events = await this.loadEvents();
+      const { events, bytes: currentLogBytes } = await this.loadEventLog();
+      const previous = events.at(-1);
+      if (isPersistenceLimitBlocker(previous)) {
+        const kind = String(previous?.data.persistenceLimit);
+        const limitBytes = kind === "event" ? this.limits.maxEventBytes : kind === "state" ? this.limits.maxStateBytes : this.limits.maxEventLogBytes - this.limits.blockedEventReserveBytes;
+        const error51 = new RunStoreLimitError(kind, limitBytes + 1, limitBytes);
+        error51.blockerPersisted = true;
+        throw error51;
+      }
       const event = createRunEvent({
         sequence: events.length + 1,
         actor,
@@ -37803,10 +41715,19 @@ var RunStore = class _RunStore {
         type,
         data: redactValue(data)
       });
-      await appendFile2(this.eventsPath(), `${JSON.stringify(event)}
-`, "utf8");
-      events.push(event);
-      await this.materialize(events);
+      const eventLine = serializedEvent(event);
+      let state;
+      try {
+        this.assertNormalEventCapacity(currentLogBytes, eventLine);
+        state = RunStateSchema.parse(reduceEvents([...events, event]));
+        this.assertNormalStateCapacity(state, event.sequence + 1);
+      } catch (error51) {
+        if (!(error51 instanceof RunStoreLimitError)) throw error51;
+        await this.persistPersistenceLimitBlocker(events, currentLogBytes, error51);
+        throw error51;
+      }
+      await this.appendEventLine(eventLine, currentLogBytes);
+      await this.writeMaterializedState(state);
       return event;
     });
     this.appendTail = operation.then(
@@ -37814,6 +41735,27 @@ var RunStore = class _RunStore {
       () => void 0
     );
     return await operation;
+  }
+  async persistPersistenceLimitBlocker(events, currentLogBytes, limitError) {
+    const previous = events.at(-1);
+    if (isPersistenceLimitBlocker(previous)) {
+      limitError.blockerPersisted = true;
+      return;
+    }
+    const blocker = this.createPersistenceLimitBlocker(events.length + 1, limitError.kind);
+    const blockerLine = serializedEvent(blocker);
+    this.assertBlockerEventFits(blockerLine);
+    const blockerBytes = Buffer.byteLength(blockerLine);
+    const blockedLogBytes = currentLogBytes + blockerBytes;
+    if (blockedLogBytes > this.limits.maxEventLogBytes)
+      throw new RunStoreLimitError("event_log", blockedLogBytes, this.limits.maxEventLogBytes);
+    const state = RunStateSchema.parse(reduceEvents([...events, blocker]));
+    const stateBytes = serializedStateBytes(state);
+    if (stateBytes > this.limits.maxStateBytes)
+      throw new RunStoreLimitError("state", stateBytes, this.limits.maxStateBytes);
+    await this.appendEventLine(blockerLine, currentLogBytes);
+    limitError.blockerPersisted = true;
+    await this.writeMaterializedState(state);
   }
   async rebuildViews() {
     await this.ensureStorage();
@@ -37841,28 +41783,15 @@ var RunStore = class _RunStore {
   }
   async writeArtifact(relativePath, value) {
     await this.ensureStorage();
-    const path = join8(this.runRoot, "artifacts", relativePath);
-    await mkdir4(dirname5(path), { recursive: true });
-    await writeFile3(path, redactTextBytes(value), { mode: 384 });
-    return path;
+    return (await this.artifactStore.writeArtifact(relativePath, value)).path;
   }
   async appendInvocationEvent(invocationId, event) {
     await this.ensureStorage();
-    const path = join8(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
-    await mkdir4(dirname5(path), { recursive: true });
-    const persistedEvent = HostEventSchema.parse(redactValue(event));
-    await appendFile2(path, `${JSON.stringify(persistedEvent)}
-`, {
-      encoding: "utf8",
-      mode: 384
-    });
-    return path;
+    return (await this.artifactStore.appendInvocationEvent(invocationId, event)).path;
   }
   async loadInvocationEvents(invocationId) {
     await this.ensureStorage();
-    const path = join8(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
-    const content = await readFile6(path, "utf8");
-    return content.split("\n").filter(Boolean).map((line) => HostEventSchema.parse(JSON.parse(line)));
+    return await this.artifactStore.loadInvocationEvents(invocationId);
   }
   async loadGraphHistory() {
     await this.ensureStorage();
@@ -37913,11 +41842,13 @@ var RunStore = class _RunStore {
     const persistedValue = redactValue(value);
     if (contentHash(persistedValue) !== hash2)
       throw new Error("Context capsule must be redacted before content addressing");
-    const path = join8(this.runRoot, "capsules", `${hash2}.json`);
-    const reused = await readFile6(path, "utf8").then((existing) => contentHash(JSON.parse(existing)) === hash2).catch(() => false);
-    if (reused) return { path, reused: true };
-    await writeJsonAtomic(path, persistedValue);
-    return { path, reused: false };
+    const result = await this.artifactStore.writeIdentityArtifact({
+      relativePath: `capsules/${hash2}.json`,
+      value: `${JSON.stringify(persistedValue, null, 2)}
+`,
+      kind: "capsule"
+    });
+    return { path: result.path, reused: result.reused };
   }
   async writeContentAddressedArtifact(category, value, extension = "json") {
     await this.ensureStorage();
@@ -37925,30 +41856,44 @@ var RunStore = class _RunStore {
       throw new Error("Content-addressed artifact category or extension is invalid");
     const bytes = redactTextBytes(value);
     const hash2 = contentHash({ contents: bytes.toString("base64") });
-    const path = join8(this.runRoot, "artifacts", category, `${hash2}.${extension}`);
-    const reused = await readFile6(path).then((existing) => Buffer.compare(existing, bytes) === 0).catch(() => false);
-    if (reused) return { path, hash: hash2, reused: true };
-    await mkdir4(dirname5(path), { recursive: true });
-    await writeFile3(path, bytes, { mode: 384 });
-    return { path, hash: hash2, reused: false };
+    const result = await this.artifactStore.writeIdentityArtifact({
+      relativePath: `artifacts/${category}/${hash2}.${extension}`,
+      value: bytes,
+      kind: "content_addressed"
+    });
+    return { path: result.path, hash: hash2, reused: result.reused };
+  }
+  async loadArtifactInventory() {
+    await this.ensureStorage();
+    return ArtifactInventorySchema.parse(await this.artifactStore.inventory());
+  }
+  async readArtifactPreview(relativePath, maxBytes) {
+    await this.ensureStorage();
+    return await this.artifactStore.readArtifactPreview(`artifacts/${relativePath}`, maxBytes);
   }
   async writeWorkspace(value) {
     await this.ensureStorage();
-    await writeJsonAtomic(join8(this.runRoot, "workspace.json"), value);
+    await this.writeBoundedJson("workspace.json", value, RUN_WORKSPACE_MAX_BYTES, "Run workspace");
   }
   async loadWorkspace() {
     await this.ensureStorage();
-    return JSON.parse(await readFile6(join8(this.runRoot, "workspace.json"), "utf8"));
+    return await this.readBoundedJson("workspace.json", RUN_WORKSPACE_MAX_BYTES);
   }
   async materialize(events) {
-    const state = reduceEvents(events);
-    await writeJsonAtomic(join8(this.runRoot, "state.json"), state);
+    const state = RunStateSchema.parse(reduceEvents(events));
+    await this.writeMaterializedState(state);
     return state;
+  }
+  async writeMaterializedState(state) {
+    const bytes = serializedStateBytes(state);
+    if (bytes > this.limits.maxStateBytes)
+      throw new RunStoreLimitError("state", bytes, this.limits.maxStateBytes);
+    await writeJsonAtomic(join10(this.runRoot, "state.json"), state);
   }
 };
 async function listRunIds(repositoryRoot) {
   try {
-    const entries = await readdir(join8(repositoryRoot, ".graphcraft", "runs"), {
+    const entries = await readdir4(join10(repositoryRoot, ".graphcraft", "runs"), {
       withFileTypes: true
     });
     return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
@@ -37976,10 +41921,10 @@ async function resolveRunId(repositoryRoot, reference) {
 }
 
 // packages/runtime/src/scope.ts
-import { createHash as createHash2 } from "node:crypto";
+import { createHash as createHash5 } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { lstat as lstat2, readlink as readlink2 } from "node:fs/promises";
-import { isAbsolute as isAbsolute3, matchesGlob, relative, resolve as resolve3, sep as sep2 } from "node:path";
+import { lstat as lstat6, readlink as readlink2 } from "node:fs/promises";
+import { isAbsolute as isAbsolute5, matchesGlob, relative as relative4, resolve as resolve7, sep as sep3 } from "node:path";
 var maximumChangedPaths = 1e4;
 async function gitOutput(repositoryPath, args) {
   const result = await runProcess("git", args, { cwd: repositoryPath, timeoutMs: 12e4 });
@@ -37991,38 +41936,38 @@ function nulPaths(value) {
   return value.split("\0").filter(Boolean);
 }
 function confinedPath(repositoryPath, path) {
-  if (isAbsolute3(path)) throw new Error(`Git reported an absolute workspace path: ${path}`);
-  const absolute = resolve3(repositoryPath, path);
-  const confined = relative(repositoryPath, absolute);
-  if (confined === ".." || confined.startsWith(`..${sep2}`) || isAbsolute3(confined))
+  if (isAbsolute5(path)) throw new Error(`Git reported an absolute workspace path: ${path}`);
+  const absolute = resolve7(repositoryPath, path);
+  const confined = relative4(repositoryPath, absolute);
+  if (confined === ".." || confined.startsWith(`..${sep3}`) || isAbsolute5(confined))
     throw new Error(`Git reported a path outside the workspace: ${path}`);
   return absolute;
 }
 async function fileDigest(path) {
-  const hash2 = createHash2("sha256");
+  const hash2 = createHash5("sha256");
   for await (const chunk of createReadStream(path)) hash2.update(chunk);
   return hash2.digest("hex");
 }
 async function pathSignature(repositoryPath, path) {
   const absolute = confinedPath(repositoryPath, path);
-  let status2;
+  let status3;
   try {
-    status2 = await lstat2(absolute);
+    status3 = await lstat6(absolute);
   } catch (error51) {
     if (error51.code === "ENOENT") return "missing";
     throw error51;
   }
-  const mode = status2.mode & 511;
-  if (status2.isSymbolicLink())
+  const mode = status3.mode & 511;
+  if (status3.isSymbolicLink())
     return contentHash({ kind: "symlink", mode, target: await readlink2(absolute) });
-  if (status2.isFile())
+  if (status3.isFile())
     return contentHash({
       kind: "file",
       mode,
-      size: status2.size,
+      size: status3.size,
       digest: await fileDigest(absolute)
     });
-  if (status2.isDirectory()) {
+  if (status3.isDirectory()) {
     const [head, state] = await Promise.all([
       gitOutput(absolute, ["rev-parse", "HEAD"]).catch(() => "not-a-repository"),
       gitOutput(absolute, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]).catch(
@@ -38031,7 +41976,7 @@ async function pathSignature(repositoryPath, path) {
     ]);
     return contentHash({ kind: "directory", mode, head: head.trim(), state });
   }
-  return contentHash({ kind: "other", mode, size: status2.size });
+  return contentHash({ kind: "other", mode, size: status3.size });
 }
 async function captureWorkspaceScopeSnapshot(repositoryPath, inspectedIgnoredPatterns = []) {
   const ignored = inspectedIgnoredPatterns.length > 0 ? gitOutput(repositoryPath, [
@@ -38310,20 +42255,20 @@ async function prepareWorkerContext(input) {
 }
 
 // packages/runtime/src/wait.ts
-import { lstat as lstat3, readFile as readFile7, readlink as readlink3 } from "node:fs/promises";
+import { lstat as lstat7, readFile as readFile3, readlink as readlink3 } from "node:fs/promises";
 import { setTimeout as waitForTimeout } from "node:timers/promises";
-import { isAbsolute as isAbsolute4, resolve as resolve4, sep as sep3 } from "node:path";
+import { isAbsolute as isAbsolute6, resolve as resolve8, sep as sep4 } from "node:path";
 function waitPath(root, path) {
-  if (isAbsolute4(path) || path.split(/[\\/]/).includes(".."))
+  if (isAbsolute6(path) || path.split(/[\\/]/).includes(".."))
     throw new Error(`Wait condition path is unsafe: ${path}`);
-  const absolute = resolve4(root, path);
-  if (absolute !== root && !absolute.startsWith(`${root}${sep3}`))
+  const absolute = resolve8(root, path);
+  if (absolute !== root && !absolute.startsWith(`${root}${sep4}`))
     throw new Error(`Wait condition path escapes the workspace: ${path}`);
   return absolute;
 }
 async function fileSignature(root, path) {
   const absolute = waitPath(root, path);
-  const stats = await lstat3(absolute).catch(() => void 0);
+  const stats = await lstat7(absolute).catch(() => void 0);
   if (!stats) return contentHash({ kind: "absent", path });
   if (stats.isSymbolicLink())
     return contentHash({ kind: "symlink", path, target: await readlink3(absolute) });
@@ -38332,22 +42277,22 @@ async function fileSignature(root, path) {
       kind: "file",
       path,
       executable: (stats.mode & 73) !== 0,
-      contents: (await readFile7(absolute)).toString("base64")
+      contents: (await readFile3(absolute)).toString("base64")
     });
   return contentHash({ kind: stats.isDirectory() ? "directory" : "other", path });
 }
-function nextWakeAt(condition, now) {
+function nextWakeAt(condition, now2) {
   if (condition.kind === "time") return condition.wakeAt;
-  const next = now + condition.pollIntervalMs;
+  const next = now2 + condition.pollIntervalMs;
   return new Date(
     condition.timeoutAt ? Math.min(next, Date.parse(condition.timeoutAt)) : next
   ).toISOString();
 }
-async function registerWait(store, node2, workspacePath, now) {
+async function registerWait(store, node2, workspacePath, now2) {
   const condition = node2.waitCondition;
   if (node2.kind !== "wait" || !condition)
     throw new Error(`Node ${node2.id} is not an executable wait node`);
-  const registeredAt = new Date(now).toISOString();
+  const registeredAt = new Date(now2).toISOString();
   const wait = WaitRuntimeStateSchema.parse({
     nodeId: node2.id,
     condition,
@@ -38363,10 +42308,10 @@ async function registerWait(store, node2, workspacePath, now) {
   await store.append("runtime", "wait.registered", { wait }, node2.id);
   return wait;
 }
-async function observe(wait, workspacePath, now) {
+async function observe(wait, workspacePath, now2) {
   const condition = wait.condition;
   if (condition.kind === "time") {
-    const satisfied2 = now >= Date.parse(condition.wakeAt);
+    const satisfied2 = now2 >= Date.parse(condition.wakeAt);
     return {
       satisfied: satisfied2,
       evidence: [
@@ -38381,6 +42326,7 @@ async function observe(wait, workspacePath, now) {
     const absent = signature === contentHash({ kind: "absent", path: condition.path });
     return {
       satisfied: !absent,
+      signature,
       evidence: [
         absent ? `${condition.path} does not exist` : `${condition.path} now exists (${signature})`
       ]
@@ -38389,45 +42335,61 @@ async function observe(wait, workspacePath, now) {
   const satisfied = signature !== wait.baselineSignature;
   return {
     satisfied,
+    signature,
     evidence: [
       satisfied ? `${condition.path} changed from ${wait.baselineSignature} to ${signature}` : `${condition.path} remains at ${signature}`
     ]
   };
 }
 async function evaluateWaitNode(input) {
-  const now = input.now ?? Date.now();
+  const now2 = input.now ?? Date.now();
   let wait = (await input.store.loadState()).waits.find(({ nodeId }) => nodeId === input.node.id);
-  if (!wait) wait = await registerWait(input.store, input.node, input.workspacePath, now);
+  if (!wait) wait = await registerWait(input.store, input.node, input.workspacePath, now2);
   if (wait.status === "satisfied") return { status: "satisfied", evidence: wait.evidence };
   if (wait.status === "timed_out") return { status: "timed_out", evidence: wait.evidence };
-  if (now < Date.parse(wait.nextWakeAt))
+  if (now2 < Date.parse(wait.nextWakeAt))
     return { status: "waiting", nextWakeAt: wait.nextWakeAt, evidence: wait.evidence };
-  const observation = await observe(wait, input.workspacePath, now);
+  const observation = await observe(wait, input.workspacePath, now2);
   if (observation.satisfied) {
     await input.store.append(
       "runtime",
       "wait.satisfied",
-      { nodeId: input.node.id, evidence: observation.evidence },
+      {
+        nodeId: input.node.id,
+        evidence: observation.evidence,
+        ...observation.signature ? { signature: observation.signature } : {}
+      },
       input.node.id
     );
     return { status: "satisfied", evidence: observation.evidence };
   }
   const timeoutAt = wait.condition.kind === "time" ? void 0 : wait.condition.timeoutAt;
-  if (timeoutAt && now >= Date.parse(timeoutAt)) {
+  if (timeoutAt && now2 >= Date.parse(timeoutAt)) {
     const evidence = [...observation.evidence, `Wait timed out at ${timeoutAt}`];
     await input.store.append(
       "runtime",
       "wait.timed_out",
-      { nodeId: input.node.id, evidence },
+      {
+        nodeId: input.node.id,
+        evidence,
+        ...observation.signature ? { signature: observation.signature } : {}
+      },
       input.node.id
     );
     return { status: "timed_out", evidence };
   }
-  const wakeAt = nextWakeAt(wait.condition, now);
+  const wakeAt = nextWakeAt(wait.condition, now2);
+  if (observation.signature && wait.lastSignature === observation.signature)
+    return { status: "waiting", nextWakeAt: wakeAt, evidence: observation.evidence };
   await input.store.append(
     "runtime",
     "wait.observed",
-    { nodeId: input.node.id, nextWakeAt: wakeAt, evidence: observation.evidence },
+    {
+      nodeId: input.node.id,
+      nextWakeAt: wakeAt,
+      evidence: observation.evidence,
+      ...observation.signature ? { signature: observation.signature } : {}
+    },
     input.node.id
   );
   return { status: "waiting", nextWakeAt: wakeAt, evidence: observation.evidence };
@@ -38445,21 +42407,21 @@ async function sleepUntilWake(nextWakeAt2, signal) {
 
 // packages/runtime/src/held-out.ts
 import { execFile } from "node:child_process";
-import { readFile as readFile8, stat as stat3 } from "node:fs/promises";
-import { isAbsolute as isAbsolute5, relative as relative2, resolve as resolve5, sep as sep4 } from "node:path";
+import { readFile as readFile4, stat as stat4 } from "node:fs/promises";
+import { isAbsolute as isAbsolute7, relative as relative5, resolve as resolve9, sep as sep5 } from "node:path";
 import { promisify } from "node:util";
 var execFileAsync = promisify(execFile);
 function relativeRepositoryPath(repositoryRoot, candidate) {
-  const root = resolve5(repositoryRoot);
-  const path = resolve5(repositoryRoot, candidate);
-  if (path !== root && !path.startsWith(`${root}${sep4}`)) return void 0;
-  const result = relative2(root, path);
-  return result && !isAbsolute5(result) ? result.split(sep4).join("/") : void 0;
+  const root = resolve9(repositoryRoot);
+  const path = resolve9(repositoryRoot, candidate);
+  if (path !== root && !path.startsWith(`${root}${sep5}`)) return void 0;
+  const result = relative5(root, path);
+  return result && !isAbsolute7(result) ? result.split(sep5).join("/") : void 0;
 }
 async function gitObjectValueHash(repositoryRoot, path) {
   const { stdout } = await execFileAsync(
     "git",
-    ["hash-object", `--path=${path.replaceAll("\\", "/")}`, resolve5(repositoryRoot, path)],
+    ["hash-object", `--path=${path.replaceAll("\\", "/")}`, resolve9(repositoryRoot, path)],
     { cwd: repositoryRoot, encoding: "utf8", maxBuffer: 1024 * 1024 }
   );
   const objectHash = stdout.trim();
@@ -38469,10 +42431,10 @@ async function gitObjectValueHash(repositoryRoot, path) {
 }
 async function fileValueHash(repositoryRoot, path, algorithm) {
   if (algorithm === "git_hash_object") {
-    const details = await stat3(resolve5(repositoryRoot, path)).catch(() => void 0);
+    const details = await stat4(resolve9(repositoryRoot, path)).catch(() => void 0);
     return details?.isFile() ? await gitObjectValueHash(repositoryRoot, path) : contentHash({ missing: true, path, algorithm });
   }
-  const contents = await readFile8(resolve5(repositoryRoot, path)).catch(() => void 0);
+  const contents = await readFile4(resolve9(repositoryRoot, path)).catch(() => void 0);
   return contents ? contentHash({ path, contents: contents.toString("base64") }) : contentHash({ missing: true, path });
 }
 function possibleFileArguments(values) {
@@ -38483,9 +42445,9 @@ function possibleFileArguments(values) {
 async function fileIntegrity(repositoryRoot, cwd, values) {
   const result = [];
   for (const value of possibleFileArguments(values)) {
-    const path = relativeRepositoryPath(repositoryRoot, resolve5(repositoryRoot, cwd ?? ".", value));
+    const path = relativeRepositoryPath(repositoryRoot, resolve9(repositoryRoot, cwd ?? ".", value));
     if (!path) continue;
-    const details = await stat3(resolve5(repositoryRoot, path)).catch(() => void 0);
+    const details = await stat4(resolve9(repositoryRoot, path)).catch(() => void 0);
     if (!details?.isFile()) continue;
     result.push({
       kind: "file",
@@ -38516,7 +42478,7 @@ async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot) {
     const script = match[2];
     const manifestPath = relativeRepositoryPath(repositoryRoot, path);
     if (!manifestPath) throw new Error(`Completion script ${script} escapes the repository`);
-    const manifest2 = JSON.parse(await readFile8(resolve5(repositoryRoot, manifestPath), "utf8"));
+    const manifest2 = JSON.parse(await readFile4(resolve9(repositoryRoot, manifestPath), "utf8"));
     const value = manifest2.scripts?.[script];
     if (!value) throw new Error(`Completion script ${script} is missing from ${manifestPath}`);
     protectedValues.push({
@@ -38547,7 +42509,7 @@ async function heldOutIntegrityFailures(plan, repositoryPath) {
     for (const integrity of entry.integrity) {
       let actualHash;
       if (integrity.kind === "package_script") {
-        const manifest2 = await readFile8(resolve5(repositoryPath, integrity.path), "utf8").then(
+        const manifest2 = await readFile4(resolve9(repositoryPath, integrity.path), "utf8").then(
           (value2) => JSON.parse(value2)
         ).catch(() => void 0);
         const value = manifest2?.scripts?.[integrity.script];
@@ -38589,7 +42551,7 @@ function actionableHeldOutFailures(results) {
 }
 
 // packages/runtime/src/trajectory.ts
-import { randomUUID as randomUUID6 } from "node:crypto";
+import { randomUUID as randomUUID7 } from "node:crypto";
 function probeShape(snapshot) {
   return snapshot.probeResults.map(({ probeId, kind }) => `${kind}:${probeId}`).sort().join("|");
 }
@@ -38655,7 +42617,7 @@ function createProgressDecisionPacket(input) {
   ].slice(-8);
   return ProgressDecisionPacketSchema.parse({
     schemaVersion: 1,
-    packetId: randomUUID6(),
+    packetId: randomUUID7(),
     nodeId: input.nodeId,
     invariant: input.invariant ?? invariant(input.classification),
     attemptedStrategies,
@@ -38986,7 +42948,7 @@ function currentReviewFeedback(snapshot) {
 }
 function lifecycleBinding(state, node2) {
   const pullRequests = state.sideEffects.filter(
-    ({ claim, status: status2, result }) => claim.kind === "github_pr_create" && status2 === "confirmed" && result !== void 0
+    ({ claim, status: status3, result }) => claim.kind === "github_pr_create" && status3 === "confirmed" && result !== void 0
   );
   if (pullRequests.length !== 1 || !pullRequests[0]?.result)
     throw new Error("The GitHub lifecycle requires one confirmed pull-request binding");
@@ -39050,12 +43012,12 @@ function lifecycleProjection(snapshot, classification) {
     binding: snapshot.binding,
     branchProtection: snapshot.branchProtection,
     requiredChecks: snapshot.requiredChecks,
-    checks: snapshot.checks.map(({ id, databaseId, kind, name, status: status2, conclusion, appId }) => ({
+    checks: snapshot.checks.map(({ id, databaseId, kind, name, status: status3, conclusion, appId }) => ({
       id,
       ...databaseId !== void 0 ? { databaseId } : {},
       kind,
       name,
-      status: status2,
+      status: status3,
       ...conclusion ? { conclusion } : {},
       ...appId !== void 0 ? { appId } : {}
     })),
@@ -39138,22 +43100,22 @@ async function captureExpectedPullRequestLifecycle(workspace, contract, expected
     }))
   );
   const actionableCheckIds = new Set(classification.checkIds.actionable);
-  const ciFailures = snapshot.checks.filter(({ id }) => actionableCheckIds.has(id)).map(({ id, kind, name, status: status2, conclusion, appId, detailsUrl }) => ({
+  const ciFailures = snapshot.checks.filter(({ id }) => actionableCheckIds.has(id)).map(({ id, kind, name, status: status3, conclusion, appId, detailsUrl }) => ({
     contentTrust: "untrusted_external",
     id,
     kind,
     name,
-    status: status2,
+    status: status3,
     ...conclusion ? { conclusion } : {},
     ...appId !== void 0 ? { appId } : {},
     ...detailsUrl ? { detailsUrl } : {}
   }));
   const ciFailureSignature = contentHash({
     mergeable: snapshot.pullRequest.mergeable,
-    failures: ciFailures.map(({ kind, name, status: status2, conclusion, appId }) => ({
+    failures: ciFailures.map(({ kind, name, status: status3, conclusion, appId }) => ({
       kind,
       name,
-      status: status2,
+      status: status3,
       conclusion: conclusion ?? null,
       appId: appId ?? null
     })).sort(
@@ -39168,13 +43130,13 @@ async function captureExpectedPullRequestLifecycle(workspace, contract, expected
   ]);
   const rerunnableChecks = snapshot.checks.filter(
     (check2) => rerunnableCheckIds.has(check2.id) && check2.kind === "check_run" && check2.databaseId !== void 0
-  ).map(({ id, databaseId, kind, name, status: status2, conclusion, appId, detailsUrl }) => ({
+  ).map(({ id, databaseId, kind, name, status: status3, conclusion, appId, detailsUrl }) => ({
     contentTrust: "untrusted_external",
     id,
     databaseId,
     kind,
     name,
-    status: status2,
+    status: status3,
     ...conclusion ? { conclusion } : {},
     ...appId !== void 0 ? { appId } : {},
     ...detailsUrl ? { detailsUrl } : {}
@@ -39706,9 +43668,9 @@ async function reconcilePendingGitHubActions(input) {
   const options = input.options ?? {};
   const state = await input.store.loadState();
   const pending = state.sideEffects.filter(
-    ({ claim, status: status2 }) => claim.nodeId === input.node.id && ["github_pr_comment", "github_review_thread_resolve", "github_check_rerun"].includes(
+    ({ claim, status: status3 }) => claim.nodeId === input.node.id && ["github_pr_comment", "github_review_thread_resolve", "github_check_rerun"].includes(
       claim.kind
-    ) && status2 !== "confirmed"
+    ) && status3 !== "confirmed"
   );
   const evidence = [];
   for (const entry of pending) {
@@ -39740,16 +43702,23 @@ async function reconcilePendingGitHubActions(input) {
   }
   return evidence;
 }
+var MAX_GITHUB_WAIT_BACKOFF_MS = 3e5;
+function githubWaitBackoffMs(pollIntervalMs, observations) {
+  return Math.min(
+    pollIntervalMs * 2 ** Math.min(Math.max(0, observations - 1), 4),
+    MAX_GITHUB_WAIT_BACKOFF_MS
+  );
+}
 async function evaluateGitHubLifecycleWait(input) {
   const condition = input.node.waitCondition;
   if (input.node.kind !== "wait" || condition?.kind !== "github_pull_request")
     throw new Error(`Node ${input.node.id} is not a GitHub lifecycle wait`);
-  const now = input.now ?? Date.now();
+  const now2 = input.now ?? Date.now();
   let state = await input.store.loadState();
   let binding = lifecycleBinding(state, input.node);
   let wait = state.waits.find(({ nodeId }) => nodeId === input.node.id);
   if (!wait) {
-    const registeredAt = new Date(now).toISOString();
+    const registeredAt = new Date(now2).toISOString();
     wait = WaitRuntimeStateSchema.parse({
       nodeId: input.node.id,
       condition,
@@ -39767,7 +43736,7 @@ async function evaluateGitHubLifecycleWait(input) {
   }
   if (wait.status === "satisfied") return { status: "satisfied", evidence: wait.evidence };
   if (wait.status === "timed_out") return { status: "timed_out", evidence: wait.evidence };
-  if (now < Date.parse(wait.nextWakeAt))
+  if (now2 < Date.parse(wait.nextWakeAt))
     return { status: "waiting", nextWakeAt: wait.nextWakeAt, evidence: wait.evidence };
   binding = lifecycleBinding(state, input.node);
   const baseMovementEvidence = [];
@@ -39907,7 +43876,7 @@ async function evaluateGitHubLifecycleWait(input) {
     );
   }
   const evidence = [...baseMovementEvidence, ...lifecycle.classification.evidence];
-  const timedOut = condition.timeoutAt && now >= Date.parse(condition.timeoutAt);
+  const timedOut = condition.timeoutAt && now2 >= Date.parse(condition.timeoutAt);
   if (timedOut) {
     const timeoutEvidence = [
       ...evidence,
@@ -39946,7 +43915,7 @@ async function evaluateGitHubLifecycleWait(input) {
       "wait.observed",
       {
         nodeId: input.node.id,
-        nextWakeAt: new Date(now).toISOString(),
+        nextWakeAt: new Date(now2).toISOString(),
         evidence,
         signature: lifecycle.classification.signature,
         probeResult: lifecycle.result
@@ -39956,13 +43925,13 @@ async function evaluateGitHubLifecycleWait(input) {
     return { status: "action_required", evidence, lifecycle };
   }
   const observations = wait.observations + 1;
-  const delay = Math.min(
-    condition.pollIntervalMs * 2 ** Math.min(Math.max(0, observations - 1), 4),
-    3e5
-  );
+  const delay = githubWaitBackoffMs(condition.pollIntervalMs, observations);
   const nextWakeAt2 = new Date(
-    condition.timeoutAt ? Math.min(now + delay, Date.parse(condition.timeoutAt)) : now + delay
+    condition.timeoutAt ? Math.min(now2 + delay, Date.parse(condition.timeoutAt)) : now2 + delay
   ).toISOString();
+  const unchangedAtDurableMaximumBackoff = wait.lastSignature === lifecycle.classification.signature && githubWaitBackoffMs(condition.pollIntervalMs, wait.observations) === MAX_GITHUB_WAIT_BACKOFF_MS;
+  if (unchangedAtDurableMaximumBackoff)
+    return { status: "waiting", nextWakeAt: nextWakeAt2, evidence, lifecycle };
   await input.store.append(
     "runtime",
     "wait.observed",
@@ -40175,7 +44144,8 @@ async function createRun(task, options) {
   return { contract, graph, store, probePlan };
 }
 async function configureRunProbes(store, input) {
-  const lock = new RunLock(join9(store.graphcraftRoot, "locks", `${store.runId}.lock`));
+  await store.prepareStorage();
+  const lock = new RunLock(join11(store.graphcraftRoot, "locks", `${store.runId}.lock`));
   await lock.acquire();
   try {
     const state = await store.loadState();
@@ -40214,13 +44184,13 @@ async function configureRunProbes(store, input) {
   }
 }
 async function executeWorker(input) {
-  let invocationId = input.resume?.invocationId ?? randomUUID7();
+  let invocationId = input.resume?.invocationId ?? randomUUID8();
   let resumeSessionId = input.reuseSession?.hostSessionId;
   if (input.resume) {
     await recordMissingUsage(input.store, input.resume, input.node, input.adapter.id);
     const reconciliation = await input.adapter.reconcile(input.resume);
     if (reconciliation.state === "completed" && reconciliation.result) {
-      const artifact2 = join9(
+      const artifact2 = join11(
         input.store.runRoot,
         "artifacts",
         "invocations",
@@ -40258,7 +44228,7 @@ async function executeWorker(input) {
         },
         invocationId
       );
-      invocationId = randomUUID7();
+      invocationId = randomUUID8();
     }
   }
   const { capsule, capsuleHash } = await prepareWorkerContext({
@@ -40290,7 +44260,7 @@ async function executeWorker(input) {
   let termination;
   let usageReceipts = 0;
   const tokenPhase = input.node.id.startsWith("repair-") ? "repair" : "worker";
-  let artifact = join9(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+  let artifact = join11(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
   const execution = input.adapter.execute(
     {
       invocationId,
@@ -40314,7 +44284,16 @@ async function executeWorker(input) {
       break;
     }
     if (next.done) break;
-    const event = HostEventSchema.parse(redactValue(next.value));
+    const parsedEvent = HostEventSchema.safeParse(redactValue(next.value));
+    if (!parsedEvent.success) {
+      error51 = "Host emitted an invalid or oversized structured event";
+      errorCause = "host_crash";
+      const event2 = { type: "error", message: error51, cause: errorCause };
+      artifact = await input.store.appendInvocationEvent(invocationId, event2);
+      await iterator.return?.().catch(() => void 0);
+      break;
+    }
+    const event = parsedEvent.data;
     artifact = await input.store.appendInvocationEvent(invocationId, event);
     if (event.type === "session") {
       await input.store.append(
@@ -40426,7 +44405,7 @@ function needsSemanticVerification(phase, probes, classification) {
   return classification === "stalled" || classification === "done";
 }
 async function runSemanticVerification(input) {
-  const invocationId = randomUUID7();
+  const invocationId = randomUUID8();
   const context = SemanticVerifierContextSchema.parse(
     redactValue({
       schemaVersion: 1,
@@ -40561,7 +44540,7 @@ function concurrencyConflict(graph, left, right) {
 function runtimeOptimizationDecision(input) {
   return OptimizationDecisionSchema.parse({
     schemaVersion: 1,
-    decisionId: randomUUID7(),
+    decisionId: randomUUID8(),
     ...input
   });
 }
@@ -40715,7 +44694,7 @@ function repairAmendment(graph, verification, failures) {
   };
   return {
     schemaVersion: 1,
-    amendmentId: randomUUID7(),
+    amendmentId: randomUUID8(),
     operations: [
       { operation: "add", node: repair, authoritySourceIds: originalDependencies },
       {
@@ -40845,7 +44824,7 @@ function githubLifecycleRepairAmendment(input) {
   };
   return {
     schemaVersion: 1,
-    amendmentId: randomUUID7(),
+    amendmentId: randomUUID8(),
     operations: [
       { operation: "add", node: repair, authoritySourceIds: [previousBoundaryId] },
       { operation: "add", node: verification, authoritySourceIds: [repairId] },
@@ -40895,7 +44874,7 @@ function githubReviewRepairAmendment(graph, wait, lifecycle) {
 }
 function githubCiRepairAmendment(graph, wait, lifecycle) {
   const failures = lifecycle.ciFailures.map(
-    ({ id, name, status: status2, conclusion, detailsUrl }) => `${name} (${id}) reported ${conclusion ?? status2}${detailsUrl ? ` at ${detailsUrl}` : ""}`
+    ({ id, name, status: status3, conclusion, detailsUrl }) => `${name} (${id}) reported ${conclusion ?? status3}${detailsUrl ? ` at ${detailsUrl}` : ""}`
   );
   return githubLifecycleRepairAmendment({
     graph,
@@ -41227,7 +45206,7 @@ async function executeRun(input) {
   const externalSignal = input.signal ?? new AbortController().signal;
   const contract = await input.store.loadContract();
   let graph = await input.store.loadGraph();
-  const lock = new RunLock(join9(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
+  const lock = new RunLock(join11(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
   await lock.acquire();
   const controlChannel = new RunControlChannel(input.store.graphcraftRoot, contract.runId);
   const controlAbort = new AbortController();
@@ -41403,7 +45382,7 @@ async function executeRun(input) {
         if (contextOptimization.reuseSession)
           reuseSessions.set(candidate.id, contextOptimization.reuseSession);
       }
-      const batchId = randomUUID7();
+      const batchId = randomUUID8();
       for (const candidate of batch) {
         input.observer?.({
           type: "status",
@@ -41457,7 +45436,7 @@ async function executeRun(input) {
             interrupted?.termination,
             interrupted?.artifact
           );
-        const failed = outcomes.find(({ status: status2 }) => status2 === "failed");
+        const failed = outcomes.find(({ status: status3 }) => status3 === "failed");
         if (failed?.status === "failed") {
           const quarantinedSiblingIds = outcomes.filter(
             (outcome2) => outcome2.status === "interrupted"
@@ -41468,7 +45447,7 @@ async function executeRun(input) {
             ...failed.packet ? { decisionPacket: failed.packet } : {},
             ...failed.progressDecision ? { progressDecision: failed.progressDecision } : {},
             batchId,
-            acceptedSiblingIds: outcomes.filter(({ status: status2 }) => status2 === "accepted").map(({ nodeId }) => nodeId),
+            acceptedSiblingIds: outcomes.filter(({ status: status3 }) => status3 === "accepted").map(({ nodeId }) => nodeId),
             quarantinedSiblingIds
           });
           return await input.store.loadState();
@@ -42238,6 +46217,10 @@ async function executeRun(input) {
     return await finishInterruption(
       Object.entries(finalState.nodes).filter(([, nodeState]) => nodeState.status === "running").map(([nodeId]) => nodeId)
     );
+  } catch (error51) {
+    if (error51 instanceof RunStoreLimitError && error51.blockerPersisted)
+      return await input.store.loadState();
+    throw error51;
   } finally {
     await stopWatching();
     await lock.release();
@@ -42245,10 +46228,26 @@ async function executeRun(input) {
 }
 
 // packages/runtime/src/supervisor.ts
-import { chmod, mkdir as mkdir5, open as open2, readFile as readFile9, readdir as readdir2 } from "node:fs/promises";
-import { join as join10 } from "node:path";
+import { open as open7, readdir as readdir5 } from "node:fs/promises";
+import { dirname as dirname8, join as join12, relative as relative6, resolve as resolve10 } from "node:path";
+var KIB3 = 1024;
+var SUPERVISOR_LOG_MAX_BYTES = 64 * KIB3;
+var SUPERVISOR_LOG_RETAIN_BYTES = 32 * KIB3;
+var SUPERVISOR_RECORD_MAX_BYTES = 64 * KIB3;
+var SUPERVISOR_MESSAGE_MAX_BYTES = 16 * KIB3;
+var SUPERVISOR_LOG_TRUNCATION_MARKER = Buffer.from(
+  `[Graphcraft supervisor log truncated; retaining the most recent ${SUPERVISOR_LOG_RETAIN_BYTES} bytes]
+`
+);
+function graphcraftRoot(repositoryRoot) {
+  return join12(repositoryRoot, ".graphcraft");
+}
 function supervisorRoot(repositoryRoot, runId) {
-  return join10(repositoryRoot, ".graphcraft", "supervisors", runId);
+  return join12(graphcraftRoot(repositoryRoot), "supervisors", runId);
+}
+async function readSupervisorRecord(path, ownedRoot) {
+  const source = await readPrivateFileBounded(path, SUPERVISOR_RECORD_MAX_BYTES, ownedRoot);
+  return SupervisorRecordSchema.parse(JSON.parse(source.toString("utf8")));
 }
 function isProcessAlive(pid) {
   try {
@@ -42259,29 +46258,30 @@ function isProcessAlive(pid) {
   }
 }
 async function listSupervisorRecords(repositoryRoot, runId) {
+  const root = supervisorRoot(repositoryRoot, runId);
+  const ownedRoot = graphcraftRoot(repositoryRoot);
   let entries;
   try {
-    entries = await readdir2(supervisorRoot(repositoryRoot, runId), { withFileTypes: true });
+    await validatePrivatePath(ownedRoot, relative6(ownedRoot, root));
+    entries = await readdir5(root, { withFileTypes: true });
   } catch (error51) {
     if (error51.code === "ENOENT") return [];
     throw error51;
   }
   const records = await Promise.all(
-    entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json")).map(
-      async (entry) => SupervisorRecordSchema.parse(
-        JSON.parse(
-          await readFile9(join10(supervisorRoot(repositoryRoot, runId), entry.name), "utf8")
-        )
-      )
-    )
+    entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json")).map(async (entry) => {
+      const path = join12(root, entry.name);
+      await validatePrivatePath(ownedRoot, relative6(ownedRoot, path));
+      return await readSupervisorRecord(path, ownedRoot);
+    })
   );
   return records.sort(
     (left, right) => left.startedAt.localeCompare(right.startedAt) || left.supervisorId.localeCompare(right.supervisorId)
   );
 }
-function inspectSupervisorRecord(record2, now = Date.now()) {
+function inspectSupervisorRecord(record2, now2 = Date.now()) {
   const alive = isProcessAlive(record2.pid);
-  const heartbeatAgeMs = Math.max(0, now - Date.parse(record2.heartbeatAt));
+  const heartbeatAgeMs = Math.max(0, now2 - Date.parse(record2.heartbeatAt));
   const health = (record2.status === "starting" || record2.status === "running") && (!alive || heartbeatAgeMs > 1e4) ? "stale" : record2.status;
   return { ...record2, alive, heartbeatAgeMs, health };
 }
@@ -42289,6 +46289,12 @@ async function latestSupervisor(repositoryRoot, runId) {
   const latest = (await listSupervisorRecords(repositoryRoot, runId)).at(-1);
   return latest ? inspectSupervisorRecord(latest) : void 0;
 }
+
+// packages/runtime/src/retention.ts
+var RETENTION_JOURNAL_MAX_BYTES = 64 * 1024;
+var RETENTION_WORKSPACE_PATH_MAX_CHARACTERS = 16 * 1024;
+var RETENTION_WORKSPACE_BRANCH_MAX_CHARACTERS = 4 * 1024;
+var RETENTION_WORKSPACE_FILE_MAX_BYTES = 64 * 1024;
 
 // packages/runtime/src/viewer.ts
 var MAX_ARTIFACT_BYTES = 1024 * 1024;
@@ -42307,7 +46313,7 @@ var VIEWER_HTML = String.raw`<!doctype html>
 <section id="timeline" class="view"><div class="panel"><h2>Durable event timeline</h2><div id="filters" class="filters"></div><div id="event-list" class="timeline"></div></div></section>
 <section id="revisions" class="view"><div class="panel"><h2>Graph revisions</h2><div id="revision-list"></div></div></section>
 <section id="tokens" class="view"><div class="panel"><h2>Token cost by phase</h2><div id="token-list"></div></div></section>
-<section id="artifacts" class="view"><div class="panel"><h2>Local artifacts</h2><p class="meta">Opened on demand; contents are redacted and capped at 1 MiB.</p><div id="artifact-list" class="artifact-list"></div><p><a class="download" href="/api/export" download="graphcraft-run-report.json">Export redacted run report</a></p></div></section></main>
+<section id="artifacts" class="view"><div class="panel"><h2>Local artifacts</h2><p class="meta">Redacted before bounded storage. Source, stored, and omitted byte counts come from the durable artifact inventory.</p><div id="artifact-summary" class="meta"></div><div id="artifact-list" class="artifact-list"></div><p><a class="download" href="/api/export" download="graphcraft-run-report.json">Export redacted run report</a></p></div></section></main>
 <script>
 const $=id=>document.getElementById(id), ns='http://www.w3.org/2000/svg'; let snapshot, selected, filter='all';
 const el=(name,attrs={})=>{const n=document.createElementNS(ns,name);for(const[k,v]of Object.entries(attrs))n.setAttribute(k,String(v));return n};
@@ -42318,7 +46324,7 @@ function selectNode(id){selected=id;const n=snapshot.nodes.find(n=>n.id===id)||s
 function renderTimeline(){const categories=['all',...new Set(snapshot.timeline.map(e=>e.category))];$('filters').textContent='';categories.forEach(c=>{const b=document.createElement('button');b.textContent=c;b.className=c===filter?'active':'';b.onclick=()=>{filter=c;renderTimeline()};$('filters').append(b)});$('event-list').textContent='';snapshot.timeline.filter(e=>filter==='all'||e.category===filter).forEach(e=>{const d=document.createElement('div');d.className='event '+e.category;const title=document.createElement('div');title.textContent=e.sequence+'. '+e.type;const meta=document.createElement('small');meta.textContent=e.timestamp+' · '+e.actor;const pre=document.createElement('pre');pre.textContent=JSON.stringify(e.data,null,2);d.append(title,meta,pre);$('event-list').append(d)})}
 function renderRevisions(){const root=$('revision-list');root.textContent='';if(!snapshot.revisions.length){root.textContent='No amendments. Revision 1 is the approved graph.';root.className='empty';return}snapshot.revisions.forEach(r=>{const p=document.createElement('pre');p.textContent=JSON.stringify(r,null,2);root.append(p)})}
 function renderTokens(){const root=$('token-list');root.textContent='';const report=snapshot.tokenReport||{};const groups=[['Cumulative',{all:report.totals||{}}],['By phase',report.byPhase||{}],['By node',report.byNode||{}]];const all=groups.flatMap(([,rows])=>Object.values(rows));const max=Math.max(1,...all.map(v=>v.total||0));if(!report.receipts){root.textContent='No token receipts.';root.className='empty';return}groups.forEach(([heading,rows])=>{const h=document.createElement('h3');h.textContent=heading;root.append(h);Object.entries(rows).forEach(([name,value])=>{const row=document.createElement('div');row.className='token-row';const label=document.createElement('span');label.textContent=name;const bar=document.createElement('div');bar.className='bar';const fill=document.createElement('i');fill.style.width=100*(value.total||0)/max+'%';bar.append(fill);const number=document.createElement('code');number.textContent='cached '+(value.cachedInput||0)+' · uncached '+(value.uncachedInput||0)+' · output '+(value.output||0)+' · reasoning '+(value.reasoning||0)+' · total '+(value.total||0);row.append(label,bar,number);root.append(row)})})}
-function renderArtifacts(){const root=$('artifact-list');root.textContent='';if(!snapshot.artifacts.length){root.textContent='No artifacts.';root.className='empty';return}snapshot.artifacts.forEach(a=>{const link=document.createElement('a');link.href=a.href;link.target='_blank';link.rel='noopener';link.textContent=a.path+' ('+a.size+' bytes)';root.append(link)})}
+function renderArtifacts(){const root=$('artifact-list'),inventory=snapshot.artifactInventory;$('artifact-summary').textContent=inventory?'Stored '+inventory.storedBytes+' of '+inventory.sourceBytes+' source bytes; '+inventory.omittedBytes+' omitted.':'';root.textContent='';if(!snapshot.artifacts.length){root.textContent='No artifacts.';root.className='empty';return}snapshot.artifacts.forEach(a=>{const item=a.href?document.createElement('a'):document.createElement('span');if(a.href){item.href=a.href;item.target='_blank';item.rel='noopener'}const omitted=a.omittedBytes?' · '+a.omittedBytes+' omitted':'';item.textContent=a.path+' ('+a.storedBytes+'/'+a.sourceBytes+' bytes'+omitted+(a.reason?' · '+a.reason:'')+')';root.append(item)})}
 function render(){const r=snapshot.run;$('run-meta').textContent=r.task+' · '+r.finishLine+' · '+r.id;$('status').textContent=r.status;renderGraph();renderTimeline();renderRevisions();renderTokens();renderArtifacts()}
 async function refresh(){try{const response=await fetch('/api/snapshot',{cache:'no-store'});if(!response.ok)throw new Error(await response.text());const next=await response.json();const changed=!snapshot||snapshot.run.updatedAt!==next.run.updatedAt||snapshot.timeline.length!==next.timeline.length;snapshot=next;if(changed)render()}catch(error){$('run-meta').textContent='Viewer refresh failed: '+error.message}}
 refresh();setInterval(refresh,1500);
@@ -42551,6 +46557,7 @@ async function performAction(input) {
       supervisor: await supervisorView(store.repositoryRoot, store.runId),
       tokenReport: tokenCostReport(state.tokenLedger),
       graphHistory: await store.loadGraphHistory(),
+      artifactInventory: await store.loadArtifactInventory(),
       contextReceipts: (await store.loadEvents()).filter(({ type }) => type === "context.selected").map(({ data }) => ContextSelectionReceiptSchema.parse(data.receipt))
     };
   if (input.action === "trace") return { events: await store.loadEvents() };

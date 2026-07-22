@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { compileGraph, compileRunContract, createRunEvent, reduceEvents } from "@graphcraft/core";
 import type { ProbePlan } from "@graphcraft/core";
+import { DEFAULT_ARTIFACT_POLICY } from "@graphcraft/runtime";
 import {
   GRAPHCRAFT_VERSION,
   assessTaskShape,
@@ -306,9 +307,24 @@ describe("run approval", () => {
     expect(rendered).toContain("Status        awaiting_approval");
     expect(rendered).toContain("cached 2, uncached 8, output 4, reasoning 1, total 14");
     expect(rendered).toContain(`graphcraft resume ${contract.runId.slice(0, 8)} --yes`);
-    expect(renderRunInspection({ state, contract, graph, graphHistory: [] })).toContain(
-      "Governance",
-    );
+    expect(
+      renderRunInspection({
+        state,
+        contract,
+        graph,
+        graphHistory: [],
+        artifactInventory: {
+          schemaVersion: 1,
+          runId: contract.runId,
+          policy: DEFAULT_ARTIFACT_POLICY,
+          sourceBytes: 0,
+          storedBytes: 0,
+          omittedBytes: 0,
+          entries: [],
+          updatedAt: new Date().toISOString(),
+        },
+      }),
+    ).toContain("Governance");
   });
 
   it("renders stable run selection and actionable recovery hints", () => {

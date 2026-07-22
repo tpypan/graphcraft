@@ -2,7 +2,6 @@ import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createInterface } from "node:readline";
 import {
   ChildTerminationController,
   GraphPlanSchema,
@@ -29,6 +28,15 @@ import {
   type SemanticVerificationResult,
   type WorkerRequest,
 } from "@graphcraft/core";
+import {
+  ADAPTER_STDERR_LIMIT_BYTES,
+  BoundedTextCapture,
+  captureStderr,
+  protocolLineLimitError,
+  readBoundedProtocolLines,
+  structuredOutputExceedsLimit,
+  structuredOutputLimitError,
+} from "./protocol.ts";
 
 function omitNullObjectProperties(value: unknown): unknown {
   if (Array.isArray(value)) return value.map((item) => omitNullObjectProperties(item));
@@ -88,14 +96,15 @@ export function codexUsage(value: unknown) {
 async function commandVersion(command: string): Promise<{ installed: boolean; version?: string }> {
   return await new Promise((resolve) => {
     const child = spawn(command, ["--version"], { stdio: ["ignore", "pipe", "ignore"] });
-    let output = "";
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      output += chunk;
-    });
+    const output = new BoundedTextCapture(ADAPTER_STDERR_LIMIT_BYTES);
+    child.stdout.on("data", (chunk: Buffer | string) => output.append(chunk));
     child.once("error", () => resolve({ installed: false }));
     child.once("close", (code) =>
-      resolve(code === 0 ? { installed: true, version: output.trim() } : { installed: false }),
+      resolve(
+        code === 0 && !output.overflowed
+          ? { installed: true, version: output.text().trim() }
+          : { installed: false },
+      ),
     );
   });
 }
@@ -103,17 +112,13 @@ async function commandVersion(command: string): Promise<{ installed: boolean; ve
 async function codexAuthenticated(): Promise<boolean> {
   return await new Promise((resolve) => {
     const child = spawn("codex", ["login", "status"], { stdio: ["ignore", "pipe", "pipe"] });
-    let output = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      output += chunk;
-    });
-    child.stderr.on("data", (chunk: string) => {
-      output += chunk;
-    });
+    const output = new BoundedTextCapture(ADAPTER_STDERR_LIMIT_BYTES);
+    child.stdout.on("data", (chunk: Buffer | string) => output.append(chunk));
+    child.stderr.on("data", (chunk: Buffer | string) => output.append(chunk));
     child.once("error", () => resolve(false));
-    child.once("close", (code) => resolve(code === 0 && !/not logged in/i.test(output)));
+    child.once("close", (code) =>
+      resolve(code === 0 && !output.overflowed && !/not logged in/i.test(output.text())),
+    );
   });
 }
 
@@ -153,34 +158,42 @@ export class CodexAdapter implements HostAdapter {
     signal.addEventListener("abort", abort, { once: true });
     child.stdin.end(renderPlannerPrompt(request));
     let lastMessage = "";
-    let stderr = "";
+    let lastMessageExceededLimit = false;
+    let protocolExceededLimit = false;
     let usage: ReturnType<typeof codexUsage> | undefined;
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
+    const stderr = captureStderr(child.stderr);
 
     try {
-      const lines = createInterface({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
-      for await (const line of lines) {
-        if (!line.trim()) continue;
+      for await (const line of readBoundedProtocolLines(child.stdout)) {
+        if (line.overflowed) {
+          protocolExceededLimit = true;
+          continue;
+        }
+        if (protocolExceededLimit || !line.text?.trim()) continue;
         let event: Record<string, unknown>;
         try {
-          event = JSON.parse(line) as Record<string, unknown>;
+          event = JSON.parse(line.text) as Record<string, unknown>;
         } catch {
           continue;
         }
         const item = event.item as Record<string, unknown> | undefined;
-        if (event.type === "item.completed" && item?.type === "agent_message")
-          lastMessage = String(item.text ?? "");
+        if (event.type === "item.completed" && item?.type === "agent_message") {
+          const candidate = String(item.text ?? "");
+          lastMessageExceededLimit = structuredOutputExceedsLimit(candidate);
+          lastMessage = lastMessageExceededLimit ? "" : candidate;
+        }
         if (event.type === "turn.completed") usage = codexUsage(event.usage);
       }
       const exitCode = await exitPromise;
       if (signal.aborted) throw new Error("Codex planning invocation aborted");
+      if (protocolExceededLimit) throw protocolLineLimitError("Codex");
+      if (lastMessageExceededLimit) {
+        throw structuredOutputLimitError("Codex", "structured graph plan");
+      }
       const plan = parseGraphPlan(lastMessage);
       if (exitCode !== 0 || !plan) {
         throw new Error(
-          stderr.trim() || `Codex exited ${exitCode} without a valid structured graph plan`,
+          stderr.text().trim() || `Codex exited ${exitCode} without a valid structured graph plan`,
         );
       }
       return { plan, ...(usage ? { usage } : {}) };
@@ -210,34 +223,42 @@ export class CodexAdapter implements HostAdapter {
     const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderSemanticVerifierPrompt(request.context));
     let lastMessage = "";
-    let stderr = "";
+    let lastMessageExceededLimit = false;
+    let protocolExceededLimit = false;
     let usage: ReturnType<typeof codexUsage> | undefined;
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
+    const stderr = captureStderr(child.stderr);
     try {
-      const lines = createInterface({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
-      for await (const line of lines) {
-        if (!line.trim()) continue;
+      for await (const line of readBoundedProtocolLines(child.stdout)) {
+        if (line.overflowed) {
+          protocolExceededLimit = true;
+          continue;
+        }
+        if (protocolExceededLimit || !line.text?.trim()) continue;
         let event: Record<string, unknown>;
         try {
-          event = JSON.parse(line) as Record<string, unknown>;
+          event = JSON.parse(line.text) as Record<string, unknown>;
         } catch {
           continue;
         }
         const item = event.item as Record<string, unknown> | undefined;
-        if (event.type === "item.completed" && item?.type === "agent_message")
-          lastMessage = String(item.text ?? "");
+        if (event.type === "item.completed" && item?.type === "agent_message") {
+          const candidate = String(item.text ?? "");
+          lastMessageExceededLimit = structuredOutputExceedsLimit(candidate);
+          lastMessage = lastMessageExceededLimit ? "" : candidate;
+        }
         if (event.type === "turn.completed") usage = codexUsage(event.usage);
       }
       const exit = await exitPromise;
       const termination = terminationController.finish(exit.code, exit.signal);
       if (termination) throw new HostTerminationError(termination);
+      if (protocolExceededLimit) throw protocolLineLimitError("Codex");
+      if (lastMessageExceededLimit) {
+        throw structuredOutputLimitError("Codex", "semantic verdict");
+      }
       const verdict = parseSemanticVerdict(lastMessage);
       if (exit.code !== 0 || !verdict) {
         throw new Error(
-          stderr.trim() || `Codex exited ${exit.code ?? 1} without a valid semantic verdict`,
+          stderr.text().trim() || `Codex exited ${exit.code ?? 1} without a valid semantic verdict`,
         );
       }
       return { verdict, ...(usage ? { usage } : {}) };
@@ -264,24 +285,31 @@ export class CodexAdapter implements HostAdapter {
     );
     const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderWorkerPrompt(request.capsule));
-
-    yield { type: "started", invocationId: request.invocationId };
     let lastMessage = "";
-    let stderr = "";
+    let lastMessageExceededLimit = false;
+    let protocolExceededLimit = false;
     let observedSessionId: string | undefined;
     let sessionReported = false;
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
+    const stderr = captureStderr(child.stderr);
+    const protocolLines = readBoundedProtocolLines(child.stdout)[Symbol.asyncIterator]();
+    let nextProtocolLine = protocolLines.next();
+
+    yield { type: "started", invocationId: request.invocationId };
 
     try {
-      const lines = createInterface({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
-      for await (const line of lines) {
-        if (!line.trim()) continue;
+      while (true) {
+        const next = await nextProtocolLine;
+        if (next.done) break;
+        nextProtocolLine = protocolLines.next();
+        const line = next.value;
+        if (line.overflowed) {
+          protocolExceededLimit = true;
+          continue;
+        }
+        if (protocolExceededLimit || !line.text?.trim()) continue;
         let event: Record<string, unknown>;
         try {
-          event = JSON.parse(line) as Record<string, unknown>;
+          event = JSON.parse(line.text) as Record<string, unknown>;
         } catch {
           continue;
         }
@@ -294,8 +322,10 @@ export class CodexAdapter implements HostAdapter {
           yield { type: "session", hostSessionId: observedSessionId };
         }
         if (type === "item.completed" && item?.type === "agent_message") {
-          lastMessage = String(item.text ?? "");
-          yield { type: "message", text: lastMessage };
+          const candidate = String(item.text ?? "");
+          lastMessageExceededLimit = structuredOutputExceedsLimit(candidate);
+          lastMessage = lastMessageExceededLimit ? "" : candidate;
+          if (!lastMessageExceededLimit) yield { type: "message", text: lastMessage };
         } else if ((type === "item.started" || type === "item.completed") && item?.type) {
           yield {
             type: "tool",
@@ -316,12 +346,24 @@ export class CodexAdapter implements HostAdapter {
         yield { type: "terminated", termination };
         return;
       }
+      if (protocolExceededLimit) {
+        yield { type: "error", message: protocolLineLimitError("Codex").message };
+        return;
+      }
+      if (lastMessageExceededLimit) {
+        yield {
+          type: "error",
+          message: structuredOutputLimitError("Codex", "structured result").message,
+        };
+        return;
+      }
       const result = parseJsonResult(lastMessage);
       if (exit.code !== 0 || !result) {
         yield {
           type: "error",
           message:
-            stderr.trim() || `Codex exited ${exit.code ?? 1} without a valid structured result`,
+            stderr.text().trim() ||
+            `Codex exited ${exit.code ?? 1} without a valid structured result`,
           cause: "host_crash",
         };
         return;

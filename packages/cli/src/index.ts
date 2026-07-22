@@ -393,6 +393,7 @@ export function renderRunInspection(input: {
   contract: RunContract;
   graph: Graph;
   graphHistory: Awaited<ReturnType<RunStore["loadGraphHistory"]>>;
+  artifactInventory: Awaited<ReturnType<RunStore["loadArtifactInventory"]>>;
 }): string {
   return [
     renderRunStatus(input.state, input.contract, input.graph),
@@ -405,6 +406,7 @@ export function renderRunInspection(input: {
     "",
     `Governance    ${input.graph.controlEdges.length} control edges; ${input.contract.acceptanceAnchors.length} anchors`,
     `Revisions     ${input.graph.revision}; ${input.graphHistory.length} amendments`,
+    `Artifacts     ${input.artifactInventory.storedBytes}/${input.artifactInventory.sourceBytes} bytes stored; ${input.artifactInventory.omittedBytes} omitted across ${input.artifactInventory.entries.length} entries`,
     `Durable files ${join(input.contract.repository.root, ".graphcraft", "runs", input.state.runId)}`,
   ].join("\n");
 }
@@ -617,6 +619,7 @@ async function performAction(input: McpActionInput): Promise<Record<string, unkn
       supervisor: await supervisorView(store.repositoryRoot, store.runId),
       tokenReport: tokenCostReport(state.tokenLedger),
       graphHistory: await store.loadGraphHistory(),
+      artifactInventory: await store.loadArtifactInventory(),
       contextReceipts: (await store.loadEvents())
         .filter(({ type }) => type === "context.selected")
         .map(({ data }) => ContextSelectionReceiptSchema.parse(data.receipt)),

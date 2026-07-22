@@ -1,13 +1,17 @@
 import { randomUUID } from "node:crypto";
-import { readFile, unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { unlink } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { RunControlRequestSchema, type RunControlRequest, type RunState } from "@graphcraft/core";
 import { writeJsonAtomic } from "./json.ts";
 import { RunLock } from "./lock.ts";
+import { ensurePrivateDirectory, hardenPrivateFile, readPrivateFileBounded } from "./secure-fs.ts";
 import type { RunStore } from "./store.ts";
+
+const CONTROL_REQUEST_MAX_BYTES = 64 * 1024;
 
 export class RunControlChannel {
   readonly path: string;
+  private storageReady: Promise<void> | undefined;
 
   constructor(
     private readonly graphcraftRoot: string,
@@ -16,7 +20,21 @@ export class RunControlChannel {
     this.path = join(graphcraftRoot, "controls", `${runId}.json`);
   }
 
+  private async ensureStorage(): Promise<void> {
+    this.storageReady ??= (async () => {
+      await ensurePrivateDirectory(this.graphcraftRoot);
+      await ensurePrivateDirectory(dirname(this.path), this.graphcraftRoot);
+    })();
+    try {
+      await this.storageReady;
+    } catch (error) {
+      this.storageReady = undefined;
+      throw error;
+    }
+  }
+
   async request(action: "pause" | "stop", reason: string): Promise<RunControlRequest> {
+    await this.ensureStorage();
     const existing = await this.read();
     if (existing?.action === "stop" && action === "pause") return existing;
     const request = RunControlRequestSchema.parse({
@@ -29,13 +47,32 @@ export class RunControlChannel {
       requestedAt: new Date().toISOString(),
       requestedByPid: process.pid,
     });
+    if (Buffer.byteLength(`${JSON.stringify(request, null, 2)}\n`) > CONTROL_REQUEST_MAX_BYTES)
+      throw new Error(
+        `Run control request exceeds its ${CONTROL_REQUEST_MAX_BYTES}-byte persistence limit`,
+      );
+    await hardenPrivateFile(this.path, this.graphcraftRoot);
     await writeJsonAtomic(this.path, request);
+    await hardenPrivateFile(this.path, this.graphcraftRoot);
     return request;
   }
 
   async read(): Promise<RunControlRequest | undefined> {
+    await this.ensureStorage();
+    await hardenPrivateFile(this.path, this.graphcraftRoot);
+    let serialized: Buffer;
     try {
-      return RunControlRequestSchema.parse(JSON.parse(await readFile(this.path, "utf8")));
+      serialized = await readPrivateFileBounded(
+        this.path,
+        CONTROL_REQUEST_MAX_BYTES,
+        this.graphcraftRoot,
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+    try {
+      return RunControlRequestSchema.parse(JSON.parse(serialized.toString("utf8")));
     } catch {
       return undefined;
     }
@@ -66,6 +103,7 @@ export class RunControlChannel {
   }
 
   async clear(requestId: string): Promise<void> {
+    await this.ensureStorage();
     const current = await this.read();
     if (current?.requestId !== requestId) return;
     await unlink(this.path).catch((error: NodeJS.ErrnoException) => {

@@ -299,16 +299,115 @@ export const GraphNodeSchema = z.strictObject({
   status: NodeStatusSchema,
 });
 
+const MAX_MODEL_GRAPH_PLAN_CHARACTERS = 1024 * 1024;
+const MAX_MODEL_GRAPH_NODES = 64;
+const MAX_MODEL_NODE_IDENTIFIER_CHARACTERS = 128;
+const MAX_MODEL_NODE_OBJECTIVE_CHARACTERS = 16 * 1024;
+const MAX_MODEL_NODE_REFERENCES = 64;
+const MAX_MODEL_NODE_PATHS = 256;
+const MAX_MODEL_PATH_CHARACTERS = 4 * 1024;
+const MAX_MODEL_NODE_PROBES = 64;
+const MAX_MODEL_PROBE_COMMAND_CHARACTERS = 4 * 1024;
+const MAX_MODEL_PROBE_ARGUMENTS = 256;
+const MAX_MODEL_PROBE_ARGUMENT_CHARACTERS = 4 * 1024;
+const MAX_MODEL_PROBE_TERMS = 256;
+const MAX_MODEL_PROBE_TERM_CHARACTERS = 1024;
+
+const ModelOutputProbeSpecSchema = z.union([
+  CommandProbeSchema.extend({
+    id: z.string().min(1).max(MAX_MODEL_NODE_IDENTIFIER_CHARACTERS),
+    command: z.string().min(1).max(MAX_MODEL_PROBE_COMMAND_CHARACTERS),
+    args: z
+      .array(z.string().max(MAX_MODEL_PROBE_ARGUMENT_CHARACTERS))
+      .max(MAX_MODEL_PROBE_ARGUMENTS)
+      .default([]),
+    cwd: z.string().max(MAX_MODEL_PATH_CHARACTERS).optional(),
+    platforms: z
+      .array(z.enum(["darwin", "linux", "win32"]))
+      .min(1)
+      .max(3)
+      .optional(),
+  }),
+  FileProbeSchema.extend({
+    id: z.string().min(1).max(MAX_MODEL_NODE_IDENTIFIER_CHARACTERS),
+    path: z.string().min(1).max(MAX_MODEL_PATH_CHARACTERS),
+    contains: z.string().min(1).max(MAX_MODEL_PROBE_COMMAND_CHARACTERS).optional(),
+  }),
+  GitDiffProbeSchema.extend({
+    id: z.string().min(1).max(MAX_MODEL_NODE_IDENTIFIER_CHARACTERS),
+    baseSha: z.string().min(1).max(MAX_MODEL_NODE_IDENTIFIER_CHARACTERS),
+  }),
+  RepositoryInventoryProbeSchema.extend({
+    id: z.string().min(1).max(MAX_MODEL_NODE_IDENTIFIER_CHARACTERS),
+    paths: z
+      .array(z.string().min(1).max(MAX_MODEL_PATH_CHARACTERS))
+      .min(1)
+      .max(MAX_MODEL_NODE_PATHS),
+    terms: z
+      .array(z.string().min(1).max(MAX_MODEL_PROBE_TERM_CHARACTERS))
+      .min(1)
+      .max(MAX_MODEL_PROBE_TERMS),
+  }),
+  GitHubSnapshotProbeSchema.extend({
+    id: z.string().min(1).max(MAX_MODEL_NODE_IDENTIFIER_CHARACTERS),
+  }),
+  HeldOutProbeReferenceSchema.extend({
+    id: z.string().min(1).max(MAX_MODEL_NODE_IDENTIFIER_CHARACTERS),
+  }),
+]);
+
+const ModelOutputWaitConditionSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("time"), wakeAt: z.iso.datetime() }),
+  z.strictObject({
+    kind: z.literal("file_exists"),
+    path: z.string().min(1).max(MAX_MODEL_PATH_CHARACTERS),
+    pollIntervalMs: z.number().int().min(250).max(300_000),
+    timeoutAt: z.iso.datetime().optional(),
+  }),
+  z.strictObject({
+    kind: z.literal("file_changed"),
+    path: z.string().min(1).max(MAX_MODEL_PATH_CHARACTERS),
+    pollIntervalMs: z.number().int().min(250).max(300_000),
+    timeoutAt: z.iso.datetime().optional(),
+  }),
+  z.strictObject({
+    kind: z.literal("github_pull_request"),
+    pollIntervalMs: z.number().int().min(1_000).max(300_000),
+    timeoutAt: z.iso.datetime().optional(),
+  }),
+]);
+
 export const PlannedGraphNodeSchema = GraphNodeSchema.omit({
   outputSchema: true,
   status: true,
+}).extend({
+  id: z.string().min(1).max(MAX_MODEL_NODE_IDENTIFIER_CHARACTERS),
+  objective: z.string().min(1).max(MAX_MODEL_NODE_OBJECTIVE_CHARACTERS),
+  dependsOn: z
+    .array(z.string().max(MAX_MODEL_NODE_IDENTIFIER_CHARACTERS))
+    .max(MAX_MODEL_NODE_REFERENCES),
+  scope: z.array(z.string().max(MAX_MODEL_PATH_CHARACTERS)).max(MAX_MODEL_NODE_PATHS),
+  contextSelector: z.strictObject({
+    includeRepositoryInstructions: z.boolean(),
+    predecessorResults: z
+      .array(z.string().max(MAX_MODEL_NODE_IDENTIFIER_CHARACTERS))
+      .max(MAX_MODEL_NODE_REFERENCES),
+    relevantPaths: z.array(z.string().max(MAX_MODEL_PATH_CHARACTERS)).max(MAX_MODEL_NODE_PATHS),
+  }),
+  progressProbes: z.array(ModelOutputProbeSpecSchema).max(MAX_MODEL_NODE_PROBES),
+  completionProbes: z.array(ModelOutputProbeSpecSchema).max(MAX_MODEL_NODE_PROBES),
+  waitCondition: ModelOutputWaitConditionSchema.optional(),
 });
 
-export const GraphPlanSchema = z.strictObject({
-  schemaVersion: z.literal(1),
-  family: z.enum(["bug", "feature", "migration", "refactor", "audit"]),
-  nodes: z.array(PlannedGraphNodeSchema).min(1),
-});
+export const GraphPlanSchema = z
+  .strictObject({
+    schemaVersion: z.literal(1),
+    family: z.enum(["bug", "feature", "migration", "refactor", "audit"]),
+    nodes: z.array(PlannedGraphNodeSchema).min(1).max(MAX_MODEL_GRAPH_NODES),
+  })
+  .refine((plan) => JSON.stringify(plan).length <= MAX_MODEL_GRAPH_PLAN_CHARACTERS, {
+    message: `Graph plan exceeds ${MAX_MODEL_GRAPH_PLAN_CHARACTERS} characters`,
+  });
 
 export const GraphAmendmentOperationSchema = z.discriminatedUnion("operation", [
   z.strictObject({
@@ -575,12 +674,20 @@ export const SupervisorRecordSchema = z.strictObject({
   message: z.string().optional(),
 });
 
+const MAX_HOST_EVENT_TEXT_CHARACTERS = 256 * 1024;
+const MAX_HOST_EVENT_DETAIL_CHARACTERS = 16 * 1024;
+const MAX_HOST_IDENTIFIER_CHARACTERS = 4 * 1024;
+const MAX_WORKER_CHANGED_PATHS = 256;
+const MAX_WORKER_PATH_CHARACTERS = 1024;
+const MAX_WORKER_EVIDENCE_ITEMS = 64;
+const MAX_WORKER_EVIDENCE_CHARACTERS = 4 * 1024;
+
 export const WorkerResultSchema = z.strictObject({
   status: z.enum(["completed", "blocked", "failed"]),
-  summary: z.string(),
-  changedPaths: z.array(z.string()),
-  evidence: z.array(z.string()),
-  nextSuggestedObjective: z.string().optional(),
+  summary: z.string().max(MAX_HOST_EVENT_DETAIL_CHARACTERS),
+  changedPaths: z.array(z.string().max(MAX_WORKER_PATH_CHARACTERS)).max(MAX_WORKER_CHANGED_PATHS),
+  evidence: z.array(z.string().max(MAX_WORKER_EVIDENCE_CHARACTERS)).max(MAX_WORKER_EVIDENCE_ITEMS),
+  nextSuggestedObjective: z.string().max(MAX_HOST_EVENT_DETAIL_CHARACTERS).optional(),
 });
 
 export const ContextCapsuleSchema = z.strictObject({
@@ -650,8 +757,11 @@ export const SemanticVerifierContextSchema = z.strictObject({
 
 export const SemanticVerdictSchema = z.strictObject({
   verdict: z.enum(["supported", "unsupported", "uncertain"]),
-  evidence: z.array(z.string()),
-  rationale: z.string().min(1),
+  evidence: z.array(z.string().max(4 * 1024)).max(64),
+  rationale: z
+    .string()
+    .min(1)
+    .max(16 * 1024),
   uncertainty: z.number().min(0).max(1),
 });
 
@@ -693,16 +803,29 @@ export const RunControlRequestSchema = z.strictObject({
 });
 
 export const HostEventSchema = z.discriminatedUnion("type", [
-  z.strictObject({ type: z.literal("started"), invocationId: z.string() }),
-  z.strictObject({ type: z.literal("session"), hostSessionId: z.string().min(1) }),
-  z.strictObject({ type: z.literal("message"), text: z.string() }),
-  z.strictObject({ type: z.literal("tool"), name: z.string(), summary: z.string() }),
+  z.strictObject({
+    type: z.literal("started"),
+    invocationId: z.string().max(MAX_HOST_IDENTIFIER_CHARACTERS),
+  }),
+  z.strictObject({
+    type: z.literal("session"),
+    hostSessionId: z.string().min(1).max(MAX_HOST_IDENTIFIER_CHARACTERS),
+  }),
+  z.strictObject({
+    type: z.literal("message"),
+    text: z.string().max(MAX_HOST_EVENT_TEXT_CHARACTERS),
+  }),
+  z.strictObject({
+    type: z.literal("tool"),
+    name: z.string().max(256),
+    summary: z.string().max(MAX_HOST_EVENT_DETAIL_CHARACTERS),
+  }),
   z.strictObject({ type: z.literal("result"), result: WorkerResultSchema }),
   z.strictObject({ type: z.literal("usage"), usage: TokenUsageSchema }),
   z.strictObject({ type: z.literal("terminated"), termination: HostTerminationSchema }),
   z.strictObject({
     type: z.literal("error"),
-    message: z.string(),
+    message: z.string().max(MAX_HOST_EVENT_DETAIL_CHARACTERS),
     cause: InterruptionCauseSchema.optional(),
   }),
 ]);
@@ -803,26 +926,300 @@ export const RunStateSchema = z.strictObject({
   updatedAt: z.iso.datetime(),
 });
 
-export const RunStorageManifestSchema = z.strictObject({
-  schemaVersion: z.literal(1),
-  runId: z.uuid(),
-  migratedFrom: z.union([z.literal(0), z.literal(1)]),
-  formats: z.strictObject({
-    contract: z.literal(1),
-    graph: z.literal(1),
-    probePlan: z.literal(1),
-    heldOutProbes: z.literal(1).default(1),
-    events: z.literal(1),
-    state: z.literal(1),
-    workspace: z.literal(1),
-    capsules: z.literal(1),
-    invocationEvents: z.literal(1),
-    semanticReports: z.literal(1),
-    rawArtifacts: z.literal(1),
-    controlRequests: z.literal(1),
-    locks: z.literal(1),
-  }),
+const RunStorageFormatsV1Schema = z.strictObject({
+  contract: z.literal(1),
+  graph: z.literal(1),
+  probePlan: z.literal(1),
+  heldOutProbes: z.literal(1).default(1),
+  events: z.literal(1),
+  state: z.literal(1),
+  workspace: z.literal(1),
+  capsules: z.literal(1),
+  invocationEvents: z.literal(1),
+  semanticReports: z.literal(1),
+  rawArtifacts: z.literal(1),
+  controlRequests: z.literal(1),
+  locks: z.literal(1),
 });
+
+export const ArtifactKindSchema = z.enum([
+  "artifact",
+  "invocation_transcript",
+  "invocation_recovery",
+  "content_addressed",
+  "capsule",
+]);
+
+export const ArtifactFormatSchema = z.enum(["binary", "text", "json", "jsonl"]);
+
+export const ArtifactDispositionSchema = z.enum([
+  "stored",
+  "truncated",
+  "omitted",
+  "rejected",
+  "legacy",
+]);
+
+export const ArtifactInventoryReasonSchema = z.enum([
+  "artifact_limit",
+  "identity_limit",
+  "transcript_reserve",
+  "run_quota",
+  "legacy_migration",
+  "missing_on_disk",
+]);
+
+const MAX_ARTIFACT_PATH_CHARACTERS = 4 * 1024;
+export const MAX_ARTIFACT_INVENTORY_BYTES = 8 * 1024 * 1024;
+export const MAX_ARTIFACT_INVENTORY_PATH_BYTES = 1024 * 1024;
+const WINDOWS_INVALID_ARTIFACT_SEGMENT = /[\u0000-\u001f<>:"|?*]/u;
+const WINDOWS_RESERVED_ARTIFACT_SEGMENT =
+  /^(?:aux|clock\$|con|conin\$|conout\$|nul|prn|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/iu;
+const UNPAIRED_SURROGATE = /[\ud800-\udfff]/u;
+const UTF8_ENCODER = new TextEncoder();
+
+export function artifactInventorySerializedBytes(value: unknown): number {
+  return UTF8_ENCODER.encode(`${JSON.stringify(value, null, 2)}\n`).byteLength;
+}
+
+/**
+ * Return the platform-independent identity key for an artifact-owned path.
+ * Invalid or non-normalized paths have no key and must not be persisted.
+ */
+export function artifactPathCanonicalKey(path: string): string | undefined {
+  if (
+    path.length === 0 ||
+    path.length > MAX_ARTIFACT_PATH_CHARACTERS ||
+    path !== path.normalize("NFC") ||
+    path.startsWith("/") ||
+    path.includes("\\") ||
+    /^[a-z]:/i.test(path) ||
+    UNPAIRED_SURROGATE.test(path)
+  )
+    return undefined;
+  const parts = path.split("/");
+  if (
+    (parts[0] !== "artifacts" && parts[0] !== "capsules") ||
+    parts.length < 2 ||
+    parts.some(
+      (part) =>
+        part.length === 0 ||
+        part === "." ||
+        part === ".." ||
+        /[. ]$/u.test(part) ||
+        WINDOWS_INVALID_ARTIFACT_SEGMENT.test(part) ||
+        WINDOWS_RESERVED_ARTIFACT_SEGMENT.test(part),
+    )
+  )
+    return undefined;
+  return parts.map((part) => part.toUpperCase().normalize("NFC")).join("/");
+}
+
+export const ArtifactInventoryEntrySchema = z.strictObject({
+  path: z.string().min(1).max(MAX_ARTIFACT_PATH_CHARACTERS),
+  kind: ArtifactKindSchema,
+  format: ArtifactFormatSchema,
+  disposition: ArtifactDispositionSchema,
+  sourceBytes: z.number().int().nonnegative(),
+  storedBytes: z.number().int().nonnegative(),
+  omittedBytes: z.number().int().nonnegative(),
+  truncated: z.boolean(),
+  legacy: z.boolean(),
+  sourceHash: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
+  storedHash: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
+  reason: ArtifactInventoryReasonSchema.optional(),
+  createdAt: z.iso.datetime(),
+  updatedAt: z.iso.datetime(),
+});
+
+export const ArtifactPolicySchema = z
+  .strictObject({
+    ordinaryArtifactBytes: z.number().int().positive(),
+    identityArtifactBytes: z.number().int().positive(),
+    capsuleBytes: z.number().int().positive(),
+    invocationTranscriptBytes: z.number().int().positive(),
+    invocationReservedBytes: z.number().int().positive(),
+    runArtifactBytes: z.number().int().positive(),
+    runReservedBytes: z.number().int().positive(),
+  })
+  .superRefine((policy, context) => {
+    if (policy.invocationReservedBytes >= policy.invocationTranscriptBytes)
+      context.addIssue({
+        code: "custom",
+        path: ["invocationReservedBytes"],
+        message: "invocation reserve is not smaller than its transcript limit",
+      });
+    if (policy.runReservedBytes >= policy.runArtifactBytes)
+      context.addIssue({
+        code: "custom",
+        path: ["runReservedBytes"],
+        message: "run reserve is not smaller than its run quota",
+      });
+    if (policy.runReservedBytes < policy.invocationReservedBytes)
+      context.addIssue({
+        code: "custom",
+        path: ["runReservedBytes"],
+        message: "run reserve is smaller than the invocation recovery reserve",
+      });
+  });
+
+export const ArtifactMutationJournalSchema = z
+  .strictObject({
+    schemaVersion: z.literal(1),
+    runId: z.uuid(),
+    mutationId: z.uuid(),
+    action: z.enum(["write", "delete", "unchanged"]),
+    previousInventoryHash: z.string().regex(/^[a-f0-9]{64}$/),
+    nextInventoryHash: z.string().regex(/^[a-f0-9]{64}$/),
+    path: z.string().min(1).max(MAX_ARTIFACT_PATH_CHARACTERS),
+    previousEntry: ArtifactInventoryEntrySchema.optional(),
+    nextEntry: ArtifactInventoryEntrySchema,
+    createdAt: z.iso.datetime(),
+  })
+  .superRefine((journal, context) => {
+    if (artifactPathCanonicalKey(journal.path) === undefined)
+      context.addIssue({
+        code: "custom",
+        path: ["path"],
+        message: "mutation path is not a portable artifact-owned path",
+      });
+    if (journal.nextEntry.path !== journal.path)
+      context.addIssue({
+        code: "custom",
+        path: ["nextEntry", "path"],
+        message: "next entry path does not match the mutation path",
+      });
+    if (journal.previousEntry && journal.previousEntry.path !== journal.path)
+      context.addIssue({
+        code: "custom",
+        path: ["previousEntry", "path"],
+        message: "previous entry path does not match the mutation path",
+      });
+  });
+
+export const ArtifactInventorySchema = z
+  .strictObject({
+    schemaVersion: z.literal(1),
+    runId: z.uuid(),
+    policy: ArtifactPolicySchema,
+    sourceBytes: z.number().int().nonnegative(),
+    storedBytes: z.number().int().nonnegative(),
+    omittedBytes: z.number().int().nonnegative(),
+    entries: z.array(ArtifactInventoryEntrySchema).max(16 * 1024),
+    updatedAt: z.iso.datetime(),
+  })
+  .superRefine((inventory, context) => {
+    const paths = new Set<string>();
+    let pathBytes = 0;
+    let sourceBytes = 0;
+    let storedBytes = 0;
+    let omittedBytes = 0;
+    for (const [index, entry] of inventory.entries.entries()) {
+      const issue = (message: string, field?: keyof typeof entry): void =>
+        context.addIssue({
+          code: "custom",
+          path: ["entries", index, ...(field ? [field] : [])],
+          message,
+        });
+      const pathKey = artifactPathCanonicalKey(entry.path);
+      if (pathKey === undefined)
+        issue(`entry path is not a portable artifact-owned path: ${entry.path}`, "path");
+      else if (paths.has(pathKey))
+        issue(`entry path aliases another portable path: ${entry.path}`, "path");
+      else paths.add(pathKey);
+      pathBytes += UTF8_ENCODER.encode(entry.path).byteLength;
+      if (entry.sourceBytes !== entry.storedBytes + entry.omittedBytes)
+        issue(`entry byte totals do not reconcile: ${entry.path}`);
+      if (
+        (entry.storedBytes > 0 ||
+          entry.disposition === "stored" ||
+          entry.disposition === "legacy") &&
+        !entry.storedHash
+      )
+        issue(`stored entry lacks a content hash: ${entry.path}`, "storedHash");
+      if (entry.truncated && (entry.omittedBytes === 0 || entry.storedBytes >= entry.sourceBytes))
+        issue(`entry truncation metadata is contradictory: ${entry.path}`, "truncated");
+      if (
+        entry.disposition === "stored" &&
+        (entry.storedBytes !== entry.sourceBytes || entry.omittedBytes !== 0 || entry.truncated)
+      )
+        issue(`stored disposition is contradictory: ${entry.path}`, "disposition");
+      if (
+        entry.disposition === "truncated" &&
+        (entry.storedBytes === 0 || entry.omittedBytes === 0 || !entry.truncated)
+      )
+        issue(`truncated disposition is contradictory: ${entry.path}`, "disposition");
+      if (
+        (entry.disposition === "omitted" || entry.disposition === "rejected") &&
+        entry.storedBytes !== 0
+      )
+        issue(`${entry.disposition} disposition stores bytes: ${entry.path}`, "disposition");
+      if (
+        entry.disposition === "legacy" &&
+        (!entry.legacy ||
+          entry.reason !== "legacy_migration" ||
+          entry.storedBytes !== entry.sourceBytes ||
+          entry.omittedBytes !== 0 ||
+          entry.truncated)
+      )
+        issue(`legacy disposition is contradictory: ${entry.path}`, "disposition");
+      sourceBytes += entry.sourceBytes;
+      storedBytes += entry.storedBytes;
+      omittedBytes += entry.omittedBytes;
+      if (![sourceBytes, storedBytes, omittedBytes].every(Number.isSafeInteger))
+        issue("aggregate byte totals exceed safe integer precision");
+    }
+    if (pathBytes > MAX_ARTIFACT_INVENTORY_PATH_BYTES)
+      context.addIssue({
+        code: "custom",
+        path: ["entries"],
+        message: "artifact inventory path metadata exceeds its byte limit",
+      });
+    else if (artifactInventorySerializedBytes(inventory) > MAX_ARTIFACT_INVENTORY_BYTES)
+      context.addIssue({
+        code: "custom",
+        message: "serialized artifact inventory exceeds its byte limit",
+      });
+    if (
+      inventory.sourceBytes !== sourceBytes ||
+      inventory.storedBytes !== storedBytes ||
+      inventory.omittedBytes !== omittedBytes
+    )
+      context.addIssue({
+        code: "custom",
+        message: "aggregate byte totals do not match entries",
+      });
+    if (inventory.storedBytes > inventory.policy.runArtifactBytes)
+      context.addIssue({
+        code: "custom",
+        path: ["storedBytes"],
+        message: "stored bytes exceed the persisted run quota",
+      });
+  });
+
+export const RunStorageManifestSchema = z.discriminatedUnion("schemaVersion", [
+  z.strictObject({
+    schemaVersion: z.literal(1),
+    runId: z.uuid(),
+    migratedFrom: z.union([z.literal(0), z.literal(1)]),
+    formats: RunStorageFormatsV1Schema,
+  }),
+  z.strictObject({
+    schemaVersion: z.literal(2),
+    runId: z.uuid(),
+    migratedFrom: z.union([z.literal(0), z.literal(1), z.literal(2)]),
+    formats: RunStorageFormatsV1Schema.extend({
+      artifactInventory: z.literal(1),
+      artifactPolicy: z.literal(1),
+    }),
+  }),
+]);
 
 export type FinishLine = z.infer<typeof FinishLineSchema>;
 export type Permission = z.infer<typeof PermissionSchema>;
@@ -876,6 +1273,14 @@ export type RunControlRequest = z.infer<typeof RunControlRequestSchema>;
 export type HostEvent = z.infer<typeof HostEventSchema>;
 export type RunEvent = z.infer<typeof RunEventSchema>;
 export type RunState = z.infer<typeof RunStateSchema>;
+export type ArtifactKind = z.infer<typeof ArtifactKindSchema>;
+export type ArtifactFormat = z.infer<typeof ArtifactFormatSchema>;
+export type ArtifactDisposition = z.infer<typeof ArtifactDispositionSchema>;
+export type ArtifactInventoryReason = z.infer<typeof ArtifactInventoryReasonSchema>;
+export type ArtifactInventoryEntry = z.infer<typeof ArtifactInventoryEntrySchema>;
+export type ArtifactPolicy = z.infer<typeof ArtifactPolicySchema>;
+export type ArtifactInventory = z.infer<typeof ArtifactInventorySchema>;
+export type ArtifactMutationJournal = z.infer<typeof ArtifactMutationJournalSchema>;
 export type RunStorageManifest = z.infer<typeof RunStorageManifestSchema>;
 
 export const workerResultJsonSchema = z.toJSONSchema(WorkerResultSchema, { target: "draft-7" });

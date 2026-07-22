@@ -181,6 +181,59 @@ describe("task-specific probe planning", () => {
     expect(executed.result.summary).toContain("…");
   });
 
+  it("bounds command output without changing exit-code evidence", async () => {
+    const { root } = await createRepository();
+    const executed = await runProbe(
+      {
+        id: "flood-check",
+        kind: "command",
+        command: process.execPath,
+        args: [
+          "-e",
+          'process.stdout.write("x".repeat(1_100_000)); process.stderr.write("y".repeat(1_100_000));',
+        ],
+        expectedExitCode: 0,
+        timeoutMs: 5_000,
+      },
+      root,
+    );
+
+    expect(executed.result.passed).toBe(true);
+    expect(executed.result.summary).toContain("Output truncated by Graphcraft");
+    expect(executed.output).toContain("GRAPHCRAFT STDOUT TRUNCATED");
+    expect(executed.output).toContain("GRAPHCRAFT STDERR TRUNCATED");
+    expect(Buffer.byteLength(executed.output)).toBeLessThan(2_100_000);
+  });
+
+  it("distinguishes truncated failures with identical retained prefixes and byte counts", async () => {
+    const { root } = await createRepository();
+    const execute = async (tail: string) =>
+      await runProbe(
+        {
+          id: "truncated-tail-check",
+          kind: "command",
+          command: process.execPath,
+          args: [
+            "-e",
+            `process.stdout.write("x".repeat(1_100_000) + ${JSON.stringify(tail)}); process.exitCode = 1;`,
+          ],
+          expectedExitCode: 0,
+          timeoutMs: 5_000,
+        },
+        root,
+      );
+
+    const firstTail = "TAIL_ONE_1234567890";
+    const secondTail = "TAIL_TWO_1234567890";
+    const first = await execute(firstTail);
+    const second = await execute(secondTail);
+
+    expect(first.output).not.toContain(firstTail);
+    expect(second.output).not.toContain(secondTail);
+    expect(Buffer.byteLength(first.output)).toBe(Buffer.byteLength(second.output));
+    expect(first.result.signature).not.toBe(second.result.signature);
+  });
+
   it("rejects unsafe or unsupported edited probe plans", async () => {
     const { root } = await createRepository();
     const invalid = {

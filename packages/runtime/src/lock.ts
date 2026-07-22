@@ -1,8 +1,11 @@
 import { hostname } from "node:os";
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, stat, unlink } from "node:fs/promises";
-import { dirname } from "node:path";
+import { open, stat, unlink } from "node:fs/promises";
+import { basename, dirname } from "node:path";
 import { writeJsonAtomic } from "./json.ts";
+import { ensurePrivateDirectory, hardenPrivateFile, readPrivateFileBounded } from "./secure-fs.ts";
+
+const LOCK_RECORD_MAX_BYTES = 64 * 1024;
 
 interface LockRecord {
   token: string;
@@ -21,18 +24,36 @@ function processExists(pid: number): boolean {
   }
 }
 
+function lockOwnedRoot(path: string): string {
+  let candidate = dirname(path);
+  while (true) {
+    if (basename(candidate) === ".graphcraft") return candidate;
+    const parent = dirname(candidate);
+    if (parent === candidate) return dirname(path);
+    candidate = parent;
+  }
+}
+
+async function readLockRecord(path: string, ownedRoot: string): Promise<string> {
+  return (await readPrivateFileBounded(path, LOCK_RECORD_MAX_BYTES, ownedRoot)).toString("utf8");
+}
+
 export class RunLock {
   private readonly path: string;
+  private readonly ownedRoot: string;
   private readonly token = randomUUID();
   private heartbeat?: NodeJS.Timeout;
   private heartbeatWrite: Promise<void> = Promise.resolve();
 
   constructor(path: string) {
     this.path = path;
+    this.ownedRoot = lockOwnedRoot(path);
   }
 
   async acquire(staleAfterMs = 30_000): Promise<void> {
-    await mkdir(dirname(this.path), { recursive: true });
+    await ensurePrivateDirectory(this.ownedRoot);
+    await ensurePrivateDirectory(dirname(this.path), this.ownedRoot);
+    await hardenPrivateFile(this.path, this.ownedRoot);
     try {
       const handle = await open(this.path, "wx", 0o600);
       const acquiredAt = new Date().toISOString();
@@ -50,12 +71,13 @@ export class RunLock {
       } finally {
         await handle.close();
       }
+      await hardenPrivateFile(this.path, this.ownedRoot);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       let record: LockRecord | undefined;
       let observed = "";
       try {
-        observed = await readFile(this.path, "utf8");
+        observed = await readLockRecord(this.path, this.ownedRoot);
         record = JSON.parse(observed) as LockRecord;
       } catch {
         // A malformed lock is only recoverable after the stale window.
@@ -69,7 +91,7 @@ export class RunLock {
       const liveLocalProcess = record !== undefined && sameHost && processExists(record.pid);
       if (liveLocalProcess || (!sameHost && heartbeatAge < staleAfterMs))
         throw new Error("Graphcraft run is already active");
-      const current = await readFile(this.path, "utf8").catch(
+      const current = await readLockRecord(this.path, this.ownedRoot).catch(
         (readError: NodeJS.ErrnoException) => {
           if (readError.code === "ENOENT") return undefined;
           throw readError;
@@ -92,8 +114,9 @@ export class RunLock {
   async release(): Promise<void> {
     if (this.heartbeat) clearInterval(this.heartbeat);
     await this.heartbeatWrite.catch(() => undefined);
+    await hardenPrivateFile(this.path, this.ownedRoot);
     try {
-      const current = JSON.parse(await readFile(this.path, "utf8")) as LockRecord;
+      const current = JSON.parse(await readLockRecord(this.path, this.ownedRoot)) as LockRecord;
       if (current.token === this.token) await unlink(this.path);
     } catch {
       // The lock is already gone or no longer ours.
@@ -101,6 +124,9 @@ export class RunLock {
   }
 
   private async writeRecord(heartbeatAt: string): Promise<void> {
+    await ensurePrivateDirectory(this.ownedRoot);
+    await ensurePrivateDirectory(dirname(this.path), this.ownedRoot);
+    await hardenPrivateFile(this.path, this.ownedRoot);
     const record: LockRecord = {
       token: this.token,
       pid: process.pid,
@@ -109,11 +135,12 @@ export class RunLock {
       heartbeatAt,
     };
     try {
-      const current = JSON.parse(await readFile(this.path, "utf8")) as LockRecord;
+      const current = JSON.parse(await readLockRecord(this.path, this.ownedRoot)) as LockRecord;
       record.acquiredAt = current.token === this.token ? current.acquiredAt : heartbeatAt;
     } catch {
       // First write.
     }
     await writeJsonAtomic(this.path, record);
+    await hardenPrivateFile(this.path, this.ownedRoot);
   }
 }

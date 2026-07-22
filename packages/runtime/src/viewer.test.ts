@@ -1,12 +1,34 @@
-import { mkdtemp, readFile, truncate } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
+import { mkdtemp, readFile, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { compileGraph, compileRunContract } from "@graphcraft/core";
 import { RunStore } from "./store.ts";
+import { RunArtifactStore } from "./artifact-policy.ts";
 import { createViewerSnapshot, startRunViewer, type RunViewer } from "./viewer.ts";
 
 const viewers: RunViewer[] = [];
+
+async function requestWithHost(
+  url: string,
+  host: string,
+): Promise<{ status: number; body: string }> {
+  return await new Promise((resolve, reject) => {
+    const request = httpRequest(url, { headers: { host } }, (response) => {
+      const chunks: Buffer[] = [];
+      response.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+      response.on("end", () =>
+        resolve({
+          status: response.statusCode ?? 0,
+          body: Buffer.concat(chunks).toString("utf8"),
+        }),
+      );
+    });
+    request.once("error", reject);
+    request.end();
+  });
+}
 
 afterEach(async () => {
   await Promise.all(
@@ -109,14 +131,21 @@ describe("local read-only viewer", () => {
     const viewer = await startRunViewer({ store, port: 0 });
     viewers.push(viewer);
 
-    const [page, snapshotResponse, exportResponse, artifactResponse, mutationResponse] =
-      await Promise.all([
-        fetch(viewer.url),
-        fetch(new URL("/api/snapshot", viewer.url)),
-        fetch(new URL("/api/export", viewer.url)),
-        fetch(new URL("/artifacts/logs/probe.log", viewer.url)),
-        fetch(new URL("/api/snapshot", viewer.url), { method: "POST" }),
-      ]);
+    const [
+      page,
+      snapshotResponse,
+      exportResponse,
+      artifactResponse,
+      mutationResponse,
+      reboundResponse,
+    ] = await Promise.all([
+      fetch(viewer.url),
+      fetch(new URL("/api/snapshot", viewer.url)),
+      fetch(new URL("/api/export", viewer.url)),
+      fetch(new URL("/artifacts/logs/probe.log", viewer.url)),
+      fetch(new URL("/api/snapshot", viewer.url), { method: "POST" }),
+      requestWithHost(viewer.url, "attacker.example"),
+    ]);
     const pageText = await page.text();
     const snapshotText = await snapshotResponse.text();
     const snapshot = JSON.parse(snapshotText) as {
@@ -155,6 +184,8 @@ describe("local read-only viewer", () => {
     expect(artifact).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz");
     expect(mutationResponse.status).toBe(405);
     expect(await mutationResponse.text()).toContain("Read-only viewer");
+    expect(reboundResponse.status).toBe(421);
+    expect(reboundResponse.body).toBe("Viewer authority rejected\n");
     expect(after).toBe(before);
   });
 
@@ -168,7 +199,8 @@ describe("local read-only viewer", () => {
   it("reads only a bounded prefix of a large artifact", async () => {
     const store = await viewerFixture();
     const artifactPath = await store.writeArtifact("logs/large.log", "bounded prefix\n");
-    await truncate(artifactPath, 64 * 1024 * 1024);
+    await truncate(artifactPath, 2 * 1024 * 1024);
+    await new RunArtifactStore(store.runRoot, store.runId).migrateLegacy();
     const viewer = await startRunViewer({ store, port: 0 });
     viewers.push(viewer);
 
@@ -177,9 +209,31 @@ describe("local read-only viewer", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get("x-graphcraft-truncated")).toBe("true");
-    expect(response.headers.get("x-graphcraft-original-bytes")).toBe(String(64 * 1024 * 1024));
+    expect(response.headers.get("x-graphcraft-original-bytes")).toBe(String(2 * 1024 * 1024));
     expect(Buffer.byteLength(body)).toBeLessThanOrEqual(1024 * 1024 + 32);
     expect(body).toContain("bounded prefix");
     expect(body).toContain("[TRUNCATED]");
+  });
+
+  it("does not disclose hostile artifact paths when durable verification fails", async () => {
+    const store = await viewerFixture();
+    const seededSecret = "seeded-viewer-path-secret";
+    const previous = process.env.GRAPHCRAFT_VIEWER_PATH_SECRET;
+    process.env.GRAPHCRAFT_VIEWER_PATH_SECRET = seededSecret;
+    try {
+      await writeFile(join(store.runRoot, "artifacts", `${seededSecret}.txt`), "untracked\n");
+      const viewer = await startRunViewer({ store, port: 0 });
+      viewers.push(viewer);
+
+      const response = await fetch(new URL("/api/snapshot", viewer.url));
+      const body = await response.text();
+
+      expect(response.status).toBe(500);
+      expect(body).toBe("Viewer read failed\n");
+      expect(body).not.toContain(seededSecret);
+    } finally {
+      if (previous === undefined) delete process.env.GRAPHCRAFT_VIEWER_PATH_SECRET;
+      else process.env.GRAPHCRAFT_VIEWER_PATH_SECRET = previous;
+    }
   });
 });

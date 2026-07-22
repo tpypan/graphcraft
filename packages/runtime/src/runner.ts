@@ -81,7 +81,7 @@ import {
   executeSideEffect,
   type SideEffectBoundary,
 } from "./side-effect.ts";
-import { RunStore } from "./store.ts";
+import { RunStore, RunStoreLimitError } from "./store.ts";
 import { redactString, redactValue } from "./redaction.ts";
 import {
   auditWorkspaceScope,
@@ -406,6 +406,7 @@ export async function configureRunProbes(
   store: RunStore,
   input: ProbePlan,
 ): Promise<{ graph: Graph; probePlan: ProbePlan }> {
+  await store.prepareStorage();
   const lock = new RunLock(join(store.graphcraftRoot, "locks", `${store.runId}.lock`));
   await lock.acquire();
   try {
@@ -571,7 +572,16 @@ async function executeWorker(input: {
       break;
     }
     if (next.done) break;
-    const event = HostEventSchema.parse(redactValue(next.value));
+    const parsedEvent = HostEventSchema.safeParse(redactValue(next.value));
+    if (!parsedEvent.success) {
+      error = "Host emitted an invalid or oversized structured event";
+      errorCause = "host_crash";
+      const event: HostEvent = { type: "error", message: error, cause: errorCause };
+      artifact = await input.store.appendInvocationEvent(invocationId, event);
+      await iterator.return?.().catch(() => undefined);
+      break;
+    }
+    const event = parsedEvent.data;
     artifact = await input.store.appendInvocationEvent(invocationId, event);
     if (event.type === "session") {
       await input.store.append(
@@ -2887,6 +2897,10 @@ export async function executeRun(input: {
         .filter(([, nodeState]) => nodeState.status === "running")
         .map(([nodeId]) => nodeId),
     );
+  } catch (error) {
+    if (error instanceof RunStoreLimitError && error.blockerPersisted)
+      return await input.store.loadState();
+    throw error;
   } finally {
     await stopWatching();
     await lock.release();

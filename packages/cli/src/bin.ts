@@ -29,10 +29,15 @@ import {
 } from "./index.ts";
 import {
   createRun,
+  applyCompletedRunPrune,
+  applyRunRetention,
+  discoverRepository,
   executeRun,
   inspectSupervisorRecord,
   listSupervisorRecords,
   loadBenchmarkSuite,
+  planCompletedRunPrune,
+  planRunRetention,
   redactString,
   redactValue,
   runBenchmark,
@@ -353,6 +358,110 @@ program
   });
 
 program
+  .command("delete")
+  .description("Plan deletion of one completed, stopped, or blocked run's Graphcraft state")
+  .argument("<run>", "explicit run ID or unique prefix for a dry run")
+  .option("-C, --cwd <path>", "repository path", process.cwd())
+  .option("--yes", "apply the plan; requires the exact full run ID")
+  .option("--json", "emit JSON")
+  .action(async (run: string, options: { cwd: string; yes?: boolean; json?: boolean }) => {
+    const repository = await discoverRepository(options.cwd);
+    const plan = await planRunRetention({
+      repositoryRoot: repository.root,
+      runReference: run,
+    });
+    if (!options.yes) {
+      if (options.json) console.log(JSON.stringify({ dryRun: true, plan }));
+      else
+        console.log(
+          [
+            "Dry run: no files deleted.",
+            `Run            ${plan.runId}`,
+            `State          ${plan.state.status}`,
+            `Delete         ${plan.deletePaths.join("\n               ")}`,
+            `Preserve       ${plan.preservedWorkspace.path}`,
+            `Branch         ${plan.preservedWorkspace.branch}`,
+            ...(plan.state.status === "completed"
+              ? []
+              : [`Warning        ${plan.state.status} run state may still be resumable`]),
+            `Apply          graphcraft delete ${plan.runId} --yes`,
+          ].join("\n"),
+        );
+      return;
+    }
+    if (run !== plan.runId)
+      throw new Error(
+        `Deletion requires the exact run ID. Re-run: graphcraft delete ${plan.runId} --yes`,
+      );
+    const result = await applyRunRetention({ plan, confirmRunId: run });
+    if (options.json) console.log(JSON.stringify({ dryRun: false, result }));
+    else
+      console.log(
+        [
+          `Deleted run state ${result.runId}.`,
+          `Removed        ${result.deletedPaths.length} Graphcraft paths`,
+          `Preserved      ${result.preservedWorkspace.path}`,
+          `Branch         ${result.preservedWorkspace.branch}`,
+        ].join("\n"),
+      );
+  });
+
+program
+  .command("prune")
+  .description("Plan deletion of completed runs older than an ISO date-time")
+  .requiredOption("--completed-before <date>", "strict ISO date-time cutoff")
+  .option("--keep <count>", "keep the newest eligible runs", "0")
+  .option("--confirm-run <id>", "exact run ID from the reviewed dry-run (repeatable)", collectScope)
+  .option("-C, --cwd <path>", "repository path", process.cwd())
+  .option("--yes", "apply the revalidated completed-run plan")
+  .option("--json", "emit JSON")
+  .action(
+    async (options: {
+      completedBefore: string;
+      keep: string;
+      cwd: string;
+      yes?: boolean;
+      json?: boolean;
+      confirmRun?: string[];
+    }) => {
+      const keepNewest = Number(options.keep);
+      const repository = await discoverRepository(options.cwd);
+      const plan = await planCompletedRunPrune({
+        repositoryRoot: repository.root,
+        completedBefore: options.completedBefore,
+        keepNewest,
+      });
+      if (!options.yes) {
+        if (options.json) console.log(JSON.stringify({ dryRun: true, plan }));
+        else
+          console.log(
+            [
+              "Dry run: no files deleted.",
+              `Cutoff         ${plan.completedBefore}`,
+              `Keep newest    ${plan.keepNewest}`,
+              `Delete         ${plan.deletionPlans.map(({ runId }) => runId).join(", ") || "none"}`,
+              `Preserve       ${plan.keptRunIds.join(", ") || "none"}`,
+              `Confirm        ${plan.deletionPlans.map(({ runId }) => `--confirm-run ${runId}`).join("\n               ") || "none"}`,
+              "Apply          repeat this command with --yes and every confirmation above",
+            ].join("\n"),
+          );
+        return;
+      }
+      const result = await applyCompletedRunPrune({
+        plan,
+        confirmRunIds: options.confirmRun ?? [],
+      });
+      if (options.json) console.log(JSON.stringify({ dryRun: false, result }));
+      else
+        console.log(
+          result.length === 0
+            ? "No completed runs matched the retention plan."
+            : `Deleted Graphcraft state for ${result.map(({ runId }) => runId).join(", ")}.`,
+        );
+    },
+  );
+
+program
   .command("inspect")
   .description("Show the contract, graph, anchors, and state")
   .argument("[run]")
@@ -372,13 +481,14 @@ program
       return;
     }
     const store = await storeFor(options.cwd, run);
-    const [state, contract, graph, graphHistory] = await Promise.all([
+    const [state, contract, graph, graphHistory, artifactInventory] = await Promise.all([
       store.loadState(),
       store.loadContract(),
       store.loadGraph(),
       store.loadGraphHistory(),
+      store.loadArtifactInventory(),
     ]);
-    console.log(renderRunInspection({ state, contract, graph, graphHistory }));
+    console.log(renderRunInspection({ state, contract, graph, graphHistory, artifactInventory }));
   });
 
 program
