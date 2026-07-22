@@ -11,7 +11,7 @@ import type {
   TokenUsage,
   WorkerResult,
 } from "./schemas.ts";
-import type { EvidenceSnapshot } from "./leases.ts";
+import type { EvidenceSnapshot } from "./schemas.ts";
 
 export interface PlanningRequest {
   contract: RunContract;

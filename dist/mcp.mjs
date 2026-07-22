@@ -31168,7 +31168,59 @@ var ProbeResultSchema = external_exports.strictObject({
   signature: external_exports.string().min(1),
   summary: external_exports.string(),
   durationMs: external_exports.number().nonnegative(),
-  artifact: external_exports.string().optional()
+  artifact: external_exports.string().optional(),
+  metrics: external_exports.record(external_exports.string(), external_exports.number().finite()).optional()
+});
+var ProgressClassificationSchema = external_exports.enum([
+  "advanced",
+  "learning",
+  "stalled",
+  "regressed",
+  "oscillating",
+  "blocked",
+  "done"
+]);
+var ProgressVectorSchema = external_exports.strictObject({
+  digest: external_exports.string().regex(/^[a-f0-9]{64}$/),
+  passedProbeIds: external_exports.array(external_exports.string()),
+  failingProbeIds: external_exports.array(external_exports.string()),
+  metrics: external_exports.record(external_exports.string(), external_exports.number().finite())
+});
+var EvidenceSnapshotSchema = external_exports.strictObject({
+  digest: external_exports.string().regex(/^[a-f0-9]{64}$/),
+  workspaceDigest: external_exports.string().min(1),
+  passed: external_exports.number().int().nonnegative(),
+  failed: external_exports.number().int().nonnegative(),
+  failureSignature: external_exports.string().regex(/^[a-f0-9]{64}$/),
+  probeResults: external_exports.array(ProbeResultSchema),
+  vector: ProgressVectorSchema
+});
+var ProgressTrajectoryEntrySchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  attemptId: external_exports.string().min(1),
+  nodeId: external_exports.string().min(1),
+  family: external_exports.enum(["bug", "feature", "migration", "refactor", "audit"]),
+  strategy: external_exports.string().min(1),
+  classification: ProgressClassificationSchema,
+  baseline: EvidenceSnapshotSchema,
+  current: EvidenceSnapshotSchema,
+  recordedAt: external_exports.iso.datetime()
+});
+var ProgressDecisionPacketSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  packetId: external_exports.uuid(),
+  nodeId: external_exports.string().min(1),
+  invariant: external_exports.string().min(1),
+  attemptedStrategies: external_exports.array(external_exports.string().min(1)).min(1),
+  evidence: external_exports.array(external_exports.string()),
+  blocker: external_exports.string().min(1),
+  choices: external_exports.array(
+    external_exports.strictObject({
+      action: external_exports.enum(["amend_strategy", "provide_evidence", "stop"]),
+      description: external_exports.string().min(1)
+    })
+  ).min(1),
+  createdAt: external_exports.iso.datetime()
 });
 var NodeKindSchema = external_exports.enum([
   "investigation",
@@ -31465,6 +31517,8 @@ var RunStateSchema = external_exports.strictObject({
   nodes: external_exports.record(external_exports.string(), NodeRuntimeStateSchema),
   currentNodeId: external_exports.string().optional(),
   latestProgressEvidence: external_exports.array(external_exports.string()),
+  progressTrajectory: external_exports.array(ProgressTrajectoryEntrySchema).default([]),
+  progressDecision: ProgressDecisionPacketSchema.optional(),
   tokens: TokenUsageSchema,
   controlDecisions: external_exports.array(ControlDecisionSchema),
   pendingDecision: ControlDecisionPacketSchema.optional(),
@@ -32189,25 +32243,76 @@ function graphPlanShape(graph) {
 }
 
 // packages/core/src/leases.ts
-function evidenceSnapshot(workspaceDigest2, probeResults) {
-  const failedResults = probeResults.filter((result) => !result.passed);
+function progressVector(probeResults, family) {
+  const passedProbeIds = probeResults.filter(({ passed }) => passed).map(({ probeId }) => probeId).sort();
+  const failingProbeIds = probeResults.filter(({ passed }) => !passed).map(({ probeId }) => probeId).sort();
+  const metrics = { failingProbes: failingProbeIds.length };
+  for (const result of probeResults)
+    for (const [key, value] of Object.entries(result.metrics ?? {}))
+      metrics[key] = (metrics[key] ?? 0) + value;
+  if (family === "migration" && metrics.inventoryMatches !== void 0)
+    metrics.remainingInventory = metrics.inventoryMatches;
+  const probes = probeResults.map(({ probeId, kind, passed, signature, metrics: resultMetrics }) => ({
+    probeId,
+    kind,
+    passed,
+    signature,
+    metrics: resultMetrics ?? {}
+  })).sort((left, right) => left.probeId.localeCompare(right.probeId));
   return {
-    digest: contentHash({ workspaceDigest: workspaceDigest2, probeResults }),
+    digest: contentHash({ probes, metrics }),
+    passedProbeIds,
+    failingProbeIds,
+    metrics
+  };
+}
+function evidenceSnapshot(workspaceDigest2, probeResults, family) {
+  const failedResults = probeResults.filter((result) => !result.passed);
+  const vector = progressVector(probeResults, family);
+  return {
+    digest: contentHash({ workspaceDigest: workspaceDigest2, vector: vector.digest }),
     workspaceDigest: workspaceDigest2,
     passed: probeResults.length - failedResults.length,
     failed: failedResults.length,
     failureSignature: contentHash(
-      failedResults.map(({ probeId, signature }) => ({ probeId, signature }))
+      failedResults.map(({ probeId, signature }) => ({ probeId, signature })).sort((left, right) => left.probeId.localeCompare(right.probeId))
     ),
-    probeResults
+    probeResults,
+    vector
   };
 }
+function metricDirection(key) {
+  if (/remaining|fail|unresolved|error|missing|todo/i.test(key)) return "lower";
+  if (/coverage|completed|passed|resolved/i.test(key)) return "higher";
+  return void 0;
+}
+function metricTrend(baseline, current) {
+  let improved = false;
+  for (const key of /* @__PURE__ */ new Set([
+    ...Object.keys(baseline.vector.metrics),
+    ...Object.keys(current.vector.metrics)
+  ])) {
+    const direction = metricDirection(key);
+    const before = baseline.vector.metrics[key];
+    const after = current.vector.metrics[key];
+    if (!direction || before === void 0 || after === void 0 || before === after) continue;
+    const better = direction === "higher" ? after > before : after < before;
+    if (!better) return "regressed";
+    improved = true;
+  }
+  return improved ? "improved" : "unchanged";
+}
 function classifyProgress(baseline, current, history = []) {
-  if (current.probeResults.length > 0 && current.failed === 0) return "done";
-  if (current.passed < baseline.passed || current.failed > baseline.failed) return "regressed";
-  if (history.slice(0, -1).some((snapshot) => snapshot.digest === current.digest))
+  const remainingInventory = current.vector.metrics.remainingInventory;
+  if (current.probeResults.length > 0 && current.failed === 0 && (remainingInventory === void 0 || remainingInventory === 0))
+    return "done";
+  const earlier = history.at(-1)?.digest === current.digest ? history.slice(0, -1) : history;
+  if (earlier.some((snapshot) => snapshot.vector.digest === current.vector.digest))
     return "oscillating";
-  if (current.passed > baseline.passed || current.workspaceDigest !== baseline.workspaceDigest) {
+  const metrics = metricTrend(baseline, current);
+  if (current.passed < baseline.passed || current.failed > baseline.failed || metrics === "regressed")
+    return "regressed";
+  if (current.passed > baseline.passed || current.failed < baseline.failed || metrics === "improved" || current.workspaceDigest !== baseline.workspaceDigest) {
     return "advanced";
   }
   if (current.failureSignature !== baseline.failureSignature) return "learning";
@@ -32314,6 +32419,7 @@ function reduceEvents(events) {
           nodeIds.map((id) => [id, { status: "pending", attempts: 0 }])
         ),
         latestProgressEvidence: [],
+        progressTrajectory: [],
         tokens: { ...emptyTokens },
         controlDecisions: [],
         updatedAt: event.timestamp
@@ -32328,6 +32434,7 @@ function reduceEvents(events) {
       case "run.started":
         state.status = "running";
         state.stopReason = void 0;
+        state.progressDecision = void 0;
         break;
       case "run.paused":
         state.status = "paused";
@@ -32340,6 +32447,7 @@ function reduceEvents(events) {
       case "run.blocked":
         state.status = "blocked";
         state.stopReason = requiredString(data, "reason");
+        state.progressDecision = data.progressDecision ? ProgressDecisionPacketSchema.parse(data.progressDecision) : void 0;
         break;
       case "run.completed":
         state.status = "completed";
@@ -32362,6 +32470,11 @@ function reduceEvents(events) {
         nodeState.lastProgress = classification;
         nodeState.lastSummary = typeof data.summary === "string" ? data.summary : void 0;
         state.latestProgressEvidence = Array.isArray(data.evidence) ? data.evidence.map((value) => String(value)) : [];
+        if (data.trajectory) {
+          const entry = ProgressTrajectoryEntrySchema.parse(data.trajectory);
+          if (!state.progressTrajectory.some(({ attemptId }) => attemptId === entry.attemptId))
+            state.progressTrajectory = [...state.progressTrajectory, entry].slice(-100);
+        }
         break;
       }
       case "node.accepted": {
@@ -33334,6 +33447,32 @@ var RunLock = class {
 };
 
 // packages/runtime/src/amendment.ts
+function failureSignatures(proposal) {
+  return new Set(
+    proposal.evidence.filter((item) => item.startsWith("failure-signature:")).map((item) => item.slice("failure-signature:".length))
+  );
+}
+function strategyFingerprint(value) {
+  return [
+    ...new Set(
+      value.toLowerCase().match(/[a-z0-9]+/g)?.filter((token) => token.length > 2) ?? []
+    )
+  ].sort().join(" ");
+}
+function requireChangedFailureStrategy(events, proposal) {
+  const signatures = failureSignatures(proposal);
+  if (signatures.size === 0) return;
+  const fingerprint = strategyFingerprint(proposal.changedStrategy);
+  for (const event of events) {
+    if (event.type !== "graph.amended" || !event.data.amendment) continue;
+    const record2 = GraphAmendmentRecordSchema.safeParse(event.data.amendment);
+    if (!record2.success) continue;
+    const previous = record2.data.proposal;
+    if (![...failureSignatures(previous)].some((signature) => signatures.has(signature))) continue;
+    if (strategyFingerprint(previous.changedStrategy) === fingerprint)
+      throw new Error("A repeated failure signature requires a meaningfully changed strategy");
+  }
+}
 async function applyRunGraphAmendmentLocked(store, input, actor) {
   const proposal = GraphAmendmentSchema.parse(input);
   const events = await store.loadEvents();
@@ -33348,6 +33487,7 @@ async function applyRunGraphAmendmentLocked(store, input, actor) {
       amendment: GraphAmendmentRecordSchema.parse(existing.data.amendment)
     };
   }
+  requireChangedFailureStrategy(events, proposal);
   const [graph, contract, state, probePlan] = await Promise.all([
     store.loadGraph(),
     store.loadContract(),
@@ -34120,7 +34260,8 @@ async function runProbe(spec, repositoryPath, signal) {
         passed: passed2,
         signature: contentHash({ matches, terms: spec.terms }),
         summary,
-        durationMs: inventory.durationMs
+        durationMs: inventory.durationMs,
+        metrics: { inventoryMatches: matches.length }
       },
       output: inventory.stdout
     };
@@ -34583,7 +34724,7 @@ async function createAtomicCommit(workspace, task) {
 }
 
 // packages/runtime/src/runner.ts
-import { randomUUID as randomUUID6 } from "node:crypto";
+import { randomUUID as randomUUID7 } from "node:crypto";
 import { join as join9 } from "node:path";
 
 // packages/runtime/src/store.ts
@@ -34870,15 +35011,110 @@ async function resolveRunId(repositoryRoot, reference) {
   return matches[0];
 }
 
+// packages/runtime/src/trajectory.ts
+import { randomUUID as randomUUID6 } from "node:crypto";
+function probeShape(snapshot) {
+  return snapshot.probeResults.map(({ probeId, kind }) => `${kind}:${probeId}`).sort().join("|");
+}
+function concise(value, limit = 240) {
+  const compact = value.replace(/\s+/g, " ").trim();
+  return compact.length > limit ? `${compact.slice(0, limit - 1)}\u2026` : compact;
+}
+async function assessRunProgress(input) {
+  const state = await input.store.loadState();
+  const existing = state.progressTrajectory.findLast(
+    ({ attemptId }) => attemptId === input.attemptId
+  );
+  if (existing) return { trajectory: existing, alreadyRecorded: true };
+  const shape = probeShape(input.current);
+  const comparable = state.progressTrajectory.filter(
+    (entry) => entry.family === input.family && probeShape(entry.current) === shape
+  );
+  const previousForNode = comparable.findLast(({ nodeId }) => nodeId === input.nodeId);
+  const baseline = input.baseline ?? previousForNode?.current ?? comparable.at(-1)?.current ?? input.current;
+  const latest = comparable.at(-1);
+  const historicalEntries = latest && latest.nodeId !== input.nodeId && latest.current.vector.digest === input.current.vector.digest ? comparable.slice(0, -1) : comparable;
+  const history = historicalEntries.flatMap(({ baseline: baseline2, current }) => [baseline2, current]);
+  const classification = comparable.length === 0 && input.firstObservation ? input.firstObservation : classifyProgress(baseline, input.current, [...history, input.current]);
+  return {
+    alreadyRecorded: false,
+    trajectory: ProgressTrajectoryEntrySchema.parse({
+      schemaVersion: 1,
+      attemptId: input.attemptId,
+      nodeId: input.nodeId,
+      family: input.family,
+      strategy: concise(input.strategy),
+      classification,
+      baseline,
+      current: input.current,
+      recordedAt: (/* @__PURE__ */ new Date()).toISOString()
+    })
+  };
+}
+function invariant(classification) {
+  if (classification === "oscillating")
+    return "Task evidence returned to a previously observed state after that state had been cleared";
+  if (classification === "regressed")
+    return "The task-specific progress vector moved away from the approved finish line";
+  if (classification === "stalled")
+    return "The latest strategy left the task-specific progress vector unchanged";
+  if (classification === "blocked")
+    return "Available evidence cannot authorize another autonomous strategy";
+  return `Autonomous progress ended with classification ${classification}`;
+}
+function createProgressDecisionPacket(input) {
+  const attemptedStrategies = [
+    ...new Set(
+      [...input.state.progressTrajectory.map(({ strategy }) => strategy), concise(input.strategy)].filter(Boolean).slice(-5)
+    )
+  ];
+  const evidence = [
+    ...new Set(
+      [
+        ...input.state.progressTrajectory.slice(-3).flatMap(({ current }) => current.probeResults.map(({ summary }) => concise(summary))),
+        ...input.evidence.map((item) => concise(item))
+      ].filter(Boolean)
+    )
+  ].slice(-8);
+  return ProgressDecisionPacketSchema.parse({
+    schemaVersion: 1,
+    packetId: randomUUID6(),
+    nodeId: input.nodeId,
+    invariant: input.invariant ?? invariant(input.classification),
+    attemptedStrategies,
+    evidence,
+    blocker: concise(input.blocker),
+    choices: [
+      {
+        action: "amend_strategy",
+        description: "Approve an amendment whose strategy changes the named invariant"
+      },
+      {
+        action: "provide_evidence",
+        description: "Provide new evidence or a decision that changes the progress vector"
+      },
+      {
+        action: "stop",
+        description: "Leave the run stopped with this durable evidence packet"
+      }
+    ],
+    createdAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+}
+
 // packages/runtime/src/runner.ts
-function persistedBaseline(value) {
+function persistedBaseline(value, family) {
   if (typeof value !== "object" || value === null) return void 0;
   const candidate = value;
   if (typeof candidate.digest !== "string" || typeof candidate.workspaceDigest !== "string" || typeof candidate.passed !== "number" || typeof candidate.failed !== "number" || typeof candidate.failureSignature !== "string" || !Array.isArray(candidate.probeResults))
     return void 0;
-  return candidate;
+  return evidenceSnapshot(
+    candidate.workspaceDigest,
+    candidate.probeResults,
+    family
+  );
 }
-async function recoverableInvocation(store, nodeId, repositoryPath) {
+async function recoverableInvocation(store, nodeId, repositoryPath, family) {
   const events = await store.loadEvents();
   const started = events.findLast(
     ({ type, data }) => type === "invocation.started" && data.nodeId === nodeId && typeof data.invocationId === "string"
@@ -34896,7 +35132,7 @@ async function recoverableInvocation(store, nodeId, repositoryPath) {
   const transcript = await store.loadInvocationEvents(invocationId).catch(() => []);
   const transcriptSession = transcript.findLast((event) => event.type === "session");
   const hostSessionId = session ? String(session.data.hostSessionId) : transcriptSession?.type === "session" ? transcriptSession.hostSessionId : void 0;
-  const baseline = persistedBaseline(started.data.baseline);
+  const baseline = persistedBaseline(started.data.baseline, family);
   return {
     adapterId: String(started.data.adapter ?? ""),
     nodeId,
@@ -35022,7 +35258,7 @@ async function executeWorker(input) {
   });
   const capsuleHash = contentHash(capsule);
   await input.store.writeCapsule(capsuleHash, capsule);
-  let invocationId = input.resume?.invocationId ?? randomUUID6();
+  let invocationId = input.resume?.invocationId ?? randomUUID7();
   let resumeSessionId;
   if (input.resume) {
     await recordMissingUsage(input.store, input.resume);
@@ -35040,7 +35276,11 @@ async function executeWorker(input) {
         { invocationId, nodeId: input.node.id, artifact: artifact2, success: true, recovered: true },
         invocationId
       );
-      return { result: WorkerResultSchema.parse(reconciliation.result), artifact: artifact2 };
+      return {
+        invocationId,
+        result: WorkerResultSchema.parse(reconciliation.result),
+        artifact: artifact2
+      };
     }
     if (reconciliation.state === "in_progress" && input.resume.hostSessionId) {
       resumeSessionId = input.resume.hostSessionId;
@@ -35062,7 +35302,7 @@ async function executeWorker(input) {
         },
         invocationId
       );
-      invocationId = randomUUID6();
+      invocationId = randomUUID7();
     }
   }
   if (!resumeSessionId) {
@@ -35140,6 +35380,7 @@ async function executeWorker(input) {
     invocationId
   );
   return {
+    invocationId,
     ...result ? { result } : {},
     ...error51 ? { error: error51 } : {},
     ...errorCause ? { errorCause } : {},
@@ -35171,7 +35412,7 @@ function needsSemanticVerification(phase, probes, classification) {
   return classification === "stalled" || classification === "done";
 }
 async function runSemanticVerification(input) {
-  const invocationId = randomUUID6();
+  const invocationId = randomUUID7();
   const context = SemanticVerifierContextSchema.parse({
     schemaVersion: 1,
     phase: input.phase,
@@ -35329,7 +35570,7 @@ function repairAmendment(graph, verification, failures) {
   };
   return {
     schemaVersion: 1,
-    amendmentId: randomUUID6(),
+    amendmentId: randomUUID7(),
     operations: [
       { operation: "add", node: repair, authoritySourceIds: originalDependencies },
       {
@@ -35377,6 +35618,38 @@ async function evaluateSuccessfulControl(input) {
     input.evidence
   );
 }
+async function strategyForNode(store, node2) {
+  const revision = (await store.loadGraphHistory()).findLast(
+    ({ diff }) => diff.addedNodeIds.includes(node2.id)
+  );
+  return revision?.amendment?.proposal.changedStrategy ?? node2.objective;
+}
+async function appendProgressTrajectory(input) {
+  if (input.alreadyRecorded) return;
+  await input.store.append(
+    "probe",
+    "node.progress",
+    {
+      nodeId: input.trajectory.nodeId,
+      classification: input.trajectory.classification,
+      summary: input.summary,
+      evidence: input.evidence,
+      trajectory: input.trajectory
+    },
+    input.trajectory.attemptId
+  );
+}
+async function progressPacket(input) {
+  return createProgressDecisionPacket({
+    state: await input.store.loadState(),
+    nodeId: input.trajectory.nodeId,
+    classification: input.trajectory.classification,
+    strategy: input.trajectory.strategy,
+    blocker: input.blocker,
+    evidence: input.evidence,
+    ...input.invariant ? { invariant: input.invariant } : {}
+  });
+}
 async function executeWorkNode(input) {
   let baseline;
   let baselineProbeResults;
@@ -35391,7 +35664,11 @@ async function executeWorkNode(input) {
     );
     if (input.signal.aborted) return { status: "interrupted", nodeId: input.node.id, artifact: "" };
     baselineProbeResults = baselineProbes.map(({ result }) => result);
-    baseline = evidenceSnapshot(await workspaceDigest(input.workspace.path), baselineProbeResults);
+    baseline = evidenceSnapshot(
+      await workspaceDigest(input.workspace.path),
+      baselineProbeResults,
+      input.graph.family
+    );
   }
   const worker = await executeWorker({
     adapter: input.adapter,
@@ -35443,18 +35720,28 @@ async function executeWorkNode(input) {
     };
   const currentEvidence = evidenceSnapshot(
     await workspaceDigest(input.workspace.path),
-    afterProbes.map(({ result }) => result)
+    afterProbes.map(({ result }) => result),
+    input.graph.family
   );
   if (input.node.sideEffectClass === "none" && currentEvidence.workspaceDigest !== baseline.workspaceDigest) {
     const reason2 = `Read-only node ${input.node.id} mutated the shared run workspace`;
     await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason: reason2 });
     return { status: "failed", nodeId: input.node.id, reason: reason2 };
   }
-  const measuredClassification = classifyProgress(baseline, currentEvidence);
+  const assessed = await assessRunProgress({
+    store: input.store,
+    attemptId: worker.invocationId,
+    nodeId: input.node.id,
+    family: input.graph.family,
+    strategy: await strategyForNode(input.store, input.node),
+    baseline,
+    current: currentEvidence
+  });
+  const measuredClassification = assessed.trajectory.classification;
   let classification = measuredClassification;
   let semanticEvidence = [];
   let semanticStopReason;
-  if (input.node.sideEffectClass === "none" && worker.result.evidence.length > 0 && needsSemanticVerification("progress", input.node.progressProbes, measuredClassification)) {
+  if (!assessed.alreadyRecorded && input.node.sideEffectClass === "none" && worker.result.evidence.length > 0 && needsSemanticVerification("progress", input.node.progressProbes, measuredClassification)) {
     let semanticVerdict;
     try {
       semanticVerdict = await runSemanticVerification({
@@ -35494,9 +35781,14 @@ async function executeWorkNode(input) {
     ...afterProbes.map(({ result }) => result.summary),
     ...semanticEvidence
   ];
-  await input.store.append("probe", "node.progress", {
-    nodeId: input.node.id,
-    classification,
+  const trajectory = {
+    ...assessed.trajectory,
+    classification
+  };
+  await appendProgressTrajectory({
+    store: input.store,
+    trajectory,
+    alreadyRecorded: assessed.alreadyRecorded,
     summary: worker.result.summary,
     evidence: progressEvidence
   });
@@ -35549,11 +35841,18 @@ async function executeWorkNode(input) {
     return { status: "accepted", nodeId: input.node.id };
   }
   await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason });
+  const progressDecision = await progressPacket({
+    store: input.store,
+    trajectory,
+    blocker: reason,
+    evidence: progressEvidence
+  });
   return {
     status: "failed",
     nodeId: input.node.id,
     reason,
-    ...control.packet ? { packet: control.packet } : {}
+    ...control.packet ? { packet: control.packet } : {},
+    progressDecision
   };
 }
 async function executeRun(input) {
@@ -35645,7 +35944,12 @@ async function executeRun(input) {
     };
     const recoveries = /* @__PURE__ */ new Map();
     for (const interruptedNodeId of interruptedNodeIds) {
-      const recovery = await recoverableInvocation(input.store, interruptedNodeId, workspace.path);
+      const recovery = await recoverableInvocation(
+        input.store,
+        interruptedNodeId,
+        workspace.path,
+        graph.family
+      );
       if (recovery && (recovery.adapterId !== input.adapter.id || recovery.record.baseline === void 0)) {
         await input.store.append(
           "runtime",
@@ -35695,7 +35999,7 @@ async function executeRun(input) {
           return await input.store.loadState();
         }
       }
-      const batchId = randomUUID6();
+      const batchId = randomUUID7();
       for (const candidate of batch) {
         input.observer?.({
           type: "status",
@@ -35753,6 +36057,7 @@ async function executeRun(input) {
             reason: failed.reason,
             ...failed.cause ? { cause: failed.cause } : {},
             ...failed.packet ? { decisionPacket: failed.packet } : {},
+            ...failed.progressDecision ? { progressDecision: failed.progressDecision } : {},
             batchId,
             acceptedSiblingIds: outcomes.filter(({ status }) => status === "accepted").map(({ nodeId }) => nodeId),
             quarantinedSiblingIds
@@ -35788,6 +36093,15 @@ async function executeRun(input) {
         );
         if (signal.aborted) return await finishInterruption(current.id);
         const results = executed.map(({ result }) => result);
+        const verificationAssessment = await assessRunProgress({
+          store: input.store,
+          attemptId: batchId,
+          nodeId: current.id,
+          family: graph.family,
+          strategy: await strategyForNode(input.store, current),
+          current: evidenceSnapshot(await workspaceDigest(workspace.path), results, graph.family),
+          firstObservation: results.every(({ passed }) => passed) ? "done" : "learning"
+        });
         if (results.every(({ passed }) => passed)) {
           let semanticEvidence = [];
           let completionControl;
@@ -35870,9 +36184,11 @@ async function executeRun(input) {
             });
             return await input.store.loadState();
           }
-          await input.store.append("probe", "node.progress", {
-            nodeId: current.id,
-            classification: "done",
+          await appendProgressTrajectory({
+            store: input.store,
+            trajectory: { ...verificationAssessment.trajectory, classification: "done" },
+            alreadyRecorded: verificationAssessment.alreadyRecorded,
+            summary: "Completion probes passed",
             evidence: completionEvidence
           });
           await input.store.append("probe", "node.accepted", { nodeId: current.id });
@@ -35883,18 +36199,28 @@ async function executeRun(input) {
         const existingRepairs = graph.nodes.filter(
           (node2) => node2.id.startsWith("repair-verify-")
         ).length;
+        const failureEvidence = failures.map(({ summary }) => summary);
+        await appendProgressTrajectory({
+          store: input.store,
+          trajectory: verificationAssessment.trajectory,
+          alreadyRecorded: verificationAssessment.alreadyRecorded,
+          summary: "Completion probes failed",
+          evidence: failureEvidence
+        });
         await input.store.append("probe", "node.failed", {
           nodeId: current.id,
-          reason: failures.map(({ summary }) => summary).join("\n")
+          reason: failureEvidence.join("\n")
         });
         const previousRepair = (await input.store.loadGraphHistory()).filter(
           ({ amendment }) => amendment?.actor === "runtime" && amendment.proposal.rationale === "Deterministic completion probes disproved the current remaining strategy"
         ).at(-1);
         const previousFailureSignature = previousRepair?.amendment?.proposal.evidence.find((item) => item.startsWith("failure-signature:"))?.slice("failure-signature:".length);
-        if (existingRepairs >= 3 || previousFailureSignature === failureSignature) {
-          const failureEvidence = failures.map(({ summary }) => summary);
+        const trajectoryStopped = ["oscillating", "regressed", "stalled", "blocked"].includes(
+          verificationAssessment.trajectory.classification
+        );
+        if (existingRepairs >= 3 || previousFailureSignature === failureSignature || trajectoryStopped) {
           const repeated = previousFailureSignature === failureSignature;
-          const rationale = repeated ? "Verification repeated the same failure signature after a changed repair strategy" : "Verification exhausted three distinct repair strategies";
+          const rationale = repeated ? "Verification repeated the same failure signature after a changed repair strategy" : existingRepairs >= 3 ? "Verification exhausted three distinct repair strategies" : `Verification trajectory was ${verificationAssessment.trajectory.classification}`;
           await recordVerifierControl({
             store: input.store,
             graph,
@@ -35910,10 +36236,21 @@ async function executeRun(input) {
             current.id,
             failureEvidence
           );
+          const reason = control.reason ?? rationale;
+          const progressDecision = await progressPacket({
+            store: input.store,
+            trajectory: verificationAssessment.trajectory,
+            blocker: reason,
+            evidence: failureEvidence,
+            ...repeated ? {
+              invariant: "Verification repeated the same failure signature after a changed strategy"
+            } : {}
+          });
           await input.store.append("runtime", "run.blocked", {
-            reason: control.reason ?? rationale,
+            reason,
             failures,
-            ...control.packet ? { decisionPacket: control.packet } : {}
+            ...control.packet ? { decisionPacket: control.packet } : {},
+            progressDecision
           });
           return await input.store.loadState();
         }
@@ -35978,7 +36315,8 @@ async function executeRun(input) {
         await input.store.append("runtime", "run.blocked", {
           reason: outcome.reason,
           ...outcome.cause ? { cause: outcome.cause } : {},
-          ...outcome.packet ? { decisionPacket: outcome.packet } : {}
+          ...outcome.packet ? { decisionPacket: outcome.packet } : {},
+          ...outcome.progressDecision ? { progressDecision: outcome.progressDecision } : {}
         });
         return await input.store.loadState();
       }
@@ -36058,6 +36396,14 @@ function stateView(state, contract) {
     runningNodes: Object.entries(state.nodes).filter(([, nodeState]) => nodeState.status === "running").map(([nodeId]) => nodeId),
     nodes: state.nodes,
     latestProgressEvidence: state.latestProgressEvidence,
+    progressTrajectory: state.progressTrajectory.slice(-10).map((entry) => ({
+      nodeId: entry.nodeId,
+      classification: entry.classification,
+      strategy: entry.strategy,
+      vector: entry.current.vector,
+      recordedAt: entry.recordedAt
+    })),
+    progressDecision: state.progressDecision,
     controlDecisions: state.controlDecisions,
     pendingDecision: state.pendingDecision,
     tokens: state.tokens,

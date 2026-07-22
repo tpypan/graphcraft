@@ -25,6 +25,8 @@ import {
   type PlannedGraphNode,
   type ProbeResult,
   type ProbePlan,
+  type ProgressDecisionPacket,
+  type ProgressTrajectoryEntry,
   type RunContract,
   type RunControlRequest,
   type RunState,
@@ -58,6 +60,7 @@ import {
   type RunWorkspace,
 } from "./repository.ts";
 import { RunStore } from "./store.ts";
+import { assessRunProgress, createProgressDecisionPacket } from "./trajectory.ts";
 
 export interface CreateRunOptions {
   cwd: string;
@@ -79,7 +82,7 @@ interface RecoverableInvocation {
   record: InvocationRecord;
 }
 
-function persistedBaseline(value: unknown): EvidenceSnapshot | undefined {
+function persistedBaseline(value: unknown, family: Graph["family"]): EvidenceSnapshot | undefined {
   if (typeof value !== "object" || value === null) return undefined;
   const candidate = value as Partial<EvidenceSnapshot>;
   if (
@@ -91,13 +94,18 @@ function persistedBaseline(value: unknown): EvidenceSnapshot | undefined {
     !Array.isArray(candidate.probeResults)
   )
     return undefined;
-  return candidate as EvidenceSnapshot;
+  return evidenceSnapshot(
+    candidate.workspaceDigest,
+    candidate.probeResults as ProbeResult[],
+    family,
+  );
 }
 
 async function recoverableInvocation(
   store: RunStore,
   nodeId: string,
   repositoryPath: string,
+  family: Graph["family"],
 ): Promise<RecoverableInvocation | undefined> {
   const events = await store.loadEvents();
   const started = events.findLast(
@@ -126,7 +134,7 @@ async function recoverableInvocation(
     : transcriptSession?.type === "session"
       ? transcriptSession.hostSessionId
       : undefined;
-  const baseline = persistedBaseline(started.data.baseline);
+  const baseline = persistedBaseline(started.data.baseline, family);
   return {
     adapterId: String(started.data.adapter ?? ""),
     nodeId,
@@ -280,6 +288,7 @@ async function executeWorker(input: {
   baseline: EvidenceSnapshot;
   resume?: InvocationRecord;
 }): Promise<{
+  invocationId: string;
   result?: WorkerResult;
   error?: string;
   errorCause?: "host_crash" | "timeout";
@@ -312,7 +321,11 @@ async function executeWorker(input: {
         { invocationId, nodeId: input.node.id, artifact, success: true, recovered: true },
         invocationId,
       );
-      return { result: WorkerResultSchema.parse(reconciliation.result), artifact };
+      return {
+        invocationId,
+        result: WorkerResultSchema.parse(reconciliation.result),
+        artifact,
+      };
     }
     if (reconciliation.state === "in_progress" && input.resume.hostSessionId) {
       resumeSessionId = input.resume.hostSessionId;
@@ -414,6 +427,7 @@ async function executeWorker(input: {
     invocationId,
   );
   return {
+    invocationId,
     ...(result ? { result } : {}),
     ...(error ? { error } : {}),
     ...(errorCause ? { errorCause } : {}),
@@ -732,6 +746,53 @@ async function evaluateSuccessfulControl(input: {
   );
 }
 
+async function strategyForNode(store: RunStore, node: GraphNode): Promise<string> {
+  const revision = (await store.loadGraphHistory()).findLast(({ diff }) =>
+    diff.addedNodeIds.includes(node.id),
+  );
+  return revision?.amendment?.proposal.changedStrategy ?? node.objective;
+}
+
+async function appendProgressTrajectory(input: {
+  store: RunStore;
+  trajectory: ProgressTrajectoryEntry;
+  alreadyRecorded: boolean;
+  summary: string;
+  evidence: string[];
+}): Promise<void> {
+  if (input.alreadyRecorded) return;
+  await input.store.append(
+    "probe",
+    "node.progress",
+    {
+      nodeId: input.trajectory.nodeId,
+      classification: input.trajectory.classification,
+      summary: input.summary,
+      evidence: input.evidence,
+      trajectory: input.trajectory,
+    },
+    input.trajectory.attemptId,
+  );
+}
+
+async function progressPacket(input: {
+  store: RunStore;
+  trajectory: ProgressTrajectoryEntry;
+  blocker: string;
+  evidence: string[];
+  invariant?: string;
+}): Promise<ProgressDecisionPacket> {
+  return createProgressDecisionPacket({
+    state: await input.store.loadState(),
+    nodeId: input.trajectory.nodeId,
+    classification: input.trajectory.classification,
+    strategy: input.trajectory.strategy,
+    blocker: input.blocker,
+    evidence: input.evidence,
+    ...(input.invariant ? { invariant: input.invariant } : {}),
+  });
+}
+
 type WorkNodeOutcome =
   | { status: "accepted"; nodeId: string }
   | {
@@ -740,6 +801,7 @@ type WorkNodeOutcome =
       reason: string;
       cause?: "host_crash" | "timeout";
       packet?: ControlEvaluation["packet"];
+      progressDecision?: ProgressDecisionPacket;
     }
   | {
       status: "interrupted";
@@ -773,7 +835,11 @@ async function executeWorkNode(input: {
     );
     if (input.signal.aborted) return { status: "interrupted", nodeId: input.node.id, artifact: "" };
     baselineProbeResults = baselineProbes.map(({ result }) => result);
-    baseline = evidenceSnapshot(await workspaceDigest(input.workspace.path), baselineProbeResults);
+    baseline = evidenceSnapshot(
+      await workspaceDigest(input.workspace.path),
+      baselineProbeResults,
+      input.graph.family,
+    );
   }
   const worker = await executeWorker({
     adapter: input.adapter,
@@ -827,6 +893,7 @@ async function executeWorkNode(input: {
   const currentEvidence = evidenceSnapshot(
     await workspaceDigest(input.workspace.path),
     afterProbes.map(({ result }) => result),
+    input.graph.family,
   );
   if (
     input.node.sideEffectClass === "none" &&
@@ -836,11 +903,21 @@ async function executeWorkNode(input: {
     await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason });
     return { status: "failed", nodeId: input.node.id, reason };
   }
-  const measuredClassification = classifyProgress(baseline, currentEvidence);
+  const assessed = await assessRunProgress({
+    store: input.store,
+    attemptId: worker.invocationId,
+    nodeId: input.node.id,
+    family: input.graph.family,
+    strategy: await strategyForNode(input.store, input.node),
+    baseline,
+    current: currentEvidence,
+  });
+  const measuredClassification = assessed.trajectory.classification;
   let classification = measuredClassification;
   let semanticEvidence: string[] = [];
   let semanticStopReason: string | undefined;
   if (
+    !assessed.alreadyRecorded &&
     input.node.sideEffectClass === "none" &&
     worker.result.evidence.length > 0 &&
     needsSemanticVerification("progress", input.node.progressProbes, measuredClassification)
@@ -888,9 +965,14 @@ async function executeWorkNode(input: {
     ...afterProbes.map(({ result }) => result.summary),
     ...semanticEvidence,
   ];
-  await input.store.append("probe", "node.progress", {
-    nodeId: input.node.id,
+  const trajectory: ProgressTrajectoryEntry = {
+    ...assessed.trajectory,
     classification,
+  };
+  await appendProgressTrajectory({
+    store: input.store,
+    trajectory,
+    alreadyRecorded: assessed.alreadyRecorded,
     summary: worker.result.summary,
     evidence: progressEvidence,
   });
@@ -945,11 +1027,18 @@ async function executeWorkNode(input: {
     return { status: "accepted", nodeId: input.node.id };
   }
   await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason });
+  const progressDecision = await progressPacket({
+    store: input.store,
+    trajectory,
+    blocker: reason,
+    evidence: progressEvidence,
+  });
   return {
     status: "failed",
     nodeId: input.node.id,
     reason,
     ...(control.packet ? { packet: control.packet } : {}),
+    progressDecision,
   };
 }
 
@@ -1063,7 +1152,12 @@ export async function executeRun(input: {
     };
     const recoveries = new Map<string, RecoverableInvocation>();
     for (const interruptedNodeId of interruptedNodeIds) {
-      const recovery = await recoverableInvocation(input.store, interruptedNodeId, workspace.path);
+      const recovery = await recoverableInvocation(
+        input.store,
+        interruptedNodeId,
+        workspace.path,
+        graph.family,
+      );
       if (
         recovery &&
         (recovery.adapterId !== input.adapter.id || recovery.record.baseline === undefined)
@@ -1189,6 +1283,7 @@ export async function executeRun(input: {
             reason: failed.reason,
             ...(failed.cause ? { cause: failed.cause } : {}),
             ...(failed.packet ? { decisionPacket: failed.packet } : {}),
+            ...(failed.progressDecision ? { progressDecision: failed.progressDecision } : {}),
             batchId,
             acceptedSiblingIds: outcomes
               .filter(({ status }) => status === "accepted")
@@ -1229,6 +1324,15 @@ export async function executeRun(input: {
         );
         if (signal.aborted) return await finishInterruption(current.id);
         const results = executed.map(({ result }) => result);
+        const verificationAssessment = await assessRunProgress({
+          store: input.store,
+          attemptId: batchId,
+          nodeId: current.id,
+          family: graph.family,
+          strategy: await strategyForNode(input.store, current),
+          current: evidenceSnapshot(await workspaceDigest(workspace.path), results, graph.family),
+          firstObservation: results.every(({ passed }) => passed) ? "done" : "learning",
+        });
         if (results.every(({ passed }) => passed)) {
           let semanticEvidence: string[] = [];
           let completionControl: ControlEvaluation | undefined;
@@ -1315,9 +1419,11 @@ export async function executeRun(input: {
             });
             return await input.store.loadState();
           }
-          await input.store.append("probe", "node.progress", {
-            nodeId: current.id,
-            classification: "done",
+          await appendProgressTrajectory({
+            store: input.store,
+            trajectory: { ...verificationAssessment.trajectory, classification: "done" },
+            alreadyRecorded: verificationAssessment.alreadyRecorded,
+            summary: "Completion probes passed",
             evidence: completionEvidence,
           });
           await input.store.append("probe", "node.accepted", { nodeId: current.id });
@@ -1332,9 +1438,17 @@ export async function executeRun(input: {
         const existingRepairs = graph.nodes.filter((node) =>
           node.id.startsWith("repair-verify-"),
         ).length;
+        const failureEvidence = failures.map(({ summary }) => summary);
+        await appendProgressTrajectory({
+          store: input.store,
+          trajectory: verificationAssessment.trajectory,
+          alreadyRecorded: verificationAssessment.alreadyRecorded,
+          summary: "Completion probes failed",
+          evidence: failureEvidence,
+        });
         await input.store.append("probe", "node.failed", {
           nodeId: current.id,
-          reason: failures.map(({ summary }) => summary).join("\n"),
+          reason: failureEvidence.join("\n"),
         });
         const previousRepair = (await input.store.loadGraphHistory())
           .filter(
@@ -1347,12 +1461,20 @@ export async function executeRun(input: {
         const previousFailureSignature = previousRepair?.amendment?.proposal.evidence
           .find((item) => item.startsWith("failure-signature:"))
           ?.slice("failure-signature:".length);
-        if (existingRepairs >= 3 || previousFailureSignature === failureSignature) {
-          const failureEvidence = failures.map(({ summary }) => summary);
+        const trajectoryStopped = ["oscillating", "regressed", "stalled", "blocked"].includes(
+          verificationAssessment.trajectory.classification,
+        );
+        if (
+          existingRepairs >= 3 ||
+          previousFailureSignature === failureSignature ||
+          trajectoryStopped
+        ) {
           const repeated = previousFailureSignature === failureSignature;
           const rationale = repeated
             ? "Verification repeated the same failure signature after a changed repair strategy"
-            : "Verification exhausted three distinct repair strategies";
+            : existingRepairs >= 3
+              ? "Verification exhausted three distinct repair strategies"
+              : `Verification trajectory was ${verificationAssessment.trajectory.classification}`;
           await recordVerifierControl({
             store: input.store,
             graph,
@@ -1368,10 +1490,24 @@ export async function executeRun(input: {
             current.id,
             failureEvidence,
           );
+          const reason = control.reason ?? rationale;
+          const progressDecision = await progressPacket({
+            store: input.store,
+            trajectory: verificationAssessment.trajectory,
+            blocker: reason,
+            evidence: failureEvidence,
+            ...(repeated
+              ? {
+                  invariant:
+                    "Verification repeated the same failure signature after a changed strategy",
+                }
+              : {}),
+          });
           await input.store.append("runtime", "run.blocked", {
-            reason: control.reason ?? rationale,
+            reason,
             failures,
             ...(control.packet ? { decisionPacket: control.packet } : {}),
+            progressDecision,
           });
           return await input.store.loadState();
         }
@@ -1439,6 +1575,7 @@ export async function executeRun(input: {
           reason: outcome.reason,
           ...(outcome.cause ? { cause: outcome.cause } : {}),
           ...(outcome.packet ? { decisionPacket: outcome.packet } : {}),
+          ...(outcome.progressDecision ? { progressDecision: outcome.progressDecision } : {}),
         });
         return await input.store.loadState();
       }

@@ -20,6 +20,7 @@ import type {
   Graph,
   PlanningRequest,
   PlanningResult,
+  ProbeResult,
   ReconciliationResult,
   RunEvent,
   SemanticVerificationRequest,
@@ -37,6 +38,7 @@ import { RunLock } from "./lock.ts";
 import { createRunWorkspace, discoverPlanningEvidence } from "./repository.ts";
 import { RunStore } from "./store.ts";
 import { amendRunGraph } from "./amendment.ts";
+import { assessRunProgress, createProgressDecisionPacket } from "./trajectory.ts";
 
 const execFileAsync = promisify(execFile);
 const temporaryRoots: string[] = [];
@@ -959,6 +961,10 @@ describe("durable runtime", () => {
         ({ amendment }) => (amendment?.proposal.falsifiableExpectation.length ?? 0) > 0,
       ),
     ).toBe(true);
+    expect(state.progressTrajectory.map(({ classification }) => classification)).toEqual(
+      expect.arrayContaining(["learning", "advanced", "done"]),
+    );
+    expect(state.progressDecision).toBeUndefined();
   });
 
   it("stops when a repair repeats the same deterministic failure signature", async () => {
@@ -995,6 +1001,94 @@ describe("durable runtime", () => {
           ),
       ),
     ).toBeDefined();
+    expect(state.progressTrajectory.at(-1)?.classification).toBe("oscillating");
+    expect(state.progressDecision).toMatchObject({
+      nodeId: "verify",
+      invariant: expect.stringMatching(/repeated the same failure signature/i),
+      choices: [{ action: "amend_strategy" }, { action: "provide_evidence" }, { action: "stop" }],
+    });
+    expect(state.progressDecision?.attemptedStrategies.length).toBeGreaterThanOrEqual(2);
+    expect(
+      (await new RunStore(repository, created.contract.runId).loadState()).progressDecision,
+    ).toEqual(state.progressDecision);
+  });
+
+  it("classifies A-to-B-to-A evidence as churn after reopening durable state", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Migrate every v2 storage call to v3", { cwd: repository });
+    const inventory = (matches: number): ProbeResult => ({
+      probeId: "remaining-v2-usage",
+      kind: "repository_inventory",
+      passed: true,
+      signature: `inventory-${matches}`,
+      summary: `${matches} tracked files retain v2 usage`,
+      durationMs: 1,
+      metrics: { inventoryMatches: matches },
+    });
+    const stateA = evidenceSnapshot("workspace-a", [inventory(3)], "migration");
+    const stateB = evidenceSnapshot("workspace-b", [inventory(1)], "migration");
+    const returnedA = evidenceSnapshot("workspace-c", [inventory(3)], "migration");
+    const appendTrajectory = async (
+      store: RunStore,
+      attemptId: string,
+      strategy: string,
+      current: ReturnType<typeof evidenceSnapshot>,
+    ) => {
+      const assessed = await assessRunProgress({
+        store,
+        attemptId,
+        nodeId: "verify",
+        family: "migration",
+        strategy,
+        current,
+        firstObservation: "learning",
+      });
+      await store.append("probe", "node.progress", {
+        nodeId: "verify",
+        classification: assessed.trajectory.classification,
+        summary: strategy,
+        evidence: current.probeResults.map(({ summary }) => summary),
+        trajectory: assessed.trajectory,
+      });
+      return assessed.trajectory;
+    };
+
+    expect(
+      (await appendTrajectory(created.store, "attempt-a", "Inventory state A", stateA))
+        .classification,
+    ).toBe("learning");
+    expect(
+      (await appendTrajectory(created.store, "attempt-b", "Reduce inventory to B", stateB))
+        .classification,
+    ).toBe("advanced");
+    const reopened = new RunStore(repository, created.contract.runId);
+    const churn = await appendTrajectory(
+      reopened,
+      "attempt-return-a",
+      "Return to state A",
+      returnedA,
+    );
+    expect(churn.classification).toBe("oscillating");
+    const progressDecision = createProgressDecisionPacket({
+      state: await reopened.loadState(),
+      nodeId: "verify",
+      classification: churn.classification,
+      strategy: churn.strategy,
+      blocker: "The migration returned to three remaining v2 files",
+      evidence: returnedA.probeResults.map(({ summary }) => summary),
+    });
+    await reopened.append("runtime", "run.blocked", {
+      reason: progressDecision.blocker,
+      progressDecision,
+    });
+
+    const persisted = await new RunStore(repository, created.contract.runId).loadState();
+    expect(persisted.progressTrajectory.map(({ classification }) => classification)).toEqual([
+      "learning",
+      "advanced",
+      "oscillating",
+    ]);
+    expect(persisted.progressDecision).toEqual(progressDecision);
   });
 
   it("revises unfinished work and resumes without mutating accepted nodes or anchors", async () => {
@@ -1036,7 +1130,10 @@ describe("durable runtime", () => {
           ],
         },
       ],
-      evidence: ["The original implementation node made no measurable repository progress"],
+      evidence: [
+        "failure-signature:unchanged-stall",
+        "The original implementation node made no measurable repository progress",
+      ],
       rationale: "The original objective combined implementation and evidence discovery",
       changedStrategy: "Split file implementation from independent proof construction",
       falsifiableExpectation: "Both branches will advance and the unchanged npm test will pass",
@@ -1045,6 +1142,14 @@ describe("durable runtime", () => {
     const amended = await amendRunGraph(created.store, amendment, "runtime");
     const repeated = await amendRunGraph(created.store, amendment, "runtime");
     expect(repeated.graph.revision).toBe(amended.graph.revision);
+    const repeatedFailureStrategy = {
+      ...amendment,
+      amendmentId: randomUUID(),
+      evidence: ["failure-signature:unchanged-stall"],
+    };
+    await expect(amendRunGraph(created.store, repeatedFailureStrategy, "runtime")).rejects.toThrow(
+      /meaningfully changed strategy/,
+    );
     const resumeAdapter = new FakeAdapter(async (request) => {
       if (request.capsule.nodeId === "implement-feature")
         await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");

@@ -6,3 +6,4 @@ export * from "./migration.ts";
 export * from "./repository.ts";
 export * from "./runner.ts";
 export * from "./store.ts";
+export * from "./trajectory.ts";

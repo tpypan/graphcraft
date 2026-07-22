@@ -2,6 +2,8 @@ import type { RunContract, RunEvent, RunState, TokenUsage } from "./schemas.ts";
 import {
   ControlDecisionPacketSchema,
   ControlDecisionSchema,
+  ProgressDecisionPacketSchema,
+  ProgressTrajectoryEntrySchema,
   RunContractSchema,
   RunStateSchema,
   TokenUsageSchema,
@@ -55,6 +57,7 @@ export function reduceEvents(events: RunEvent[]): RunState {
           nodeIds.map((id) => [id, { status: "pending" as const, attempts: 0 }]),
         ),
         latestProgressEvidence: [],
+        progressTrajectory: [],
         tokens: { ...emptyTokens },
         controlDecisions: [],
         updatedAt: event.timestamp,
@@ -70,6 +73,7 @@ export function reduceEvents(events: RunEvent[]): RunState {
       case "run.started":
         state.status = "running";
         state.stopReason = undefined;
+        state.progressDecision = undefined;
         break;
       case "run.paused":
         state.status = "paused";
@@ -82,6 +86,9 @@ export function reduceEvents(events: RunEvent[]): RunState {
       case "run.blocked":
         state.status = "blocked";
         state.stopReason = requiredString(data, "reason");
+        state.progressDecision = data.progressDecision
+          ? ProgressDecisionPacketSchema.parse(data.progressDecision)
+          : undefined;
         break;
       case "run.completed":
         state.status = "completed";
@@ -108,6 +115,11 @@ export function reduceEvents(events: RunEvent[]): RunState {
         state.latestProgressEvidence = Array.isArray(data.evidence)
           ? data.evidence.map((value) => String(value))
           : [];
+        if (data.trajectory) {
+          const entry = ProgressTrajectoryEntrySchema.parse(data.trajectory);
+          if (!state.progressTrajectory.some(({ attemptId }) => attemptId === entry.attemptId))
+            state.progressTrajectory = [...state.progressTrajectory, entry].slice(-100);
+        }
         break;
       }
       case "node.accepted": {

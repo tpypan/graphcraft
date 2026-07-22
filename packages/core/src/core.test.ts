@@ -542,4 +542,26 @@ describe("progress leases", () => {
       ),
     ).toBe("regressed");
   });
+
+  it("tracks migration inventory vectors across advancing and oscillating states", () => {
+    const inventory = (matches: number): ProbeResult => ({
+      probeId: "remaining-v2-usage",
+      kind: "repository_inventory",
+      passed: true,
+      signature: `inventory-${matches}`,
+      summary: `${matches} tracked files retain v2 usage`,
+      durationMs: 1,
+      metrics: { inventoryMatches: matches },
+    });
+    const stateA = evidenceSnapshot("workspace-a", [inventory(3)], "migration");
+    const stateB = evidenceSnapshot("workspace-b", [inventory(1)], "migration");
+    const returnedA = evidenceSnapshot("workspace-c", [inventory(3)], "migration");
+    const done = evidenceSnapshot("workspace-d", [inventory(0)], "migration");
+
+    expect(stateA.vector.metrics.remainingInventory).toBe(3);
+    expect(classifyProgress(stateA, stateB, [stateA, stateB])).toBe("advanced");
+    expect(classifyProgress(stateB, returnedA, [stateA, stateB, returnedA])).toBe("oscillating");
+    expect(classifyProgress(stateB, done, [stateA, stateB, done])).toBe("done");
+    expect(classifyProgress(stateB, stateA)).toBe("regressed");
+  });
 });

@@ -6,6 +6,7 @@ import {
   type Graph,
   type GraphAmendment,
   type GraphAmendmentRecord,
+  type RunEvent,
 } from "@graphcraft/core";
 import { RunLock } from "./lock.ts";
 import { RunStore } from "./store.ts";
@@ -13,6 +14,42 @@ import { RunStore } from "./store.ts";
 export interface RunGraphAmendmentResult {
   graph: Graph;
   amendment: GraphAmendmentRecord;
+}
+
+function failureSignatures(proposal: GraphAmendment): Set<string> {
+  return new Set(
+    proposal.evidence
+      .filter((item) => item.startsWith("failure-signature:"))
+      .map((item) => item.slice("failure-signature:".length)),
+  );
+}
+
+function strategyFingerprint(value: string): string {
+  return [
+    ...new Set(
+      value
+        .toLowerCase()
+        .match(/[a-z0-9]+/g)
+        ?.filter((token) => token.length > 2) ?? [],
+    ),
+  ]
+    .sort()
+    .join(" ");
+}
+
+function requireChangedFailureStrategy(events: RunEvent[], proposal: GraphAmendment): void {
+  const signatures = failureSignatures(proposal);
+  if (signatures.size === 0) return;
+  const fingerprint = strategyFingerprint(proposal.changedStrategy);
+  for (const event of events) {
+    if (event.type !== "graph.amended" || !event.data.amendment) continue;
+    const record = GraphAmendmentRecordSchema.safeParse(event.data.amendment);
+    if (!record.success) continue;
+    const previous = record.data.proposal;
+    if (![...failureSignatures(previous)].some((signature) => signatures.has(signature))) continue;
+    if (strategyFingerprint(previous.changedStrategy) === fingerprint)
+      throw new Error("A repeated failure signature requires a meaningfully changed strategy");
+  }
 }
 
 export async function applyRunGraphAmendmentLocked(
@@ -33,6 +70,7 @@ export async function applyRunGraphAmendmentLocked(
       amendment: GraphAmendmentRecordSchema.parse(existing.data.amendment),
     };
   }
+  requireChangedFailureStrategy(events, proposal);
 
   const [graph, contract, state, probePlan] = await Promise.all([
     store.loadGraph(),

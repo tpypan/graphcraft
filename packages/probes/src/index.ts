@@ -100,6 +100,7 @@ export async function runProbe(
         signature: contentHash({ matches, terms: spec.terms }),
         summary,
         durationMs: inventory.durationMs,
+        metrics: { inventoryMatches: matches.length },
       },
       output: inventory.stdout,
     };

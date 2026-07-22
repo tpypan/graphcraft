@@ -126,6 +126,65 @@ export const ProbeResultSchema = z.strictObject({
   summary: z.string(),
   durationMs: z.number().nonnegative(),
   artifact: z.string().optional(),
+  metrics: z.record(z.string(), z.number().finite()).optional(),
+});
+
+export const ProgressClassificationSchema = z.enum([
+  "advanced",
+  "learning",
+  "stalled",
+  "regressed",
+  "oscillating",
+  "blocked",
+  "done",
+]);
+
+export const ProgressVectorSchema = z.strictObject({
+  digest: z.string().regex(/^[a-f0-9]{64}$/),
+  passedProbeIds: z.array(z.string()),
+  failingProbeIds: z.array(z.string()),
+  metrics: z.record(z.string(), z.number().finite()),
+});
+
+export const EvidenceSnapshotSchema = z.strictObject({
+  digest: z.string().regex(/^[a-f0-9]{64}$/),
+  workspaceDigest: z.string().min(1),
+  passed: z.number().int().nonnegative(),
+  failed: z.number().int().nonnegative(),
+  failureSignature: z.string().regex(/^[a-f0-9]{64}$/),
+  probeResults: z.array(ProbeResultSchema),
+  vector: ProgressVectorSchema,
+});
+
+export const ProgressTrajectoryEntrySchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  attemptId: z.string().min(1),
+  nodeId: z.string().min(1),
+  family: z.enum(["bug", "feature", "migration", "refactor", "audit"]),
+  strategy: z.string().min(1),
+  classification: ProgressClassificationSchema,
+  baseline: EvidenceSnapshotSchema,
+  current: EvidenceSnapshotSchema,
+  recordedAt: z.iso.datetime(),
+});
+
+export const ProgressDecisionPacketSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  packetId: z.uuid(),
+  nodeId: z.string().min(1),
+  invariant: z.string().min(1),
+  attemptedStrategies: z.array(z.string().min(1)).min(1),
+  evidence: z.array(z.string()),
+  blocker: z.string().min(1),
+  choices: z
+    .array(
+      z.strictObject({
+        action: z.enum(["amend_strategy", "provide_evidence", "stop"]),
+        description: z.string().min(1),
+      }),
+    )
+    .min(1),
+  createdAt: z.iso.datetime(),
 });
 
 export const NodeKindSchema = z.enum([
@@ -452,6 +511,8 @@ export const RunStateSchema = z.strictObject({
   nodes: z.record(z.string(), NodeRuntimeStateSchema),
   currentNodeId: z.string().optional(),
   latestProgressEvidence: z.array(z.string()),
+  progressTrajectory: z.array(ProgressTrajectoryEntrySchema).default([]),
+  progressDecision: ProgressDecisionPacketSchema.optional(),
   tokens: TokenUsageSchema,
   controlDecisions: z.array(ControlDecisionSchema),
   pendingDecision: ControlDecisionPacketSchema.optional(),
@@ -487,6 +548,11 @@ export type ProbeSpec = z.infer<typeof ProbeSpecSchema>;
 export type ProbePlan = z.infer<typeof ProbePlanSchema>;
 export type ProbePlanItem = z.infer<typeof ProbePlanItemSchema>;
 export type ProbeResult = z.infer<typeof ProbeResultSchema>;
+export type ProgressClassification = z.infer<typeof ProgressClassificationSchema>;
+export type ProgressVector = z.infer<typeof ProgressVectorSchema>;
+export type EvidenceSnapshot = z.infer<typeof EvidenceSnapshotSchema>;
+export type ProgressTrajectoryEntry = z.infer<typeof ProgressTrajectoryEntrySchema>;
+export type ProgressDecisionPacket = z.infer<typeof ProgressDecisionPacketSchema>;
 export type GraphNode = z.infer<typeof GraphNodeSchema>;
 export type PlannedGraphNode = z.infer<typeof PlannedGraphNodeSchema>;
 export type GraphPlan = z.infer<typeof GraphPlanSchema>;

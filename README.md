@@ -52,6 +52,7 @@ Graphcraft displays a concise run contract before doing work. Use `--yes` only w
 - Gives each worker a small context capsule instead of replaying raw transcripts.
 - Infers deterministic, task-family-specific progress and completion probes from repository evidence, then lets users inspect or replace the versioned probe plan before approval.
 - Runs approved probes outside model context and classifies progress as advanced, learning, stalled, regressed, oscillating, blocked, or done.
+- Persists task-specific evidence vectors and strategy trajectories across restarts, distinguishes advancing A→B→done work from A→B→A churn, and returns a concise decision packet when autonomous progress stops.
 - Uses a fresh read-only semantic verifier only when structural probes cannot ground reported progress or completion, and persists its verdict and cost separately.
 - Enforces control edges during scheduling and acceptance: observers record evidence, vetoes block without gaining write authority, target owners must approve, and user-owned arbitrators resolve explicit conflicts through durable decision packets.
 - Applies evidence-backed add, supersede, split, fuse, and dependency amendments only to unfinished work, preserves governance anchors and completion probes, and stops repeated repair signatures.
