@@ -28,6 +28,8 @@ export async function runProbe(
   signal?: AbortSignal,
 ): Promise<ExecutedProbe> {
   const started = performance.now();
+  if (spec.kind === "held_out")
+    throw new Error(`Held-out probe ${spec.id} must be resolved by the runtime`);
   if (spec.kind === "command") {
     const processResult = await runProcess(spec.command, spec.args, {
       cwd: spec.cwd ? resolve(repositoryPath, spec.cwd) : repositoryPath,
@@ -339,6 +341,8 @@ export async function validateProbePlan(
     const key = `${item.phase}:${item.probe.id}`;
     if (keys.has(key)) throw new Error(`Duplicate ${item.phase} probe ID ${item.probe.id}`);
     keys.add(key);
+    if (item.probe.kind === "held_out")
+      throw new Error("User-editable probe plans cannot contain held-out references");
     if (item.probe.kind === "command") {
       if (item.probe.timeoutMs > 1_800_000)
         throw new Error(`Probe ${item.probe.id} exceeds the 30 minute timeout limit`);

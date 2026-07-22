@@ -266,7 +266,9 @@ function validateProbePolicy(
     throw new Error(`Probe ${probe.id} contains an unsafe inventory path`);
   }
   if (
-    (probe.kind === "command" || probe.kind === "repository_inventory") &&
+    (probe.kind === "command" ||
+      probe.kind === "repository_inventory" ||
+      probe.kind === "held_out") &&
     !approvedProbes.some((allowed) => sameProbe(allowed, probe))
   ) {
     throw new Error(`Probe ${probe.id} is not an approved deterministic probe`);

@@ -331,15 +331,29 @@ export async function handleAction(input: McpActionInput): Promise<Record<string
   }
 
   const store = await storeFor(cwd, input.run);
-  const [contract, graph, state, probePlan] = await Promise.all([
+  const [contract, graph, state, probePlan, heldOutProbePlan] = await Promise.all([
     store.loadContract(),
     store.loadGraph(),
     store.loadState(),
     store.loadProbePlan(),
+    store.loadHeldOutProbePlan(),
   ]);
   if (input.action === "status") return stateView(state, contract);
   if (input.action === "inspect")
-    return { contract, graph, probePlan, state, graphHistory: await store.loadGraphHistory() };
+    return {
+      contract,
+      graph,
+      probePlan,
+      heldOutProof: {
+        digest: heldOutProbePlan.digest,
+        probes: heldOutProbePlan.probes.map(({ probe, integrity }) => ({
+          id: probe.id,
+          integrityProtected: integrity.length > 0,
+        })),
+      },
+      state,
+      graphHistory: await store.loadGraphHistory(),
+    };
   if (input.action === "trace") return { events: await store.loadEvents() };
   if (input.action === "probes") {
     if (!input.probePlan) return { probePlan };

@@ -15,6 +15,7 @@ function manifest(runId: string, migratedFrom: 0 | 1): RunStorageManifest {
       contract: 1,
       graph: 1,
       probePlan: 1,
+      heldOutProbes: 1,
       events: 1,
       state: 1,
       workspace: 1,

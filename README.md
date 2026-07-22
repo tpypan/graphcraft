@@ -51,6 +51,7 @@ Graphcraft displays a concise run contract before doing work. Use `--yes` only w
 - Stores a hashed append-only event log and rebuildable state under the repository's local `.graphcraft/` directory.
 - Gives each worker a small context capsule instead of replaying raw transcripts.
 - Infers deterministic, task-family-specific progress and completion probes from repository evidence, then lets users inspect or replace the versioned probe plan before approval.
+- Keeps executable completion definitions in an integrity-hashed held-out plan, gives planner graphs only opaque references, and blocks omitted, substituted, or weakened checks before acceptance.
 - Runs approved probes outside model context and classifies progress as advanced, learning, stalled, regressed, oscillating, blocked, or done.
 - Persists task-specific evidence vectors and strategy trajectories across restarts, distinguishes advancing A→B→done work from A→B→A churn, and returns a concise decision packet when autonomous progress stops.
 - Uses a fresh read-only semantic verifier only when structural probes cannot ground reported progress or completion, and persists its verdict and cost separately.

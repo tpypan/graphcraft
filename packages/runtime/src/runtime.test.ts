@@ -114,6 +114,7 @@ class FakeAdapter implements HostAdapter {
   readonly calls: string[] = [];
   readonly requests: WorkerRequest[] = [];
   readonly semanticRequests: SemanticVerificationRequest[] = [];
+  readonly planningRequests: PlanningRequest[] = [];
   private readonly act: (
     request: WorkerRequest,
     call: number,
@@ -150,6 +151,7 @@ class FakeAdapter implements HostAdapter {
   }
 
   async plan(request: PlanningRequest, _signal: AbortSignal): Promise<PlanningResult> {
+    this.planningRequests.push(request);
     const nodes: PlanningResult["plan"]["nodes"] = [
       {
         id: "investigate",
@@ -481,6 +483,24 @@ describe("durable runtime", () => {
     });
 
     expect(created.graph.nodes.map(({ id }) => id)).toEqual(["investigate", "implement", "verify"]);
+    expect(adapter.planningRequests[0]?.verificationProbes).toEqual([
+      expect.objectContaining({ kind: "held_out" }),
+    ]);
+    expect(created.graph.nodes.find(({ id }) => id === "verify")?.completionProbes).toEqual([
+      expect.objectContaining({ kind: "held_out" }),
+    ]);
+    const heldOut = await created.store.loadHeldOutProbePlan();
+    expect(heldOut.probes).toEqual([
+      expect.objectContaining({ probe: expect.objectContaining({ kind: "command" }) }),
+    ]);
+    expect(heldOut.probes[0]?.integrity).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "package_script", path: "package.json", script: "test" }),
+        expect.objectContaining({ kind: "file", path: "verify.mjs" }),
+      ]),
+    );
+    await writeFile(join(created.store.runRoot, "held-out-probes.json"), "{}\n");
+    expect((await created.store.loadHeldOutProbePlan()).digest).toBe(heldOut.digest);
     expect((await created.store.loadState()).tokens.total).toBe(7);
 
     const state = await executeRun({ store: created.store, adapter, approve: true });
@@ -493,6 +513,15 @@ describe("durable runtime", () => {
     ]);
     expect(adapter.requests[0]?.allowedTools).toEqual(["read"]);
     expect(adapter.requests[1]?.allowedTools).toEqual(["read", "write", "shell"]);
+    expect(
+      adapter.requests.every((request) => {
+        const capsule = JSON.stringify(request.capsule);
+        return !capsule.includes('\"kind\":\"held_out\"') && !capsule.includes("planDigest");
+      }),
+    ).toBe(true);
+    expect(
+      (await created.store.loadEvents()).filter(({ type }) => type === "held_out.checked"),
+    ).toHaveLength(1);
     expect(state.tokens.total).toBe(38);
     expect(adapter.semanticRequests).toHaveLength(1);
     expect(adapter.semanticRequests[0]).toMatchObject({
@@ -501,6 +530,23 @@ describe("durable runtime", () => {
     expect((await created.store.loadEvents()).map(({ type }) => type)).toContain(
       "semantic.verdict",
     );
+  });
+
+  it("rejects event-log tampering before resolving held-out completion checks", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a substantial held-out integrity feature", {
+      cwd: repository,
+    });
+    const lines = (await readFile(created.store.eventsPath(), "utf8")).trimEnd().split("\n");
+    const createdEvent = JSON.parse(lines[0]!) as RunEvent;
+    const heldOutProbePlan = createdEvent.data.heldOutProbePlan as {
+      probes: Array<{ source: string }>;
+    };
+    heldOutProbePlan.probes[0]!.source = "substituted completion implementation";
+    lines[0] = JSON.stringify(createdEvent);
+    await writeFile(created.store.eventsPath(), `${lines.join("\n")}\n`);
+
+    await expect(created.store.loadHeldOutProbePlan()).rejects.toThrow(/event hash/i);
   });
 
   it("stops on an unsupported isolated semantic progress verdict", async () => {
@@ -1011,6 +1057,70 @@ describe("durable runtime", () => {
     expect(
       (await new RunStore(repository, created.contract.runId).loadState()).progressDecision,
     ).toEqual(state.progressDecision);
+  });
+
+  it("blocks a worker that weakens an approved package-script completion check", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId !== "implement") return;
+      const path = join(request.repositoryPath, "package.json");
+      const manifest = JSON.parse(await readFile(path, "utf8")) as {
+        scripts: Record<string, string>;
+      };
+      manifest.scripts.test = "node -p 1";
+      await writeFile(path, `${JSON.stringify(manifest, null, 2)}\n`);
+    });
+    const created = await createRun("Implement a feature without weakening its acceptance check", {
+      cwd: repository,
+    });
+
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+    const repair = adapter.requests.find(({ capsule }) => capsule.nodeId === "repair-verify-1");
+    const heldOutEvents = (await created.store.loadEvents()).filter(
+      ({ type }) => type === "held_out.checked",
+    );
+
+    expect(state.status).toBe("blocked");
+    expect(adapter.calls).toEqual(["implement", "repair-verify-1"]);
+    expect(heldOutEvents).toEqual([
+      expect.objectContaining({
+        data: expect.objectContaining({
+          results: [
+            expect.objectContaining({ probeId: "package-root-test-integrity", passed: false }),
+          ],
+        }),
+      }),
+    ]);
+    expect(repair?.capsule.objective).toContain(
+      "Approved completion check package-root-test changed or was removed",
+    );
+    expect(repair?.capsule.objective).not.toContain("node verify.mjs");
+    expect(repair?.capsule.objective).not.toContain("node -p 1");
+    expect((await created.store.loadGraph()).revision).toBe(1);
+  });
+
+  it("blocks replacement of a protected completion-check implementation", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "verify.mjs"), "process.exit(0);\n");
+    });
+    const created = await createRun("Implement a feature without replacing its acceptance check", {
+      cwd: repository,
+    });
+
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+    const repair = adapter.requests.find(({ capsule }) => capsule.nodeId === "repair-verify-1");
+    const heldOutEvent = (await created.store.loadEvents()).find(
+      ({ type }) => type === "held_out.checked",
+    );
+
+    expect(state.status).toBe("blocked");
+    expect(heldOutEvent?.data.results).toEqual([
+      expect.objectContaining({ probeId: "package-root-test-integrity", passed: false }),
+    ]);
+    expect(repair?.capsule.objective).toContain("protected measurement file");
+    expect(repair?.capsule.objective).not.toContain("process.exit(0)");
   });
 
   it("classifies A-to-B-to-A evidence as churn after reopening durable state", async () => {
@@ -1559,8 +1669,12 @@ describe("durable runtime", () => {
     ]);
     await writeFile(join(created.store.runRoot, "graph.json"), "not-json\n");
     await writeFile(join(created.store.runRoot, "probe-plan.json"), "not-json\n");
+    await writeFile(join(created.store.runRoot, "held-out-probes.json"), "not-json\n");
     expect((await created.store.loadGraph()).revision).toBe(1);
     expect((await created.store.loadProbePlan()).items).toEqual(edited.items);
+    expect(
+      (await created.store.loadHeldOutProbePlan()).probes.map(({ probe }) => probe.id),
+    ).toEqual(["fixture-acceptance"]);
 
     await created.store.append("user", "run.approved", { approved: true });
     await expect(configureRunProbes(created.store, edited)).rejects.toThrow(/before.*approved/);

@@ -3,6 +3,7 @@ import {
   GraphAmendmentRecordSchema,
   GraphAmendmentSchema,
   applyGraphAmendment,
+  workerVisibleProbePlan,
   type Graph,
   type GraphAmendment,
   type GraphAmendmentRecord,
@@ -72,15 +73,17 @@ export async function applyRunGraphAmendmentLocked(
   }
   requireChangedFailureStrategy(events, proposal);
 
-  const [graph, contract, state, probePlan] = await Promise.all([
+  const [graph, contract, state, probePlan, heldOutProbePlan] = await Promise.all([
     store.loadGraph(),
     store.loadContract(),
     store.loadState(),
     store.loadProbePlan(),
+    store.loadHeldOutProbePlan(),
   ]);
   if (["awaiting_approval", "completed", "stopped"].includes(state.status))
     throw new Error(`Graph amendments are not allowed while a run is ${state.status}`);
-  const completionProbes = probePlan.items
+  const graphProbePlan = workerVisibleProbePlan(probePlan, heldOutProbePlan);
+  const completionProbes = graphProbePlan.items
     .filter(({ phase }) => phase === "completion")
     .map(({ probe }) => probe);
   const applied = applyGraphAmendment({
@@ -90,7 +93,7 @@ export async function applyRunGraphAmendmentLocked(
     actor,
     nodeStatuses: state.nodes,
     requiredVerificationProbes: completionProbes,
-    approvedProbes: probePlan.items.map(({ probe }) => probe),
+    approvedProbes: graphProbePlan.items.map(({ probe }) => probe),
   });
   const record = GraphAmendmentRecordSchema.parse({
     schemaVersion: 1,

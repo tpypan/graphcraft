@@ -13,7 +13,10 @@ import {
   createContextCapsule,
   evidenceSnapshot,
   interruptionReason,
+  resolveHeldOutProbes,
+  workerVisibleProbePlan,
   type EvidenceSnapshot,
+  type ExecutableProbe,
   type Graph,
   type GraphAmendment,
   type GraphPlanner,
@@ -21,6 +24,7 @@ import {
   type HostAdapter,
   type HostEvent,
   type HostTermination,
+  type HeldOutProbePlan,
   type InvocationRecord,
   type PlannedGraphNode,
   type ProbeResult,
@@ -60,6 +64,11 @@ import {
   type RunWorkspace,
 } from "./repository.ts";
 import { RunStore } from "./store.ts";
+import {
+  actionableHeldOutFailures,
+  createRuntimeHeldOutProbePlan,
+  heldOutIntegrityFailures,
+} from "./held-out.ts";
 import { assessRunProgress, createProgressDecisionPacket } from "./trajectory.ts";
 
 export interface CreateRunOptions {
@@ -199,13 +208,19 @@ export async function createRun(
     discoverProbePlan(repository.root, task, repository.baseSha),
     discoverPlanningEvidence(repository.root, task),
   ]);
-  const completionProbes = probePlan.items
-    .filter(({ phase }) => phase === "completion")
-    .map(({ probe }) => probe);
-  const approvedProbes = probePlan.items.map(({ probe }) => probe);
   const contract = compileRunContract(task, repository, {
     ...(options.finishLine ? { finishLine: options.finishLine } : {}),
   });
+  const heldOutProbePlan = await createRuntimeHeldOutProbePlan(
+    contract.runId,
+    probePlan,
+    repository.root,
+  );
+  const graphProbePlan = workerVisibleProbePlan(probePlan, heldOutProbePlan);
+  const completionProbes = graphProbePlan.items
+    .filter(({ phase }) => phase === "completion")
+    .map(({ probe }) => probe);
+  const approvedProbes = graphProbePlan.items.map(({ probe }) => probe);
   let graph: Graph;
   let planningUsage: TokenUsage | undefined;
   if (options.planner) {
@@ -225,7 +240,7 @@ export async function createRun(
         contract,
         repositoryPath: repository.root,
         repositoryEvidence,
-        probePlan,
+        probePlan: graphProbePlan,
         verificationProbes: completionProbes,
       },
       options.signal ?? new AbortController().signal,
@@ -236,8 +251,14 @@ export async function createRun(
   } else {
     graph = compileGraph(contract, completionProbes);
   }
-  graph = applyProbePlan(graph, contract, probePlan);
-  const store = await RunStore.create(repository.root, contract, graph, probePlan);
+  graph = applyProbePlan(graph, contract, graphProbePlan);
+  const store = await RunStore.create(
+    repository.root,
+    contract,
+    graph,
+    probePlan,
+    heldOutProbePlan,
+  );
   if (planningUsage)
     await store.append("host", "tokens.recorded", { usage: planningUsage, phase: "planning" });
   return { contract, graph, store, probePlan };
@@ -255,20 +276,31 @@ export async function configureRunProbes(
       throw new Error("Probes can only be edited before the run contract is approved");
     const [contract, existingGraph] = await Promise.all([store.loadContract(), store.loadGraph()]);
     const probePlan = await validateProbePlan(input, store.repositoryRoot);
+    const heldOutProbePlan = await createRuntimeHeldOutProbePlan(
+      contract.runId,
+      probePlan,
+      store.repositoryRoot,
+    );
+    const graphProbePlan = workerVisibleProbePlan(probePlan, heldOutProbePlan);
     const graph = applyProbePlan(
       { ...existingGraph, revision: existingGraph.revision + 1 },
       contract,
-      probePlan,
+      graphProbePlan,
     );
     await store.append("user", "graph.amended", {
       graph,
       probePlan,
+      heldOutProbePlan,
       addedNodeIds: [],
       rationale: "User edited the deterministic probe plan before approval",
       previousProbePlanHash: contentHash(await store.loadProbePlan()),
       probePlanHash: contentHash(probePlan),
     });
-    await Promise.all([store.saveGraph(graph), store.saveProbePlan(probePlan)]);
+    await Promise.all([
+      store.saveGraph(graph),
+      store.saveProbePlan(probePlan),
+      store.saveHeldOutProbePlan(heldOutProbePlan),
+    ]);
     return { graph, probePlan };
   } finally {
     await lock.release();
@@ -671,7 +703,7 @@ function repairAmendment(
       predecessorResults: verification.dependsOn,
       relevantPaths: [],
     },
-    progressProbes: verification.completionProbes,
+    progressProbes: [],
     completionProbes: [],
     sideEffectClass: "workspace_write",
   };
@@ -1304,7 +1336,18 @@ export async function executeRun(input: {
       const current = batch[0]!;
 
       if (current.kind === "verification") {
-        if (current.completionProbes.length === 0) {
+        let completionProbes: ExecutableProbe[];
+        let heldOutProbePlan: HeldOutProbePlan;
+        try {
+          heldOutProbePlan = await input.store.loadHeldOutProbePlan();
+          completionProbes = resolveHeldOutProbes(current.completionProbes, heldOutProbePlan);
+        } catch (error) {
+          const reason = `Held-out completion proof is invalid: ${(error as Error).message}`;
+          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+          await input.store.append("runtime", "run.blocked", { reason });
+          return await input.store.loadState();
+        }
+        if (completionProbes.length === 0) {
           await input.store.append("probe", "node.failed", {
             nodeId: current.id,
             reason: "No deterministic verification commands were discovered",
@@ -1315,15 +1358,24 @@ export async function executeRun(input: {
           });
           return await input.store.loadState();
         }
-        const executed = await captureProbes(
-          input.store,
-          current.completionProbes,
-          workspace,
-          input.observer,
-          signal,
-        );
+        const integrityFailures = await heldOutIntegrityFailures(heldOutProbePlan, workspace.path);
+        const executed = integrityFailures.length
+          ? []
+          : await captureProbes(input.store, completionProbes, workspace, input.observer, signal);
         if (signal.aborted) return await finishInterruption(current.id);
-        const results = executed.map(({ result }) => result);
+        const results = integrityFailures.length
+          ? integrityFailures
+          : executed.map(({ result }) => result);
+        await input.store.append("probe", "held_out.checked", {
+          nodeId: current.id,
+          planDigest: heldOutProbePlan.digest,
+          results: results.map(({ probeId, passed, signature, artifact }) => ({
+            probeId,
+            passed,
+            signature,
+            artifact: artifact ?? null,
+          })),
+        });
         const verificationAssessment = await assessRunProgress({
           store: input.store,
           attemptId: batchId,
@@ -1336,7 +1388,7 @@ export async function executeRun(input: {
         if (results.every(({ passed }) => passed)) {
           let semanticEvidence: string[] = [];
           let completionControl: ControlEvaluation | undefined;
-          if (needsSemanticVerification("completion", current.completionProbes)) {
+          if (needsSemanticVerification("completion", completionProbes)) {
             let semanticVerdict: SemanticVerdict;
             try {
               semanticVerdict = await runSemanticVerification({
@@ -1430,7 +1482,7 @@ export async function executeRun(input: {
           continue;
         }
 
-        const failures = results.filter(({ passed }) => !passed);
+        const failures = actionableHeldOutFailures(results.filter(({ passed }) => !passed));
         const failureSignature = failures
           .map(({ signature }) => signature)
           .sort()

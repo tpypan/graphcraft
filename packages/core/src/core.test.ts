@@ -10,17 +10,21 @@ import {
   compileGraph,
   compilePlannedGraph,
   compileRunContract,
+  createHeldOutProbePlan,
   createRunEvent,
   evidenceSnapshot,
   graphPlanShape,
+  resolveHeldOutProbes,
   reduceEvents,
   semanticVerdictJsonSchema,
   validateGraph,
   verifyRunEvent,
+  workerVisibleProbePlan,
   workerResultJsonSchema,
   type GraphPlan,
   type GraphAmendment,
   type ProbeResult,
+  type ProbePlan,
 } from "./index.ts";
 
 const repository = {
@@ -57,6 +61,55 @@ describe("run contracts and graphs", () => {
     expect(graph.family).toBe("migration");
     expect(graph.nodes.map(({ id }) => id)).toEqual(["implement", "verify", "commit"]);
     expect(() => validateGraph(graph)).not.toThrow();
+  });
+
+  it("replaces held-out scoring implementations with integrity-bound graph references", () => {
+    const runId = randomUUID();
+    const hiddenCommand = {
+      id: "hidden-acceptance",
+      kind: "command" as const,
+      command: "node",
+      args: ["hidden-scorer.mjs", "--private-rubric"],
+      expectedExitCode: 0,
+      timeoutMs: 1_000,
+    };
+    const probePlan: ProbePlan = {
+      schemaVersion: 1,
+      family: "feature",
+      items: [
+        {
+          phase: "progress",
+          purpose: "focused",
+          source: "approved base SHA",
+          probe: {
+            id: "workspace-diff",
+            kind: "git_diff",
+            baseSha: "abc123",
+            requireChanges: true,
+          },
+        },
+        {
+          phase: "completion",
+          purpose: "acceptance",
+          source: "private acceptance scorer",
+          probe: hiddenCommand,
+        },
+      ],
+    };
+    const heldOut = createHeldOutProbePlan(runId, probePlan);
+    const visible = workerVisibleProbePlan(probePlan, heldOut);
+    const reference = visible.items.find(({ phase }) => phase === "completion")!.probe;
+
+    expect(reference).toMatchObject({ id: hiddenCommand.id, kind: "held_out" });
+    if (reference.kind !== "held_out") throw new Error("Expected a held-out probe reference");
+    expect(JSON.stringify(visible)).not.toContain("hidden-scorer.mjs");
+    expect(resolveHeldOutProbes([reference], heldOut)).toEqual([hiddenCommand]);
+    expect(() =>
+      resolveHeldOutProbes([{ ...reference, probeHash: "0".repeat(64) }], heldOut),
+    ).toThrow(/substituted/);
+    expect(() =>
+      createHeldOutProbePlan(runId, { ...probePlan, items: probePlan.items.slice(0, 1) }),
+    ).toThrow(/executable held-out proof/);
   });
 
   it("rejects a dependency cycle", () => {

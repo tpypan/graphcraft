@@ -1,6 +1,7 @@
 export * from "./amendment.ts";
 export * from "./control.ts";
 export * from "./governance.ts";
+export * from "./held-out.ts";
 export * from "./lock.ts";
 export * from "./migration.ts";
 export * from "./repository.ts";

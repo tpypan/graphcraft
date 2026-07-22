@@ -176,6 +176,7 @@ export function reduceEvents(events: RunEvent[]): RunState {
       case "invocation.resumed":
       case "invocation.finished":
       case "control.applied":
+      case "held_out.checked":
       case "semantic.verdict":
       case "control.observed":
       case "control.override":

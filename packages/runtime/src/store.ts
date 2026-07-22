@@ -4,17 +4,22 @@ import {
   GraphSchema,
   GraphAmendmentRecordSchema,
   GraphRevisionRecordSchema,
+  HeldOutProbePlanSchema,
   HostEventSchema,
   ProbePlanSchema,
   RunContractSchema,
   RunEventSchema,
   RunStateSchema,
   createRunEvent,
+  createHeldOutProbePlan,
   probePlanFromGraph,
   reduceEvents,
+  validateHeldOutProbePlan,
+  verifyRunEvent,
   type Graph,
   type GraphRevisionRecord,
   type HostEvent,
+  type HeldOutProbePlan,
   type ProbePlan,
   type RunContract,
   type RunEvent,
@@ -54,10 +59,14 @@ export class RunStore {
     contract: RunContract,
     graph: Graph,
     inputProbePlan?: ProbePlan,
+    inputHeldOutProbePlan?: HeldOutProbePlan,
   ): Promise<RunStore> {
     const store = new RunStore(repositoryRoot, contract.runId);
     store.initializing = true;
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
+    const heldOutProbePlan = inputHeldOutProbePlan
+      ? validateHeldOutProbePlan(inputHeldOutProbePlan)
+      : createHeldOutProbePlan(contract.runId, probePlan);
     await Promise.all([
       mkdir(join(store.runRoot, "artifacts"), { recursive: true }),
       mkdir(join(store.runRoot, "capsules"), { recursive: true }),
@@ -68,13 +77,20 @@ export class RunStore {
       store.saveContract(contract),
       store.saveGraph(graph),
       store.saveProbePlan(probePlan),
+      store.saveHeldOutProbePlan(heldOutProbePlan),
     ]);
     const event = createRunEvent({
       sequence: 1,
       actor: "runtime",
       causationId: contract.runId,
       type: "run.created",
-      data: { contract, graph, probePlan, nodeIds: graph.nodes.map(({ id }) => id) },
+      data: {
+        contract,
+        graph,
+        probePlan,
+        heldOutProbePlan,
+        nodeIds: graph.nodes.map(({ id }) => id),
+      },
     });
     await writeFile(store.eventsPath(), `${JSON.stringify(event)}\n`, {
       encoding: "utf8",
@@ -155,13 +171,55 @@ export class RunStore {
     }
   }
 
+  async saveHeldOutProbePlan(heldOutProbePlan: HeldOutProbePlan): Promise<void> {
+    await this.ensureStorage();
+    await writeJsonAtomic(
+      join(this.runRoot, "held-out-probes.json"),
+      validateHeldOutProbePlan(heldOutProbePlan),
+    );
+  }
+
+  async loadHeldOutProbePlan(): Promise<HeldOutProbePlan> {
+    await this.ensureStorage();
+    const events = await this.loadEvents();
+    const eventPlan = events.findLast(
+      (event) =>
+        (event.type === "run.created" || event.type === "graph.amended") &&
+        event.data.heldOutProbePlan,
+    )?.data.heldOutProbePlan;
+    if (eventPlan) {
+      const heldOutProbePlan = validateHeldOutProbePlan(HeldOutProbePlanSchema.parse(eventPlan));
+      const materialized = await readFile(join(this.runRoot, "held-out-probes.json"), "utf8")
+        .then((value) => validateHeldOutProbePlan(HeldOutProbePlanSchema.parse(JSON.parse(value))))
+        .catch(() => undefined);
+      if (JSON.stringify(materialized) !== JSON.stringify(heldOutProbePlan))
+        await this.saveHeldOutProbePlan(heldOutProbePlan);
+      return heldOutProbePlan;
+    }
+    try {
+      return validateHeldOutProbePlan(
+        HeldOutProbePlanSchema.parse(
+          JSON.parse(await readFile(join(this.runRoot, "held-out-probes.json"), "utf8")),
+        ),
+      );
+    } catch {
+      return createHeldOutProbePlan(this.runId, await this.loadProbePlan());
+    }
+  }
+
   async loadEvents(): Promise<RunEvent[]> {
     await this.ensureStorage();
     const content = await readFile(this.eventsPath(), "utf8");
-    return content
+    const events = content
       .split("\n")
       .filter(Boolean)
       .map((line) => RunEventSchema.parse(JSON.parse(line)));
+    for (const [index, event] of events.entries()) {
+      verifyRunEvent(event);
+      if (event.sequence !== index + 1)
+        throw new Error(`Expected event sequence ${index + 1}, received ${event.sequence}`);
+    }
+    return events;
   }
 
   async loadState(): Promise<RunState> {
@@ -211,13 +269,24 @@ export class RunStore {
     let probePlan = events[0]?.data.probePlan
       ? ProbePlanSchema.parse(events[0].data.probePlan)
       : probePlanFromGraph(createdGraph);
+    let heldOutProbePlan = events[0]?.data.heldOutProbePlan
+      ? validateHeldOutProbePlan(HeldOutProbePlanSchema.parse(events[0].data.heldOutProbePlan))
+      : createHeldOutProbePlan(this.runId, probePlan);
     for (const event of events) {
       if (event.type === "graph.amended" && event.data.graph) {
         graph = GraphSchema.parse(event.data.graph);
         if (event.data.probePlan) probePlan = ProbePlanSchema.parse(event.data.probePlan);
+        if (event.data.heldOutProbePlan)
+          heldOutProbePlan = validateHeldOutProbePlan(
+            HeldOutProbePlanSchema.parse(event.data.heldOutProbePlan),
+          );
       }
     }
-    await Promise.all([this.saveGraph(graph), this.saveProbePlan(probePlan)]);
+    await Promise.all([
+      this.saveGraph(graph),
+      this.saveProbePlan(probePlan),
+      this.saveHeldOutProbePlan(heldOutProbePlan),
+    ]);
     return await this.materialize(events);
   }
 

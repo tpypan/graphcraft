@@ -3374,7 +3374,7 @@ function useColor() {
 var program = new Command();
 
 // packages/cli/src/bin.ts
-import { readFile as readFile7 } from "node:fs/promises";
+import { readFile as readFile8 } from "node:fs/promises";
 
 // packages/cli/src/index.ts
 import { createInterface as createInterface3 } from "node:readline/promises";
@@ -3382,7 +3382,7 @@ import { spawn as spawn4 } from "node:child_process";
 import { access as access2, chmod, copyFile, mkdir as mkdir5 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname as dirname6, join as join10, resolve as resolve3 } from "node:path";
+import { dirname as dirname6, join as join10, resolve as resolve4 } from "node:path";
 import { stdin, stdout } from "node:process";
 
 // package.json
@@ -18082,12 +18082,19 @@ var RepositoryInventoryProbeSchema = external_exports.strictObject({
   paths: external_exports.array(external_exports.string().min(1)).min(1),
   terms: external_exports.array(external_exports.string().min(1)).min(1)
 });
-var ProbeSpecSchema = external_exports.union([
+var ExecutableProbeSchema = external_exports.union([
   CommandProbeSchema,
   FileProbeSchema,
   GitDiffProbeSchema,
   RepositoryInventoryProbeSchema
 ]);
+var HeldOutProbeReferenceSchema = external_exports.strictObject({
+  id: external_exports.string().min(1),
+  kind: external_exports.literal("held_out"),
+  planDigest: external_exports.string().regex(/^[a-f0-9]{64}$/),
+  probeHash: external_exports.string().regex(/^[a-f0-9]{64}$/)
+});
+var ProbeSpecSchema = external_exports.union([ExecutableProbeSchema, HeldOutProbeReferenceSchema]);
 var ProbePlanItemSchema = external_exports.strictObject({
   phase: external_exports.enum(["progress", "completion"]),
   purpose: external_exports.enum(["inventory", "focused", "acceptance", "regression"]),
@@ -18098,6 +18105,32 @@ var ProbePlanSchema = external_exports.strictObject({
   schemaVersion: external_exports.literal(1),
   family: external_exports.enum(["bug", "feature", "migration", "refactor", "audit"]),
   items: external_exports.array(ProbePlanItemSchema).min(1)
+});
+var HeldOutProbeIntegritySchema = external_exports.discriminatedUnion("kind", [
+  external_exports.strictObject({
+    kind: external_exports.literal("package_script"),
+    path: external_exports.string().min(1),
+    script: external_exports.string().min(1),
+    valueHash: external_exports.string().regex(/^[a-f0-9]{64}$/)
+  }),
+  external_exports.strictObject({
+    kind: external_exports.literal("file"),
+    path: external_exports.string().min(1),
+    valueHash: external_exports.string().regex(/^[a-f0-9]{64}$/)
+  })
+]);
+var HeldOutProbeEntrySchema = external_exports.strictObject({
+  probe: ExecutableProbeSchema,
+  probeHash: external_exports.string().regex(/^[a-f0-9]{64}$/),
+  source: external_exports.string().min(1),
+  integrity: external_exports.array(HeldOutProbeIntegritySchema)
+});
+var HeldOutProbePlanSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  runId: external_exports.uuid(),
+  family: external_exports.enum(["bug", "feature", "migration", "refactor", "audit"]),
+  probes: external_exports.array(HeldOutProbeEntrySchema).min(1),
+  digest: external_exports.string().regex(/^[a-f0-9]{64}$/)
 });
 var ProbeResultSchema = external_exports.strictObject({
   probeId: external_exports.string().min(1),
@@ -18418,6 +18451,7 @@ var RunEventTypeSchema = external_exports.enum([
   "control.override",
   "control.decision_required",
   "control.resolved",
+  "held_out.checked",
   "semantic.verdict",
   "tokens.recorded",
   "graph.amended"
@@ -18471,6 +18505,7 @@ var RunStorageManifestSchema = external_exports.strictObject({
     contract: external_exports.literal(1),
     graph: external_exports.literal(1),
     probePlan: external_exports.literal(1),
+    heldOutProbes: external_exports.literal(1).default(1),
     events: external_exports.literal(1),
     state: external_exports.literal(1),
     workspace: external_exports.literal(1),
@@ -18779,7 +18814,7 @@ function validateProbePolicy(probe, contract, approvedProbes) {
   if (probe.kind === "repository_inventory" && probe.paths.some((path2) => !safeRelativePattern(path2))) {
     throw new Error(`Probe ${probe.id} contains an unsafe inventory path`);
   }
-  if ((probe.kind === "command" || probe.kind === "repository_inventory") && !approvedProbes.some((allowed) => sameProbe(allowed, probe))) {
+  if ((probe.kind === "command" || probe.kind === "repository_inventory" || probe.kind === "held_out") && !approvedProbes.some((allowed) => sameProbe(allowed, probe))) {
     throw new Error(`Probe ${probe.id} is not an approved deterministic probe`);
   }
 }
@@ -19180,6 +19215,94 @@ function graphPlanShape(graph) {
   return layers.join(" \u2192 ");
 }
 
+// packages/core/src/held-out.ts
+function createHeldOutProbePlan(runId, input, integrity = {}) {
+  const plan = ProbePlanSchema.parse(input);
+  if (plan.items.some(({ probe }) => probe.kind === "held_out"))
+    throw new Error("An approved probe plan cannot contain held-out references");
+  const probes = plan.items.filter(({ phase }) => phase === "completion").map(({ probe, source }) => {
+    if (probe.kind === "held_out") throw new Error("Unreachable held-out probe reference");
+    return {
+      probe,
+      probeHash: contentHash(probe),
+      source,
+      integrity: integrity[probe.id] ?? []
+    };
+  });
+  if (probes.length === 0)
+    throw new Error("Every finish line requires at least one executable held-out proof");
+  const value = { schemaVersion: 1, runId, family: plan.family, probes };
+  return validateHeldOutProbePlan(
+    HeldOutProbePlanSchema.parse({ ...value, digest: contentHash(value) })
+  );
+}
+function validateHeldOutProbePlan(input) {
+  const plan = HeldOutProbePlanSchema.parse(input);
+  const ids = /* @__PURE__ */ new Set();
+  for (const entry of plan.probes) {
+    if (ids.has(entry.probe.id))
+      throw new Error(`Held-out completion probe ID ${entry.probe.id} is duplicated`);
+    ids.add(entry.probe.id);
+    if (entry.probeHash !== contentHash(entry.probe))
+      throw new Error(`Held-out completion probe ${entry.probe.id} failed its integrity hash`);
+    for (const integrity of entry.integrity) {
+      const normalized = integrity.path.replaceAll("\\", "/");
+      if (normalized.startsWith("/") || /^[a-z]:\//i.test(normalized) || normalized.split("/").includes("..")) {
+        throw new Error(`Held-out completion probe ${entry.probe.id} has an unsafe integrity path`);
+      }
+    }
+  }
+  const { digest: _digest, ...value } = plan;
+  if (plan.digest !== contentHash(value))
+    throw new Error("Held-out completion plan failed its integrity hash");
+  return plan;
+}
+function workerVisibleProbePlan(input, heldOutInput) {
+  const probePlan = ProbePlanSchema.parse(input);
+  const heldOut = validateHeldOutProbePlan(heldOutInput);
+  if (probePlan.family !== heldOut.family)
+    throw new Error("Held-out completion probes do not match the task family");
+  const byId = new Map(heldOut.probes.map((entry) => [entry.probe.id, entry]));
+  return ProbePlanSchema.parse({
+    ...probePlan,
+    items: probePlan.items.map((item) => {
+      if (item.phase !== "completion") return item;
+      const entry = byId.get(item.probe.id);
+      if (!entry || entry.probeHash !== contentHash(item.probe))
+        throw new Error(`Completion probe ${item.probe.id} is not in the held-out plan`);
+      return {
+        ...item,
+        source: `Runtime-held completion proof ${item.probe.id}`,
+        probe: {
+          id: item.probe.id,
+          kind: "held_out",
+          planDigest: heldOut.digest,
+          probeHash: entry.probeHash
+        }
+      };
+    })
+  });
+}
+function resolveHeldOutProbes(input, heldOutInput) {
+  const heldOut = validateHeldOutProbePlan(heldOutInput);
+  if (input.length !== heldOut.probes.length)
+    throw new Error("The graph omitted or added a held-out completion check");
+  const resolved = input.map((probe) => {
+    const entry = heldOut.probes.find(({ probe: candidate }) => candidate.id === probe.id);
+    if (!entry) throw new Error(`Unknown held-out completion check ${probe.id}`);
+    if (probe.kind === "held_out") {
+      if (probe.planDigest !== heldOut.digest || probe.probeHash !== entry.probeHash)
+        throw new Error(`Held-out completion reference ${probe.id} was substituted`);
+    } else if (contentHash(probe) !== entry.probeHash) {
+      throw new Error(`Completion check ${probe.id} was weakened or substituted`);
+    }
+    return entry.probe;
+  });
+  if (new Set(resolved.map(({ id }) => id)).size !== heldOut.probes.length)
+    throw new Error("The graph duplicated a held-out completion check");
+  return resolved;
+}
+
 // packages/core/src/leases.ts
 function progressVector(probeResults, family) {
   const passedProbeIds = probeResults.filter(({ passed }) => passed).map(({ probeId }) => probeId).sort();
@@ -19465,6 +19588,7 @@ function reduceEvents(events) {
       case "invocation.resumed":
       case "invocation.finished":
       case "control.applied":
+      case "held_out.checked":
       case "semantic.verdict":
       case "control.observed":
       case "control.override":
@@ -19639,22 +19763,22 @@ function codexUsage(value) {
   });
 }
 async function commandVersion(command) {
-  return await new Promise((resolve4) => {
+  return await new Promise((resolve5) => {
     const child = spawn(command, ["--version"], { stdio: ["ignore", "pipe", "ignore"] });
     let output = "";
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       output += chunk;
     });
-    child.once("error", () => resolve4({ installed: false }));
+    child.once("error", () => resolve5({ installed: false }));
     child.once(
       "close",
-      (code) => resolve4(code === 0 ? { installed: true, version: output.trim() } : { installed: false })
+      (code) => resolve5(code === 0 ? { installed: true, version: output.trim() } : { installed: false })
     );
   });
 }
 async function codexAuthenticated() {
-  return await new Promise((resolve4) => {
+  return await new Promise((resolve5) => {
     const child = spawn("codex", ["login", "status"], { stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     child.stdout.setEncoding("utf8");
@@ -19665,8 +19789,8 @@ async function codexAuthenticated() {
     child.stderr.on("data", (chunk) => {
       output += chunk;
     });
-    child.once("error", () => resolve4(false));
-    child.once("close", (code) => resolve4(code === 0 && !/not logged in/i.test(output)));
+    child.once("error", () => resolve5(false));
+    child.once("close", (code) => resolve5(code === 0 && !/not logged in/i.test(output)));
   });
 }
 var CodexAdapter = class {
@@ -19709,7 +19833,7 @@ var CodexAdapter = class {
       }
     );
     const exitPromise = new Promise(
-      (resolve4) => child.once("close", (code) => resolve4(code ?? 1))
+      (resolve5) => child.once("close", (code) => resolve5(code ?? 1))
     );
     const abort = () => {
       child.kill("SIGTERM");
@@ -19763,7 +19887,7 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve4) => child.once("close", (code, closeSignal) => resolve4({ code, signal: closeSignal }))
+      (resolve5) => child.once("close", (code, closeSignal) => resolve5({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderSemanticVerifierPrompt(request.context));
@@ -19816,7 +19940,7 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve4) => child.once("close", (code, closeSignal) => resolve4({ code, signal: closeSignal }))
+      (resolve5) => child.once("close", (code, closeSignal) => resolve5({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderWorkerPrompt(request.capsule));
@@ -19983,22 +20107,22 @@ function claudeUsage(value) {
   });
 }
 async function claudeVersion() {
-  return await new Promise((resolve4) => {
+  return await new Promise((resolve5) => {
     const child = spawn2("claude", ["--version"], { stdio: ["ignore", "pipe", "ignore"] });
     let output = "";
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       output += chunk;
     });
-    child.once("error", () => resolve4({ installed: false }));
+    child.once("error", () => resolve5({ installed: false }));
     child.once(
       "close",
-      (code) => resolve4(code === 0 ? { installed: true, version: output.trim() } : { installed: false })
+      (code) => resolve5(code === 0 ? { installed: true, version: output.trim() } : { installed: false })
     );
   });
 }
 async function claudeAuthenticated() {
-  return await new Promise((resolve4) => {
+  return await new Promise((resolve5) => {
     const child = spawn2("claude", ["auth", "status", "--json"], {
       stdio: ["ignore", "pipe", "ignore"]
     });
@@ -20007,13 +20131,13 @@ async function claudeAuthenticated() {
     child.stdout.on("data", (chunk) => {
       output += chunk;
     });
-    child.once("error", () => resolve4(false));
+    child.once("error", () => resolve5(false));
     child.once("close", (code) => {
       try {
         const status = JSON.parse(output);
-        resolve4(code === 0 && status.loggedIn === true);
+        resolve5(code === 0 && status.loggedIn === true);
       } catch {
-        resolve4(false);
+        resolve5(false);
       }
     });
   });
@@ -20061,7 +20185,7 @@ var ClaudeAdapter = class {
       }
     );
     const exitPromise = new Promise(
-      (resolve4) => child.once("close", (code) => resolve4(code ?? 1))
+      (resolve5) => child.once("close", (code) => resolve5(code ?? 1))
     );
     const abort = () => {
       child.kill("SIGTERM");
@@ -20109,7 +20233,7 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve4) => child.once("close", (code, closeSignal) => resolve4({ code, signal: closeSignal }))
+      (resolve5) => child.once("close", (code, closeSignal) => resolve5({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     let stderr = "";
@@ -20156,7 +20280,7 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve4) => child.once("close", (code, closeSignal) => resolve4({ code, signal: closeSignal }))
+      (resolve5) => child.once("close", (code, closeSignal) => resolve5({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     yield { type: "started", invocationId: request.invocationId };
@@ -20426,15 +20550,17 @@ async function applyRunGraphAmendmentLocked(store, input, actor) {
     };
   }
   requireChangedFailureStrategy(events, proposal);
-  const [graph, contract, state, probePlan] = await Promise.all([
+  const [graph, contract, state, probePlan, heldOutProbePlan] = await Promise.all([
     store.loadGraph(),
     store.loadContract(),
     store.loadState(),
-    store.loadProbePlan()
+    store.loadProbePlan(),
+    store.loadHeldOutProbePlan()
   ]);
   if (["awaiting_approval", "completed", "stopped"].includes(state.status))
     throw new Error(`Graph amendments are not allowed while a run is ${state.status}`);
-  const completionProbes = probePlan.items.filter(({ phase }) => phase === "completion").map(({ probe }) => probe);
+  const graphProbePlan = workerVisibleProbePlan(probePlan, heldOutProbePlan);
+  const completionProbes = graphProbePlan.items.filter(({ phase }) => phase === "completion").map(({ probe }) => probe);
   const applied = applyGraphAmendment({
     graph,
     contract,
@@ -20442,7 +20568,7 @@ async function applyRunGraphAmendmentLocked(store, input, actor) {
     actor,
     nodeStatuses: state.nodes,
     requiredVerificationProbes: completionProbes,
-    approvedProbes: probePlan.items.map(({ probe }) => probe)
+    approvedProbes: graphProbePlan.items.map(({ probe }) => probe)
   });
   const record2 = GraphAmendmentRecordSchema.parse({
     schemaVersion: 1,
@@ -20585,7 +20711,7 @@ async function requestRunControl(store, action, reason = action === "pause" ? "P
       if (!(error51 instanceof Error) || error51.message !== "Graphcraft run is already active")
         throw error51;
     }
-    await new Promise((resolve4) => setTimeout(resolve4, 50));
+    await new Promise((resolve5) => setTimeout(resolve5, 50));
   }
   throw new Error(
     `The active Graphcraft process did not acknowledge ${action} within ${waitMs}ms; the durable request remains pending`
@@ -20976,8 +21102,134 @@ async function decideRunControl(store, input) {
   }
 }
 
+// packages/runtime/src/held-out.ts
+import { readFile as readFile3, stat as stat2 } from "node:fs/promises";
+import { isAbsolute as isAbsolute2, relative, resolve, sep } from "node:path";
+function relativeRepositoryPath(repositoryRoot, candidate) {
+  const root = resolve(repositoryRoot);
+  const path2 = resolve(repositoryRoot, candidate);
+  if (path2 !== root && !path2.startsWith(`${root}${sep}`)) return void 0;
+  const result = relative(root, path2);
+  return result && !isAbsolute2(result) ? result : void 0;
+}
+function possibleFileArguments(values) {
+  return values.map((value) => value.replace(/^["']|["']$/g, "").replace(/[;&|]+$/g, "")).filter(
+    (value) => !value.startsWith("-") && (value.startsWith(".") || value.includes("/") || /\.[a-z0-9]{1,8}$/i.test(value))
+  );
+}
+async function fileIntegrity(repositoryRoot, cwd, values) {
+  const result = [];
+  for (const value of possibleFileArguments(values)) {
+    const path2 = relativeRepositoryPath(repositoryRoot, resolve(repositoryRoot, cwd ?? ".", value));
+    if (!path2) continue;
+    const details = await stat2(resolve(repositoryRoot, path2)).catch(() => void 0);
+    if (!details?.isFile()) continue;
+    const contents = await readFile3(resolve(repositoryRoot, path2));
+    result.push({
+      kind: "file",
+      path: path2,
+      valueHash: contentHash({ path: path2, contents: contents.toString("base64") })
+    });
+  }
+  return result;
+}
+async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot) {
+  const integrity = {};
+  for (const item of probePlan.items.filter(({ phase }) => phase === "completion")) {
+    if (item.probe.kind === "held_out")
+      throw new Error("An approved probe plan cannot contain held-out references");
+    const protectedValues = [];
+    if (item.probe.kind === "command") {
+      protectedValues.push(
+        ...await fileIntegrity(repositoryRoot, item.probe.cwd, item.probe.args)
+      );
+    }
+    const match = /^(.*package\.json) script (.+)$/.exec(item.source);
+    if (!match) {
+      integrity[item.probe.id] = protectedValues;
+      continue;
+    }
+    const path2 = match[1];
+    const script = match[2];
+    const manifestPath = relativeRepositoryPath(repositoryRoot, path2);
+    if (!manifestPath) throw new Error(`Completion script ${script} escapes the repository`);
+    const manifest2 = JSON.parse(await readFile3(resolve(repositoryRoot, manifestPath), "utf8"));
+    const value = manifest2.scripts?.[script];
+    if (!value) throw new Error(`Completion script ${script} is missing from ${manifestPath}`);
+    protectedValues.push({
+      kind: "package_script",
+      path: manifestPath,
+      script,
+      valueHash: contentHash({ path: manifestPath, script, value })
+    });
+    const scriptDirectory = manifestPath.includes("/") ? manifestPath.slice(0, manifestPath.lastIndexOf("/")) : void 0;
+    protectedValues.push(
+      ...await fileIntegrity(repositoryRoot, scriptDirectory, value.split(/\s+/))
+    );
+    const unique2 = new Map(
+      protectedValues.map((entry) => [
+        `${entry.kind}:${entry.path}${entry.kind === "package_script" ? `:${entry.script}` : ""}`,
+        entry
+      ])
+    );
+    integrity[item.probe.id] = [...unique2.values()];
+  }
+  return createHeldOutProbePlan(runId, probePlan, integrity);
+}
+async function heldOutIntegrityFailures(plan, repositoryPath) {
+  const failures = [];
+  for (const entry of plan.probes) {
+    const changedKinds = /* @__PURE__ */ new Set();
+    let signature = "";
+    for (const integrity of entry.integrity) {
+      let actualHash;
+      if (integrity.kind === "package_script") {
+        const manifest2 = await readFile3(resolve(repositoryPath, integrity.path), "utf8").then(
+          (value2) => JSON.parse(value2)
+        ).catch(() => void 0);
+        const value = manifest2?.scripts?.[integrity.script];
+        actualHash = value ? contentHash({ path: integrity.path, script: integrity.script, value }) : contentHash({ missing: true, path: integrity.path, script: integrity.script });
+      } else {
+        const contents = await readFile3(resolve(repositoryPath, integrity.path)).catch(
+          () => void 0
+        );
+        actualHash = contents ? contentHash({ path: integrity.path, contents: contents.toString("base64") }) : contentHash({ missing: true, path: integrity.path });
+      }
+      if (actualHash === integrity.valueHash) continue;
+      changedKinds.add(integrity.kind);
+      signature += actualHash;
+    }
+    if (changedKinds.size > 0) {
+      const detail = [
+        changedKinds.has("package_script") ? "package script definition" : void 0,
+        changedKinds.has("file") ? "protected measurement file" : void 0
+      ].filter(Boolean).join(" and ");
+      failures.push({
+        probeId: `${entry.probe.id}-integrity`,
+        kind: "file",
+        passed: false,
+        signature: contentHash(signature),
+        summary: `Approved completion check ${entry.probe.id} changed or was removed; restore its ${detail}`,
+        durationMs: 0
+      });
+    }
+  }
+  return failures;
+}
+function actionableHeldOutFailures(results) {
+  return results.map((result) => {
+    if (result.probeId.endsWith("-integrity")) return result;
+    const separator = result.summary.indexOf(":");
+    const detail = separator >= 0 ? result.summary.slice(separator + 1).trim() : "";
+    return {
+      ...result,
+      summary: `Completion check ${result.probeId} failed${detail ? `: ${detail}` : ""}`
+    };
+  });
+}
+
 // packages/runtime/src/migration.ts
-import { cp, readFile as readFile3 } from "node:fs/promises";
+import { cp, readFile as readFile4 } from "node:fs/promises";
 import { join as join5 } from "node:path";
 var CURRENT_RUN_STORAGE_VERSION = 1;
 function manifest(runId, migratedFrom) {
@@ -20989,6 +21241,7 @@ function manifest(runId, migratedFrom) {
       contract: 1,
       graph: 1,
       probePlan: 1,
+      heldOutProbes: 1,
       events: 1,
       state: 1,
       workspace: 1,
@@ -21013,7 +21266,7 @@ async function ensureCurrentRunStorage(input) {
   const path2 = runStorageManifestPath(input.runRoot);
   let raw;
   try {
-    raw = JSON.parse(await readFile3(path2, "utf8"));
+    raw = JSON.parse(await readFile4(path2, "utf8"));
   } catch (error51) {
     if (error51.code !== "ENOENT")
       throw new Error(
@@ -21035,7 +21288,7 @@ async function ensureCurrentRunStorage(input) {
       throw new Error(`Run storage manifest belongs to ${parsed.runId}, not ${input.runId}`);
     return parsed;
   }
-  await readFile3(join5(input.runRoot, "events.jsonl"), "utf8").catch((error51) => {
+  await readFile4(join5(input.runRoot, "events.jsonl"), "utf8").catch((error51) => {
     throw new Error(
       `Legacy run ${input.runId} cannot migrate because events.jsonl is unavailable: ${error51.message}`
     );
@@ -21047,14 +21300,14 @@ async function ensureCurrentRunStorage(input) {
     if (!(error51 instanceof Error) || !error51.message.includes("already active")) throw error51;
     const deadline = Date.now() + 5e3;
     while (Date.now() <= deadline) {
-      const migrated = await readFile3(path2, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
+      const migrated = await readFile4(path2, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
       if (migrated) return migrated;
-      await new Promise((resolve4) => setTimeout(resolve4, 10));
+      await new Promise((resolve5) => setTimeout(resolve5, 10));
     }
     throw new Error(`Timed out waiting for storage migration of run ${input.runId}`);
   }
   try {
-    const migrated = await readFile3(path2, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
+    const migrated = await readFile4(path2, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
     if (migrated) return migrated;
     const backupRoot = join5(input.graphcraftRoot, "migration-backups", input.runId, "0-to-1");
     await cp(input.runRoot, backupRoot, {
@@ -21069,20 +21322,20 @@ async function ensureCurrentRunStorage(input) {
 }
 
 // packages/runtime/src/repository.ts
-import { appendFile, mkdir as mkdir3, readFile as readFile5 } from "node:fs/promises";
-import { basename, dirname as dirname4, isAbsolute as isAbsolute2, join as join7, resolve as resolve2 } from "node:path";
+import { appendFile, mkdir as mkdir3, readFile as readFile6 } from "node:fs/promises";
+import { basename, dirname as dirname4, isAbsolute as isAbsolute3, join as join7, resolve as resolve3 } from "node:path";
 
 // packages/probes/src/index.ts
-import { access, readFile as readFile4, stat as stat2 } from "node:fs/promises";
+import { access, readFile as readFile5, stat as stat3 } from "node:fs/promises";
 import { constants } from "node:fs";
-import { dirname as dirname3, join as join6, resolve, sep } from "node:path";
+import { dirname as dirname3, join as join6, resolve as resolve2, sep as sep2 } from "node:path";
 
 // packages/probes/src/process.ts
 import { spawn as spawn3 } from "node:child_process";
 async function runProcess(command, args, options) {
   const started = performance.now();
   const timeoutMs = options.timeoutMs ?? 12e4;
-  return await new Promise((resolve4, reject) => {
+  return await new Promise((resolve5, reject) => {
     const child = spawn3(command, args, {
       cwd: options.cwd,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -21114,7 +21367,7 @@ async function runProcess(command, args, options) {
     child.once("close", (code) => {
       clearTimeout(timer);
       options.signal?.removeEventListener("abort", abort);
-      resolve4({
+      resolve5({
         exitCode: code ?? (timedOut ? 124 : 1),
         stdout: stdout2,
         stderr,
@@ -21133,9 +21386,11 @@ function compactOutput(result) {
 }
 async function runProbe(spec, repositoryPath, signal) {
   const started = performance.now();
+  if (spec.kind === "held_out")
+    throw new Error(`Held-out probe ${spec.id} must be resolved by the runtime`);
   if (spec.kind === "command") {
     const processResult = await runProcess(spec.command, spec.args, {
-      cwd: spec.cwd ? resolve(repositoryPath, spec.cwd) : repositoryPath,
+      cwd: spec.cwd ? resolve2(repositoryPath, spec.cwd) : repositoryPath,
       timeoutMs: spec.timeoutMs,
       ...signal ? { signal } : {}
     });
@@ -21157,7 +21412,7 @@ async function runProbe(spec, repositoryPath, signal) {
     };
   }
   if (spec.kind === "file") {
-    const path2 = resolve(repositoryPath, spec.path);
+    const path2 = resolve2(repositoryPath, spec.path);
     let exists = true;
     try {
       await access(path2, constants.F_OK);
@@ -21165,7 +21420,7 @@ async function runProbe(spec, repositoryPath, signal) {
       exists = false;
     }
     let contains = true;
-    if (exists && spec.contains) contains = (await readFile4(path2, "utf8")).includes(spec.contains);
+    if (exists && spec.contains) contains = (await readFile5(path2, "utf8")).includes(spec.contains);
     const passed2 = exists === spec.shouldExist && contains;
     const summary = `${spec.path} ${exists ? "exists" : "does not exist"}${spec.contains ? ` and ${contains ? "contains" : "does not contain"} the required text` : ""}`;
     return {
@@ -21313,10 +21568,10 @@ async function packageCandidates(repositoryPath, family, terms) {
   const tracked = await runProcess("git", ["ls-files"], { cwd: repositoryPath });
   if (tracked.exitCode !== 0) return [];
   const manifests = tracked.stdout.split("\n").filter((path2) => path2 === "package.json" || path2.endsWith("/package.json")).slice(0, 100);
-  const rootManifest = manifests.includes("package.json") ? JSON.parse(await readFile4(join6(repositoryPath, "package.json"), "utf8")) : void 0;
+  const rootManifest = manifests.includes("package.json") ? JSON.parse(await readFile5(join6(repositoryPath, "package.json"), "utf8")) : void 0;
   const candidates = [];
   for (const manifestPath of manifests) {
-    const manifest2 = JSON.parse(await readFile4(join6(repositoryPath, manifestPath), "utf8"));
+    const manifest2 = JSON.parse(await readFile5(join6(repositoryPath, manifestPath), "utf8"));
     const directory = dirname3(manifestPath) === "." ? void 0 : dirname3(manifestPath);
     const relevant = !directory || terms.some(
       (term) => directory.toLowerCase().includes(term) || manifest2.name?.toLowerCase().includes(term)
@@ -21357,9 +21612,9 @@ function selectPackageCandidates(candidates) {
   );
 }
 function withinRepository(repositoryPath, candidate) {
-  const root = resolve(repositoryPath);
-  const path2 = resolve(repositoryPath, candidate);
-  return path2 === root || path2.startsWith(`${root}${sep}`);
+  const root = resolve2(repositoryPath);
+  const path2 = resolve2(repositoryPath, candidate);
+  return path2 === root || path2.startsWith(`${root}${sep2}`);
 }
 async function validateProbePlan(input, repositoryPath) {
   const plan = ProbePlanSchema.parse(input);
@@ -21370,6 +21625,8 @@ async function validateProbePlan(input, repositoryPath) {
     const key = `${item.phase}:${item.probe.id}`;
     if (keys.has(key)) throw new Error(`Duplicate ${item.phase} probe ID ${item.probe.id}`);
     keys.add(key);
+    if (item.probe.kind === "held_out")
+      throw new Error("User-editable probe plans cannot contain held-out references");
     if (item.probe.kind === "command") {
       if (item.probe.timeoutMs > 18e5)
         throw new Error(`Probe ${item.probe.id} exceeds the 30 minute timeout limit`);
@@ -21378,7 +21635,7 @@ async function validateProbePlan(input, repositoryPath) {
       const cwd = item.probe.cwd ?? ".";
       if (!withinRepository(repositoryPath, cwd))
         throw new Error(`Probe ${item.probe.id} escapes the repository working directory`);
-      const directory = await stat2(resolve(repositoryPath, cwd)).catch(() => void 0);
+      const directory = await stat3(resolve2(repositoryPath, cwd)).catch(() => void 0);
       if (!directory?.isDirectory())
         throw new Error(`Probe ${item.probe.id} uses missing working directory ${cwd}`);
     }
@@ -21576,7 +21833,7 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
   ) : [];
   const taskMatches = await Promise.all(
     matchedPaths.map(async (path2) => {
-      const content = await readFile5(join7(repositoryRoot, path2), "utf8").catch(() => "");
+      const content = await readFile6(join7(repositoryRoot, path2), "utf8").catch(() => "");
       const normalized = content.toLowerCase();
       const score = searchTerms.filter((term) => normalized.includes(term)).length;
       const pathScore = searchTerms.filter((term) => path2.toLowerCase().includes(term)).length;
@@ -21601,7 +21858,7 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
   for (const path2 of baselinePaths) {
     if (remainingCharacters <= 0 || files.length >= 7) break;
     if (files.some((file2) => file2.path === path2)) continue;
-    const content = await readFile5(join7(repositoryRoot, path2), "utf8").catch(() => "");
+    const content = await readFile6(join7(repositoryRoot, path2), "utf8").catch(() => "");
     const limit = Math.min(2e3, remainingCharacters);
     const selected = content.slice(0, limit);
     files.push({ path: path2, content: selected, truncated: selected.length < content.length });
@@ -21617,10 +21874,10 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
 }
 async function ensureGraphcraftIgnored(repositoryRoot) {
   const rawExcludePath = await git(repositoryRoot, ["rev-parse", "--git-path", "info/exclude"]);
-  const excludePath = isAbsolute2(rawExcludePath) ? rawExcludePath : resolve2(repositoryRoot, rawExcludePath);
+  const excludePath = isAbsolute3(rawExcludePath) ? rawExcludePath : resolve3(repositoryRoot, rawExcludePath);
   let content = "";
   try {
-    content = await readFile5(excludePath, "utf8");
+    content = await readFile6(excludePath, "utf8");
   } catch {
     await mkdir3(dirname4(excludePath), { recursive: true });
   }
@@ -21666,7 +21923,7 @@ import { randomUUID as randomUUID7 } from "node:crypto";
 import { join as join9 } from "node:path";
 
 // packages/runtime/src/store.ts
-import { appendFile as appendFile2, mkdir as mkdir4, readFile as readFile6, readdir, writeFile as writeFile3 } from "node:fs/promises";
+import { appendFile as appendFile2, mkdir as mkdir4, readFile as readFile7, readdir, writeFile as writeFile3 } from "node:fs/promises";
 import { dirname as dirname5, join as join8 } from "node:path";
 var RunStore = class _RunStore {
   repositoryRoot;
@@ -21691,10 +21948,11 @@ var RunStore = class _RunStore {
     });
     await this.storageReady;
   }
-  static async create(repositoryRoot, contract, graph, inputProbePlan) {
+  static async create(repositoryRoot, contract, graph, inputProbePlan, inputHeldOutProbePlan) {
     const store = new _RunStore(repositoryRoot, contract.runId);
     store.initializing = true;
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
+    const heldOutProbePlan = inputHeldOutProbePlan ? validateHeldOutProbePlan(inputHeldOutProbePlan) : createHeldOutProbePlan(contract.runId, probePlan);
     await Promise.all([
       mkdir4(join8(store.runRoot, "artifacts"), { recursive: true }),
       mkdir4(join8(store.runRoot, "capsules"), { recursive: true }),
@@ -21704,14 +21962,21 @@ var RunStore = class _RunStore {
     await Promise.all([
       store.saveContract(contract),
       store.saveGraph(graph),
-      store.saveProbePlan(probePlan)
+      store.saveProbePlan(probePlan),
+      store.saveHeldOutProbePlan(heldOutProbePlan)
     ]);
     const event = createRunEvent({
       sequence: 1,
       actor: "runtime",
       causationId: contract.runId,
       type: "run.created",
-      data: { contract, graph, probePlan, nodeIds: graph.nodes.map(({ id }) => id) }
+      data: {
+        contract,
+        graph,
+        probePlan,
+        heldOutProbePlan,
+        nodeIds: graph.nodes.map(({ id }) => id)
+      }
     });
     await writeFile3(store.eventsPath(), `${JSON.stringify(event)}
 `, {
@@ -21733,7 +21998,7 @@ var RunStore = class _RunStore {
   async loadContract() {
     await this.ensureStorage();
     return RunContractSchema.parse(
-      JSON.parse(await readFile6(join8(this.runRoot, "contract.json"), "utf8"))
+      JSON.parse(await readFile7(join8(this.runRoot, "contract.json"), "utf8"))
     );
   }
   async saveGraph(graph) {
@@ -21748,11 +22013,11 @@ var RunStore = class _RunStore {
     )?.data.graph;
     if (eventGraph) {
       const graph = GraphSchema.parse(eventGraph);
-      const materialized = await readFile6(join8(this.runRoot, "graph.json"), "utf8").then((value) => GraphSchema.parse(JSON.parse(value))).catch(() => void 0);
+      const materialized = await readFile7(join8(this.runRoot, "graph.json"), "utf8").then((value) => GraphSchema.parse(JSON.parse(value))).catch(() => void 0);
       if (JSON.stringify(materialized) !== JSON.stringify(graph)) await this.saveGraph(graph);
       return graph;
     }
-    return GraphSchema.parse(JSON.parse(await readFile6(join8(this.runRoot, "graph.json"), "utf8")));
+    return GraphSchema.parse(JSON.parse(await readFile7(join8(this.runRoot, "graph.json"), "utf8")));
   }
   async saveProbePlan(probePlan) {
     await this.ensureStorage();
@@ -21766,29 +22031,65 @@ var RunStore = class _RunStore {
     )?.data.probePlan;
     if (eventPlan) {
       const probePlan = ProbePlanSchema.parse(eventPlan);
-      const materialized = await readFile6(join8(this.runRoot, "probe-plan.json"), "utf8").then((value) => ProbePlanSchema.parse(JSON.parse(value))).catch(() => void 0);
+      const materialized = await readFile7(join8(this.runRoot, "probe-plan.json"), "utf8").then((value) => ProbePlanSchema.parse(JSON.parse(value))).catch(() => void 0);
       if (JSON.stringify(materialized) !== JSON.stringify(probePlan))
         await this.saveProbePlan(probePlan);
       return probePlan;
     }
     try {
       return ProbePlanSchema.parse(
-        JSON.parse(await readFile6(join8(this.runRoot, "probe-plan.json"), "utf8"))
+        JSON.parse(await readFile7(join8(this.runRoot, "probe-plan.json"), "utf8"))
       );
     } catch {
       return probePlanFromGraph(await this.loadGraph());
     }
   }
+  async saveHeldOutProbePlan(heldOutProbePlan) {
+    await this.ensureStorage();
+    await writeJsonAtomic(
+      join8(this.runRoot, "held-out-probes.json"),
+      validateHeldOutProbePlan(heldOutProbePlan)
+    );
+  }
+  async loadHeldOutProbePlan() {
+    await this.ensureStorage();
+    const events = await this.loadEvents();
+    const eventPlan = events.findLast(
+      (event) => (event.type === "run.created" || event.type === "graph.amended") && event.data.heldOutProbePlan
+    )?.data.heldOutProbePlan;
+    if (eventPlan) {
+      const heldOutProbePlan = validateHeldOutProbePlan(HeldOutProbePlanSchema.parse(eventPlan));
+      const materialized = await readFile7(join8(this.runRoot, "held-out-probes.json"), "utf8").then((value) => validateHeldOutProbePlan(HeldOutProbePlanSchema.parse(JSON.parse(value)))).catch(() => void 0);
+      if (JSON.stringify(materialized) !== JSON.stringify(heldOutProbePlan))
+        await this.saveHeldOutProbePlan(heldOutProbePlan);
+      return heldOutProbePlan;
+    }
+    try {
+      return validateHeldOutProbePlan(
+        HeldOutProbePlanSchema.parse(
+          JSON.parse(await readFile7(join8(this.runRoot, "held-out-probes.json"), "utf8"))
+        )
+      );
+    } catch {
+      return createHeldOutProbePlan(this.runId, await this.loadProbePlan());
+    }
+  }
   async loadEvents() {
     await this.ensureStorage();
-    const content = await readFile6(this.eventsPath(), "utf8");
-    return content.split("\n").filter(Boolean).map((line) => RunEventSchema.parse(JSON.parse(line)));
+    const content = await readFile7(this.eventsPath(), "utf8");
+    const events = content.split("\n").filter(Boolean).map((line) => RunEventSchema.parse(JSON.parse(line)));
+    for (const [index, event] of events.entries()) {
+      verifyRunEvent(event);
+      if (event.sequence !== index + 1)
+        throw new Error(`Expected event sequence ${index + 1}, received ${event.sequence}`);
+    }
+    return events;
   }
   async loadState() {
     await this.ensureStorage();
     try {
       return RunStateSchema.parse(
-        JSON.parse(await readFile6(join8(this.runRoot, "state.json"), "utf8"))
+        JSON.parse(await readFile7(join8(this.runRoot, "state.json"), "utf8"))
       );
     } catch {
       return await this.rebuildViews();
@@ -21823,13 +22124,22 @@ var RunStore = class _RunStore {
     const createdGraph = GraphSchema.parse(events[0]?.data.graph);
     let graph = createdGraph;
     let probePlan = events[0]?.data.probePlan ? ProbePlanSchema.parse(events[0].data.probePlan) : probePlanFromGraph(createdGraph);
+    let heldOutProbePlan = events[0]?.data.heldOutProbePlan ? validateHeldOutProbePlan(HeldOutProbePlanSchema.parse(events[0].data.heldOutProbePlan)) : createHeldOutProbePlan(this.runId, probePlan);
     for (const event of events) {
       if (event.type === "graph.amended" && event.data.graph) {
         graph = GraphSchema.parse(event.data.graph);
         if (event.data.probePlan) probePlan = ProbePlanSchema.parse(event.data.probePlan);
+        if (event.data.heldOutProbePlan)
+          heldOutProbePlan = validateHeldOutProbePlan(
+            HeldOutProbePlanSchema.parse(event.data.heldOutProbePlan)
+          );
       }
     }
-    await Promise.all([this.saveGraph(graph), this.saveProbePlan(probePlan)]);
+    await Promise.all([
+      this.saveGraph(graph),
+      this.saveProbePlan(probePlan),
+      this.saveHeldOutProbePlan(heldOutProbePlan)
+    ]);
     return await this.materialize(events);
   }
   async writeArtifact(relativePath, value) {
@@ -21853,7 +22163,7 @@ var RunStore = class _RunStore {
   async loadInvocationEvents(invocationId) {
     await this.ensureStorage();
     const path2 = join8(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
-    const content = await readFile6(path2, "utf8");
+    const content = await readFile7(path2, "utf8");
     return content.split("\n").filter(Boolean).map((line) => HostEventSchema.parse(JSON.parse(line)));
   }
   async loadGraphHistory() {
@@ -21912,7 +22222,7 @@ var RunStore = class _RunStore {
   }
   async loadWorkspace() {
     await this.ensureStorage();
-    return JSON.parse(await readFile6(join8(this.runRoot, "workspace.json"), "utf8"));
+    return JSON.parse(await readFile7(join8(this.runRoot, "workspace.json"), "utf8"));
   }
   async materialize(events) {
     const state = reduceEvents(events);
@@ -22123,11 +22433,17 @@ async function createRun(task, options) {
     discoverProbePlan(repository.root, task, repository.baseSha),
     discoverPlanningEvidence(repository.root, task)
   ]);
-  const completionProbes = probePlan.items.filter(({ phase }) => phase === "completion").map(({ probe }) => probe);
-  const approvedProbes = probePlan.items.map(({ probe }) => probe);
   const contract = compileRunContract(task, repository, {
     ...options.finishLine ? { finishLine: options.finishLine } : {}
   });
+  const heldOutProbePlan = await createRuntimeHeldOutProbePlan(
+    contract.runId,
+    probePlan,
+    repository.root
+  );
+  const graphProbePlan = workerVisibleProbePlan(probePlan, heldOutProbePlan);
+  const completionProbes = graphProbePlan.items.filter(({ phase }) => phase === "completion").map(({ probe }) => probe);
+  const approvedProbes = graphProbePlan.items.map(({ probe }) => probe);
   let graph;
   let planningUsage;
   if (options.planner) {
@@ -22142,7 +22458,7 @@ async function createRun(task, options) {
         contract,
         repositoryPath: repository.root,
         repositoryEvidence,
-        probePlan,
+        probePlan: graphProbePlan,
         verificationProbes: completionProbes
       },
       options.signal ?? new AbortController().signal
@@ -22153,8 +22469,14 @@ async function createRun(task, options) {
   } else {
     graph = compileGraph(contract, completionProbes);
   }
-  graph = applyProbePlan(graph, contract, probePlan);
-  const store = await RunStore.create(repository.root, contract, graph, probePlan);
+  graph = applyProbePlan(graph, contract, graphProbePlan);
+  const store = await RunStore.create(
+    repository.root,
+    contract,
+    graph,
+    probePlan,
+    heldOutProbePlan
+  );
   if (planningUsage)
     await store.append("host", "tokens.recorded", { usage: planningUsage, phase: "planning" });
   return { contract, graph, store, probePlan };
@@ -22168,20 +22490,31 @@ async function configureRunProbes(store, input) {
       throw new Error("Probes can only be edited before the run contract is approved");
     const [contract, existingGraph] = await Promise.all([store.loadContract(), store.loadGraph()]);
     const probePlan = await validateProbePlan(input, store.repositoryRoot);
+    const heldOutProbePlan = await createRuntimeHeldOutProbePlan(
+      contract.runId,
+      probePlan,
+      store.repositoryRoot
+    );
+    const graphProbePlan = workerVisibleProbePlan(probePlan, heldOutProbePlan);
     const graph = applyProbePlan(
       { ...existingGraph, revision: existingGraph.revision + 1 },
       contract,
-      probePlan
+      graphProbePlan
     );
     await store.append("user", "graph.amended", {
       graph,
       probePlan,
+      heldOutProbePlan,
       addedNodeIds: [],
       rationale: "User edited the deterministic probe plan before approval",
       previousProbePlanHash: contentHash(await store.loadProbePlan()),
       probePlanHash: contentHash(probePlan)
     });
-    await Promise.all([store.saveGraph(graph), store.saveProbePlan(probePlan)]);
+    await Promise.all([
+      store.saveGraph(graph),
+      store.saveProbePlan(probePlan),
+      store.saveHeldOutProbePlan(heldOutProbePlan)
+    ]);
     return { graph, probePlan };
   } finally {
     await lock.release();
@@ -22502,7 +22835,7 @@ function repairAmendment(graph, verification, failures) {
       predecessorResults: verification.dependsOn,
       relevantPaths: []
     },
-    progressProbes: verification.completionProbes,
+    progressProbes: [],
     completionProbes: [],
     sideEffectClass: "workspace_write"
   };
@@ -23012,7 +23345,18 @@ async function executeRun(input) {
       }
       const current = batch[0];
       if (current.kind === "verification") {
-        if (current.completionProbes.length === 0) {
+        let completionProbes;
+        let heldOutProbePlan;
+        try {
+          heldOutProbePlan = await input.store.loadHeldOutProbePlan();
+          completionProbes = resolveHeldOutProbes(current.completionProbes, heldOutProbePlan);
+        } catch (error51) {
+          const reason = `Held-out completion proof is invalid: ${error51.message}`;
+          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+          await input.store.append("runtime", "run.blocked", { reason });
+          return await input.store.loadState();
+        }
+        if (completionProbes.length === 0) {
           await input.store.append("probe", "node.failed", {
             nodeId: current.id,
             reason: "No deterministic verification commands were discovered"
@@ -23022,15 +23366,20 @@ async function executeRun(input) {
           });
           return await input.store.loadState();
         }
-        const executed = await captureProbes(
-          input.store,
-          current.completionProbes,
-          workspace,
-          input.observer,
-          signal
-        );
+        const integrityFailures = await heldOutIntegrityFailures(heldOutProbePlan, workspace.path);
+        const executed = integrityFailures.length ? [] : await captureProbes(input.store, completionProbes, workspace, input.observer, signal);
         if (signal.aborted) return await finishInterruption(current.id);
-        const results = executed.map(({ result }) => result);
+        const results = integrityFailures.length ? integrityFailures : executed.map(({ result }) => result);
+        await input.store.append("probe", "held_out.checked", {
+          nodeId: current.id,
+          planDigest: heldOutProbePlan.digest,
+          results: results.map(({ probeId, passed, signature, artifact }) => ({
+            probeId,
+            passed,
+            signature,
+            artifact: artifact ?? null
+          }))
+        });
         const verificationAssessment = await assessRunProgress({
           store: input.store,
           attemptId: batchId,
@@ -23043,7 +23392,7 @@ async function executeRun(input) {
         if (results.every(({ passed }) => passed)) {
           let semanticEvidence = [];
           let completionControl;
-          if (needsSemanticVerification("completion", current.completionProbes)) {
+          if (needsSemanticVerification("completion", completionProbes)) {
             let semanticVerdict;
             try {
               semanticVerdict = await runSemanticVerification({
@@ -23132,7 +23481,7 @@ async function executeRun(input) {
           await input.store.append("probe", "node.accepted", { nodeId: current.id });
           continue;
         }
-        const failures = results.filter(({ passed }) => !passed);
+        const failures = actionableHeldOutFailures(results.filter(({ passed }) => !passed));
         const failureSignature = failures.map(({ signature }) => signature).sort().join("|");
         const existingRepairs = graph.nodes.filter(
           (node2) => node2.id.startsWith("repair-verify-")
@@ -23287,8 +23636,8 @@ async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
   const moduleDirectory = dirname6(fileURLToPath(moduleUrl));
   const candidates = [
     join10(moduleDirectory, "mcp.mjs"),
-    resolve3(moduleDirectory, "../../../dist/mcp.mjs"),
-    resolve3(process.cwd(), "dist/mcp.mjs")
+    resolve4(moduleDirectory, "../../../dist/mcp.mjs"),
+    resolve4(process.cwd(), "dist/mcp.mjs")
   ];
   for (const candidate of candidates) {
     try {
@@ -23300,13 +23649,13 @@ async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
   throw new Error("dist/mcp.mjs is missing; run pnpm build before installing Graphcraft");
 }
 function resolveGraphcraftHome(configuredHome = process.env.GRAPHCRAFT_HOME) {
-  return configuredHome?.trim() ? resolve3(configuredHome) : join10(homedir(), ".graphcraft");
+  return configuredHome?.trim() ? resolve4(configuredHome) : join10(homedir(), ".graphcraft");
 }
 async function stageBundledMcp(sourcePath, graphcraftHome = resolveGraphcraftHome()) {
   const runtimeDirectory = join10(graphcraftHome, "runtime", GRAPHCRAFT_VERSION);
   const runtimePath = join10(runtimeDirectory, "mcp.mjs");
   await mkdir5(runtimeDirectory, { recursive: true });
-  if (resolve3(sourcePath) !== resolve3(runtimePath)) await copyFile(sourcePath, runtimePath);
+  if (resolve4(sourcePath) !== resolve4(runtimePath)) await copyFile(sourcePath, runtimePath);
   await chmod(runtimePath, 493);
   return runtimePath;
 }
@@ -23496,15 +23845,29 @@ async function handleAction(input) {
     return stateView(state2, created.contract);
   }
   const store = await storeFor(cwd, input.run);
-  const [contract, graph, state, probePlan] = await Promise.all([
+  const [contract, graph, state, probePlan, heldOutProbePlan] = await Promise.all([
     store.loadContract(),
     store.loadGraph(),
     store.loadState(),
-    store.loadProbePlan()
+    store.loadProbePlan(),
+    store.loadHeldOutProbePlan()
   ]);
   if (input.action === "status") return stateView(state, contract);
   if (input.action === "inspect")
-    return { contract, graph, probePlan, state, graphHistory: await store.loadGraphHistory() };
+    return {
+      contract,
+      graph,
+      probePlan,
+      heldOutProof: {
+        digest: heldOutProbePlan.digest,
+        probes: heldOutProbePlan.probes.map(({ probe, integrity }) => ({
+          id: probe.id,
+          integrityProtected: integrity.length > 0
+        }))
+      },
+      state,
+      graphHistory: await store.loadGraphHistory()
+    };
   if (input.action === "trace") return { events: await store.loadEvents() };
   if (input.action === "probes") {
     if (!input.probePlan) return { probePlan };
@@ -23652,7 +24015,7 @@ program2.command("inspect").description("Show the contract, graph, anchors, and 
   );
 });
 program2.command("probes").description("Show or replace the deterministic probe plan before approval").argument("[run]").option("-C, --cwd <path>", "repository path", process.cwd()).option("--set <file>", "replace the probe plan from a JSON file").action(async (run, options) => {
-  const probePlan = options.set ? JSON.parse(await readFile7(options.set, "utf8")) : void 0;
+  const probePlan = options.set ? JSON.parse(await readFile8(options.set, "utf8")) : void 0;
   const result = await handleAction({
     action: "probes",
     repository: options.cwd,
@@ -23663,7 +24026,7 @@ program2.command("probes").description("Show or replace the deterministic probe 
 });
 program2.command("amend").description("Apply an evidence-backed amendment to unfinished graph work").argument("[run]").option("-C, --cwd <path>", "repository path", process.cwd()).requiredOption("--set <file>", "graph amendment proposal JSON file").option("--approve", "record explicit user approval for authority expansion").action(
   async (run, options) => {
-    const amendment = JSON.parse(await readFile7(options.set, "utf8"));
+    const amendment = JSON.parse(await readFile8(options.set, "utf8"));
     console.log(
       JSON.stringify(
         await handleAction({

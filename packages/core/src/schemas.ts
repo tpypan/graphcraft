@@ -98,12 +98,21 @@ export const RepositoryInventoryProbeSchema = z.strictObject({
   terms: z.array(z.string().min(1)).min(1),
 });
 
-export const ProbeSpecSchema = z.union([
+export const ExecutableProbeSchema = z.union([
   CommandProbeSchema,
   FileProbeSchema,
   GitDiffProbeSchema,
   RepositoryInventoryProbeSchema,
 ]);
+
+export const HeldOutProbeReferenceSchema = z.strictObject({
+  id: z.string().min(1),
+  kind: z.literal("held_out"),
+  planDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  probeHash: z.string().regex(/^[a-f0-9]{64}$/),
+});
+
+export const ProbeSpecSchema = z.union([ExecutableProbeSchema, HeldOutProbeReferenceSchema]);
 
 export const ProbePlanItemSchema = z.strictObject({
   phase: z.enum(["progress", "completion"]),
@@ -116,6 +125,35 @@ export const ProbePlanSchema = z.strictObject({
   schemaVersion: z.literal(1),
   family: z.enum(["bug", "feature", "migration", "refactor", "audit"]),
   items: z.array(ProbePlanItemSchema).min(1),
+});
+
+export const HeldOutProbeIntegritySchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    kind: z.literal("package_script"),
+    path: z.string().min(1),
+    script: z.string().min(1),
+    valueHash: z.string().regex(/^[a-f0-9]{64}$/),
+  }),
+  z.strictObject({
+    kind: z.literal("file"),
+    path: z.string().min(1),
+    valueHash: z.string().regex(/^[a-f0-9]{64}$/),
+  }),
+]);
+
+export const HeldOutProbeEntrySchema = z.strictObject({
+  probe: ExecutableProbeSchema,
+  probeHash: z.string().regex(/^[a-f0-9]{64}$/),
+  source: z.string().min(1),
+  integrity: z.array(HeldOutProbeIntegritySchema),
+});
+
+export const HeldOutProbePlanSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  runId: z.uuid(),
+  family: z.enum(["bug", "feature", "migration", "refactor", "audit"]),
+  probes: z.array(HeldOutProbeEntrySchema).min(1),
+  digest: z.string().regex(/^[a-f0-9]{64}$/),
 });
 
 export const ProbeResultSchema = z.strictObject({
@@ -469,6 +507,7 @@ export const RunEventTypeSchema = z.enum([
   "control.override",
   "control.decision_required",
   "control.resolved",
+  "held_out.checked",
   "semantic.verdict",
   "tokens.recorded",
   "graph.amended",
@@ -528,6 +567,7 @@ export const RunStorageManifestSchema = z.strictObject({
     contract: z.literal(1),
     graph: z.literal(1),
     probePlan: z.literal(1),
+    heldOutProbes: z.literal(1).default(1),
     events: z.literal(1),
     state: z.literal(1),
     workspace: z.literal(1),
@@ -545,8 +585,13 @@ export type Permission = z.infer<typeof PermissionSchema>;
 export type AcceptanceAnchor = z.infer<typeof AcceptanceAnchorSchema>;
 export type RunContract = z.infer<typeof RunContractSchema>;
 export type ProbeSpec = z.infer<typeof ProbeSpecSchema>;
+export type ExecutableProbe = z.infer<typeof ExecutableProbeSchema>;
 export type ProbePlan = z.infer<typeof ProbePlanSchema>;
 export type ProbePlanItem = z.infer<typeof ProbePlanItemSchema>;
+export type HeldOutProbeReference = z.infer<typeof HeldOutProbeReferenceSchema>;
+export type HeldOutProbeIntegrity = z.infer<typeof HeldOutProbeIntegritySchema>;
+export type HeldOutProbeEntry = z.infer<typeof HeldOutProbeEntrySchema>;
+export type HeldOutProbePlan = z.infer<typeof HeldOutProbePlanSchema>;
 export type ProbeResult = z.infer<typeof ProbeResultSchema>;
 export type ProgressClassification = z.infer<typeof ProgressClassificationSchema>;
 export type ProgressVector = z.infer<typeof ProgressVectorSchema>;
