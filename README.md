@@ -60,7 +60,7 @@ Graphcraft displays a concise run contract before doing work. Use `--yes` only w
 - Runs sequentially by default and can overlap at most two independent read-only branches; all shared-worktree writes and Git side effects remain sequential.
 - Checkpoints host sessions and results during execution, resumes the same host session when safe, and falls back to repository evidence when switching hosts or native continuation is unavailable.
 - Accepts pause or stop from another CLI process, terminates the active child with bounded escalation, and records the exact cause and outcome before releasing the run lock.
-- Tracks cached, uncached, output, reasoning, and total tokens when the host exposes them.
+- Tracks cached, uncached, output, reasoning, and total tokens with explicit provider availability, and reports planning, worker, repair, semantic-verification, and Graphcraft-overhead costs by phase and node.
 
 ## Commands
 

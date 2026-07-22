@@ -11,6 +11,7 @@ import {
   evidenceSnapshot,
   interruptionReason,
   reconcilePersistedInvocation,
+  tokenCostReport,
 } from "@graphcraft/core";
 import type {
   HostAdapter,
@@ -26,6 +27,7 @@ import type {
   RunEvent,
   SemanticVerificationRequest,
   SemanticVerificationResult,
+  TokenUsage,
   WorkerRequest,
 } from "@graphcraft/core";
 import { configureRunProbes, createRun, executeRun } from "./runner.ts";
@@ -44,6 +46,30 @@ import { assessRunProgress, createProgressDecisionPacket } from "./trajectory.ts
 const execFileAsync = promisify(execFile);
 const temporaryRoots: string[] = [];
 const storageFixturesRoot = fileURLToPath(new URL("./fixtures/storage", import.meta.url));
+
+function reportedUsage(
+  input: number,
+  cachedInput: number,
+  output: number,
+  reasoning = 0,
+): TokenUsage {
+  return {
+    input,
+    cachedInput,
+    uncachedInput: Math.max(0, input - cachedInput),
+    output,
+    reasoning,
+    total: input + output,
+    availability: {
+      input: "reported",
+      cachedInput: "reported",
+      uncachedInput: "derived",
+      output: "reported",
+      reasoning: "reported",
+      total: "derived",
+    },
+  };
+}
 
 async function snapshotFiles(root: string): Promise<Record<string, string>> {
   const snapshot: Record<string, string> = {};
@@ -125,6 +151,7 @@ class FakeAdapter implements HostAdapter {
   private readonly failureCause: "host_crash" | "timeout" | undefined;
   private readonly semanticAct:
     ((request: SemanticVerificationRequest) => Promise<SemanticVerificationResult>) | undefined;
+  private readonly emitUsage: boolean;
 
   constructor(
     act: (request: WorkerRequest, call: number, signal: AbortSignal) => Promise<void>,
@@ -132,12 +159,14 @@ class FakeAdapter implements HostAdapter {
     failureCause?: "host_crash" | "timeout",
     semanticAct?: (request: SemanticVerificationRequest) => Promise<SemanticVerificationResult>,
     id: HostAdapter["id"] = "test",
+    emitUsage = true,
   ) {
     this.act = act;
     this.authenticated = authenticated;
     this.failureCause = failureCause;
     this.semanticAct = semanticAct;
     this.id = id;
+    this.emitUsage = emitUsage;
   }
 
   async probe(): Promise<HostCapabilities> {
@@ -226,7 +255,7 @@ class FakeAdapter implements HostAdapter {
     }
     return {
       plan: { schemaVersion: 1, family: "feature", nodes },
-      usage: { input: 5, cachedInput: 1, output: 2, reasoning: 0, total: 7 },
+      usage: reportedUsage(5, 1, 2),
     };
   }
 
@@ -258,10 +287,11 @@ class FakeAdapter implements HostAdapter {
       };
       return;
     }
-    yield {
-      type: "usage",
-      usage: { input: 10, cachedInput: 2, output: 4, reasoning: 0, total: 14 },
-    };
+    if (this.emitUsage)
+      yield {
+        type: "usage",
+        usage: reportedUsage(10, 2, 4),
+      };
     yield {
       type: "result",
       result: {
@@ -287,7 +317,7 @@ class FakeAdapter implements HostAdapter {
         rationale: "The worker returned concrete evidence tied to the requested objective",
         uncertainty: 0.1,
       },
-      usage: { input: 2, cachedInput: 0, output: 1, reasoning: 0, total: 3 },
+      usage: reportedUsage(2, 0, 1),
     };
   }
 }
@@ -537,6 +567,15 @@ describe("durable runtime", () => {
     expect(contextReceipts[0]?.reused.repositoryInventory).toBe(false);
     expect(contextReceipts[1]?.reused.repositoryInventory).toBe(true);
     expect(state.tokens.total).toBe(38);
+    const cost = tokenCostReport(state.tokenLedger);
+    expect(cost).toMatchObject({ receipts: 5, reconciled: true });
+    expect(cost.byPhase).toMatchObject({
+      graphcraft_overhead: { total: 0 },
+      planning: { total: 7 },
+      semantic_verification: { total: 3 },
+      worker: { total: 28 },
+    });
+    expect(cost.byNode).toMatchObject({ investigate: { total: 17 }, implement: { total: 14 } });
     expect(adapter.semanticRequests).toHaveLength(1);
     expect(adapter.semanticRequests[0]).toMatchObject({
       context: { phase: "progress", nodeId: "investigate" },
@@ -593,6 +632,18 @@ describe("durable runtime", () => {
     expect(
       (await created.store.loadEvents()).find(({ type }) => type === "semantic.verdict"),
     ).toMatchObject({ data: { usage: null, policyViolation: false } });
+    expect(state.tokenLedger).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          phase: "semantic_verification",
+          nodeId: "investigate",
+          missing: true,
+          usage: expect.objectContaining({
+            availability: expect.objectContaining({ total: "unavailable" }),
+          }),
+        }),
+      ]),
+    );
   });
 
   it("blocks if a semantic verifier mutates its read-only workspace", async () => {
@@ -674,6 +725,33 @@ describe("durable runtime", () => {
     expect(resumed.status).toBe("completed");
     expect(adapter.calls).toEqual(["implement"]);
     expect(await created.store.loadEvents()).toHaveLength(eventCount);
+  });
+
+  it("records an unavailable worker receipt instead of treating missing usage as free", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(
+      async (request) =>
+        await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n"),
+      true,
+      undefined,
+      undefined,
+      "test",
+      false,
+    );
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+    const missing = state.tokenLedger.find(({ phase }) => phase === "worker");
+
+    expect(state.status).toBe("completed");
+    expect(missing).toMatchObject({
+      nodeId: "implement",
+      missing: true,
+      usage: { total: 0, availability: { total: "unavailable" } },
+    });
+    expect(tokenCostReport(state.tokenLedger)).toMatchObject({ reconciled: false });
   });
 
   it("enforces sticky owner decisions before scheduling the owned target", async () => {
@@ -1006,6 +1084,11 @@ describe("durable runtime", () => {
 
     expect(state.status).toBe("completed");
     expect(adapter.calls).toEqual(["implement", "repair-verify-1"]);
+    expect(state.tokenLedger).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ phase: "repair", nodeId: "repair-verify-1" }),
+      ]),
+    );
     expect(graph.revision).toBe(1);
     expect(graph.nodes.map(({ id }) => id)).toContain("repair-verify-1");
   });
@@ -1820,7 +1903,7 @@ describe("durable runtime", () => {
     );
     await created.store.appendInvocationEvent(invocationId, {
       type: "usage",
-      usage: { input: 10, cachedInput: 2, output: 4, reasoning: 0, total: 14 },
+      usage: reportedUsage(10, 2, 4),
     });
     await created.store.appendInvocationEvent(invocationId, {
       type: "result",

@@ -6,9 +6,9 @@ import {
   HostTerminationError,
   HostCapabilitiesSchema,
   SemanticVerdictSchema,
-  TokenUsageSchema,
   WorkerResultSchema,
   graphPlanJsonSchema,
+  normalizeTokenUsage,
   reconcilePersistedInvocation,
   renderPlannerPrompt,
   renderSemanticVerifierPrompt,
@@ -65,18 +65,8 @@ function parseSemanticVerdict(value: unknown) {
   }
 }
 
-function claudeUsage(value: unknown) {
-  const usage = (value ?? {}) as Record<string, unknown>;
-  const input = Number(usage.input_tokens ?? 0);
-  const cachedInput = Number(usage.cache_read_input_tokens ?? 0);
-  const output = Number(usage.output_tokens ?? 0);
-  return TokenUsageSchema.parse({
-    input,
-    cachedInput,
-    output,
-    reasoning: 0,
-    total: input + output,
-  });
+export function claudeUsage(value: unknown) {
+  return normalizeTokenUsage("claude", value);
 }
 
 async function claudeVersion(): Promise<{ installed: boolean; version?: string }> {
@@ -169,7 +159,7 @@ export class ClaudeAdapter implements HostAdapter {
     signal.addEventListener("abort", abort, { once: true });
     let stderr = "";
     let plan: ReturnType<typeof GraphPlanSchema.parse> | undefined;
-    let usage: ReturnType<typeof TokenUsageSchema.parse> | undefined;
+    let usage: ReturnType<typeof claudeUsage> | undefined;
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
       stderr += chunk;
@@ -219,7 +209,7 @@ export class ClaudeAdapter implements HostAdapter {
     const terminationController = new ChildTerminationController(child, signal);
     let stderr = "";
     let verdict: ReturnType<typeof SemanticVerdictSchema.parse> | undefined;
-    let usage: ReturnType<typeof TokenUsageSchema.parse> | undefined;
+    let usage: ReturnType<typeof claudeUsage> | undefined;
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
       stderr += chunk;

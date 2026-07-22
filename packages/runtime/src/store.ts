@@ -226,9 +226,12 @@ export class RunStore {
   async loadState(): Promise<RunState> {
     await this.ensureStorage();
     try {
-      return RunStateSchema.parse(
-        JSON.parse(await readFile(join(this.runRoot, "state.json"), "utf8")),
-      );
+      const value = JSON.parse(await readFile(join(this.runRoot, "state.json"), "utf8")) as Record<
+        string,
+        unknown
+      >;
+      if (!("tokenLedger" in value)) return await this.rebuildViews();
+      return RunStateSchema.parse(value);
     } catch {
       return await this.rebuildViews();
     }

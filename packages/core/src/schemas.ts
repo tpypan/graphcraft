@@ -381,12 +381,61 @@ export const GraphSchema = z.strictObject({
   revision: z.number().int().nonnegative(),
 });
 
+export const TokenAvailabilityStatusSchema = z.enum([
+  "reported",
+  "derived",
+  "estimated",
+  "unavailable",
+  "legacy_unknown",
+]);
+
+const legacyTokenAvailability = {
+  input: "legacy_unknown" as const,
+  cachedInput: "legacy_unknown" as const,
+  uncachedInput: "legacy_unknown" as const,
+  output: "legacy_unknown" as const,
+  reasoning: "legacy_unknown" as const,
+  total: "legacy_unknown" as const,
+};
+
+export const TokenAvailabilitySchema = z
+  .strictObject({
+    input: TokenAvailabilityStatusSchema,
+    cachedInput: TokenAvailabilityStatusSchema,
+    uncachedInput: TokenAvailabilityStatusSchema,
+    output: TokenAvailabilityStatusSchema,
+    reasoning: TokenAvailabilityStatusSchema,
+    total: TokenAvailabilityStatusSchema,
+  })
+  .default(legacyTokenAvailability);
+
 export const TokenUsageSchema = z.strictObject({
   input: z.number().int().nonnegative().default(0),
   cachedInput: z.number().int().nonnegative().default(0),
+  uncachedInput: z.number().int().nonnegative().default(0),
   output: z.number().int().nonnegative().default(0),
   reasoning: z.number().int().nonnegative().default(0),
   total: z.number().int().nonnegative().default(0),
+  availability: TokenAvailabilitySchema,
+});
+
+export const TokenAttributionPhaseSchema = z.enum([
+  "planning",
+  "worker",
+  "repair",
+  "semantic_verification",
+  "graphcraft_overhead",
+]);
+
+export const TokenLedgerEntrySchema = z.strictObject({
+  sequence: z.number().int().positive(),
+  phase: TokenAttributionPhaseSchema,
+  usage: TokenUsageSchema,
+  causationId: z.string().min(1),
+  nodeId: z.string().min(1).optional(),
+  host: z.string().min(1).optional(),
+  recovered: z.boolean().default(false),
+  missing: z.boolean().default(false),
 });
 
 export const WorkerResultSchema = z.strictObject({
@@ -591,6 +640,7 @@ export const RunStateSchema = z.strictObject({
   progressTrajectory: z.array(ProgressTrajectoryEntrySchema).default([]),
   progressDecision: ProgressDecisionPacketSchema.optional(),
   tokens: TokenUsageSchema,
+  tokenLedger: z.array(TokenLedgerEntrySchema).default([]),
   controlDecisions: z.array(ControlDecisionSchema),
   pendingDecision: ControlDecisionPacketSchema.optional(),
   stopReason: z.string().optional(),
@@ -648,6 +698,9 @@ export type Graph = z.infer<typeof GraphSchema>;
 export type ControlDecision = z.infer<typeof ControlDecisionSchema>;
 export type ControlDecisionPacket = z.infer<typeof ControlDecisionPacketSchema>;
 export type TokenUsage = z.infer<typeof TokenUsageSchema>;
+export type TokenAvailabilityStatus = z.infer<typeof TokenAvailabilityStatusSchema>;
+export type TokenAttributionPhase = z.infer<typeof TokenAttributionPhaseSchema>;
+export type TokenLedgerEntry = z.infer<typeof TokenLedgerEntrySchema>;
 export type WorkerResult = z.infer<typeof WorkerResultSchema>;
 export type ContextCapsule = z.infer<typeof ContextCapsuleSchema>;
 export type ContextSelectionReceipt = z.infer<typeof ContextSelectionReceiptSchema>;

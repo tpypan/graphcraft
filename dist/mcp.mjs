@@ -23446,18 +23446,18 @@ var ParseStatus = class _ParseStatus {
     if (this.value !== "aborted")
       this.value = "aborted";
   }
-  static mergeArray(status, results) {
+  static mergeArray(status2, results) {
     const arrayValue = [];
     for (const s of results) {
       if (s.status === "aborted")
         return INVALID;
       if (s.status === "dirty")
-        status.dirty();
+        status2.dirty();
       arrayValue.push(s.value);
     }
-    return { status: status.value, value: arrayValue };
+    return { status: status2.value, value: arrayValue };
   }
-  static async mergeObjectAsync(status, pairs) {
+  static async mergeObjectAsync(status2, pairs) {
     const syncPairs = [];
     for (const pair of pairs) {
       const key = await pair.key;
@@ -23467,9 +23467,9 @@ var ParseStatus = class _ParseStatus {
         value
       });
     }
-    return _ParseStatus.mergeObjectSync(status, syncPairs);
+    return _ParseStatus.mergeObjectSync(status2, syncPairs);
   }
-  static mergeObjectSync(status, pairs) {
+  static mergeObjectSync(status2, pairs) {
     const finalObject = {};
     for (const pair of pairs) {
       const { key, value } = pair;
@@ -23478,14 +23478,14 @@ var ParseStatus = class _ParseStatus {
       if (value.status === "aborted")
         return INVALID;
       if (key.status === "dirty")
-        status.dirty();
+        status2.dirty();
       if (value.status === "dirty")
-        status.dirty();
+        status2.dirty();
       if (key.value !== "__proto__" && (typeof value.value !== "undefined" || pair.alwaysSet)) {
         finalObject[key.value] = value.value;
       }
     }
-    return { status: status.value, value: finalObject };
+    return { status: status2.value, value: finalObject };
   }
 };
 var INVALID = Object.freeze({
@@ -23945,7 +23945,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
       });
       return INVALID;
     }
-    const status = new ParseStatus();
+    const status2 = new ParseStatus();
     let ctx = void 0;
     for (const check2 of this._def.checks) {
       if (check2.kind === "min") {
@@ -23959,7 +23959,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             exact: false,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "max") {
         if (input.data.length > check2.value) {
@@ -23972,7 +23972,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             exact: false,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "length") {
         const tooBig = input.data.length > check2.value;
@@ -23998,7 +23998,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
               message: check2.message
             });
           }
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "email") {
         if (!emailRegex.test(input.data)) {
@@ -24008,7 +24008,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "emoji") {
         if (!emojiRegex) {
@@ -24021,7 +24021,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "uuid") {
         if (!uuidRegex.test(input.data)) {
@@ -24031,7 +24031,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "nanoid") {
         if (!nanoidRegex.test(input.data)) {
@@ -24041,7 +24041,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "cuid") {
         if (!cuidRegex.test(input.data)) {
@@ -24051,7 +24051,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "cuid2") {
         if (!cuid2Regex.test(input.data)) {
@@ -24061,7 +24061,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "ulid") {
         if (!ulidRegex.test(input.data)) {
@@ -24071,7 +24071,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "url") {
         try {
@@ -24083,7 +24083,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "regex") {
         check2.regex.lastIndex = 0;
@@ -24095,7 +24095,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "trim") {
         input.data = input.data.trim();
@@ -24107,7 +24107,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             validation: { includes: check2.value, position: check2.position },
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "toLowerCase") {
         input.data = input.data.toLowerCase();
@@ -24121,7 +24121,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             validation: { startsWith: check2.value },
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "endsWith") {
         if (!input.data.endsWith(check2.value)) {
@@ -24131,7 +24131,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             validation: { endsWith: check2.value },
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "datetime") {
         const regex = datetimeRegex(check2);
@@ -24142,7 +24142,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             validation: "datetime",
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "date") {
         const regex = dateRegex;
@@ -24153,7 +24153,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             validation: "date",
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "time") {
         const regex = timeRegex(check2);
@@ -24164,7 +24164,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             validation: "time",
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "duration") {
         if (!durationRegex.test(input.data)) {
@@ -24174,7 +24174,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "ip") {
         if (!isValidIP(input.data, check2.version)) {
@@ -24184,7 +24184,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "jwt") {
         if (!isValidJWT2(input.data, check2.alg)) {
@@ -24194,7 +24194,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "cidr") {
         if (!isValidCidr(input.data, check2.version)) {
@@ -24204,7 +24204,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "base64") {
         if (!base64Regex.test(input.data)) {
@@ -24214,7 +24214,7 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "base64url") {
         if (!base64urlRegex.test(input.data)) {
@@ -24224,13 +24224,13 @@ var ZodString2 = class _ZodString2 extends ZodType2 {
             code: ZodIssueCode2.invalid_string,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else {
         util.assertNever(check2);
       }
     }
-    return { status: status.value, value: input.data };
+    return { status: status2.value, value: input.data };
   }
   _regex(regex, validation, message) {
     return this.refinement((data) => regex.test(data), {
@@ -24506,7 +24506,7 @@ var ZodNumber2 = class _ZodNumber extends ZodType2 {
       return INVALID;
     }
     let ctx = void 0;
-    const status = new ParseStatus();
+    const status2 = new ParseStatus();
     for (const check2 of this._def.checks) {
       if (check2.kind === "int") {
         if (!util.isInteger(input.data)) {
@@ -24517,7 +24517,7 @@ var ZodNumber2 = class _ZodNumber extends ZodType2 {
             received: "float",
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "min") {
         const tooSmall = check2.inclusive ? input.data < check2.value : input.data <= check2.value;
@@ -24531,7 +24531,7 @@ var ZodNumber2 = class _ZodNumber extends ZodType2 {
             exact: false,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "max") {
         const tooBig = check2.inclusive ? input.data > check2.value : input.data >= check2.value;
@@ -24545,7 +24545,7 @@ var ZodNumber2 = class _ZodNumber extends ZodType2 {
             exact: false,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "multipleOf") {
         if (floatSafeRemainder2(input.data, check2.value) !== 0) {
@@ -24555,7 +24555,7 @@ var ZodNumber2 = class _ZodNumber extends ZodType2 {
             multipleOf: check2.value,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "finite") {
         if (!Number.isFinite(input.data)) {
@@ -24564,13 +24564,13 @@ var ZodNumber2 = class _ZodNumber extends ZodType2 {
             code: ZodIssueCode2.not_finite,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else {
         util.assertNever(check2);
       }
     }
-    return { status: status.value, value: input.data };
+    return { status: status2.value, value: input.data };
   }
   gte(value, message) {
     return this.setLimit("min", value, true, errorUtil.toString(message));
@@ -24735,7 +24735,7 @@ var ZodBigInt2 = class _ZodBigInt extends ZodType2 {
       return this._getInvalidInput(input);
     }
     let ctx = void 0;
-    const status = new ParseStatus();
+    const status2 = new ParseStatus();
     for (const check2 of this._def.checks) {
       if (check2.kind === "min") {
         const tooSmall = check2.inclusive ? input.data < check2.value : input.data <= check2.value;
@@ -24748,7 +24748,7 @@ var ZodBigInt2 = class _ZodBigInt extends ZodType2 {
             inclusive: check2.inclusive,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "max") {
         const tooBig = check2.inclusive ? input.data > check2.value : input.data >= check2.value;
@@ -24761,7 +24761,7 @@ var ZodBigInt2 = class _ZodBigInt extends ZodType2 {
             inclusive: check2.inclusive,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "multipleOf") {
         if (input.data % check2.value !== BigInt(0)) {
@@ -24771,13 +24771,13 @@ var ZodBigInt2 = class _ZodBigInt extends ZodType2 {
             multipleOf: check2.value,
             message: check2.message
           });
-          status.dirty();
+          status2.dirty();
         }
       } else {
         util.assertNever(check2);
       }
     }
-    return { status: status.value, value: input.data };
+    return { status: status2.value, value: input.data };
   }
   _getInvalidInput(input) {
     const ctx = this._getOrReturnCtx(input);
@@ -24935,7 +24935,7 @@ var ZodDate2 = class _ZodDate extends ZodType2 {
       });
       return INVALID;
     }
-    const status = new ParseStatus();
+    const status2 = new ParseStatus();
     let ctx = void 0;
     for (const check2 of this._def.checks) {
       if (check2.kind === "min") {
@@ -24949,7 +24949,7 @@ var ZodDate2 = class _ZodDate extends ZodType2 {
             minimum: check2.value,
             type: "date"
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (check2.kind === "max") {
         if (input.data.getTime() > check2.value) {
@@ -24962,14 +24962,14 @@ var ZodDate2 = class _ZodDate extends ZodType2 {
             maximum: check2.value,
             type: "date"
           });
-          status.dirty();
+          status2.dirty();
         }
       } else {
         util.assertNever(check2);
       }
     }
     return {
-      status: status.value,
+      status: status2.value,
       value: new Date(input.data.getTime())
     };
   }
@@ -25155,7 +25155,7 @@ ZodVoid2.create = (params) => {
 };
 var ZodArray2 = class _ZodArray extends ZodType2 {
   _parse(input) {
-    const { ctx, status } = this._processInputParams(input);
+    const { ctx, status: status2 } = this._processInputParams(input);
     const def = this._def;
     if (ctx.parsedType !== ZodParsedType.array) {
       addIssueToContext(ctx, {
@@ -25178,7 +25178,7 @@ var ZodArray2 = class _ZodArray extends ZodType2 {
           exact: true,
           message: def.exactLength.message
         });
-        status.dirty();
+        status2.dirty();
       }
     }
     if (def.minLength !== null) {
@@ -25191,7 +25191,7 @@ var ZodArray2 = class _ZodArray extends ZodType2 {
           exact: false,
           message: def.minLength.message
         });
-        status.dirty();
+        status2.dirty();
       }
     }
     if (def.maxLength !== null) {
@@ -25204,20 +25204,20 @@ var ZodArray2 = class _ZodArray extends ZodType2 {
           exact: false,
           message: def.maxLength.message
         });
-        status.dirty();
+        status2.dirty();
       }
     }
     if (ctx.common.async) {
       return Promise.all([...ctx.data].map((item, i) => {
         return def.type._parseAsync(new ParseInputLazyPath(ctx, item, ctx.path, i));
       })).then((result2) => {
-        return ParseStatus.mergeArray(status, result2);
+        return ParseStatus.mergeArray(status2, result2);
       });
     }
     const result = [...ctx.data].map((item, i) => {
       return def.type._parseSync(new ParseInputLazyPath(ctx, item, ctx.path, i));
     });
-    return ParseStatus.mergeArray(status, result);
+    return ParseStatus.mergeArray(status2, result);
   }
   get element() {
     return this._def.type;
@@ -25306,7 +25306,7 @@ var ZodObject2 = class _ZodObject extends ZodType2 {
       });
       return INVALID;
     }
-    const { status, ctx } = this._processInputParams(input);
+    const { status: status2, ctx } = this._processInputParams(input);
     const { shape, keys: shapeKeys } = this._getCached();
     const extraKeys = [];
     if (!(this._def.catchall instanceof ZodNever2 && this._def.unknownKeys === "strip")) {
@@ -25341,7 +25341,7 @@ var ZodObject2 = class _ZodObject extends ZodType2 {
             code: ZodIssueCode2.unrecognized_keys,
             keys: extraKeys
           });
-          status.dirty();
+          status2.dirty();
         }
       } else if (unknownKeys === "strip") {
       } else {
@@ -25375,10 +25375,10 @@ var ZodObject2 = class _ZodObject extends ZodType2 {
         }
         return syncPairs;
       }).then((syncPairs) => {
-        return ParseStatus.mergeObjectSync(status, syncPairs);
+        return ParseStatus.mergeObjectSync(status2, syncPairs);
       });
     } else {
-      return ParseStatus.mergeObjectSync(status, pairs);
+      return ParseStatus.mergeObjectSync(status2, pairs);
     }
   }
   get shape() {
@@ -25856,7 +25856,7 @@ function mergeValues2(a, b) {
 }
 var ZodIntersection2 = class extends ZodType2 {
   _parse(input) {
-    const { status, ctx } = this._processInputParams(input);
+    const { status: status2, ctx } = this._processInputParams(input);
     const handleParsed = (parsedLeft, parsedRight) => {
       if (isAborted(parsedLeft) || isAborted(parsedRight)) {
         return INVALID;
@@ -25869,9 +25869,9 @@ var ZodIntersection2 = class extends ZodType2 {
         return INVALID;
       }
       if (isDirty(parsedLeft) || isDirty(parsedRight)) {
-        status.dirty();
+        status2.dirty();
       }
-      return { status: status.value, value: merged.data };
+      return { status: status2.value, value: merged.data };
     };
     if (ctx.common.async) {
       return Promise.all([
@@ -25909,7 +25909,7 @@ ZodIntersection2.create = (left, right, params) => {
 };
 var ZodTuple2 = class _ZodTuple extends ZodType2 {
   _parse(input) {
-    const { status, ctx } = this._processInputParams(input);
+    const { status: status2, ctx } = this._processInputParams(input);
     if (ctx.parsedType !== ZodParsedType.array) {
       addIssueToContext(ctx, {
         code: ZodIssueCode2.invalid_type,
@@ -25937,7 +25937,7 @@ var ZodTuple2 = class _ZodTuple extends ZodType2 {
         exact: false,
         type: "array"
       });
-      status.dirty();
+      status2.dirty();
     }
     const items = [...ctx.data].map((item, itemIndex) => {
       const schema = this._def.items[itemIndex] || this._def.rest;
@@ -25947,10 +25947,10 @@ var ZodTuple2 = class _ZodTuple extends ZodType2 {
     }).filter((x) => !!x);
     if (ctx.common.async) {
       return Promise.all(items).then((results) => {
-        return ParseStatus.mergeArray(status, results);
+        return ParseStatus.mergeArray(status2, results);
       });
     } else {
-      return ParseStatus.mergeArray(status, items);
+      return ParseStatus.mergeArray(status2, items);
     }
   }
   get items() {
@@ -25982,7 +25982,7 @@ var ZodRecord2 = class _ZodRecord extends ZodType2 {
     return this._def.valueType;
   }
   _parse(input) {
-    const { status, ctx } = this._processInputParams(input);
+    const { status: status2, ctx } = this._processInputParams(input);
     if (ctx.parsedType !== ZodParsedType.object) {
       addIssueToContext(ctx, {
         code: ZodIssueCode2.invalid_type,
@@ -26002,9 +26002,9 @@ var ZodRecord2 = class _ZodRecord extends ZodType2 {
       });
     }
     if (ctx.common.async) {
-      return ParseStatus.mergeObjectAsync(status, pairs);
+      return ParseStatus.mergeObjectAsync(status2, pairs);
     } else {
-      return ParseStatus.mergeObjectSync(status, pairs);
+      return ParseStatus.mergeObjectSync(status2, pairs);
     }
   }
   get element() {
@@ -26035,7 +26035,7 @@ var ZodMap2 = class extends ZodType2 {
     return this._def.valueType;
   }
   _parse(input) {
-    const { status, ctx } = this._processInputParams(input);
+    const { status: status2, ctx } = this._processInputParams(input);
     if (ctx.parsedType !== ZodParsedType.map) {
       addIssueToContext(ctx, {
         code: ZodIssueCode2.invalid_type,
@@ -26062,11 +26062,11 @@ var ZodMap2 = class extends ZodType2 {
             return INVALID;
           }
           if (key.status === "dirty" || value.status === "dirty") {
-            status.dirty();
+            status2.dirty();
           }
           finalMap.set(key.value, value.value);
         }
-        return { status: status.value, value: finalMap };
+        return { status: status2.value, value: finalMap };
       });
     } else {
       const finalMap = /* @__PURE__ */ new Map();
@@ -26077,11 +26077,11 @@ var ZodMap2 = class extends ZodType2 {
           return INVALID;
         }
         if (key.status === "dirty" || value.status === "dirty") {
-          status.dirty();
+          status2.dirty();
         }
         finalMap.set(key.value, value.value);
       }
-      return { status: status.value, value: finalMap };
+      return { status: status2.value, value: finalMap };
     }
   }
 };
@@ -26095,7 +26095,7 @@ ZodMap2.create = (keyType, valueType, params) => {
 };
 var ZodSet2 = class _ZodSet extends ZodType2 {
   _parse(input) {
-    const { status, ctx } = this._processInputParams(input);
+    const { status: status2, ctx } = this._processInputParams(input);
     if (ctx.parsedType !== ZodParsedType.set) {
       addIssueToContext(ctx, {
         code: ZodIssueCode2.invalid_type,
@@ -26115,7 +26115,7 @@ var ZodSet2 = class _ZodSet extends ZodType2 {
           exact: false,
           message: def.minSize.message
         });
-        status.dirty();
+        status2.dirty();
       }
     }
     if (def.maxSize !== null) {
@@ -26128,7 +26128,7 @@ var ZodSet2 = class _ZodSet extends ZodType2 {
           exact: false,
           message: def.maxSize.message
         });
-        status.dirty();
+        status2.dirty();
       }
     }
     const valueType = this._def.valueType;
@@ -26138,10 +26138,10 @@ var ZodSet2 = class _ZodSet extends ZodType2 {
         if (element.status === "aborted")
           return INVALID;
         if (element.status === "dirty")
-          status.dirty();
+          status2.dirty();
         parsedSet.add(element.value);
       }
-      return { status: status.value, value: parsedSet };
+      return { status: status2.value, value: parsedSet };
     }
     const elements = [...ctx.data.values()].map((item, i) => valueType._parse(new ParseInputLazyPath(ctx, item, ctx.path, i)));
     if (ctx.common.async) {
@@ -26472,15 +26472,15 @@ var ZodEffects = class extends ZodType2 {
     return this._def.schema._def.typeName === ZodFirstPartyTypeKind2.ZodEffects ? this._def.schema.sourceType() : this._def.schema;
   }
   _parse(input) {
-    const { status, ctx } = this._processInputParams(input);
+    const { status: status2, ctx } = this._processInputParams(input);
     const effect = this._def.effect || null;
     const checkCtx = {
       addIssue: (arg) => {
         addIssueToContext(ctx, arg);
         if (arg.fatal) {
-          status.abort();
+          status2.abort();
         } else {
-          status.dirty();
+          status2.dirty();
         }
       },
       get path() {
@@ -26492,7 +26492,7 @@ var ZodEffects = class extends ZodType2 {
       const processed = effect.transform(ctx.data, checkCtx);
       if (ctx.common.async) {
         return Promise.resolve(processed).then(async (processed2) => {
-          if (status.value === "aborted")
+          if (status2.value === "aborted")
             return INVALID;
           const result = await this._def.schema._parseAsync({
             data: processed2,
@@ -26503,12 +26503,12 @@ var ZodEffects = class extends ZodType2 {
             return INVALID;
           if (result.status === "dirty")
             return DIRTY(result.value);
-          if (status.value === "dirty")
+          if (status2.value === "dirty")
             return DIRTY(result.value);
           return result;
         });
       } else {
-        if (status.value === "aborted")
+        if (status2.value === "aborted")
           return INVALID;
         const result = this._def.schema._parseSync({
           data: processed,
@@ -26519,7 +26519,7 @@ var ZodEffects = class extends ZodType2 {
           return INVALID;
         if (result.status === "dirty")
           return DIRTY(result.value);
-        if (status.value === "dirty")
+        if (status2.value === "dirty")
           return DIRTY(result.value);
         return result;
       }
@@ -26544,17 +26544,17 @@ var ZodEffects = class extends ZodType2 {
         if (inner.status === "aborted")
           return INVALID;
         if (inner.status === "dirty")
-          status.dirty();
+          status2.dirty();
         executeRefinement(inner.value);
-        return { status: status.value, value: inner.value };
+        return { status: status2.value, value: inner.value };
       } else {
         return this._def.schema._parseAsync({ data: ctx.data, path: ctx.path, parent: ctx }).then((inner) => {
           if (inner.status === "aborted")
             return INVALID;
           if (inner.status === "dirty")
-            status.dirty();
+            status2.dirty();
           return executeRefinement(inner.value).then(() => {
-            return { status: status.value, value: inner.value };
+            return { status: status2.value, value: inner.value };
           });
         });
       }
@@ -26572,13 +26572,13 @@ var ZodEffects = class extends ZodType2 {
         if (result instanceof Promise) {
           throw new Error(`Asynchronous transform encountered during synchronous parse operation. Use .parseAsync instead.`);
         }
-        return { status: status.value, value: result };
+        return { status: status2.value, value: result };
       } else {
         return this._def.schema._parseAsync({ data: ctx.data, path: ctx.path, parent: ctx }).then((base) => {
           if (!isValid(base))
             return INVALID;
           return Promise.resolve(effect.transform(base.value, checkCtx)).then((result) => ({
-            status: status.value,
+            status: status2.value,
             value: result
           }));
         });
@@ -26756,7 +26756,7 @@ var ZodBranded = class extends ZodType2 {
 };
 var ZodPipeline = class _ZodPipeline extends ZodType2 {
   _parse(input) {
-    const { status, ctx } = this._processInputParams(input);
+    const { status: status2, ctx } = this._processInputParams(input);
     if (ctx.common.async) {
       const handleAsync = async () => {
         const inResult = await this._def.in._parseAsync({
@@ -26767,7 +26767,7 @@ var ZodPipeline = class _ZodPipeline extends ZodType2 {
         if (inResult.status === "aborted")
           return INVALID;
         if (inResult.status === "dirty") {
-          status.dirty();
+          status2.dirty();
           return DIRTY(inResult.value);
         } else {
           return this._def.out._parseAsync({
@@ -26787,7 +26787,7 @@ var ZodPipeline = class _ZodPipeline extends ZodType2 {
       if (inResult.status === "aborted")
         return INVALID;
       if (inResult.status === "dirty") {
-        status.dirty();
+        status2.dirty();
         return {
           status: "dirty",
           value: inResult.value
@@ -27099,8 +27099,8 @@ function getLiteralValue(schema) {
 }
 
 // node_modules/.pnpm/@modelcontextprotocol+sdk@1.29.0_zod@4.4.3/node_modules/@modelcontextprotocol/sdk/dist/esm/experimental/tasks/interfaces.js
-function isTerminal(status) {
-  return status === "completed" || status === "failed" || status === "cancelled";
+function isTerminal(status2) {
+  return status2 === "completed" || status2 === "failed" || status2 === "cancelled";
 }
 
 // node_modules/.pnpm/zod-to-json-schema@3.25.2_zod@4.4.3/node_modules/zod-to-json-schema/dist/esm/Options.js
@@ -29319,8 +29319,8 @@ var Protocol = class {
         }
         return task;
       },
-      storeTaskResult: async (taskId, status, result) => {
-        await taskStore.storeTaskResult(taskId, status, result, sessionId);
+      storeTaskResult: async (taskId, status2, result) => {
+        await taskStore.storeTaskResult(taskId, status2, result, sessionId);
         const task = await taskStore.getTask(taskId, sessionId);
         if (task) {
           const notification = TaskStatusNotificationSchema.parse({
@@ -29336,15 +29336,15 @@ var Protocol = class {
       getTaskResult: (taskId) => {
         return taskStore.getTaskResult(taskId, sessionId);
       },
-      updateTaskStatus: async (taskId, status, statusMessage) => {
+      updateTaskStatus: async (taskId, status2, statusMessage) => {
         const task = await taskStore.getTask(taskId, sessionId);
         if (!task) {
           throw new McpError(ErrorCode.InvalidParams, `Task "${taskId}" not found - it may have been cleaned up`);
         }
         if (isTerminal(task.status)) {
-          throw new McpError(ErrorCode.InvalidParams, `Cannot update task "${taskId}" from terminal status "${task.status}" to "${status}". Terminal states (completed, failed, cancelled) cannot transition to other states.`);
+          throw new McpError(ErrorCode.InvalidParams, `Cannot update task "${taskId}" from terminal status "${task.status}" to "${status2}". Terminal states (completed, failed, cancelled) cannot transition to other states.`);
         }
-        await taskStore.updateTaskStatus(taskId, status, statusMessage, sessionId);
+        await taskStore.updateTaskStatus(taskId, status2, statusMessage, sessionId);
         const updatedTask = await taskStore.getTask(taskId, sessionId);
         if (updatedTask) {
           const notification = TaskStatusNotificationSchema.parse({
@@ -31397,12 +31397,54 @@ var GraphSchema = external_exports.strictObject({
   controlEdges: external_exports.array(ControlEdgeSchema),
   revision: external_exports.number().int().nonnegative()
 });
+var TokenAvailabilityStatusSchema = external_exports.enum([
+  "reported",
+  "derived",
+  "estimated",
+  "unavailable",
+  "legacy_unknown"
+]);
+var legacyTokenAvailability = {
+  input: "legacy_unknown",
+  cachedInput: "legacy_unknown",
+  uncachedInput: "legacy_unknown",
+  output: "legacy_unknown",
+  reasoning: "legacy_unknown",
+  total: "legacy_unknown"
+};
+var TokenAvailabilitySchema = external_exports.strictObject({
+  input: TokenAvailabilityStatusSchema,
+  cachedInput: TokenAvailabilityStatusSchema,
+  uncachedInput: TokenAvailabilityStatusSchema,
+  output: TokenAvailabilityStatusSchema,
+  reasoning: TokenAvailabilityStatusSchema,
+  total: TokenAvailabilityStatusSchema
+}).default(legacyTokenAvailability);
 var TokenUsageSchema = external_exports.strictObject({
   input: external_exports.number().int().nonnegative().default(0),
   cachedInput: external_exports.number().int().nonnegative().default(0),
+  uncachedInput: external_exports.number().int().nonnegative().default(0),
   output: external_exports.number().int().nonnegative().default(0),
   reasoning: external_exports.number().int().nonnegative().default(0),
-  total: external_exports.number().int().nonnegative().default(0)
+  total: external_exports.number().int().nonnegative().default(0),
+  availability: TokenAvailabilitySchema
+});
+var TokenAttributionPhaseSchema = external_exports.enum([
+  "planning",
+  "worker",
+  "repair",
+  "semantic_verification",
+  "graphcraft_overhead"
+]);
+var TokenLedgerEntrySchema = external_exports.strictObject({
+  sequence: external_exports.number().int().positive(),
+  phase: TokenAttributionPhaseSchema,
+  usage: TokenUsageSchema,
+  causationId: external_exports.string().min(1),
+  nodeId: external_exports.string().min(1).optional(),
+  host: external_exports.string().min(1).optional(),
+  recovered: external_exports.boolean().default(false),
+  missing: external_exports.boolean().default(false)
 });
 var WorkerResultSchema = external_exports.strictObject({
   status: external_exports.enum(["completed", "blocked", "failed"]),
@@ -31591,6 +31633,7 @@ var RunStateSchema = external_exports.strictObject({
   progressTrajectory: external_exports.array(ProgressTrajectoryEntrySchema).default([]),
   progressDecision: ProgressDecisionPacketSchema.optional(),
   tokens: TokenUsageSchema,
+  tokenLedger: external_exports.array(TokenLedgerEntrySchema).default([]),
   controlDecisions: external_exports.array(ControlDecisionSchema),
   pendingDecision: ControlDecisionPacketSchema.optional(),
   stopReason: external_exports.string().optional(),
@@ -32117,9 +32160,9 @@ function applyGraphAmendment(input) {
   const target = (id) => {
     const item = nodes.find((candidate) => candidate.id === id);
     if (!item) throw new Error(`Amendment references unknown node ${id}`);
-    const status = input.nodeStatuses[id]?.status;
-    if (status === "accepted") throw new Error(`Accepted node ${id} is immutable`);
-    if (status === "running")
+    const status2 = input.nodeStatuses[id]?.status;
+    if (status2 === "accepted") throw new Error(`Accepted node ${id} is immutable`);
+    if (status2 === "running")
       throw new Error(`Running node ${id} must be checkpointed before amendment`);
     return item;
   };
@@ -32227,8 +32270,8 @@ function applyGraphAmendment(input) {
     input.requiredVerificationProbes,
     input.approvedProbes ?? input.requiredVerificationProbes
   );
-  for (const [id, status] of Object.entries(input.nodeStatuses)) {
-    if (status.status !== "accepted") continue;
+  for (const [id, status2] of Object.entries(input.nodeStatuses)) {
+    if (status2.status !== "accepted") continue;
     if (JSON.stringify(originalById.get(id)) !== JSON.stringify(graph.nodes.find((item) => item.id === id)))
       throw new Error(`Accepted node ${id} was changed by the amendment`);
   }
@@ -32581,22 +32624,171 @@ function renderSemanticVerifierPrompt(context) {
   ].join("\n");
 }
 
+// packages/core/src/tokens.ts
+var dimensions = [
+  "input",
+  "cachedInput",
+  "uncachedInput",
+  "output",
+  "reasoning",
+  "total"
+];
+function reported(value, key) {
+  const candidate = value[key];
+  return typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0 ? Math.trunc(candidate) : void 0;
+}
+function status(value) {
+  return value === void 0 ? "unavailable" : "reported";
+}
+function derivedStatus(required2, hasAny) {
+  if (required2.every((value) => value !== void 0)) return "derived";
+  return hasAny ? "estimated" : "unavailable";
+}
+function unavailableTokenUsage() {
+  return TokenUsageSchema.parse({
+    input: 0,
+    cachedInput: 0,
+    uncachedInput: 0,
+    output: 0,
+    reasoning: 0,
+    total: 0,
+    availability: Object.fromEntries(dimensions.map((dimension) => [dimension, "unavailable"]))
+  });
+}
+function deterministicTokenUsage() {
+  return TokenUsageSchema.parse({
+    input: 0,
+    cachedInput: 0,
+    uncachedInput: 0,
+    output: 0,
+    reasoning: 0,
+    total: 0,
+    availability: Object.fromEntries(dimensions.map((dimension) => [dimension, "derived"]))
+  });
+}
+function normalizeTokenUsage(provider, value) {
+  const usage = typeof value === "object" && value !== null ? value : {};
+  if (provider === "codex") {
+    const input2 = reported(usage, "input_tokens");
+    const cachedInput = reported(usage, "cached_input_tokens");
+    const output2 = reported(usage, "output_tokens");
+    const reasoning2 = reported(usage, "reasoning_output_tokens");
+    const uncachedInput2 = input2 !== void 0 && cachedInput !== void 0 ? Math.max(0, input2 - cachedInput) : void 0;
+    const total = input2 !== void 0 && output2 !== void 0 ? input2 + output2 : void 0;
+    return TokenUsageSchema.parse({
+      input: input2 ?? 0,
+      cachedInput: cachedInput ?? 0,
+      uncachedInput: uncachedInput2 ?? 0,
+      output: output2 ?? 0,
+      reasoning: reasoning2 ?? 0,
+      total: total ?? (input2 ?? 0) + (output2 ?? 0),
+      availability: {
+        input: status(input2),
+        cachedInput: status(cachedInput),
+        uncachedInput: input2 !== void 0 && cachedInput !== void 0 ? "derived" : "unavailable",
+        output: status(output2),
+        reasoning: status(reasoning2),
+        total: derivedStatus([input2, output2], input2 !== void 0 || output2 !== void 0)
+      }
+    });
+  }
+  const directInput = reported(usage, "input_tokens");
+  const cacheCreation = reported(usage, "cache_creation_input_tokens");
+  const cacheRead = reported(usage, "cache_read_input_tokens");
+  const output = reported(usage, "output_tokens");
+  const reasoning = reported(usage, "reasoning_output_tokens");
+  const inputParts = [directInput, cacheCreation, cacheRead];
+  const uncachedParts = [directInput, cacheCreation];
+  const input = inputParts.reduce((sum, item) => sum + (item ?? 0), 0);
+  const uncachedInput = uncachedParts.reduce((sum, item) => sum + (item ?? 0), 0);
+  const inputAvailability = derivedStatus(
+    inputParts,
+    inputParts.some((item) => item !== void 0)
+  );
+  const uncachedAvailability = derivedStatus(
+    uncachedParts,
+    uncachedParts.some((item) => item !== void 0)
+  );
+  return TokenUsageSchema.parse({
+    input,
+    cachedInput: cacheRead ?? 0,
+    uncachedInput,
+    output: output ?? 0,
+    reasoning: reasoning ?? 0,
+    total: input + (output ?? 0),
+    availability: {
+      input: inputAvailability,
+      cachedInput: status(cacheRead),
+      uncachedInput: uncachedAvailability,
+      output: status(output),
+      reasoning: status(reasoning),
+      total: output === void 0 || inputAvailability === "unavailable" ? input > 0 || output !== void 0 ? "estimated" : "unavailable" : inputAvailability === "estimated" ? "estimated" : "derived"
+    }
+  });
+}
+var availabilityRank = {
+  reported: 0,
+  derived: 1,
+  estimated: 2,
+  unavailable: 3,
+  legacy_unknown: 4
+};
+function aggregateTokenUsage(usages) {
+  if (usages.length === 0) return unavailableTokenUsage();
+  const values = Object.fromEntries(
+    dimensions.map((dimension) => [
+      dimension,
+      usages.reduce((sum, usage) => sum + usage[dimension], 0)
+    ])
+  );
+  const availability = Object.fromEntries(
+    dimensions.map((dimension) => {
+      const worst = usages.map((usage) => usage.availability[dimension]).sort((left, right) => availabilityRank[right] - availabilityRank[left])[0];
+      return [dimension, usages.length > 1 && worst === "reported" ? "derived" : worst];
+    })
+  );
+  return TokenUsageSchema.parse({ ...values, availability });
+}
+function groupedReport(entries, key) {
+  const groups = /* @__PURE__ */ new Map();
+  for (const entry of entries) {
+    const value = entry[key];
+    if (!value) continue;
+    const group = groups.get(value) ?? [];
+    group.push(entry.usage);
+    groups.set(value, group);
+  }
+  return Object.fromEntries(
+    [...groups.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([name, usages]) => [name, aggregateTokenUsage(usages)])
+  );
+}
+function tokenCostReport(entries) {
+  const totals = aggregateTokenUsage(entries.map(({ usage }) => usage));
+  const limitations = /* @__PURE__ */ new Set();
+  for (const entry of entries)
+    for (const dimension of dimensions) {
+      const availability = entry.usage.availability[dimension];
+      if (["unavailable", "legacy_unknown", "estimated"].includes(availability))
+        limitations.add(
+          `${entry.phase}${entry.nodeId ? `:${entry.nodeId}` : ""}.${dimension}:${availability}`
+        );
+    }
+  return {
+    receipts: entries.length,
+    totals,
+    byPhase: groupedReport(entries, "phase"),
+    byNode: groupedReport(entries, "nodeId"),
+    reconciled: limitations.size === 0,
+    limitations: [...limitations].sort()
+  };
+}
+
 // packages/core/src/reducer.ts
-var emptyTokens = { input: 0, cachedInput: 0, output: 0, reasoning: 0, total: 0 };
 function requiredString(data, key) {
   const value = data[key];
   if (typeof value !== "string" || value.length === 0)
     throw new Error(`Event data.${key} must be a string`);
   return value;
-}
-function addTokens(left, right) {
-  return {
-    input: left.input + right.input,
-    cachedInput: left.cachedInput + right.cachedInput,
-    output: left.output + right.output,
-    reasoning: left.reasoning + right.reasoning,
-    total: left.total + right.total
-  };
 }
 function reduceEvents(events) {
   let state;
@@ -32623,7 +32815,8 @@ function reduceEvents(events) {
         ),
         latestProgressEvidence: [],
         progressTrajectory: [],
-        tokens: { ...emptyTokens },
+        tokens: unavailableTokenUsage(),
+        tokenLedger: [],
         controlDecisions: [],
         updatedAt: event.timestamp
       };
@@ -32706,9 +32899,26 @@ function reduceEvents(events) {
         state.currentNodeId = void 0;
         break;
       }
-      case "tokens.recorded":
-        state.tokens = addTokens(state.tokens, TokenUsageSchema.parse(data.usage));
+      case "tokens.recorded": {
+        const phase = TokenAttributionPhaseSchema.catch("worker").parse(data.phase);
+        const entry = TokenLedgerEntrySchema.parse({
+          sequence: event.sequence,
+          phase,
+          usage: TokenUsageSchema.parse(data.usage),
+          causationId: event.causationId,
+          ...typeof data.nodeId === "string" ? { nodeId: data.nodeId } : {},
+          ...typeof data.host === "string" ? { host: data.host } : {},
+          recovered: data.recovered === true,
+          missing: data.missing === true
+        });
+        if (!entry.missing)
+          state.tokenLedger = state.tokenLedger.filter(
+            (candidate) => !(candidate.missing && candidate.causationId === entry.causationId && candidate.phase === entry.phase)
+          );
+        state.tokenLedger.push(entry);
+        state.tokens = aggregateTokenUsage(state.tokenLedger.map(({ usage }) => usage));
         break;
+      }
       case "graph.amended": {
         const addedNodeIds = Array.isArray(data.addedNodeIds) ? data.addedNodeIds.map((value) => String(value)) : [];
         const removedNodeIds = Array.isArray(data.removedNodeIds) ? data.removedNodeIds.map((value) => String(value)) : [];
@@ -32892,18 +33102,7 @@ function parseSemanticVerdict(value) {
   }
 }
 function codexUsage(value) {
-  const usage = value ?? {};
-  const input = Number(usage.input_tokens ?? 0);
-  const cachedInput = Number(usage.cached_input_tokens ?? 0);
-  const output = Number(usage.output_tokens ?? 0);
-  const reasoning = Number(usage.reasoning_output_tokens ?? 0);
-  return TokenUsageSchema.parse({
-    input,
-    cachedInput,
-    output,
-    reasoning,
-    total: input + output
-  });
+  return normalizeTokenUsage("codex", value);
 }
 async function commandVersion(command) {
   return await new Promise((resolve4) => {
@@ -33237,17 +33436,7 @@ function parseSemanticVerdict2(value) {
   }
 }
 function claudeUsage(value) {
-  const usage = value ?? {};
-  const input = Number(usage.input_tokens ?? 0);
-  const cachedInput = Number(usage.cache_read_input_tokens ?? 0);
-  const output = Number(usage.output_tokens ?? 0);
-  return TokenUsageSchema.parse({
-    input,
-    cachedInput,
-    output,
-    reasoning: 0,
-    total: input + output
-  });
+  return normalizeTokenUsage("claude", value);
 }
 async function claudeVersion() {
   return await new Promise((resolve4) => {
@@ -33277,8 +33466,8 @@ async function claudeAuthenticated() {
     child.once("error", () => resolve4(false));
     child.once("close", (code) => {
       try {
-        const status = JSON.parse(output);
-        resolve4(code === 0 && status.loggedIn === true);
+        const status2 = JSON.parse(output);
+        resolve4(code === 0 && status2.loggedIn === true);
       } catch {
         resolve4(false);
       }
@@ -34025,15 +34214,15 @@ async function runProbes(specs, repositoryPath, signal) {
   return results;
 }
 async function workspaceDigest(repositoryPath) {
-  const [status, diff] = await Promise.all([
+  const [status2, diff] = await Promise.all([
     runProcess("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
       cwd: repositoryPath
     }),
     runProcess("git", ["diff", "--no-ext-diff", "--binary", "HEAD", "--"], { cwd: repositoryPath })
   ]);
-  if (status.exitCode !== 0 || diff.exitCode !== 0)
+  if (status2.exitCode !== 0 || diff.exitCode !== 0)
     throw new Error("Unable to capture repository state");
-  return contentHash({ status: status.stdout, diff: diff.stdout });
+  return contentHash({ status: status2.stdout, diff: diff.stdout });
 }
 var probeStopWords = /* @__PURE__ */ new Set([
   "across",
@@ -35178,8 +35367,8 @@ async function createRunWorkspace(contract) {
   return { path, branch, created: true };
 }
 async function createAtomicCommit(workspace, task) {
-  const status = await git(workspace.path, ["status", "--porcelain=v1"]);
-  if (!status) throw new Error("No accepted changes are available to commit");
+  const status2 = await git(workspace.path, ["status", "--porcelain=v1"]);
+  if (!status2) throw new Error("No accepted changes are available to commit");
   await git(workspace.path, ["add", "-A"]);
   const summary = task.replace(/\s+/g, " ").slice(0, 64);
   await git(workspace.path, ["commit", "-m", `graphcraft: ${summary}`]);
@@ -35356,9 +35545,9 @@ var RunStore = class _RunStore {
   async loadState() {
     await this.ensureStorage();
     try {
-      return RunStateSchema.parse(
-        JSON.parse(await readFile7(join8(this.runRoot, "state.json"), "utf8"))
-      );
+      const value = JSON.parse(await readFile7(join8(this.runRoot, "state.json"), "utf8"));
+      if (!("tokenLedger" in value)) return await this.rebuildViews();
+      return RunStateSchema.parse(value);
     } catch {
       return await this.rebuildViews();
     }
@@ -35697,19 +35886,36 @@ async function recoverableInvocation(store, nodeId, repositoryPath, family) {
     }
   };
 }
-async function recordMissingUsage(store, invocation) {
+async function recordMissingUsage(store, invocation, node2, host) {
   const transcriptUsage = (invocation.transcript ?? []).filter(
     (event) => event.type === "usage"
   );
   const events = await store.loadEvents();
   const recordedCount = events.filter(
-    ({ type, causationId }) => type === "tokens.recorded" && causationId === invocation.invocationId
+    ({ type, causationId, data }) => type === "tokens.recorded" && causationId === invocation.invocationId && data.missing !== true
   ).length;
+  const phase = node2.id.startsWith("repair-") ? "repair" : "worker";
   for (const event of transcriptUsage.slice(recordedCount))
     await store.append(
       "host",
       "tokens.recorded",
-      { usage: event.usage, recovered: true },
+      { usage: event.usage, recovered: true, phase, nodeId: node2.id, host },
+      invocation.invocationId
+    );
+  if (transcriptUsage.length === 0 && (invocation.transcript ?? []).some(({ type }) => type === "result") && !events.some(
+    ({ type, causationId }) => type === "tokens.recorded" && causationId === invocation.invocationId
+  ))
+    await store.append(
+      "host",
+      "tokens.recorded",
+      {
+        usage: unavailableTokenUsage(),
+        phase,
+        nodeId: node2.id,
+        host,
+        missing: true,
+        recovered: true
+      },
       invocation.invocationId
     );
 }
@@ -35782,8 +35988,17 @@ async function createRun(task, options) {
     probePlan,
     heldOutProbePlan
   );
-  if (planningUsage)
-    await store.append("host", "tokens.recorded", { usage: planningUsage, phase: "planning" });
+  await store.append("runtime", "tokens.recorded", {
+    usage: deterministicTokenUsage(),
+    phase: "graphcraft_overhead"
+  });
+  if (options.planner)
+    await store.append("host", "tokens.recorded", {
+      usage: planningUsage ?? unavailableTokenUsage(),
+      phase: "planning",
+      host: options.planner.id,
+      missing: !planningUsage
+    });
   return { contract, graph, store, probePlan };
 }
 async function configureRunProbes(store, input) {
@@ -35829,7 +36044,7 @@ async function executeWorker(input) {
   let invocationId = input.resume?.invocationId ?? randomUUID7();
   let resumeSessionId;
   if (input.resume) {
-    await recordMissingUsage(input.store, input.resume);
+    await recordMissingUsage(input.store, input.resume, input.node, input.adapter.id);
     const reconciliation = await input.adapter.reconcile(input.resume);
     if (reconciliation.state === "completed" && reconciliation.result) {
       const artifact2 = join9(
@@ -35895,6 +36110,8 @@ async function executeWorker(input) {
   let error51;
   let errorCause;
   let termination;
+  let usageReceipts = 0;
+  const tokenPhase = input.node.id.startsWith("repair-") ? "repair" : "worker";
   let artifact = join9(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
   const execution = input.adapter.execute(
     {
@@ -35933,7 +36150,18 @@ async function executeWorker(input) {
     if (event.type === "tool")
       input.observer?.({ type: "host", message: `${event.name} ${event.summary}`.trim() });
     if (event.type === "usage") {
-      await input.store.append("host", "tokens.recorded", { usage: event.usage }, invocationId);
+      usageReceipts += 1;
+      await input.store.append(
+        "host",
+        "tokens.recorded",
+        {
+          usage: event.usage,
+          phase: tokenPhase,
+          nodeId: input.node.id,
+          host: input.adapter.id
+        },
+        invocationId
+      );
     }
     if (event.type === "result") result = WorkerResultSchema.parse(event.result);
     if (event.type === "terminated") termination = event.termination;
@@ -35942,6 +36170,19 @@ async function executeWorker(input) {
       if (event.cause === "host_crash" || event.cause === "timeout") errorCause = event.cause;
     }
   }
+  if (usageReceipts === 0)
+    await input.store.append(
+      "host",
+      "tokens.recorded",
+      {
+        usage: unavailableTokenUsage(),
+        phase: tokenPhase,
+        nodeId: input.node.id,
+        host: input.adapter.id,
+        missing: true
+      },
+      invocationId
+    );
   await input.store.append(
     "runtime",
     "invocation.finished",
@@ -36038,13 +36279,18 @@ async function runSemanticVerification(input) {
       invocationId
     );
     verdictPersisted = true;
-    if (result.usage)
-      await input.store.append(
-        "host",
-        "tokens.recorded",
-        { usage: result.usage, phase: "semantic_verification", nodeId: input.node.id },
-        invocationId
-      );
+    await input.store.append(
+      "host",
+      "tokens.recorded",
+      {
+        usage: result.usage ?? unavailableTokenUsage(),
+        phase: "semantic_verification",
+        nodeId: input.node.id,
+        host: input.adapter.id,
+        missing: !result.usage
+      },
+      invocationId
+    );
     if (policyViolation)
       throw new Error("The read-only semantic verifier changed the repository workspace");
     return result.verdict;
@@ -36625,7 +36871,7 @@ async function executeRun(input) {
             interrupted?.termination,
             interrupted?.artifact
           );
-        const failed = outcomes.find(({ status }) => status === "failed");
+        const failed = outcomes.find(({ status: status2 }) => status2 === "failed");
         if (failed?.status === "failed") {
           const quarantinedSiblingIds = outcomes.filter(
             (outcome2) => outcome2.status === "interrupted"
@@ -36636,7 +36882,7 @@ async function executeRun(input) {
             ...failed.packet ? { decisionPacket: failed.packet } : {},
             ...failed.progressDecision ? { progressDecision: failed.progressDecision } : {},
             batchId,
-            acceptedSiblingIds: outcomes.filter(({ status }) => status === "accepted").map(({ nodeId }) => nodeId),
+            acceptedSiblingIds: outcomes.filter(({ status: status2 }) => status2 === "accepted").map(({ nodeId }) => nodeId),
             quarantinedSiblingIds
           });
           return await input.store.loadState();
@@ -37000,6 +37246,7 @@ function stateView(state, contract) {
     controlDecisions: state.controlDecisions,
     pendingDecision: state.pendingDecision,
     tokens: state.tokens,
+    tokenReport: tokenCostReport(state.tokenLedger),
     stopReason: state.stopReason,
     updatedAt: state.updatedAt
   };
@@ -37078,6 +37325,7 @@ async function handleAction(input) {
         }))
       },
       state,
+      tokenReport: tokenCostReport(state.tokenLedger),
       graphHistory: await store.loadGraphHistory(),
       contextReceipts: (await store.loadEvents()).filter(({ type }) => type === "context.selected").map(({ data }) => ContextSelectionReceiptSchema.parse(data.receipt))
     };

@@ -21,6 +21,7 @@ import {
   resolveHeldOutProbes,
   reduceEvents,
   semanticVerdictJsonSchema,
+  tokenCostReport,
   validateGraph,
   verifyRunEvent,
   workerVisibleProbePlan,
@@ -616,6 +617,87 @@ describe("event replay", () => {
     expect(first.nodes.implement?.status).toBe("accepted");
 
     expect(() => verifyRunEvent({ ...accepted, hash: "0".repeat(64) })).toThrow(/hash/);
+  });
+
+  it("replaces a missing usage placeholder when the host receipt is recovered", () => {
+    const contract = compileRunContract("Implement a substantial new feature", repository);
+    const graph = compileGraph(contract, []);
+    const invocationId = randomUUID();
+    const created = createRunEvent({
+      sequence: 1,
+      timestamp: "2026-07-21T12:00:00.000Z",
+      actor: "runtime",
+      causationId: contract.runId,
+      type: "run.created",
+      data: { contract, graph, nodeIds: graph.nodes.map(({ id }) => id) },
+    });
+    const missing = createRunEvent({
+      sequence: 2,
+      timestamp: "2026-07-21T12:00:01.000Z",
+      actor: "host",
+      causationId: invocationId,
+      type: "tokens.recorded",
+      data: {
+        phase: "worker",
+        nodeId: "implement",
+        missing: true,
+        usage: {
+          input: 0,
+          cachedInput: 0,
+          uncachedInput: 0,
+          output: 0,
+          reasoning: 0,
+          total: 0,
+          availability: {
+            input: "unavailable",
+            cachedInput: "unavailable",
+            uncachedInput: "unavailable",
+            output: "unavailable",
+            reasoning: "unavailable",
+            total: "unavailable",
+          },
+        },
+      },
+    });
+    const recovered = createRunEvent({
+      sequence: 3,
+      timestamp: "2026-07-21T12:00:02.000Z",
+      actor: "host",
+      causationId: invocationId,
+      type: "tokens.recorded",
+      data: {
+        phase: "worker",
+        nodeId: "implement",
+        recovered: true,
+        usage: {
+          input: 10,
+          cachedInput: 2,
+          uncachedInput: 8,
+          output: 4,
+          reasoning: 1,
+          total: 14,
+          availability: {
+            input: "reported",
+            cachedInput: "reported",
+            uncachedInput: "derived",
+            output: "reported",
+            reasoning: "reported",
+            total: "derived",
+          },
+        },
+      },
+    });
+
+    const state = reduceEvents([created, missing, recovered]);
+
+    expect(state.tokenLedger).toEqual([
+      expect.objectContaining({ sequence: 3, recovered: true, missing: false }),
+    ]);
+    expect(tokenCostReport(state.tokenLedger)).toMatchObject({
+      receipts: 1,
+      reconciled: true,
+      totals: { total: 14 },
+    });
   });
 });
 

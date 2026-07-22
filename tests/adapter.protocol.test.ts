@@ -2,9 +2,14 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { describe, expect, it } from "vitest";
-import { codexSemanticVerifierArgs, codexWorkerArgs } from "../packages/adapter-codex/src/index.ts";
+import {
+  codexSemanticVerifierArgs,
+  codexUsage,
+  codexWorkerArgs,
+} from "../packages/adapter-codex/src/index.ts";
 import {
   claudeSemanticVerifierArgs,
+  claudeUsage,
   claudeWorkerArgs,
 } from "../packages/adapter-claude/src/index.ts";
 import {
@@ -37,6 +42,46 @@ function semanticRequest(): SemanticVerificationRequest {
 }
 
 describe("native host continuation protocol", () => {
+  it("normalizes provider token dimensions without fabricating missing values", () => {
+    expect(
+      codexUsage({
+        input_tokens: 100,
+        cached_input_tokens: 40,
+        output_tokens: 20,
+        reasoning_output_tokens: 5,
+      }),
+    ).toMatchObject({
+      input: 100,
+      cachedInput: 40,
+      uncachedInput: 60,
+      output: 20,
+      reasoning: 5,
+      total: 120,
+      availability: { uncachedInput: "derived", total: "derived" },
+    });
+    expect(
+      claudeUsage({
+        input_tokens: 10,
+        cache_creation_input_tokens: 5,
+        cache_read_input_tokens: 20,
+        output_tokens: 4,
+      }),
+    ).toMatchObject({
+      input: 35,
+      cachedInput: 20,
+      uncachedInput: 15,
+      output: 4,
+      reasoning: 0,
+      total: 39,
+      availability: { reasoning: "unavailable", total: "derived" },
+    });
+    expect(codexUsage({ input_tokens: 10, output_tokens: 2 })).toMatchObject({
+      cachedInput: 0,
+      uncachedInput: 0,
+      availability: { cachedInput: "unavailable", uncachedInput: "unavailable" },
+    });
+  });
+
   it("persists Codex worker sessions and resumes an exact thread without ephemeral mode", () => {
     const fresh = codexWorkerArgs(request(), "/tmp/schema.json");
     expect(fresh).not.toContain("--ephemeral");

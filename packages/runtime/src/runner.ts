@@ -10,9 +10,11 @@ import {
   compilePlannedGraph,
   compileRunContract,
   contentHash,
+  deterministicTokenUsage,
   evidenceSnapshot,
   interruptionReason,
   resolveHeldOutProbes,
+  unavailableTokenUsage,
   workerVisibleProbePlan,
   type EvidenceSnapshot,
   type ExecutableProbe,
@@ -184,20 +186,49 @@ async function recoverableInvocation(
   };
 }
 
-async function recordMissingUsage(store: RunStore, invocation: InvocationRecord): Promise<void> {
+async function recordMissingUsage(
+  store: RunStore,
+  invocation: InvocationRecord,
+  node: GraphNode,
+  host: string,
+): Promise<void> {
   const transcriptUsage = (invocation.transcript ?? []).filter(
     (event): event is Extract<HostEvent, { type: "usage" }> => event.type === "usage",
   );
   const events = await store.loadEvents();
   const recordedCount = events.filter(
-    ({ type, causationId }) =>
-      type === "tokens.recorded" && causationId === invocation.invocationId,
+    ({ type, causationId, data }) =>
+      type === "tokens.recorded" &&
+      causationId === invocation.invocationId &&
+      data.missing !== true,
   ).length;
+  const phase = node.id.startsWith("repair-") ? "repair" : "worker";
   for (const event of transcriptUsage.slice(recordedCount))
     await store.append(
       "host",
       "tokens.recorded",
-      { usage: event.usage, recovered: true },
+      { usage: event.usage, recovered: true, phase, nodeId: node.id, host },
+      invocation.invocationId,
+    );
+  if (
+    transcriptUsage.length === 0 &&
+    (invocation.transcript ?? []).some(({ type }) => type === "result") &&
+    !events.some(
+      ({ type, causationId }) =>
+        type === "tokens.recorded" && causationId === invocation.invocationId,
+    )
+  )
+    await store.append(
+      "host",
+      "tokens.recorded",
+      {
+        usage: unavailableTokenUsage(),
+        phase,
+        nodeId: node.id,
+        host,
+        missing: true,
+        recovered: true,
+      },
       invocation.invocationId,
     );
 }
@@ -287,8 +318,17 @@ export async function createRun(
     probePlan,
     heldOutProbePlan,
   );
-  if (planningUsage)
-    await store.append("host", "tokens.recorded", { usage: planningUsage, phase: "planning" });
+  await store.append("runtime", "tokens.recorded", {
+    usage: deterministicTokenUsage(),
+    phase: "graphcraft_overhead",
+  });
+  if (options.planner)
+    await store.append("host", "tokens.recorded", {
+      usage: planningUsage ?? unavailableTokenUsage(),
+      phase: "planning",
+      host: options.planner.id,
+      missing: !planningUsage,
+    });
   return { contract, graph, store, probePlan };
 }
 
@@ -358,7 +398,7 @@ async function executeWorker(input: {
   let invocationId = input.resume?.invocationId ?? randomUUID();
   let resumeSessionId: string | undefined;
   if (input.resume) {
-    await recordMissingUsage(input.store, input.resume);
+    await recordMissingUsage(input.store, input.resume, input.node, input.adapter.id);
     const reconciliation = await input.adapter.reconcile(input.resume);
     if (reconciliation.state === "completed" && reconciliation.result) {
       const artifact = join(
@@ -424,6 +464,8 @@ async function executeWorker(input: {
   let error: string | undefined;
   let errorCause: "host_crash" | "timeout" | undefined;
   let termination: HostTermination | undefined;
+  let usageReceipts = 0;
+  const tokenPhase = input.node.id.startsWith("repair-") ? "repair" : "worker";
 
   let artifact = join(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
   const execution = input.adapter.execute(
@@ -464,7 +506,18 @@ async function executeWorker(input: {
     if (event.type === "tool")
       input.observer?.({ type: "host", message: `${event.name} ${event.summary}`.trim() });
     if (event.type === "usage") {
-      await input.store.append("host", "tokens.recorded", { usage: event.usage }, invocationId);
+      usageReceipts += 1;
+      await input.store.append(
+        "host",
+        "tokens.recorded",
+        {
+          usage: event.usage,
+          phase: tokenPhase,
+          nodeId: input.node.id,
+          host: input.adapter.id,
+        },
+        invocationId,
+      );
     }
     if (event.type === "result") result = WorkerResultSchema.parse(event.result);
     if (event.type === "terminated") termination = event.termination;
@@ -473,6 +526,19 @@ async function executeWorker(input: {
       if (event.cause === "host_crash" || event.cause === "timeout") errorCause = event.cause;
     }
   }
+  if (usageReceipts === 0)
+    await input.store.append(
+      "host",
+      "tokens.recorded",
+      {
+        usage: unavailableTokenUsage(),
+        phase: tokenPhase,
+        nodeId: input.node.id,
+        host: input.adapter.id,
+        missing: true,
+      },
+      invocationId,
+    );
   await input.store.append(
     "runtime",
     "invocation.finished",
@@ -593,13 +659,18 @@ async function runSemanticVerification(input: {
       invocationId,
     );
     verdictPersisted = true;
-    if (result.usage)
-      await input.store.append(
-        "host",
-        "tokens.recorded",
-        { usage: result.usage, phase: "semantic_verification", nodeId: input.node.id },
-        invocationId,
-      );
+    await input.store.append(
+      "host",
+      "tokens.recorded",
+      {
+        usage: result.usage ?? unavailableTokenUsage(),
+        phase: "semantic_verification",
+        nodeId: input.node.id,
+        host: input.adapter.id,
+        missing: !result.usage,
+      },
+      invocationId,
+    );
     if (policyViolation)
       throw new Error("The read-only semantic verifier changed the repository workspace");
     return result.verdict;

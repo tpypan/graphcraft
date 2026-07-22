@@ -18335,12 +18335,54 @@ var GraphSchema = external_exports.strictObject({
   controlEdges: external_exports.array(ControlEdgeSchema),
   revision: external_exports.number().int().nonnegative()
 });
+var TokenAvailabilityStatusSchema = external_exports.enum([
+  "reported",
+  "derived",
+  "estimated",
+  "unavailable",
+  "legacy_unknown"
+]);
+var legacyTokenAvailability = {
+  input: "legacy_unknown",
+  cachedInput: "legacy_unknown",
+  uncachedInput: "legacy_unknown",
+  output: "legacy_unknown",
+  reasoning: "legacy_unknown",
+  total: "legacy_unknown"
+};
+var TokenAvailabilitySchema = external_exports.strictObject({
+  input: TokenAvailabilityStatusSchema,
+  cachedInput: TokenAvailabilityStatusSchema,
+  uncachedInput: TokenAvailabilityStatusSchema,
+  output: TokenAvailabilityStatusSchema,
+  reasoning: TokenAvailabilityStatusSchema,
+  total: TokenAvailabilityStatusSchema
+}).default(legacyTokenAvailability);
 var TokenUsageSchema = external_exports.strictObject({
   input: external_exports.number().int().nonnegative().default(0),
   cachedInput: external_exports.number().int().nonnegative().default(0),
+  uncachedInput: external_exports.number().int().nonnegative().default(0),
   output: external_exports.number().int().nonnegative().default(0),
   reasoning: external_exports.number().int().nonnegative().default(0),
-  total: external_exports.number().int().nonnegative().default(0)
+  total: external_exports.number().int().nonnegative().default(0),
+  availability: TokenAvailabilitySchema
+});
+var TokenAttributionPhaseSchema = external_exports.enum([
+  "planning",
+  "worker",
+  "repair",
+  "semantic_verification",
+  "graphcraft_overhead"
+]);
+var TokenLedgerEntrySchema = external_exports.strictObject({
+  sequence: external_exports.number().int().positive(),
+  phase: TokenAttributionPhaseSchema,
+  usage: TokenUsageSchema,
+  causationId: external_exports.string().min(1),
+  nodeId: external_exports.string().min(1).optional(),
+  host: external_exports.string().min(1).optional(),
+  recovered: external_exports.boolean().default(false),
+  missing: external_exports.boolean().default(false)
 });
 var WorkerResultSchema = external_exports.strictObject({
   status: external_exports.enum(["completed", "blocked", "failed"]),
@@ -18529,6 +18571,7 @@ var RunStateSchema = external_exports.strictObject({
   progressTrajectory: external_exports.array(ProgressTrajectoryEntrySchema).default([]),
   progressDecision: ProgressDecisionPacketSchema.optional(),
   tokens: TokenUsageSchema,
+  tokenLedger: external_exports.array(TokenLedgerEntrySchema).default([]),
   controlDecisions: external_exports.array(ControlDecisionSchema),
   pendingDecision: ControlDecisionPacketSchema.optional(),
   stopReason: external_exports.string().optional(),
@@ -19055,9 +19098,9 @@ function applyGraphAmendment(input) {
   const target = (id) => {
     const item = nodes.find((candidate) => candidate.id === id);
     if (!item) throw new Error(`Amendment references unknown node ${id}`);
-    const status = input.nodeStatuses[id]?.status;
-    if (status === "accepted") throw new Error(`Accepted node ${id} is immutable`);
-    if (status === "running")
+    const status2 = input.nodeStatuses[id]?.status;
+    if (status2 === "accepted") throw new Error(`Accepted node ${id} is immutable`);
+    if (status2 === "running")
       throw new Error(`Running node ${id} must be checkpointed before amendment`);
     return item;
   };
@@ -19165,8 +19208,8 @@ function applyGraphAmendment(input) {
     input.requiredVerificationProbes,
     input.approvedProbes ?? input.requiredVerificationProbes
   );
-  for (const [id, status] of Object.entries(input.nodeStatuses)) {
-    if (status.status !== "accepted") continue;
+  for (const [id, status2] of Object.entries(input.nodeStatuses)) {
+    if (status2.status !== "accepted") continue;
     if (JSON.stringify(originalById.get(id)) !== JSON.stringify(graph.nodes.find((item) => item.id === id)))
       throw new Error(`Accepted node ${id} was changed by the amendment`);
   }
@@ -19519,22 +19562,171 @@ function renderSemanticVerifierPrompt(context) {
   ].join("\n");
 }
 
+// packages/core/src/tokens.ts
+var dimensions = [
+  "input",
+  "cachedInput",
+  "uncachedInput",
+  "output",
+  "reasoning",
+  "total"
+];
+function reported(value, key) {
+  const candidate = value[key];
+  return typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0 ? Math.trunc(candidate) : void 0;
+}
+function status(value) {
+  return value === void 0 ? "unavailable" : "reported";
+}
+function derivedStatus(required2, hasAny) {
+  if (required2.every((value) => value !== void 0)) return "derived";
+  return hasAny ? "estimated" : "unavailable";
+}
+function unavailableTokenUsage() {
+  return TokenUsageSchema.parse({
+    input: 0,
+    cachedInput: 0,
+    uncachedInput: 0,
+    output: 0,
+    reasoning: 0,
+    total: 0,
+    availability: Object.fromEntries(dimensions.map((dimension) => [dimension, "unavailable"]))
+  });
+}
+function deterministicTokenUsage() {
+  return TokenUsageSchema.parse({
+    input: 0,
+    cachedInput: 0,
+    uncachedInput: 0,
+    output: 0,
+    reasoning: 0,
+    total: 0,
+    availability: Object.fromEntries(dimensions.map((dimension) => [dimension, "derived"]))
+  });
+}
+function normalizeTokenUsage(provider, value) {
+  const usage = typeof value === "object" && value !== null ? value : {};
+  if (provider === "codex") {
+    const input2 = reported(usage, "input_tokens");
+    const cachedInput = reported(usage, "cached_input_tokens");
+    const output2 = reported(usage, "output_tokens");
+    const reasoning2 = reported(usage, "reasoning_output_tokens");
+    const uncachedInput2 = input2 !== void 0 && cachedInput !== void 0 ? Math.max(0, input2 - cachedInput) : void 0;
+    const total = input2 !== void 0 && output2 !== void 0 ? input2 + output2 : void 0;
+    return TokenUsageSchema.parse({
+      input: input2 ?? 0,
+      cachedInput: cachedInput ?? 0,
+      uncachedInput: uncachedInput2 ?? 0,
+      output: output2 ?? 0,
+      reasoning: reasoning2 ?? 0,
+      total: total ?? (input2 ?? 0) + (output2 ?? 0),
+      availability: {
+        input: status(input2),
+        cachedInput: status(cachedInput),
+        uncachedInput: input2 !== void 0 && cachedInput !== void 0 ? "derived" : "unavailable",
+        output: status(output2),
+        reasoning: status(reasoning2),
+        total: derivedStatus([input2, output2], input2 !== void 0 || output2 !== void 0)
+      }
+    });
+  }
+  const directInput = reported(usage, "input_tokens");
+  const cacheCreation = reported(usage, "cache_creation_input_tokens");
+  const cacheRead = reported(usage, "cache_read_input_tokens");
+  const output = reported(usage, "output_tokens");
+  const reasoning = reported(usage, "reasoning_output_tokens");
+  const inputParts = [directInput, cacheCreation, cacheRead];
+  const uncachedParts = [directInput, cacheCreation];
+  const input = inputParts.reduce((sum, item) => sum + (item ?? 0), 0);
+  const uncachedInput = uncachedParts.reduce((sum, item) => sum + (item ?? 0), 0);
+  const inputAvailability = derivedStatus(
+    inputParts,
+    inputParts.some((item) => item !== void 0)
+  );
+  const uncachedAvailability = derivedStatus(
+    uncachedParts,
+    uncachedParts.some((item) => item !== void 0)
+  );
+  return TokenUsageSchema.parse({
+    input,
+    cachedInput: cacheRead ?? 0,
+    uncachedInput,
+    output: output ?? 0,
+    reasoning: reasoning ?? 0,
+    total: input + (output ?? 0),
+    availability: {
+      input: inputAvailability,
+      cachedInput: status(cacheRead),
+      uncachedInput: uncachedAvailability,
+      output: status(output),
+      reasoning: status(reasoning),
+      total: output === void 0 || inputAvailability === "unavailable" ? input > 0 || output !== void 0 ? "estimated" : "unavailable" : inputAvailability === "estimated" ? "estimated" : "derived"
+    }
+  });
+}
+var availabilityRank = {
+  reported: 0,
+  derived: 1,
+  estimated: 2,
+  unavailable: 3,
+  legacy_unknown: 4
+};
+function aggregateTokenUsage(usages) {
+  if (usages.length === 0) return unavailableTokenUsage();
+  const values = Object.fromEntries(
+    dimensions.map((dimension) => [
+      dimension,
+      usages.reduce((sum, usage) => sum + usage[dimension], 0)
+    ])
+  );
+  const availability = Object.fromEntries(
+    dimensions.map((dimension) => {
+      const worst = usages.map((usage) => usage.availability[dimension]).sort((left, right) => availabilityRank[right] - availabilityRank[left])[0];
+      return [dimension, usages.length > 1 && worst === "reported" ? "derived" : worst];
+    })
+  );
+  return TokenUsageSchema.parse({ ...values, availability });
+}
+function groupedReport(entries, key) {
+  const groups = /* @__PURE__ */ new Map();
+  for (const entry of entries) {
+    const value = entry[key];
+    if (!value) continue;
+    const group = groups.get(value) ?? [];
+    group.push(entry.usage);
+    groups.set(value, group);
+  }
+  return Object.fromEntries(
+    [...groups.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([name, usages]) => [name, aggregateTokenUsage(usages)])
+  );
+}
+function tokenCostReport(entries) {
+  const totals = aggregateTokenUsage(entries.map(({ usage }) => usage));
+  const limitations = /* @__PURE__ */ new Set();
+  for (const entry of entries)
+    for (const dimension of dimensions) {
+      const availability = entry.usage.availability[dimension];
+      if (["unavailable", "legacy_unknown", "estimated"].includes(availability))
+        limitations.add(
+          `${entry.phase}${entry.nodeId ? `:${entry.nodeId}` : ""}.${dimension}:${availability}`
+        );
+    }
+  return {
+    receipts: entries.length,
+    totals,
+    byPhase: groupedReport(entries, "phase"),
+    byNode: groupedReport(entries, "nodeId"),
+    reconciled: limitations.size === 0,
+    limitations: [...limitations].sort()
+  };
+}
+
 // packages/core/src/reducer.ts
-var emptyTokens = { input: 0, cachedInput: 0, output: 0, reasoning: 0, total: 0 };
 function requiredString(data, key) {
   const value = data[key];
   if (typeof value !== "string" || value.length === 0)
     throw new Error(`Event data.${key} must be a string`);
   return value;
-}
-function addTokens(left, right) {
-  return {
-    input: left.input + right.input,
-    cachedInput: left.cachedInput + right.cachedInput,
-    output: left.output + right.output,
-    reasoning: left.reasoning + right.reasoning,
-    total: left.total + right.total
-  };
 }
 function reduceEvents(events) {
   let state;
@@ -19561,7 +19753,8 @@ function reduceEvents(events) {
         ),
         latestProgressEvidence: [],
         progressTrajectory: [],
-        tokens: { ...emptyTokens },
+        tokens: unavailableTokenUsage(),
+        tokenLedger: [],
         controlDecisions: [],
         updatedAt: event.timestamp
       };
@@ -19644,9 +19837,26 @@ function reduceEvents(events) {
         state.currentNodeId = void 0;
         break;
       }
-      case "tokens.recorded":
-        state.tokens = addTokens(state.tokens, TokenUsageSchema.parse(data.usage));
+      case "tokens.recorded": {
+        const phase = TokenAttributionPhaseSchema.catch("worker").parse(data.phase);
+        const entry = TokenLedgerEntrySchema.parse({
+          sequence: event.sequence,
+          phase,
+          usage: TokenUsageSchema.parse(data.usage),
+          causationId: event.causationId,
+          ...typeof data.nodeId === "string" ? { nodeId: data.nodeId } : {},
+          ...typeof data.host === "string" ? { host: data.host } : {},
+          recovered: data.recovered === true,
+          missing: data.missing === true
+        });
+        if (!entry.missing)
+          state.tokenLedger = state.tokenLedger.filter(
+            (candidate) => !(candidate.missing && candidate.causationId === entry.causationId && candidate.phase === entry.phase)
+          );
+        state.tokenLedger.push(entry);
+        state.tokens = aggregateTokenUsage(state.tokenLedger.map(({ usage }) => usage));
         break;
+      }
       case "graph.amended": {
         const addedNodeIds = Array.isArray(data.addedNodeIds) ? data.addedNodeIds.map((value) => String(value)) : [];
         const removedNodeIds = Array.isArray(data.removedNodeIds) ? data.removedNodeIds.map((value) => String(value)) : [];
@@ -19830,18 +20040,7 @@ function parseSemanticVerdict(value) {
   }
 }
 function codexUsage(value) {
-  const usage = value ?? {};
-  const input = Number(usage.input_tokens ?? 0);
-  const cachedInput = Number(usage.cached_input_tokens ?? 0);
-  const output = Number(usage.output_tokens ?? 0);
-  const reasoning = Number(usage.reasoning_output_tokens ?? 0);
-  return TokenUsageSchema.parse({
-    input,
-    cachedInput,
-    output,
-    reasoning,
-    total: input + output
-  });
+  return normalizeTokenUsage("codex", value);
 }
 async function commandVersion(command) {
   return await new Promise((resolve5) => {
@@ -20175,17 +20374,7 @@ function parseSemanticVerdict2(value) {
   }
 }
 function claudeUsage(value) {
-  const usage = value ?? {};
-  const input = Number(usage.input_tokens ?? 0);
-  const cachedInput = Number(usage.cache_read_input_tokens ?? 0);
-  const output = Number(usage.output_tokens ?? 0);
-  return TokenUsageSchema.parse({
-    input,
-    cachedInput,
-    output,
-    reasoning: 0,
-    total: input + output
-  });
+  return normalizeTokenUsage("claude", value);
 }
 async function claudeVersion() {
   return await new Promise((resolve5) => {
@@ -20215,8 +20404,8 @@ async function claudeAuthenticated() {
     child.once("error", () => resolve5(false));
     child.once("close", (code) => {
       try {
-        const status = JSON.parse(output);
-        resolve5(code === 0 && status.loggedIn === true);
+        const status2 = JSON.parse(output);
+        resolve5(code === 0 && status2.loggedIn === true);
       } catch {
         resolve5(false);
       }
@@ -20963,15 +21152,15 @@ async function runProbes(specs, repositoryPath, signal) {
   return results;
 }
 async function workspaceDigest(repositoryPath) {
-  const [status, diff] = await Promise.all([
+  const [status2, diff] = await Promise.all([
     runProcess("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
       cwd: repositoryPath
     }),
     runProcess("git", ["diff", "--no-ext-diff", "--binary", "HEAD", "--"], { cwd: repositoryPath })
   ]);
-  if (status.exitCode !== 0 || diff.exitCode !== 0)
+  if (status2.exitCode !== 0 || diff.exitCode !== 0)
     throw new Error("Unable to capture repository state");
-  return contentHash({ status: status.stdout, diff: diff.stdout });
+  return contentHash({ status: status2.stdout, diff: diff.stdout });
 }
 var probeStopWords = /* @__PURE__ */ new Set([
   "across",
@@ -22116,8 +22305,8 @@ async function createRunWorkspace(contract) {
   return { path: path2, branch, created: true };
 }
 async function createAtomicCommit(workspace, task) {
-  const status = await git(workspace.path, ["status", "--porcelain=v1"]);
-  if (!status) throw new Error("No accepted changes are available to commit");
+  const status2 = await git(workspace.path, ["status", "--porcelain=v1"]);
+  if (!status2) throw new Error("No accepted changes are available to commit");
   await git(workspace.path, ["add", "-A"]);
   const summary = task.replace(/\s+/g, " ").slice(0, 64);
   await git(workspace.path, ["commit", "-m", `graphcraft: ${summary}`]);
@@ -22294,9 +22483,9 @@ var RunStore = class _RunStore {
   async loadState() {
     await this.ensureStorage();
     try {
-      return RunStateSchema.parse(
-        JSON.parse(await readFile7(join8(this.runRoot, "state.json"), "utf8"))
-      );
+      const value = JSON.parse(await readFile7(join8(this.runRoot, "state.json"), "utf8"));
+      if (!("tokenLedger" in value)) return await this.rebuildViews();
+      return RunStateSchema.parse(value);
     } catch {
       return await this.rebuildViews();
     }
@@ -22635,19 +22824,36 @@ async function recoverableInvocation(store, nodeId, repositoryPath, family) {
     }
   };
 }
-async function recordMissingUsage(store, invocation) {
+async function recordMissingUsage(store, invocation, node2, host) {
   const transcriptUsage = (invocation.transcript ?? []).filter(
     (event) => event.type === "usage"
   );
   const events = await store.loadEvents();
   const recordedCount = events.filter(
-    ({ type, causationId }) => type === "tokens.recorded" && causationId === invocation.invocationId
+    ({ type, causationId, data }) => type === "tokens.recorded" && causationId === invocation.invocationId && data.missing !== true
   ).length;
+  const phase = node2.id.startsWith("repair-") ? "repair" : "worker";
   for (const event of transcriptUsage.slice(recordedCount))
     await store.append(
       "host",
       "tokens.recorded",
-      { usage: event.usage, recovered: true },
+      { usage: event.usage, recovered: true, phase, nodeId: node2.id, host },
+      invocation.invocationId
+    );
+  if (transcriptUsage.length === 0 && (invocation.transcript ?? []).some(({ type }) => type === "result") && !events.some(
+    ({ type, causationId }) => type === "tokens.recorded" && causationId === invocation.invocationId
+  ))
+    await store.append(
+      "host",
+      "tokens.recorded",
+      {
+        usage: unavailableTokenUsage(),
+        phase,
+        nodeId: node2.id,
+        host,
+        missing: true,
+        recovered: true
+      },
       invocation.invocationId
     );
 }
@@ -22720,8 +22926,17 @@ async function createRun(task, options) {
     probePlan,
     heldOutProbePlan
   );
-  if (planningUsage)
-    await store.append("host", "tokens.recorded", { usage: planningUsage, phase: "planning" });
+  await store.append("runtime", "tokens.recorded", {
+    usage: deterministicTokenUsage(),
+    phase: "graphcraft_overhead"
+  });
+  if (options.planner)
+    await store.append("host", "tokens.recorded", {
+      usage: planningUsage ?? unavailableTokenUsage(),
+      phase: "planning",
+      host: options.planner.id,
+      missing: !planningUsage
+    });
   return { contract, graph, store, probePlan };
 }
 async function configureRunProbes(store, input) {
@@ -22767,7 +22982,7 @@ async function executeWorker(input) {
   let invocationId = input.resume?.invocationId ?? randomUUID7();
   let resumeSessionId;
   if (input.resume) {
-    await recordMissingUsage(input.store, input.resume);
+    await recordMissingUsage(input.store, input.resume, input.node, input.adapter.id);
     const reconciliation = await input.adapter.reconcile(input.resume);
     if (reconciliation.state === "completed" && reconciliation.result) {
       const artifact2 = join9(
@@ -22833,6 +23048,8 @@ async function executeWorker(input) {
   let error51;
   let errorCause;
   let termination;
+  let usageReceipts = 0;
+  const tokenPhase = input.node.id.startsWith("repair-") ? "repair" : "worker";
   let artifact = join9(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
   const execution = input.adapter.execute(
     {
@@ -22871,7 +23088,18 @@ async function executeWorker(input) {
     if (event.type === "tool")
       input.observer?.({ type: "host", message: `${event.name} ${event.summary}`.trim() });
     if (event.type === "usage") {
-      await input.store.append("host", "tokens.recorded", { usage: event.usage }, invocationId);
+      usageReceipts += 1;
+      await input.store.append(
+        "host",
+        "tokens.recorded",
+        {
+          usage: event.usage,
+          phase: tokenPhase,
+          nodeId: input.node.id,
+          host: input.adapter.id
+        },
+        invocationId
+      );
     }
     if (event.type === "result") result = WorkerResultSchema.parse(event.result);
     if (event.type === "terminated") termination = event.termination;
@@ -22880,6 +23108,19 @@ async function executeWorker(input) {
       if (event.cause === "host_crash" || event.cause === "timeout") errorCause = event.cause;
     }
   }
+  if (usageReceipts === 0)
+    await input.store.append(
+      "host",
+      "tokens.recorded",
+      {
+        usage: unavailableTokenUsage(),
+        phase: tokenPhase,
+        nodeId: input.node.id,
+        host: input.adapter.id,
+        missing: true
+      },
+      invocationId
+    );
   await input.store.append(
     "runtime",
     "invocation.finished",
@@ -22976,13 +23217,18 @@ async function runSemanticVerification(input) {
       invocationId
     );
     verdictPersisted = true;
-    if (result.usage)
-      await input.store.append(
-        "host",
-        "tokens.recorded",
-        { usage: result.usage, phase: "semantic_verification", nodeId: input.node.id },
-        invocationId
-      );
+    await input.store.append(
+      "host",
+      "tokens.recorded",
+      {
+        usage: result.usage ?? unavailableTokenUsage(),
+        phase: "semantic_verification",
+        nodeId: input.node.id,
+        host: input.adapter.id,
+        missing: !result.usage
+      },
+      invocationId
+    );
     if (policyViolation)
       throw new Error("The read-only semantic verifier changed the repository workspace");
     return result.verdict;
@@ -23563,7 +23809,7 @@ async function executeRun(input) {
             interrupted?.termination,
             interrupted?.artifact
           );
-        const failed = outcomes.find(({ status }) => status === "failed");
+        const failed = outcomes.find(({ status: status2 }) => status2 === "failed");
         if (failed?.status === "failed") {
           const quarantinedSiblingIds = outcomes.filter(
             (outcome2) => outcome2.status === "interrupted"
@@ -23574,7 +23820,7 @@ async function executeRun(input) {
             ...failed.packet ? { decisionPacket: failed.packet } : {},
             ...failed.progressDecision ? { progressDecision: failed.progressDecision } : {},
             batchId,
-            acceptedSiblingIds: outcomes.filter(({ status }) => status === "accepted").map(({ nodeId }) => nodeId),
+            acceptedSiblingIds: outcomes.filter(({ status: status2 }) => status2 === "accepted").map(({ nodeId }) => nodeId),
             quarantinedSiblingIds
           });
           return await input.store.loadState();
@@ -23998,6 +24244,7 @@ function stateView(state, contract) {
     controlDecisions: state.controlDecisions,
     pendingDecision: state.pendingDecision,
     tokens: state.tokens,
+    tokenReport: tokenCostReport(state.tokenLedger),
     stopReason: state.stopReason,
     updatedAt: state.updatedAt
   };
@@ -24110,6 +24357,7 @@ async function handleAction(input) {
         }))
       },
       state,
+      tokenReport: tokenCostReport(state.tokenLedger),
       graphHistory: await store.loadGraphHistory(),
       contextReceipts: (await store.loadEvents()).filter(({ type }) => type === "context.selected").map(({ data }) => ContextSelectionReceiptSchema.parse(data.receipt))
     };

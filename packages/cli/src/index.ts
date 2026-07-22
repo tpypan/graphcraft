@@ -12,6 +12,7 @@ import {
   ContextSelectionReceiptSchema,
   graphPlanShape,
   probePlanFromGraph,
+  tokenCostReport,
   type Graph,
   type GraphAmendment,
   type HostAdapter,
@@ -201,6 +202,7 @@ export function stateView(state: RunState, contract: RunContract): Record<string
     controlDecisions: state.controlDecisions,
     pendingDecision: state.pendingDecision,
     tokens: state.tokens,
+    tokenReport: tokenCostReport(state.tokenLedger),
     stopReason: state.stopReason,
     updatedAt: state.updatedAt,
   };
@@ -353,6 +355,7 @@ export async function handleAction(input: McpActionInput): Promise<Record<string
         })),
       },
       state,
+      tokenReport: tokenCostReport(state.tokenLedger),
       graphHistory: await store.loadGraphHistory(),
       contextReceipts: (await store.loadEvents())
         .filter(({ type }) => type === "context.selected")

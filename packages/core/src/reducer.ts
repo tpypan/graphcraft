@@ -1,4 +1,4 @@
-import type { RunContract, RunEvent, RunState, TokenUsage } from "./schemas.ts";
+import type { RunContract, RunEvent, RunState } from "./schemas.ts";
 import {
   ControlDecisionPacketSchema,
   ControlDecisionSchema,
@@ -6,27 +6,18 @@ import {
   ProgressTrajectoryEntrySchema,
   RunContractSchema,
   RunStateSchema,
+  TokenAttributionPhaseSchema,
+  TokenLedgerEntrySchema,
   TokenUsageSchema,
 } from "./schemas.ts";
 import { verifyRunEvent } from "./events.ts";
-
-const emptyTokens: TokenUsage = { input: 0, cachedInput: 0, output: 0, reasoning: 0, total: 0 };
+import { aggregateTokenUsage, unavailableTokenUsage } from "./tokens.ts";
 
 function requiredString(data: Record<string, unknown>, key: string): string {
   const value = data[key];
   if (typeof value !== "string" || value.length === 0)
     throw new Error(`Event data.${key} must be a string`);
   return value;
-}
-
-function addTokens(left: TokenUsage, right: TokenUsage): TokenUsage {
-  return {
-    input: left.input + right.input,
-    cachedInput: left.cachedInput + right.cachedInput,
-    output: left.output + right.output,
-    reasoning: left.reasoning + right.reasoning,
-    total: left.total + right.total,
-  };
 }
 
 export function reduceEvents(events: RunEvent[]): RunState {
@@ -58,7 +49,8 @@ export function reduceEvents(events: RunEvent[]): RunState {
         ),
         latestProgressEvidence: [],
         progressTrajectory: [],
-        tokens: { ...emptyTokens },
+        tokens: unavailableTokenUsage(),
+        tokenLedger: [],
         controlDecisions: [],
         updatedAt: event.timestamp,
       };
@@ -148,9 +140,31 @@ export function reduceEvents(events: RunEvent[]): RunState {
         state.currentNodeId = undefined;
         break;
       }
-      case "tokens.recorded":
-        state.tokens = addTokens(state.tokens, TokenUsageSchema.parse(data.usage));
+      case "tokens.recorded": {
+        const phase = TokenAttributionPhaseSchema.catch("worker").parse(data.phase);
+        const entry = TokenLedgerEntrySchema.parse({
+          sequence: event.sequence,
+          phase,
+          usage: TokenUsageSchema.parse(data.usage),
+          causationId: event.causationId,
+          ...(typeof data.nodeId === "string" ? { nodeId: data.nodeId } : {}),
+          ...(typeof data.host === "string" ? { host: data.host } : {}),
+          recovered: data.recovered === true,
+          missing: data.missing === true,
+        });
+        if (!entry.missing)
+          state.tokenLedger = state.tokenLedger.filter(
+            (candidate) =>
+              !(
+                candidate.missing &&
+                candidate.causationId === entry.causationId &&
+                candidate.phase === entry.phase
+              ),
+          );
+        state.tokenLedger.push(entry);
+        state.tokens = aggregateTokenUsage(state.tokenLedger.map(({ usage }) => usage));
         break;
+      }
       case "graph.amended": {
         const addedNodeIds = Array.isArray(data.addedNodeIds)
           ? data.addedNodeIds.map((value) => String(value))

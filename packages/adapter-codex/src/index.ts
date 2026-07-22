@@ -9,11 +9,11 @@ import {
   HostTerminationError,
   HostCapabilitiesSchema,
   SemanticVerdictSchema,
-  TokenUsageSchema,
   WorkerResultSchema,
   codexGraphPlanJsonSchema,
   codexSemanticVerdictJsonSchema,
   codexWorkerResultJsonSchema,
+  normalizeTokenUsage,
   reconcilePersistedInvocation,
   renderPlannerPrompt,
   renderSemanticVerifierPrompt,
@@ -80,19 +80,8 @@ function parseSemanticVerdict(
   }
 }
 
-function codexUsage(value: unknown) {
-  const usage = (value ?? {}) as Record<string, unknown>;
-  const input = Number(usage.input_tokens ?? 0);
-  const cachedInput = Number(usage.cached_input_tokens ?? 0);
-  const output = Number(usage.output_tokens ?? 0);
-  const reasoning = Number(usage.reasoning_output_tokens ?? 0);
-  return TokenUsageSchema.parse({
-    input,
-    cachedInput,
-    output,
-    reasoning,
-    total: input + output,
-  });
+export function codexUsage(value: unknown) {
+  return normalizeTokenUsage("codex", value);
 }
 
 async function commandVersion(command: string): Promise<{ installed: boolean; version?: string }> {
@@ -178,7 +167,7 @@ export class CodexAdapter implements HostAdapter {
     child.stdin.end(renderPlannerPrompt(request));
     let lastMessage = "";
     let stderr = "";
-    let usage: ReturnType<typeof TokenUsageSchema.parse> | undefined;
+    let usage: ReturnType<typeof codexUsage> | undefined;
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
       stderr += chunk;
@@ -235,7 +224,7 @@ export class CodexAdapter implements HostAdapter {
     child.stdin.end(renderSemanticVerifierPrompt(request.context));
     let lastMessage = "";
     let stderr = "";
-    let usage: ReturnType<typeof TokenUsageSchema.parse> | undefined;
+    let usage: ReturnType<typeof codexUsage> | undefined;
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
       stderr += chunk;
