@@ -24,12 +24,21 @@ pnpm add --global @tpypan/graphcraft
 graphcraft install --host claude
 ```
 
-If the npm registry is unavailable, install the same executable directly from GitHub:
+If the npm registry is unavailable, install the versioned package asset from the matching
+workflow-verified GitHub release:
 
 ```bash
-npm install --global https://github.com/tpypan/graphcraft/archive/refs/heads/main.tar.gz
+GRAPHCRAFT_VERSION=0.1.2
+npm install --global "https://github.com/tpypan/graphcraft/releases/download/v${GRAPHCRAFT_VERSION}/tpypan-graphcraft-${GRAPHCRAFT_VERSION}.tgz"
 graphcraft install --host codex
 ```
+
+Each release publishes `SHA256SUMS` beside the tarball for independent verification before install.
+
+Direct npm, pnpm, and GitHub installation is the permanent supported fallback even when a host
+marketplace is unavailable. Graphcraft also ships version-locked Codex and Claude marketplace
+catalogs; [marketplace distribution](https://github.com/tpypan/graphcraft/blob/v0.1.2/docs/MARKETPLACES.md) records their validation and the
+separate boundary for hosted public-directory submission.
 
 For a one-shot installation, use `npx @tpypan/graphcraft install --host codex` or `pnpm dlx @tpypan/graphcraft install --host claude`. The installer copies its MCP runtime to `~/.graphcraft/runtime/<version>/` before host registration, so clearing the package-manager cache does not break Graphcraft.
 
@@ -71,12 +80,13 @@ Graphcraft displays a concise run contract before doing work. Use `--yes` only w
 - Classifies exact-SHA PR lifecycle state deterministically, giving current review feedback precedence over same-head CI failures and separating pending, actionable, infrastructure, cancelled, stale, human-decision, and green outcomes. `pr_green` waits with persisted bounded backoff and no model calls while checks or approvals are pending. Review and actionable-CI changes receive bounded, fully reverified repair pushes; unchanged signatures stop. Verified review fixes receive an exact reply and resolution, infrastructure or cancelled GitHub check runs receive at most one justified rerun, changes-requested decisions remain sticky until approval, and base movement is durably rebound without inferring rebase or merge authority.
 - Serves `graphcraft view [run]` only on `127.0.0.1` as a read-only live projection of verified run files. The accessible local viewer distinguishes dependency and governance edges, exposes node context/probes/evidence, revisions, recovery and side-effect timelines, per-phase/per-node token dimensions, redacted on-demand artifacts, and a redacted self-contained export without writing to the run.
 - Tracks cached, uncached, output, reasoning, and total tokens with explicit provider availability, and reports planning, worker, repair, semantic-verification, and Graphcraft-overhead costs by phase and node.
-- Provides an experimental matched benchmark harness with a versioned ten-task public corpus, fresh deterministic fixtures, explicit model/effort controls, executable external scoring, atomic checkpoints, and resumable randomized trials.
+- Provides an experimental matched benchmark harness with a versioned ten-task public corpus, fresh deterministic fixtures, explicit model/effort controls, immutable fixture-bound scoring, atomic checkpoints, and resumable randomized trials.
 
 ## Commands
 
 ```text
 graphcraft install --host <codex|claude>
+graphcraft update --host <codex|claude>
 graphcraft run <task> [--include <glob>] [--exclude <glob>] [--finish-line <local_verified|committed|pushed|pr_open|pr_green>] [--max-workers 2] [--background]
 graphcraft runs [--json]
 graphcraft status [run]
@@ -112,7 +122,7 @@ Use `stable-v1` as the bundled benchmark suite name. A dry run validates and pri
 
 ## Evidence and scope
 
-The [v0.1 implementation report](docs/V0.1.md) records the acceptance boundary, architecture, tests, real-host dogfood, and known gaps. Research and competitive rationale live under [docs/research](docs/research).
+The [v0.1 implementation report](https://github.com/tpypan/graphcraft/blob/v0.1.2/docs/V0.1.md) records the acceptance boundary, architecture, tests, real-host dogfood, and known gaps. Research and competitive rationale live under [docs/research](https://github.com/tpypan/graphcraft/tree/v0.1.2/docs/research).
 
 Graphcraft does not yet claim stable reliability or a 20% token-savings gate. The harness and public fixtures exist, but repeated real Codex and Claude trials, blinded defect review, and a passing stable gate remain outstanding.
 
