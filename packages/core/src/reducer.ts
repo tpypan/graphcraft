@@ -263,6 +263,7 @@ export function reduceEvents(events: RunEvent[]): RunState {
         if (!wait) throw new Error(`Unknown wait node ${nodeId}`);
         wait.observations += 1;
         wait.nextWakeAt = requiredString(data, "nextWakeAt");
+        if (typeof data.signature === "string") wait.lastSignature = data.signature;
         wait.evidence = Array.isArray(data.evidence)
           ? data.evidence.map((value) => String(value))
           : [];
@@ -277,6 +278,7 @@ export function reduceEvents(events: RunEvent[]): RunState {
         wait.evidence = Array.isArray(data.evidence)
           ? data.evidence.map((value) => String(value))
           : wait.evidence;
+        if (typeof data.signature === "string") wait.lastSignature = data.signature;
         wait.updatedAt = event.timestamp;
         break;
       }
@@ -288,6 +290,7 @@ export function reduceEvents(events: RunEvent[]): RunState {
         wait.evidence = Array.isArray(data.evidence)
           ? data.evidence.map((value) => String(value))
           : wait.evidence;
+        if (typeof data.signature === "string") wait.lastSignature = data.signature;
         wait.updatedAt = event.timestamp;
         break;
       }

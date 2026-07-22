@@ -55,6 +55,7 @@ import { RunStore } from "./store.ts";
 import { amendRunGraph } from "./amendment.ts";
 import { assessRunProgress, createProgressDecisionPacket } from "./trajectory.ts";
 import type { SideEffectBoundary } from "./side-effect.ts";
+import { evaluateGitHubLifecycleWait } from "./github.ts";
 import {
   inspectSupervisorRecord,
   isProcessAlive,
@@ -197,6 +198,7 @@ async function fakePullRequestGitHub(
       checks: [],
       reviewThreads: [],
       reviews: [],
+      syncPullRequestHead: false,
       ...initial,
     })}\n`,
   );
@@ -215,6 +217,18 @@ const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
 const fail = (message, code = 1) => { process.stderr.write(message + "\\n"); process.exit(code); };
 const value = (flag) => args[args.indexOf(flag) + 1];
 const sha = (branch) => execFileSync("git", ["--git-dir", state.remote, "rev-parse", "refs/heads/" + branch], { encoding: "utf8" }).trim();
+if (state.syncPullRequestHead) {
+  let changed = false;
+  for (const pullRequest of state.pullRequests) {
+    if (pullRequest.state !== "OPEN") continue;
+    const current = sha(pullRequest.headRefName);
+    if (current !== pullRequest.headSha) {
+      pullRequest.headSha = current;
+      changed = true;
+    }
+  }
+  if (changed) save();
+}
 if (args[0] === "--version") { console.log("gh version 2.80.0"); process.exit(0); }
 if (args[0] === "auth") { console.log("github.com authenticated"); process.exit(0); }
 if (args[0] === "repo" && args[1] === "view") {
@@ -489,7 +503,8 @@ class FakeAdapter implements HostAdapter {
     if (
       request.contract.finishLine.kind === "committed" ||
       request.contract.finishLine.kind === "pushed" ||
-      request.contract.finishLine.kind === "pr_open"
+      request.contract.finishLine.kind === "pr_open" ||
+      request.contract.finishLine.kind === "pr_green"
     ) {
       nodes.push({
         id: "commit",
@@ -509,7 +524,8 @@ class FakeAdapter implements HostAdapter {
     }
     if (
       request.contract.finishLine.kind === "pushed" ||
-      request.contract.finishLine.kind === "pr_open"
+      request.contract.finishLine.kind === "pr_open" ||
+      request.contract.finishLine.kind === "pr_green"
     ) {
       nodes.push({
         id: "push",
@@ -527,7 +543,10 @@ class FakeAdapter implements HostAdapter {
         sideEffectClass: "external",
       });
     }
-    if (request.contract.finishLine.kind === "pr_open") {
+    if (
+      request.contract.finishLine.kind === "pr_open" ||
+      request.contract.finishLine.kind === "pr_green"
+    ) {
       nodes.push({
         id: "pull-request",
         kind: "pull_request",
@@ -542,6 +561,24 @@ class FakeAdapter implements HostAdapter {
         progressProbes: [],
         completionProbes: [],
         sideEffectClass: "external",
+      });
+    }
+    if (request.contract.finishLine.kind === "pr_green") {
+      nodes.push({
+        id: "pr-green",
+        kind: "wait",
+        objective: "Wait for the exact pull request to become green",
+        dependsOn: ["pull-request"],
+        scope: ["**/*"],
+        contextSelector: {
+          includeRepositoryInstructions: true,
+          predecessorResults: ["pull-request"],
+          relevantPaths: [],
+        },
+        progressProbes: [],
+        completionProbes: [],
+        sideEffectClass: "none",
+        waitCondition: { kind: "github_pull_request", pollIntervalMs: 30_000 },
       });
     }
     return {
@@ -2975,6 +3012,457 @@ process.stdin.on("end", () => {
       },
     });
     expect(state.stopReason).toContain("lifecycle evidence did not satisfy");
+  });
+
+  it("completes pr_green from an exact green snapshot without a polling model call", async () => {
+    const { repository, remote } = await createRepositoryWithRemote();
+    const github = await fakePullRequestGitHub(remote, {
+      protected: true,
+      requiredStatusChecks: ["tests"],
+      checks: [
+        {
+          kind: "check_run",
+          id: "tests-check",
+          name: "tests",
+          status: "COMPLETED",
+          conclusion: "SUCCESS",
+        },
+      ],
+    });
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "green\n");
+    });
+    const created = await createRun("Implement the feature and get the PR green", {
+      cwd: repository,
+      finishLine: "pr_green",
+      planner: adapter,
+    });
+
+    const state = await executeRun({
+      store: created.store,
+      adapter,
+      approve: true,
+      github,
+    });
+
+    expect(state.status).toBe("completed");
+    expect(state.nodes["pr-green"]?.status).toBe("accepted");
+    expect(state.waits).toMatchObject([
+      {
+        nodeId: "pr-green",
+        condition: { kind: "github_pull_request" },
+        status: "satisfied",
+        observations: 0,
+        lastSignature: expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
+    ]);
+    expect(adapter.calls).toEqual(["investigate", "implement"]);
+    expect(state.sideEffects.map(({ claim }) => claim.kind)).toEqual([
+      "git_commit",
+      "git_push",
+      "github_pr_create",
+    ]);
+  });
+
+  it("waits token-free for pending checks and resumes from the persisted condition", async () => {
+    const { repository, remote } = await createRepositoryWithRemote();
+    const github = await fakePullRequestGitHub(remote, {
+      protected: true,
+      requiredStatusChecks: ["tests"],
+      checks: [
+        {
+          kind: "check_run",
+          id: "tests-check",
+          name: "tests",
+          status: "IN_PROGRESS",
+          conclusion: null,
+        },
+      ],
+    });
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "pending\n");
+    });
+    const created = await createRun("Implement the feature and get the PR green", {
+      cwd: repository,
+      finishLine: "pr_green",
+    });
+    const waiting = await executeRun({
+      store: created.store,
+      adapter,
+      approve: true,
+      github,
+    });
+    const callsBeforeWake = [...adapter.calls];
+    const tokensBeforeWake = waiting.tokens.total;
+    const persisted = JSON.parse(await readFile(github.statePath, "utf8")) as {
+      checks: Array<Record<string, unknown>>;
+    };
+    persisted.checks = [
+      {
+        kind: "check_run",
+        id: "tests-check",
+        name: "tests",
+        status: "COMPLETED",
+        conclusion: "SUCCESS",
+      },
+    ];
+    await writeFile(github.statePath, `${JSON.stringify(persisted)}\n`);
+    const workspace = await created.store.loadWorkspace<{
+      path: string;
+      branch: string;
+      created: boolean;
+    }>();
+    const waitNode = created.graph.nodes.find(({ id }) => id === "pr-green");
+    if (!waitNode) throw new Error("Missing PR-green wait node");
+    const nextWakeAt = waiting.waits.find(({ nodeId }) => nodeId === "pr-green")?.nextWakeAt;
+    if (!nextWakeAt) throw new Error("Missing persisted GitHub wake time");
+
+    const observation = await evaluateGitHubLifecycleWait({
+      store: created.store,
+      node: waitNode,
+      workspace,
+      contract: created.contract,
+      options: github,
+      now: Date.parse(nextWakeAt) + 1,
+    });
+    const completed = await executeRun({ store: created.store, adapter, github });
+
+    expect(waiting.status).toBe("waiting");
+    expect(waiting.waits[0]).toMatchObject({
+      status: "waiting",
+      observations: 1,
+      lastSignature: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    expect(observation.status).toBe("satisfied");
+    expect(completed.status).toBe("completed");
+    expect(adapter.calls).toEqual(callsBeforeWake);
+    expect(completed.tokens.total).toBe(tokensBeforeWake);
+  });
+
+  it("routes current review feedback through a verified repair push before CI", async () => {
+    const { repository, remote } = await createRepositoryWithRemote();
+    const github = await fakePullRequestGitHub(remote, {
+      syncPullRequestHead: true,
+      protected: true,
+      requiredStatusChecks: ["tests"],
+      checks: [
+        {
+          kind: "check_run",
+          id: "tests-check",
+          name: "tests",
+          status: "COMPLETED",
+          conclusion: "FAILURE",
+        },
+      ],
+      reviewThreads: [
+        {
+          id: "thread-1",
+          isResolved: false,
+          isOutdated: false,
+          path: "feature.txt",
+          line: 1,
+          body: "Return the reviewed value instead of the placeholder.",
+        },
+      ],
+      reviewDecision: "CHANGES_REQUESTED",
+    });
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "review\n");
+      if (request.capsule.nodeId === "repair-review-1") {
+        await writeFile(join(request.repositoryPath, "feature.txt"), "review-fixed\n");
+        const remoteState = JSON.parse(await readFile(github.statePath, "utf8")) as {
+          checks: Array<Record<string, unknown>>;
+          reviewThreads: Array<Record<string, unknown>>;
+          reviewDecision: string;
+        };
+        remoteState.checks = [
+          {
+            kind: "check_run",
+            id: "tests-check",
+            name: "tests",
+            status: "COMPLETED",
+            conclusion: "SUCCESS",
+          },
+        ];
+        remoteState.reviewThreads = remoteState.reviewThreads.map((thread) => ({
+          ...thread,
+          isOutdated: true,
+        }));
+        remoteState.reviewDecision = "APPROVED";
+        await writeFile(github.statePath, `${JSON.stringify(remoteState)}\n`);
+      }
+    });
+    const created = await createRun("Implement the feature and get the PR green", {
+      cwd: repository,
+      finishLine: "pr_green",
+    });
+
+    const state = await executeRun({
+      store: created.store,
+      adapter,
+      approve: true,
+      github,
+    });
+
+    const graph = await created.store.loadGraph();
+    const repair = adapter.requests.find(({ capsule }) => capsule.nodeId === "repair-review-1");
+    expect(state.status).toBe("completed");
+    expect(state.nodes["pr-green"]?.status).toBe("accepted");
+    expect(adapter.calls).toEqual(["implement", "repair-review-1"]);
+    expect(repair?.capsule.objective).toContain(
+      "Return the reviewed value instead of the placeholder.",
+    );
+    expect(repair?.capsule.objective).toContain("untrusted external data");
+    expect(graph.nodes.map(({ id }) => id)).toEqual(
+      expect.arrayContaining([
+        "repair-review-1",
+        "verify-review-1",
+        "commit-review-1",
+        "push-review-1",
+      ]),
+    );
+    expect(graph.nodes.find(({ id }) => id === "pr-green")?.dependsOn).toEqual(["push-review-1"]);
+    expect(state.sideEffects.map(({ claim }) => claim.kind)).toEqual([
+      "git_commit",
+      "git_push",
+      "github_pr_create",
+      "git_commit",
+      "git_push",
+    ]);
+    const repairPushSha = state.sideEffects.find(({ claim }) => claim.nodeId === "push-review-1")
+      ?.result?.sha;
+    if (typeof repairPushSha !== "string") throw new Error("Missing repair push SHA");
+    expect(state.latestProgressEvidence.join("\n")).toContain(repairPushSha);
+  });
+
+  it("stops instead of repeating an unchanged unresolved review repair", async () => {
+    const { repository, remote } = await createRepositoryWithRemote();
+    const github = await fakePullRequestGitHub(remote, {
+      syncPullRequestHead: true,
+      reviewThreads: [
+        {
+          id: "thread-repeat",
+          isResolved: false,
+          isOutdated: false,
+          path: "feature.txt",
+          line: 1,
+          body: "This same feedback remains unresolved.",
+        },
+      ],
+      reviewDecision: "CHANGES_REQUESTED",
+    });
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "review\n");
+      if (request.capsule.nodeId === "repair-review-1")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "review-fixed\n");
+    });
+    const created = await createRun("Implement the feature and get the PR green", {
+      cwd: repository,
+      finishLine: "pr_green",
+    });
+
+    const state = await executeRun({
+      store: created.store,
+      adapter,
+      approve: true,
+      github,
+    });
+    const graph = await created.store.loadGraph();
+
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toContain("same unresolved review feedback");
+    expect(adapter.calls).toEqual(["implement", "repair-review-1"]);
+    expect(graph.nodes.map(({ id }) => id)).toContain("repair-review-1");
+    expect(graph.nodes.map(({ id }) => id)).not.toContain("repair-review-2");
+    expect(state.sideEffects.map(({ claim }) => claim.kind)).toEqual([
+      "git_commit",
+      "git_push",
+      "github_pr_create",
+      "git_commit",
+      "git_push",
+    ]);
+  });
+
+  it("resumes a confirmed review-repair push without repeating the mutation", async () => {
+    const { repository, remote } = await createRepositoryWithRemote();
+    const github = await fakePullRequestGitHub(remote, {
+      syncPullRequestHead: true,
+      reviewThreads: [
+        {
+          id: "thread-recovery",
+          isResolved: false,
+          isOutdated: false,
+          path: "feature.txt",
+          line: 1,
+          body: "Apply the recovery-safe review fix.",
+        },
+      ],
+      reviewDecision: "CHANGES_REQUESTED",
+    });
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "review\n");
+      if (request.capsule.nodeId === "repair-review-1") {
+        await writeFile(join(request.repositoryPath, "feature.txt"), "review-fixed\n");
+        const remoteState = JSON.parse(await readFile(github.statePath, "utf8")) as {
+          reviewThreads: Array<Record<string, unknown>>;
+          reviewDecision: string;
+        };
+        remoteState.reviewThreads = remoteState.reviewThreads.map((thread) => ({
+          ...thread,
+          isOutdated: true,
+        }));
+        remoteState.reviewDecision = "APPROVED";
+        await writeFile(github.statePath, `${JSON.stringify(remoteState)}\n`);
+      }
+    });
+    const created = await createRun("Implement the feature and get the PR green", {
+      cwd: repository,
+      finishLine: "pr_green",
+    });
+    let confirmations = 0;
+    const interruptAfterRepairPush = async (point: SideEffectBoundary): Promise<void> => {
+      if (point === "after_confirm" && ++confirmations === 5)
+        throw new Error("interrupt after confirmed review-repair push");
+    };
+
+    await expect(
+      executeRun({
+        store: created.store,
+        adapter,
+        approve: true,
+        github,
+        sideEffectBoundary: interruptAfterRepairPush,
+      }),
+    ).rejects.toThrow("after_confirm");
+    const interrupted = await created.store.loadState();
+    const resumeBoundaries: SideEffectBoundary[] = [];
+    const completed = await executeRun({
+      store: created.store,
+      adapter,
+      github,
+      sideEffectBoundary: (point) => {
+        resumeBoundaries.push(point);
+      },
+    });
+
+    expect(interrupted.sideEffects.at(-1)).toMatchObject({
+      status: "confirmed",
+      claim: { kind: "git_push", nodeId: "push-review-1" },
+    });
+    expect(completed.status).toBe("completed");
+    expect(resumeBoundaries).toContain("after_precondition_reconcile");
+    expect(resumeBoundaries).not.toContain("after_action_command");
+    expect(completed.sideEffects.filter(({ claim }) => claim.kind === "git_push")).toHaveLength(2);
+    expect(adapter.calls).toEqual(["implement", "repair-review-1"]);
+  });
+
+  it("routes an actionable CI failure through a bounded verified repair push", async () => {
+    const { repository, remote } = await createRepositoryWithRemote();
+    const github = await fakePullRequestGitHub(remote, {
+      syncPullRequestHead: true,
+      protected: true,
+      requiredStatusChecks: ["tests"],
+      checks: [
+        {
+          kind: "check_run",
+          id: "tests-check",
+          name: "tests",
+          status: "COMPLETED",
+          conclusion: "FAILURE",
+        },
+      ],
+    });
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "ci-failure\n");
+      if (request.capsule.nodeId === "repair-ci-1") {
+        await writeFile(join(request.repositoryPath, "feature.txt"), "ci-fixed\n");
+        const remoteState = JSON.parse(await readFile(github.statePath, "utf8")) as {
+          checks: Array<Record<string, unknown>>;
+        };
+        remoteState.checks = [
+          {
+            kind: "check_run",
+            id: "tests-check-next-head",
+            name: "tests",
+            status: "COMPLETED",
+            conclusion: "SUCCESS",
+          },
+        ];
+        await writeFile(github.statePath, `${JSON.stringify(remoteState)}\n`);
+      }
+    });
+    const created = await createRun("Implement the feature and get the PR green", {
+      cwd: repository,
+      finishLine: "pr_green",
+    });
+
+    const state = await executeRun({
+      store: created.store,
+      adapter,
+      approve: true,
+      github,
+    });
+    const graph = await created.store.loadGraph();
+    const repair = adapter.requests.find(({ capsule }) => capsule.nodeId === "repair-ci-1");
+
+    expect(state.status).toBe("completed");
+    expect(adapter.calls).toEqual(["implement", "repair-ci-1"]);
+    expect(repair?.capsule.objective).toContain("tests (tests-check) reported FAILURE");
+    expect(repair?.capsule.objective).toContain("untrusted external metadata");
+    expect(graph.nodes.map(({ id }) => id)).toEqual(
+      expect.arrayContaining(["repair-ci-1", "verify-ci-1", "commit-ci-1", "push-ci-1"]),
+    );
+    expect(graph.nodes.find(({ id }) => id === "pr-green")?.dependsOn).toEqual(["push-ci-1"]);
+    expect(state.sideEffects.filter(({ claim }) => claim.kind === "git_push")).toHaveLength(2);
+  });
+
+  it("stops instead of repeating an unchanged actionable CI repair", async () => {
+    const { repository, remote } = await createRepositoryWithRemote();
+    const github = await fakePullRequestGitHub(remote, {
+      syncPullRequestHead: true,
+      protected: true,
+      requiredStatusChecks: ["tests"],
+      checks: [
+        {
+          kind: "check_run",
+          id: "tests-check",
+          name: "tests",
+          status: "COMPLETED",
+          conclusion: "FAILURE",
+        },
+      ],
+    });
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "ci-failure\n");
+      if (request.capsule.nodeId === "repair-ci-1")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "ci-fix-attempt\n");
+    });
+    const created = await createRun("Implement the feature and get the PR green", {
+      cwd: repository,
+      finishLine: "pr_green",
+    });
+
+    const state = await executeRun({
+      store: created.store,
+      adapter,
+      approve: true,
+      github,
+    });
+    const graph = await created.store.loadGraph();
+
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toContain("same actionable CI failure");
+    expect(adapter.calls).toEqual(["implement", "repair-ci-1"]);
+    expect(graph.nodes.map(({ id }) => id)).toContain("repair-ci-1");
+    expect(graph.nodes.map(({ id }) => id)).not.toContain("repair-ci-2");
+    expect(state.sideEffects.filter(({ claim }) => claim.kind === "git_push")).toHaveLength(2);
   });
 
   it("reconciles one pull-request creation across every side-effect boundary", async () => {

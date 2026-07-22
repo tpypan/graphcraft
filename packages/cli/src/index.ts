@@ -194,7 +194,8 @@ export function shouldBypassGraph(task: string): boolean {
   return assessTaskShape(task).bypass;
 }
 
-export type ExecutableFinishLine = "local_verified" | "committed" | "pushed" | "pr_open";
+export type ExecutableFinishLine =
+  "local_verified" | "committed" | "pushed" | "pr_open" | "pr_green";
 
 export async function prepareFinishLine(
   task: string,
@@ -202,20 +203,20 @@ export async function prepareFinishLine(
   requested?: ExecutableFinishLine,
 ): Promise<ExecutableFinishLine> {
   if (
-    /\b(pr green|merge|deploy|force[- ]?push)\b|\brebase\b.{0,40}\b(?:published|remote)\s+branch\b/i.test(
+    /\b(merge|deploy|force[- ]?push)\b|\brebase\b.{0,40}\b(?:published|remote)\s+branch\b/i.test(
       task,
     )
   )
     throw new Error(
-      "Graphcraft supports local_verified, committed, pushed, and pr_open finish lines. It will not infer PR-green, force-push, published-branch rebase, merge, or deployment authority.",
+      "Graphcraft supports local_verified, committed, pushed, pr_open, and pr_green finish lines. It will not infer force-push, published-branch rebase, merge, or deployment authority.",
     );
   const inferred = inferFinishLine(task);
-  if (["pushed", "pr_open"].includes(inferred) && requested && requested !== inferred)
+  if (["pushed", "pr_open", "pr_green"].includes(inferred) && requested && requested !== inferred)
     throw new Error(
       `The requested task includes a ${inferred} outcome, so Graphcraft will not silently narrow it to ${requested}.`,
     );
   const finishLine = requested ?? inferred;
-  if (finishLine === "pushed" || finishLine === "pr_open")
+  if (["pushed", "pr_open", "pr_green"].includes(finishLine))
     await assertGitHubPushCapability({ cwd });
   return finishLine;
 }
@@ -523,7 +524,7 @@ export async function handleAction(input: McpActionInput): Promise<Record<string
     }
     if (
       state.status === "awaiting_approval" &&
-      (contract.finishLine.kind === "pushed" || contract.finishLine.kind === "pr_open")
+      ["pushed", "pr_open", "pr_green"].includes(contract.finishLine.kind)
     )
       await assertGitHubPushCapability({ cwd: store.repositoryRoot });
     const resumed = await executeRun({

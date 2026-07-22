@@ -134,6 +134,42 @@ describe("run contracts and graphs", () => {
     });
   });
 
+  it("infers a pr_green contract with a terminal token-free GitHub wait", () => {
+    const contract = compileRunContract("Implement the migration and get the PR green", repository);
+    const graph = compileGraph(contract, [
+      {
+        id: "tests",
+        kind: "command",
+        command: "npm",
+        args: ["test"],
+        expectedExitCode: 0,
+        timeoutMs: 1_000,
+      },
+    ]);
+
+    expect(contract.finishLine).toEqual({
+      kind: "pr_green",
+      requiredChecks: "github_required",
+    });
+    expect(contract.permissions).toEqual(
+      expect.arrayContaining(["commit", "push", "github_read", "github_write"]),
+    );
+    expect(graph.nodes.map(({ id }) => id)).toEqual([
+      "implement",
+      "verify",
+      "commit",
+      "push",
+      "pull-request",
+      "pr-green",
+    ]);
+    expect(graph.nodes.at(-1)).toMatchObject({
+      kind: "wait",
+      dependsOn: ["pull-request"],
+      sideEffectClass: "none",
+      waitCondition: { kind: "github_pull_request", pollIntervalMs: 30_000 },
+    });
+  });
+
   it("replaces held-out scoring implementations with integrity-bound graph references", () => {
     const runId = randomUUID();
     const hiddenCommand = {

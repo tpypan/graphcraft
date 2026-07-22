@@ -32,7 +32,7 @@ export interface RepositoryIdentity {
 }
 
 export interface ContractOptions {
-  finishLine?: "local_verified" | "committed" | "pushed" | "pr_open";
+  finishLine?: "local_verified" | "committed" | "pushed" | "pr_open" | "pr_green";
   include?: string[];
   exclude?: string[];
 }
@@ -49,7 +49,9 @@ export function classifyTask(task: string): TaskFamily {
 
 export function inferFinishLine(
   task: string,
-): "local_verified" | "committed" | "pushed" | "pr_open" {
+): "local_verified" | "committed" | "pushed" | "pr_open" | "pr_green" {
+  if (/\b(?:pr|pull request)\b.{0,40}\bgreen\b|\bgreen\b.{0,40}\b(?:pr|pull request)\b/i.test(task))
+    return "pr_green";
   if (/\b(?:open|create)(?:\s+(?:a|the))?\s+(?:pr|pull request)\b/i.test(task)) return "pr_open";
   if (
     /\bpush(?:ed|ing)?\s+(?:(?:the|this)\s+)?(?:(?:verified|accepted)\s+)?(?:branch|commit|changes|result)\b|\bpush(?:ed|ing)?\s+to\s+(?:origin|github|the remote)\b/i.test(
@@ -72,8 +74,9 @@ export function compileRunContract(
     "run_commands",
     "create_worktree",
   ];
-  if (["committed", "pushed", "pr_open"].includes(finishKind)) permissions.push("commit");
-  if (finishKind === "pushed" || finishKind === "pr_open")
+  if (["committed", "pushed", "pr_open", "pr_green"].includes(finishKind))
+    permissions.push("commit");
+  if (["pushed", "pr_open", "pr_green"].includes(finishKind))
     permissions.push("push", "github_read", "github_write");
 
   return RunContractSchema.parse({
@@ -81,7 +84,10 @@ export function compileRunContract(
     runId: randomUUID(),
     task: task.trim(),
     outcome: task.trim(),
-    finishLine: { kind: finishKind },
+    finishLine:
+      finishKind === "pr_green"
+        ? { kind: finishKind, requiredChecks: "github_required" }
+        : { kind: finishKind },
     repository,
     scope: {
       include: options.include ?? ["**/*"],
@@ -212,7 +218,7 @@ export function compileGraph(contract: RunContract, verificationProbes: ProbeSpe
     }),
   ];
 
-  if (["committed", "pushed", "pr_open"].includes(contract.finishLine.kind)) {
+  if (["committed", "pushed", "pr_open", "pr_green"].includes(contract.finishLine.kind)) {
     nodes.push(
       node({
         id: "commit",
@@ -224,7 +230,7 @@ export function compileGraph(contract: RunContract, verificationProbes: ProbeSpe
     );
   }
 
-  if (contract.finishLine.kind === "pushed" || contract.finishLine.kind === "pr_open") {
+  if (["pushed", "pr_open", "pr_green"].includes(contract.finishLine.kind)) {
     nodes.push(
       node({
         id: "push",
@@ -236,7 +242,7 @@ export function compileGraph(contract: RunContract, verificationProbes: ProbeSpe
     );
   }
 
-  if (contract.finishLine.kind === "pr_open") {
+  if (contract.finishLine.kind === "pr_open" || contract.finishLine.kind === "pr_green") {
     nodes.push(
       node({
         id: "pull-request",
@@ -244,6 +250,19 @@ export function compileGraph(contract: RunContract, verificationProbes: ProbeSpe
         objective: "Open or recover the pull request for the exact pushed run branch",
         dependsOn: ["push"],
         sideEffectClass: "external",
+      }),
+    );
+  }
+
+  if (contract.finishLine.kind === "pr_green") {
+    nodes.push(
+      node({
+        id: "pr-green",
+        kind: "wait",
+        objective:
+          "Wait without model polling until the exact pull request is green or requires reasoning",
+        dependsOn: ["pull-request"],
+        waitCondition: { kind: "github_pull_request", pollIntervalMs: 30_000 },
       }),
     );
   }
@@ -334,11 +353,13 @@ export function validateGraphPolicy(
   const commitNodes = graph.nodes.filter((candidate) => candidate.kind === "commit");
   const pushNodes = graph.nodes.filter((candidate) => candidate.kind === "push");
   const pullRequestNodes = graph.nodes.filter((candidate) => candidate.kind === "pull_request");
+  let finalVerification: GraphNode | undefined;
   if (contract.finishLine.kind === "local_verified") {
     if (commitNodes.length > 0 || pushNodes.length > 0 || pullRequestNodes.length > 0)
       throw new Error("A local_verified plan cannot contain commit, push, or pull-request nodes");
     if (terminal.kind !== "verification")
       throw new Error("A local_verified plan must end in a verification node");
+    finalVerification = terminal;
   } else if (contract.finishLine.kind === "committed") {
     if (
       commitNodes.length !== 1 ||
@@ -354,6 +375,7 @@ export function validateGraphPolicy(
     ) {
       throw new Error("The terminal commit node must directly depend on one verification node");
     }
+    finalVerification = graph.nodes.find((candidate) => candidate.id === terminal.dependsOn[0]);
   } else if (contract.finishLine.kind === "pushed") {
     if (
       commitNodes.length !== 1 ||
@@ -370,6 +392,7 @@ export function validateGraphPolicy(
       graph.nodes.find((candidate) => candidate.id === commit.dependsOn[0])?.kind !== "verification"
     )
       throw new Error("The pushed commit node must directly depend on one verification node");
+    finalVerification = graph.nodes.find((candidate) => candidate.id === commit.dependsOn[0]);
   } else if (contract.finishLine.kind === "pr_open") {
     if (
       commitNodes.length !== 1 ||
@@ -389,16 +412,76 @@ export function validateGraphPolicy(
       graph.nodes.find((candidate) => candidate.id === commit.dependsOn[0])?.kind !== "verification"
     )
       throw new Error("The PR commit node must directly depend on one verification node");
+    finalVerification = graph.nodes.find((candidate) => candidate.id === commit.dependsOn[0]);
+  } else if (contract.finishLine.kind === "pr_green") {
+    if (
+      commitNodes.length < 1 ||
+      pushNodes.length < 1 ||
+      pullRequestNodes.length !== 1 ||
+      terminal.kind !== "wait" ||
+      terminal.waitCondition?.kind !== "github_pull_request"
+    )
+      throw new Error(
+        "A pr_green plan must end in one GitHub lifecycle wait after pull request, push, and commit",
+      );
+    const pullRequest = pullRequestNodes[0]!;
+    if (pullRequest.dependsOn.length !== 1)
+      throw new Error("The PR-green pull-request node must directly depend on the push node");
+    const initialPush = graph.nodes.find(({ id }) => id === pullRequest.dependsOn[0]);
+    if (initialPush?.kind !== "push" || initialPush.dependsOn.length !== 1)
+      throw new Error("The PR-green push node must directly depend on the commit node");
+    const initialCommit = graph.nodes.find(({ id }) => id === initialPush.dependsOn[0]);
+    if (initialCommit?.kind !== "commit" || initialCommit.dependsOn.length !== 1)
+      throw new Error("The PR-green commit node must directly depend on one verification node");
+    const initialVerification = graph.nodes.find(({ id }) => id === initialCommit.dependsOn[0]);
+    if (initialVerification?.kind !== "verification")
+      throw new Error("The PR-green commit node must directly depend on one verification node");
+    if (terminal.dependsOn.length !== 1)
+      throw new Error("The terminal GitHub wait must directly depend on one remote boundary");
+
+    const lifecyclePushes = new Set<string>([initialPush.id]);
+    const lifecycleCommits = new Set<string>([initialCommit.id]);
+    let boundary = graph.nodes.find(({ id }) => id === terminal.dependsOn[0]);
+    let terminalCommit = initialCommit;
+    while (boundary?.kind === "push" && boundary.id !== initialPush.id) {
+      const repairCommitDependencies = boundary.dependsOn
+        .map((id) => graph.nodes.find((candidate) => candidate.id === id))
+        .filter((candidate): candidate is GraphNode => candidate !== undefined);
+      const repairCommit = repairCommitDependencies.find(({ kind }) => kind === "commit");
+      const previousBoundary = repairCommitDependencies.find(({ kind }) =>
+        ["push", "pull_request"].includes(kind),
+      );
+      if (
+        boundary.dependsOn.length !== 2 ||
+        !repairCommit ||
+        !previousBoundary ||
+        repairCommit.dependsOn.length !== 2 ||
+        !repairCommit.dependsOn.includes(previousBoundary.id)
+      )
+        throw new Error(
+          `Repair push ${boundary.id} must depend on its commit and previous PR boundary`,
+        );
+      const verification = repairCommit.dependsOn
+        .map((id) => graph.nodes.find((candidate) => candidate.id === id))
+        .find((candidate) => candidate?.kind === "verification");
+      if (!verification)
+        throw new Error(`Repair commit ${repairCommit.id} must depend on one verification node`);
+      lifecyclePushes.add(boundary.id);
+      lifecycleCommits.add(repairCommit.id);
+      terminalCommit = repairCommit;
+      boundary = previousBoundary;
+    }
+    if (boundary?.id !== pullRequest.id)
+      throw new Error("The terminal GitHub wait must descend from the approved pull request");
+    if (lifecyclePushes.size !== pushNodes.length || lifecycleCommits.size !== commitNodes.length)
+      throw new Error("Every PR-green commit and push must belong to the lifecycle repair chain");
+    finalVerification = terminalCommit.dependsOn
+      .map((id) => graph.nodes.find((candidate) => candidate.id === id))
+      .find((candidate) => candidate?.kind === "verification");
   } else {
     throw new Error(`Finish line ${contract.finishLine.kind} is not executable locally`);
   }
 
-  const finalVerification =
-    terminal.kind === "verification"
-      ? terminal
-      : terminal.kind === "commit"
-        ? graph.nodes.find((candidate) => candidate.id === terminal.dependsOn[0])
-        : graph.nodes.find((candidate) => candidate.id === commitNodes[0]?.dependsOn[0]);
   if (!finalVerification || finalVerification.completionProbes.length === 0)
     throw new Error("The terminal verification node must contain executable completion probes");
   for (const required of requiredVerificationProbes) {
@@ -417,7 +500,17 @@ export function validateGraphPolicy(
         throw new Error(`Wait node ${item.id} must be read-only`);
       if (item.progressProbes.length > 0 || item.completionProbes.length > 0)
         throw new Error(`Wait node ${item.id} cannot run model-visible probes`);
-      if (
+      if (condition.kind === "github_pull_request") {
+        if (
+          contract.finishLine.kind !== "pr_green" ||
+          !contract.permissions.includes("github_read") ||
+          item.dependsOn.length !== 1 ||
+          !["pull_request", "push"].includes(
+            graph.nodes.find(({ id }) => id === item.dependsOn[0])?.kind ?? "",
+          )
+        )
+          throw new Error(`GitHub wait node ${item.id} exceeds the approved PR lifecycle`);
+      } else if (
         condition.kind !== "time" &&
         (!safeRelativePattern(condition.path) ||
           /[*?[{]/.test(condition.path) ||
@@ -1011,12 +1104,19 @@ function verificationNode(graph: Graph): GraphNode {
   let candidate = graph.nodes.find(
     (candidate) => !graph.nodes.some((other) => other.dependsOn.includes(candidate.id)),
   );
-  while (
-    candidate &&
-    ["commit", "push", "pull_request"].includes(candidate.kind) &&
-    candidate.dependsOn.length === 1
-  )
-    candidate = graph.nodes.find((node) => node.id === candidate!.dependsOn[0]);
+  while (candidate && ["commit", "push", "pull_request", "wait"].includes(candidate.kind)) {
+    const expectedKind =
+      candidate.kind === "wait"
+        ? ["pull_request", "push"]
+        : candidate.kind === "pull_request"
+          ? ["push"]
+          : candidate.kind === "push"
+            ? ["commit"]
+            : ["verification"];
+    candidate = candidate.dependsOn
+      .map((id) => graph.nodes.find((node) => node.id === id))
+      .find((dependency) => dependency && expectedKind.includes(dependency.kind));
+  }
   if (candidate?.kind !== "verification")
     throw new Error("The graph has no finish-line verification node");
   return candidate;

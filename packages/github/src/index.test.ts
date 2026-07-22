@@ -6,6 +6,7 @@ import {
   assertGitHubPushCapability,
   assertGitHubSnapshotCurrent,
   captureGitHubPullRequestSnapshot,
+  classifyGitHubPullRequestLifecycle,
   createGitHubPullRequest,
   listGitHubPullRequestsForHead,
   probeGitHub,
@@ -316,6 +317,149 @@ describe("GitHub capability and snapshot layer", () => {
         ),
       ),
     ).toBe(false);
+  });
+
+  it("classifies exact-SHA review and CI lifecycle states deterministically", async () => {
+    const fixture = await fakeGitHub();
+    const snapshot = await captureGitHubPullRequestSnapshot(fixture);
+    const expected = {
+      host: snapshot.repository.host,
+      nameWithOwner: snapshot.repository.nameWithOwner,
+      number: snapshot.pullRequest.number,
+      headRefName: snapshot.pullRequest.headRefName,
+      baseRefName: snapshot.pullRequest.baseRefName,
+      headSha: snapshot.binding.headSha,
+      baseSha: snapshot.binding.baseSha,
+    };
+
+    const reviewFirst = classifyGitHubPullRequestLifecycle(snapshot, expected);
+    expect(reviewFirst).toMatchObject({
+      status: "review_required",
+      counts: {
+        requiredChecksSucceeded: 1,
+        requiredChecksPending: 1,
+        unresolvedReviewThreads: 1,
+        currentApprovals: 1,
+        requiredApprovals: 1,
+      },
+      unresolvedThreadIds: ["thread-1"],
+    });
+
+    const greenSnapshot = {
+      ...snapshot,
+      pullRequest: { ...snapshot.pullRequest, reviewDecision: "APPROVED" },
+      requiredChecks: snapshot.requiredChecks.map((check) => ({
+        ...check,
+        state: "success" as const,
+      })),
+      reviewThreads: snapshot.reviewThreads.map((thread) => ({
+        ...thread,
+        isResolved: true,
+      })),
+    };
+    const green = classifyGitHubPullRequestLifecycle(greenSnapshot, expected);
+    expect(green.status).toBe("green");
+    expect(green.counts).toMatchObject({
+      requiredChecksSucceeded: 2,
+      requiredChecksPending: 0,
+      unresolvedReviewThreads: 0,
+    });
+
+    const recaptured = {
+      ...snapshot,
+      binding: { ...snapshot.binding, capturedAt: "2026-07-22T23:00:00.000Z" },
+      reviewThreads: snapshot.reviewThreads.map((thread) => ({
+        ...thread,
+        ...(thread.latestComment
+          ? {
+              latestComment: {
+                ...thread.latestComment,
+                body: "Different untrusted review text",
+              },
+            }
+          : {}),
+      })),
+      rateLimit: {
+        core: { ...snapshot.rateLimit.core, remaining: 1 },
+        graphql: { ...snapshot.rateLimit.graphql, remaining: 2 },
+      },
+    };
+    expect(classifyGitHubPullRequestLifecycle(recaptured, expected).signature).toBe(
+      reviewFirst.signature,
+    );
+    expect(
+      classifyGitHubPullRequestLifecycle(snapshot, {
+        ...expected,
+        baseSha: "e".repeat(40),
+      }).status,
+    ).toBe("stale");
+  });
+
+  it("separates actionable, infrastructure, cancelled, and pending required checks", async () => {
+    const fixture = await fakeGitHub();
+    const captured = await captureGitHubPullRequestSnapshot(fixture);
+    const expected = {
+      host: captured.repository.host,
+      nameWithOwner: captured.repository.nameWithOwner,
+      number: captured.pullRequest.number,
+      headRefName: captured.pullRequest.headRefName,
+      baseRefName: captured.pullRequest.baseRefName,
+      headSha: captured.binding.headSha,
+      baseSha: captured.binding.baseSha,
+    };
+    const base = {
+      ...captured,
+      pullRequest: { ...captured.pullRequest, reviewDecision: "APPROVED" },
+      branchProtection: {
+        ...captured.branchProtection,
+        requiresApprovingReviews: false,
+        requiredApprovingReviewCount: 0,
+      },
+      reviewThreads: captured.reviewThreads.map((thread) => ({
+        ...thread,
+        isResolved: true,
+      })),
+    };
+    const classify = (state: "failure" | "pending", conclusion: string | undefined) =>
+      classifyGitHubPullRequestLifecycle(
+        {
+          ...base,
+          requiredChecks: [
+            {
+              context: "tests",
+              state,
+              matchingCheckIds: ["check-1"],
+            },
+          ],
+          checks: [
+            {
+              id: "check-1",
+              kind: "check_run",
+              name: "tests",
+              status: state === "pending" ? "IN_PROGRESS" : "COMPLETED",
+              ...(conclusion ? { conclusion } : {}),
+            },
+          ],
+        },
+        expected,
+      );
+
+    expect(classify("failure", "FAILURE")).toMatchObject({
+      status: "actionable_failure",
+      checkIds: { actionable: ["check-1"] },
+    });
+    expect(classify("failure", "STARTUP_FAILURE")).toMatchObject({
+      status: "infrastructure_failure",
+      checkIds: { infrastructure: ["check-1"] },
+    });
+    expect(classify("failure", "CANCELLED")).toMatchObject({
+      status: "cancelled",
+      checkIds: { cancelled: ["check-1"] },
+    });
+    expect(classify("pending", undefined)).toMatchObject({
+      status: "waiting",
+      checkIds: { pending: ["check-1"] },
+    });
   });
 
   it("rejects a snapshot after either bound SHA changes", async () => {

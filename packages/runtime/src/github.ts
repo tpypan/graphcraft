@@ -1,8 +1,10 @@
 import { runProcess, type ExecutedProbe } from "@graphcraft/probes";
 import {
   SideEffectClaimSchema,
+  WaitRuntimeStateSchema,
   contentHash,
   type ExecutableProbe,
+  type GraphNode,
   type RunContract,
   type SideEffectClaim,
 } from "@graphcraft/core";
@@ -10,10 +12,12 @@ import {
   assertGitHubSnapshotCurrent,
   assertGitHubPushCapability,
   captureGitHubPullRequestSnapshot,
+  classifyGitHubPullRequestLifecycle,
   createGitHubPullRequest,
   listGitHubPullRequestsForHead,
   readGitHubPullRequestIdentity,
   type GitHubCommandOptions,
+  type GitHubPullRequestLifecycleClassification,
   type GitHubPullRequestCandidate,
 } from "@graphcraft/github";
 import {
@@ -22,6 +26,7 @@ import {
   type SideEffectReconciliation,
 } from "./side-effect.ts";
 import type { RunWorkspace } from "./repository.ts";
+import { RunStore } from "./store.ts";
 
 export type GitHubExecutionOptions = Omit<GitHubCommandOptions, "cwd">;
 
@@ -213,7 +218,7 @@ export async function createPullRequestClaim(
   options: GitHubExecutionOptions = {},
 ): Promise<SideEffectClaim> {
   if (contract.repository.baseRef === "HEAD")
-    throw new Error("A pr_open finish line requires a named base branch");
+    throw new Error("A pull-request finish line requires a named base branch");
   const actionId = contentHash({
     schemaVersion: 1,
     runId: contract.runId,
@@ -412,8 +417,69 @@ export async function performPullRequestCreation(
 
 type GitHubSnapshotProbe = Extract<ExecutableProbe, { kind: "github_snapshot" }>;
 
+export interface CapturedPullRequestLifecycle extends ExecutedProbe {
+  classification: GitHubPullRequestLifecycleClassification;
+  reviewFeedback: GitHubReviewFeedback[];
+  reviewFeedbackSignature: string;
+  ciFailures: GitHubCheckFailureEvidence[];
+  ciFailureSignature: string;
+}
+
+export interface GitHubReviewFeedback {
+  contentTrust: "untrusted_external";
+  threadId: string;
+  path?: string;
+  line?: number;
+  commentCount: number;
+  latestComment?: {
+    id: string;
+    author?: string;
+    body: string;
+    url: string;
+    createdAt: string;
+  };
+}
+
+export interface GitHubCheckFailureEvidence {
+  contentTrust: "untrusted_external";
+  id: string;
+  kind: "check_run" | "status_context";
+  name: string;
+  status: string;
+  conclusion?: string;
+  appId?: number;
+  detailsUrl?: string;
+}
+
+function currentReviewFeedback(
+  snapshot: Awaited<ReturnType<typeof captureGitHubPullRequestSnapshot>>,
+): GitHubReviewFeedback[] {
+  return snapshot.reviewThreads
+    .filter(({ isResolved, isOutdated }) => !isResolved && !isOutdated)
+    .slice(0, 20)
+    .map(({ id, path, line, commentCount, latestComment }) => ({
+      contentTrust: "untrusted_external" as const,
+      threadId: id,
+      ...(path ? { path } : {}),
+      ...(line !== undefined ? { line } : {}),
+      commentCount,
+      ...(latestComment
+        ? {
+            latestComment: {
+              id: latestComment.id,
+              ...(latestComment.author ? { author: latestComment.author } : {}),
+              body: latestComment.body.replaceAll("\0", "�").slice(0, 4_000),
+              url: latestComment.url,
+              createdAt: latestComment.createdAt,
+            },
+          }
+        : {}),
+    }));
+}
+
 function lifecycleProjection(
   snapshot: Awaited<ReturnType<typeof captureGitHubPullRequestSnapshot>>,
+  classification: GitHubPullRequestLifecycleClassification,
 ): Record<string, unknown> {
   return {
     schemaVersion: 1,
@@ -470,6 +536,7 @@ function lifecycleProjection(
       }),
     ),
     reviews: snapshot.reviews,
+    classification,
     rateLimit: snapshot.rateLimit,
   };
 }
@@ -481,93 +548,338 @@ export async function capturePullRequestLifecycleProbe(
   result: Record<string, unknown>,
   spec: GitHubSnapshotProbe,
   options: GitHubExecutionOptions = {},
-): Promise<ExecutedProbe> {
+): Promise<CapturedPullRequestLifecycle> {
   if (claim.kind !== "github_pr_create")
     throw new Error(`Side effect ${claim.actionId} is not a pull-request creation`);
   const expected = pullRequestPrecondition(claim);
   const number = result.number;
   if (typeof number !== "number" || !Number.isInteger(number) || number <= 0)
     throw new Error(`Pull-request result for ${claim.actionId} has no valid number`);
+  return await captureExpectedPullRequestLifecycle(
+    workspace,
+    contract,
+    expected,
+    number,
+    spec,
+    result.headSha === expected.headSha && result.baseSha === expected.baseSha,
+    options,
+  );
+}
+
+async function captureExpectedPullRequestLifecycle(
+  workspace: RunWorkspace,
+  contract: RunContract,
+  expected: PullRequestPrecondition,
+  number: number,
+  spec: GitHubSnapshotProbe,
+  resultBindingMatches: boolean,
+  options: GitHubExecutionOptions,
+): Promise<CapturedPullRequestLifecycle> {
   const started = performance.now();
   const github = commandOptions(workspace, options);
+  await assertCurrentRemoteBinding(workspace, expected);
   const snapshot = await captureGitHubPullRequestSnapshot({ ...github, pullRequest: number });
   await assertGitHubSnapshotCurrent(github, snapshot);
 
   const expectedState = spec.expectedState.toUpperCase();
-  const exactBinding =
-    contract.finishLine.kind === "pr_open" &&
+  const actionBindingMatchesContract =
+    (contract.finishLine.kind === "pr_open" || contract.finishLine.kind === "pr_green") &&
     expected.baseRefName === contract.repository.baseRef &&
-    snapshot.repository.host === expected.host &&
-    snapshot.repository.nameWithOwner === expected.nameWithOwner &&
-    snapshot.pullRequest.number === number &&
-    snapshot.pullRequest.headRefName === expected.headRefName &&
-    snapshot.pullRequest.baseRefName === expected.baseRefName &&
-    snapshot.binding.headSha === expected.headSha &&
-    snapshot.binding.baseSha === expected.baseSha &&
-    result.headSha === expected.headSha &&
-    result.baseSha === expected.baseSha;
-  const requiredSuccess = snapshot.requiredChecks.filter(({ state }) => state === "success");
-  const requiredPending = snapshot.requiredChecks.filter(({ state }) => state === "pending");
-  const requiredFailing = snapshot.requiredChecks.filter(({ state }) =>
-    ["failure", "missing", "unknown"].includes(state),
-  );
-  const unresolvedThreads = snapshot.reviewThreads.filter(
-    ({ isResolved, isOutdated }) => !isResolved && !isOutdated,
-  );
+    resultBindingMatches;
+  const classification = classifyGitHubPullRequestLifecycle(snapshot, {
+    host: expected.host,
+    nameWithOwner: expected.nameWithOwner,
+    number,
+    headRefName: expected.headRefName,
+    baseRefName: expected.baseRefName,
+    headSha: expected.headSha,
+    baseSha: expected.baseSha,
+  });
+  const counts = classification.counts;
   const stateMatches = snapshot.pullRequest.state.toUpperCase() === expectedState;
   const checksMatch =
     spec.requiredChecks === "observe" ||
-    (requiredPending.length === 0 &&
-      requiredFailing.length === 0 &&
-      requiredSuccess.length === snapshot.requiredChecks.length);
-  const reviewsMatch = spec.reviewThreads === "observe" || unresolvedThreads.length === 0;
-  const passed = exactBinding && stateMatches && checksMatch && reviewsMatch;
-  const stableEvidence = {
-    repository: snapshot.repository.nameWithOwner,
-    number: snapshot.pullRequest.number,
-    state: snapshot.pullRequest.state,
-    isDraft: snapshot.pullRequest.isDraft,
-    headRefName: snapshot.pullRequest.headRefName,
-    baseRefName: snapshot.pullRequest.baseRefName,
-    headSha: snapshot.binding.headSha,
-    baseSha: snapshot.binding.baseSha,
+    (counts.requiredChecksSucceeded === counts.requiredChecksTotal &&
+      counts.requiredChecksPending === 0 &&
+      counts.requiredChecksActionableFailure === 0 &&
+      counts.requiredChecksInfrastructureFailure === 0 &&
+      counts.requiredChecksCancelled === 0 &&
+      counts.requiredChecksMissingOrUnknown === 0);
+  const reviewsMatch = spec.reviewThreads === "observe" || counts.unresolvedReviewThreads === 0;
+  const passed =
+    actionBindingMatchesContract &&
+    classification.status !== "stale" &&
+    classification.status !== "blocked" &&
+    stateMatches &&
+    checksMatch &&
+    reviewsMatch;
+  const summary = classification.evidence.join("; ");
+  const reviewFeedback = currentReviewFeedback(snapshot);
+  const reviewFeedbackSignature = contentHash(
+    reviewFeedback.map(({ threadId, path, line, commentCount, latestComment }) => ({
+      threadId,
+      path: path ?? null,
+      line: line ?? null,
+      commentCount,
+      latestComment: latestComment
+        ? {
+            id: latestComment.id,
+            author: latestComment.author ?? null,
+            bodyHash: contentHash(latestComment.body),
+            url: latestComment.url,
+            createdAt: latestComment.createdAt,
+          }
+        : null,
+    })),
+  );
+  const actionableCheckIds = new Set(classification.checkIds.actionable);
+  const ciFailures = snapshot.checks
+    .filter(({ id }) => actionableCheckIds.has(id))
+    .map(({ id, kind, name, status, conclusion, appId, detailsUrl }) => ({
+      contentTrust: "untrusted_external" as const,
+      id,
+      kind,
+      name,
+      status,
+      ...(conclusion ? { conclusion } : {}),
+      ...(appId !== undefined ? { appId } : {}),
+      ...(detailsUrl ? { detailsUrl } : {}),
+    }));
+  const ciFailureSignature = contentHash({
     mergeable: snapshot.pullRequest.mergeable,
-    reviewDecision: snapshot.pullRequest.reviewDecision ?? null,
-    requiredChecks: snapshot.requiredChecks,
-    reviewThreads: snapshot.reviewThreads.map(
-      ({ id, isResolved, isOutdated, path, line, commentCount }) => ({
-        id,
-        isResolved,
-        isOutdated,
-        path: path ?? null,
-        line: line ?? null,
-        commentCount,
-      }),
-    ),
-    reviews: snapshot.reviews,
-  };
-  const summary = [
-    `PR #${number} is ${snapshot.pullRequest.state} at ${snapshot.binding.headSha}/${snapshot.binding.baseSha}`,
-    `${requiredSuccess.length} required checks succeeded, ${requiredPending.length} pending, ${requiredFailing.length} failing or missing`,
-    `${unresolvedThreads.length} unresolved current review threads`,
-    `mergeability is ${snapshot.pullRequest.mergeable}`,
-  ].join("; ");
+    failures: ciFailures
+      .map(({ kind, name, status, conclusion, appId }) => ({
+        kind,
+        name,
+        status,
+        conclusion: conclusion ?? null,
+        appId: appId ?? null,
+      }))
+      .sort((left, right) =>
+        `${left.kind}:${left.name}:${left.appId ?? ""}`.localeCompare(
+          `${right.kind}:${right.name}:${right.appId ?? ""}`,
+        ),
+      ),
+  });
   return {
+    classification,
+    reviewFeedback,
+    reviewFeedbackSignature,
+    ciFailures,
+    ciFailureSignature,
     result: {
       probeId: spec.id,
       kind: spec.kind,
       passed,
-      signature: contentHash(stableEvidence),
+      signature: classification.signature,
       summary,
       durationMs: Math.round(performance.now() - started),
       metrics: {
-        requiredChecksTotal: snapshot.requiredChecks.length,
-        requiredChecksSucceeded: requiredSuccess.length,
-        requiredChecksPending: requiredPending.length,
-        requiredChecksFailing: requiredFailing.length,
-        unresolvedReviewThreads: unresolvedThreads.length,
+        requiredChecksTotal: counts.requiredChecksTotal,
+        requiredChecksSucceeded: counts.requiredChecksSucceeded,
+        requiredChecksPending: counts.requiredChecksPending,
+        requiredChecksFailing:
+          counts.requiredChecksActionableFailure +
+          counts.requiredChecksInfrastructureFailure +
+          counts.requiredChecksCancelled +
+          counts.requiredChecksMissingOrUnknown,
+        requiredChecksActionableFailure: counts.requiredChecksActionableFailure,
+        requiredChecksInfrastructureFailure: counts.requiredChecksInfrastructureFailure,
+        requiredChecksCancelled: counts.requiredChecksCancelled,
+        requiredChecksMissingOrUnknown: counts.requiredChecksMissingOrUnknown,
+        unresolvedReviewThreads: counts.unresolvedReviewThreads,
       },
     },
-    output: `${JSON.stringify(lifecycleProjection(snapshot), null, 2)}\n`,
+    output: `${JSON.stringify(lifecycleProjection(snapshot, classification), null, 2)}\n`,
   };
+}
+
+export type GitHubLifecycleWaitOutcome =
+  | {
+      status: "satisfied";
+      evidence: string[];
+      lifecycle?: CapturedPullRequestLifecycle;
+    }
+  | {
+      status: "action_required";
+      evidence: string[];
+      lifecycle: CapturedPullRequestLifecycle;
+    }
+  | {
+      status: "timed_out";
+      evidence: string[];
+      lifecycle?: CapturedPullRequestLifecycle;
+    }
+  | {
+      status: "waiting";
+      nextWakeAt: string;
+      evidence: string[];
+      lifecycle?: CapturedPullRequestLifecycle;
+    };
+
+export async function evaluateGitHubLifecycleWait(input: {
+  store: RunStore;
+  node: GraphNode;
+  workspace: RunWorkspace;
+  contract: RunContract;
+  options?: GitHubExecutionOptions;
+  now?: number;
+}): Promise<GitHubLifecycleWaitOutcome> {
+  const condition = input.node.waitCondition;
+  if (input.node.kind !== "wait" || condition?.kind !== "github_pull_request")
+    throw new Error(`Node ${input.node.id} is not a GitHub lifecycle wait`);
+  const now = input.now ?? Date.now();
+  let state = await input.store.loadState();
+  let wait = state.waits.find(({ nodeId }) => nodeId === input.node.id);
+  if (!wait) {
+    const registeredAt = new Date(now).toISOString();
+    wait = WaitRuntimeStateSchema.parse({
+      nodeId: input.node.id,
+      condition,
+      workspacePath: input.workspace.path,
+      status: "waiting",
+      registeredAt,
+      nextWakeAt: registeredAt,
+      observations: 0,
+      evidence: [],
+      updatedAt: registeredAt,
+    });
+    await input.store.append("runtime", "wait.registered", { wait }, input.node.id);
+    state = await input.store.loadState();
+  }
+  if (wait.status === "satisfied") return { status: "satisfied", evidence: wait.evidence };
+  if (wait.status === "timed_out") return { status: "timed_out", evidence: wait.evidence };
+  if (now < Date.parse(wait.nextWakeAt))
+    return { status: "waiting", nextWakeAt: wait.nextWakeAt, evidence: wait.evidence };
+
+  const pullRequests = state.sideEffects.filter(
+    ({ claim, status, result }) =>
+      claim.kind === "github_pr_create" && status === "confirmed" && result !== undefined,
+  );
+  if (pullRequests.length !== 1 || !pullRequests[0]?.result)
+    throw new Error("The GitHub lifecycle wait requires one confirmed pull-request binding");
+  const pullRequest = pullRequests[0];
+  const pullRequestResult = pullRequest.result;
+  if (!pullRequestResult)
+    throw new Error("The confirmed pull-request binding has no durable result");
+  const originalExpected = pullRequestPrecondition(pullRequest.claim);
+  const number = pullRequestResult.number;
+  if (typeof number !== "number" || !Number.isInteger(number) || number <= 0)
+    throw new Error("The confirmed pull-request binding has no valid number");
+  let expected = originalExpected;
+  const boundaryNodeId = input.node.dependsOn[0];
+  if (boundaryNodeId !== pullRequest.claim.nodeId) {
+    const pushed = state.sideEffects.find(
+      ({ claim }) => claim.nodeId === boundaryNodeId && claim.kind === "git_push",
+    );
+    if (pushed?.status !== "confirmed" || !pushed.result)
+      throw new Error(`The GitHub lifecycle wait has no confirmed push for ${boundaryNodeId}`);
+    const branch = pushed.claim.precondition.branch;
+    const remote = pushed.claim.precondition.remote;
+    const remoteUrl = pushed.claim.precondition.remoteUrl;
+    const sha = pushed.result.sha;
+    if (
+      branch !== originalExpected.headRefName ||
+      remote !== originalExpected.remote ||
+      remoteUrl !== originalExpected.remoteUrl ||
+      typeof sha !== "string"
+    )
+      throw new Error(`The repair push ${boundaryNodeId} does not preserve the pull-request head`);
+    expected = { ...originalExpected, headSha: sha };
+  }
+  const lifecycle = await captureExpectedPullRequestLifecycle(
+    input.workspace,
+    input.contract,
+    expected,
+    number,
+    {
+      id: `${input.node.id}-lifecycle`,
+      kind: "github_snapshot",
+      pullRequest: "run_branch",
+      expectedState: "open",
+      requiredChecks: "success",
+      reviewThreads: "resolved",
+    },
+    pullRequestResult.baseSha === originalExpected.baseSha &&
+      (boundaryNodeId !== pullRequest.claim.nodeId ||
+        pullRequestResult.headSha === originalExpected.headSha),
+    input.options ?? {},
+  );
+  if (lifecycle.output) {
+    lifecycle.result.artifact = await input.store.writeArtifact(
+      `probes/${lifecycle.result.signature}.log`,
+      lifecycle.output,
+    );
+  }
+  const evidence = lifecycle.classification.evidence;
+  const timedOut = condition.timeoutAt && now >= Date.parse(condition.timeoutAt);
+  if (timedOut) {
+    const timeoutEvidence = [
+      ...evidence,
+      `GitHub lifecycle wait timed out at ${condition.timeoutAt}`,
+    ];
+    await input.store.append(
+      "runtime",
+      "wait.timed_out",
+      {
+        nodeId: input.node.id,
+        evidence: timeoutEvidence,
+        signature: lifecycle.classification.signature,
+        probeResult: lifecycle.result,
+      },
+      input.node.id,
+    );
+    return { status: "timed_out", evidence: timeoutEvidence, lifecycle };
+  }
+  if (lifecycle.classification.status === "green") {
+    await input.store.append(
+      "runtime",
+      "wait.satisfied",
+      {
+        nodeId: input.node.id,
+        evidence,
+        signature: lifecycle.classification.signature,
+        probeResult: lifecycle.result,
+      },
+      input.node.id,
+    );
+    return { status: "satisfied", evidence, lifecycle };
+  }
+  if (lifecycle.classification.status !== "waiting") {
+    await input.store.append(
+      "runtime",
+      "wait.observed",
+      {
+        nodeId: input.node.id,
+        nextWakeAt: new Date(now).toISOString(),
+        evidence,
+        signature: lifecycle.classification.signature,
+        probeResult: lifecycle.result,
+      },
+      input.node.id,
+    );
+    return { status: "action_required", evidence, lifecycle };
+  }
+
+  const observations = wait.observations + 1;
+  const delay = Math.min(
+    condition.pollIntervalMs * 2 ** Math.min(Math.max(0, observations - 1), 4),
+    300_000,
+  );
+  const nextWakeAt = new Date(
+    condition.timeoutAt ? Math.min(now + delay, Date.parse(condition.timeoutAt)) : now + delay,
+  ).toISOString();
+  await input.store.append(
+    "runtime",
+    "wait.observed",
+    {
+      nodeId: input.node.id,
+      nextWakeAt,
+      evidence,
+      signature: lifecycle.classification.signature,
+      probeResult: lifecycle.result,
+    },
+    input.node.id,
+  );
+  return { status: "waiting", nextWakeAt, evidence, lifecycle };
 }

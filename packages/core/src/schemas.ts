@@ -272,6 +272,11 @@ export const WaitConditionSchema = z.discriminatedUnion("kind", [
     pollIntervalMs: z.number().int().min(250).max(300_000),
     timeoutAt: z.iso.datetime().optional(),
   }),
+  z.strictObject({
+    kind: z.literal("github_pull_request"),
+    pollIntervalMs: z.number().int().min(1_000).max(300_000),
+    timeoutAt: z.iso.datetime().optional(),
+  }),
 ]);
 
 export const GraphNodeSchema = z.strictObject({
@@ -521,6 +526,7 @@ export const WaitRuntimeStateSchema = z.strictObject({
   status: z.enum(["waiting", "satisfied", "timed_out"]),
   registeredAt: z.iso.datetime(),
   baselineSignature: z.string().optional(),
+  lastSignature: z.string().optional(),
   nextWakeAt: z.iso.datetime(),
   observations: z.number().int().nonnegative(),
   evidence: z.array(z.string()).default([]),

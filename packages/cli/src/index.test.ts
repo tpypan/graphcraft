@@ -90,6 +90,9 @@ describe("run approval", () => {
       prepareFinishLine("Implement the feature and open a pull request", "/tmp/unused", "pushed"),
     ).rejects.toThrow(/will not silently narrow/);
     await expect(
+      prepareFinishLine("Implement the feature and get the PR green", "/tmp/unused", "pr_open"),
+    ).rejects.toThrow(/will not silently narrow/);
+    await expect(
       prepareFinishLine("Force-push the published branch", "/tmp/unused", "pushed"),
     ).rejects.toThrow(/will not infer/);
   });
@@ -195,6 +198,32 @@ describe("run approval", () => {
           reviewThreads: "observe",
         },
       ],
+    });
+  });
+
+  it("shows pr_green as a token-free terminal wait without merge authority", () => {
+    const contract = compileRunContract("Implement the feature and get the PR green", {
+      root: "/tmp/example",
+      baseRef: "main",
+      baseSha: "abc123",
+    });
+    const graph = compileGraph(contract, [
+      {
+        id: "tests",
+        kind: "command",
+        command: "pnpm",
+        args: ["test"],
+        expectedExitCode: 0,
+        timeoutMs: 1_000,
+      },
+    ]);
+    const rendered = renderContract(contract, graph);
+
+    expect(rendered).toContain("Finish line    pr_green");
+    expect(rendered).toContain("github_read");
+    expect(rendered).not.toContain("merge");
+    expect(contractView(contract, graph)).toMatchObject({
+      planShape: "implement → verify → commit → push → pull-request → pr-green",
     });
   });
 

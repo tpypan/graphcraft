@@ -35,7 +35,9 @@ export function createGraphcraftServer(): McpServer {
         repository: z.string().optional(),
         host: z.enum(["codex", "claude"]).optional(),
         approve: z.boolean().optional(),
-        finishLine: z.enum(["local_verified", "committed", "pushed", "pr_open"]).optional(),
+        finishLine: z
+          .enum(["local_verified", "committed", "pushed", "pr_open", "pr_green"])
+          .optional(),
         force: z.boolean().optional(),
         maxWorkers: z.union([z.literal(1), z.literal(2)]).optional(),
         probePlan: ProbePlanSchema.optional(),

@@ -88,6 +88,8 @@ async function observe(
       ],
     };
   }
+  if (condition.kind === "github_pull_request")
+    throw new Error("GitHub pull-request waits must be evaluated by the runtime GitHub boundary");
   const signature = await fileSignature(workspacePath, condition.path);
   if (condition.kind === "file_exists") {
     const absent = signature === contentHash({ kind: "absent", path: condition.path });

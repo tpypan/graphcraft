@@ -126,9 +126,65 @@ export const GitHubPullRequestSnapshotSchema = z.strictObject({
   }),
 });
 
+export const GitHubPullRequestBindingExpectationSchema = z.strictObject({
+  host: z.string().min(1),
+  nameWithOwner: z.string().min(3),
+  number: z.number().int().positive(),
+  headRefName: z.string().min(1),
+  baseRefName: z.string().min(1),
+  headSha: z.string().min(7),
+  baseSha: z.string().min(7),
+});
+
+export const GitHubLifecycleStatusSchema = z.enum([
+  "green",
+  "waiting",
+  "review_required",
+  "actionable_failure",
+  "infrastructure_failure",
+  "cancelled",
+  "human_decision",
+  "stale",
+  "blocked",
+]);
+
+export const GitHubPullRequestLifecycleClassificationSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  snapshotId: z.string().regex(/^[a-f0-9]{64}$/),
+  status: GitHubLifecycleStatusSchema,
+  counts: z.strictObject({
+    requiredChecksTotal: z.number().int().nonnegative(),
+    requiredChecksSucceeded: z.number().int().nonnegative(),
+    requiredChecksPending: z.number().int().nonnegative(),
+    requiredChecksActionableFailure: z.number().int().nonnegative(),
+    requiredChecksInfrastructureFailure: z.number().int().nonnegative(),
+    requiredChecksCancelled: z.number().int().nonnegative(),
+    requiredChecksMissingOrUnknown: z.number().int().nonnegative(),
+    unresolvedReviewThreads: z.number().int().nonnegative(),
+    currentApprovals: z.number().int().nonnegative(),
+    requiredApprovals: z.number().int().nonnegative(),
+  }),
+  checkIds: z.strictObject({
+    actionable: z.array(z.string().min(1)),
+    infrastructure: z.array(z.string().min(1)),
+    cancelled: z.array(z.string().min(1)),
+    pending: z.array(z.string().min(1)),
+  }),
+  unresolvedThreadIds: z.array(z.string().min(1)),
+  signature: z.string().regex(/^[a-f0-9]{64}$/),
+  evidence: z.array(z.string().min(1)),
+});
+
 export type GitHubCapabilityReport = z.infer<typeof GitHubCapabilityReportSchema>;
 export type GitHubBranchProtection = z.infer<typeof GitHubBranchProtectionSchema>;
 export type GitHubPullRequestSnapshot = z.infer<typeof GitHubPullRequestSnapshotSchema>;
+export type GitHubPullRequestBindingExpectation = z.infer<
+  typeof GitHubPullRequestBindingExpectationSchema
+>;
+export type GitHubLifecycleStatus = z.infer<typeof GitHubLifecycleStatusSchema>;
+export type GitHubPullRequestLifecycleClassification = z.infer<
+  typeof GitHubPullRequestLifecycleClassificationSchema
+>;
 
 export interface GitHubCommandOptions {
   cwd: string;
@@ -1031,6 +1087,176 @@ export async function assertGitHubSnapshotCurrent(
     throw new Error(
       `GitHub snapshot ${parsed.snapshotId} is stale: ${parsed.binding.headSha}/${parsed.binding.baseSha} changed to ${current.headSha}/${current.baseSha}`,
     );
+}
+
+type RequiredCheckBucket =
+  "success" | "pending" | "actionable" | "infrastructure" | "cancelled" | "missing";
+
+function requiredCheckBucket(
+  required: GitHubPullRequestSnapshot["requiredChecks"][number],
+  checks: Map<string, GitHubPullRequestSnapshot["checks"][number]>,
+): RequiredCheckBucket {
+  if (required.state === "success") return "success";
+  if (required.state === "pending") return "pending";
+  if (required.state === "missing" || required.state === "unknown") return "missing";
+  const observations = required.matchingCheckIds
+    .map((id) => checks.get(id))
+    .filter((value): value is GitHubPullRequestSnapshot["checks"][number] => value !== undefined);
+  const signals = observations.map(({ conclusion, status }) =>
+    (conclusion ?? status).toUpperCase(),
+  );
+  if (signals.some((value) => ["FAILURE", "TIMED_OUT", "ACTION_REQUIRED"].includes(value)))
+    return "actionable";
+  if (signals.some((value) => value === "STARTUP_FAILURE")) return "infrastructure";
+  if (signals.some((value) => ["CANCELLED", "STALE", "SKIPPED", "NEUTRAL"].includes(value)))
+    return "cancelled";
+  return "actionable";
+}
+
+function latestReviewStates(
+  snapshot: GitHubPullRequestSnapshot,
+): Array<{ author: string; state: string }> {
+  const latest = new Map<string, { state: string; submittedAt: string; id: string }>();
+  for (const review of snapshot.reviews) {
+    if (!review.author || review.commitSha !== snapshot.binding.headSha) continue;
+    const submittedAt = review.submittedAt ?? "";
+    const current = latest.get(review.author);
+    if (
+      !current ||
+      submittedAt > current.submittedAt ||
+      (submittedAt === current.submittedAt && review.id > current.id)
+    )
+      latest.set(review.author, { state: review.state, submittedAt, id: review.id });
+  }
+  return [...latest.entries()]
+    .map(([author, { state }]) => ({ author, state }))
+    .sort((left, right) => left.author.localeCompare(right.author));
+}
+
+export function classifyGitHubPullRequestLifecycle(
+  snapshotInput: GitHubPullRequestSnapshot,
+  expectedInput: GitHubPullRequestBindingExpectation,
+): GitHubPullRequestLifecycleClassification {
+  const snapshot = GitHubPullRequestSnapshotSchema.parse(snapshotInput);
+  const expected = GitHubPullRequestBindingExpectationSchema.parse(expectedInput);
+  const exactBinding =
+    snapshot.repository.host === expected.host &&
+    snapshot.repository.nameWithOwner === expected.nameWithOwner &&
+    snapshot.pullRequest.number === expected.number &&
+    snapshot.pullRequest.headRefName === expected.headRefName &&
+    snapshot.pullRequest.baseRefName === expected.baseRefName &&
+    snapshot.binding.headSha === expected.headSha &&
+    snapshot.binding.baseSha === expected.baseSha;
+  const checks = new Map(snapshot.checks.map((check) => [check.id, check]));
+  const buckets = snapshot.requiredChecks.map((required) => ({
+    required,
+    bucket: requiredCheckBucket(required, checks),
+  }));
+  const count = (bucket: RequiredCheckBucket): number =>
+    buckets.filter((value) => value.bucket === bucket).length;
+  const ids = (bucket: RequiredCheckBucket): string[] =>
+    [
+      ...new Set(
+        buckets
+          .filter((value) => value.bucket === bucket)
+          .flatMap(({ required }) => required.matchingCheckIds),
+      ),
+    ].sort();
+  const unresolvedThreadIds = snapshot.reviewThreads
+    .filter(({ isResolved, isOutdated }) => !isResolved && !isOutdated)
+    .map(({ id }) => id)
+    .sort();
+  const latestReviews = latestReviewStates(snapshot);
+  const currentApprovals = latestReviews.filter(({ state }) => state === "APPROVED").length;
+  const requiredApprovals = snapshot.branchProtection.requiresApprovingReviews
+    ? (snapshot.branchProtection.requiredApprovingReviewCount ?? 1)
+    : 0;
+  const counts = {
+    requiredChecksTotal: snapshot.requiredChecks.length,
+    requiredChecksSucceeded: count("success"),
+    requiredChecksPending: count("pending"),
+    requiredChecksActionableFailure: count("actionable"),
+    requiredChecksInfrastructureFailure: count("infrastructure"),
+    requiredChecksCancelled: count("cancelled"),
+    requiredChecksMissingOrUnknown: count("missing"),
+    unresolvedReviewThreads: unresolvedThreadIds.length,
+    currentApprovals,
+    requiredApprovals,
+  };
+  const checkIds = {
+    actionable: ids("actionable"),
+    infrastructure: ids("infrastructure"),
+    cancelled: ids("cancelled"),
+    pending: [...new Set([...ids("pending"), ...ids("missing")])].sort(),
+  };
+
+  let status: GitHubLifecycleStatus;
+  if (!exactBinding) status = "stale";
+  else if (snapshot.pullRequest.state.toUpperCase() !== "OPEN") status = "blocked";
+  else if (snapshot.pullRequest.isDraft) status = "human_decision";
+  else if (unresolvedThreadIds.length > 0) status = "review_required";
+  else if (snapshot.pullRequest.reviewDecision === "CHANGES_REQUESTED") status = "human_decision";
+  else if (snapshot.pullRequest.mergeable.toUpperCase() === "CONFLICTING")
+    status = "actionable_failure";
+  else if (counts.requiredChecksActionableFailure > 0) status = "actionable_failure";
+  else if (counts.requiredChecksInfrastructureFailure > 0) status = "infrastructure_failure";
+  else if (counts.requiredChecksCancelled > 0) status = "cancelled";
+  else if (
+    counts.requiredChecksPending > 0 ||
+    counts.requiredChecksMissingOrUnknown > 0 ||
+    currentApprovals < requiredApprovals ||
+    snapshot.pullRequest.reviewDecision === "REVIEW_REQUIRED" ||
+    snapshot.pullRequest.mergeable.toUpperCase() === "UNKNOWN"
+  )
+    status = "waiting";
+  else status = "green";
+
+  const stableEvidence = {
+    status,
+    binding: {
+      host: snapshot.repository.host,
+      nameWithOwner: snapshot.repository.nameWithOwner,
+      number: snapshot.pullRequest.number,
+      headRefName: snapshot.pullRequest.headRefName,
+      baseRefName: snapshot.pullRequest.baseRefName,
+      headSha: snapshot.binding.headSha,
+      baseSha: snapshot.binding.baseSha,
+    },
+    state: snapshot.pullRequest.state,
+    isDraft: snapshot.pullRequest.isDraft,
+    mergeable: snapshot.pullRequest.mergeable,
+    reviewDecision: snapshot.pullRequest.reviewDecision ?? null,
+    counts,
+    checkStates: snapshot.requiredChecks
+      .map(({ context, appId, state, matchingCheckIds }) => ({
+        context,
+        appId: appId ?? null,
+        state,
+        matchingCheckIds: [...matchingCheckIds].sort(),
+      }))
+      .sort((left, right) =>
+        `${left.context}:${left.appId ?? ""}`.localeCompare(
+          `${right.context}:${right.appId ?? ""}`,
+        ),
+      ),
+    unresolvedThreadIds,
+    latestReviews,
+  };
+  const evidence = [
+    `Lifecycle status is ${status} for PR #${snapshot.pullRequest.number} at ${snapshot.binding.headSha}/${snapshot.binding.baseSha}`,
+    `${counts.requiredChecksSucceeded}/${counts.requiredChecksTotal} required checks succeeded; ${counts.requiredChecksPending} pending, ${counts.requiredChecksActionableFailure} actionable, ${counts.requiredChecksInfrastructureFailure} infrastructure, ${counts.requiredChecksCancelled} cancelled, ${counts.requiredChecksMissingOrUnknown} missing or unknown`,
+    `${counts.unresolvedReviewThreads} unresolved current review threads; ${counts.currentApprovals}/${counts.requiredApprovals} required approvals observed`,
+  ];
+  return GitHubPullRequestLifecycleClassificationSchema.parse({
+    schemaVersion: 1,
+    snapshotId: snapshot.snapshotId,
+    status,
+    counts,
+    checkIds,
+    unresolvedThreadIds,
+    signature: contentHash(stableEvidence),
+    evidence,
+  });
 }
 
 export async function captureGitHubPullRequestSnapshot(

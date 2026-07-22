@@ -5,12 +5,12 @@
 Graphcraft is a local execution layer for long-running coding agents. It turns a repository task into a durable execution and governance graph, runs bounded workers through Codex or Claude Code, checks progress with repository evidence, survives interruption, and stops safely when a changed strategy is no longer productive.
 
 > [!WARNING]
-> Graphcraft v0.1 is an alpha. It supports local verification, atomic commits, normal non-force pushes, and idempotent pull-request opening. It does not yet monitor CI, repair reviews, merge, or deploy.
+> Graphcraft v0.1 is an alpha. It supports local verification, atomic commits, normal non-force pushes, idempotent pull-request opening, token-free waiting for an exact pull request to reach required-check green, and bounded review-first or actionable-CI repair pushes. It does not yet reply to or resolve review threads, rerun checks, merge, or deploy.
 
 ## Install the alpha
 
 Requirements: Git, Node.js 22+, and an authenticated Codex or Claude Code CLI.
-Remote `pushed` and `pr_open` finish lines additionally require an authenticated GitHub CLI (`gh`).
+Remote `pushed`, `pr_open`, and `pr_green` finish lines additionally require an authenticated GitHub CLI (`gh`).
 
 The public npm package is `@tpypan/graphcraft`; the unscoped `graphcraft` name belongs to an unrelated project. Install it globally with either package manager:
 
@@ -66,6 +66,7 @@ Graphcraft displays a concise run contract before doing work. Use `--yes` only w
 - Runs approved work under an optional detached local supervisor with atomic PID/heartbeat records, mode-`0600` logs, stale-process replacement, and the same coordinated pause/stop channel. Supervisor files are operational projections; run events remain authoritative.
 - Uses the authenticated `gh` CLI for a read-only GitHub preflight and fully paginated pull-request snapshot: exact head/base SHAs, required checks, reviews, review threads, mergeability, permissions, branch protection, and rate limits. Snapshots are marked untrusted and rejected when either SHA moves.
 - Journals atomic commits, normal pushes, and pull-request creation as durable claim–act–confirm side effects. PR creation binds exact head/base SHAs, fully paginates existing branch PRs, recovers an existing exact open PR, and uses a durable action marker to reconcile a lost create response. Before accepting `pr_open`, a runtime-owned lifecycle probe captures and revalidates a fresh SHA-bound snapshot, persists check/review metrics, and excludes review bodies from its artifact.
+- Classifies exact-SHA PR lifecycle state deterministically, giving current review feedback precedence over same-head CI failures and separating pending, actionable, infrastructure, cancelled, stale, and green outcomes. `pr_green` waits with persisted bounded backoff and no model calls while checks or approvals are pending. Current review feedback and actionable CI failures amend the durable graph with a bounded repair, full verification, atomic commit, and normal push; unchanged signatures stop instead of looping. An exact green snapshot completes after restart without repeating accepted work or a confirmed repair push.
 - Tracks cached, uncached, output, reasoning, and total tokens with explicit provider availability, and reports planning, worker, repair, semantic-verification, and Graphcraft-overhead costs by phase and node.
 - Provides an experimental matched benchmark harness with a versioned ten-task public corpus, fresh deterministic fixtures, explicit model/effort controls, executable external scoring, atomic checkpoints, and resumable randomized trials.
 
@@ -73,7 +74,7 @@ Graphcraft displays a concise run contract before doing work. Use `--yes` only w
 
 ```text
 graphcraft install --host <codex|claude>
-graphcraft run <task> [--finish-line <local_verified|committed|pushed|pr_open>] [--max-workers 2] [--background]
+graphcraft run <task> [--finish-line <local_verified|committed|pushed|pr_open|pr_green>] [--max-workers 2] [--background]
 graphcraft status [run]
 graphcraft inspect [run]
 graphcraft probes [run] [--set probe-plan.json]
@@ -92,7 +93,7 @@ graphcraft uninstall --host <codex|claude>
 
 `--background` detaches only after contract approval. `status` shows the current supervisor and `supervisors` shows every supervisor instance, including stale replacements and local log paths. A machine restart does not auto-launch a process; rerun `graphcraft resume <run> --background` to recover the persisted wait and continue without repeating accepted work. Filesystem wait paths are resolved inside the isolated worktree, whose exact path is exposed with the wait state.
 
-`github-snapshot` itself is read-only. The separate `pushed` and `pr_open` finish lines perform only the approved normal push and optional PR creation after GitHub preflight. They never force-push, reopen, merge, or edit an unrelated PR. Comments, thread resolution, check reruns, review/CI repair, merge, and deployment remain unsupported.
+`github-snapshot` itself is read-only. The separate `pushed`, `pr_open`, and `pr_green` finish lines perform only the approved normal push and optional PR creation after GitHub preflight. `pr_green` adds read-only token-free lifecycle polling and bounded, reverified repair pushes for current review feedback or actionable CI failures. Infrastructure failures, cancellations, unchanged repair signatures, and human decisions stop with classified evidence. These finish lines never force-push, reopen, merge, or edit an unrelated PR. Comments, replies, thread resolution, check reruns, merge, and deployment remain unsupported.
 
 Small localized tasks bypass Graphcraft by default using measured task-shape signals rather than request length. Pass `--force` when you deliberately want a durable graph.
 
