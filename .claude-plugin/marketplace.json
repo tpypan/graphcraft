@@ -1,0 +1,24 @@
+{
+  "name": "graphcraft",
+  "owner": { "name": "Tony Pan" },
+  "description": "Durable, inspectable execution for long-running coding-agent workflows.",
+  "plugins": [
+    {
+      "name": "graphcraft",
+      "displayName": "Graphcraft",
+      "source": {
+        "source": "npm",
+        "package": "@tpypan/graphcraft",
+        "version": "0.1.2",
+        "registry": "https://registry.npmjs.org"
+      },
+      "description": "Progress-aware execution for durable coding agents.",
+      "author": { "name": "Tony Pan", "url": "https://github.com/tpypan" },
+      "homepage": "https://github.com/tpypan/graphcraft",
+      "repository": "https://github.com/tpypan/graphcraft",
+      "license": "MIT",
+      "keywords": ["ai-agents", "coding-agents", "graph-engineering"],
+      "category": "productivity"
+    }
+  ]
+}

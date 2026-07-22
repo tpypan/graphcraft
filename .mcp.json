@@ -1,8 +1,5 @@
 {
   "mcpServers": {
-    "graphcraft": {
-      "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/mcp.mjs"]
-    }
+    "graphcraft": { "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/dist/mcp.mjs"] }
   }
 }
