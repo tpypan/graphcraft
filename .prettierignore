@@ -1,4 +1,5 @@
 .graphcraft
+.claude/settings.local.json
 coverage
 dist
 docs/research
