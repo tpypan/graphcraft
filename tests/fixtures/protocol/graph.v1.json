@@ -1,0 +1,93 @@
+{
+  "schemaVersion": 1,
+  "runId": "11111111-1111-4111-8111-111111111111",
+  "family": "feature",
+  "nodes": [
+    {
+      "id": "implement",
+      "kind": "implementation",
+      "objective": "Implement the versioned protocol fixture",
+      "dependsOn": [],
+      "scope": ["src/**", "tests/**"],
+      "contextSelector": {
+        "includeRepositoryInstructions": true,
+        "predecessorResults": [],
+        "relevantPaths": ["src/protocol.ts", "tests/protocol.test.ts"]
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "progressProbes": [
+        {
+          "id": "workspace-diff",
+          "kind": "git_diff",
+          "baseSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "requireChanges": true
+        }
+      ],
+      "completionProbes": [],
+      "sideEffectClass": "workspace_write",
+      "status": "pending"
+    },
+    {
+      "id": "verify",
+      "kind": "verification",
+      "objective": "Verify the versioned protocol fixture",
+      "dependsOn": ["implement"],
+      "scope": ["src/**", "tests/**"],
+      "contextSelector": {
+        "includeRepositoryInstructions": true,
+        "predecessorResults": ["implement"],
+        "relevantPaths": ["tests/protocol.test.ts"]
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "progressProbes": [],
+      "completionProbes": [
+        {
+          "id": "fixture-exists",
+          "kind": "file",
+          "path": "tests/protocol.test.ts",
+          "shouldExist": true
+        }
+      ],
+      "sideEffectClass": "none",
+      "status": "pending"
+    }
+  ],
+  "anchors": [
+    {
+      "id": "user-outcome",
+      "description": "The approved protocol fixture outcome",
+      "owner": "user",
+      "evidenceSource": "approved run contract",
+      "mutationPolicy": "user_approval"
+    },
+    {
+      "id": "repository-policy",
+      "description": "Repository instructions remain authoritative",
+      "owner": "repository",
+      "evidenceSource": "AGENTS.md and repository state",
+      "mutationPolicy": "immutable"
+    }
+  ],
+  "controlEdges": [
+    {
+      "from": "repository-policy",
+      "to": "implement",
+      "relation": "vetoes"
+    },
+    {
+      "from": "repository-policy",
+      "to": "verify",
+      "relation": "vetoes"
+    },
+    {
+      "from": "user-outcome",
+      "to": "verify",
+      "relation": "owns_target"
+    }
+  ],
+  "revision": 0
+}

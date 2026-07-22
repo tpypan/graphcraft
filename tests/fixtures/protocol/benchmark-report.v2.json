@@ -1,0 +1,123 @@
+{
+  "schemaVersion": 2,
+  "status": "running",
+  "suite": {
+    "id": "protocol-fixture",
+    "version": 1,
+    "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "startedAt": "2026-07-22T12:00:00.000Z",
+  "updatedAt": "2026-07-22T12:00:00.000Z",
+  "seed": "protocol-fixture-seed",
+  "randomized": true,
+  "modelPolicy": {
+    "codex": "fixture-model"
+  },
+  "effortPolicy": "low",
+  "permissionPolicy": {
+    "codex": "codex_workspace_write_shell_external_not_graphcraft_enforced"
+  },
+  "scorerPolicy": "fixture_bound_scorers_plus_suite_assertions",
+  "environment": {
+    "platform": "fixture",
+    "architecture": "fixture",
+    "nodeVersion": "v22.0.0",
+    "graphcraftVersion": "0.1.2"
+  },
+  "limitations": ["Protocol fixture; no host trial was executed"],
+  "schedule": [
+    {
+      "trialId": "protocol-fixture-trial",
+      "order": 0,
+      "taskId": "protocol-fixture-task",
+      "family": "feature",
+      "host": "codex",
+      "mode": "graphcraft",
+      "repetition": 1,
+      "seed": "protocol-fixture-seed"
+    }
+  ],
+  "results": [],
+  "summary": {
+    "codex": {
+      "baseline": {
+        "trials": 0,
+        "accepted": 0,
+        "unsuccessful": 0,
+        "acceptanceRate": 0,
+        "reconciledTokenTrials": 0,
+        "medianAcceptedTokens": null
+      },
+      "graphcraft": {
+        "trials": 0,
+        "accepted": 0,
+        "unsuccessful": 0,
+        "acceptanceRate": 0,
+        "reconciledTokenTrials": 0,
+        "medianAcceptedTokens": null
+      },
+      "matchedAccepted": {
+        "aggregation": "median_pair_reduction_within_task_then_median_across_tasks",
+        "pairs": 0,
+        "zeroBaselinePairs": 0,
+        "coveredTasks": 0,
+        "totalTasks": 1,
+        "minimumPairsPerTask": 3,
+        "completeTaskCoverage": false,
+        "medianBaselineTokens": null,
+        "medianGraphcraftTokens": null,
+        "medianTokenReductionPercent": null,
+        "byTask": {}
+      },
+      "gate": {
+        "completeSchedule": false,
+        "matchedControls": true,
+        "stableHostVersion": true,
+        "comparable": false,
+        "tokenReductionPercent": null,
+        "acceptanceDeltaPoints": null,
+        "passes": null
+      }
+    },
+    "claude": {
+      "baseline": {
+        "trials": 0,
+        "accepted": 0,
+        "unsuccessful": 0,
+        "acceptanceRate": 0,
+        "reconciledTokenTrials": 0,
+        "medianAcceptedTokens": null
+      },
+      "graphcraft": {
+        "trials": 0,
+        "accepted": 0,
+        "unsuccessful": 0,
+        "acceptanceRate": 0,
+        "reconciledTokenTrials": 0,
+        "medianAcceptedTokens": null
+      },
+      "matchedAccepted": {
+        "aggregation": "median_pair_reduction_within_task_then_median_across_tasks",
+        "pairs": 0,
+        "zeroBaselinePairs": 0,
+        "coveredTasks": 0,
+        "totalTasks": 0,
+        "minimumPairsPerTask": 3,
+        "completeTaskCoverage": false,
+        "medianBaselineTokens": null,
+        "medianGraphcraftTokens": null,
+        "medianTokenReductionPercent": null,
+        "byTask": {}
+      },
+      "gate": {
+        "completeSchedule": true,
+        "matchedControls": true,
+        "stableHostVersion": true,
+        "comparable": false,
+        "tokenReductionPercent": null,
+        "acceptanceDeltaPoints": null,
+        "passes": null
+      }
+    }
+  }
+}
