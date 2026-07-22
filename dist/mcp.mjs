@@ -2984,7 +2984,7 @@ var require_compile = __commonJS({
       const schOrFunc = root.refs[ref];
       if (schOrFunc)
         return schOrFunc;
-      let _sch = resolve4.call(this, root, ref);
+      let _sch = resolve5.call(this, root, ref);
       if (_sch === void 0) {
         const schema = (_a3 = root.localRefs) === null || _a3 === void 0 ? void 0 : _a3[ref];
         const { schemaId } = this.opts;
@@ -3011,7 +3011,7 @@ var require_compile = __commonJS({
     function sameSchemaEnv(s1, s2) {
       return s1.schema === s2.schema && s1.root === s2.root && s1.baseId === s2.baseId;
     }
-    function resolve4(root, ref) {
+    function resolve5(root, ref) {
       let sch;
       while (typeof (sch = this.refs[ref]) == "string")
         ref = sch;
@@ -3642,7 +3642,7 @@ var require_fast_uri = __commonJS({
       }
       return uri;
     }
-    function resolve4(baseURI, relativeURI, options) {
+    function resolve5(baseURI, relativeURI, options) {
       const schemelessOptions = options ? Object.assign({ scheme: "null" }, options) : { scheme: "null" };
       const resolved = resolveComponent(parse3(baseURI, schemelessOptions), parse3(relativeURI, schemelessOptions), schemelessOptions, true);
       schemelessOptions.skipEscape = true;
@@ -3906,7 +3906,7 @@ var require_fast_uri = __commonJS({
     var fastUri = {
       SCHEMES,
       normalize,
-      resolve: resolve4,
+      resolve: resolve5,
       resolveComponent,
       equal,
       serialize,
@@ -23021,12 +23021,12 @@ var StdioServerTransport = class {
     this.onclose?.();
   }
   send(message) {
-    return new Promise((resolve4) => {
+    return new Promise((resolve5) => {
       const json2 = serializeMessage(message);
       if (this._stdout.write(json2)) {
-        resolve4();
+        resolve5();
       } else {
-        this._stdout.once("drain", resolve4);
+        this._stdout.once("drain", resolve5);
       }
     });
   }
@@ -28929,7 +28929,7 @@ var Protocol = class {
           return;
         }
         const pollInterval = task2.pollInterval ?? this._options?.defaultTaskPollInterval ?? 1e3;
-        await new Promise((resolve4) => setTimeout(resolve4, pollInterval));
+        await new Promise((resolve5) => setTimeout(resolve5, pollInterval));
         options?.signal?.throwIfAborted();
       }
     } catch (error51) {
@@ -28946,7 +28946,7 @@ var Protocol = class {
    */
   request(request, resultSchema, options) {
     const { relatedRequestId, resumptionToken, onresumptiontoken, task, relatedTask } = options ?? {};
-    return new Promise((resolve4, reject) => {
+    return new Promise((resolve5, reject) => {
       const earlyReject = (error51) => {
         reject(error51);
       };
@@ -29024,7 +29024,7 @@ var Protocol = class {
           if (!parseResult2.success) {
             reject(parseResult2.error);
           } else {
-            resolve4(parseResult2.data);
+            resolve5(parseResult2.data);
           }
         } catch (error51) {
           reject(error51);
@@ -29285,12 +29285,12 @@ var Protocol = class {
       }
     } catch {
     }
-    return new Promise((resolve4, reject) => {
+    return new Promise((resolve5, reject) => {
       if (signal.aborted) {
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
         return;
       }
-      const timeoutId = setTimeout(resolve4, interval);
+      const timeoutId = setTimeout(resolve5, interval);
       signal.addEventListener("abort", () => {
         clearTimeout(timeoutId);
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
@@ -30390,7 +30390,7 @@ var McpServer = class {
     let task = createTaskResult.task;
     const pollInterval = task.pollInterval ?? 5e3;
     while (task.status !== "completed" && task.status !== "failed" && task.status !== "cancelled") {
-      await new Promise((resolve4) => setTimeout(resolve4, pollInterval));
+      await new Promise((resolve5) => setTimeout(resolve5, pollInterval));
       const updatedTask = await extra.taskStore.getTask(taskId);
       if (!updatedTask) {
         throw new McpError(ErrorCode.InternalError, `Task ${taskId} not found during polling`);
@@ -31268,11 +31268,27 @@ var NodeKindSchema = external_exports.enum([
 var NodeStatusSchema = external_exports.enum([
   "pending",
   "running",
+  "waiting",
   "accepted",
   "failed",
   "blocked",
   "stopped",
   "superseded"
+]);
+var WaitConditionSchema = external_exports.discriminatedUnion("kind", [
+  external_exports.strictObject({ kind: external_exports.literal("time"), wakeAt: external_exports.iso.datetime() }),
+  external_exports.strictObject({
+    kind: external_exports.literal("file_exists"),
+    path: external_exports.string().min(1),
+    pollIntervalMs: external_exports.number().int().min(250).max(3e5),
+    timeoutAt: external_exports.iso.datetime().optional()
+  }),
+  external_exports.strictObject({
+    kind: external_exports.literal("file_changed"),
+    path: external_exports.string().min(1),
+    pollIntervalMs: external_exports.number().int().min(250).max(3e5),
+    timeoutAt: external_exports.iso.datetime().optional()
+  })
 ]);
 var GraphNodeSchema = external_exports.strictObject({
   id: external_exports.string().min(1),
@@ -31289,6 +31305,7 @@ var GraphNodeSchema = external_exports.strictObject({
   progressProbes: external_exports.array(ProbeSpecSchema),
   completionProbes: external_exports.array(ProbeSpecSchema),
   sideEffectClass: external_exports.enum(["none", "workspace_write", "git_commit", "external"]),
+  waitCondition: WaitConditionSchema.optional(),
   status: NodeStatusSchema
 });
 var PlannedGraphNodeSchema = GraphNodeSchema.omit({
@@ -31489,6 +31506,45 @@ var SideEffectJournalEntrySchema = external_exports.strictObject({
   retryable: external_exports.boolean().optional(),
   updatedAt: external_exports.iso.datetime()
 });
+var WaitRuntimeStateSchema = external_exports.strictObject({
+  nodeId: external_exports.string().min(1),
+  condition: WaitConditionSchema,
+  workspacePath: external_exports.string().min(1),
+  status: external_exports.enum(["waiting", "satisfied", "timed_out"]),
+  registeredAt: external_exports.iso.datetime(),
+  baselineSignature: external_exports.string().optional(),
+  nextWakeAt: external_exports.iso.datetime(),
+  observations: external_exports.number().int().nonnegative(),
+  evidence: external_exports.array(external_exports.string()).default([]),
+  updatedAt: external_exports.iso.datetime()
+});
+var SupervisorRecordSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  supervisorId: external_exports.uuid(),
+  runId: external_exports.uuid(),
+  repositoryRoot: external_exports.string().min(1),
+  pid: external_exports.number().int().positive(),
+  host: external_exports.enum(["codex", "claude"]),
+  maxWorkers: external_exports.union([external_exports.literal(1), external_exports.literal(2)]),
+  status: external_exports.enum(["starting", "running", "exited", "failed"]),
+  runStatus: external_exports.enum([
+    "awaiting_approval",
+    "running",
+    "waiting",
+    "paused",
+    "stopped",
+    "blocked",
+    "completed",
+    "failed"
+  ]).optional(),
+  startedAt: external_exports.iso.datetime(),
+  heartbeatAt: external_exports.iso.datetime(),
+  updatedAt: external_exports.iso.datetime(),
+  endedAt: external_exports.iso.datetime().optional(),
+  logPath: external_exports.string().min(1),
+  replacesSupervisorId: external_exports.uuid().optional(),
+  message: external_exports.string().optional()
+});
 var WorkerResultSchema = external_exports.strictObject({
   status: external_exports.enum(["completed", "blocked", "failed"]),
   summary: external_exports.string(),
@@ -31643,6 +31699,11 @@ var RunEventTypeSchema = external_exports.enum([
   "side_effect.reconciled",
   "side_effect.confirmed",
   "side_effect.failed",
+  "run.waiting",
+  "wait.registered",
+  "wait.observed",
+  "wait.satisfied",
+  "wait.timed_out",
   "graph.amended"
 ]);
 var RunEventSchema = external_exports.strictObject({
@@ -31668,6 +31729,7 @@ var RunStateSchema = external_exports.strictObject({
   status: external_exports.enum([
     "awaiting_approval",
     "running",
+    "waiting",
     "paused",
     "stopped",
     "blocked",
@@ -31684,6 +31746,7 @@ var RunStateSchema = external_exports.strictObject({
   tokenLedger: external_exports.array(TokenLedgerEntrySchema).default([]),
   optimizationDecisions: external_exports.array(OptimizationDecisionSchema).default([]),
   sideEffects: external_exports.array(SideEffectJournalEntrySchema).default([]),
+  waits: external_exports.array(WaitRuntimeStateSchema).default([]),
   controlDecisions: external_exports.array(ControlDecisionSchema),
   pendingDecision: ControlDecisionPacketSchema.optional(),
   stopReason: external_exports.string().optional(),
@@ -32080,6 +32143,7 @@ function node(input) {
     progressProbes: input.progressProbes ?? [],
     completionProbes: input.completionProbes ?? [],
     sideEffectClass: input.sideEffectClass ?? "none",
+    ...input.waitCondition ? { waitCondition: input.waitCondition } : {},
     status: "pending"
   };
 }
@@ -32196,8 +32260,18 @@ function validateGraphPolicy(graph, contract, requiredVerificationProbes, approv
   for (const item of graph.nodes) {
     if (!/^[a-z][a-z0-9-]*$/.test(item.id))
       throw new Error(`Planned node ID ${item.id} must be lowercase and stable`);
-    if (item.kind === "wait")
-      throw new Error("Wait nodes are not executable in the local runtime yet");
+    if (item.kind === "wait") {
+      if (!item.waitCondition) throw new Error(`Wait node ${item.id} has no wake condition`);
+      const condition = item.waitCondition;
+      if (item.sideEffectClass !== "none")
+        throw new Error(`Wait node ${item.id} must be read-only`);
+      if (item.progressProbes.length > 0 || item.completionProbes.length > 0)
+        throw new Error(`Wait node ${item.id} cannot run model-visible probes`);
+      if (condition.kind !== "time" && (!safeRelativePattern(condition.path) || /[*?[{]/.test(condition.path) || !contract.scope.include.some((included) => patternWithin(condition.path, included)) || contract.scope.exclude.some((excluded) => patternWithin(condition.path, excluded))))
+        throw new Error(`Wait node ${item.id} contains an unsafe wake path`);
+    } else if (item.waitCondition) {
+      throw new Error(`Non-wait node ${item.id} cannot declare a wake condition`);
+    }
     if (!item.contextSelector.includeRepositoryInstructions)
       throw new Error(`Planned node ${item.id} attempted to omit repository instructions`);
     if (item.sideEffectClass === "external")
@@ -32680,7 +32754,7 @@ function applyProbePlan(graph, contract, input) {
   }));
   for (const item of plan.items.filter(({ phase }) => phase === "progress")) {
     const preferred = item.purpose === "inventory" ? nodes.find((node2) => ["investigation", "decision", "diagnostic"].includes(node2.kind)) : nodes.find((node2) => node2.sideEffectClass === "workspace_write");
-    const target = preferred ?? nodes.find((node2) => !["verification", "commit"].includes(node2.kind));
+    const target = preferred ?? nodes.find((node2) => !["verification", "commit", "wait"].includes(node2.kind));
     if (!target) throw new Error(`No executable node can own progress probe ${item.probe.id}`);
     target.progressProbes.push(item.probe);
   }
@@ -32951,11 +33025,12 @@ function renderPlannerPrompt(request) {
     "Use investigation nodes when repository evidence must be gathered before writes.",
     "End local_verified work in one verification node with executable completion probes.",
     "End committed work in one commit node that directly depends on a verification node.",
-    "Use only repository-relative scopes. Never propose external side effects or wait nodes.",
+    "Use only repository-relative scopes. Never propose external side effects.",
+    "Use a wait node only when the task explicitly requires time or filesystem state before downstream reasoning. Wait nodes must be read-only, have no probes, and declare one time, file_exists, or file_changed condition. Use a bounded 250-300000ms polling interval for filesystem conditions and an explicit timeout when the request provides one.",
     "Use the supplied task family. Every node must keep repository instructions enabled.",
     "A node may select predecessorResults only from its direct dependsOn list; do not repeat transitive predecessors.",
-    "Select at least one existing tracked repository path for every non-commit node. Every relevantPaths value must be copied exactly from repositoryEvidence.trackedPaths; relevant paths are evidence inputs, not files the worker might create.",
-    "Investigation, decision, and verification nodes must use sideEffectClass none. Implementation and repair/diagnostic nodes that edit files use workspace_write. Commit nodes alone use git_commit.",
+    "Select at least one existing tracked repository path for every non-commit node. Every relevantPaths value must be copied exactly from repositoryEvidence.trackedPaths; relevant paths are evidence inputs, not files the worker might create. A wait-condition path may identify a future repository-relative file even when it is not yet tracked.",
+    "Investigation, decision, verification, and wait nodes must use sideEffectClass none. Implementation and repair/diagnostic nodes that edit files use workspace_write. Commit nodes alone use git_commit.",
     "Use the supplied probe plan exactly: assign completion probes to the terminal verification node and progress probes to the node where they measure change.",
     "Only the terminal verification node may contain completionProbes. Every other node must have an empty completionProbes array.",
     "Do not invent, weaken, omit, or replace probes. Graphcraft will deterministically reattach the approved probe plan after validating the topology.",
@@ -33196,6 +33271,7 @@ function reduceEvents(events) {
         tokenLedger: [],
         optimizationDecisions: [],
         sideEffects: [],
+        waits: [],
         controlDecisions: [],
         updatedAt: event.timestamp
       };
@@ -33210,6 +33286,11 @@ function reduceEvents(events) {
         state.status = "running";
         state.stopReason = void 0;
         state.progressDecision = void 0;
+        break;
+      case "run.waiting":
+        state.status = "waiting";
+        state.currentNodeId = void 0;
+        state.stopReason = requiredString(data, "reason");
         break;
       case "run.paused":
         state.status = "paused";
@@ -33349,6 +33430,45 @@ function reduceEvents(events) {
         entry.failure = requiredString(data, "reason");
         entry.retryable = data.retryable === true;
         entry.updatedAt = event.timestamp;
+        break;
+      }
+      case "wait.registered": {
+        const wait = WaitRuntimeStateSchema.parse(data.wait);
+        if (state.waits.some(({ nodeId }) => nodeId === wait.nodeId))
+          throw new Error(`Wait node ${wait.nodeId} was registered more than once`);
+        const nodeState = state.nodes[wait.nodeId];
+        if (!nodeState) throw new Error(`Unknown wait node ${wait.nodeId}`);
+        nodeState.status = "waiting";
+        state.currentNodeId = void 0;
+        state.waits.push(wait);
+        break;
+      }
+      case "wait.observed": {
+        const nodeId = requiredString(data, "nodeId");
+        const wait = state.waits.find((candidate) => candidate.nodeId === nodeId);
+        if (!wait) throw new Error(`Unknown wait node ${nodeId}`);
+        wait.observations += 1;
+        wait.nextWakeAt = requiredString(data, "nextWakeAt");
+        wait.evidence = Array.isArray(data.evidence) ? data.evidence.map((value) => String(value)) : [];
+        wait.updatedAt = event.timestamp;
+        break;
+      }
+      case "wait.satisfied": {
+        const nodeId = requiredString(data, "nodeId");
+        const wait = state.waits.find((candidate) => candidate.nodeId === nodeId);
+        if (!wait) throw new Error(`Unknown wait node ${nodeId}`);
+        wait.status = "satisfied";
+        wait.evidence = Array.isArray(data.evidence) ? data.evidence.map((value) => String(value)) : wait.evidence;
+        wait.updatedAt = event.timestamp;
+        break;
+      }
+      case "wait.timed_out": {
+        const nodeId = requiredString(data, "nodeId");
+        const wait = state.waits.find((candidate) => candidate.nodeId === nodeId);
+        if (!wait) throw new Error(`Unknown wait node ${nodeId}`);
+        wait.status = "timed_out";
+        wait.evidence = Array.isArray(data.evidence) ? data.evidence.map((value) => String(value)) : wait.evidence;
+        wait.updatedAt = event.timestamp;
         break;
       }
       case "graph.amended": {
@@ -33537,22 +33657,22 @@ function codexUsage(value) {
   return normalizeTokenUsage("codex", value);
 }
 async function commandVersion(command) {
-  return await new Promise((resolve4) => {
+  return await new Promise((resolve5) => {
     const child = spawn(command, ["--version"], { stdio: ["ignore", "pipe", "ignore"] });
     let output = "";
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       output += chunk;
     });
-    child.once("error", () => resolve4({ installed: false }));
+    child.once("error", () => resolve5({ installed: false }));
     child.once(
       "close",
-      (code) => resolve4(code === 0 ? { installed: true, version: output.trim() } : { installed: false })
+      (code) => resolve5(code === 0 ? { installed: true, version: output.trim() } : { installed: false })
     );
   });
 }
 async function codexAuthenticated() {
-  return await new Promise((resolve4) => {
+  return await new Promise((resolve5) => {
     const child = spawn("codex", ["login", "status"], { stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     child.stdout.setEncoding("utf8");
@@ -33563,8 +33683,8 @@ async function codexAuthenticated() {
     child.stderr.on("data", (chunk) => {
       output += chunk;
     });
-    child.once("error", () => resolve4(false));
-    child.once("close", (code) => resolve4(code === 0 && !/not logged in/i.test(output)));
+    child.once("error", () => resolve5(false));
+    child.once("close", (code) => resolve5(code === 0 && !/not logged in/i.test(output)));
   });
 }
 var CodexAdapter = class {
@@ -33595,7 +33715,7 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve4) => child.once("close", (code) => resolve4(code ?? 1))
+      (resolve5) => child.once("close", (code) => resolve5(code ?? 1))
     );
     const abort = () => {
       child.kill("SIGTERM");
@@ -33649,7 +33769,7 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve4) => child.once("close", (code, closeSignal) => resolve4({ code, signal: closeSignal }))
+      (resolve5) => child.once("close", (code, closeSignal) => resolve5({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderSemanticVerifierPrompt(request.context));
@@ -33702,7 +33822,7 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve4) => child.once("close", (code, closeSignal) => resolve4({ code, signal: closeSignal }))
+      (resolve5) => child.once("close", (code, closeSignal) => resolve5({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderWorkerPrompt(request.capsule));
@@ -33881,22 +34001,22 @@ function claudeUsage(value) {
   return normalizeTokenUsage("claude", value);
 }
 async function claudeVersion() {
-  return await new Promise((resolve4) => {
+  return await new Promise((resolve5) => {
     const child = spawn2("claude", ["--version"], { stdio: ["ignore", "pipe", "ignore"] });
     let output = "";
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       output += chunk;
     });
-    child.once("error", () => resolve4({ installed: false }));
+    child.once("error", () => resolve5({ installed: false }));
     child.once(
       "close",
-      (code) => resolve4(code === 0 ? { installed: true, version: output.trim() } : { installed: false })
+      (code) => resolve5(code === 0 ? { installed: true, version: output.trim() } : { installed: false })
     );
   });
 }
 async function claudeAuthenticated() {
-  return await new Promise((resolve4) => {
+  return await new Promise((resolve5) => {
     const child = spawn2("claude", ["auth", "status", "--json"], {
       stdio: ["ignore", "pipe", "ignore"]
     });
@@ -33905,13 +34025,13 @@ async function claudeAuthenticated() {
     child.stdout.on("data", (chunk) => {
       output += chunk;
     });
-    child.once("error", () => resolve4(false));
+    child.once("error", () => resolve5(false));
     child.once("close", (code) => {
       try {
         const status2 = JSON.parse(output);
-        resolve4(code === 0 && status2.loggedIn === true);
+        resolve5(code === 0 && status2.loggedIn === true);
       } catch {
-        resolve4(false);
+        resolve5(false);
       }
     });
   });
@@ -33941,7 +34061,7 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve4) => child.once("close", (code) => resolve4(code ?? 1))
+      (resolve5) => child.once("close", (code) => resolve5(code ?? 1))
     );
     const abort = () => {
       child.kill("SIGTERM");
@@ -33989,7 +34109,7 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve4) => child.once("close", (code, closeSignal) => resolve4({ code, signal: closeSignal }))
+      (resolve5) => child.once("close", (code, closeSignal) => resolve5({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     let stderr = "";
@@ -34036,7 +34156,7 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve4) => child.once("close", (code, closeSignal) => resolve4({ code, signal: closeSignal }))
+      (resolve5) => child.once("close", (code, closeSignal) => resolve5({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     yield { type: "started", invocationId: request.invocationId };
@@ -34395,7 +34515,7 @@ import { spawn as spawn3 } from "node:child_process";
 async function runProcess(command, args, options) {
   const started = performance.now();
   const timeoutMs = options.timeoutMs ?? 12e4;
-  return await new Promise((resolve4, reject) => {
+  return await new Promise((resolve5, reject) => {
     const child = spawn3(command, args, {
       cwd: options.cwd,
       env: { ...process.env, ...options.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -34427,7 +34547,7 @@ async function runProcess(command, args, options) {
     child.once("close", (code) => {
       clearTimeout(timer);
       options.signal?.removeEventListener("abort", abort);
-      resolve4({
+      resolve5({
         exitCode: code ?? (timedOut ? 124 : 1),
         stdout,
         stderr,
@@ -34901,7 +35021,7 @@ async function requestRunControl(store, action, reason = action === "pause" ? "P
       if (!(error51 instanceof Error) || error51.message !== "Graphcraft run is already active")
         throw error51;
     }
-    await new Promise((resolve4) => setTimeout(resolve4, 50));
+    await new Promise((resolve5) => setTimeout(resolve5, 50));
   }
   throw new Error(
     `The active Graphcraft process did not acknowledge ${action} within ${waitMs}ms; the durable request remains pending`
@@ -35806,7 +35926,7 @@ async function ensureCurrentRunStorage(input) {
     while (Date.now() <= deadline) {
       const migrated = await readFile5(path, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
       if (migrated) return migrated;
-      await new Promise((resolve4) => setTimeout(resolve4, 10));
+      await new Promise((resolve5) => setTimeout(resolve5, 10));
     }
     throw new Error(`Timed out waiting for storage migration of run ${input.runId}`);
   }
@@ -36302,15 +36422,147 @@ async function prepareWorkerContext(input) {
   return { capsule, capsuleHash, receipt };
 }
 
+// packages/runtime/src/wait.ts
+import { lstat as lstat2, readFile as readFile7, readlink as readlink2 } from "node:fs/promises";
+import { setTimeout as waitForTimeout } from "node:timers/promises";
+import { isAbsolute as isAbsolute3, resolve as resolve3, sep as sep2 } from "node:path";
+function waitPath(root, path) {
+  if (isAbsolute3(path) || path.split(/[\\/]/).includes(".."))
+    throw new Error(`Wait condition path is unsafe: ${path}`);
+  const absolute = resolve3(root, path);
+  if (absolute !== root && !absolute.startsWith(`${root}${sep2}`))
+    throw new Error(`Wait condition path escapes the workspace: ${path}`);
+  return absolute;
+}
+async function fileSignature(root, path) {
+  const absolute = waitPath(root, path);
+  const stats = await lstat2(absolute).catch(() => void 0);
+  if (!stats) return contentHash({ kind: "absent", path });
+  if (stats.isSymbolicLink())
+    return contentHash({ kind: "symlink", path, target: await readlink2(absolute) });
+  if (stats.isFile())
+    return contentHash({
+      kind: "file",
+      path,
+      executable: (stats.mode & 73) !== 0,
+      contents: (await readFile7(absolute)).toString("base64")
+    });
+  return contentHash({ kind: stats.isDirectory() ? "directory" : "other", path });
+}
+function nextWakeAt(condition, now) {
+  if (condition.kind === "time") return condition.wakeAt;
+  const next = now + condition.pollIntervalMs;
+  return new Date(
+    condition.timeoutAt ? Math.min(next, Date.parse(condition.timeoutAt)) : next
+  ).toISOString();
+}
+async function registerWait(store, node2, workspacePath, now) {
+  const condition = node2.waitCondition;
+  if (node2.kind !== "wait" || !condition)
+    throw new Error(`Node ${node2.id} is not an executable wait node`);
+  const registeredAt = new Date(now).toISOString();
+  const wait = WaitRuntimeStateSchema.parse({
+    nodeId: node2.id,
+    condition,
+    workspacePath,
+    status: "waiting",
+    registeredAt,
+    ...condition.kind === "file_changed" ? { baselineSignature: await fileSignature(workspacePath, condition.path) } : {},
+    nextWakeAt: condition.kind === "time" ? condition.wakeAt : registeredAt,
+    observations: 0,
+    evidence: [],
+    updatedAt: registeredAt
+  });
+  await store.append("runtime", "wait.registered", { wait }, node2.id);
+  return wait;
+}
+async function observe(wait, workspacePath, now) {
+  const condition = wait.condition;
+  if (condition.kind === "time") {
+    const satisfied2 = now >= Date.parse(condition.wakeAt);
+    return {
+      satisfied: satisfied2,
+      evidence: [
+        satisfied2 ? `Wake time ${condition.wakeAt} was reached` : `Waiting until ${condition.wakeAt}`
+      ]
+    };
+  }
+  const signature = await fileSignature(workspacePath, condition.path);
+  if (condition.kind === "file_exists") {
+    const absent = signature === contentHash({ kind: "absent", path: condition.path });
+    return {
+      satisfied: !absent,
+      evidence: [
+        absent ? `${condition.path} does not exist` : `${condition.path} now exists (${signature})`
+      ]
+    };
+  }
+  const satisfied = signature !== wait.baselineSignature;
+  return {
+    satisfied,
+    evidence: [
+      satisfied ? `${condition.path} changed from ${wait.baselineSignature} to ${signature}` : `${condition.path} remains at ${signature}`
+    ]
+  };
+}
+async function evaluateWaitNode(input) {
+  const now = input.now ?? Date.now();
+  let wait = (await input.store.loadState()).waits.find(({ nodeId }) => nodeId === input.node.id);
+  if (!wait) wait = await registerWait(input.store, input.node, input.workspacePath, now);
+  if (wait.status === "satisfied") return { status: "satisfied", evidence: wait.evidence };
+  if (wait.status === "timed_out") return { status: "timed_out", evidence: wait.evidence };
+  if (now < Date.parse(wait.nextWakeAt))
+    return { status: "waiting", nextWakeAt: wait.nextWakeAt, evidence: wait.evidence };
+  const observation = await observe(wait, input.workspacePath, now);
+  if (observation.satisfied) {
+    await input.store.append(
+      "runtime",
+      "wait.satisfied",
+      { nodeId: input.node.id, evidence: observation.evidence },
+      input.node.id
+    );
+    return { status: "satisfied", evidence: observation.evidence };
+  }
+  const timeoutAt = wait.condition.kind === "time" ? void 0 : wait.condition.timeoutAt;
+  if (timeoutAt && now >= Date.parse(timeoutAt)) {
+    const evidence = [...observation.evidence, `Wait timed out at ${timeoutAt}`];
+    await input.store.append(
+      "runtime",
+      "wait.timed_out",
+      { nodeId: input.node.id, evidence },
+      input.node.id
+    );
+    return { status: "timed_out", evidence };
+  }
+  const wakeAt = nextWakeAt(wait.condition, now);
+  await input.store.append(
+    "runtime",
+    "wait.observed",
+    { nodeId: input.node.id, nextWakeAt: wakeAt, evidence: observation.evidence },
+    input.node.id
+  );
+  return { status: "waiting", nextWakeAt: wakeAt, evidence: observation.evidence };
+}
+async function sleepUntilWake(nextWakeAt2, signal) {
+  const delay = Math.max(0, Date.parse(nextWakeAt2) - Date.now());
+  try {
+    await waitForTimeout(delay, void 0, { signal });
+    return true;
+  } catch (error51) {
+    if (signal.aborted || error51.name === "AbortError") return false;
+    throw error51;
+  }
+}
+
 // packages/runtime/src/held-out.ts
-import { readFile as readFile7, stat as stat3 } from "node:fs/promises";
-import { isAbsolute as isAbsolute3, relative, resolve as resolve3, sep as sep2 } from "node:path";
+import { readFile as readFile8, stat as stat3 } from "node:fs/promises";
+import { isAbsolute as isAbsolute4, relative, resolve as resolve4, sep as sep3 } from "node:path";
 function relativeRepositoryPath(repositoryRoot, candidate) {
-  const root = resolve3(repositoryRoot);
-  const path = resolve3(repositoryRoot, candidate);
-  if (path !== root && !path.startsWith(`${root}${sep2}`)) return void 0;
+  const root = resolve4(repositoryRoot);
+  const path = resolve4(repositoryRoot, candidate);
+  if (path !== root && !path.startsWith(`${root}${sep3}`)) return void 0;
   const result = relative(root, path);
-  return result && !isAbsolute3(result) ? result : void 0;
+  return result && !isAbsolute4(result) ? result : void 0;
 }
 function possibleFileArguments(values) {
   return values.map((value) => value.replace(/^["']|["']$/g, "").replace(/[;&|]+$/g, "")).filter(
@@ -36320,11 +36572,11 @@ function possibleFileArguments(values) {
 async function fileIntegrity(repositoryRoot, cwd, values) {
   const result = [];
   for (const value of possibleFileArguments(values)) {
-    const path = relativeRepositoryPath(repositoryRoot, resolve3(repositoryRoot, cwd ?? ".", value));
+    const path = relativeRepositoryPath(repositoryRoot, resolve4(repositoryRoot, cwd ?? ".", value));
     if (!path) continue;
-    const details = await stat3(resolve3(repositoryRoot, path)).catch(() => void 0);
+    const details = await stat3(resolve4(repositoryRoot, path)).catch(() => void 0);
     if (!details?.isFile()) continue;
-    const contents = await readFile7(resolve3(repositoryRoot, path));
+    const contents = await readFile8(resolve4(repositoryRoot, path));
     result.push({
       kind: "file",
       path,
@@ -36353,7 +36605,7 @@ async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot) {
     const script = match[2];
     const manifestPath = relativeRepositoryPath(repositoryRoot, path);
     if (!manifestPath) throw new Error(`Completion script ${script} escapes the repository`);
-    const manifest2 = JSON.parse(await readFile7(resolve3(repositoryRoot, manifestPath), "utf8"));
+    const manifest2 = JSON.parse(await readFile8(resolve4(repositoryRoot, manifestPath), "utf8"));
     const value = manifest2.scripts?.[script];
     if (!value) throw new Error(`Completion script ${script} is missing from ${manifestPath}`);
     protectedValues.push({
@@ -36384,13 +36636,13 @@ async function heldOutIntegrityFailures(plan, repositoryPath) {
     for (const integrity of entry.integrity) {
       let actualHash;
       if (integrity.kind === "package_script") {
-        const manifest2 = await readFile7(resolve3(repositoryPath, integrity.path), "utf8").then(
+        const manifest2 = await readFile8(resolve4(repositoryPath, integrity.path), "utf8").then(
           (value2) => JSON.parse(value2)
         ).catch(() => void 0);
         const value = manifest2?.scripts?.[integrity.script];
         actualHash = value ? contentHash({ path: integrity.path, script: integrity.script, value }) : contentHash({ missing: true, path: integrity.path, script: integrity.script });
       } else {
-        const contents = await readFile7(resolve3(repositoryPath, integrity.path)).catch(
+        const contents = await readFile8(resolve4(repositoryPath, integrity.path)).catch(
           () => void 0
         );
         actualHash = contents ? contentHash({ path: integrity.path, contents: contents.toString("base64") }) : contentHash({ missing: true, path: integrity.path });
@@ -37036,7 +37288,7 @@ function acceptedNodeIds(state) {
 function readyRuntimeNodes(graph, state) {
   const accepted = acceptedNodeIds(state);
   return graph.nodes.filter(
-    (node2) => state.nodes[node2.id]?.status === "pending" && node2.dependsOn.every((id) => accepted.has(id))
+    (node2) => (state.nodes[node2.id]?.status === "pending" || node2.kind === "wait" && state.nodes[node2.id]?.status === "waiting") && node2.dependsOn.every((id) => accepted.has(id))
   );
 }
 function scopeRoot(pattern) {
@@ -37542,13 +37794,20 @@ async function executeRun(input) {
       }
       state = await input.store.loadState();
     }
-    const capabilities = await input.adapter.probe();
-    if (!capabilities.installed || !capabilities.authenticated || !capabilities.structuredOutput || !capabilities.streamingEvents) {
-      await input.store.append("runtime", "run.blocked", {
-        reason: `${input.adapter.id} is not authenticated or does not provide the required structured unattended interface`
-      });
+    let adapterReady = false;
+    const ensureAdapterReady = async () => {
+      if (adapterReady) return true;
+      const capabilities = await input.adapter.probe();
+      adapterReady = capabilities.installed && capabilities.authenticated && capabilities.structuredOutput && capabilities.streamingEvents;
+      if (!adapterReady)
+        await input.store.append("runtime", "run.blocked", {
+          reason: `${input.adapter.id} is not authenticated or does not provide the required structured unattended interface`
+        });
+      return adapterReady;
+    };
+    const initialBatch = readyBatch(graph, state, input.maxWorkers ?? 1).nodes;
+    if (initialBatch.some((candidate) => !["wait", "commit"].includes(candidate.kind)) && !await ensureAdapterReady())
       return await input.store.loadState();
-    }
     let workspace;
     try {
       workspace = await input.store.loadWorkspace();
@@ -37640,7 +37899,7 @@ async function executeRun(input) {
         }
         return await input.store.loadState();
       }
-      if (batchSelection.decision)
+      if (batchSelection.decision && !batch.some((node2) => state.nodes[node2.id]?.status === "waiting"))
         await input.store.append(
           "runtime",
           "optimizer.decided",
@@ -37657,9 +37916,11 @@ async function executeRun(input) {
           return await input.store.loadState();
         }
       }
+      if (batch.some((candidate) => !["wait", "commit"].includes(candidate.kind)) && !await ensureAdapterReady())
+        return await input.store.loadState();
       const reuseSessions = /* @__PURE__ */ new Map();
       for (const candidate of batch) {
-        if (["verification", "commit"].includes(candidate.kind) || recoveries.has(candidate.id))
+        if (["verification", "commit", "wait"].includes(candidate.kind) || recoveries.has(candidate.id))
           continue;
         const contextOptimization = await hostContextOptimization(
           input.store,
@@ -37682,12 +37943,13 @@ async function executeRun(input) {
           type: "status",
           message: `${candidate.kind}: ${candidate.objective}`
         });
-        await input.store.append("runtime", "node.started", {
-          nodeId: candidate.id,
-          batchId,
-          batchSize: batch.length,
-          maxWorkers: input.maxWorkers ?? 1
-        });
+        if (state.nodes[candidate.id]?.status !== "waiting")
+          await input.store.append("runtime", "node.started", {
+            nodeId: candidate.id,
+            batchId,
+            batchSize: batch.length,
+            maxWorkers: input.maxWorkers ?? 1
+          });
       }
       if (signal.aborted) return await finishInterruption(batch.map(({ id }) => id));
       if (batch.length > 1) {
@@ -37751,6 +38013,59 @@ async function executeRun(input) {
         continue;
       }
       const current = batch[0];
+      if (current.kind === "wait") {
+        const outcome2 = await evaluateWaitNode({
+          store: input.store,
+          node: current,
+          workspacePath: workspace.path
+        });
+        if (outcome2.status === "satisfied") {
+          const control = await evaluateSuccessfulControl({
+            store: input.store,
+            graph,
+            node: current,
+            rationale: "The approved deterministic wait condition was satisfied",
+            evidence: outcome2.evidence
+          });
+          if (!control.allowed) {
+            const reason = control.reason ?? `Control graph blocked wait node ${current.id}`;
+            await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+            await input.store.append("runtime", "run.blocked", {
+              reason,
+              ...control.packet ? { decisionPacket: control.packet } : {}
+            });
+            return await input.store.loadState();
+          }
+          await input.store.append("runtime", "node.progress", {
+            nodeId: current.id,
+            classification: "done",
+            summary: "Wait condition satisfied",
+            evidence: outcome2.evidence
+          });
+          await input.store.append("runtime", "node.accepted", { nodeId: current.id });
+          continue;
+        }
+        if (outcome2.status === "timed_out") {
+          const reason = outcome2.evidence.join("; ");
+          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+          await input.store.append("runtime", "run.blocked", { reason });
+          return await input.store.loadState();
+        }
+        await input.store.append("runtime", "run.waiting", {
+          reason: `Waiting for ${current.id}: ${outcome2.evidence.join("; ")}`,
+          nodeId: current.id,
+          nextWakeAt: outcome2.nextWakeAt
+        });
+        if (!input.superviseWaits) return await input.store.loadState();
+        if (!await sleepUntilWake(outcome2.nextWakeAt, signal))
+          return await finishInterruption(current.id);
+        await input.store.append("runtime", "run.started", {
+          workspace,
+          wakeNodeId: current.id,
+          wakeAt: (/* @__PURE__ */ new Date()).toISOString()
+        });
+        continue;
+      }
       if (current.kind === "verification") {
         let completionProbes;
         let heldOutProbePlan;
@@ -38043,6 +38358,52 @@ async function executeRun(input) {
   }
 }
 
+// packages/runtime/src/supervisor.ts
+import { chmod, mkdir as mkdir5, open as open2, readFile as readFile9, readdir as readdir2 } from "node:fs/promises";
+import { join as join10 } from "node:path";
+function supervisorRoot(repositoryRoot, runId) {
+  return join10(repositoryRoot, ".graphcraft", "supervisors", runId);
+}
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error51) {
+    return error51.code === "EPERM";
+  }
+}
+async function listSupervisorRecords(repositoryRoot, runId) {
+  let entries;
+  try {
+    entries = await readdir2(supervisorRoot(repositoryRoot, runId), { withFileTypes: true });
+  } catch (error51) {
+    if (error51.code === "ENOENT") return [];
+    throw error51;
+  }
+  const records = await Promise.all(
+    entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json")).map(
+      async (entry) => SupervisorRecordSchema.parse(
+        JSON.parse(
+          await readFile9(join10(supervisorRoot(repositoryRoot, runId), entry.name), "utf8")
+        )
+      )
+    )
+  );
+  return records.sort(
+    (left, right) => left.startedAt.localeCompare(right.startedAt) || left.supervisorId.localeCompare(right.supervisorId)
+  );
+}
+function inspectSupervisorRecord(record2, now = Date.now()) {
+  const alive = isProcessAlive(record2.pid);
+  const heartbeatAgeMs = Math.max(0, now - Date.parse(record2.heartbeatAt));
+  const health = (record2.status === "starting" || record2.status === "running") && (!alive || heartbeatAgeMs > 1e4) ? "stale" : record2.status;
+  return { ...record2, alive, heartbeatAgeMs, health };
+}
+async function latestSupervisor(repositoryRoot, runId) {
+  const latest = (await listSupervisorRecords(repositoryRoot, runId)).at(-1);
+  return latest ? inspectSupervisorRecord(latest) : void 0;
+}
+
 // packages/cli/src/index.ts
 var GRAPHCRAFT_VERSION = package_default.version;
 function createAdapter(host, policy) {
@@ -38152,9 +38513,20 @@ function stateView(state, contract) {
     tokenReport: tokenCostReport(state.tokenLedger),
     optimizationDecisions: state.optimizationDecisions,
     sideEffects: state.sideEffects,
+    waits: state.waits,
     stopReason: state.stopReason,
     updatedAt: state.updatedAt
   };
+}
+async function supervisorView(repositoryRoot, runId) {
+  try {
+    return await latestSupervisor(repositoryRoot, runId) ?? null;
+  } catch (error51) {
+    return {
+      health: "invalid",
+      error: `Supervisor projection is unreadable: ${error51.message}`
+    };
+  }
 }
 async function storeFor(cwd, runReference) {
   const repository = await discoverRepository(cwd);
@@ -38218,7 +38590,11 @@ async function handleAction(input) {
     store.loadProbePlan(),
     store.loadHeldOutProbePlan()
   ]);
-  if (input.action === "status") return stateView(state, contract);
+  if (input.action === "status")
+    return {
+      ...stateView(state, contract),
+      supervisor: await supervisorView(store.repositoryRoot, store.runId)
+    };
   if (input.action === "inspect")
     return {
       contract,
@@ -38232,6 +38608,7 @@ async function handleAction(input) {
         }))
       },
       state,
+      supervisor: await supervisorView(store.repositoryRoot, store.runId),
       tokenReport: tokenCostReport(state.tokenLedger),
       graphHistory: await store.loadGraphHistory(),
       contextReceipts: (await store.loadEvents()).filter(({ type }) => type === "context.selected").map(({ data }) => ContextSelectionReceiptSchema.parse(data.receipt))

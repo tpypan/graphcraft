@@ -302,6 +302,135 @@ describe("run contracts and graphs", () => {
     });
   });
 
+  it("accepts scoped deterministic waits and rejects unsafe wake policies", () => {
+    const contract = compileRunContract("Implement a substantial feature after a durable wait", {
+      ...repository,
+      root: "/tmp/example",
+    });
+    const verificationProbe = {
+      id: "tests",
+      kind: "command" as const,
+      command: "npm",
+      args: ["test"],
+      expectedExitCode: 0,
+      timeoutMs: 1_000,
+    };
+    const plan: GraphPlan = {
+      schemaVersion: 1,
+      family: "feature",
+      nodes: [
+        {
+          id: "await-signal",
+          kind: "wait",
+          objective: "Wait for the approved repository-local signal",
+          dependsOn: [],
+          scope: ["**/*"],
+          contextSelector: {
+            includeRepositoryInstructions: true,
+            predecessorResults: [],
+            relevantPaths: ["package.json"],
+          },
+          progressProbes: [],
+          completionProbes: [],
+          sideEffectClass: "none",
+          waitCondition: {
+            kind: "file_exists",
+            path: "signals/ready.json",
+            pollIntervalMs: 1_000,
+          },
+        },
+        {
+          id: "implement",
+          kind: "implementation",
+          objective: "Implement the approved feature",
+          dependsOn: ["await-signal"],
+          scope: ["**/*"],
+          contextSelector: {
+            includeRepositoryInstructions: true,
+            predecessorResults: ["await-signal"],
+            relevantPaths: ["package.json"],
+          },
+          progressProbes: [],
+          completionProbes: [],
+          sideEffectClass: "workspace_write",
+        },
+        {
+          id: "verify",
+          kind: "verification",
+          objective: "Verify the approved feature",
+          dependsOn: ["implement"],
+          scope: ["**/*"],
+          contextSelector: {
+            includeRepositoryInstructions: true,
+            predecessorResults: ["implement"],
+            relevantPaths: ["package.json"],
+          },
+          progressProbes: [],
+          completionProbes: [verificationProbe],
+          sideEffectClass: "none",
+        },
+      ],
+    };
+
+    expect(() => compilePlannedGraph(contract, plan, [verificationProbe])).not.toThrow();
+    expect(() =>
+      compilePlannedGraph(
+        contract,
+        {
+          ...plan,
+          nodes: plan.nodes.map((node) =>
+            node.id === "await-signal"
+              ? { ...node, waitCondition: { kind: "time", wakeAt: new Date().toISOString() } }
+              : node,
+          ),
+        },
+        [verificationProbe],
+      ),
+    ).not.toThrow();
+
+    const invalidWait = (replacement: Partial<GraphPlan["nodes"][number]>): GraphPlan => ({
+      ...plan,
+      nodes: plan.nodes.map((node) =>
+        node.id === "await-signal" ? { ...node, ...replacement } : node,
+      ),
+    });
+    expect(() =>
+      compilePlannedGraph(contract, invalidWait({ waitCondition: undefined }), [verificationProbe]),
+    ).toThrow(/no wake condition/);
+    expect(() =>
+      compilePlannedGraph(
+        contract,
+        {
+          ...plan,
+          nodes: plan.nodes.map((node) =>
+            node.id === "implement"
+              ? {
+                  ...node,
+                  waitCondition: { kind: "time", wakeAt: new Date().toISOString() },
+                }
+              : node,
+          ),
+        },
+        [verificationProbe],
+      ),
+    ).toThrow(/Non-wait node/);
+    for (const path of ["../ready", "/tmp/ready", "signals/*.json", ".graphcraft/ready"]) {
+      expect(() =>
+        compilePlannedGraph(
+          contract,
+          invalidWait({
+            waitCondition: {
+              kind: "file_exists",
+              path,
+              pollIntervalMs: 1_000,
+            },
+          }),
+          [verificationProbe],
+        ),
+      ).toThrow(/unsafe wake path/);
+    }
+  });
+
   it("fuses bounded adjacent reads when their host boundary costs more than isolation", () => {
     const contract = compileRunContract("Implement a substantial reporting feature", repository);
     const verificationProbe = {

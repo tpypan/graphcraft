@@ -61,6 +61,8 @@ Graphcraft displays a concise run contract before doing work. Use `--yes` only w
 - Optimizes the approved shape deterministically by fusing redundant bounded reads, splitting safely partitionable broad writes, recording concurrency choices, and reusing a durable host context only for tightly dependent same-authority reasoning with reconciled cost evidence.
 - Checkpoints host sessions and results during execution, resumes the same host session when safe, and falls back to repository evidence when switching hosts or native continuation is unavailable.
 - Accepts pause or stop from another CLI process, terminates the active child with bounded escalation, and records the exact cause and outcome before releasing the run lock.
+- Executes explicit time, file-exists, and file-changed wait nodes without a model call while state is unchanged; wake conditions, content baselines, observations, and the next wake time survive restart in the event log.
+- Runs approved work under an optional detached local supervisor with atomic PID/heartbeat records, mode-`0600` logs, stale-process replacement, and the same coordinated pause/stop channel. Supervisor files are operational projections; run events remain authoritative.
 - Journals atomic commits as durable claim–act–confirm side effects with exact HEAD, branch, and changed-content preconditions plus an idempotency trailer, so restart reconciles Git truth instead of creating a duplicate commit.
 - Tracks cached, uncached, output, reasoning, and total tokens with explicit provider availability, and reports planning, worker, repair, semantic-verification, and Graphcraft-overhead costs by phase and node.
 - Provides an experimental matched benchmark harness with a versioned ten-task public corpus, fresh deterministic fixtures, explicit model/effort controls, executable external scoring, atomic checkpoints, and resumable randomized trials.
@@ -69,20 +71,23 @@ Graphcraft displays a concise run contract before doing work. Use `--yes` only w
 
 ```text
 graphcraft install --host <codex|claude>
-graphcraft run <task> [--max-workers 2]
+graphcraft run <task> [--max-workers 2] [--background]
 graphcraft status [run]
 graphcraft inspect [run]
 graphcraft probes [run] [--set probe-plan.json]
 graphcraft amend [run] --set amendment.json [--approve]
 graphcraft decide [run] --source <id> --target <node> --verdict <approve|veto> --reason <text>
 graphcraft pause [run]
-graphcraft resume [run]
+graphcraft resume [run] [--background]
+graphcraft supervisors [run]
 graphcraft stop [run]
 graphcraft trace [run]
 graphcraft doctor
 graphcraft benchmark <suite> --host both --codex-model <model> --claude-model <model> --effort <level>
 graphcraft uninstall --host <codex|claude>
 ```
+
+`--background` detaches only after contract approval. `status` shows the current supervisor and `supervisors` shows every supervisor instance, including stale replacements and local log paths. A machine restart does not auto-launch a process; rerun `graphcraft resume <run> --background` to recover the persisted wait and continue without repeating accepted work. Filesystem wait paths are resolved inside the isolated worktree, whose exact path is exposed with the wait state.
 
 Small localized tasks bypass Graphcraft by default using measured task-shape signals rather than request length. Pass `--force` when you deliberately want a durable graph.
 

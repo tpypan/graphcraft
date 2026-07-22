@@ -15,10 +15,21 @@ import {
   renderContract,
   stateView,
   storeFor,
+  supervisorView,
   uninstallHost,
   type HostName,
 } from "./index.ts";
-import { createRun, executeRun, loadBenchmarkSuite, runBenchmark } from "@graphcraft/runtime";
+import {
+  createRun,
+  executeRun,
+  inspectSupervisorRecord,
+  listSupervisorRecords,
+  loadBenchmarkSuite,
+  runBenchmark,
+  startDetachedSupervisor,
+  superviseRun,
+  type SupervisorLauncher,
+} from "@graphcraft/runtime";
 import {
   BenchmarkSuiteSchema,
   createBenchmarkSchedule,
@@ -51,6 +62,15 @@ function executionSignal(): { signal: AbortSignal; dispose: () => void } {
       process.off("SIGINT", cancel);
       process.off("SIGTERM", shutdown);
     },
+  };
+}
+
+function currentSupervisorLauncher(): SupervisorLauncher {
+  const entrypoint = process.argv[1];
+  if (!entrypoint) throw new Error("Cannot resolve the Graphcraft executable for supervision");
+  return {
+    command: process.execPath,
+    args: [...process.execArgv.filter((argument) => !argument.startsWith("--inspect")), entrypoint],
   };
 }
 
@@ -190,6 +210,7 @@ program
   .option("-y, --yes", "approve the displayed contract non-interactively")
   .option("--force", "force Graphcraft for a small task")
   .option("--json", "emit machine-readable progress")
+  .option("--background", "continue under a detached local supervisor")
   .addOption(
     new Option("--max-workers <count>", "maximum concurrent read-only workers")
       .choices(["1", "2"])
@@ -210,6 +231,7 @@ program
         yes?: boolean;
         force?: boolean;
         json?: boolean;
+        background?: boolean;
         host: HostName;
         maxWorkers: "1" | "2";
         finishLine?: "local_verified" | "committed";
@@ -242,6 +264,17 @@ program
         );
         return;
       }
+      if (options.background) {
+        const supervisor = await startDetachedSupervisor({
+          repositoryRoot: created.store.repositoryRoot,
+          runId: created.store.runId,
+          host: options.host,
+          maxWorkers: Number(options.maxWorkers) as 1 | 2,
+          launcher: currentSupervisorLauncher(),
+        });
+        console.log(JSON.stringify({ runId: created.store.runId, supervisor }, null, 2));
+        return;
+      }
       const execution = executionSignal();
       const state = await executeRun({
         store: created.store,
@@ -265,7 +298,10 @@ program
   .action(async (run: string | undefined, options: { cwd: string; json?: boolean }) => {
     const store = await storeFor(options.cwd, run);
     const [state, contract] = await Promise.all([store.loadState(), store.loadContract()]);
-    const view = stateView(state, contract);
+    const view = {
+      ...stateView(state, contract),
+      supervisor: await supervisorView(store.repositoryRoot, store.runId),
+    };
     console.log(options.json ? JSON.stringify(view) : JSON.stringify(view, null, 2));
   });
 
@@ -388,6 +424,7 @@ program
   .option("-C, --cwd <path>", "repository path", process.cwd())
   .option("-y, --yes", "approve a pending contract")
   .option("--json", "emit machine-readable progress")
+  .option("--background", "continue under a detached local supervisor")
   .addOption(
     new Option("--max-workers <count>", "maximum concurrent read-only workers")
       .choices(["1", "2"])
@@ -401,6 +438,7 @@ program
         cwd: string;
         yes?: boolean;
         json?: boolean;
+        background?: boolean;
         host: HostName;
         maxWorkers: "1" | "2";
       },
@@ -424,6 +462,17 @@ program
         );
         return;
       }
+      if (options.background) {
+        const supervisor = await startDetachedSupervisor({
+          repositoryRoot: store.repositoryRoot,
+          runId: store.runId,
+          host: options.host,
+          maxWorkers: Number(options.maxWorkers) as 1 | 2,
+          launcher: currentSupervisorLauncher(),
+        });
+        console.log(JSON.stringify({ runId: store.runId, supervisor }, null, 2));
+        return;
+      }
       const execution = executionSignal();
       const resumed = await executeRun({
         store,
@@ -435,6 +484,62 @@ program
       }).finally(execution.dispose);
       console.log(JSON.stringify(stateView(resumed, contract), null, options.json ? 0 : 2));
       if (resumed.status !== "completed") process.exitCode = 2;
+    },
+  );
+
+program
+  .command("supervisors")
+  .description("Show the local supervisor lifecycle for a durable run")
+  .argument("[run]")
+  .option("-C, --cwd <path>", "repository path", process.cwd())
+  .action(async (run: string | undefined, options: { cwd: string }) => {
+    const store = await storeFor(options.cwd, run);
+    const records = await listSupervisorRecords(store.repositoryRoot, store.runId);
+    console.log(
+      JSON.stringify(
+        {
+          runId: store.runId,
+          supervisors: records.map((record) => inspectSupervisorRecord(record)),
+        },
+        null,
+        2,
+      ),
+    );
+  });
+
+program
+  .command("supervise", { hidden: true })
+  .description("Internal detached supervisor entrypoint")
+  .argument("<run>")
+  .option("-C, --cwd <path>", "repository path", process.cwd())
+  .addOption(hostOption)
+  .addOption(
+    new Option("--max-workers <count>", "maximum concurrent read-only workers")
+      .choices(["1", "2"])
+      .default("1"),
+  )
+  .addOption(new Option("--supervisor-id <id>").makeOptionMandatory().hideHelp())
+  .action(
+    async (
+      run: string,
+      options: {
+        cwd: string;
+        host: HostName;
+        maxWorkers: "1" | "2";
+        supervisorId: string;
+      },
+    ) => {
+      const store = await storeFor(options.cwd, run);
+      const execution = executionSignal();
+      const state = await superviseRun({
+        store,
+        adapter: createAdapter(options.host),
+        supervisorId: options.supervisorId,
+        signal: execution.signal,
+        maxWorkers: Number(options.maxWorkers) as 1 | 2,
+        observer: consoleObserver(false),
+      }).finally(execution.dispose);
+      console.log(JSON.stringify(stateView(state, await store.loadContract()), null, 2));
     },
   );
 

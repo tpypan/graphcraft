@@ -77,6 +77,7 @@ import {
 } from "./side-effect.ts";
 import { RunStore } from "./store.ts";
 import { groundedRelevantPaths, prepareWorkerContext } from "./context.ts";
+import { evaluateWaitNode, sleepUntilWake } from "./wait.ts";
 import {
   actionableHeldOutFailures,
   createRuntimeHeldOutProbePlan,
@@ -739,7 +740,9 @@ function readyRuntimeNodes(graph: Graph, state: RunState): GraphNode[] {
   const accepted = acceptedNodeIds(state);
   return graph.nodes.filter(
     (node) =>
-      state.nodes[node.id]?.status === "pending" && node.dependsOn.every((id) => accepted.has(id)),
+      (state.nodes[node.id]?.status === "pending" ||
+        (node.kind === "wait" && state.nodes[node.id]?.status === "waiting")) &&
+      node.dependsOn.every((id) => accepted.has(id)),
   );
 }
 
@@ -1387,6 +1390,7 @@ export async function executeRun(input: {
   observer?: RunObserver;
   signal?: AbortSignal;
   maxWorkers?: 1 | 2;
+  superviseWaits?: boolean;
   sideEffectBoundary?: (point: SideEffectBoundary) => void | Promise<void>;
 }): Promise<RunState> {
   const externalSignal = input.signal ?? new AbortController().signal;
@@ -1428,18 +1432,28 @@ export async function executeRun(input: {
       state = await input.store.loadState();
     }
 
-    const capabilities = await input.adapter.probe();
+    let adapterReady = false;
+    const ensureAdapterReady = async (): Promise<boolean> => {
+      if (adapterReady) return true;
+      const capabilities = await input.adapter.probe();
+      adapterReady =
+        capabilities.installed &&
+        capabilities.authenticated &&
+        capabilities.structuredOutput &&
+        capabilities.streamingEvents;
+      if (!adapterReady)
+        await input.store.append("runtime", "run.blocked", {
+          reason: `${input.adapter.id} is not authenticated or does not provide the required structured unattended interface`,
+        });
+      return adapterReady;
+    };
+
+    const initialBatch = readyBatch(graph, state, input.maxWorkers ?? 1).nodes;
     if (
-      !capabilities.installed ||
-      !capabilities.authenticated ||
-      !capabilities.structuredOutput ||
-      !capabilities.streamingEvents
-    ) {
-      await input.store.append("runtime", "run.blocked", {
-        reason: `${input.adapter.id} is not authenticated or does not provide the required structured unattended interface`,
-      });
+      initialBatch.some((candidate) => !["wait", "commit"].includes(candidate.kind)) &&
+      !(await ensureAdapterReady())
+    )
       return await input.store.loadState();
-    }
 
     let workspace: RunWorkspace;
     try {
@@ -1546,7 +1560,10 @@ export async function executeRun(input: {
         }
         return await input.store.loadState();
       }
-      if (batchSelection.decision)
+      if (
+        batchSelection.decision &&
+        !batch.some((node) => state.nodes[node.id]?.status === "waiting")
+      )
         await input.store.append(
           "runtime",
           "optimizer.decided",
@@ -1565,9 +1582,18 @@ export async function executeRun(input: {
         }
       }
 
+      if (
+        batch.some((candidate) => !["wait", "commit"].includes(candidate.kind)) &&
+        !(await ensureAdapterReady())
+      )
+        return await input.store.loadState();
+
       const reuseSessions = new Map<string, { hostSessionId: string; sourceNodeId: string }>();
       for (const candidate of batch) {
-        if (["verification", "commit"].includes(candidate.kind) || recoveries.has(candidate.id))
+        if (
+          ["verification", "commit", "wait"].includes(candidate.kind) ||
+          recoveries.has(candidate.id)
+        )
           continue;
         const contextOptimization = await hostContextOptimization(
           input.store,
@@ -1591,12 +1617,13 @@ export async function executeRun(input: {
           type: "status",
           message: `${candidate.kind}: ${candidate.objective}`,
         });
-        await input.store.append("runtime", "node.started", {
-          nodeId: candidate.id,
-          batchId,
-          batchSize: batch.length,
-          maxWorkers: input.maxWorkers ?? 1,
-        });
+        if (state.nodes[candidate.id]?.status !== "waiting")
+          await input.store.append("runtime", "node.started", {
+            nodeId: candidate.id,
+            batchId,
+            batchSize: batch.length,
+            maxWorkers: input.maxWorkers ?? 1,
+          });
       }
       if (signal.aborted) return await finishInterruption(batch.map(({ id }) => id));
 
@@ -1672,6 +1699,60 @@ export async function executeRun(input: {
       }
 
       const current = batch[0]!;
+
+      if (current.kind === "wait") {
+        const outcome = await evaluateWaitNode({
+          store: input.store,
+          node: current,
+          workspacePath: workspace.path,
+        });
+        if (outcome.status === "satisfied") {
+          const control = await evaluateSuccessfulControl({
+            store: input.store,
+            graph,
+            node: current,
+            rationale: "The approved deterministic wait condition was satisfied",
+            evidence: outcome.evidence,
+          });
+          if (!control.allowed) {
+            const reason = control.reason ?? `Control graph blocked wait node ${current.id}`;
+            await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+            await input.store.append("runtime", "run.blocked", {
+              reason,
+              ...(control.packet ? { decisionPacket: control.packet } : {}),
+            });
+            return await input.store.loadState();
+          }
+          await input.store.append("runtime", "node.progress", {
+            nodeId: current.id,
+            classification: "done",
+            summary: "Wait condition satisfied",
+            evidence: outcome.evidence,
+          });
+          await input.store.append("runtime", "node.accepted", { nodeId: current.id });
+          continue;
+        }
+        if (outcome.status === "timed_out") {
+          const reason = outcome.evidence.join("; ");
+          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+          await input.store.append("runtime", "run.blocked", { reason });
+          return await input.store.loadState();
+        }
+        await input.store.append("runtime", "run.waiting", {
+          reason: `Waiting for ${current.id}: ${outcome.evidence.join("; ")}`,
+          nodeId: current.id,
+          nextWakeAt: outcome.nextWakeAt,
+        });
+        if (!input.superviseWaits) return await input.store.loadState();
+        if (!(await sleepUntilWake(outcome.nextWakeAt, signal)))
+          return await finishInterruption(current.id);
+        await input.store.append("runtime", "run.started", {
+          workspace,
+          wakeNodeId: current.id,
+          wakeAt: new Date().toISOString(),
+        });
+        continue;
+      }
 
       if (current.kind === "verification") {
         let completionProbes: ExecutableProbe[];

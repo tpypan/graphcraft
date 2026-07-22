@@ -29,6 +29,7 @@ import {
   decideRunControl,
   discoverRepository,
   executeRun,
+  latestSupervisor,
   requestRunControl,
   resolveRunId,
   type RunObserver,
@@ -273,9 +274,21 @@ export function stateView(state: RunState, contract: RunContract): Record<string
     tokenReport: tokenCostReport(state.tokenLedger),
     optimizationDecisions: state.optimizationDecisions,
     sideEffects: state.sideEffects,
+    waits: state.waits,
     stopReason: state.stopReason,
     updatedAt: state.updatedAt,
   };
+}
+
+export async function supervisorView(repositoryRoot: string, runId: string) {
+  try {
+    return (await latestSupervisor(repositoryRoot, runId)) ?? null;
+  } catch (error) {
+    return {
+      health: "invalid",
+      error: `Supervisor projection is unreadable: ${(error as Error).message}`,
+    };
+  }
 }
 
 export function renderContract(contract: RunContract, graph: Graph, probePlan?: ProbePlan): string {
@@ -413,7 +426,11 @@ export async function handleAction(input: McpActionInput): Promise<Record<string
     store.loadProbePlan(),
     store.loadHeldOutProbePlan(),
   ]);
-  if (input.action === "status") return stateView(state, contract);
+  if (input.action === "status")
+    return {
+      ...stateView(state, contract),
+      supervisor: await supervisorView(store.repositoryRoot, store.runId),
+    };
   if (input.action === "inspect")
     return {
       contract,
@@ -427,6 +444,7 @@ export async function handleAction(input: McpActionInput): Promise<Record<string
         })),
       },
       state,
+      supervisor: await supervisorView(store.repositoryRoot, store.runId),
       tokenReport: tokenCostReport(state.tokenLedger),
       graphHistory: await store.loadGraphHistory(),
       contextReceipts: (await store.loadEvents())

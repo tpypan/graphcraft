@@ -238,11 +238,28 @@ export const NodeKindSchema = z.enum([
 export const NodeStatusSchema = z.enum([
   "pending",
   "running",
+  "waiting",
   "accepted",
   "failed",
   "blocked",
   "stopped",
   "superseded",
+]);
+
+export const WaitConditionSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("time"), wakeAt: z.iso.datetime() }),
+  z.strictObject({
+    kind: z.literal("file_exists"),
+    path: z.string().min(1),
+    pollIntervalMs: z.number().int().min(250).max(300_000),
+    timeoutAt: z.iso.datetime().optional(),
+  }),
+  z.strictObject({
+    kind: z.literal("file_changed"),
+    path: z.string().min(1),
+    pollIntervalMs: z.number().int().min(250).max(300_000),
+    timeoutAt: z.iso.datetime().optional(),
+  }),
 ]);
 
 export const GraphNodeSchema = z.strictObject({
@@ -260,6 +277,7 @@ export const GraphNodeSchema = z.strictObject({
   progressProbes: z.array(ProbeSpecSchema),
   completionProbes: z.array(ProbeSpecSchema),
   sideEffectClass: z.enum(["none", "workspace_write", "git_commit", "external"]),
+  waitCondition: WaitConditionSchema.optional(),
   status: NodeStatusSchema,
 });
 
@@ -484,6 +502,49 @@ export const SideEffectJournalEntrySchema = z.strictObject({
   updatedAt: z.iso.datetime(),
 });
 
+export const WaitRuntimeStateSchema = z.strictObject({
+  nodeId: z.string().min(1),
+  condition: WaitConditionSchema,
+  workspacePath: z.string().min(1),
+  status: z.enum(["waiting", "satisfied", "timed_out"]),
+  registeredAt: z.iso.datetime(),
+  baselineSignature: z.string().optional(),
+  nextWakeAt: z.iso.datetime(),
+  observations: z.number().int().nonnegative(),
+  evidence: z.array(z.string()).default([]),
+  updatedAt: z.iso.datetime(),
+});
+
+export const SupervisorRecordSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  supervisorId: z.uuid(),
+  runId: z.uuid(),
+  repositoryRoot: z.string().min(1),
+  pid: z.number().int().positive(),
+  host: z.enum(["codex", "claude"]),
+  maxWorkers: z.union([z.literal(1), z.literal(2)]),
+  status: z.enum(["starting", "running", "exited", "failed"]),
+  runStatus: z
+    .enum([
+      "awaiting_approval",
+      "running",
+      "waiting",
+      "paused",
+      "stopped",
+      "blocked",
+      "completed",
+      "failed",
+    ])
+    .optional(),
+  startedAt: z.iso.datetime(),
+  heartbeatAt: z.iso.datetime(),
+  updatedAt: z.iso.datetime(),
+  endedAt: z.iso.datetime().optional(),
+  logPath: z.string().min(1),
+  replacesSupervisorId: z.uuid().optional(),
+  message: z.string().optional(),
+});
+
 export const WorkerResultSchema = z.strictObject({
   status: z.enum(["completed", "blocked", "failed"]),
   summary: z.string(),
@@ -648,6 +709,11 @@ export const RunEventTypeSchema = z.enum([
   "side_effect.reconciled",
   "side_effect.confirmed",
   "side_effect.failed",
+  "run.waiting",
+  "wait.registered",
+  "wait.observed",
+  "wait.satisfied",
+  "wait.timed_out",
   "graph.amended",
 ]);
 
@@ -678,6 +744,7 @@ export const RunStateSchema = z.strictObject({
   status: z.enum([
     "awaiting_approval",
     "running",
+    "waiting",
     "paused",
     "stopped",
     "blocked",
@@ -694,6 +761,7 @@ export const RunStateSchema = z.strictObject({
   tokenLedger: z.array(TokenLedgerEntrySchema).default([]),
   optimizationDecisions: z.array(OptimizationDecisionSchema).default([]),
   sideEffects: z.array(SideEffectJournalEntrySchema).default([]),
+  waits: z.array(WaitRuntimeStateSchema).default([]),
   controlDecisions: z.array(ControlDecisionSchema),
   pendingDecision: ControlDecisionPacketSchema.optional(),
   stopReason: z.string().optional(),
@@ -739,6 +807,7 @@ export type ProgressVector = z.infer<typeof ProgressVectorSchema>;
 export type EvidenceSnapshot = z.infer<typeof EvidenceSnapshotSchema>;
 export type ProgressTrajectoryEntry = z.infer<typeof ProgressTrajectoryEntrySchema>;
 export type ProgressDecisionPacket = z.infer<typeof ProgressDecisionPacketSchema>;
+export type WaitCondition = z.infer<typeof WaitConditionSchema>;
 export type GraphNode = z.infer<typeof GraphNodeSchema>;
 export type PlannedGraphNode = z.infer<typeof PlannedGraphNodeSchema>;
 export type GraphPlan = z.infer<typeof GraphPlanSchema>;
@@ -758,6 +827,8 @@ export type OptimizationDecision = z.infer<typeof OptimizationDecisionSchema>;
 export type SideEffectKind = z.infer<typeof SideEffectKindSchema>;
 export type SideEffectClaim = z.infer<typeof SideEffectClaimSchema>;
 export type SideEffectJournalEntry = z.infer<typeof SideEffectJournalEntrySchema>;
+export type WaitRuntimeState = z.infer<typeof WaitRuntimeStateSchema>;
+export type SupervisorRecord = z.infer<typeof SupervisorRecordSchema>;
 export type WorkerResult = z.infer<typeof WorkerResultSchema>;
 export type ContextCapsule = z.infer<typeof ContextCapsuleSchema>;
 export type ContextSelectionReceipt = z.infer<typeof ContextSelectionReceiptSchema>;

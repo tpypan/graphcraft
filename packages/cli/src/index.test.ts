@@ -11,6 +11,7 @@ import {
   resolveGraphcraftHome,
   stageBundledMcp,
   stateView,
+  supervisorView,
 } from "./index.ts";
 
 const temporaryRoots: string[] = [];
@@ -41,6 +42,19 @@ describe("package installation", () => {
 
   it("honors an explicit Graphcraft home", () => {
     expect(resolveGraphcraftHome("./custom-home")).toBe(join(process.cwd(), "custom-home"));
+  });
+});
+
+describe("supervisor projection", () => {
+  it("reports an invalid projection without hiding durable run status", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-supervisor-view-test-"));
+    temporaryRoots.push(root);
+    const runId = "11111111-1111-4111-8111-111111111111";
+    const supervisorRoot = join(root, ".graphcraft", "supervisors", runId);
+    await mkdir(supervisorRoot, { recursive: true });
+    await writeFile(join(supervisorRoot, "broken.json"), '{"schemaVersion":999}\n');
+
+    await expect(supervisorView(root, runId)).resolves.toMatchObject({ health: "invalid" });
   });
 });
 

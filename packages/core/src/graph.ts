@@ -170,6 +170,7 @@ function node(input: Partial<GraphNode> & Pick<GraphNode, "id" | "kind" | "objec
     progressProbes: input.progressProbes ?? [],
     completionProbes: input.completionProbes ?? [],
     sideEffectClass: input.sideEffectClass ?? "none",
+    ...(input.waitCondition ? { waitCondition: input.waitCondition } : {}),
     status: "pending",
   };
 }
@@ -327,8 +328,24 @@ export function validateGraphPolicy(
   for (const item of graph.nodes) {
     if (!/^[a-z][a-z0-9-]*$/.test(item.id))
       throw new Error(`Planned node ID ${item.id} must be lowercase and stable`);
-    if (item.kind === "wait")
-      throw new Error("Wait nodes are not executable in the local runtime yet");
+    if (item.kind === "wait") {
+      if (!item.waitCondition) throw new Error(`Wait node ${item.id} has no wake condition`);
+      const condition = item.waitCondition;
+      if (item.sideEffectClass !== "none")
+        throw new Error(`Wait node ${item.id} must be read-only`);
+      if (item.progressProbes.length > 0 || item.completionProbes.length > 0)
+        throw new Error(`Wait node ${item.id} cannot run model-visible probes`);
+      if (
+        condition.kind !== "time" &&
+        (!safeRelativePattern(condition.path) ||
+          /[*?[{]/.test(condition.path) ||
+          !contract.scope.include.some((included) => patternWithin(condition.path, included)) ||
+          contract.scope.exclude.some((excluded) => patternWithin(condition.path, excluded)))
+      )
+        throw new Error(`Wait node ${item.id} contains an unsafe wake path`);
+    } else if (item.waitCondition) {
+      throw new Error(`Non-wait node ${item.id} cannot declare a wake condition`);
+    }
     if (!item.contextSelector.includeRepositoryInstructions)
       throw new Error(`Planned node ${item.id} attempted to omit repository instructions`);
     if (item.sideEffectClass === "external")
@@ -928,7 +945,7 @@ export function applyProbePlan(graph: Graph, contract: RunContract, input: Probe
         ? nodes.find((node) => ["investigation", "decision", "diagnostic"].includes(node.kind))
         : nodes.find((node) => node.sideEffectClass === "workspace_write");
     const target =
-      preferred ?? nodes.find((node) => !["verification", "commit"].includes(node.kind));
+      preferred ?? nodes.find((node) => !["verification", "commit", "wait"].includes(node.kind));
     if (!target) throw new Error(`No executable node can own progress probe ${item.probe.id}`);
     target.progressProbes.push(item.probe);
   }

@@ -10,4 +10,6 @@ export * from "./repository.ts";
 export * from "./runner.ts";
 export * from "./side-effect.ts";
 export * from "./store.ts";
+export * from "./supervisor.ts";
+export * from "./wait.ts";
 export * from "./trajectory.ts";

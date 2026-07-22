@@ -1,8 +1,18 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { cp, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  cp,
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
@@ -28,6 +38,7 @@ import type {
   SemanticVerificationRequest,
   SemanticVerificationResult,
   TokenUsage,
+  WaitCondition,
   WorkerRequest,
 } from "@graphcraft/core";
 import { configureRunProbes, createRun, executeRun } from "./runner.ts";
@@ -43,6 +54,13 @@ import { RunStore } from "./store.ts";
 import { amendRunGraph } from "./amendment.ts";
 import { assessRunProgress, createProgressDecisionPacket } from "./trajectory.ts";
 import type { SideEffectBoundary } from "./side-effect.ts";
+import {
+  inspectSupervisorRecord,
+  isProcessAlive,
+  latestSupervisor,
+  listSupervisorRecords,
+  startDetachedSupervisor,
+} from "./supervisor.ts";
 
 const execFileAsync = promisify(execFile);
 const temporaryRoots: string[] = [];
@@ -86,9 +104,12 @@ async function snapshotFiles(root: string): Promise<Record<string, string>> {
   return snapshot;
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
+async function waitFor(
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs = 5_000,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
+  while (!(await predicate())) {
     if (Date.now() > deadline) throw new Error("Timed out waiting for test condition");
     await new Promise<void>((resolve) => setTimeout(resolve, 10));
   }
@@ -111,10 +132,13 @@ async function git(cwd: string, ...args: string[]): Promise<void> {
   await execFileAsync("git", args, { cwd });
 }
 
-async function createRepository(requiredFile = "feature.txt"): Promise<string> {
+async function createRepository(
+  requiredFile = "feature.txt",
+  repositoryName = "repo",
+): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "graphcraft-runtime-test-"));
   temporaryRoots.push(root);
-  const repository = join(root, "repo");
+  const repository = join(root, repositoryName);
   await mkdir(repository);
   await git(repository, "init", "-b", "main");
   await git(repository, "config", "user.name", "Graphcraft Test");
@@ -323,6 +347,96 @@ class FakeAdapter implements HostAdapter {
   }
 }
 
+class WaitPlannerAdapter extends FakeAdapter {
+  constructor(
+    private readonly condition: WaitCondition,
+    act: (request: WorkerRequest, call: number, signal: AbortSignal) => Promise<void>,
+  ) {
+    super(act);
+  }
+
+  override async plan(request: PlanningRequest, _signal: AbortSignal): Promise<PlanningResult> {
+    this.planningRequests.push(request);
+    return {
+      plan: {
+        schemaVersion: 1,
+        family: "feature",
+        nodes: [
+          {
+            id: "await-signal",
+            kind: "wait",
+            objective: "Wait for the approved repository-local condition",
+            dependsOn: [],
+            scope: ["**/*"],
+            contextSelector: {
+              includeRepositoryInstructions: true,
+              predecessorResults: [],
+              relevantPaths: ["package.json"],
+            },
+            progressProbes: [],
+            completionProbes: [],
+            sideEffectClass: "none",
+            waitCondition: this.condition,
+          },
+          {
+            id: "implement",
+            kind: "implementation",
+            objective: request.contract.outcome,
+            dependsOn: ["await-signal"],
+            scope: ["**/*"],
+            contextSelector: {
+              includeRepositoryInstructions: true,
+              predecessorResults: ["await-signal"],
+              relevantPaths: ["package.json"],
+            },
+            progressProbes: [],
+            completionProbes: [],
+            sideEffectClass: "workspace_write",
+          },
+          {
+            id: "verify",
+            kind: "verification",
+            objective: `Verify the approved outcome: ${request.contract.outcome}`,
+            dependsOn: ["implement"],
+            scope: ["**/*"],
+            contextSelector: {
+              includeRepositoryInstructions: true,
+              predecessorResults: ["implement"],
+              relevantPaths: ["package.json", "verify.mjs"],
+            },
+            progressProbes: [],
+            completionProbes: request.verificationProbes,
+            sideEffectClass: "none",
+          },
+        ],
+      },
+      usage: reportedUsage(5, 1, 2),
+    };
+  }
+}
+
+class WaitSatisfactionFaultStore extends RunStore {
+  injected = false;
+
+  constructor(store: RunStore) {
+    super(store.repositoryRoot, store.runId);
+  }
+
+  override async append(
+    actor: RunEvent["actor"],
+    type: RunEvent["type"],
+    data: Record<string, unknown>,
+    causationId = this.runId,
+  ): Promise<RunEvent> {
+    const event = await super.append(actor, type, data, causationId);
+    if (!this.injected && type === "wait.satisfied") {
+      this.injected = true;
+      throw new Error("Injected process termination after wait.satisfied");
+    }
+    return event;
+  }
+}
+
 type InvocationFaultPoint =
   | "node.started"
   | "invocation.started"
@@ -454,6 +568,315 @@ function splitParallelBranches(graph: Graph): GraphAmendment {
 }
 
 describe("durable runtime", () => {
+  it("persists a file wait without invoking a host and resumes downstream work once", async () => {
+    const repository = await createRepository();
+    const adapter = new WaitPlannerAdapter(
+      { kind: "file_exists", path: "ready.flag", pollIntervalMs: 250 },
+      async (request) => {
+        if (request.capsule.nodeId === "implement")
+          await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+      },
+    );
+    const created = await createRun("Implement a substantial feature after a durable wait", {
+      cwd: repository,
+      planner: adapter,
+    });
+
+    const waiting = await executeRun({ store: created.store, adapter, approve: true });
+
+    expect(waiting.status).toBe("waiting");
+    expect(waiting.nodes["await-signal"]?.status).toBe("waiting");
+    expect(waiting.waits).toEqual([
+      expect.objectContaining({
+        nodeId: "await-signal",
+        status: "waiting",
+        observations: 1,
+        workspacePath: expect.stringContaining("graphcraft-worktrees"),
+      }),
+    ]);
+    expect(adapter.calls).toEqual([]);
+    expect(waiting.tokenLedger.filter(({ phase }) => phase === "worker")).toHaveLength(0);
+
+    const workspace = await created.store.loadWorkspace<{ path: string }>();
+    await writeFile(join(workspace.path, "ready.flag"), "ready\n");
+    await new Promise<void>((resolve) => setTimeout(resolve, 275));
+    const completed = await executeRun({ store: created.store, adapter });
+    const events = await created.store.loadEvents();
+
+    expect(completed.status).toBe("completed");
+    expect(adapter.calls).toEqual(["implement"]);
+    expect(events.filter(({ type }) => type === "wait.registered")).toHaveLength(1);
+    expect(events.filter(({ type }) => type === "wait.satisfied")).toHaveLength(1);
+    expect(
+      events.filter(({ type, data }) => type === "node.accepted" && data.nodeId === "await-signal"),
+    ).toHaveLength(1);
+  });
+
+  it("keeps a file-change baseline across runtime restart", async () => {
+    const repository = await createRepository();
+    await writeFile(join(repository, "signal.txt"), "before\n");
+    await git(repository, "add", "signal.txt");
+    await git(repository, "commit", "-m", "add wait signal");
+    const adapter = new WaitPlannerAdapter(
+      { kind: "file_changed", path: "signal.txt", pollIntervalMs: 250 },
+      async (request) => {
+        if (request.capsule.nodeId === "implement")
+          await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+      },
+    );
+    const created = await createRun("Implement a substantial feature after a changed signal", {
+      cwd: repository,
+      planner: adapter,
+    });
+    const waiting = await executeRun({ store: created.store, adapter, approve: true });
+    const baseline = waiting.waits[0]?.baselineSignature;
+
+    const restartedStore = new RunStore(repository, created.contract.runId);
+    const stillWaiting = await executeRun({ store: restartedStore, adapter });
+    expect(stillWaiting.status).toBe("waiting");
+    expect(stillWaiting.waits[0]?.baselineSignature).toBe(baseline);
+    expect(adapter.calls).toEqual([]);
+
+    const workspace = await restartedStore.loadWorkspace<{ path: string }>();
+    await writeFile(join(workspace.path, "signal.txt"), "after\n");
+    await new Promise<void>((resolve) => setTimeout(resolve, 275));
+    const completed = await executeRun({
+      store: new RunStore(repository, created.contract.runId),
+      adapter,
+    });
+    expect(completed.status).toBe("completed");
+    expect(adapter.calls).toEqual(["implement"]);
+    expect(
+      (await restartedStore.loadEvents()).filter(({ type }) => type === "wait.registered"),
+    ).toHaveLength(1);
+  });
+
+  it("supervises a time wait without recording model tokens during sleep", async () => {
+    const repository = await createRepository();
+    const adapter = new WaitPlannerAdapter(
+      { kind: "time", wakeAt: new Date(Date.now() + 150).toISOString() },
+      async (request) => {
+        if (request.capsule.nodeId === "implement")
+          await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+      },
+    );
+    const created = await createRun("Implement a substantial feature after a timed wait", {
+      cwd: repository,
+      planner: adapter,
+    });
+
+    const completed = await executeRun({
+      store: created.store,
+      adapter,
+      approve: true,
+      superviseWaits: true,
+    });
+    const events = await created.store.loadEvents();
+    const registered = events.findIndex(({ type }) => type === "wait.registered");
+    const satisfied = events.findIndex(({ type }) => type === "wait.satisfied");
+
+    expect(completed.status).toBe("completed");
+    expect(adapter.calls).toEqual(["implement"]);
+    expect(registered).toBeGreaterThan(-1);
+    expect(satisfied).toBeGreaterThan(registered);
+    expect(events.slice(registered, satisfied).some(({ type }) => type === "tokens.recorded")).toBe(
+      false,
+    );
+  });
+
+  it("blocks accurately when a supervised filesystem wait times out", async () => {
+    const repository = await createRepository();
+    const adapter = new WaitPlannerAdapter(
+      {
+        kind: "file_exists",
+        path: "never-created.flag",
+        pollIntervalMs: 250,
+        timeoutAt: new Date(Date.now() + 100).toISOString(),
+      },
+      async () => undefined,
+    );
+    const created = await createRun("Implement a substantial feature after a bounded wait", {
+      cwd: repository,
+      planner: adapter,
+    });
+
+    const blocked = await executeRun({
+      store: created.store,
+      adapter,
+      approve: true,
+      superviseWaits: true,
+    });
+
+    expect(blocked.status).toBe("blocked");
+    expect(blocked.nodes["await-signal"]?.status).toBe("failed");
+    expect(blocked.waits[0]?.status).toBe("timed_out");
+    expect(blocked.stopReason).toMatch(/timed out/);
+    expect(adapter.calls).toEqual([]);
+  });
+
+  it("reconciles a satisfied wait after termination before node acceptance", async () => {
+    const repository = await createRepository();
+    const adapter = new WaitPlannerAdapter(
+      { kind: "file_exists", path: "ready.flag", pollIntervalMs: 250 },
+      async (request) => {
+        if (request.capsule.nodeId === "implement")
+          await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+      },
+    );
+    const created = await createRun("Implement a substantial feature after a durable signal", {
+      cwd: repository,
+      planner: adapter,
+    });
+    expect((await executeRun({ store: created.store, adapter, approve: true })).status).toBe(
+      "waiting",
+    );
+    const workspace = await created.store.loadWorkspace<{ path: string }>();
+    await writeFile(join(workspace.path, "ready.flag"), "ready\n");
+    await new Promise<void>((resolve) => setTimeout(resolve, 275));
+
+    const faultStore = new WaitSatisfactionFaultStore(created.store);
+    await expect(executeRun({ store: faultStore, adapter })).rejects.toThrow(
+      /termination after wait\.satisfied/,
+    );
+    expect(faultStore.injected).toBe(true);
+
+    const completed = await executeRun({
+      store: new RunStore(repository, created.contract.runId),
+      adapter,
+    });
+    const events = await created.store.loadEvents();
+    expect(completed.status).toBe("completed");
+    expect(adapter.calls).toEqual(["implement"]);
+    expect(events.filter(({ type }) => type === "wait.satisfied")).toHaveLength(1);
+    expect(
+      events.filter(({ type, data }) => type === "node.accepted" && data.nodeId === "await-signal"),
+    ).toHaveLength(1);
+  });
+
+  it("detaches, exposes, and replaces a stale supervisor in a repository path with spaces", async () => {
+    const repository = await createRepository("feature.txt", "repo with spaces");
+    const adapter = new WaitPlannerAdapter(
+      { kind: "file_exists", path: "ready.flag", pollIntervalMs: 250 },
+      async () => undefined,
+    );
+    const created = await createRun("Implement a substantial feature after a background wait", {
+      cwd: repository,
+      planner: adapter,
+    });
+    const repositoryRoot = created.store.repositoryRoot;
+    const fakeBin = join(repository, ".test-bin");
+    const fakeCodex = join(fakeBin, "codex");
+    await mkdir(fakeBin);
+    await writeFile(
+      fakeCodex,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+if (args[0] === "--version") { console.log("codex-cli 0.0.0-test"); process.exit(0); }
+if (args[0] === "login" && args[1] === "status") { console.log("Logged in"); process.exit(0); }
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { input += chunk; });
+process.stdin.on("end", () => {
+  fs.writeFileSync("feature.txt", "implemented by detached fixture\\n");
+  console.log(JSON.stringify({ type: "thread.started", thread_id: "11111111-1111-4111-8111-111111111111" }));
+  console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ status: "completed", summary: "implemented fixture", changedPaths: ["feature.txt"], evidence: ["fixture write"] }) } }));
+  console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 4 } }));
+});
+`,
+    );
+    await chmod(fakeCodex, 0o700);
+    const launcher = {
+      command: process.execPath,
+      args: [
+        "--import",
+        resolve("node_modules/tsx/dist/loader.mjs"),
+        resolve("packages/cli/src/bin.ts"),
+      ],
+      env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ""}` },
+    };
+    let activePid: number | undefined;
+    try {
+      const first = await startDetachedSupervisor({
+        repositoryRoot,
+        runId: created.contract.runId,
+        host: "codex",
+        maxWorkers: 1,
+        launcher,
+      });
+      activePid = first.pid;
+      expect((await stat(first.logPath)).mode & 0o777).toBe(0o600);
+      expect(
+        inspectSupervisorRecord({ ...first, heartbeatAt: "1970-01-01T00:00:00.000Z" }).health,
+      ).toBe("stale");
+      try {
+        await waitFor(async () => {
+          const [supervisor, state] = await Promise.all([
+            latestSupervisor(repositoryRoot, created.contract.runId),
+            created.store.loadState(),
+          ]);
+          return supervisor?.health === "running" && state.status === "waiting";
+        }, 10_000);
+      } catch (error) {
+        throw new Error(
+          `${(error as Error).message}\nSupervisor log:\n${await readFile(first.logPath, "utf8")}`,
+        );
+      }
+      await expect(
+        startDetachedSupervisor({
+          repositoryRoot,
+          runId: created.contract.runId,
+          host: "codex",
+          maxWorkers: 1,
+          launcher,
+        }),
+      ).rejects.toThrow(/already has active supervisor/);
+
+      process.kill(first.pid, "SIGKILL");
+      await waitFor(() => !isProcessAlive(first.pid));
+      expect((await latestSupervisor(repositoryRoot, created.contract.runId))?.health).toBe(
+        "stale",
+      );
+
+      const second = await startDetachedSupervisor({
+        repositoryRoot,
+        runId: created.contract.runId,
+        host: "codex",
+        maxWorkers: 1,
+        launcher,
+      });
+      activePid = second.pid;
+      expect(second.replacesSupervisorId).toBe(first.supervisorId);
+      await waitFor(
+        async () =>
+          (await latestSupervisor(repositoryRoot, created.contract.runId))?.health === "running",
+        10_000,
+      );
+      const workspace = await created.store.loadWorkspace<{ path: string }>();
+      await writeFile(join(workspace.path, "ready.flag"), "ready\n");
+      await waitFor(async () => (await created.store.loadState()).status === "completed", 15_000);
+      await waitFor(
+        async () =>
+          (await latestSupervisor(repositoryRoot, created.contract.runId))?.runStatus ===
+          "completed",
+        10_000,
+      );
+      activePid = undefined;
+
+      const records = await listSupervisorRecords(repositoryRoot, created.contract.runId);
+      expect(records).toHaveLength(2);
+      expect(records[0]?.status).toBe("running");
+      expect(records[1]).toMatchObject({
+        supervisorId: second.supervisorId,
+        replacesSupervisorId: first.supervisorId,
+        status: "exited",
+        runStatus: "completed",
+      });
+    } finally {
+      if (activePid && isProcessAlive(activePid)) process.kill(activePid, "SIGKILL");
+    }
+  });
+
   it("selects bounded task-matched source snippets for planning evidence", async () => {
     const repository = await createRepository();
     await mkdir(join(repository, "src"));

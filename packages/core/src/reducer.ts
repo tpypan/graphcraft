@@ -12,6 +12,7 @@ import {
   TokenAttributionPhaseSchema,
   TokenLedgerEntrySchema,
   TokenUsageSchema,
+  WaitRuntimeStateSchema,
 } from "./schemas.ts";
 import { verifyRunEvent } from "./events.ts";
 import { aggregateTokenUsage, unavailableTokenUsage } from "./tokens.ts";
@@ -63,6 +64,7 @@ export function reduceEvents(events: RunEvent[]): RunState {
         tokenLedger: [],
         optimizationDecisions: [],
         sideEffects: [],
+        waits: [],
         controlDecisions: [],
         updatedAt: event.timestamp,
       };
@@ -78,6 +80,11 @@ export function reduceEvents(events: RunEvent[]): RunState {
         state.status = "running";
         state.stopReason = undefined;
         state.progressDecision = undefined;
+        break;
+      case "run.waiting":
+        state.status = "waiting";
+        state.currentNodeId = undefined;
+        state.stopReason = requiredString(data, "reason");
         break;
       case "run.paused":
         state.status = "paused";
@@ -232,6 +239,51 @@ export function reduceEvents(events: RunEvent[]): RunState {
         entry.failure = requiredString(data, "reason");
         entry.retryable = data.retryable === true;
         entry.updatedAt = event.timestamp;
+        break;
+      }
+      case "wait.registered": {
+        const wait = WaitRuntimeStateSchema.parse(data.wait);
+        if (state.waits.some(({ nodeId }) => nodeId === wait.nodeId))
+          throw new Error(`Wait node ${wait.nodeId} was registered more than once`);
+        const nodeState = state.nodes[wait.nodeId];
+        if (!nodeState) throw new Error(`Unknown wait node ${wait.nodeId}`);
+        nodeState.status = "waiting";
+        state.currentNodeId = undefined;
+        state.waits.push(wait);
+        break;
+      }
+      case "wait.observed": {
+        const nodeId = requiredString(data, "nodeId");
+        const wait = state.waits.find((candidate) => candidate.nodeId === nodeId);
+        if (!wait) throw new Error(`Unknown wait node ${nodeId}`);
+        wait.observations += 1;
+        wait.nextWakeAt = requiredString(data, "nextWakeAt");
+        wait.evidence = Array.isArray(data.evidence)
+          ? data.evidence.map((value) => String(value))
+          : [];
+        wait.updatedAt = event.timestamp;
+        break;
+      }
+      case "wait.satisfied": {
+        const nodeId = requiredString(data, "nodeId");
+        const wait = state.waits.find((candidate) => candidate.nodeId === nodeId);
+        if (!wait) throw new Error(`Unknown wait node ${nodeId}`);
+        wait.status = "satisfied";
+        wait.evidence = Array.isArray(data.evidence)
+          ? data.evidence.map((value) => String(value))
+          : wait.evidence;
+        wait.updatedAt = event.timestamp;
+        break;
+      }
+      case "wait.timed_out": {
+        const nodeId = requiredString(data, "nodeId");
+        const wait = state.waits.find((candidate) => candidate.nodeId === nodeId);
+        if (!wait) throw new Error(`Unknown wait node ${nodeId}`);
+        wait.status = "timed_out";
+        wait.evidence = Array.isArray(data.evidence)
+          ? data.evidence.map((value) => String(value))
+          : wait.evidence;
+        wait.updatedAt = event.timestamp;
         break;
       }
       case "graph.amended": {
