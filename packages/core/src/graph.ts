@@ -4,13 +4,21 @@ import type {
   Graph,
   GraphNode,
   GraphPlan,
+  GraphAmendment,
+  GraphAmendmentDiff,
   Permission,
   AcceptanceAnchor,
   ProbePlan,
   ProbeSpec,
   RunContract,
 } from "./schemas.ts";
-import { GraphPlanSchema, GraphSchema, ProbePlanSchema, RunContractSchema } from "./schemas.ts";
+import {
+  GraphAmendmentSchema,
+  GraphPlanSchema,
+  GraphSchema,
+  ProbePlanSchema,
+  RunContractSchema,
+} from "./schemas.ts";
 
 export type TaskFamily = Graph["family"];
 
@@ -265,7 +273,7 @@ function validateProbePolicy(
   }
 }
 
-function validatePlannedGraphPolicy(
+export function validateGraphPolicy(
   graph: Graph,
   contract: RunContract,
   requiredVerificationProbes: ProbeSpec[],
@@ -396,8 +404,235 @@ export function compilePlannedGraph(
     revision: 0,
   });
   validateGraph(graph);
-  validatePlannedGraphPolicy(graph, contract, requiredVerificationProbes, approvedProbes);
+  validateGraphPolicy(graph, contract, requiredVerificationProbes, approvedProbes);
   return graph;
+}
+
+function unique(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+function edgeKey(edge: Graph["controlEdges"][number]): string {
+  return `${edge.from}\0${edge.to}\0${edge.relation}`;
+}
+
+function materializeAmendmentNode(
+  planned: GraphPlan["nodes"][number],
+  outputSchema: GraphNode["outputSchema"] = resultShape,
+): GraphNode {
+  return node({ ...planned, outputSchema, status: "pending" });
+}
+
+function redirectNodeReferences(
+  nodes: GraphNode[],
+  removedIds: Set<string>,
+  replacementIds: string[],
+): GraphNode[] {
+  const redirect = (values: string[]): string[] =>
+    unique(values.flatMap((value) => (removedIds.has(value) ? replacementIds : [value])));
+  return nodes
+    .filter(({ id }) => !removedIds.has(id))
+    .map((item) => ({
+      ...item,
+      dependsOn: redirect(item.dependsOn),
+      contextSelector: {
+        ...item.contextSelector,
+        predecessorResults: redirect(item.contextSelector.predecessorResults),
+      },
+    }));
+}
+
+function assertReplacementAuthority(
+  actor: "runtime" | "user",
+  targets: GraphNode[],
+  replacements: GraphNode[],
+): void {
+  if (actor === "user" || targets.length === 0) return;
+  const targetScopes = targets.flatMap(({ scope }) => scope);
+  const sideEffectRank: Record<GraphNode["sideEffectClass"], number> = {
+    none: 0,
+    workspace_write: 1,
+    git_commit: 2,
+    external: 3,
+  };
+  const maximumSideEffect = Math.max(
+    ...targets.map(({ sideEffectClass }) => sideEffectRank[sideEffectClass]),
+  );
+  for (const replacement of replacements) {
+    if (
+      replacement.scope.some(
+        (candidate) => !targetScopes.some((boundary) => patternWithin(candidate, boundary)),
+      )
+    )
+      throw new Error(
+        `Amendment broadens scope for ${replacement.id} without explicit user approval`,
+      );
+    if (sideEffectRank[replacement.sideEffectClass] > maximumSideEffect)
+      throw new Error(
+        `Amendment broadens side effects for ${replacement.id} without explicit user approval`,
+      );
+  }
+}
+
+export function applyGraphAmendment(input: {
+  graph: Graph;
+  contract: RunContract;
+  amendment: GraphAmendment;
+  actor: "runtime" | "user";
+  nodeStatuses: Record<string, { status: GraphNode["status"] }>;
+  requiredVerificationProbes: ProbeSpec[];
+  approvedProbes?: ProbeSpec[];
+}): { graph: Graph; diff: GraphAmendmentDiff } {
+  const amendment = GraphAmendmentSchema.parse(input.amendment);
+  const original = GraphSchema.parse(input.graph);
+  if (JSON.stringify(original.anchors) !== JSON.stringify(input.contract.acceptanceAnchors))
+    throw new Error("The graph acceptance anchors differ from the approved run contract");
+  let nodes = [...original.nodes];
+  const originalById = new Map(original.nodes.map((item) => [item.id, item]));
+  const standardEdges = new Set(
+    runtimeControlEdges(original.anchors, original.nodes).map((edge) => edgeKey(edge)),
+  );
+  const customEdges = original.controlEdges.filter((edge) => !standardEdges.has(edgeKey(edge)));
+  const removedAcrossOperations = new Set<string>();
+
+  const target = (id: string): GraphNode => {
+    const item = nodes.find((candidate) => candidate.id === id);
+    if (!item) throw new Error(`Amendment references unknown node ${id}`);
+    const status = input.nodeStatuses[id]?.status;
+    if (status === "accepted") throw new Error(`Accepted node ${id} is immutable`);
+    if (status === "running")
+      throw new Error(`Running node ${id} must be checkpointed before amendment`);
+    return item;
+  };
+  const replacements = (planned: GraphPlan["nodes"], targets: GraphNode[]): GraphNode[] => {
+    const outputSchema = targets[0]?.outputSchema ?? resultShape;
+    const values = planned.map((item) => materializeAmendmentNode(item, outputSchema));
+    const ids = new Set(values.map(({ id }) => id));
+    if (ids.size !== values.length)
+      throw new Error("Amendment replacement node IDs must be unique");
+    const removed = new Set(targets.map(({ id }) => id));
+    for (const value of values) {
+      if (removed.has(value.id))
+        throw new Error(`Amendment replacement ${value.id} must use a new stable node ID`);
+      if (nodes.some((existing) => existing.id === value.id && !removed.has(existing.id)))
+        throw new Error(`Amendment node ID ${value.id} already exists`);
+    }
+    assertReplacementAuthority(input.actor, targets, values);
+    return values;
+  };
+  const replace = (targets: GraphNode[], values: GraphNode[]): void => {
+    const removed = new Set(targets.map(({ id }) => id));
+    for (const id of removed) removedAcrossOperations.add(id);
+    nodes = [
+      ...redirectNodeReferences(
+        nodes,
+        removed,
+        values.map(({ id }) => id),
+      ),
+      ...values,
+    ];
+  };
+
+  for (const operation of amendment.operations) {
+    if (operation.operation === "add") {
+      const authoritySourceIds = unique(operation.authoritySourceIds);
+      if (authoritySourceIds.length !== operation.authoritySourceIds.length)
+        throw new Error("Add authority source IDs must be unique");
+      if (authoritySourceIds.some((id) => !operation.node.dependsOn.includes(id)))
+        throw new Error("An added node must depend on every declared authority source");
+      const authoritySources = authoritySourceIds.map((id) => {
+        const source = nodes.find((candidate) => candidate.id === id);
+        if (!source) throw new Error(`Amendment references unknown authority source ${id}`);
+        return source;
+      });
+      const value = replacements([operation.node], authoritySources);
+      nodes.push(...value);
+      continue;
+    }
+    if (operation.operation === "supersede") {
+      const replaced = target(operation.targetId);
+      replace([replaced], replacements([operation.replacement], [replaced]));
+      continue;
+    }
+    if (operation.operation === "split") {
+      const replaced = target(operation.targetId);
+      replace([replaced], replacements(operation.replacements, [replaced]));
+      continue;
+    }
+    if (operation.operation === "fuse") {
+      const targetIds = unique(operation.targetIds);
+      if (targetIds.length !== operation.targetIds.length)
+        throw new Error("Fuse target IDs must be unique");
+      const fused = targetIds.map((id) => target(id));
+      replace(fused, replacements([operation.replacement], fused));
+      continue;
+    }
+    const changed = target(operation.targetId);
+    nodes = nodes.map((item) =>
+      item.id === changed.id
+        ? {
+            ...item,
+            dependsOn: unique(operation.dependsOn),
+            contextSelector: {
+              ...item.contextSelector,
+              predecessorResults: item.contextSelector.predecessorResults.filter((id) =>
+                operation.dependsOn.includes(id),
+              ),
+            },
+          }
+        : item,
+    );
+  }
+
+  for (const edge of customEdges) {
+    if (removedAcrossOperations.has(edge.from) || removedAcrossOperations.has(edge.to))
+      throw new Error(
+        `Amendment cannot remove control-bound node ${removedAcrossOperations.has(edge.from) ? edge.from : edge.to}`,
+      );
+  }
+  validateGraph(
+    GraphSchema.parse({
+      ...original,
+      nodes,
+      controlEdges: [],
+      revision: original.revision + 1,
+    }),
+  );
+  const graph = GraphSchema.parse({
+    ...original,
+    nodes,
+    anchors: input.contract.acceptanceAnchors,
+    controlEdges: [...runtimeControlEdges(input.contract.acceptanceAnchors, nodes), ...customEdges],
+    revision: original.revision + 1,
+  });
+  validateGraph(graph);
+  validateGraphPolicy(
+    graph,
+    input.contract,
+    input.requiredVerificationProbes,
+    input.approvedProbes ?? input.requiredVerificationProbes,
+  );
+  for (const [id, status] of Object.entries(input.nodeStatuses)) {
+    if (status.status !== "accepted") continue;
+    if (
+      JSON.stringify(originalById.get(id)) !==
+      JSON.stringify(graph.nodes.find((item) => item.id === id))
+    )
+      throw new Error(`Accepted node ${id} was changed by the amendment`);
+  }
+  const finalById = new Map(graph.nodes.map((item) => [item.id, item]));
+  const addedNodeIds = [...finalById.keys()].filter((id) => !originalById.has(id)).sort();
+  const removedNodeIds = [...originalById.keys()].filter((id) => !finalById.has(id)).sort();
+  const changedNodeIds = [...originalById.keys()]
+    .filter(
+      (id) =>
+        finalById.has(id) &&
+        JSON.stringify(originalById.get(id)) !== JSON.stringify(finalById.get(id)),
+    )
+    .sort();
+  if (addedNodeIds.length + removedNodeIds.length + changedNodeIds.length === 0)
+    throw new Error("Amendment did not change the graph");
+  return { graph, diff: { addedNodeIds, removedNodeIds, changedNodeIds } };
 }
 
 function verificationNode(graph: Graph): GraphNode {

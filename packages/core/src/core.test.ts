@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
+  applyGraphAmendment,
   classifyProgress,
   classifyTask,
   codexGraphPlanJsonSchema,
@@ -17,6 +19,7 @@ import {
   verifyRunEvent,
   workerResultJsonSchema,
   type GraphPlan,
+  type GraphAmendment,
   type ProbeResult,
 } from "./index.ts";
 
@@ -188,6 +191,229 @@ describe("run contracts and graphs", () => {
       to: "verify",
       relation: "owns_target",
     });
+  });
+
+  it("applies add, supersede, split, fuse, and dependency amendments under contract policy", () => {
+    const contract = compileRunContract("Refactor the src implementation safely", repository);
+    const verificationProbe = {
+      id: "tests",
+      kind: "command" as const,
+      command: "npm",
+      args: ["test"],
+      expectedExitCode: 0,
+      timeoutMs: 1_000,
+    };
+    const plannedNode = (
+      id: string,
+      dependsOn: string[],
+      sideEffectClass: "none" | "workspace_write" = "workspace_write",
+    ): GraphPlan["nodes"][number] => ({
+      id,
+      kind: sideEffectClass === "none" ? "investigation" : "implementation",
+      objective: `Complete ${id}`,
+      dependsOn,
+      scope: ["src/**"],
+      contextSelector: {
+        includeRepositoryInstructions: true,
+        predecessorResults: dependsOn,
+        relevantPaths: ["src"],
+      },
+      progressProbes: [],
+      completionProbes: [],
+      sideEffectClass,
+    });
+    const graph = compilePlannedGraph(
+      contract,
+      {
+        schemaVersion: 1,
+        family: "refactor",
+        nodes: [
+          plannedNode("inventory", [], "none"),
+          plannedNode("part-a", ["inventory"]),
+          plannedNode("part-b", ["inventory"]),
+          {
+            ...plannedNode("verify", ["part-a", "part-b"], "none"),
+            kind: "verification",
+            scope: ["**/*"],
+            completionProbes: [verificationProbe],
+          },
+        ],
+      },
+      [verificationProbe],
+    );
+    const amendment: GraphAmendment = {
+      schemaVersion: 1,
+      amendmentId: randomUUID(),
+      operations: [
+        {
+          operation: "fuse",
+          targetIds: ["part-a", "part-b"],
+          replacement: plannedNode("fused", ["inventory"]),
+        },
+        {
+          operation: "split",
+          targetId: "fused",
+          replacements: [
+            plannedNode("split-a", ["inventory"]),
+            plannedNode("split-b", ["inventory"]),
+          ],
+        },
+        {
+          operation: "supersede",
+          targetId: "split-a",
+          replacement: plannedNode("revised-a", ["inventory"]),
+        },
+        {
+          operation: "add",
+          node: plannedNode("audit-note", ["inventory"], "none"),
+          authoritySourceIds: ["inventory"],
+        },
+        {
+          operation: "dependency_change",
+          targetId: "verify",
+          dependsOn: ["revised-a", "split-b", "audit-note"],
+        },
+      ],
+      evidence: ["Repository evidence disproves the original file boundary"],
+      rationale: "The original parallel split duplicates a shared implementation boundary",
+      changedStrategy: "Fuse the duplicate work, then split it along the discovered boundary",
+      falsifiableExpectation: "All revised branches converge on the unchanged npm test probe",
+    };
+    const applied = applyGraphAmendment({
+      graph,
+      contract,
+      amendment,
+      actor: "runtime",
+      nodeStatuses: Object.fromEntries(
+        graph.nodes.map(({ id }) => [id, { status: "pending" as const }]),
+      ),
+      requiredVerificationProbes: [verificationProbe],
+      approvedProbes: [verificationProbe],
+    });
+
+    expect(applied.graph.revision).toBe(1);
+    expect(applied.graph.nodes.map(({ id }) => id).sort()).toEqual([
+      "audit-note",
+      "inventory",
+      "revised-a",
+      "split-b",
+      "verify",
+    ]);
+    expect(applied.graph.nodes.find(({ id }) => id === "verify")?.dependsOn.sort()).toEqual([
+      "audit-note",
+      "revised-a",
+      "split-b",
+    ]);
+    expect(applied.graph.anchors).toEqual(contract.acceptanceAnchors);
+    expect(applied.diff).toEqual({
+      addedNodeIds: ["audit-note", "revised-a", "split-b"],
+      removedNodeIds: ["part-a", "part-b"],
+      changedNodeIds: ["verify"],
+    });
+  });
+
+  it("rejects unsafe or ungrounded amendments and requires user approval for authority expansion", () => {
+    const contract = compileRunContract("Implement a substantial feature", repository);
+    const verificationProbe = {
+      id: "tests",
+      kind: "command" as const,
+      command: "npm",
+      args: ["test"],
+      expectedExitCode: 0,
+      timeoutMs: 1_000,
+    };
+    const graph = compileGraph(contract, [verificationProbe]);
+    graph.nodes[0]!.scope = ["src/**"];
+    const replacement = {
+      id: "implement-broader",
+      kind: "implementation" as const,
+      objective: "Implement across the approved repository",
+      dependsOn: [],
+      scope: ["**/*"],
+      contextSelector: {
+        includeRepositoryInstructions: true,
+        predecessorResults: [],
+        relevantPaths: ["src"],
+      },
+      progressProbes: graph.nodes[0]!.progressProbes,
+      completionProbes: [],
+      sideEffectClass: "workspace_write" as const,
+    };
+    const amendment: GraphAmendment = {
+      schemaVersion: 1,
+      amendmentId: randomUUID(),
+      operations: [{ operation: "supersede", targetId: "implement", replacement }],
+      evidence: ["The implementation crosses the original src boundary"],
+      rationale: "The original scope is incomplete",
+      changedStrategy: "Use the broader contract scope",
+      falsifiableExpectation: "The unchanged completion probe will pass",
+    };
+    const apply = (actor: "runtime" | "user", status: "pending" | "accepted" = "pending") =>
+      applyGraphAmendment({
+        graph,
+        contract,
+        amendment,
+        actor,
+        nodeStatuses: { implement: { status }, verify: { status: "pending" } },
+        requiredVerificationProbes: [verificationProbe],
+        approvedProbes: [verificationProbe],
+      });
+
+    expect(() => apply("runtime")).toThrow(/without explicit user approval/);
+    expect(() => apply("user")).not.toThrow();
+    expect(() => apply("user", "accepted")).toThrow(/Accepted node implement is immutable/);
+    expect(() =>
+      applyGraphAmendment({
+        graph,
+        contract,
+        amendment: {
+          ...amendment,
+          amendmentId: randomUUID(),
+          operations: [
+            {
+              operation: "supersede",
+              targetId: "verify",
+              replacement: {
+                id: "verify-weakened",
+                kind: "verification",
+                objective: "Claim completion without the held-out probe",
+                dependsOn: ["implement"],
+                scope: ["**/*"],
+                contextSelector: {
+                  includeRepositoryInstructions: true,
+                  predecessorResults: ["implement"],
+                  relevantPaths: [],
+                },
+                progressProbes: [],
+                completionProbes: [],
+                sideEffectClass: "none",
+              },
+            },
+          ],
+        },
+        actor: "user",
+        nodeStatuses: { implement: { status: "pending" }, verify: { status: "pending" } },
+        requiredVerificationProbes: [verificationProbe],
+        approvedProbes: [verificationProbe],
+      }),
+    ).toThrow(/verification.*probe/i);
+    expect(() =>
+      applyGraphAmendment({
+        graph,
+        contract,
+        amendment: {
+          ...amendment,
+          amendmentId: randomUUID(),
+          operations: [
+            { operation: "dependency_change", targetId: "implement", dependsOn: ["verify"] },
+          ],
+        },
+        actor: "user",
+        nodeStatuses: { implement: { status: "pending" }, verify: { status: "pending" } },
+        requiredVerificationProbes: [verificationProbe],
+        approvedProbes: [verificationProbe],
+      }),
+    ).toThrow(/cycle/);
   });
 
   it("rejects proposed graphs that weaken required proof or exceed local authority", () => {

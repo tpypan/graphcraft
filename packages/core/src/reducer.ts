@@ -143,8 +143,19 @@ export function reduceEvents(events: RunEvent[]): RunState {
         const addedNodeIds = Array.isArray(data.addedNodeIds)
           ? data.addedNodeIds.map((value) => String(value))
           : [];
+        const removedNodeIds = Array.isArray(data.removedNodeIds)
+          ? data.removedNodeIds.map((value) => String(value))
+          : [];
         for (const nodeId of addedNodeIds) {
           state.nodes[nodeId] ??= { status: "pending", attempts: 0 };
+        }
+        for (const nodeId of removedNodeIds) {
+          const nodeState = state.nodes[nodeId];
+          if (!nodeState) throw new Error(`Unknown superseded node ${nodeId}`);
+          if (nodeState.status === "accepted")
+            throw new Error(`Accepted node ${nodeId} cannot be superseded`);
+          nodeState.status = "superseded";
+          if (state.currentNodeId === nodeId) state.currentNodeId = undefined;
         }
         break;
       }

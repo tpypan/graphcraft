@@ -177,6 +177,72 @@ export const GraphPlanSchema = z.strictObject({
   nodes: z.array(PlannedGraphNodeSchema).min(1),
 });
 
+export const GraphAmendmentOperationSchema = z.discriminatedUnion("operation", [
+  z.strictObject({
+    operation: z.literal("add"),
+    node: PlannedGraphNodeSchema,
+    authoritySourceIds: z.array(z.string().min(1)).min(1),
+  }),
+  z.strictObject({
+    operation: z.literal("supersede"),
+    targetId: z.string().min(1),
+    replacement: PlannedGraphNodeSchema,
+  }),
+  z.strictObject({
+    operation: z.literal("split"),
+    targetId: z.string().min(1),
+    replacements: z.array(PlannedGraphNodeSchema).min(2),
+  }),
+  z.strictObject({
+    operation: z.literal("fuse"),
+    targetIds: z.array(z.string().min(1)).min(2),
+    replacement: PlannedGraphNodeSchema,
+  }),
+  z.strictObject({
+    operation: z.literal("dependency_change"),
+    targetId: z.string().min(1),
+    dependsOn: z.array(z.string()),
+  }),
+]);
+
+export const GraphAmendmentSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  amendmentId: z.uuid(),
+  operations: z.array(GraphAmendmentOperationSchema).min(1),
+  evidence: z.array(z.string().min(1)).min(1),
+  rationale: z.string().min(1),
+  changedStrategy: z.string().min(1),
+  falsifiableExpectation: z.string().min(1),
+});
+
+export const GraphAmendmentDiffSchema = z.strictObject({
+  addedNodeIds: z.array(z.string()),
+  removedNodeIds: z.array(z.string()),
+  changedNodeIds: z.array(z.string()),
+});
+
+export const GraphAmendmentRecordSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  proposal: GraphAmendmentSchema,
+  actor: z.enum(["runtime", "user"]),
+  previousRevision: z.number().int().nonnegative(),
+  nextRevision: z.number().int().positive(),
+  diff: GraphAmendmentDiffSchema,
+});
+
+export const GraphRevisionRecordSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  eventSequence: z.number().int().positive(),
+  timestamp: z.iso.datetime(),
+  actor: z.enum(["user", "runtime", "worker", "probe", "host"]),
+  previousRevision: z.number().int().nonnegative(),
+  nextRevision: z.number().int().positive(),
+  rationale: z.string().min(1),
+  evidence: z.array(z.string()),
+  diff: GraphAmendmentDiffSchema,
+  amendment: GraphAmendmentRecordSchema.optional(),
+});
+
 export const ControlEdgeSchema = z.strictObject({
   from: z.string().min(1),
   to: z.string().min(1),
@@ -404,6 +470,11 @@ export type ProbeResult = z.infer<typeof ProbeResultSchema>;
 export type GraphNode = z.infer<typeof GraphNodeSchema>;
 export type PlannedGraphNode = z.infer<typeof PlannedGraphNodeSchema>;
 export type GraphPlan = z.infer<typeof GraphPlanSchema>;
+export type GraphAmendmentOperation = z.infer<typeof GraphAmendmentOperationSchema>;
+export type GraphAmendment = z.infer<typeof GraphAmendmentSchema>;
+export type GraphAmendmentDiff = z.infer<typeof GraphAmendmentDiffSchema>;
+export type GraphAmendmentRecord = z.infer<typeof GraphAmendmentRecordSchema>;
+export type GraphRevisionRecord = z.infer<typeof GraphRevisionRecordSchema>;
 export type Graph = z.infer<typeof GraphSchema>;
 export type ControlDecision = z.infer<typeof ControlDecisionSchema>;
 export type ControlDecisionPacket = z.infer<typeof ControlDecisionPacketSchema>;

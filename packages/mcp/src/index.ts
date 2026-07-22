@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { handleAction } from "@graphcraft/cli";
-import { ProbePlanSchema } from "@graphcraft/core";
+import { GraphAmendmentSchema, ProbePlanSchema } from "@graphcraft/core";
 import metadata from "../tool-metadata.json" with { type: "json" };
 
 export function createGraphcraftServer(): McpServer {
@@ -26,6 +26,7 @@ export function createGraphcraftServer(): McpServer {
           "stop",
           "trace",
           "probes",
+          "amend",
           "decide",
           "doctor",
         ]),
@@ -37,6 +38,7 @@ export function createGraphcraftServer(): McpServer {
         finishLine: z.enum(["local_verified", "committed"]).optional(),
         force: z.boolean().optional(),
         probePlan: ProbePlanSchema.optional(),
+        amendment: GraphAmendmentSchema.optional(),
         controlSource: z.string().optional(),
         controlTarget: z.string().optional(),
         controlVerdict: z.enum(["approve", "veto"]).optional(),

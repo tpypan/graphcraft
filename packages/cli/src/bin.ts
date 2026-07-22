@@ -17,7 +17,7 @@ import {
   type HostName,
 } from "./index.ts";
 import { createRun, executeRun } from "@graphcraft/runtime";
-import type { ProbePlan } from "@graphcraft/core";
+import type { GraphAmendment, ProbePlan } from "@graphcraft/core";
 
 const program = new Command()
   .name("graphcraft")
@@ -165,6 +165,7 @@ program
           graph: await store.loadGraph(),
           probePlan: await store.loadProbePlan(),
           state: await store.loadState(),
+          graphHistory: await store.loadGraphHistory(),
         },
         null,
         2,
@@ -190,6 +191,32 @@ program
     });
     console.log(JSON.stringify(options.set ? result : result.probePlan, null, 2));
   });
+
+program
+  .command("amend")
+  .description("Apply an evidence-backed amendment to unfinished graph work")
+  .argument("[run]")
+  .option("-C, --cwd <path>", "repository path", process.cwd())
+  .requiredOption("--set <file>", "graph amendment proposal JSON file")
+  .option("--approve", "record explicit user approval for authority expansion")
+  .action(
+    async (run: string | undefined, options: { cwd: string; set: string; approve?: boolean }) => {
+      const amendment = JSON.parse(await readFile(options.set, "utf8")) as GraphAmendment;
+      console.log(
+        JSON.stringify(
+          await handleAction({
+            action: "amend",
+            repository: options.cwd,
+            ...(run ? { run } : {}),
+            amendment,
+            approve: options.approve ?? false,
+          }),
+          null,
+          2,
+        ),
+      );
+    },
+  );
 
 program
   .command("decide")

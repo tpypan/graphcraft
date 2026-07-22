@@ -3382,7 +3382,7 @@ import { spawn as spawn4 } from "node:child_process";
 import { access as access2, chmod, copyFile, mkdir as mkdir5 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname as dirname6, join as join8, resolve as resolve3 } from "node:path";
+import { dirname as dirname6, join as join9, resolve as resolve3 } from "node:path";
 import { stdin, stdout } from "node:process";
 
 // package.json
@@ -18152,6 +18152,67 @@ var GraphPlanSchema = external_exports.strictObject({
   family: external_exports.enum(["bug", "feature", "migration", "refactor", "audit"]),
   nodes: external_exports.array(PlannedGraphNodeSchema).min(1)
 });
+var GraphAmendmentOperationSchema = external_exports.discriminatedUnion("operation", [
+  external_exports.strictObject({
+    operation: external_exports.literal("add"),
+    node: PlannedGraphNodeSchema,
+    authoritySourceIds: external_exports.array(external_exports.string().min(1)).min(1)
+  }),
+  external_exports.strictObject({
+    operation: external_exports.literal("supersede"),
+    targetId: external_exports.string().min(1),
+    replacement: PlannedGraphNodeSchema
+  }),
+  external_exports.strictObject({
+    operation: external_exports.literal("split"),
+    targetId: external_exports.string().min(1),
+    replacements: external_exports.array(PlannedGraphNodeSchema).min(2)
+  }),
+  external_exports.strictObject({
+    operation: external_exports.literal("fuse"),
+    targetIds: external_exports.array(external_exports.string().min(1)).min(2),
+    replacement: PlannedGraphNodeSchema
+  }),
+  external_exports.strictObject({
+    operation: external_exports.literal("dependency_change"),
+    targetId: external_exports.string().min(1),
+    dependsOn: external_exports.array(external_exports.string())
+  })
+]);
+var GraphAmendmentSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  amendmentId: external_exports.uuid(),
+  operations: external_exports.array(GraphAmendmentOperationSchema).min(1),
+  evidence: external_exports.array(external_exports.string().min(1)).min(1),
+  rationale: external_exports.string().min(1),
+  changedStrategy: external_exports.string().min(1),
+  falsifiableExpectation: external_exports.string().min(1)
+});
+var GraphAmendmentDiffSchema = external_exports.strictObject({
+  addedNodeIds: external_exports.array(external_exports.string()),
+  removedNodeIds: external_exports.array(external_exports.string()),
+  changedNodeIds: external_exports.array(external_exports.string())
+});
+var GraphAmendmentRecordSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  proposal: GraphAmendmentSchema,
+  actor: external_exports.enum(["runtime", "user"]),
+  previousRevision: external_exports.number().int().nonnegative(),
+  nextRevision: external_exports.number().int().positive(),
+  diff: GraphAmendmentDiffSchema
+});
+var GraphRevisionRecordSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  eventSequence: external_exports.number().int().positive(),
+  timestamp: external_exports.iso.datetime(),
+  actor: external_exports.enum(["user", "runtime", "worker", "probe", "host"]),
+  previousRevision: external_exports.number().int().nonnegative(),
+  nextRevision: external_exports.number().int().positive(),
+  rationale: external_exports.string().min(1),
+  evidence: external_exports.array(external_exports.string()),
+  diff: GraphAmendmentDiffSchema,
+  amendment: GraphAmendmentRecordSchema.optional()
+});
 var ControlEdgeSchema = external_exports.strictObject({
   from: external_exports.string().min(1),
   to: external_exports.string().min(1),
@@ -18649,7 +18710,7 @@ function validateProbePolicy(probe, contract, approvedProbes) {
     throw new Error(`Probe ${probe.id} is not an approved deterministic probe`);
   }
 }
-function validatePlannedGraphPolicy(graph, contract, requiredVerificationProbes, approvedProbes = requiredVerificationProbes) {
+function validateGraphPolicy(graph, contract, requiredVerificationProbes, approvedProbes = requiredVerificationProbes) {
   if (graph.family !== classifyTask(contract.task))
     throw new Error("The planned graph changed the runtime-selected task family");
   const terminalNodes = graph.nodes.filter(
@@ -18743,8 +18804,193 @@ function compilePlannedGraph(contract, plan, requiredVerificationProbes, approve
     revision: 0
   });
   validateGraph(graph);
-  validatePlannedGraphPolicy(graph, contract, requiredVerificationProbes, approvedProbes);
+  validateGraphPolicy(graph, contract, requiredVerificationProbes, approvedProbes);
   return graph;
+}
+function unique(values) {
+  return [...new Set(values)];
+}
+function edgeKey(edge) {
+  return `${edge.from}\0${edge.to}\0${edge.relation}`;
+}
+function materializeAmendmentNode(planned, outputSchema = resultShape) {
+  return node({ ...planned, outputSchema, status: "pending" });
+}
+function redirectNodeReferences(nodes, removedIds, replacementIds) {
+  const redirect = (values) => unique(values.flatMap((value) => removedIds.has(value) ? replacementIds : [value]));
+  return nodes.filter(({ id }) => !removedIds.has(id)).map((item) => ({
+    ...item,
+    dependsOn: redirect(item.dependsOn),
+    contextSelector: {
+      ...item.contextSelector,
+      predecessorResults: redirect(item.contextSelector.predecessorResults)
+    }
+  }));
+}
+function assertReplacementAuthority(actor, targets, replacements) {
+  if (actor === "user" || targets.length === 0) return;
+  const targetScopes = targets.flatMap(({ scope }) => scope);
+  const sideEffectRank = {
+    none: 0,
+    workspace_write: 1,
+    git_commit: 2,
+    external: 3
+  };
+  const maximumSideEffect = Math.max(
+    ...targets.map(({ sideEffectClass }) => sideEffectRank[sideEffectClass])
+  );
+  for (const replacement of replacements) {
+    if (replacement.scope.some(
+      (candidate) => !targetScopes.some((boundary) => patternWithin(candidate, boundary))
+    ))
+      throw new Error(
+        `Amendment broadens scope for ${replacement.id} without explicit user approval`
+      );
+    if (sideEffectRank[replacement.sideEffectClass] > maximumSideEffect)
+      throw new Error(
+        `Amendment broadens side effects for ${replacement.id} without explicit user approval`
+      );
+  }
+}
+function applyGraphAmendment(input) {
+  const amendment = GraphAmendmentSchema.parse(input.amendment);
+  const original = GraphSchema.parse(input.graph);
+  if (JSON.stringify(original.anchors) !== JSON.stringify(input.contract.acceptanceAnchors))
+    throw new Error("The graph acceptance anchors differ from the approved run contract");
+  let nodes = [...original.nodes];
+  const originalById = new Map(original.nodes.map((item) => [item.id, item]));
+  const standardEdges = new Set(
+    runtimeControlEdges(original.anchors, original.nodes).map((edge) => edgeKey(edge))
+  );
+  const customEdges = original.controlEdges.filter((edge) => !standardEdges.has(edgeKey(edge)));
+  const removedAcrossOperations = /* @__PURE__ */ new Set();
+  const target = (id) => {
+    const item = nodes.find((candidate) => candidate.id === id);
+    if (!item) throw new Error(`Amendment references unknown node ${id}`);
+    const status = input.nodeStatuses[id]?.status;
+    if (status === "accepted") throw new Error(`Accepted node ${id} is immutable`);
+    if (status === "running")
+      throw new Error(`Running node ${id} must be checkpointed before amendment`);
+    return item;
+  };
+  const replacements = (planned, targets) => {
+    const outputSchema = targets[0]?.outputSchema ?? resultShape;
+    const values = planned.map((item) => materializeAmendmentNode(item, outputSchema));
+    const ids = new Set(values.map(({ id }) => id));
+    if (ids.size !== values.length)
+      throw new Error("Amendment replacement node IDs must be unique");
+    const removed = new Set(targets.map(({ id }) => id));
+    for (const value of values) {
+      if (removed.has(value.id))
+        throw new Error(`Amendment replacement ${value.id} must use a new stable node ID`);
+      if (nodes.some((existing) => existing.id === value.id && !removed.has(existing.id)))
+        throw new Error(`Amendment node ID ${value.id} already exists`);
+    }
+    assertReplacementAuthority(input.actor, targets, values);
+    return values;
+  };
+  const replace = (targets, values) => {
+    const removed = new Set(targets.map(({ id }) => id));
+    for (const id of removed) removedAcrossOperations.add(id);
+    nodes = [
+      ...redirectNodeReferences(
+        nodes,
+        removed,
+        values.map(({ id }) => id)
+      ),
+      ...values
+    ];
+  };
+  for (const operation of amendment.operations) {
+    if (operation.operation === "add") {
+      const authoritySourceIds = unique(operation.authoritySourceIds);
+      if (authoritySourceIds.length !== operation.authoritySourceIds.length)
+        throw new Error("Add authority source IDs must be unique");
+      if (authoritySourceIds.some((id) => !operation.node.dependsOn.includes(id)))
+        throw new Error("An added node must depend on every declared authority source");
+      const authoritySources = authoritySourceIds.map((id) => {
+        const source = nodes.find((candidate) => candidate.id === id);
+        if (!source) throw new Error(`Amendment references unknown authority source ${id}`);
+        return source;
+      });
+      const value = replacements([operation.node], authoritySources);
+      nodes.push(...value);
+      continue;
+    }
+    if (operation.operation === "supersede") {
+      const replaced = target(operation.targetId);
+      replace([replaced], replacements([operation.replacement], [replaced]));
+      continue;
+    }
+    if (operation.operation === "split") {
+      const replaced = target(operation.targetId);
+      replace([replaced], replacements(operation.replacements, [replaced]));
+      continue;
+    }
+    if (operation.operation === "fuse") {
+      const targetIds = unique(operation.targetIds);
+      if (targetIds.length !== operation.targetIds.length)
+        throw new Error("Fuse target IDs must be unique");
+      const fused = targetIds.map((id) => target(id));
+      replace(fused, replacements([operation.replacement], fused));
+      continue;
+    }
+    const changed = target(operation.targetId);
+    nodes = nodes.map(
+      (item) => item.id === changed.id ? {
+        ...item,
+        dependsOn: unique(operation.dependsOn),
+        contextSelector: {
+          ...item.contextSelector,
+          predecessorResults: item.contextSelector.predecessorResults.filter(
+            (id) => operation.dependsOn.includes(id)
+          )
+        }
+      } : item
+    );
+  }
+  for (const edge of customEdges) {
+    if (removedAcrossOperations.has(edge.from) || removedAcrossOperations.has(edge.to))
+      throw new Error(
+        `Amendment cannot remove control-bound node ${removedAcrossOperations.has(edge.from) ? edge.from : edge.to}`
+      );
+  }
+  validateGraph(
+    GraphSchema.parse({
+      ...original,
+      nodes,
+      controlEdges: [],
+      revision: original.revision + 1
+    })
+  );
+  const graph = GraphSchema.parse({
+    ...original,
+    nodes,
+    anchors: input.contract.acceptanceAnchors,
+    controlEdges: [...runtimeControlEdges(input.contract.acceptanceAnchors, nodes), ...customEdges],
+    revision: original.revision + 1
+  });
+  validateGraph(graph);
+  validateGraphPolicy(
+    graph,
+    input.contract,
+    input.requiredVerificationProbes,
+    input.approvedProbes ?? input.requiredVerificationProbes
+  );
+  for (const [id, status] of Object.entries(input.nodeStatuses)) {
+    if (status.status !== "accepted") continue;
+    if (JSON.stringify(originalById.get(id)) !== JSON.stringify(graph.nodes.find((item) => item.id === id)))
+      throw new Error(`Accepted node ${id} was changed by the amendment`);
+  }
+  const finalById = new Map(graph.nodes.map((item) => [item.id, item]));
+  const addedNodeIds = [...finalById.keys()].filter((id) => !originalById.has(id)).sort();
+  const removedNodeIds = [...originalById.keys()].filter((id) => !finalById.has(id)).sort();
+  const changedNodeIds = [...originalById.keys()].filter(
+    (id) => finalById.has(id) && JSON.stringify(originalById.get(id)) !== JSON.stringify(finalById.get(id))
+  ).sort();
+  if (addedNodeIds.length + removedNodeIds.length + changedNodeIds.length === 0)
+    throw new Error("Amendment did not change the graph");
+  return { graph, diff: { addedNodeIds, removedNodeIds, changedNodeIds } };
 }
 function verificationNode(graph) {
   const terminal = graph.nodes.find(
@@ -19068,8 +19314,17 @@ function reduceEvents(events) {
         break;
       case "graph.amended": {
         const addedNodeIds = Array.isArray(data.addedNodeIds) ? data.addedNodeIds.map((value) => String(value)) : [];
+        const removedNodeIds = Array.isArray(data.removedNodeIds) ? data.removedNodeIds.map((value) => String(value)) : [];
         for (const nodeId of addedNodeIds) {
           state.nodes[nodeId] ??= { status: "pending", attempts: 0 };
+        }
+        for (const nodeId of removedNodeIds) {
+          const nodeState = state.nodes[nodeId];
+          if (!nodeState) throw new Error(`Unknown superseded node ${nodeId}`);
+          if (nodeState.status === "accepted")
+            throw new Error(`Accepted node ${nodeId} cannot be superseded`);
+          nodeState.status = "superseded";
+          if (state.currentNodeId === nodeId) state.currentNodeId = void 0;
         }
         break;
       }
@@ -19879,10 +20134,14 @@ function claudeSemanticVerifierArgs(request) {
   ];
 }
 
-// packages/runtime/src/control.ts
-import { randomUUID as randomUUID4 } from "node:crypto";
-import { readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
+// packages/runtime/src/amendment.ts
 import { join as join2 } from "node:path";
+
+// packages/runtime/src/lock.ts
+import { hostname as hostname3 } from "node:os";
+import { randomUUID as randomUUID3 } from "node:crypto";
+import { mkdir as mkdir2, open, readFile, stat, unlink } from "node:fs/promises";
+import { dirname as dirname2 } from "node:path";
 
 // packages/runtime/src/json.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
@@ -19900,10 +20159,6 @@ async function writeJsonAtomic(path2, value) {
 }
 
 // packages/runtime/src/lock.ts
-import { hostname as hostname3 } from "node:os";
-import { randomUUID as randomUUID3 } from "node:crypto";
-import { mkdir as mkdir2, open, readFile, stat, unlink } from "node:fs/promises";
-import { dirname as dirname2 } from "node:path";
 function processExists(pid) {
   try {
     process.kill(pid, 0);
@@ -19997,12 +20252,83 @@ var RunLock = class {
   }
 };
 
+// packages/runtime/src/amendment.ts
+async function applyRunGraphAmendmentLocked(store, input, actor) {
+  const proposal = GraphAmendmentSchema.parse(input);
+  const events = await store.loadEvents();
+  const existing = events.find(({ type, data }) => {
+    if (type !== "graph.amended" || !data.amendment) return false;
+    const record3 = GraphAmendmentRecordSchema.safeParse(data.amendment);
+    return record3.success && record3.data.proposal.amendmentId === proposal.amendmentId;
+  });
+  if (existing) {
+    return {
+      graph: await store.loadGraph(),
+      amendment: GraphAmendmentRecordSchema.parse(existing.data.amendment)
+    };
+  }
+  const [graph, contract, state, probePlan] = await Promise.all([
+    store.loadGraph(),
+    store.loadContract(),
+    store.loadState(),
+    store.loadProbePlan()
+  ]);
+  if (["awaiting_approval", "completed", "stopped"].includes(state.status))
+    throw new Error(`Graph amendments are not allowed while a run is ${state.status}`);
+  const completionProbes = probePlan.items.filter(({ phase }) => phase === "completion").map(({ probe }) => probe);
+  const applied = applyGraphAmendment({
+    graph,
+    contract,
+    amendment: proposal,
+    actor,
+    nodeStatuses: state.nodes,
+    requiredVerificationProbes: completionProbes,
+    approvedProbes: probePlan.items.map(({ probe }) => probe)
+  });
+  const record2 = GraphAmendmentRecordSchema.parse({
+    schemaVersion: 1,
+    proposal,
+    actor,
+    previousRevision: graph.revision,
+    nextRevision: applied.graph.revision,
+    diff: applied.diff
+  });
+  await store.append(
+    actor === "user" ? "user" : "runtime",
+    "graph.amended",
+    {
+      graph: applied.graph,
+      amendment: record2,
+      ...applied.diff,
+      evidence: proposal.evidence,
+      rationale: proposal.rationale,
+      changedStrategy: proposal.changedStrategy,
+      falsifiableExpectation: proposal.falsifiableExpectation
+    },
+    proposal.amendmentId
+  );
+  await store.saveGraph(applied.graph);
+  return { graph: applied.graph, amendment: record2 };
+}
+async function amendRunGraph(store, input, actor = "runtime") {
+  const lock = new RunLock(join2(store.graphcraftRoot, "locks", `${store.runId}.lock`));
+  await lock.acquire();
+  try {
+    return await applyRunGraphAmendmentLocked(store, input, actor);
+  } finally {
+    await lock.release();
+  }
+}
+
 // packages/runtime/src/control.ts
+import { randomUUID as randomUUID4 } from "node:crypto";
+import { readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
+import { join as join3 } from "node:path";
 var RunControlChannel = class {
   constructor(graphcraftRoot, runId) {
     this.graphcraftRoot = graphcraftRoot;
     this.runId = runId;
-    this.path = join2(graphcraftRoot, "controls", `${runId}.json`);
+    this.path = join3(graphcraftRoot, "controls", `${runId}.json`);
   }
   graphcraftRoot;
   runId;
@@ -20070,7 +20396,7 @@ async function requestRunControl(store, action, reason = action === "pause" ? "P
   if (targetReached(action, state)) return state;
   const channel = new RunControlChannel(store.graphcraftRoot, store.runId);
   const request = await channel.request(action, reason);
-  const lockPath = join2(store.graphcraftRoot, "locks", `${store.runId}.lock`);
+  const lockPath = join3(store.graphcraftRoot, "locks", `${store.runId}.lock`);
   const deadline = Date.now() + waitMs;
   while (Date.now() <= deadline) {
     const lock = new RunLock(lockPath);
@@ -20109,7 +20435,7 @@ async function requestRunControl(store, action, reason = action === "pause" ? "P
 
 // packages/runtime/src/governance.ts
 import { randomUUID as randomUUID5 } from "node:crypto";
-import { join as join3 } from "node:path";
+import { join as join4 } from "node:path";
 function decisionFor(state, sourceId, targetId) {
   const explicit = state.controlDecisions.findLast(
     (decision) => decision.sourceId === sourceId && decision.targetId === targetId
@@ -20450,7 +20776,7 @@ async function evaluateControlAcceptance(store, graph, state, targetId, evidence
   return { allowed: true };
 }
 async function decideRunControl(store, input) {
-  const lock = new RunLock(join3(store.graphcraftRoot, "locks", `${store.runId}.lock`));
+  const lock = new RunLock(join4(store.graphcraftRoot, "locks", `${store.runId}.lock`));
   await lock.acquire();
   try {
     const [graph, state] = await Promise.all([store.loadGraph(), store.loadState()]);
@@ -20493,12 +20819,12 @@ async function decideRunControl(store, input) {
 
 // packages/runtime/src/repository.ts
 import { appendFile, mkdir as mkdir3, readFile as readFile4 } from "node:fs/promises";
-import { basename, dirname as dirname4, isAbsolute as isAbsolute2, join as join5, resolve as resolve2 } from "node:path";
+import { basename, dirname as dirname4, isAbsolute as isAbsolute2, join as join6, resolve as resolve2 } from "node:path";
 
 // packages/probes/src/index.ts
 import { access, readFile as readFile3, stat as stat2 } from "node:fs/promises";
 import { constants } from "node:fs";
-import { dirname as dirname3, join as join4, resolve, sep } from "node:path";
+import { dirname as dirname3, join as join5, resolve, sep } from "node:path";
 
 // packages/probes/src/process.ts
 import { spawn as spawn3 } from "node:child_process";
@@ -20735,10 +21061,10 @@ async function packageCandidates(repositoryPath, family, terms) {
   const tracked = await runProcess("git", ["ls-files"], { cwd: repositoryPath });
   if (tracked.exitCode !== 0) return [];
   const manifests = tracked.stdout.split("\n").filter((path2) => path2 === "package.json" || path2.endsWith("/package.json")).slice(0, 100);
-  const rootManifest = manifests.includes("package.json") ? JSON.parse(await readFile3(join4(repositoryPath, "package.json"), "utf8")) : void 0;
+  const rootManifest = manifests.includes("package.json") ? JSON.parse(await readFile3(join5(repositoryPath, "package.json"), "utf8")) : void 0;
   const candidates = [];
   for (const manifestPath of manifests) {
-    const manifest = JSON.parse(await readFile3(join4(repositoryPath, manifestPath), "utf8"));
+    const manifest = JSON.parse(await readFile3(join5(repositoryPath, manifestPath), "utf8"));
     const directory = dirname3(manifestPath) === "." ? void 0 : dirname3(manifestPath);
     const relevant = !directory || terms.some(
       (term) => directory.toLowerCase().includes(term) || manifest.name?.toLowerCase().includes(term)
@@ -20850,7 +21176,7 @@ async function discoverProbePlan(repositoryPath, task, baseSha) {
     items.push(completion);
   }
   try {
-    await access(join4(repositoryPath, "pyproject.toml"));
+    await access(join5(repositoryPath, "pyproject.toml"));
     items.push({
       phase: "completion",
       purpose: "regression",
@@ -20868,7 +21194,7 @@ async function discoverProbePlan(repositoryPath, task, baseSha) {
   } catch {
   }
   try {
-    await access(join4(repositoryPath, "go.mod"));
+    await access(join5(repositoryPath, "go.mod"));
     items.push({
       phase: "completion",
       purpose: "regression",
@@ -20998,7 +21324,7 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
   ) : [];
   const taskMatches = await Promise.all(
     matchedPaths.map(async (path2) => {
-      const content = await readFile4(join5(repositoryRoot, path2), "utf8").catch(() => "");
+      const content = await readFile4(join6(repositoryRoot, path2), "utf8").catch(() => "");
       const normalized = content.toLowerCase();
       const score = searchTerms.filter((term) => normalized.includes(term)).length;
       const pathScore = searchTerms.filter((term) => path2.toLowerCase().includes(term)).length;
@@ -21023,7 +21349,7 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
   for (const path2 of baselinePaths) {
     if (remainingCharacters <= 0 || files.length >= 7) break;
     if (files.some((file2) => file2.path === path2)) continue;
-    const content = await readFile4(join5(repositoryRoot, path2), "utf8").catch(() => "");
+    const content = await readFile4(join6(repositoryRoot, path2), "utf8").catch(() => "");
     const limit = Math.min(2e3, remainingCharacters);
     const selected = content.slice(0, limit);
     files.push({ path: path2, content: selected, truncated: selected.length < content.length });
@@ -21054,11 +21380,11 @@ function slug(task) {
 }
 async function createRunWorkspace(contract) {
   const branch = `graphcraft/${contract.runId.slice(0, 8)}-${slug(contract.task)}`;
-  const parent = join5(
+  const parent = join6(
     dirname4(contract.repository.root),
     `.${basename(contract.repository.root)}-graphcraft-worktrees`
   );
-  const path2 = join5(parent, contract.runId);
+  const path2 = join6(parent, contract.runId);
   await mkdir3(parent, { recursive: true });
   const registered = await git(contract.repository.root, ["worktree", "list", "--porcelain"]);
   if (registered.includes(`worktree ${path2}`)) return { path: path2, branch, created: false };
@@ -21085,11 +21411,11 @@ async function createAtomicCommit(workspace, task) {
 
 // packages/runtime/src/runner.ts
 import { randomUUID as randomUUID6 } from "node:crypto";
-import { join as join7 } from "node:path";
+import { join as join8 } from "node:path";
 
 // packages/runtime/src/store.ts
 import { appendFile as appendFile2, mkdir as mkdir4, readFile as readFile5, readdir, writeFile as writeFile3 } from "node:fs/promises";
-import { dirname as dirname5, join as join6 } from "node:path";
+import { dirname as dirname5, join as join7 } from "node:path";
 var RunStore = class _RunStore {
   repositoryRoot;
   runId;
@@ -21098,17 +21424,17 @@ var RunStore = class _RunStore {
   constructor(repositoryRoot, runId) {
     this.repositoryRoot = repositoryRoot;
     this.runId = runId;
-    this.graphcraftRoot = join6(repositoryRoot, ".graphcraft");
-    this.runRoot = join6(this.graphcraftRoot, "runs", runId);
+    this.graphcraftRoot = join7(repositoryRoot, ".graphcraft");
+    this.runRoot = join7(this.graphcraftRoot, "runs", runId);
   }
   static async create(repositoryRoot, contract, graph, inputProbePlan) {
     const store = new _RunStore(repositoryRoot, contract.runId);
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
     await Promise.all([
-      mkdir4(join6(store.runRoot, "artifacts"), { recursive: true }),
-      mkdir4(join6(store.runRoot, "capsules"), { recursive: true }),
-      mkdir4(join6(store.runRoot, "reports"), { recursive: true }),
-      mkdir4(join6(store.graphcraftRoot, "locks"), { recursive: true })
+      mkdir4(join7(store.runRoot, "artifacts"), { recursive: true }),
+      mkdir4(join7(store.runRoot, "capsules"), { recursive: true }),
+      mkdir4(join7(store.runRoot, "reports"), { recursive: true }),
+      mkdir4(join7(store.graphcraftRoot, "locks"), { recursive: true })
     ]);
     await Promise.all([
       store.saveContract(contract),
@@ -21131,18 +21457,18 @@ var RunStore = class _RunStore {
     return store;
   }
   eventsPath() {
-    return join6(this.runRoot, "events.jsonl");
+    return join7(this.runRoot, "events.jsonl");
   }
   async saveContract(contract) {
-    await writeJsonAtomic(join6(this.runRoot, "contract.json"), RunContractSchema.parse(contract));
+    await writeJsonAtomic(join7(this.runRoot, "contract.json"), RunContractSchema.parse(contract));
   }
   async loadContract() {
     return RunContractSchema.parse(
-      JSON.parse(await readFile5(join6(this.runRoot, "contract.json"), "utf8"))
+      JSON.parse(await readFile5(join7(this.runRoot, "contract.json"), "utf8"))
     );
   }
   async saveGraph(graph) {
-    await writeJsonAtomic(join6(this.runRoot, "graph.json"), GraphSchema.parse(graph));
+    await writeJsonAtomic(join7(this.runRoot, "graph.json"), GraphSchema.parse(graph));
   }
   async loadGraph() {
     const events = await this.loadEvents();
@@ -21151,14 +21477,14 @@ var RunStore = class _RunStore {
     )?.data.graph;
     if (eventGraph) {
       const graph = GraphSchema.parse(eventGraph);
-      const materialized = await readFile5(join6(this.runRoot, "graph.json"), "utf8").then((value) => GraphSchema.parse(JSON.parse(value))).catch(() => void 0);
+      const materialized = await readFile5(join7(this.runRoot, "graph.json"), "utf8").then((value) => GraphSchema.parse(JSON.parse(value))).catch(() => void 0);
       if (JSON.stringify(materialized) !== JSON.stringify(graph)) await this.saveGraph(graph);
       return graph;
     }
-    return GraphSchema.parse(JSON.parse(await readFile5(join6(this.runRoot, "graph.json"), "utf8")));
+    return GraphSchema.parse(JSON.parse(await readFile5(join7(this.runRoot, "graph.json"), "utf8")));
   }
   async saveProbePlan(probePlan) {
-    await writeJsonAtomic(join6(this.runRoot, "probe-plan.json"), ProbePlanSchema.parse(probePlan));
+    await writeJsonAtomic(join7(this.runRoot, "probe-plan.json"), ProbePlanSchema.parse(probePlan));
   }
   async loadProbePlan() {
     const events = await this.loadEvents();
@@ -21167,14 +21493,14 @@ var RunStore = class _RunStore {
     )?.data.probePlan;
     if (eventPlan) {
       const probePlan = ProbePlanSchema.parse(eventPlan);
-      const materialized = await readFile5(join6(this.runRoot, "probe-plan.json"), "utf8").then((value) => ProbePlanSchema.parse(JSON.parse(value))).catch(() => void 0);
+      const materialized = await readFile5(join7(this.runRoot, "probe-plan.json"), "utf8").then((value) => ProbePlanSchema.parse(JSON.parse(value))).catch(() => void 0);
       if (JSON.stringify(materialized) !== JSON.stringify(probePlan))
         await this.saveProbePlan(probePlan);
       return probePlan;
     }
     try {
       return ProbePlanSchema.parse(
-        JSON.parse(await readFile5(join6(this.runRoot, "probe-plan.json"), "utf8"))
+        JSON.parse(await readFile5(join7(this.runRoot, "probe-plan.json"), "utf8"))
       );
     } catch {
       return probePlanFromGraph(await this.loadGraph());
@@ -21187,7 +21513,7 @@ var RunStore = class _RunStore {
   async loadState() {
     try {
       return RunStateSchema.parse(
-        JSON.parse(await readFile5(join6(this.runRoot, "state.json"), "utf8"))
+        JSON.parse(await readFile5(join7(this.runRoot, "state.json"), "utf8"))
       );
     } catch {
       return await this.rebuildViews();
@@ -21223,13 +21549,13 @@ var RunStore = class _RunStore {
     return await this.materialize(events);
   }
   async writeArtifact(relativePath, value) {
-    const path2 = join6(this.runRoot, "artifacts", relativePath);
+    const path2 = join7(this.runRoot, "artifacts", relativePath);
     await mkdir4(dirname5(path2), { recursive: true });
     await writeFile3(path2, value, { mode: 384 });
     return path2;
   }
   async appendInvocationEvent(invocationId, event) {
-    const path2 = join6(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+    const path2 = join7(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
     await mkdir4(dirname5(path2), { recursive: true });
     await appendFile2(path2, `${JSON.stringify(HostEventSchema.parse(event))}
 `, {
@@ -21239,30 +21565,73 @@ var RunStore = class _RunStore {
     return path2;
   }
   async loadInvocationEvents(invocationId) {
-    const path2 = join6(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+    const path2 = join7(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
     const content = await readFile5(path2, "utf8");
     return content.split("\n").filter(Boolean).map((line) => HostEventSchema.parse(JSON.parse(line)));
   }
+  async loadGraphHistory() {
+    const events = await this.loadEvents();
+    let previous = GraphSchema.parse(events[0]?.data.graph);
+    const history = [];
+    for (const event of events) {
+      if (event.type !== "graph.amended" || !event.data.graph) continue;
+      const graph = GraphSchema.parse(event.data.graph);
+      if (graph.revision !== previous.revision + 1)
+        throw new Error(
+          `Expected graph revision ${previous.revision + 1}, received ${graph.revision}`
+        );
+      const previousById = new Map(previous.nodes.map((item) => [item.id, item]));
+      const nextById = new Map(graph.nodes.map((item) => [item.id, item]));
+      const diff = {
+        addedNodeIds: [...nextById.keys()].filter((id) => !previousById.has(id)).sort(),
+        removedNodeIds: [...previousById.keys()].filter((id) => !nextById.has(id)).sort(),
+        changedNodeIds: [...previousById.keys()].filter(
+          (id) => nextById.has(id) && JSON.stringify(previousById.get(id)) !== JSON.stringify(nextById.get(id))
+        ).sort()
+      };
+      const amendment = GraphAmendmentRecordSchema.safeParse(event.data.amendment);
+      if (amendment.success && (amendment.data.previousRevision !== previous.revision || amendment.data.nextRevision !== graph.revision))
+        throw new Error("Graph amendment record does not match its persisted revisions");
+      history.push(
+        GraphRevisionRecordSchema.parse({
+          schemaVersion: 1,
+          eventSequence: event.sequence,
+          timestamp: event.timestamp,
+          actor: event.actor,
+          previousRevision: previous.revision,
+          nextRevision: graph.revision,
+          rationale: typeof event.data.rationale === "string" ? event.data.rationale : "Graph revision persisted without a rationale",
+          evidence: Array.isArray(event.data.evidence) ? event.data.evidence.map(
+            (value) => typeof value === "string" ? value : JSON.stringify(value)
+          ) : [],
+          diff,
+          ...amendment.success ? { amendment: amendment.data } : {}
+        })
+      );
+      previous = graph;
+    }
+    return history;
+  }
   async writeCapsule(hash2, value) {
-    const path2 = join6(this.runRoot, "capsules", `${hash2}.json`);
+    const path2 = join7(this.runRoot, "capsules", `${hash2}.json`);
     await writeJsonAtomic(path2, value);
     return path2;
   }
   async writeWorkspace(value) {
-    await writeJsonAtomic(join6(this.runRoot, "workspace.json"), value);
+    await writeJsonAtomic(join7(this.runRoot, "workspace.json"), value);
   }
   async loadWorkspace() {
-    return JSON.parse(await readFile5(join6(this.runRoot, "workspace.json"), "utf8"));
+    return JSON.parse(await readFile5(join7(this.runRoot, "workspace.json"), "utf8"));
   }
   async materialize(events) {
     const state = reduceEvents(events);
-    await writeJsonAtomic(join6(this.runRoot, "state.json"), state);
+    await writeJsonAtomic(join7(this.runRoot, "state.json"), state);
     return state;
   }
 };
 async function listRunIds(repositoryRoot) {
   try {
-    const entries = await readdir(join6(repositoryRoot, ".graphcraft", "runs"), {
+    const entries = await readdir(join7(repositoryRoot, ".graphcraft", "runs"), {
       withFileTypes: true
     });
     return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
@@ -21405,7 +21774,7 @@ async function createRun(task, options) {
   return { contract, graph, store, probePlan };
 }
 async function configureRunProbes(store, input) {
-  const lock = new RunLock(join7(store.graphcraftRoot, "locks", `${store.runId}.lock`));
+  const lock = new RunLock(join8(store.graphcraftRoot, "locks", `${store.runId}.lock`));
   await lock.acquire();
   try {
     const state = await store.loadState();
@@ -21447,7 +21816,7 @@ async function executeWorker(input) {
     await recordMissingUsage(input.store, input.resume);
     const reconciliation = await input.adapter.reconcile(input.resume);
     if (reconciliation.state === "completed" && reconciliation.result) {
-      const artifact2 = join7(
+      const artifact2 = join8(
         input.store.runRoot,
         "artifacts",
         "invocations",
@@ -21497,7 +21866,7 @@ async function executeWorker(input) {
   let error51;
   let errorCause;
   let termination;
-  let artifact = join7(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+  let artifact = join8(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
   const execution = input.adapter.execute(
     {
       invocationId,
@@ -21684,7 +22053,7 @@ function nextReadyNode(graph, state) {
     (node2) => state.nodes[node2.id]?.status === "pending" && node2.dependsOn.every((id) => accepted.has(id))
   );
 }
-function addRepairNode(graph, verification, failures) {
+function repairAmendment(graph, verification, failures) {
   const repairCount = graph.nodes.filter((node2) => node2.id.startsWith("repair-verify-")).length;
   const id = `repair-verify-${repairCount + 1}`;
   const originalDependencies = verification.dependsOn.filter(
@@ -21693,6 +22062,8 @@ function addRepairNode(graph, verification, failures) {
   const previousRepair = verification.dependsOn.find(
     (dependency) => dependency.startsWith("repair-verify-")
   );
+  const authoritySources = graph.nodes.filter(({ id: id2 }) => originalDependencies.includes(id2));
+  const failureSignature = failures.map(({ signature }) => signature).sort().join("|");
   const repair = {
     id,
     kind: "diagnostic",
@@ -21701,31 +22072,35 @@ function addRepairNode(graph, verification, failures) {
       ...failures.map((failure) => `${failure.probeId}: ${failure.summary}`)
     ].join("\n"),
     dependsOn: previousRepair ? [...originalDependencies, previousRepair] : originalDependencies,
-    scope: verification.scope,
+    scope: [...new Set(authoritySources.flatMap(({ scope }) => scope))],
     contextSelector: {
       includeRepositoryInstructions: true,
       predecessorResults: verification.dependsOn,
       relevantPaths: []
     },
-    outputSchema: verification.outputSchema,
     progressProbes: verification.completionProbes,
     completionProbes: [],
-    sideEffectClass: "workspace_write",
-    status: "pending"
+    sideEffectClass: "workspace_write"
   };
-  return GraphSchema.parse({
-    ...graph,
-    nodes: [
-      ...graph.nodes.filter((node2) => node2.id !== verification.id),
-      repair,
-      { ...verification, dependsOn: [...originalDependencies, id] }
+  return {
+    schemaVersion: 1,
+    amendmentId: randomUUID6(),
+    operations: [
+      { operation: "add", node: repair, authoritySourceIds: originalDependencies },
+      {
+        operation: "dependency_change",
+        targetId: verification.id,
+        dependsOn: [...originalDependencies, id]
+      }
     ],
-    controlEdges: [
-      ...graph.controlEdges,
-      ...graph.controlEdges.filter((edge) => edge.to === verification.id && edge.relation !== "owns_target").map((edge) => ({ ...edge, to: id }))
+    evidence: [
+      `failure-signature:${failureSignature}`,
+      ...failures.map(({ probeId, summary }) => `${probeId}: ${summary}`)
     ],
-    revision: graph.revision + 1
-  });
+    rationale: "Deterministic completion probes disproved the current remaining strategy",
+    changedStrategy: repairCount === 0 ? "Insert a focused diagnostic repair before retrying finish-line verification" : "Target the changed failure signature with a new repair after the previous repair advanced",
+    falsifiableExpectation: `The next verification will not report failure signature ${failureSignature}`
+  };
 }
 function runtimeVerifierControls(graph, targetId) {
   return graph.controlEdges.some(
@@ -21761,7 +22136,7 @@ async function executeRun(input) {
   const externalSignal = input.signal ?? new AbortController().signal;
   const contract = await input.store.loadContract();
   let graph = await input.store.loadGraph();
-  const lock = new RunLock(join7(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
+  const lock = new RunLock(join8(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
   await lock.acquire();
   const controlChannel = new RunControlChannel(input.store.graphcraftRoot, contract.runId);
   const controlAbort = new AbortController();
@@ -22003,21 +22378,29 @@ async function executeRun(input) {
           await input.store.append("probe", "node.accepted", { nodeId: current.id });
           continue;
         }
+        const failures = results.filter(({ passed }) => !passed);
+        const failureSignature = failures.map(({ signature }) => signature).sort().join("|");
         const existingRepairs = graph.nodes.filter(
           (node2) => node2.id.startsWith("repair-verify-")
         ).length;
         await input.store.append("probe", "node.failed", {
           nodeId: current.id,
-          reason: results.filter(({ passed }) => !passed).map(({ summary }) => summary).join("\n")
+          reason: failures.map(({ summary }) => summary).join("\n")
         });
-        if (existingRepairs >= 1) {
-          const failureEvidence = results.filter(({ passed }) => !passed).map(({ summary }) => summary);
+        const previousRepair = (await input.store.loadGraphHistory()).filter(
+          ({ amendment }) => amendment?.actor === "runtime" && amendment.proposal.rationale === "Deterministic completion probes disproved the current remaining strategy"
+        ).at(-1);
+        const previousFailureSignature = previousRepair?.amendment?.proposal.evidence.find((item) => item.startsWith("failure-signature:"))?.slice("failure-signature:".length);
+        if (existingRepairs >= 3 || previousFailureSignature === failureSignature) {
+          const failureEvidence = failures.map(({ summary }) => summary);
+          const repeated = previousFailureSignature === failureSignature;
+          const rationale = repeated ? "Verification repeated the same failure signature after a changed repair strategy" : "Verification exhausted three distinct repair strategies";
           await recordVerifierControl({
             store: input.store,
             graph,
             targetId: current.id,
             verdict: "veto",
-            rationale: "Verification still fails after a changed repair strategy",
+            rationale,
             evidence: failureEvidence
           });
           const control = await evaluateControlAcceptance(
@@ -22028,24 +22411,18 @@ async function executeRun(input) {
             failureEvidence
           );
           await input.store.append("runtime", "run.blocked", {
-            reason: control.reason ?? "Verification still fails after a changed repair strategy",
-            failures: results.filter(({ passed }) => !passed),
+            reason: control.reason ?? rationale,
+            failures,
             ...control.packet ? { decisionPacket: control.packet } : {}
           });
           return await input.store.loadState();
         }
-        graph = addRepairNode(
-          graph,
-          current,
-          results.filter(({ passed }) => !passed)
+        const applied = await applyRunGraphAmendmentLocked(
+          input.store,
+          repairAmendment(graph, current, failures),
+          "runtime"
         );
-        await input.store.saveGraph(graph);
-        await input.store.append("runtime", "graph.amended", {
-          graph,
-          addedNodeIds: [graph.nodes.find((node2) => node2.id.startsWith("repair-verify-")).id],
-          evidence: results.filter(({ passed }) => !passed),
-          rationale: "Deterministic completion probes failed; schedule one evidence-driven repair"
-        });
+        graph = applied.graph;
         await input.store.append("runtime", "node.reset", {
           nodeId: current.id,
           reason: "Repair scheduled"
@@ -22269,7 +22646,7 @@ async function runHostCommand(command, args, allowFailure = false) {
 async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
   const moduleDirectory = dirname6(fileURLToPath(moduleUrl));
   const candidates = [
-    join8(moduleDirectory, "mcp.mjs"),
+    join9(moduleDirectory, "mcp.mjs"),
     resolve3(moduleDirectory, "../../../dist/mcp.mjs"),
     resolve3(process.cwd(), "dist/mcp.mjs")
   ];
@@ -22283,11 +22660,11 @@ async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
   throw new Error("dist/mcp.mjs is missing; run pnpm build before installing Graphcraft");
 }
 function resolveGraphcraftHome(configuredHome = process.env.GRAPHCRAFT_HOME) {
-  return configuredHome?.trim() ? resolve3(configuredHome) : join8(homedir(), ".graphcraft");
+  return configuredHome?.trim() ? resolve3(configuredHome) : join9(homedir(), ".graphcraft");
 }
 async function stageBundledMcp(sourcePath, graphcraftHome = resolveGraphcraftHome()) {
-  const runtimeDirectory = join8(graphcraftHome, "runtime", GRAPHCRAFT_VERSION);
-  const runtimePath = join8(runtimeDirectory, "mcp.mjs");
+  const runtimeDirectory = join9(graphcraftHome, "runtime", GRAPHCRAFT_VERSION);
+  const runtimePath = join9(runtimeDirectory, "mcp.mjs");
   await mkdir5(runtimeDirectory, { recursive: true });
   if (resolve3(sourcePath) !== resolve3(runtimePath)) await copyFile(sourcePath, runtimePath);
   await chmod(runtimePath, 493);
@@ -22476,11 +22853,21 @@ async function handleAction(input) {
     store.loadProbePlan()
   ]);
   if (input.action === "status") return stateView(state, contract);
-  if (input.action === "inspect") return { contract, graph, probePlan, state };
+  if (input.action === "inspect")
+    return { contract, graph, probePlan, state, graphHistory: await store.loadGraphHistory() };
   if (input.action === "trace") return { events: await store.loadEvents() };
   if (input.action === "probes") {
     if (!input.probePlan) return { probePlan };
     return await configureRunProbes(store, input.probePlan);
+  }
+  if (input.action === "amend") {
+    if (!input.amendment) throw new Error("amendment is required for action=amend");
+    const result = await amendRunGraph(
+      store,
+      input.amendment,
+      input.approve === true ? "user" : "runtime"
+    );
+    return { ...result, graphHistory: await store.loadGraphHistory() };
   }
   if (input.action === "decide") {
     if (!input.controlSource || !input.controlTarget || !input.controlVerdict || !input.rationale)
@@ -22602,7 +22989,8 @@ program2.command("inspect").description("Show the contract, graph, anchors, and 
         contract: await store.loadContract(),
         graph: await store.loadGraph(),
         probePlan: await store.loadProbePlan(),
-        state: await store.loadState()
+        state: await store.loadState(),
+        graphHistory: await store.loadGraphHistory()
       },
       null,
       2
@@ -22619,6 +23007,24 @@ program2.command("probes").description("Show or replace the deterministic probe 
   });
   console.log(JSON.stringify(options.set ? result : result.probePlan, null, 2));
 });
+program2.command("amend").description("Apply an evidence-backed amendment to unfinished graph work").argument("[run]").option("-C, --cwd <path>", "repository path", process.cwd()).requiredOption("--set <file>", "graph amendment proposal JSON file").option("--approve", "record explicit user approval for authority expansion").action(
+  async (run, options) => {
+    const amendment = JSON.parse(await readFile6(options.set, "utf8"));
+    console.log(
+      JSON.stringify(
+        await handleAction({
+          action: "amend",
+          repository: options.cwd,
+          ...run ? { run } : {},
+          amendment,
+          approve: options.approve ?? false
+        }),
+        null,
+        2
+      )
+    );
+  }
+);
 program2.command("decide").description("Resolve a durable control decision as an authorized user-owned source").argument("[run]").option("-C, --cwd <path>", "repository path", process.cwd()).requiredOption("--source <id>", "user-owned control source").requiredOption("--target <id>", "controlled node").addOption(
   new Option("--verdict <verdict>", "decision").choices(["approve", "veto"]).makeOptionMandatory()
 ).requiredOption("--reason <reason>", "decision rationale").option("--evidence <text...>", "supporting evidence").option("--replace <decision>", "explicitly replace a sticky decision").action(

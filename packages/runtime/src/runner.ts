@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import {
-  GraphSchema,
   HostTerminationError,
   SemanticVerifierContextSchema,
   WorkerResultSchema,
@@ -16,12 +15,14 @@ import {
   interruptionReason,
   type EvidenceSnapshot,
   type Graph,
+  type GraphAmendment,
   type GraphPlanner,
   type GraphNode,
   type HostAdapter,
   type HostEvent,
   type HostTermination,
   type InvocationRecord,
+  type PlannedGraphNode,
   type ProbeResult,
   type ProbePlan,
   type RunContract,
@@ -40,6 +41,7 @@ import {
   type ExecutedProbe,
 } from "@graphcraft/probes";
 import { RunLock } from "./lock.ts";
+import { applyRunGraphAmendmentLocked } from "./amendment.ts";
 import { requestRunControl, RunControlChannel } from "./control.ts";
 import {
   evaluateControlAcceptance,
@@ -566,7 +568,11 @@ function nextReadyNode(graph: Graph, state: RunState): GraphNode | undefined {
   );
 }
 
-function addRepairNode(graph: Graph, verification: GraphNode, failures: ProbeResult[]): Graph {
+function repairAmendment(
+  graph: Graph,
+  verification: GraphNode,
+  failures: ProbeResult[],
+): GraphAmendment {
   const repairCount = graph.nodes.filter((node) => node.id.startsWith("repair-verify-")).length;
   const id = `repair-verify-${repairCount + 1}`;
   const originalDependencies = verification.dependsOn.filter(
@@ -575,7 +581,12 @@ function addRepairNode(graph: Graph, verification: GraphNode, failures: ProbeRes
   const previousRepair = verification.dependsOn.find((dependency) =>
     dependency.startsWith("repair-verify-"),
   );
-  const repair: GraphNode = {
+  const authoritySources = graph.nodes.filter(({ id }) => originalDependencies.includes(id));
+  const failureSignature = failures
+    .map(({ signature }) => signature)
+    .sort()
+    .join("|");
+  const repair: PlannedGraphNode = {
     id,
     kind: "diagnostic",
     objective: [
@@ -583,33 +594,38 @@ function addRepairNode(graph: Graph, verification: GraphNode, failures: ProbeRes
       ...failures.map((failure) => `${failure.probeId}: ${failure.summary}`),
     ].join("\n"),
     dependsOn: previousRepair ? [...originalDependencies, previousRepair] : originalDependencies,
-    scope: verification.scope,
+    scope: [...new Set(authoritySources.flatMap(({ scope }) => scope))],
     contextSelector: {
       includeRepositoryInstructions: true,
       predecessorResults: verification.dependsOn,
       relevantPaths: [],
     },
-    outputSchema: verification.outputSchema,
     progressProbes: verification.completionProbes,
     completionProbes: [],
     sideEffectClass: "workspace_write",
-    status: "pending",
   };
-  return GraphSchema.parse({
-    ...graph,
-    nodes: [
-      ...graph.nodes.filter((node) => node.id !== verification.id),
-      repair,
-      { ...verification, dependsOn: [...originalDependencies, id] },
+  return {
+    schemaVersion: 1,
+    amendmentId: randomUUID(),
+    operations: [
+      { operation: "add", node: repair, authoritySourceIds: originalDependencies },
+      {
+        operation: "dependency_change",
+        targetId: verification.id,
+        dependsOn: [...originalDependencies, id],
+      },
     ],
-    controlEdges: [
-      ...graph.controlEdges,
-      ...graph.controlEdges
-        .filter((edge) => edge.to === verification.id && edge.relation !== "owns_target")
-        .map((edge) => ({ ...edge, to: id })),
+    evidence: [
+      `failure-signature:${failureSignature}`,
+      ...failures.map(({ probeId, summary }) => `${probeId}: ${summary}`),
     ],
-    revision: graph.revision + 1,
-  });
+    rationale: "Deterministic completion probes disproved the current remaining strategy",
+    changedStrategy:
+      repairCount === 0
+        ? "Insert a focused diagnostic repair before retrying finish-line verification"
+        : "Target the changed failure signature with a new repair after the previous repair advanced",
+    falsifiableExpectation: `The next verification will not report failure signature ${failureSignature}`,
+  };
 }
 
 function runtimeVerifierControls(graph: Graph, targetId: string): boolean {
@@ -947,26 +963,41 @@ export async function executeRun(input: {
           continue;
         }
 
+        const failures = results.filter(({ passed }) => !passed);
+        const failureSignature = failures
+          .map(({ signature }) => signature)
+          .sort()
+          .join("|");
         const existingRepairs = graph.nodes.filter((node) =>
           node.id.startsWith("repair-verify-"),
         ).length;
         await input.store.append("probe", "node.failed", {
           nodeId: current.id,
-          reason: results
-            .filter(({ passed }) => !passed)
-            .map(({ summary }) => summary)
-            .join("\n"),
+          reason: failures.map(({ summary }) => summary).join("\n"),
         });
-        if (existingRepairs >= 1) {
-          const failureEvidence = results
-            .filter(({ passed }) => !passed)
-            .map(({ summary }) => summary);
+        const previousRepair = (await input.store.loadGraphHistory())
+          .filter(
+            ({ amendment }) =>
+              amendment?.actor === "runtime" &&
+              amendment.proposal.rationale ===
+                "Deterministic completion probes disproved the current remaining strategy",
+          )
+          .at(-1);
+        const previousFailureSignature = previousRepair?.amendment?.proposal.evidence
+          .find((item) => item.startsWith("failure-signature:"))
+          ?.slice("failure-signature:".length);
+        if (existingRepairs >= 3 || previousFailureSignature === failureSignature) {
+          const failureEvidence = failures.map(({ summary }) => summary);
+          const repeated = previousFailureSignature === failureSignature;
+          const rationale = repeated
+            ? "Verification repeated the same failure signature after a changed repair strategy"
+            : "Verification exhausted three distinct repair strategies";
           await recordVerifierControl({
             store: input.store,
             graph,
             targetId: current.id,
             verdict: "veto",
-            rationale: "Verification still fails after a changed repair strategy",
+            rationale,
             evidence: failureEvidence,
           });
           const control = await evaluateControlAcceptance(
@@ -977,24 +1008,18 @@ export async function executeRun(input: {
             failureEvidence,
           );
           await input.store.append("runtime", "run.blocked", {
-            reason: control.reason ?? "Verification still fails after a changed repair strategy",
-            failures: results.filter(({ passed }) => !passed),
+            reason: control.reason ?? rationale,
+            failures,
             ...(control.packet ? { decisionPacket: control.packet } : {}),
           });
           return await input.store.loadState();
         }
-        graph = addRepairNode(
-          graph,
-          current,
-          results.filter(({ passed }) => !passed),
+        const applied = await applyRunGraphAmendmentLocked(
+          input.store,
+          repairAmendment(graph, current, failures),
+          "runtime",
         );
-        await input.store.saveGraph(graph);
-        await input.store.append("runtime", "graph.amended", {
-          graph,
-          addedNodeIds: [graph.nodes.find((node) => node.id.startsWith("repair-verify-"))!.id],
-          evidence: results.filter(({ passed }) => !passed),
-          rationale: "Deterministic completion probes failed; schedule one evidence-driven repair",
-        });
+        graph = applied.graph;
         await input.store.append("runtime", "node.reset", {
           nodeId: current.id,
           reason: "Repair scheduled",

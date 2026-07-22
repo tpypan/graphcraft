@@ -2,6 +2,8 @@ import { appendFile, mkdir, readFile, readdir, writeFile } from "node:fs/promise
 import { dirname, join } from "node:path";
 import {
   GraphSchema,
+  GraphAmendmentRecordSchema,
+  GraphRevisionRecordSchema,
   HostEventSchema,
   ProbePlanSchema,
   RunContractSchema,
@@ -11,6 +13,7 @@ import {
   probePlanFromGraph,
   reduceEvents,
   type Graph,
+  type GraphRevisionRecord,
   type HostEvent,
   type ProbePlan,
   type RunContract,
@@ -208,6 +211,63 @@ export class RunStore {
       .split("\n")
       .filter(Boolean)
       .map((line) => HostEventSchema.parse(JSON.parse(line)));
+  }
+
+  async loadGraphHistory(): Promise<GraphRevisionRecord[]> {
+    const events = await this.loadEvents();
+    let previous = GraphSchema.parse(events[0]?.data.graph);
+    const history: GraphRevisionRecord[] = [];
+    for (const event of events) {
+      if (event.type !== "graph.amended" || !event.data.graph) continue;
+      const graph = GraphSchema.parse(event.data.graph);
+      if (graph.revision !== previous.revision + 1)
+        throw new Error(
+          `Expected graph revision ${previous.revision + 1}, received ${graph.revision}`,
+        );
+      const previousById = new Map(previous.nodes.map((item) => [item.id, item]));
+      const nextById = new Map(graph.nodes.map((item) => [item.id, item]));
+      const diff = {
+        addedNodeIds: [...nextById.keys()].filter((id) => !previousById.has(id)).sort(),
+        removedNodeIds: [...previousById.keys()].filter((id) => !nextById.has(id)).sort(),
+        changedNodeIds: [...previousById.keys()]
+          .filter(
+            (id) =>
+              nextById.has(id) &&
+              JSON.stringify(previousById.get(id)) !== JSON.stringify(nextById.get(id)),
+          )
+          .sort(),
+      };
+      const amendment = GraphAmendmentRecordSchema.safeParse(event.data.amendment);
+      if (
+        amendment.success &&
+        (amendment.data.previousRevision !== previous.revision ||
+          amendment.data.nextRevision !== graph.revision)
+      )
+        throw new Error("Graph amendment record does not match its persisted revisions");
+      history.push(
+        GraphRevisionRecordSchema.parse({
+          schemaVersion: 1,
+          eventSequence: event.sequence,
+          timestamp: event.timestamp,
+          actor: event.actor,
+          previousRevision: previous.revision,
+          nextRevision: graph.revision,
+          rationale:
+            typeof event.data.rationale === "string"
+              ? event.data.rationale
+              : "Graph revision persisted without a rationale",
+          evidence: Array.isArray(event.data.evidence)
+            ? event.data.evidence.map((value) =>
+                typeof value === "string" ? value : JSON.stringify(value),
+              )
+            : [],
+          diff,
+          ...(amendment.success ? { amendment: amendment.data } : {}),
+        }),
+      );
+      previous = graph;
+    }
+    return history;
   }
 
   async writeCapsule(hash: string, value: unknown): Promise<string> {

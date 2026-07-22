@@ -15,6 +15,7 @@ import type {
   HostCapabilities,
   HostEvent,
   InvocationRecord,
+  GraphAmendment,
   PlanningRequest,
   PlanningResult,
   ReconciliationResult,
@@ -33,6 +34,7 @@ import {
 import { RunLock } from "./lock.ts";
 import { createRunWorkspace, discoverPlanningEvidence } from "./repository.ts";
 import { RunStore } from "./store.ts";
+import { amendRunGraph } from "./amendment.ts";
 
 const execFileAsync = promisify(execFile);
 const temporaryRoots: string[] = [];
@@ -849,6 +851,153 @@ describe("durable runtime", () => {
     expect(graph.nodes.map(({ id }) => id)).toContain("repair-verify-1");
   });
 
+  it("uses distinct evidence-driven repair strategies when the failure signature advances", async () => {
+    const repository = await createRepository();
+    await writeFile(
+      join(repository, "verify.mjs"),
+      'import { access } from "node:fs/promises";\nawait access(new URL("./step-one.txt", import.meta.url));\nawait access(new URL("./step-two.txt", import.meta.url));\n',
+    );
+    await git(repository, "add", "verify.mjs");
+    await git(repository, "commit", "-m", "require staged repair evidence");
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+      if (request.capsule.nodeId === "repair-verify-1")
+        await writeFile(join(request.repositoryPath, "step-one.txt"), "done\n");
+      if (request.capsule.nodeId === "repair-verify-2")
+        await writeFile(join(request.repositoryPath, "step-two.txt"), "done\n");
+    });
+    const created = await createRun("Implement a feature requiring staged repairs", {
+      cwd: repository,
+    });
+
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+    const history = await created.store.loadGraphHistory();
+
+    expect(state.status).toBe("completed");
+    expect(adapter.calls).toEqual(["implement", "repair-verify-1", "repair-verify-2"]);
+    expect((await created.store.loadGraph()).revision).toBe(2);
+    expect(history).toHaveLength(2);
+    expect(new Set(history.map(({ amendment }) => amendment?.proposal.changedStrategy)).size).toBe(
+      2,
+    );
+    expect(
+      history.every(
+        ({ amendment }) => (amendment?.proposal.falsifiableExpectation.length ?? 0) > 0,
+      ),
+    ).toBe(true);
+  });
+
+  it("stops when a repair repeats the same deterministic failure signature", async () => {
+    const repository = await createRepository();
+    await writeFile(
+      join(repository, "verify.mjs"),
+      'console.error("unchanged failure");\nprocess.exit(1);\n',
+    );
+    await git(repository, "add", "verify.mjs");
+    await git(repository, "commit", "-m", "add stable failure");
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+      if (request.capsule.nodeId === "repair-verify-1")
+        await writeFile(join(request.repositoryPath, "unrelated.txt"), "changed but unhelpful\n");
+    });
+    const created = await createRun("Implement a feature and stop repeated repairs", {
+      cwd: repository,
+    });
+
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+    const graph = await created.store.loadGraph();
+
+    expect(state.status).toBe("blocked");
+    expect(adapter.calls).toEqual(["implement", "repair-verify-1"]);
+    expect(graph.nodes.map(({ id }) => id)).not.toContain("repair-verify-2");
+    expect(await created.store.loadGraphHistory()).toHaveLength(1);
+    expect(
+      (await created.store.loadEvents()).find(
+        ({ type, data }) =>
+          type === "control.decision" &&
+          (data.decision as { rationale?: string }).rationale?.includes(
+            "repeated the same failure signature",
+          ),
+      ),
+    ).toBeDefined();
+  });
+
+  it("revises unfinished work and resumes without mutating accepted nodes or anchors", async () => {
+    const repository = await createRepository();
+    const initialAdapter = new FakeAdapter(async () => undefined);
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+      planner: initialAdapter,
+    });
+    const blocked = await executeRun({
+      store: created.store,
+      adapter: initialAdapter,
+      approve: true,
+    });
+    expect(blocked.status).toBe("blocked");
+    expect(blocked.nodes.investigate?.status).toBe("accepted");
+    const implement = created.graph.nodes.find(({ id }) => id === "implement")!;
+    const plannedReplacement = (id: string, objective: string) => ({
+      id,
+      kind: implement.kind,
+      objective,
+      dependsOn: implement.dependsOn,
+      scope: implement.scope,
+      contextSelector: implement.contextSelector,
+      progressProbes: implement.progressProbes,
+      completionProbes: implement.completionProbes,
+      sideEffectClass: implement.sideEffectClass,
+    });
+    const amendment: GraphAmendment = {
+      schemaVersion: 1,
+      amendmentId: randomUUID(),
+      operations: [
+        {
+          operation: "split",
+          targetId: "implement",
+          replacements: [
+            plannedReplacement("implement-feature", "Implement the required feature file"),
+            plannedReplacement("implement-proof", "Add independent implementation evidence"),
+          ],
+        },
+      ],
+      evidence: ["The original implementation node made no measurable repository progress"],
+      rationale: "The original objective combined implementation and evidence discovery",
+      changedStrategy: "Split file implementation from independent proof construction",
+      falsifiableExpectation: "Both branches will advance and the unchanged npm test will pass",
+    };
+
+    const amended = await amendRunGraph(created.store, amendment, "runtime");
+    const repeated = await amendRunGraph(created.store, amendment, "runtime");
+    expect(repeated.graph.revision).toBe(amended.graph.revision);
+    const resumeAdapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement-feature")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+      if (request.capsule.nodeId === "implement-proof")
+        await writeFile(join(request.repositoryPath, "proof.txt"), "evidence\n");
+    });
+    const completed = await executeRun({ store: created.store, adapter: resumeAdapter });
+    const events = await created.store.loadEvents();
+
+    expect(completed.status).toBe("completed");
+    expect(completed.nodes.implement?.status).toBe("superseded");
+    expect(completed.nodes.investigate?.status).toBe("accepted");
+    expect(
+      events.filter(({ type, data }) => type === "node.accepted" && data.nodeId === "investigate"),
+    ).toHaveLength(1);
+    expect(amended.graph.anchors).toEqual(created.contract.acceptanceAnchors);
+    expect(amended.amendment.diff).toEqual({
+      addedNodeIds: ["implement-feature", "implement-proof"],
+      removedNodeIds: ["implement"],
+      changedNodeIds: ["verify"],
+    });
+    expect((await created.store.loadGraphHistory()).map(({ amendment }) => amendment)).toEqual([
+      amended.amendment,
+    ]);
+  });
+
   it("stops safely when a write task makes no measurable progress", async () => {
     const repository = await createRepository();
     const adapter = new FakeAdapter(async () => undefined);
@@ -938,6 +1087,14 @@ describe("durable runtime", () => {
       type: "graph.amended",
       data: { rationale: "User edited the deterministic probe plan before approval" },
     });
+    expect(await created.store.loadGraphHistory()).toEqual([
+      expect.objectContaining({
+        previousRevision: 0,
+        nextRevision: 1,
+        rationale: "User edited the deterministic probe plan before approval",
+        diff: expect.objectContaining({ changedNodeIds: ["verify"] }),
+      }),
+    ]);
     await writeFile(join(created.store.runRoot, "graph.json"), "not-json\n");
     await writeFile(join(created.store.runRoot, "probe-plan.json"), "not-json\n");
     expect((await created.store.loadGraph()).revision).toBe(1);

@@ -12,6 +12,7 @@ import {
   graphPlanShape,
   probePlanFromGraph,
   type Graph,
+  type GraphAmendment,
   type HostAdapter,
   type ProbePlan,
   type RunContract,
@@ -19,6 +20,7 @@ import {
 } from "@graphcraft/core";
 import {
   RunStore,
+  amendRunGraph,
   configureRunProbes,
   createRun,
   decideRunControl,
@@ -247,6 +249,7 @@ export interface McpActionInput {
     | "stop"
     | "trace"
     | "probes"
+    | "amend"
     | "decide"
     | "doctor";
   task?: string | undefined;
@@ -257,6 +260,7 @@ export interface McpActionInput {
   finishLine?: "local_verified" | "committed" | undefined;
   force?: boolean | undefined;
   probePlan?: ProbePlan | undefined;
+  amendment?: GraphAmendment | undefined;
   controlSource?: string | undefined;
   controlTarget?: string | undefined;
   controlVerdict?: "approve" | "veto" | undefined;
@@ -321,11 +325,21 @@ export async function handleAction(input: McpActionInput): Promise<Record<string
     store.loadProbePlan(),
   ]);
   if (input.action === "status") return stateView(state, contract);
-  if (input.action === "inspect") return { contract, graph, probePlan, state };
+  if (input.action === "inspect")
+    return { contract, graph, probePlan, state, graphHistory: await store.loadGraphHistory() };
   if (input.action === "trace") return { events: await store.loadEvents() };
   if (input.action === "probes") {
     if (!input.probePlan) return { probePlan };
     return await configureRunProbes(store, input.probePlan);
+  }
+  if (input.action === "amend") {
+    if (!input.amendment) throw new Error("amendment is required for action=amend");
+    const result = await amendRunGraph(
+      store,
+      input.amendment,
+      input.approve === true ? "user" : "runtime",
+    );
+    return { ...result, graphHistory: await store.loadGraphHistory() };
   }
   if (input.action === "decide") {
     if (!input.controlSource || !input.controlTarget || !input.controlVerdict || !input.rationale)

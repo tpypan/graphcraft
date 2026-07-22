@@ -12,6 +12,7 @@
     "stop",
     "trace",
     "probes",
+    "amend",
     "decide",
     "doctor"
   ],
@@ -24,6 +25,7 @@
     "finishLine",
     "force",
     "probePlan",
+    "amendment",
     "controlSource",
     "controlTarget",
     "controlVerdict",
