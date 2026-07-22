@@ -11,6 +11,7 @@
     "@graphcraft/adapter-claude": "workspace:^",
     "@graphcraft/adapter-codex": "workspace:^",
     "@graphcraft/core": "workspace:^",
+    "@graphcraft/github": "workspace:^",
     "@graphcraft/runtime": "workspace:^",
     "commander": "15.0.0"
   }

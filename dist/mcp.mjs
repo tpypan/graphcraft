@@ -23404,15 +23404,15 @@ var makeIssue = (params) => {
       message: issueData.message
     };
   }
-  let errorMessage = "";
+  let errorMessage2 = "";
   const maps = errorMaps.filter((m) => !!m).slice().reverse();
   for (const map2 of maps) {
-    errorMessage = map2(fullIssue, { data, defaultError: errorMessage }).message;
+    errorMessage2 = map2(fullIssue, { data, defaultError: errorMessage2 }).message;
   }
   return {
     ...issueData,
     path: fullPath,
-    message: errorMessage
+    message: errorMessage2
   };
 };
 function addIssueToContext(ctx, issueData) {
@@ -27159,19 +27159,19 @@ var getRefs = (options) => {
 };
 
 // node_modules/.pnpm/zod-to-json-schema@3.25.2_zod@4.4.3/node_modules/zod-to-json-schema/dist/esm/errorMessages.js
-function addErrorMessage(res, key, errorMessage, refs) {
+function addErrorMessage(res, key, errorMessage2, refs) {
   if (!refs?.errorMessages)
     return;
-  if (errorMessage) {
+  if (errorMessage2) {
     res.errorMessage = {
       ...res.errorMessage,
-      [key]: errorMessage
+      [key]: errorMessage2
     };
   }
 }
-function setResponseValueAndErrors(res, key, value, errorMessage, refs) {
+function setResponseValueAndErrors(res, key, value, errorMessage2, refs) {
   res[key] = value;
-  addErrorMessage(res, key, errorMessage, refs);
+  addErrorMessage(res, key, errorMessage2, refs);
 }
 
 // node_modules/.pnpm/zod-to-json-schema@3.25.2_zod@4.4.3/node_modules/zod-to-json-schema/dist/esm/getRelativePath.js
@@ -28482,8 +28482,8 @@ var Protocol = class {
                   if (queuedMessage.type === "response") {
                     resolver(message);
                   } else {
-                    const errorMessage = message;
-                    const error51 = new McpError(errorMessage.error.code, errorMessage.error.message, errorMessage.error.data);
+                    const errorMessage2 = message;
+                    const error51 = new McpError(errorMessage2.error.code, errorMessage2.error.message, errorMessage2.error.data);
                     resolver(error51);
                   }
                 } else {
@@ -29783,23 +29783,23 @@ var Server = class extends Protocol {
       const wrappedHandler = async (request, extra) => {
         const validatedRequest = safeParse3(CallToolRequestSchema, request);
         if (!validatedRequest.success) {
-          const errorMessage = validatedRequest.error instanceof Error ? validatedRequest.error.message : String(validatedRequest.error);
-          throw new McpError(ErrorCode.InvalidParams, `Invalid tools/call request: ${errorMessage}`);
+          const errorMessage2 = validatedRequest.error instanceof Error ? validatedRequest.error.message : String(validatedRequest.error);
+          throw new McpError(ErrorCode.InvalidParams, `Invalid tools/call request: ${errorMessage2}`);
         }
         const { params } = validatedRequest.data;
         const result = await Promise.resolve(handler(request, extra));
         if (params.task) {
           const taskValidationResult = safeParse3(CreateTaskResultSchema, result);
           if (!taskValidationResult.success) {
-            const errorMessage = taskValidationResult.error instanceof Error ? taskValidationResult.error.message : String(taskValidationResult.error);
-            throw new McpError(ErrorCode.InvalidParams, `Invalid task creation result: ${errorMessage}`);
+            const errorMessage2 = taskValidationResult.error instanceof Error ? taskValidationResult.error.message : String(taskValidationResult.error);
+            throw new McpError(ErrorCode.InvalidParams, `Invalid task creation result: ${errorMessage2}`);
           }
           return taskValidationResult.data;
         }
         const validationResult = safeParse3(CallToolResultSchema, result);
         if (!validationResult.success) {
-          const errorMessage = validationResult.error instanceof Error ? validationResult.error.message : String(validationResult.error);
-          throw new McpError(ErrorCode.InvalidParams, `Invalid tools/call result: ${errorMessage}`);
+          const errorMessage2 = validationResult.error instanceof Error ? validationResult.error.message : String(validationResult.error);
+          throw new McpError(ErrorCode.InvalidParams, `Invalid tools/call result: ${errorMessage2}`);
         }
         return validationResult.data;
       };
@@ -30293,12 +30293,12 @@ var McpServer = class {
    * @param errorMessage - The error message.
    * @returns The tool error result.
    */
-  createToolError(errorMessage) {
+  createToolError(errorMessage2) {
     return {
       content: [
         {
           type: "text",
-          text: errorMessage
+          text: errorMessage2
         }
       ],
       isError: true
@@ -30316,8 +30316,8 @@ var McpServer = class {
     const parseResult2 = await safeParseAsync3(schemaToParse, args);
     if (!parseResult2.success) {
       const error51 = "error" in parseResult2 ? parseResult2.error : "Unknown error";
-      const errorMessage = getParseErrorMessage(error51);
-      throw new McpError(ErrorCode.InvalidParams, `Input validation error: Invalid arguments for tool ${toolName}: ${errorMessage}`);
+      const errorMessage2 = getParseErrorMessage(error51);
+      throw new McpError(ErrorCode.InvalidParams, `Input validation error: Invalid arguments for tool ${toolName}: ${errorMessage2}`);
     }
     return parseResult2.data;
   }
@@ -30341,8 +30341,8 @@ var McpServer = class {
     const parseResult2 = await safeParseAsync3(outputObj, result.structuredContent);
     if (!parseResult2.success) {
       const error51 = "error" in parseResult2 ? parseResult2.error : "Unknown error";
-      const errorMessage = getParseErrorMessage(error51);
-      throw new McpError(ErrorCode.InvalidParams, `Output validation error: Invalid structured content for tool ${toolName}: ${errorMessage}`);
+      const errorMessage2 = getParseErrorMessage(error51);
+      throw new McpError(ErrorCode.InvalidParams, `Output validation error: Invalid structured content for tool ${toolName}: ${errorMessage2}`);
     }
   }
   /**
@@ -30554,8 +30554,8 @@ var McpServer = class {
         const parseResult2 = await safeParseAsync3(argsObj, request.params.arguments);
         if (!parseResult2.success) {
           const error51 = "error" in parseResult2 ? parseResult2.error : "Unknown error";
-          const errorMessage = getParseErrorMessage(error51);
-          throw new McpError(ErrorCode.InvalidParams, `Invalid arguments for prompt ${request.params.name}: ${errorMessage}`);
+          const errorMessage2 = getParseErrorMessage(error51);
+          throw new McpError(ErrorCode.InvalidParams, `Invalid arguments for prompt ${request.params.name}: ${errorMessage2}`);
         }
         const args = parseResult2.data;
         const cb = prompt.callback;
@@ -34290,6 +34290,496 @@ function claudeSemanticVerifierArgs(request, policy) {
   ];
 }
 
+// packages/github/src/index.ts
+import { spawn as spawn3 } from "node:child_process";
+var PermissionSchema2 = external_exports.enum(["ADMIN", "MAINTAIN", "WRITE", "TRIAGE", "READ", "NONE"]);
+var RequiredStatusCheckSchema = external_exports.strictObject({
+  context: external_exports.string().min(1),
+  appId: external_exports.number().int().optional()
+});
+var GitHubBranchProtectionSchema = external_exports.strictObject({
+  status: external_exports.enum(["protected", "unprotected", "unknown"]),
+  branch: external_exports.string().min(1),
+  requiredStatusChecks: external_exports.array(RequiredStatusCheckSchema),
+  requiresApprovingReviews: external_exports.boolean().optional(),
+  requiredApprovingReviewCount: external_exports.number().int().nonnegative().optional(),
+  error: external_exports.string().optional()
+});
+var GitHubCapabilityReportSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  installed: external_exports.boolean(),
+  authenticated: external_exports.boolean(),
+  repositoryAccessible: external_exports.boolean(),
+  readyForSnapshot: external_exports.boolean(),
+  commandVersion: external_exports.string().optional(),
+  host: external_exports.string().optional(),
+  nameWithOwner: external_exports.string().optional(),
+  url: external_exports.string().url().optional(),
+  defaultBranch: external_exports.string().optional(),
+  viewerPermission: PermissionSchema2.optional(),
+  canRead: external_exports.boolean(),
+  canWrite: external_exports.boolean(),
+  branchProtection: GitHubBranchProtectionSchema.optional(),
+  errors: external_exports.array(external_exports.string())
+});
+var LatestThreadCommentSchema = external_exports.strictObject({
+  id: external_exports.string().min(1),
+  author: external_exports.string().optional(),
+  body: external_exports.string(),
+  url: external_exports.string().url(),
+  createdAt: external_exports.iso.datetime()
+});
+var ReviewThreadSchema = external_exports.strictObject({
+  id: external_exports.string().min(1),
+  isResolved: external_exports.boolean(),
+  isOutdated: external_exports.boolean(),
+  path: external_exports.string().optional(),
+  line: external_exports.number().int().positive().optional(),
+  commentCount: external_exports.number().int().nonnegative(),
+  latestComment: LatestThreadCommentSchema.optional()
+});
+var PullRequestReviewSchema = external_exports.strictObject({
+  id: external_exports.string().min(1),
+  state: external_exports.string().min(1),
+  author: external_exports.string().optional(),
+  commitSha: external_exports.string().optional(),
+  submittedAt: external_exports.iso.datetime().optional()
+});
+var CheckObservationSchema = external_exports.strictObject({
+  id: external_exports.string().min(1),
+  kind: external_exports.enum(["check_run", "status_context"]),
+  name: external_exports.string().min(1),
+  status: external_exports.string().min(1),
+  conclusion: external_exports.string().optional(),
+  detailsUrl: external_exports.string().url().optional(),
+  appId: external_exports.number().int().optional()
+});
+var RequiredCheckObservationSchema = external_exports.strictObject({
+  context: external_exports.string().min(1),
+  appId: external_exports.number().int().optional(),
+  state: external_exports.enum(["success", "pending", "failure", "missing", "unknown"]),
+  matchingCheckIds: external_exports.array(external_exports.string())
+});
+var RateLimitResourceSchema = external_exports.strictObject({
+  limit: external_exports.number().int().nonnegative(),
+  used: external_exports.number().int().nonnegative(),
+  remaining: external_exports.number().int().nonnegative(),
+  resetAt: external_exports.iso.datetime()
+});
+var GitHubPullRequestSnapshotSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  snapshotId: external_exports.string().regex(/^[a-f0-9]{64}$/),
+  contentTrust: external_exports.literal("untrusted_external"),
+  repository: external_exports.strictObject({
+    nameWithOwner: external_exports.string().min(3),
+    url: external_exports.string().url(),
+    host: external_exports.string().min(1),
+    viewerPermission: PermissionSchema2
+  }),
+  pullRequest: external_exports.strictObject({
+    number: external_exports.number().int().positive(),
+    url: external_exports.string().url(),
+    title: external_exports.string(),
+    state: external_exports.string().min(1),
+    isDraft: external_exports.boolean(),
+    headRefName: external_exports.string().min(1),
+    baseRefName: external_exports.string().min(1),
+    headSha: external_exports.string().min(7),
+    baseSha: external_exports.string().min(7),
+    mergeable: external_exports.string().min(1),
+    reviewDecision: external_exports.string().optional(),
+    updatedAt: external_exports.iso.datetime()
+  }),
+  binding: external_exports.strictObject({
+    headSha: external_exports.string().min(7),
+    baseSha: external_exports.string().min(7),
+    capturedAt: external_exports.iso.datetime()
+  }),
+  branchProtection: GitHubBranchProtectionSchema,
+  requiredChecks: external_exports.array(RequiredCheckObservationSchema),
+  checks: external_exports.array(CheckObservationSchema),
+  reviewThreads: external_exports.array(ReviewThreadSchema),
+  reviews: external_exports.array(PullRequestReviewSchema),
+  rateLimit: external_exports.strictObject({
+    core: RateLimitResourceSchema,
+    graphql: RateLimitResourceSchema
+  })
+});
+var GitHubCommandError = class extends Error {
+  constructor(message, exitCode) {
+    super(message);
+    this.exitCode = exitCode;
+    this.name = "GitHubCommandError";
+  }
+  exitCode;
+};
+async function runCommand(options, args) {
+  const command = options.command ?? "gh";
+  return await new Promise((resolve5, reject) => {
+    const child = spawn3(command, args, {
+      cwd: options.cwd,
+      env: options.env ?? process.env,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    let outputBytes = 0;
+    let failure;
+    let forceTimer;
+    const terminate = (reason) => {
+      if (failure) return;
+      failure = reason;
+      child.kill("SIGTERM");
+      forceTimer = setTimeout(() => child.kill("SIGKILL"), 2e3);
+      forceTimer.unref();
+    };
+    const timeout = setTimeout(
+      () => terminate(`gh exceeded its ${options.timeoutMs ?? 6e4}ms timeout`),
+      options.timeoutMs ?? 6e4
+    );
+    timeout.unref();
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      outputBytes += Buffer.byteLength(chunk);
+      if (outputBytes > 16 * 1024 * 1024)
+        return terminate("gh output exceeded the 16MiB safety limit");
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      outputBytes += Buffer.byteLength(chunk);
+      if (outputBytes > 16 * 1024 * 1024)
+        return terminate("gh output exceeded the 16MiB safety limit");
+      stderr += chunk;
+    });
+    child.once("error", (error51) => {
+      clearTimeout(timeout);
+      if (forceTimer) clearTimeout(forceTimer);
+      reject(error51);
+    });
+    child.once("close", (exitCode) => {
+      clearTimeout(timeout);
+      if (forceTimer) clearTimeout(forceTimer);
+      if (failure) return reject(new GitHubCommandError(failure, exitCode ?? 1));
+      const code = exitCode ?? 1;
+      if (code === 0) resolve5({ stdout, stderr });
+      else
+        reject(
+          new GitHubCommandError(
+            stderr.trim() || stdout.trim() || `${command} ${args[0] ?? ""} exited ${code}`,
+            code
+          )
+        );
+    });
+  });
+}
+async function jsonCommand(options, args) {
+  const { stdout } = await runCommand(options, args);
+  try {
+    return JSON.parse(stdout);
+  } catch {
+    throw new Error(`gh returned invalid JSON for ${args.slice(0, 2).join(" ")}`);
+  }
+}
+var RepoViewSchema = external_exports.object({
+  nameWithOwner: external_exports.string().min(3),
+  url: external_exports.string().url(),
+  viewerPermission: PermissionSchema2,
+  defaultBranchRef: external_exports.object({ name: external_exports.string().min(1) })
+});
+function errorMessage(error51) {
+  return error51 instanceof Error ? error51.message : String(error51);
+}
+async function readBranchProtection(options, input) {
+  const branchPath = encodeURIComponent(input.branch);
+  const endpoint = `repos/${input.nameWithOwner}/branches/${branchPath}`;
+  let branch;
+  try {
+    branch = external_exports.object({ protected: external_exports.boolean() }).parse(await jsonCommand(options, ["api", "--hostname", input.host, endpoint]));
+  } catch (error51) {
+    return GitHubBranchProtectionSchema.parse({
+      status: "unknown",
+      branch: input.branch,
+      requiredStatusChecks: [],
+      error: `Cannot inspect base branch protection: ${errorMessage(error51)}`
+    });
+  }
+  if (!branch.protected)
+    return GitHubBranchProtectionSchema.parse({
+      status: "unprotected",
+      branch: input.branch,
+      requiredStatusChecks: []
+    });
+  try {
+    const protection = external_exports.object({
+      required_status_checks: external_exports.object({
+        contexts: external_exports.array(external_exports.string()).optional(),
+        checks: external_exports.array(
+          external_exports.object({
+            context: external_exports.string().min(1),
+            app_id: external_exports.number().int().nullable().optional()
+          })
+        ).optional()
+      }).nullable().optional(),
+      required_pull_request_reviews: external_exports.object({ required_approving_review_count: external_exports.number().int().nonnegative() }).nullable().optional()
+    }).parse(
+      await jsonCommand(options, ["api", "--hostname", input.host, `${endpoint}/protection`])
+    );
+    const checks = protection.required_status_checks?.checks;
+    const requiredStatusChecks = checks?.length ? checks.map(({ context, app_id }) => ({
+      context,
+      ...typeof app_id === "number" && app_id >= 0 ? { appId: app_id } : {}
+    })) : (protection.required_status_checks?.contexts ?? []).map((context) => ({ context }));
+    return GitHubBranchProtectionSchema.parse({
+      status: "protected",
+      branch: input.branch,
+      requiredStatusChecks,
+      requiresApprovingReviews: protection.required_pull_request_reviews != null,
+      ...protection.required_pull_request_reviews ? {
+        requiredApprovingReviewCount: protection.required_pull_request_reviews.required_approving_review_count
+      } : {}
+    });
+  } catch (error51) {
+    return GitHubBranchProtectionSchema.parse({
+      status: "unknown",
+      branch: input.branch,
+      requiredStatusChecks: [],
+      error: `Base branch is protected but its rules are unavailable: ${errorMessage(error51)}`
+    });
+  }
+}
+async function probeGitHub(options) {
+  const errors = [];
+  let commandVersion2;
+  try {
+    commandVersion2 = (await runCommand(options, ["--version"])).stdout.split("\n")[0]?.trim();
+  } catch (error51) {
+    errors.push(`GitHub CLI is unavailable: ${errorMessage(error51)}`);
+    return GitHubCapabilityReportSchema.parse({
+      schemaVersion: 1,
+      installed: false,
+      authenticated: false,
+      repositoryAccessible: false,
+      readyForSnapshot: false,
+      canRead: false,
+      canWrite: false,
+      errors
+    });
+  }
+  try {
+    await runCommand(options, ["auth", "status", "--active"]);
+  } catch (error51) {
+    errors.push(`GitHub CLI authentication is unavailable: ${errorMessage(error51)}`);
+    return GitHubCapabilityReportSchema.parse({
+      schemaVersion: 1,
+      installed: true,
+      authenticated: false,
+      repositoryAccessible: false,
+      readyForSnapshot: false,
+      commandVersion: commandVersion2,
+      canRead: false,
+      canWrite: false,
+      errors
+    });
+  }
+  let repository;
+  try {
+    repository = RepoViewSchema.parse(
+      await jsonCommand(options, [
+        "repo",
+        "view",
+        "--json",
+        "nameWithOwner,url,viewerPermission,defaultBranchRef"
+      ])
+    );
+  } catch (error51) {
+    errors.push(`GitHub repository access is unavailable: ${errorMessage(error51)}`);
+    return GitHubCapabilityReportSchema.parse({
+      schemaVersion: 1,
+      installed: true,
+      authenticated: true,
+      repositoryAccessible: false,
+      readyForSnapshot: false,
+      commandVersion: commandVersion2,
+      canRead: false,
+      canWrite: false,
+      errors
+    });
+  }
+  const host = new URL(repository.url).hostname;
+  const branch = options.baseBranch ?? repository.defaultBranchRef.name;
+  const branchProtection = await readBranchProtection(options, {
+    host,
+    nameWithOwner: repository.nameWithOwner,
+    branch
+  });
+  if (branchProtection.status === "unknown" && branchProtection.error)
+    errors.push(branchProtection.error);
+  const canRead = repository.viewerPermission !== "NONE";
+  const canWrite = ["ADMIN", "MAINTAIN", "WRITE"].includes(repository.viewerPermission);
+  if (!canRead) errors.push("The authenticated account has no readable repository permission");
+  return GitHubCapabilityReportSchema.parse({
+    schemaVersion: 1,
+    installed: true,
+    authenticated: true,
+    repositoryAccessible: true,
+    readyForSnapshot: canRead && branchProtection.status !== "unknown",
+    commandVersion: commandVersion2,
+    host,
+    nameWithOwner: repository.nameWithOwner,
+    url: repository.url,
+    defaultBranch: repository.defaultBranchRef.name,
+    viewerPermission: repository.viewerPermission,
+    canRead,
+    canWrite,
+    branchProtection,
+    errors
+  });
+}
+var RateLimitSchema = external_exports.strictObject({
+  cost: external_exports.number().int().nonnegative(),
+  remaining: external_exports.number().int().nonnegative(),
+  resetAt: external_exports.iso.datetime()
+});
+var PageInfoSchema = external_exports.strictObject({
+  hasNextPage: external_exports.boolean(),
+  endCursor: external_exports.string().nullable()
+});
+var PullRequestIdentitySchema = external_exports.object({
+  number: external_exports.number().int().positive(),
+  url: external_exports.string().url(),
+  title: external_exports.string(),
+  state: external_exports.string().min(1),
+  isDraft: external_exports.boolean(),
+  headRefName: external_exports.string().min(1),
+  baseRefName: external_exports.string().min(1),
+  headRefOid: external_exports.string().min(7),
+  baseRefOid: external_exports.string().min(7),
+  mergeable: external_exports.string().min(1),
+  reviewDecision: external_exports.string().nullable(),
+  updatedAt: external_exports.iso.datetime()
+});
+var ThreadPageResponseSchema = external_exports.strictObject({
+  data: external_exports.strictObject({
+    repository: external_exports.strictObject({
+      url: external_exports.string().url(),
+      viewerPermission: PermissionSchema2,
+      pullRequest: PullRequestIdentitySchema.extend({
+        reviewThreads: external_exports.strictObject({
+          nodes: external_exports.array(
+            external_exports.strictObject({
+              id: external_exports.string().min(1),
+              isResolved: external_exports.boolean(),
+              isOutdated: external_exports.boolean(),
+              path: external_exports.string().nullable(),
+              line: external_exports.number().int().positive().nullable(),
+              comments: external_exports.strictObject({
+                totalCount: external_exports.number().int().nonnegative(),
+                nodes: external_exports.array(
+                  external_exports.strictObject({
+                    id: external_exports.string().min(1),
+                    author: external_exports.strictObject({ login: external_exports.string() }).nullable(),
+                    body: external_exports.string(),
+                    url: external_exports.string().url(),
+                    createdAt: external_exports.iso.datetime()
+                  })
+                )
+              })
+            })
+          ),
+          pageInfo: PageInfoSchema
+        })
+      })
+    }),
+    rateLimit: RateLimitSchema
+  })
+});
+var ReviewsPageResponseSchema = external_exports.strictObject({
+  data: external_exports.strictObject({
+    repository: external_exports.strictObject({
+      pullRequest: external_exports.strictObject({
+        headRefOid: external_exports.string().min(7),
+        baseRefOid: external_exports.string().min(7),
+        reviews: external_exports.strictObject({
+          nodes: external_exports.array(
+            external_exports.strictObject({
+              id: external_exports.string().min(1),
+              state: external_exports.string().min(1),
+              author: external_exports.strictObject({ login: external_exports.string() }).nullable(),
+              commit: external_exports.strictObject({ oid: external_exports.string().min(7) }).nullable(),
+              submittedAt: external_exports.iso.datetime().nullable()
+            })
+          ),
+          pageInfo: PageInfoSchema
+        })
+      })
+    }),
+    rateLimit: RateLimitSchema
+  })
+});
+var CheckNodeSchema = external_exports.discriminatedUnion("__typename", [
+  external_exports.strictObject({
+    __typename: external_exports.literal("CheckRun"),
+    id: external_exports.string().min(1),
+    name: external_exports.string().min(1),
+    status: external_exports.string().min(1),
+    conclusion: external_exports.string().nullable(),
+    detailsUrl: external_exports.string().url().nullable(),
+    app: external_exports.strictObject({ databaseId: external_exports.number().int() }).nullable()
+  }),
+  external_exports.strictObject({
+    __typename: external_exports.literal("StatusContext"),
+    id: external_exports.string().min(1),
+    context: external_exports.string().min(1),
+    state: external_exports.string().min(1),
+    targetUrl: external_exports.string().url().nullable()
+  })
+]);
+var ChecksPageResponseSchema = external_exports.strictObject({
+  data: external_exports.strictObject({
+    repository: external_exports.strictObject({
+      object: external_exports.strictObject({
+        oid: external_exports.string().min(7),
+        statusCheckRollup: external_exports.strictObject({
+          contexts: external_exports.strictObject({
+            nodes: external_exports.array(CheckNodeSchema),
+            pageInfo: PageInfoSchema
+          })
+        }).nullable()
+      })
+    }),
+    rateLimit: RateLimitSchema
+  })
+});
+var IdentityResponseSchema = external_exports.strictObject({
+  data: external_exports.strictObject({
+    repository: external_exports.strictObject({
+      pullRequest: external_exports.strictObject({
+        headRefOid: external_exports.string().min(7),
+        baseRefOid: external_exports.string().min(7)
+      })
+    }),
+    rateLimit: RateLimitSchema
+  })
+});
+var ApiRateLimitSchema = external_exports.object({
+  resources: external_exports.object({
+    core: external_exports.object({
+      limit: external_exports.number().int().nonnegative(),
+      used: external_exports.number().int().nonnegative(),
+      remaining: external_exports.number().int().nonnegative(),
+      reset: external_exports.number().int().nonnegative()
+    }),
+    graphql: external_exports.object({
+      limit: external_exports.number().int().nonnegative(),
+      used: external_exports.number().int().nonnegative(),
+      remaining: external_exports.number().int().nonnegative(),
+      reset: external_exports.number().int().nonnegative()
+    })
+  })
+});
+
 // packages/runtime/src/amendment.ts
 import { join as join2 } from "node:path";
 
@@ -34511,12 +35001,12 @@ import { constants } from "node:fs";
 import { dirname as dirname3, join as join3, resolve, sep } from "node:path";
 
 // packages/probes/src/process.ts
-import { spawn as spawn3 } from "node:child_process";
+import { spawn as spawn4 } from "node:child_process";
 async function runProcess(command, args, options) {
   const started = performance.now();
   const timeoutMs = options.timeoutMs ?? 12e4;
   return await new Promise((resolve5, reject) => {
-    const child = spawn3(command, args, {
+    const child = spawn4(command, args, {
       cwd: options.cwd,
       env: { ...process.env, ...options.env, NO_COLOR: "1", FORCE_COLOR: "0" },
       shell: false,
@@ -38536,9 +39026,10 @@ async function storeFor(cwd, runReference) {
 async function handleAction(input) {
   const cwd = input.repository ?? process.cwd();
   if (input.action === "doctor") {
-    const [codex, claude] = await Promise.all([
+    const [codex, claude, github] = await Promise.all([
       new CodexAdapter().probe(),
-      new ClaudeAdapter().probe()
+      new ClaudeAdapter().probe(),
+      probeGitHub({ cwd })
     ]);
     let repository;
     try {
@@ -38546,7 +39037,7 @@ async function handleAction(input) {
     } catch (error51) {
       repository = { error: error51.message };
     }
-    return { node: process.version, codex, claude, repository };
+    return { node: process.version, codex, claude, github, repository };
   }
   if (input.action === "run") {
     if (!input.task) throw new Error("task is required for action=run");

@@ -37,6 +37,7 @@ import {
   type HostExecutionPolicy,
   type ProbePlan,
 } from "@graphcraft/core";
+import { captureGitHubPullRequestSnapshot } from "@graphcraft/github";
 
 const program = new Command()
   .name("graphcraft")
@@ -586,6 +587,24 @@ program
     else
       for (const event of events)
         console.log(`${event.sequence}\t${event.timestamp}\t${event.type}\t${event.actor}`);
+  });
+
+program
+  .command("github-snapshot")
+  .description("Capture one fully paginated, SHA-bound read-only pull request snapshot")
+  .argument("[pull-request]", "pull request number, URL, or branch")
+  .option("-C, --cwd <path>", "repository path", process.cwd())
+  .action(async (pullRequest: string | undefined, options: { cwd: string }) => {
+    console.log(
+      JSON.stringify(
+        await captureGitHubPullRequestSnapshot({
+          cwd: options.cwd,
+          ...(pullRequest ? { pullRequest } : {}),
+        }),
+        null,
+        2,
+      ),
+    );
   });
 
 program

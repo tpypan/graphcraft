@@ -3565,7 +3565,7 @@ var stable_v1_default = {
 
 // packages/cli/src/index.ts
 import { createInterface as createInterface3 } from "node:readline/promises";
-import { spawn as spawn5 } from "node:child_process";
+import { spawn as spawn6 } from "node:child_process";
 import { access as access3, chmod as chmod2, copyFile, mkdir as mkdir7 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -21524,6 +21524,784 @@ function claudeSemanticVerifierArgs(request, policy) {
   ];
 }
 
+// packages/github/src/index.ts
+import { spawn as spawn3 } from "node:child_process";
+var PermissionSchema2 = external_exports.enum(["ADMIN", "MAINTAIN", "WRITE", "TRIAGE", "READ", "NONE"]);
+var RequiredStatusCheckSchema = external_exports.strictObject({
+  context: external_exports.string().min(1),
+  appId: external_exports.number().int().optional()
+});
+var GitHubBranchProtectionSchema = external_exports.strictObject({
+  status: external_exports.enum(["protected", "unprotected", "unknown"]),
+  branch: external_exports.string().min(1),
+  requiredStatusChecks: external_exports.array(RequiredStatusCheckSchema),
+  requiresApprovingReviews: external_exports.boolean().optional(),
+  requiredApprovingReviewCount: external_exports.number().int().nonnegative().optional(),
+  error: external_exports.string().optional()
+});
+var GitHubCapabilityReportSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  installed: external_exports.boolean(),
+  authenticated: external_exports.boolean(),
+  repositoryAccessible: external_exports.boolean(),
+  readyForSnapshot: external_exports.boolean(),
+  commandVersion: external_exports.string().optional(),
+  host: external_exports.string().optional(),
+  nameWithOwner: external_exports.string().optional(),
+  url: external_exports.string().url().optional(),
+  defaultBranch: external_exports.string().optional(),
+  viewerPermission: PermissionSchema2.optional(),
+  canRead: external_exports.boolean(),
+  canWrite: external_exports.boolean(),
+  branchProtection: GitHubBranchProtectionSchema.optional(),
+  errors: external_exports.array(external_exports.string())
+});
+var LatestThreadCommentSchema = external_exports.strictObject({
+  id: external_exports.string().min(1),
+  author: external_exports.string().optional(),
+  body: external_exports.string(),
+  url: external_exports.string().url(),
+  createdAt: external_exports.iso.datetime()
+});
+var ReviewThreadSchema = external_exports.strictObject({
+  id: external_exports.string().min(1),
+  isResolved: external_exports.boolean(),
+  isOutdated: external_exports.boolean(),
+  path: external_exports.string().optional(),
+  line: external_exports.number().int().positive().optional(),
+  commentCount: external_exports.number().int().nonnegative(),
+  latestComment: LatestThreadCommentSchema.optional()
+});
+var PullRequestReviewSchema = external_exports.strictObject({
+  id: external_exports.string().min(1),
+  state: external_exports.string().min(1),
+  author: external_exports.string().optional(),
+  commitSha: external_exports.string().optional(),
+  submittedAt: external_exports.iso.datetime().optional()
+});
+var CheckObservationSchema = external_exports.strictObject({
+  id: external_exports.string().min(1),
+  kind: external_exports.enum(["check_run", "status_context"]),
+  name: external_exports.string().min(1),
+  status: external_exports.string().min(1),
+  conclusion: external_exports.string().optional(),
+  detailsUrl: external_exports.string().url().optional(),
+  appId: external_exports.number().int().optional()
+});
+var RequiredCheckObservationSchema = external_exports.strictObject({
+  context: external_exports.string().min(1),
+  appId: external_exports.number().int().optional(),
+  state: external_exports.enum(["success", "pending", "failure", "missing", "unknown"]),
+  matchingCheckIds: external_exports.array(external_exports.string())
+});
+var RateLimitResourceSchema = external_exports.strictObject({
+  limit: external_exports.number().int().nonnegative(),
+  used: external_exports.number().int().nonnegative(),
+  remaining: external_exports.number().int().nonnegative(),
+  resetAt: external_exports.iso.datetime()
+});
+var GitHubPullRequestSnapshotSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  snapshotId: external_exports.string().regex(/^[a-f0-9]{64}$/),
+  contentTrust: external_exports.literal("untrusted_external"),
+  repository: external_exports.strictObject({
+    nameWithOwner: external_exports.string().min(3),
+    url: external_exports.string().url(),
+    host: external_exports.string().min(1),
+    viewerPermission: PermissionSchema2
+  }),
+  pullRequest: external_exports.strictObject({
+    number: external_exports.number().int().positive(),
+    url: external_exports.string().url(),
+    title: external_exports.string(),
+    state: external_exports.string().min(1),
+    isDraft: external_exports.boolean(),
+    headRefName: external_exports.string().min(1),
+    baseRefName: external_exports.string().min(1),
+    headSha: external_exports.string().min(7),
+    baseSha: external_exports.string().min(7),
+    mergeable: external_exports.string().min(1),
+    reviewDecision: external_exports.string().optional(),
+    updatedAt: external_exports.iso.datetime()
+  }),
+  binding: external_exports.strictObject({
+    headSha: external_exports.string().min(7),
+    baseSha: external_exports.string().min(7),
+    capturedAt: external_exports.iso.datetime()
+  }),
+  branchProtection: GitHubBranchProtectionSchema,
+  requiredChecks: external_exports.array(RequiredCheckObservationSchema),
+  checks: external_exports.array(CheckObservationSchema),
+  reviewThreads: external_exports.array(ReviewThreadSchema),
+  reviews: external_exports.array(PullRequestReviewSchema),
+  rateLimit: external_exports.strictObject({
+    core: RateLimitResourceSchema,
+    graphql: RateLimitResourceSchema
+  })
+});
+var GitHubCommandError = class extends Error {
+  constructor(message, exitCode) {
+    super(message);
+    this.exitCode = exitCode;
+    this.name = "GitHubCommandError";
+  }
+  exitCode;
+};
+async function runCommand(options, args) {
+  const command = options.command ?? "gh";
+  return await new Promise((resolve8, reject) => {
+    const child = spawn3(command, args, {
+      cwd: options.cwd,
+      env: options.env ?? process.env,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout2 = "";
+    let stderr = "";
+    let outputBytes = 0;
+    let failure;
+    let forceTimer;
+    const terminate = (reason) => {
+      if (failure) return;
+      failure = reason;
+      child.kill("SIGTERM");
+      forceTimer = setTimeout(() => child.kill("SIGKILL"), 2e3);
+      forceTimer.unref();
+    };
+    const timeout = setTimeout(
+      () => terminate(`gh exceeded its ${options.timeoutMs ?? 6e4}ms timeout`),
+      options.timeoutMs ?? 6e4
+    );
+    timeout.unref();
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      outputBytes += Buffer.byteLength(chunk);
+      if (outputBytes > 16 * 1024 * 1024)
+        return terminate("gh output exceeded the 16MiB safety limit");
+      stdout2 += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      outputBytes += Buffer.byteLength(chunk);
+      if (outputBytes > 16 * 1024 * 1024)
+        return terminate("gh output exceeded the 16MiB safety limit");
+      stderr += chunk;
+    });
+    child.once("error", (error51) => {
+      clearTimeout(timeout);
+      if (forceTimer) clearTimeout(forceTimer);
+      reject(error51);
+    });
+    child.once("close", (exitCode) => {
+      clearTimeout(timeout);
+      if (forceTimer) clearTimeout(forceTimer);
+      if (failure) return reject(new GitHubCommandError(failure, exitCode ?? 1));
+      const code = exitCode ?? 1;
+      if (code === 0) resolve8({ stdout: stdout2, stderr });
+      else
+        reject(
+          new GitHubCommandError(
+            stderr.trim() || stdout2.trim() || `${command} ${args[0] ?? ""} exited ${code}`,
+            code
+          )
+        );
+    });
+  });
+}
+async function jsonCommand(options, args) {
+  const { stdout: stdout2 } = await runCommand(options, args);
+  try {
+    return JSON.parse(stdout2);
+  } catch {
+    throw new Error(`gh returned invalid JSON for ${args.slice(0, 2).join(" ")}`);
+  }
+}
+var RepoViewSchema = external_exports.object({
+  nameWithOwner: external_exports.string().min(3),
+  url: external_exports.string().url(),
+  viewerPermission: PermissionSchema2,
+  defaultBranchRef: external_exports.object({ name: external_exports.string().min(1) })
+});
+function repositoryParts(nameWithOwner) {
+  const [owner, name, ...rest] = nameWithOwner.split("/");
+  if (!owner || !name || rest.length > 0)
+    throw new Error(`GitHub repository name is invalid: ${nameWithOwner}`);
+  return { owner, name };
+}
+function errorMessage(error51) {
+  return error51 instanceof Error ? error51.message : String(error51);
+}
+async function readBranchProtection(options, input) {
+  const branchPath = encodeURIComponent(input.branch);
+  const endpoint = `repos/${input.nameWithOwner}/branches/${branchPath}`;
+  let branch;
+  try {
+    branch = external_exports.object({ protected: external_exports.boolean() }).parse(await jsonCommand(options, ["api", "--hostname", input.host, endpoint]));
+  } catch (error51) {
+    return GitHubBranchProtectionSchema.parse({
+      status: "unknown",
+      branch: input.branch,
+      requiredStatusChecks: [],
+      error: `Cannot inspect base branch protection: ${errorMessage(error51)}`
+    });
+  }
+  if (!branch.protected)
+    return GitHubBranchProtectionSchema.parse({
+      status: "unprotected",
+      branch: input.branch,
+      requiredStatusChecks: []
+    });
+  try {
+    const protection = external_exports.object({
+      required_status_checks: external_exports.object({
+        contexts: external_exports.array(external_exports.string()).optional(),
+        checks: external_exports.array(
+          external_exports.object({
+            context: external_exports.string().min(1),
+            app_id: external_exports.number().int().nullable().optional()
+          })
+        ).optional()
+      }).nullable().optional(),
+      required_pull_request_reviews: external_exports.object({ required_approving_review_count: external_exports.number().int().nonnegative() }).nullable().optional()
+    }).parse(
+      await jsonCommand(options, ["api", "--hostname", input.host, `${endpoint}/protection`])
+    );
+    const checks = protection.required_status_checks?.checks;
+    const requiredStatusChecks = checks?.length ? checks.map(({ context, app_id }) => ({
+      context,
+      ...typeof app_id === "number" && app_id >= 0 ? { appId: app_id } : {}
+    })) : (protection.required_status_checks?.contexts ?? []).map((context) => ({ context }));
+    return GitHubBranchProtectionSchema.parse({
+      status: "protected",
+      branch: input.branch,
+      requiredStatusChecks,
+      requiresApprovingReviews: protection.required_pull_request_reviews != null,
+      ...protection.required_pull_request_reviews ? {
+        requiredApprovingReviewCount: protection.required_pull_request_reviews.required_approving_review_count
+      } : {}
+    });
+  } catch (error51) {
+    return GitHubBranchProtectionSchema.parse({
+      status: "unknown",
+      branch: input.branch,
+      requiredStatusChecks: [],
+      error: `Base branch is protected but its rules are unavailable: ${errorMessage(error51)}`
+    });
+  }
+}
+async function probeGitHub(options) {
+  const errors = [];
+  let commandVersion2;
+  try {
+    commandVersion2 = (await runCommand(options, ["--version"])).stdout.split("\n")[0]?.trim();
+  } catch (error51) {
+    errors.push(`GitHub CLI is unavailable: ${errorMessage(error51)}`);
+    return GitHubCapabilityReportSchema.parse({
+      schemaVersion: 1,
+      installed: false,
+      authenticated: false,
+      repositoryAccessible: false,
+      readyForSnapshot: false,
+      canRead: false,
+      canWrite: false,
+      errors
+    });
+  }
+  try {
+    await runCommand(options, ["auth", "status", "--active"]);
+  } catch (error51) {
+    errors.push(`GitHub CLI authentication is unavailable: ${errorMessage(error51)}`);
+    return GitHubCapabilityReportSchema.parse({
+      schemaVersion: 1,
+      installed: true,
+      authenticated: false,
+      repositoryAccessible: false,
+      readyForSnapshot: false,
+      commandVersion: commandVersion2,
+      canRead: false,
+      canWrite: false,
+      errors
+    });
+  }
+  let repository;
+  try {
+    repository = RepoViewSchema.parse(
+      await jsonCommand(options, [
+        "repo",
+        "view",
+        "--json",
+        "nameWithOwner,url,viewerPermission,defaultBranchRef"
+      ])
+    );
+  } catch (error51) {
+    errors.push(`GitHub repository access is unavailable: ${errorMessage(error51)}`);
+    return GitHubCapabilityReportSchema.parse({
+      schemaVersion: 1,
+      installed: true,
+      authenticated: true,
+      repositoryAccessible: false,
+      readyForSnapshot: false,
+      commandVersion: commandVersion2,
+      canRead: false,
+      canWrite: false,
+      errors
+    });
+  }
+  const host = new URL(repository.url).hostname;
+  const branch = options.baseBranch ?? repository.defaultBranchRef.name;
+  const branchProtection = await readBranchProtection(options, {
+    host,
+    nameWithOwner: repository.nameWithOwner,
+    branch
+  });
+  if (branchProtection.status === "unknown" && branchProtection.error)
+    errors.push(branchProtection.error);
+  const canRead = repository.viewerPermission !== "NONE";
+  const canWrite = ["ADMIN", "MAINTAIN", "WRITE"].includes(repository.viewerPermission);
+  if (!canRead) errors.push("The authenticated account has no readable repository permission");
+  return GitHubCapabilityReportSchema.parse({
+    schemaVersion: 1,
+    installed: true,
+    authenticated: true,
+    repositoryAccessible: true,
+    readyForSnapshot: canRead && branchProtection.status !== "unknown",
+    commandVersion: commandVersion2,
+    host,
+    nameWithOwner: repository.nameWithOwner,
+    url: repository.url,
+    defaultBranch: repository.defaultBranchRef.name,
+    viewerPermission: repository.viewerPermission,
+    canRead,
+    canWrite,
+    branchProtection,
+    errors
+  });
+}
+var RateLimitSchema = external_exports.strictObject({
+  cost: external_exports.number().int().nonnegative(),
+  remaining: external_exports.number().int().nonnegative(),
+  resetAt: external_exports.iso.datetime()
+});
+var PageInfoSchema = external_exports.strictObject({
+  hasNextPage: external_exports.boolean(),
+  endCursor: external_exports.string().nullable()
+});
+var PullRequestIdentitySchema = external_exports.object({
+  number: external_exports.number().int().positive(),
+  url: external_exports.string().url(),
+  title: external_exports.string(),
+  state: external_exports.string().min(1),
+  isDraft: external_exports.boolean(),
+  headRefName: external_exports.string().min(1),
+  baseRefName: external_exports.string().min(1),
+  headRefOid: external_exports.string().min(7),
+  baseRefOid: external_exports.string().min(7),
+  mergeable: external_exports.string().min(1),
+  reviewDecision: external_exports.string().nullable(),
+  updatedAt: external_exports.iso.datetime()
+});
+var ThreadPageResponseSchema = external_exports.strictObject({
+  data: external_exports.strictObject({
+    repository: external_exports.strictObject({
+      url: external_exports.string().url(),
+      viewerPermission: PermissionSchema2,
+      pullRequest: PullRequestIdentitySchema.extend({
+        reviewThreads: external_exports.strictObject({
+          nodes: external_exports.array(
+            external_exports.strictObject({
+              id: external_exports.string().min(1),
+              isResolved: external_exports.boolean(),
+              isOutdated: external_exports.boolean(),
+              path: external_exports.string().nullable(),
+              line: external_exports.number().int().positive().nullable(),
+              comments: external_exports.strictObject({
+                totalCount: external_exports.number().int().nonnegative(),
+                nodes: external_exports.array(
+                  external_exports.strictObject({
+                    id: external_exports.string().min(1),
+                    author: external_exports.strictObject({ login: external_exports.string() }).nullable(),
+                    body: external_exports.string(),
+                    url: external_exports.string().url(),
+                    createdAt: external_exports.iso.datetime()
+                  })
+                )
+              })
+            })
+          ),
+          pageInfo: PageInfoSchema
+        })
+      })
+    }),
+    rateLimit: RateLimitSchema
+  })
+});
+var ReviewsPageResponseSchema = external_exports.strictObject({
+  data: external_exports.strictObject({
+    repository: external_exports.strictObject({
+      pullRequest: external_exports.strictObject({
+        headRefOid: external_exports.string().min(7),
+        baseRefOid: external_exports.string().min(7),
+        reviews: external_exports.strictObject({
+          nodes: external_exports.array(
+            external_exports.strictObject({
+              id: external_exports.string().min(1),
+              state: external_exports.string().min(1),
+              author: external_exports.strictObject({ login: external_exports.string() }).nullable(),
+              commit: external_exports.strictObject({ oid: external_exports.string().min(7) }).nullable(),
+              submittedAt: external_exports.iso.datetime().nullable()
+            })
+          ),
+          pageInfo: PageInfoSchema
+        })
+      })
+    }),
+    rateLimit: RateLimitSchema
+  })
+});
+var CheckNodeSchema = external_exports.discriminatedUnion("__typename", [
+  external_exports.strictObject({
+    __typename: external_exports.literal("CheckRun"),
+    id: external_exports.string().min(1),
+    name: external_exports.string().min(1),
+    status: external_exports.string().min(1),
+    conclusion: external_exports.string().nullable(),
+    detailsUrl: external_exports.string().url().nullable(),
+    app: external_exports.strictObject({ databaseId: external_exports.number().int() }).nullable()
+  }),
+  external_exports.strictObject({
+    __typename: external_exports.literal("StatusContext"),
+    id: external_exports.string().min(1),
+    context: external_exports.string().min(1),
+    state: external_exports.string().min(1),
+    targetUrl: external_exports.string().url().nullable()
+  })
+]);
+var ChecksPageResponseSchema = external_exports.strictObject({
+  data: external_exports.strictObject({
+    repository: external_exports.strictObject({
+      object: external_exports.strictObject({
+        oid: external_exports.string().min(7),
+        statusCheckRollup: external_exports.strictObject({
+          contexts: external_exports.strictObject({
+            nodes: external_exports.array(CheckNodeSchema),
+            pageInfo: PageInfoSchema
+          })
+        }).nullable()
+      })
+    }),
+    rateLimit: RateLimitSchema
+  })
+});
+var IdentityResponseSchema = external_exports.strictObject({
+  data: external_exports.strictObject({
+    repository: external_exports.strictObject({
+      pullRequest: external_exports.strictObject({
+        headRefOid: external_exports.string().min(7),
+        baseRefOid: external_exports.string().min(7)
+      })
+    }),
+    rateLimit: RateLimitSchema
+  })
+});
+var THREADS_QUERY = `query GraphcraftPullRequestThreads($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){url viewerPermission pullRequest(number:$number){number url title state isDraft headRefName baseRefName headRefOid baseRefOid mergeable reviewDecision updatedAt reviewThreads(first:100,after:$cursor){nodes{id isResolved isOutdated path line comments(last:1){totalCount nodes{id author{login} body url createdAt}}} pageInfo{hasNextPage endCursor}}}} rateLimit{cost remaining resetAt}}`;
+var REVIEWS_QUERY = `query GraphcraftPullRequestReviews($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid baseRefOid reviews(first:100,after:$cursor){nodes{id state author{login} commit{oid} submittedAt} pageInfo{hasNextPage endCursor}}}} rateLimit{cost remaining resetAt}}`;
+var CHECKS_QUERY = `query GraphcraftCommitChecks($owner:String!,$name:String!,$head:GitObjectID!,$cursor:String){repository(owner:$owner,name:$name){object(oid:$head){... on Commit{oid statusCheckRollup{contexts(first:100,after:$cursor){nodes{__typename ... on CheckRun{id name status conclusion detailsUrl app{databaseId}} ... on StatusContext{id context state targetUrl}} pageInfo{hasNextPage endCursor}}}}}} rateLimit{cost remaining resetAt}}`;
+var IDENTITY_QUERY = `query GraphcraftPullRequestIdentity($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid baseRefOid}} rateLimit{cost remaining resetAt}}`;
+async function graphql(options, host, query, variables) {
+  const args = ["api", "graphql", "--hostname", host, "-f", `query=${query}`];
+  for (const [name, value] of Object.entries(variables)) {
+    if (value === void 0) continue;
+    args.push(typeof value === "number" ? "-F" : "-f", `${name}=${value}`);
+  }
+  return await jsonCommand(options, args);
+}
+function assertBound(expected, actual) {
+  if (expected.headSha !== actual.headRefOid || expected.baseSha !== actual.baseRefOid)
+    throw new Error(
+      `GitHub snapshot became stale: expected ${expected.headSha}/${expected.baseSha}, received ${actual.headRefOid}/${actual.baseRefOid}`
+    );
+}
+async function pullRequestNumber(options, reference) {
+  const args = ["pr", "view"];
+  if (reference !== void 0) args.push(String(reference));
+  args.push("--json", "number");
+  return external_exports.object({ number: external_exports.number().int().positive() }).parse(await jsonCommand(options, args)).number;
+}
+async function collectThreads(input) {
+  let cursor;
+  let identity;
+  let repositoryUrl = "";
+  let viewerPermission;
+  const threads = [];
+  do {
+    const response = ThreadPageResponseSchema.parse(
+      await graphql(input.options, input.host, THREADS_QUERY, {
+        owner: input.owner,
+        name: input.name,
+        number: input.number,
+        cursor
+      })
+    );
+    const page = response.data.repository.pullRequest;
+    if (!identity) identity = PullRequestIdentitySchema.parse(page);
+    else assertBound({ headSha: identity.headRefOid, baseSha: identity.baseRefOid }, page);
+    repositoryUrl = response.data.repository.url;
+    viewerPermission = response.data.repository.viewerPermission;
+    threads.push(
+      ...page.reviewThreads.nodes.map((thread) => {
+        const latest = thread.comments.nodes[0];
+        return ReviewThreadSchema.parse({
+          id: thread.id,
+          isResolved: thread.isResolved,
+          isOutdated: thread.isOutdated,
+          ...thread.path ? { path: thread.path } : {},
+          ...thread.line ? { line: thread.line } : {},
+          commentCount: thread.comments.totalCount,
+          ...latest ? {
+            latestComment: {
+              id: latest.id,
+              ...latest.author ? { author: latest.author.login } : {},
+              body: latest.body,
+              url: latest.url,
+              createdAt: latest.createdAt
+            }
+          } : {}
+        });
+      })
+    );
+    cursor = page.reviewThreads.pageInfo.hasNextPage ? page.reviewThreads.pageInfo.endCursor ?? void 0 : void 0;
+    if (page.reviewThreads.pageInfo.hasNextPage && !cursor)
+      throw new Error("GitHub review-thread pagination omitted its next cursor");
+  } while (cursor);
+  if (!identity || !viewerPermission) throw new Error("GitHub returned no pull request snapshot");
+  return { identity, repositoryUrl, viewerPermission, threads };
+}
+async function collectReviews(input) {
+  let cursor;
+  const reviews = [];
+  do {
+    const response = ReviewsPageResponseSchema.parse(
+      await graphql(input.options, input.host, REVIEWS_QUERY, {
+        owner: input.owner,
+        name: input.name,
+        number: input.number,
+        cursor
+      })
+    );
+    const pullRequest = response.data.repository.pullRequest;
+    assertBound(input.binding, pullRequest);
+    reviews.push(
+      ...pullRequest.reviews.nodes.map(
+        (review) => PullRequestReviewSchema.parse({
+          id: review.id,
+          state: review.state,
+          ...review.author ? { author: review.author.login } : {},
+          ...review.commit ? { commitSha: review.commit.oid } : {},
+          ...review.submittedAt ? { submittedAt: review.submittedAt } : {}
+        })
+      )
+    );
+    cursor = pullRequest.reviews.pageInfo.hasNextPage ? pullRequest.reviews.pageInfo.endCursor ?? void 0 : void 0;
+    if (pullRequest.reviews.pageInfo.hasNextPage && !cursor)
+      throw new Error("GitHub review pagination omitted its next cursor");
+  } while (cursor);
+  return reviews;
+}
+async function collectChecks(input) {
+  let cursor;
+  const checks = [];
+  do {
+    const response = ChecksPageResponseSchema.parse(
+      await graphql(input.options, input.host, CHECKS_QUERY, {
+        owner: input.owner,
+        name: input.name,
+        head: input.headSha,
+        cursor
+      })
+    );
+    const commit = response.data.repository.object;
+    if (commit.oid !== input.headSha)
+      throw new Error(`GitHub check rollup moved from ${input.headSha} to ${commit.oid}`);
+    const contexts = commit.statusCheckRollup?.contexts;
+    for (const check2 of contexts?.nodes ?? []) {
+      checks.push(
+        check2.__typename === "CheckRun" ? CheckObservationSchema.parse({
+          id: check2.id,
+          kind: "check_run",
+          name: check2.name,
+          status: check2.status,
+          ...check2.conclusion ? { conclusion: check2.conclusion } : {},
+          ...check2.detailsUrl ? { detailsUrl: check2.detailsUrl } : {},
+          ...check2.app ? { appId: check2.app.databaseId } : {}
+        }) : CheckObservationSchema.parse({
+          id: check2.id,
+          kind: "status_context",
+          name: check2.context,
+          status: check2.state,
+          ...check2.targetUrl ? { detailsUrl: check2.targetUrl } : {}
+        })
+      );
+    }
+    cursor = contexts?.pageInfo.hasNextPage ? contexts.pageInfo.endCursor ?? void 0 : void 0;
+    if (contexts?.pageInfo.hasNextPage && !cursor)
+      throw new Error("GitHub check pagination omitted its next cursor");
+  } while (cursor);
+  return checks;
+}
+function checkState(check2) {
+  if (check2.kind === "status_context") {
+    if (check2.status === "SUCCESS") return "success";
+    if (check2.status === "PENDING") return "pending";
+    if (["ERROR", "FAILURE"].includes(check2.status)) return "failure";
+    return "unknown";
+  }
+  if (check2.status !== "COMPLETED") return "pending";
+  if (["SUCCESS", "NEUTRAL", "SKIPPED"].includes(check2.conclusion ?? "")) return "success";
+  if (["ACTION_REQUIRED", "CANCELLED", "FAILURE", "STALE", "STARTUP_FAILURE", "TIMED_OUT"].includes(
+    check2.conclusion ?? ""
+  ))
+    return "failure";
+  return "unknown";
+}
+function requiredCheckObservations(protection, checks) {
+  return protection.requiredStatusChecks.map((required2) => {
+    const matching = checks.filter(
+      (check2) => check2.name === required2.context && (required2.appId === void 0 || check2.appId === required2.appId)
+    );
+    const states = matching.map(checkState);
+    const state = matching.length === 0 ? "missing" : states.includes("failure") ? "failure" : states.includes("pending") ? "pending" : states.every((candidate) => candidate === "success") ? "success" : "unknown";
+    return RequiredCheckObservationSchema.parse({
+      ...required2,
+      state,
+      matchingCheckIds: matching.map(({ id }) => id)
+    });
+  });
+}
+var ApiRateLimitSchema = external_exports.object({
+  resources: external_exports.object({
+    core: external_exports.object({
+      limit: external_exports.number().int().nonnegative(),
+      used: external_exports.number().int().nonnegative(),
+      remaining: external_exports.number().int().nonnegative(),
+      reset: external_exports.number().int().nonnegative()
+    }),
+    graphql: external_exports.object({
+      limit: external_exports.number().int().nonnegative(),
+      used: external_exports.number().int().nonnegative(),
+      remaining: external_exports.number().int().nonnegative(),
+      reset: external_exports.number().int().nonnegative()
+    })
+  })
+});
+async function rateLimit(options, host) {
+  const response = ApiRateLimitSchema.parse(
+    await jsonCommand(options, ["api", "--hostname", host, "rate_limit"])
+  );
+  const resource = (value) => ({
+    limit: value.limit,
+    used: value.used,
+    remaining: value.remaining,
+    resetAt: new Date(value.reset * 1e3).toISOString()
+  });
+  return { core: resource(response.resources.core), graphql: resource(response.resources.graphql) };
+}
+async function currentBinding(input) {
+  const response = IdentityResponseSchema.parse(
+    await graphql(input.options, input.host, IDENTITY_QUERY, {
+      owner: input.owner,
+      name: input.name,
+      number: input.number
+    })
+  );
+  return {
+    headSha: response.data.repository.pullRequest.headRefOid,
+    baseSha: response.data.repository.pullRequest.baseRefOid
+  };
+}
+async function captureGitHubPullRequestSnapshot(options) {
+  const capability = await probeGitHub(options);
+  if (!capability.readyForSnapshot || !capability.host || !capability.nameWithOwner)
+    throw new Error(`GitHub snapshot preflight failed: ${capability.errors.join("; ")}`);
+  const number4 = await pullRequestNumber(options, options.pullRequest);
+  const { owner, name } = repositoryParts(capability.nameWithOwner);
+  const collected = await collectThreads({
+    options,
+    host: capability.host,
+    owner,
+    name,
+    number: number4
+  });
+  const binding = {
+    headSha: collected.identity.headRefOid,
+    baseSha: collected.identity.baseRefOid
+  };
+  const branchProtection = await readBranchProtection(options, {
+    host: capability.host,
+    nameWithOwner: capability.nameWithOwner,
+    branch: collected.identity.baseRefName
+  });
+  if (branchProtection.status === "unknown")
+    throw new Error(`GitHub snapshot preflight failed: ${branchProtection.error}`);
+  const [reviews, checks, limits] = await Promise.all([
+    collectReviews({ options, host: capability.host, owner, name, number: number4, binding }),
+    collectChecks({
+      options,
+      host: capability.host,
+      owner,
+      name,
+      headSha: binding.headSha
+    }),
+    rateLimit(options, capability.host)
+  ]);
+  const finalBinding = await currentBinding({
+    options,
+    host: capability.host,
+    owner,
+    name,
+    number: number4
+  });
+  if (finalBinding.headSha !== binding.headSha || finalBinding.baseSha !== binding.baseSha)
+    throw new Error(
+      `GitHub snapshot became stale during capture: ${binding.headSha}/${binding.baseSha} changed to ${finalBinding.headSha}/${finalBinding.baseSha}`
+    );
+  const capturedAt = (/* @__PURE__ */ new Date()).toISOString();
+  const value = {
+    schemaVersion: 1,
+    contentTrust: "untrusted_external",
+    repository: {
+      nameWithOwner: capability.nameWithOwner,
+      url: collected.repositoryUrl,
+      host: capability.host,
+      viewerPermission: collected.viewerPermission
+    },
+    pullRequest: {
+      number: collected.identity.number,
+      url: collected.identity.url,
+      title: collected.identity.title,
+      state: collected.identity.state,
+      isDraft: collected.identity.isDraft,
+      headRefName: collected.identity.headRefName,
+      baseRefName: collected.identity.baseRefName,
+      headSha: binding.headSha,
+      baseSha: binding.baseSha,
+      mergeable: collected.identity.mergeable,
+      ...collected.identity.reviewDecision ? { reviewDecision: collected.identity.reviewDecision } : {},
+      updatedAt: collected.identity.updatedAt
+    },
+    binding: { ...binding, capturedAt },
+    branchProtection,
+    requiredChecks: requiredCheckObservations(branchProtection, checks),
+    checks,
+    reviewThreads: collected.threads,
+    reviews,
+    rateLimit: limits
+  };
+  return GitHubPullRequestSnapshotSchema.parse({
+    ...value,
+    snapshotId: contentHash(value)
+  });
+}
+
 // packages/runtime/src/amendment.ts
 import { join as join2 } from "node:path";
 
@@ -21751,12 +22529,12 @@ import { constants } from "node:fs";
 import { dirname as dirname3, join as join3, resolve, sep } from "node:path";
 
 // packages/probes/src/process.ts
-import { spawn as spawn3 } from "node:child_process";
+import { spawn as spawn4 } from "node:child_process";
 async function runProcess(command, args, options) {
   const started = performance.now();
   const timeoutMs = options.timeoutMs ?? 12e4;
   return await new Promise((resolve8, reject) => {
-    const child = spawn3(command, args, {
+    const child = spawn4(command, args, {
       cwd: options.cwd,
       env: { ...process.env, ...options.env, NO_COLOR: "1", FORCE_COLOR: "0" },
       shell: false,
@@ -26017,7 +26795,7 @@ async function runBenchmark(input) {
 }
 
 // packages/runtime/src/supervisor.ts
-import { spawn as spawn4 } from "node:child_process";
+import { spawn as spawn5 } from "node:child_process";
 import { randomUUID as randomUUID9 } from "node:crypto";
 import { chmod, mkdir as mkdir6, open as open2, readFile as readFile10, readdir as readdir2 } from "node:fs/promises";
 import { join as join11 } from "node:path";
@@ -26092,7 +26870,7 @@ async function launchDetachedSupervisor(input) {
   await chmod(logPath, 384);
   let child;
   try {
-    child = spawn4(
+    child = spawn5(
       input.launcher.command,
       [
         ...input.launcher.args,
@@ -26241,7 +27019,7 @@ function createAdapter(host, policy) {
 }
 async function runHostCommand(command, args, allowFailure = false) {
   const exitCode = await new Promise((resolveExit, reject) => {
-    const child = spawn5(command, args, { shell: false, stdio: "inherit" });
+    const child = spawn6(command, args, { shell: false, stdio: "inherit" });
     child.once("error", reject);
     child.once("close", (code) => resolveExit(code ?? 1));
   });
@@ -26460,9 +27238,10 @@ async function storeFor(cwd, runReference) {
 async function handleAction(input) {
   const cwd = input.repository ?? process.cwd();
   if (input.action === "doctor") {
-    const [codex, claude] = await Promise.all([
+    const [codex, claude, github] = await Promise.all([
       new CodexAdapter().probe(),
-      new ClaudeAdapter().probe()
+      new ClaudeAdapter().probe(),
+      probeGitHub({ cwd })
     ]);
     let repository;
     try {
@@ -26470,7 +27249,7 @@ async function handleAction(input) {
     } catch (error51) {
       repository = { error: error51.message };
     }
-    return { node: process.version, codex, claude, repository };
+    return { node: process.version, codex, claude, github, repository };
   }
   if (input.action === "run") {
     if (!input.task) throw new Error("task is required for action=run");
@@ -26922,6 +27701,18 @@ program2.command("trace").description("Print the append-only event trace").argum
   else
     for (const event of events)
       console.log(`${event.sequence}	${event.timestamp}	${event.type}	${event.actor}`);
+});
+program2.command("github-snapshot").description("Capture one fully paginated, SHA-bound read-only pull request snapshot").argument("[pull-request]", "pull request number, URL, or branch").option("-C, --cwd <path>", "repository path", process.cwd()).action(async (pullRequest, options) => {
+  console.log(
+    JSON.stringify(
+      await captureGitHubPullRequestSnapshot({
+        cwd: options.cwd,
+        ...pullRequest ? { pullRequest } : {}
+      }),
+      null,
+      2
+    )
+  );
 });
 program2.command("doctor").description("Check repository and host capabilities").option("-C, --cwd <path>", "repository path", process.cwd()).action(async (options) => {
   console.log(

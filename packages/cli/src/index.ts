@@ -8,6 +8,7 @@ import { stdin, stdout } from "node:process";
 import packageMetadata from "../../../package.json" with { type: "json" };
 import { CodexAdapter } from "@graphcraft/adapter-codex";
 import { ClaudeAdapter } from "@graphcraft/adapter-claude";
+import { probeGitHub } from "@graphcraft/github";
 import {
   ContextSelectionReceiptSchema,
   graphPlanShape,
@@ -370,9 +371,10 @@ export interface McpActionInput {
 export async function handleAction(input: McpActionInput): Promise<Record<string, unknown>> {
   const cwd = input.repository ?? process.cwd();
   if (input.action === "doctor") {
-    const [codex, claude] = await Promise.all([
+    const [codex, claude, github] = await Promise.all([
       new CodexAdapter().probe(),
       new ClaudeAdapter().probe(),
+      probeGitHub({ cwd }),
     ]);
     let repository: Record<string, unknown>;
     try {
@@ -380,7 +382,7 @@ export async function handleAction(input: McpActionInput): Promise<Record<string
     } catch (error) {
       repository = { error: (error as Error).message };
     }
-    return { node: process.version, codex, claude, repository };
+    return { node: process.version, codex, claude, github, repository };
   }
 
   if (input.action === "run") {
