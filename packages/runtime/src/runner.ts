@@ -10,7 +10,6 @@ import {
   compilePlannedGraph,
   compileRunContract,
   contentHash,
-  createContextCapsule,
   evidenceSnapshot,
   interruptionReason,
   resolveHeldOutProbes,
@@ -64,6 +63,7 @@ import {
   type RunWorkspace,
 } from "./repository.ts";
 import { RunStore } from "./store.ts";
+import { groundedRelevantPaths, prepareWorkerContext } from "./context.ts";
 import {
   actionableHeldOutFailures,
   createRuntimeHeldOutProbePlan,
@@ -84,6 +84,32 @@ export interface RunObserverEvent {
 }
 
 export type RunObserver = (event: RunObserverEvent) => void;
+
+function populateMissingGraphContext(
+  graph: Graph,
+  repositoryEvidence: Awaited<ReturnType<typeof discoverPlanningEvidence>>,
+): Graph {
+  const evidencePaths = repositoryEvidence.files.map(({ path }) => path);
+  return {
+    ...graph,
+    nodes: graph.nodes.map((node) =>
+      node.kind === "commit" || node.contextSelector.relevantPaths.length > 0
+        ? node
+        : {
+            ...node,
+            contextSelector: {
+              ...node.contextSelector,
+              relevantPaths: [
+                ...new Set([
+                  ...groundedRelevantPaths(evidencePaths, node.objective),
+                  ...groundedRelevantPaths(repositoryEvidence.trackedPaths, node.objective),
+                ]),
+              ].slice(0, 4),
+            },
+          },
+    ),
+  };
+}
 
 interface RecoverableInvocation {
   adapterId: string;
@@ -252,6 +278,8 @@ export async function createRun(
     graph = compileGraph(contract, completionProbes);
   }
   graph = applyProbePlan(graph, contract, graphProbePlan);
+  graph = populateMissingGraphContext(graph, repositoryEvidence);
+  await validatePlannedContext(graph, repository.root);
   const store = await RunStore.create(
     repository.root,
     contract,
@@ -327,14 +355,6 @@ async function executeWorker(input: {
   termination?: HostTermination;
   artifact: string;
 }> {
-  const capsule = createContextCapsule({
-    contract: input.contract,
-    node: input.node,
-    ...(input.predecessorEvidence ? { predecessorEvidence: input.predecessorEvidence } : {}),
-    ...(input.probeResults ? { probeResults: input.probeResults } : {}),
-  });
-  const capsuleHash = contentHash(capsule);
-  await input.store.writeCapsule(capsuleHash, capsule);
   let invocationId = input.resume?.invocationId ?? randomUUID();
   let resumeSessionId: string | undefined;
   if (input.resume) {
@@ -382,6 +402,15 @@ async function executeWorker(input: {
       invocationId = randomUUID();
     }
   }
+  const { capsule, capsuleHash } = await prepareWorkerContext({
+    store: input.store,
+    invocationId,
+    contract: input.contract,
+    node: input.node,
+    repositoryPath: input.workspace.path,
+    predecessorEvidence: input.predecessorEvidence ?? [],
+    probeResults: input.probeResults ?? [],
+  });
   if (!resumeSessionId) {
     await input.store.append("runtime", "invocation.started", {
       invocationId,
@@ -701,7 +730,7 @@ function repairAmendment(
     contextSelector: {
       includeRepositoryInstructions: true,
       predecessorResults: verification.dependsOn,
-      relevantPaths: [],
+      relevantPaths: verification.contextSelector.relevantPaths,
     },
     progressProbes: [],
     completionProbes: [],

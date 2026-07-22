@@ -9,6 +9,7 @@ import packageMetadata from "../../../package.json" with { type: "json" };
 import { CodexAdapter } from "@graphcraft/adapter-codex";
 import { ClaudeAdapter } from "@graphcraft/adapter-claude";
 import {
+  ContextSelectionReceiptSchema,
   graphPlanShape,
   probePlanFromGraph,
   type Graph,
@@ -353,6 +354,9 @@ export async function handleAction(input: McpActionInput): Promise<Record<string
       },
       state,
       graphHistory: await store.loadGraphHistory(),
+      contextReceipts: (await store.loadEvents())
+        .filter(({ type }) => type === "context.selected")
+        .map(({ data }) => ContextSelectionReceiptSchema.parse(data.receipt)),
     };
   if (input.action === "trace") return { events: await store.loadEvents() };
   if (input.action === "probes") {

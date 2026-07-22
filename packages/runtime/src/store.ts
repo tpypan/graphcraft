@@ -10,6 +10,7 @@ import {
   RunContractSchema,
   RunEventSchema,
   RunStateSchema,
+  contentHash,
   createRunEvent,
   createHeldOutProbePlan,
   probePlanFromGraph,
@@ -377,11 +378,35 @@ export class RunStore {
     return history;
   }
 
-  async writeCapsule(hash: string, value: unknown): Promise<string> {
+  async writeCapsule(hash: string, value: unknown): Promise<{ path: string; reused: boolean }> {
     await this.ensureStorage();
     const path = join(this.runRoot, "capsules", `${hash}.json`);
+    const reused = await readFile(path, "utf8")
+      .then((existing) => contentHash(JSON.parse(existing)) === hash)
+      .catch(() => false);
+    if (reused) return { path, reused: true };
     await writeJsonAtomic(path, value);
-    return path;
+    return { path, reused: false };
+  }
+
+  async writeContentAddressedArtifact(
+    category: string,
+    value: string | Uint8Array,
+    extension = "json",
+  ): Promise<{ path: string; hash: string; reused: boolean }> {
+    await this.ensureStorage();
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(category) || !/^[a-z0-9]+$/.test(extension))
+      throw new Error("Content-addressed artifact category or extension is invalid");
+    const bytes = typeof value === "string" ? Buffer.from(value) : Buffer.from(value);
+    const hash = contentHash({ contents: bytes.toString("base64") });
+    const path = join(this.runRoot, "artifacts", category, `${hash}.${extension}`);
+    const reused = await readFile(path)
+      .then((existing) => Buffer.compare(existing, bytes) === 0)
+      .catch(() => false);
+    if (reused) return { path, hash, reused: true };
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, bytes, { mode: 0o600 });
+    return { path, hash, reused: false };
   }
 
   async writeWorkspace(value: unknown): Promise<void> {

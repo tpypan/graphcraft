@@ -31423,6 +31423,42 @@ var ContextCapsuleSchema = external_exports.strictObject({
   relevantPaths: external_exports.array(external_exports.string()),
   probeEvidence: external_exports.array(external_exports.string())
 });
+var ContextSelectionReceiptSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  runId: external_exports.uuid(),
+  nodeId: external_exports.string().min(1),
+  capsule: external_exports.strictObject({
+    hash: external_exports.string().regex(/^[a-f0-9]{64}$/),
+    path: external_exports.string().min(1),
+    characters: external_exports.number().int().nonnegative()
+  }),
+  selected: external_exports.strictObject({
+    repositoryPaths: external_exports.array(external_exports.string()),
+    predecessorNodeIds: external_exports.array(external_exports.string()),
+    predecessorEvidenceHashes: external_exports.array(external_exports.string().regex(/^[a-f0-9]{64}$/)),
+    probeIds: external_exports.array(external_exports.string()),
+    probeSignatures: external_exports.array(external_exports.string().regex(/^[a-f0-9]{64}$/)),
+    acceptanceAnchorIds: external_exports.array(external_exports.string())
+  }),
+  omitted: external_exports.strictObject({
+    repositoryPathCount: external_exports.number().int().nonnegative(),
+    declaredRepositoryPaths: external_exports.array(external_exports.string()),
+    predecessorNodeIds: external_exports.array(external_exports.string()),
+    probeIds: external_exports.array(external_exports.string()),
+    repositoryInventory: external_exports.strictObject({
+      digest: external_exports.string().regex(/^[a-f0-9]{64}$/),
+      artifact: external_exports.string().min(1),
+      totalPathCount: external_exports.number().int().nonnegative()
+    }),
+    rawHostTranscripts: external_exports.literal(true),
+    rawProbeOutputs: external_exports.literal(true)
+  }),
+  reused: external_exports.strictObject({
+    capsule: external_exports.boolean(),
+    repositoryInventory: external_exports.boolean(),
+    artifacts: external_exports.array(external_exports.string())
+  })
+});
 var SemanticVerifierContextSchema = external_exports.strictObject({
   schemaVersion: external_exports.literal(1),
   phase: external_exports.enum(["progress", "completion"]),
@@ -31513,6 +31549,7 @@ var RunEventTypeSchema = external_exports.enum([
   "control.override",
   "control.decision_required",
   "control.resolved",
+  "context.selected",
   "held_out.checked",
   "semantic.verdict",
   "tokens.recorded",
@@ -31635,9 +31672,40 @@ var codexGraphPlanJsonSchema = codexStrictSchema(graphPlanJsonSchema);
 var codexSemanticVerdictJsonSchema = codexStrictSchema(semanticVerdictJsonSchema);
 
 // packages/core/src/capsule.ts
+var MAX_CONTEXT_CAPSULE_CHARACTERS = 24e3;
+function compactText(value, maximum) {
+  const normalized = value.replace(/\0/g, "").trim();
+  return normalized.length <= maximum ? normalized : `${normalized.slice(0, Math.max(0, maximum - 14))}
+\u2026 [truncated]`;
+}
+function compactList(values, maximumItems, maximumItemCharacters, maximumTotalCharacters) {
+  const selected = [];
+  let remaining = maximumTotalCharacters;
+  for (const value of values.slice(0, maximumItems)) {
+    if (remaining <= 0) break;
+    const item = compactText(value, Math.min(maximumItemCharacters, remaining));
+    selected.push(item);
+    remaining -= item.length;
+  }
+  return selected;
+}
+function boundedValues(values, maximumItems, maximumTotalCharacters) {
+  const selected = [];
+  let remaining = maximumTotalCharacters;
+  for (const value of values) {
+    if (selected.length >= maximumItems) break;
+    if (value.length > remaining) continue;
+    selected.push(value);
+    remaining -= value.length;
+  }
+  return selected;
+}
+function contextCapsuleCharacters(capsule) {
+  return JSON.stringify(capsule).length;
+}
 function createContextCapsule(input) {
   const { contract, node: node2 } = input;
-  return ContextCapsuleSchema.parse({
+  const capsule = {
     schemaVersion: 1,
     runId: contract.runId,
     nodeId: node2.id,
@@ -31650,12 +31718,24 @@ function createContextCapsule(input) {
       "Preserve unrelated work and report evidence, not confidence."
     ],
     acceptanceAnchors: contract.acceptanceAnchors,
-    predecessorEvidence: input.predecessorEvidence ?? [],
-    relevantPaths: node2.contextSelector.relevantPaths,
-    probeEvidence: (input.probeResults ?? []).map(
-      (result) => `${result.probeId}: ${result.passed ? "pass" : "fail"} - ${result.summary}`
+    predecessorEvidence: compactList(input.predecessorEvidence ?? [], 8, 1500, 4e3),
+    relevantPaths: boundedValues([...new Set(node2.contextSelector.relevantPaths)], 32, 4e3),
+    probeEvidence: compactList(
+      (input.probeResults ?? []).map(
+        (result) => `${result.probeId}: ${result.passed ? "pass" : "fail"} - ${result.summary}`
+      ),
+      16,
+      1500,
+      5e3
     )
-  });
+  };
+  const parsed = ContextCapsuleSchema.parse(capsule);
+  const characters = contextCapsuleCharacters(parsed);
+  if (characters > MAX_CONTEXT_CAPSULE_CHARACTERS)
+    throw new Error(
+      `Context capsule for ${node2.id} exceeds ${MAX_CONTEXT_CAPSULE_CHARACTERS} characters`
+    );
+  return parsed;
 }
 
 // packages/core/src/events.ts
@@ -32650,6 +32730,7 @@ function reduceEvents(events) {
       case "invocation.resumed":
       case "invocation.finished":
       case "control.applied":
+      case "context.selected":
       case "held_out.checked":
       case "semantic.verdict":
       case "control.observed":
@@ -33780,9 +33861,542 @@ async function requestRunControl(store, action, reason = action === "pause" ? "P
   );
 }
 
+// packages/probes/src/index.ts
+import { access, readFile as readFile3, stat as stat2 } from "node:fs/promises";
+import { constants } from "node:fs";
+import { dirname as dirname3, join as join4, resolve, sep } from "node:path";
+
+// packages/probes/src/process.ts
+import { spawn as spawn3 } from "node:child_process";
+async function runProcess(command, args, options) {
+  const started = performance.now();
+  const timeoutMs = options.timeoutMs ?? 12e4;
+  return await new Promise((resolve4, reject) => {
+    const child = spawn3(command, args, {
+      cwd: options.cwd,
+      env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.once("error", reject);
+    const abort = () => {
+      child.kill("SIGTERM");
+    };
+    options.signal?.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 2e3).unref();
+    }, timeoutMs);
+    timer.unref();
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", abort);
+      resolve4({
+        exitCode: code ?? (timedOut ? 124 : 1),
+        stdout,
+        stderr,
+        durationMs: Math.round(performance.now() - started),
+        timedOut
+      });
+    });
+  });
+}
+
+// packages/probes/src/index.ts
+function compactOutput(result) {
+  const value = [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join("\n");
+  return value.length > 1e3 ? `${value.slice(0, 1e3)}
+\u2026` : value;
+}
+async function runProbe(spec, repositoryPath, signal) {
+  const started = performance.now();
+  if (spec.kind === "held_out")
+    throw new Error(`Held-out probe ${spec.id} must be resolved by the runtime`);
+  if (spec.kind === "command") {
+    const processResult = await runProcess(spec.command, spec.args, {
+      cwd: spec.cwd ? resolve(repositoryPath, spec.cwd) : repositoryPath,
+      timeoutMs: spec.timeoutMs,
+      ...signal ? { signal } : {}
+    });
+    const output2 = [processResult.stdout, processResult.stderr].filter(Boolean).join("\n");
+    const passed2 = !processResult.timedOut && processResult.exitCode === spec.expectedExitCode;
+    return {
+      result: {
+        probeId: spec.id,
+        kind: spec.kind,
+        passed: passed2,
+        signature: contentHash({
+          exitCode: processResult.exitCode,
+          output: compactOutput(processResult)
+        }),
+        summary: processResult.timedOut ? `Timed out after ${spec.timeoutMs}ms` : `${spec.command} exited ${processResult.exitCode}${compactOutput(processResult) ? `: ${compactOutput(processResult)}` : ""}`,
+        durationMs: processResult.durationMs
+      },
+      output: output2
+    };
+  }
+  if (spec.kind === "file") {
+    const path = resolve(repositoryPath, spec.path);
+    let exists = true;
+    try {
+      await access(path, constants.F_OK);
+    } catch {
+      exists = false;
+    }
+    let contains = true;
+    if (exists && spec.contains) contains = (await readFile3(path, "utf8")).includes(spec.contains);
+    const passed2 = exists === spec.shouldExist && contains;
+    const summary = `${spec.path} ${exists ? "exists" : "does not exist"}${spec.contains ? ` and ${contains ? "contains" : "does not contain"} the required text` : ""}`;
+    return {
+      result: {
+        probeId: spec.id,
+        kind: spec.kind,
+        passed: passed2,
+        signature: contentHash({ exists, contains }),
+        summary,
+        durationMs: Math.round(performance.now() - started)
+      },
+      output: summary
+    };
+  }
+  if (spec.kind === "repository_inventory") {
+    const args = ["grep", "-l", "-I", "-F"];
+    for (const term of spec.terms) args.push("-e", term);
+    args.push("--", ...spec.paths);
+    const inventory = await runProcess("git", args, {
+      cwd: repositoryPath,
+      ...signal ? { signal } : {}
+    });
+    const matches = inventory.stdout.split("\n").filter(Boolean);
+    const passed2 = inventory.exitCode === 0 || inventory.exitCode === 1;
+    const summary = matches.length ? `${matches.length} tracked files match ${spec.terms.join(", ")}: ${matches.slice(0, 20).join(", ")}` : `No tracked files match ${spec.terms.join(", ")}`;
+    return {
+      result: {
+        probeId: spec.id,
+        kind: spec.kind,
+        passed: passed2,
+        signature: contentHash({ matches, terms: spec.terms }),
+        summary,
+        durationMs: inventory.durationMs,
+        metrics: { inventoryMatches: matches.length }
+      },
+      output: inventory.stdout
+    };
+  }
+  const diff = await runProcess(
+    "git",
+    ["diff", "--no-ext-diff", "--name-status", spec.baseSha, "--"],
+    { cwd: repositoryPath, ...signal ? { signal } : {} }
+  );
+  const untracked = await runProcess("git", ["ls-files", "--others", "--exclude-standard"], {
+    cwd: repositoryPath,
+    ...signal ? { signal } : {}
+  });
+  const output = [diff.stdout.trim(), untracked.stdout.trim()].filter(Boolean).join("\n");
+  const hasChanges = output.length > 0;
+  const passed = diff.exitCode === 0 && untracked.exitCode === 0 && (!spec.requireChanges || hasChanges);
+  return {
+    result: {
+      probeId: spec.id,
+      kind: spec.kind,
+      passed,
+      signature: contentHash(output),
+      summary: hasChanges ? output.split("\n").slice(0, 20).join(", ") : "No workspace changes",
+      durationMs: Math.round(performance.now() - started)
+    },
+    output
+  };
+}
+async function runProbes(specs, repositoryPath, signal) {
+  const results = [];
+  for (const spec of specs) results.push(await runProbe(spec, repositoryPath, signal));
+  return results;
+}
+async function workspaceDigest(repositoryPath) {
+  const [status, diff] = await Promise.all([
+    runProcess("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
+      cwd: repositoryPath
+    }),
+    runProcess("git", ["diff", "--no-ext-diff", "--binary", "HEAD", "--"], { cwd: repositoryPath })
+  ]);
+  if (status.exitCode !== 0 || diff.exitCode !== 0)
+    throw new Error("Unable to capture repository state");
+  return contentHash({ status: status.stdout, diff: diff.stdout });
+}
+var probeStopWords = /* @__PURE__ */ new Set([
+  "across",
+  "add",
+  "and",
+  "audit",
+  "bug",
+  "every",
+  "feature",
+  "files",
+  "fix",
+  "from",
+  "implement",
+  "investigate",
+  "migration",
+  "refactor",
+  "repository",
+  "review",
+  "that",
+  "the",
+  "this",
+  "verify",
+  "with"
+]);
+function taskTerms(task) {
+  const quoted = [...task.matchAll(/[`"']([^`"']{2,40})[`"']/g)].map((match) => match[1]);
+  const words = task.toLowerCase().match(/[a-z0-9][a-z0-9._/-]{2,}/g) ?? [];
+  return [
+    ...new Set(
+      [...quoted, ...words].map((value) => value.toLowerCase()).filter((value) => !probeStopWords.has(value))
+    )
+  ].slice(0, 10);
+}
+function stableId(value) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 64);
+}
+function packageCommand(packageManager, script) {
+  const manager = packageManager?.split("@")[0] ?? "npm";
+  const direct = manager === "pnpm" || manager === "yarn" ? "corepack" : manager;
+  const directArgs = [
+    ...direct === "corepack" ? [manager] : [],
+    ...manager === "npm" ? ["run"] : [],
+    script
+  ];
+  if (process.platform !== "win32") {
+    return { command: direct, args: directArgs, platforms: ["darwin", "linux"] };
+  }
+  return {
+    command: process.env.ComSpec ?? "cmd.exe",
+    args: ["/d", "/s", "/c", [direct, ...directArgs].join(" ")],
+    platforms: ["win32"]
+  };
+}
+function familyScriptPurpose(family, name, terms) {
+  const normalized = name.toLowerCase();
+  if (!/test|check|lint|typecheck|build|verify|validate|audit/.test(normalized)) return void 0;
+  if (/fix|write|update|generate|deploy|publish|release/.test(normalized)) return void 0;
+  if (terms.some((term) => term.length >= 3 && normalized.includes(stableId(term))))
+    return "focused";
+  if (family === "feature" && /accept|integration|e2e|scenario/.test(normalized))
+    return "acceptance";
+  const matchedFamily = family === "bug" && /unit|regression|focused/.test(normalized) || family === "migration" && /migrat|upgrade|compat/.test(normalized) || family === "refactor" && /unit|structur|typecheck/.test(normalized) || family === "audit" && /audit|lint|static|typecheck/.test(normalized);
+  if (matchedFamily) return "focused";
+  if (["check", "test", "typecheck", "lint", "build"].includes(normalized)) return "regression";
+  return void 0;
+}
+async function packageCandidates(repositoryPath, family, terms) {
+  const tracked = await runProcess("git", ["ls-files"], { cwd: repositoryPath });
+  if (tracked.exitCode !== 0) return [];
+  const manifests = tracked.stdout.split("\n").filter((path) => path === "package.json" || path.endsWith("/package.json")).slice(0, 100);
+  const rootManifest = manifests.includes("package.json") ? JSON.parse(await readFile3(join4(repositoryPath, "package.json"), "utf8")) : void 0;
+  const candidates = [];
+  for (const manifestPath of manifests) {
+    const manifest2 = JSON.parse(await readFile3(join4(repositoryPath, manifestPath), "utf8"));
+    const directory = dirname3(manifestPath) === "." ? void 0 : dirname3(manifestPath);
+    const relevant = !directory || terms.some(
+      (term) => directory.toLowerCase().includes(term) || manifest2.name?.toLowerCase().includes(term)
+    );
+    if (!relevant) continue;
+    for (const name of Object.keys(manifest2.scripts ?? {}).sort()) {
+      const purpose = familyScriptPurpose(family, name, terms);
+      if (!purpose) continue;
+      const command = packageCommand(manifest2.packageManager ?? rootManifest?.packageManager, name);
+      candidates.push({
+        root: !directory,
+        item: {
+          phase: "completion",
+          purpose,
+          source: `${manifestPath} script ${name}`,
+          probe: {
+            id: stableId(`package-${directory ?? "root"}-${name}`),
+            kind: "command",
+            ...command,
+            ...directory ? { cwd: directory } : {},
+            expectedExitCode: 0,
+            timeoutMs: /test|e2e|integration/.test(name) ? 3e5 : 18e4
+          }
+        }
+      });
+    }
+  }
+  return candidates;
+}
+function selectPackageCandidates(candidates) {
+  const focused = candidates.filter(({ item }) => item.purpose !== "regression").sort((left, right) => Number(right.root) - Number(left.root)).slice(0, 2).map(({ item }) => item);
+  const rootCheck = candidates.find(
+    ({ root, item }) => root && item.purpose === "regression" && item.probe.id.endsWith("-check")
+  );
+  const regression = (rootCheck ? [rootCheck] : candidates.filter(({ item }) => item.purpose === "regression").slice(0, 3)).map(({ item }) => item);
+  return [...focused, ...regression].filter(
+    (item, index, items) => items.findIndex(({ probe }) => probe.id === item.probe.id) === index
+  );
+}
+function withinRepository(repositoryPath, candidate) {
+  const root = resolve(repositoryPath);
+  const path = resolve(repositoryPath, candidate);
+  return path === root || path.startsWith(`${root}${sep}`);
+}
+async function validateProbePlan(input, repositoryPath) {
+  const plan = ProbePlanSchema.parse(input);
+  if (!plan.items.some(({ phase }) => phase === "completion"))
+    throw new Error("A probe plan must contain at least one completion probe");
+  const keys = /* @__PURE__ */ new Set();
+  for (const item of plan.items) {
+    const key = `${item.phase}:${item.probe.id}`;
+    if (keys.has(key)) throw new Error(`Duplicate ${item.phase} probe ID ${item.probe.id}`);
+    keys.add(key);
+    if (item.probe.kind === "held_out")
+      throw new Error("User-editable probe plans cannot contain held-out references");
+    if (item.probe.kind === "command") {
+      if (item.probe.timeoutMs > 18e5)
+        throw new Error(`Probe ${item.probe.id} exceeds the 30 minute timeout limit`);
+      if (item.probe.platforms && !item.probe.platforms.includes(process.platform))
+        throw new Error(`Probe ${item.probe.id} does not support ${process.platform}`);
+      const cwd = item.probe.cwd ?? ".";
+      if (!withinRepository(repositoryPath, cwd))
+        throw new Error(`Probe ${item.probe.id} escapes the repository working directory`);
+      const directory = await stat2(resolve(repositoryPath, cwd)).catch(() => void 0);
+      if (!directory?.isDirectory())
+        throw new Error(`Probe ${item.probe.id} uses missing working directory ${cwd}`);
+    }
+    if (item.probe.kind === "file" && !withinRepository(repositoryPath, item.probe.path)) {
+      throw new Error(`Probe ${item.probe.id} escapes the repository`);
+    }
+    if (item.probe.kind === "repository_inventory" && item.probe.paths.some((path) => !withinRepository(repositoryPath, path))) {
+      throw new Error(`Probe ${item.probe.id} escapes the repository inventory scope`);
+    }
+  }
+  return plan;
+}
+async function discoverProbePlan(repositoryPath, task, baseSha) {
+  const family = classifyTask(task);
+  const terms = taskTerms(task);
+  const inventoryTerms = terms.length ? terms : [family];
+  const inventory = {
+    id: `${family}-task-inventory`,
+    kind: "repository_inventory",
+    paths: ["."],
+    terms: inventoryTerms
+  };
+  const items = [
+    {
+      phase: "progress",
+      purpose: "inventory",
+      source: "Task terms matched against tracked repository files",
+      probe: inventory
+    },
+    {
+      phase: "progress",
+      purpose: "focused",
+      source: "Approved base SHA workspace delta",
+      probe: {
+        id: "workspace-diff",
+        kind: "git_diff",
+        baseSha,
+        requireChanges: family !== "audit"
+      }
+    }
+  ];
+  const selected = selectPackageCandidates(
+    await packageCandidates(repositoryPath, family, inventoryTerms)
+  );
+  for (const completion of selected) {
+    if (completion.purpose !== "regression") items.push({ ...completion, phase: "progress" });
+    items.push(completion);
+  }
+  try {
+    await access(join4(repositoryPath, "pyproject.toml"));
+    items.push({
+      phase: "completion",
+      purpose: "regression",
+      source: "pyproject.toml",
+      probe: {
+        id: "python-tests",
+        kind: "command",
+        command: "python",
+        args: ["-m", "pytest", "-q"],
+        expectedExitCode: 0,
+        timeoutMs: 3e5,
+        platforms: ["darwin", "linux", "win32"]
+      }
+    });
+  } catch {
+  }
+  try {
+    await access(join4(repositoryPath, "go.mod"));
+    items.push({
+      phase: "completion",
+      purpose: "regression",
+      source: "go.mod",
+      probe: {
+        id: "go-tests",
+        kind: "command",
+        command: "go",
+        args: ["test", "./..."],
+        expectedExitCode: 0,
+        timeoutMs: 3e5,
+        platforms: ["darwin", "linux", "win32"]
+      }
+    });
+  } catch {
+  }
+  if (family === "audit" || !items.some(({ phase }) => phase === "completion")) {
+    items.push({
+      phase: "completion",
+      purpose: "inventory",
+      source: "Task-term coverage across tracked repository files",
+      probe: inventory
+    });
+  }
+  return await validateProbePlan({ schemaVersion: 1, family, items }, repositoryPath);
+}
+
+// packages/runtime/src/context.ts
+var contextStopWords = /* @__PURE__ */ new Set([
+  "acceptance",
+  "approved",
+  "complete",
+  "completion",
+  "feature",
+  "implement",
+  "implementation",
+  "repository",
+  "substantial",
+  "verify"
+]);
+function contextTerms(objective) {
+  return [
+    ...new Set(
+      (objective.toLowerCase().match(/[a-z0-9][a-z0-9._/-]{2,}/g) ?? []).filter(
+        (term) => !contextStopWords.has(term)
+      )
+    )
+  ].slice(0, 12);
+}
+function groundedRelevantPaths(paths, objective) {
+  const terms = contextTerms(objective);
+  return [...new Set(paths)].filter(
+    (path) => path.length > 0 && !path.startsWith("dist/") && !path.endsWith(".map") && !path.endsWith(".lock")
+  ).map((path) => {
+    const normalized = path.toLowerCase();
+    const affinity = terms.filter((term) => normalized.includes(term)).length;
+    const source = /(?:^|\/)(?:src|test|tests)\//.test(path) ? 2 : 0;
+    const policy = /(?:^|\/)(?:agents\.md|package\.json|pyproject\.toml|go\.mod)$/i.test(path) ? 1 : 0;
+    return { path, score: affinity * 4 + source + policy };
+  }).sort((left, right) => right.score - left.score || left.path.localeCompare(right.path)).slice(0, 4).map(({ path }) => path);
+}
+function selectedTrackedPaths(inventory, selected) {
+  const matches = /* @__PURE__ */ new Set();
+  for (const path of inventory)
+    if (selected.some((candidate) => path === candidate || path.startsWith(`${candidate}/`)))
+      matches.add(path);
+  return matches;
+}
+async function prepareWorkerContext(input) {
+  const tracked = await runProcess(
+    "git",
+    ["ls-files", "--cached", "--others", "--exclude-standard"],
+    {
+      cwd: input.repositoryPath,
+      timeoutMs: 3e4
+    }
+  );
+  if (tracked.exitCode !== 0) throw new Error("Unable to inventory repository context");
+  const repositoryPaths = tracked.stdout.split("\n").filter(Boolean).sort();
+  const inventory = await input.store.writeContentAddressedArtifact(
+    "context-repositories",
+    `${JSON.stringify(repositoryPaths)}
+`
+  );
+  const relevantPaths = input.node.contextSelector.relevantPaths.length ? input.node.contextSelector.relevantPaths : groundedRelevantPaths(repositoryPaths, input.node.objective);
+  if (input.node.kind !== "commit" && relevantPaths.length === 0)
+    throw new Error(`Node ${input.node.id} has no grounded repository context`);
+  const node2 = {
+    ...input.node,
+    contextSelector: { ...input.node.contextSelector, relevantPaths }
+  };
+  const capsule = createContextCapsule({
+    contract: input.contract,
+    node: node2,
+    predecessorEvidence: input.predecessorEvidence,
+    probeResults: input.probeResults
+  });
+  const capsuleHash = contentHash(capsule);
+  const storedCapsule = await input.store.writeCapsule(capsuleHash, capsule);
+  const matchedPaths = selectedTrackedPaths(repositoryPaths, capsule.relevantPaths);
+  const selectedPredecessorNodeIds = input.node.contextSelector.predecessorResults.filter(
+    (nodeId) => capsule.predecessorEvidence.some((value) => value.startsWith(`${nodeId}:`))
+  );
+  const selectedProbeResults = input.probeResults.filter(
+    ({ probeId }) => capsule.probeEvidence.some((value) => value.startsWith(`${probeId}:`))
+  );
+  const reusedArtifacts = [
+    ...storedCapsule.reused ? [storedCapsule.path] : [],
+    ...inventory.reused ? [inventory.path] : []
+  ];
+  const receipt = ContextSelectionReceiptSchema.parse({
+    schemaVersion: 1,
+    runId: input.contract.runId,
+    nodeId: input.node.id,
+    capsule: {
+      hash: capsuleHash,
+      path: storedCapsule.path,
+      characters: contextCapsuleCharacters(capsule)
+    },
+    selected: {
+      repositoryPaths: capsule.relevantPaths,
+      predecessorNodeIds: selectedPredecessorNodeIds,
+      predecessorEvidenceHashes: capsule.predecessorEvidence.map((value) => contentHash(value)),
+      probeIds: selectedProbeResults.map(({ probeId }) => probeId),
+      probeSignatures: selectedProbeResults.map(({ signature }) => signature),
+      acceptanceAnchorIds: capsule.acceptanceAnchors.map(({ id }) => id)
+    },
+    omitted: {
+      repositoryPathCount: repositoryPaths.length - matchedPaths.size,
+      declaredRepositoryPaths: input.node.contextSelector.relevantPaths.filter(
+        (path) => !capsule.relevantPaths.includes(path)
+      ),
+      predecessorNodeIds: input.node.dependsOn.filter(
+        (nodeId) => !selectedPredecessorNodeIds.includes(nodeId)
+      ),
+      probeIds: input.probeResults.filter(({ probeId }) => !selectedProbeResults.some((result) => result.probeId === probeId)).map(({ probeId }) => probeId),
+      repositoryInventory: {
+        digest: inventory.hash,
+        artifact: inventory.path,
+        totalPathCount: repositoryPaths.length
+      },
+      rawHostTranscripts: true,
+      rawProbeOutputs: true
+    },
+    reused: {
+      capsule: storedCapsule.reused,
+      repositoryInventory: inventory.reused,
+      artifacts: reusedArtifacts
+    }
+  });
+  await input.store.append("runtime", "context.selected", { receipt }, input.invocationId);
+  return { capsule, capsuleHash, receipt };
+}
+
 // packages/runtime/src/governance.ts
 import { randomUUID as randomUUID5 } from "node:crypto";
-import { join as join4 } from "node:path";
+import { join as join5 } from "node:path";
 function decisionFor(state, sourceId, targetId) {
   const explicit = state.controlDecisions.findLast(
     (decision) => decision.sourceId === sourceId && decision.targetId === targetId
@@ -34123,7 +34737,7 @@ async function evaluateControlAcceptance(store, graph, state, targetId, evidence
   return { allowed: true };
 }
 async function decideRunControl(store, input) {
-  const lock = new RunLock(join4(store.graphcraftRoot, "locks", `${store.runId}.lock`));
+  const lock = new RunLock(join5(store.graphcraftRoot, "locks", `${store.runId}.lock`));
   await lock.acquire();
   try {
     const [graph, state] = await Promise.all([store.loadGraph(), store.loadState()]);
@@ -34165,12 +34779,12 @@ async function decideRunControl(store, input) {
 }
 
 // packages/runtime/src/held-out.ts
-import { readFile as readFile3, stat as stat2 } from "node:fs/promises";
-import { isAbsolute as isAbsolute2, relative, resolve, sep } from "node:path";
+import { readFile as readFile4, stat as stat3 } from "node:fs/promises";
+import { isAbsolute as isAbsolute2, relative, resolve as resolve2, sep as sep2 } from "node:path";
 function relativeRepositoryPath(repositoryRoot, candidate) {
-  const root = resolve(repositoryRoot);
-  const path = resolve(repositoryRoot, candidate);
-  if (path !== root && !path.startsWith(`${root}${sep}`)) return void 0;
+  const root = resolve2(repositoryRoot);
+  const path = resolve2(repositoryRoot, candidate);
+  if (path !== root && !path.startsWith(`${root}${sep2}`)) return void 0;
   const result = relative(root, path);
   return result && !isAbsolute2(result) ? result : void 0;
 }
@@ -34182,11 +34796,11 @@ function possibleFileArguments(values) {
 async function fileIntegrity(repositoryRoot, cwd, values) {
   const result = [];
   for (const value of possibleFileArguments(values)) {
-    const path = relativeRepositoryPath(repositoryRoot, resolve(repositoryRoot, cwd ?? ".", value));
+    const path = relativeRepositoryPath(repositoryRoot, resolve2(repositoryRoot, cwd ?? ".", value));
     if (!path) continue;
-    const details = await stat2(resolve(repositoryRoot, path)).catch(() => void 0);
+    const details = await stat3(resolve2(repositoryRoot, path)).catch(() => void 0);
     if (!details?.isFile()) continue;
-    const contents = await readFile3(resolve(repositoryRoot, path));
+    const contents = await readFile4(resolve2(repositoryRoot, path));
     result.push({
       kind: "file",
       path,
@@ -34215,7 +34829,7 @@ async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot) {
     const script = match[2];
     const manifestPath = relativeRepositoryPath(repositoryRoot, path);
     if (!manifestPath) throw new Error(`Completion script ${script} escapes the repository`);
-    const manifest2 = JSON.parse(await readFile3(resolve(repositoryRoot, manifestPath), "utf8"));
+    const manifest2 = JSON.parse(await readFile4(resolve2(repositoryRoot, manifestPath), "utf8"));
     const value = manifest2.scripts?.[script];
     if (!value) throw new Error(`Completion script ${script} is missing from ${manifestPath}`);
     protectedValues.push({
@@ -34246,13 +34860,13 @@ async function heldOutIntegrityFailures(plan, repositoryPath) {
     for (const integrity of entry.integrity) {
       let actualHash;
       if (integrity.kind === "package_script") {
-        const manifest2 = await readFile3(resolve(repositoryPath, integrity.path), "utf8").then(
+        const manifest2 = await readFile4(resolve2(repositoryPath, integrity.path), "utf8").then(
           (value2) => JSON.parse(value2)
         ).catch(() => void 0);
         const value = manifest2?.scripts?.[integrity.script];
         actualHash = value ? contentHash({ path: integrity.path, script: integrity.script, value }) : contentHash({ missing: true, path: integrity.path, script: integrity.script });
       } else {
-        const contents = await readFile3(resolve(repositoryPath, integrity.path)).catch(
+        const contents = await readFile4(resolve2(repositoryPath, integrity.path)).catch(
           () => void 0
         );
         actualHash = contents ? contentHash({ path: integrity.path, contents: contents.toString("base64") }) : contentHash({ missing: true, path: integrity.path });
@@ -34291,8 +34905,8 @@ function actionableHeldOutFailures(results) {
 }
 
 // packages/runtime/src/migration.ts
-import { cp, readFile as readFile4 } from "node:fs/promises";
-import { join as join5 } from "node:path";
+import { cp, readFile as readFile5 } from "node:fs/promises";
+import { join as join6 } from "node:path";
 var CURRENT_RUN_STORAGE_VERSION = 1;
 function manifest(runId, migratedFrom) {
   return RunStorageManifestSchema.parse({
@@ -34317,7 +34931,7 @@ function manifest(runId, migratedFrom) {
   });
 }
 function runStorageManifestPath(runRoot) {
-  return join5(runRoot, "storage.json");
+  return join6(runRoot, "storage.json");
 }
 async function writeCurrentRunStorageManifest(runRoot, runId, migratedFrom) {
   const value = manifest(runId, migratedFrom);
@@ -34328,7 +34942,7 @@ async function ensureCurrentRunStorage(input) {
   const path = runStorageManifestPath(input.runRoot);
   let raw;
   try {
-    raw = JSON.parse(await readFile4(path, "utf8"));
+    raw = JSON.parse(await readFile5(path, "utf8"));
   } catch (error51) {
     if (error51.code !== "ENOENT")
       throw new Error(
@@ -34350,28 +34964,28 @@ async function ensureCurrentRunStorage(input) {
       throw new Error(`Run storage manifest belongs to ${parsed.runId}, not ${input.runId}`);
     return parsed;
   }
-  await readFile4(join5(input.runRoot, "events.jsonl"), "utf8").catch((error51) => {
+  await readFile5(join6(input.runRoot, "events.jsonl"), "utf8").catch((error51) => {
     throw new Error(
       `Legacy run ${input.runId} cannot migrate because events.jsonl is unavailable: ${error51.message}`
     );
   });
-  const lock = new RunLock(join5(input.graphcraftRoot, "locks", `${input.runId}.migration.lock`));
+  const lock = new RunLock(join6(input.graphcraftRoot, "locks", `${input.runId}.migration.lock`));
   try {
     await lock.acquire();
   } catch (error51) {
     if (!(error51 instanceof Error) || !error51.message.includes("already active")) throw error51;
     const deadline = Date.now() + 5e3;
     while (Date.now() <= deadline) {
-      const migrated = await readFile4(path, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
+      const migrated = await readFile5(path, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
       if (migrated) return migrated;
       await new Promise((resolve4) => setTimeout(resolve4, 10));
     }
     throw new Error(`Timed out waiting for storage migration of run ${input.runId}`);
   }
   try {
-    const migrated = await readFile4(path, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
+    const migrated = await readFile5(path, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
     if (migrated) return migrated;
-    const backupRoot = join5(input.graphcraftRoot, "migration-backups", input.runId, "0-to-1");
+    const backupRoot = join6(input.graphcraftRoot, "migration-backups", input.runId, "0-to-1");
     await cp(input.runRoot, backupRoot, {
       recursive: true,
       force: true,
@@ -34386,414 +35000,6 @@ async function ensureCurrentRunStorage(input) {
 // packages/runtime/src/repository.ts
 import { appendFile, mkdir as mkdir3, readFile as readFile6 } from "node:fs/promises";
 import { basename, dirname as dirname4, isAbsolute as isAbsolute3, join as join7, resolve as resolve3 } from "node:path";
-
-// packages/probes/src/index.ts
-import { access, readFile as readFile5, stat as stat3 } from "node:fs/promises";
-import { constants } from "node:fs";
-import { dirname as dirname3, join as join6, resolve as resolve2, sep as sep2 } from "node:path";
-
-// packages/probes/src/process.ts
-import { spawn as spawn3 } from "node:child_process";
-async function runProcess(command, args, options) {
-  const started = performance.now();
-  const timeoutMs = options.timeoutMs ?? 12e4;
-  return await new Promise((resolve4, reject) => {
-    const child = spawn3(command, args, {
-      cwd: options.cwd,
-      env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"]
-    });
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
-    child.once("error", reject);
-    const abort = () => {
-      child.kill("SIGTERM");
-    };
-    options.signal?.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 2e3).unref();
-    }, timeoutMs);
-    timer.unref();
-    child.once("close", (code) => {
-      clearTimeout(timer);
-      options.signal?.removeEventListener("abort", abort);
-      resolve4({
-        exitCode: code ?? (timedOut ? 124 : 1),
-        stdout,
-        stderr,
-        durationMs: Math.round(performance.now() - started),
-        timedOut
-      });
-    });
-  });
-}
-
-// packages/probes/src/index.ts
-function compactOutput(result) {
-  const value = [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join("\n");
-  return value.length > 1e3 ? `${value.slice(0, 1e3)}
-\u2026` : value;
-}
-async function runProbe(spec, repositoryPath, signal) {
-  const started = performance.now();
-  if (spec.kind === "held_out")
-    throw new Error(`Held-out probe ${spec.id} must be resolved by the runtime`);
-  if (spec.kind === "command") {
-    const processResult = await runProcess(spec.command, spec.args, {
-      cwd: spec.cwd ? resolve2(repositoryPath, spec.cwd) : repositoryPath,
-      timeoutMs: spec.timeoutMs,
-      ...signal ? { signal } : {}
-    });
-    const output2 = [processResult.stdout, processResult.stderr].filter(Boolean).join("\n");
-    const passed2 = !processResult.timedOut && processResult.exitCode === spec.expectedExitCode;
-    return {
-      result: {
-        probeId: spec.id,
-        kind: spec.kind,
-        passed: passed2,
-        signature: contentHash({
-          exitCode: processResult.exitCode,
-          output: compactOutput(processResult)
-        }),
-        summary: processResult.timedOut ? `Timed out after ${spec.timeoutMs}ms` : `${spec.command} exited ${processResult.exitCode}${compactOutput(processResult) ? `: ${compactOutput(processResult)}` : ""}`,
-        durationMs: processResult.durationMs
-      },
-      output: output2
-    };
-  }
-  if (spec.kind === "file") {
-    const path = resolve2(repositoryPath, spec.path);
-    let exists = true;
-    try {
-      await access(path, constants.F_OK);
-    } catch {
-      exists = false;
-    }
-    let contains = true;
-    if (exists && spec.contains) contains = (await readFile5(path, "utf8")).includes(spec.contains);
-    const passed2 = exists === spec.shouldExist && contains;
-    const summary = `${spec.path} ${exists ? "exists" : "does not exist"}${spec.contains ? ` and ${contains ? "contains" : "does not contain"} the required text` : ""}`;
-    return {
-      result: {
-        probeId: spec.id,
-        kind: spec.kind,
-        passed: passed2,
-        signature: contentHash({ exists, contains }),
-        summary,
-        durationMs: Math.round(performance.now() - started)
-      },
-      output: summary
-    };
-  }
-  if (spec.kind === "repository_inventory") {
-    const args = ["grep", "-l", "-I", "-F"];
-    for (const term of spec.terms) args.push("-e", term);
-    args.push("--", ...spec.paths);
-    const inventory = await runProcess("git", args, {
-      cwd: repositoryPath,
-      ...signal ? { signal } : {}
-    });
-    const matches = inventory.stdout.split("\n").filter(Boolean);
-    const passed2 = inventory.exitCode === 0 || inventory.exitCode === 1;
-    const summary = matches.length ? `${matches.length} tracked files match ${spec.terms.join(", ")}: ${matches.slice(0, 20).join(", ")}` : `No tracked files match ${spec.terms.join(", ")}`;
-    return {
-      result: {
-        probeId: spec.id,
-        kind: spec.kind,
-        passed: passed2,
-        signature: contentHash({ matches, terms: spec.terms }),
-        summary,
-        durationMs: inventory.durationMs,
-        metrics: { inventoryMatches: matches.length }
-      },
-      output: inventory.stdout
-    };
-  }
-  const diff = await runProcess(
-    "git",
-    ["diff", "--no-ext-diff", "--name-status", spec.baseSha, "--"],
-    { cwd: repositoryPath, ...signal ? { signal } : {} }
-  );
-  const untracked = await runProcess("git", ["ls-files", "--others", "--exclude-standard"], {
-    cwd: repositoryPath,
-    ...signal ? { signal } : {}
-  });
-  const output = [diff.stdout.trim(), untracked.stdout.trim()].filter(Boolean).join("\n");
-  const hasChanges = output.length > 0;
-  const passed = diff.exitCode === 0 && untracked.exitCode === 0 && (!spec.requireChanges || hasChanges);
-  return {
-    result: {
-      probeId: spec.id,
-      kind: spec.kind,
-      passed,
-      signature: contentHash(output),
-      summary: hasChanges ? output.split("\n").slice(0, 20).join(", ") : "No workspace changes",
-      durationMs: Math.round(performance.now() - started)
-    },
-    output
-  };
-}
-async function runProbes(specs, repositoryPath, signal) {
-  const results = [];
-  for (const spec of specs) results.push(await runProbe(spec, repositoryPath, signal));
-  return results;
-}
-async function workspaceDigest(repositoryPath) {
-  const [status, diff] = await Promise.all([
-    runProcess("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
-      cwd: repositoryPath
-    }),
-    runProcess("git", ["diff", "--no-ext-diff", "--binary", "HEAD", "--"], { cwd: repositoryPath })
-  ]);
-  if (status.exitCode !== 0 || diff.exitCode !== 0)
-    throw new Error("Unable to capture repository state");
-  return contentHash({ status: status.stdout, diff: diff.stdout });
-}
-var probeStopWords = /* @__PURE__ */ new Set([
-  "across",
-  "add",
-  "and",
-  "audit",
-  "bug",
-  "every",
-  "feature",
-  "files",
-  "fix",
-  "from",
-  "implement",
-  "investigate",
-  "migration",
-  "refactor",
-  "repository",
-  "review",
-  "that",
-  "the",
-  "this",
-  "verify",
-  "with"
-]);
-function taskTerms(task) {
-  const quoted = [...task.matchAll(/[`"']([^`"']{2,40})[`"']/g)].map((match) => match[1]);
-  const words = task.toLowerCase().match(/[a-z0-9][a-z0-9._/-]{2,}/g) ?? [];
-  return [
-    ...new Set(
-      [...quoted, ...words].map((value) => value.toLowerCase()).filter((value) => !probeStopWords.has(value))
-    )
-  ].slice(0, 10);
-}
-function stableId(value) {
-  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 64);
-}
-function packageCommand(packageManager, script) {
-  const manager = packageManager?.split("@")[0] ?? "npm";
-  const direct = manager === "pnpm" || manager === "yarn" ? "corepack" : manager;
-  const directArgs = [
-    ...direct === "corepack" ? [manager] : [],
-    ...manager === "npm" ? ["run"] : [],
-    script
-  ];
-  if (process.platform !== "win32") {
-    return { command: direct, args: directArgs, platforms: ["darwin", "linux"] };
-  }
-  return {
-    command: process.env.ComSpec ?? "cmd.exe",
-    args: ["/d", "/s", "/c", [direct, ...directArgs].join(" ")],
-    platforms: ["win32"]
-  };
-}
-function familyScriptPurpose(family, name, terms) {
-  const normalized = name.toLowerCase();
-  if (!/test|check|lint|typecheck|build|verify|validate|audit/.test(normalized)) return void 0;
-  if (/fix|write|update|generate|deploy|publish|release/.test(normalized)) return void 0;
-  if (terms.some((term) => term.length >= 3 && normalized.includes(stableId(term))))
-    return "focused";
-  if (family === "feature" && /accept|integration|e2e|scenario/.test(normalized))
-    return "acceptance";
-  const matchedFamily = family === "bug" && /unit|regression|focused/.test(normalized) || family === "migration" && /migrat|upgrade|compat/.test(normalized) || family === "refactor" && /unit|structur|typecheck/.test(normalized) || family === "audit" && /audit|lint|static|typecheck/.test(normalized);
-  if (matchedFamily) return "focused";
-  if (["check", "test", "typecheck", "lint", "build"].includes(normalized)) return "regression";
-  return void 0;
-}
-async function packageCandidates(repositoryPath, family, terms) {
-  const tracked = await runProcess("git", ["ls-files"], { cwd: repositoryPath });
-  if (tracked.exitCode !== 0) return [];
-  const manifests = tracked.stdout.split("\n").filter((path) => path === "package.json" || path.endsWith("/package.json")).slice(0, 100);
-  const rootManifest = manifests.includes("package.json") ? JSON.parse(await readFile5(join6(repositoryPath, "package.json"), "utf8")) : void 0;
-  const candidates = [];
-  for (const manifestPath of manifests) {
-    const manifest2 = JSON.parse(await readFile5(join6(repositoryPath, manifestPath), "utf8"));
-    const directory = dirname3(manifestPath) === "." ? void 0 : dirname3(manifestPath);
-    const relevant = !directory || terms.some(
-      (term) => directory.toLowerCase().includes(term) || manifest2.name?.toLowerCase().includes(term)
-    );
-    if (!relevant) continue;
-    for (const name of Object.keys(manifest2.scripts ?? {}).sort()) {
-      const purpose = familyScriptPurpose(family, name, terms);
-      if (!purpose) continue;
-      const command = packageCommand(manifest2.packageManager ?? rootManifest?.packageManager, name);
-      candidates.push({
-        root: !directory,
-        item: {
-          phase: "completion",
-          purpose,
-          source: `${manifestPath} script ${name}`,
-          probe: {
-            id: stableId(`package-${directory ?? "root"}-${name}`),
-            kind: "command",
-            ...command,
-            ...directory ? { cwd: directory } : {},
-            expectedExitCode: 0,
-            timeoutMs: /test|e2e|integration/.test(name) ? 3e5 : 18e4
-          }
-        }
-      });
-    }
-  }
-  return candidates;
-}
-function selectPackageCandidates(candidates) {
-  const focused = candidates.filter(({ item }) => item.purpose !== "regression").sort((left, right) => Number(right.root) - Number(left.root)).slice(0, 2).map(({ item }) => item);
-  const rootCheck = candidates.find(
-    ({ root, item }) => root && item.purpose === "regression" && item.probe.id.endsWith("-check")
-  );
-  const regression = (rootCheck ? [rootCheck] : candidates.filter(({ item }) => item.purpose === "regression").slice(0, 3)).map(({ item }) => item);
-  return [...focused, ...regression].filter(
-    (item, index, items) => items.findIndex(({ probe }) => probe.id === item.probe.id) === index
-  );
-}
-function withinRepository(repositoryPath, candidate) {
-  const root = resolve2(repositoryPath);
-  const path = resolve2(repositoryPath, candidate);
-  return path === root || path.startsWith(`${root}${sep2}`);
-}
-async function validateProbePlan(input, repositoryPath) {
-  const plan = ProbePlanSchema.parse(input);
-  if (!plan.items.some(({ phase }) => phase === "completion"))
-    throw new Error("A probe plan must contain at least one completion probe");
-  const keys = /* @__PURE__ */ new Set();
-  for (const item of plan.items) {
-    const key = `${item.phase}:${item.probe.id}`;
-    if (keys.has(key)) throw new Error(`Duplicate ${item.phase} probe ID ${item.probe.id}`);
-    keys.add(key);
-    if (item.probe.kind === "held_out")
-      throw new Error("User-editable probe plans cannot contain held-out references");
-    if (item.probe.kind === "command") {
-      if (item.probe.timeoutMs > 18e5)
-        throw new Error(`Probe ${item.probe.id} exceeds the 30 minute timeout limit`);
-      if (item.probe.platforms && !item.probe.platforms.includes(process.platform))
-        throw new Error(`Probe ${item.probe.id} does not support ${process.platform}`);
-      const cwd = item.probe.cwd ?? ".";
-      if (!withinRepository(repositoryPath, cwd))
-        throw new Error(`Probe ${item.probe.id} escapes the repository working directory`);
-      const directory = await stat3(resolve2(repositoryPath, cwd)).catch(() => void 0);
-      if (!directory?.isDirectory())
-        throw new Error(`Probe ${item.probe.id} uses missing working directory ${cwd}`);
-    }
-    if (item.probe.kind === "file" && !withinRepository(repositoryPath, item.probe.path)) {
-      throw new Error(`Probe ${item.probe.id} escapes the repository`);
-    }
-    if (item.probe.kind === "repository_inventory" && item.probe.paths.some((path) => !withinRepository(repositoryPath, path))) {
-      throw new Error(`Probe ${item.probe.id} escapes the repository inventory scope`);
-    }
-  }
-  return plan;
-}
-async function discoverProbePlan(repositoryPath, task, baseSha) {
-  const family = classifyTask(task);
-  const terms = taskTerms(task);
-  const inventoryTerms = terms.length ? terms : [family];
-  const inventory = {
-    id: `${family}-task-inventory`,
-    kind: "repository_inventory",
-    paths: ["."],
-    terms: inventoryTerms
-  };
-  const items = [
-    {
-      phase: "progress",
-      purpose: "inventory",
-      source: "Task terms matched against tracked repository files",
-      probe: inventory
-    },
-    {
-      phase: "progress",
-      purpose: "focused",
-      source: "Approved base SHA workspace delta",
-      probe: {
-        id: "workspace-diff",
-        kind: "git_diff",
-        baseSha,
-        requireChanges: family !== "audit"
-      }
-    }
-  ];
-  const selected = selectPackageCandidates(
-    await packageCandidates(repositoryPath, family, inventoryTerms)
-  );
-  for (const completion of selected) {
-    if (completion.purpose !== "regression") items.push({ ...completion, phase: "progress" });
-    items.push(completion);
-  }
-  try {
-    await access(join6(repositoryPath, "pyproject.toml"));
-    items.push({
-      phase: "completion",
-      purpose: "regression",
-      source: "pyproject.toml",
-      probe: {
-        id: "python-tests",
-        kind: "command",
-        command: "python",
-        args: ["-m", "pytest", "-q"],
-        expectedExitCode: 0,
-        timeoutMs: 3e5,
-        platforms: ["darwin", "linux", "win32"]
-      }
-    });
-  } catch {
-  }
-  try {
-    await access(join6(repositoryPath, "go.mod"));
-    items.push({
-      phase: "completion",
-      purpose: "regression",
-      source: "go.mod",
-      probe: {
-        id: "go-tests",
-        kind: "command",
-        command: "go",
-        args: ["test", "./..."],
-        expectedExitCode: 0,
-        timeoutMs: 3e5,
-        platforms: ["darwin", "linux", "win32"]
-      }
-    });
-  } catch {
-  }
-  if (family === "audit" || !items.some(({ phase }) => phase === "completion")) {
-    items.push({
-      phase: "completion",
-      purpose: "inventory",
-      source: "Task-term coverage across tracked repository files",
-      probe: inventory
-    });
-  }
-  return await validateProbePlan({ schemaVersion: 1, family, items }, repositoryPath);
-}
-
-// packages/runtime/src/repository.ts
 async function git(repositoryPath, args) {
   const result = await runProcess("git", args, { cwd: repositoryPath, timeoutMs: 12e4 });
   if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `git ${args[0]} failed`);
@@ -35275,8 +35481,23 @@ var RunStore = class _RunStore {
   async writeCapsule(hash2, value) {
     await this.ensureStorage();
     const path = join8(this.runRoot, "capsules", `${hash2}.json`);
+    const reused = await readFile7(path, "utf8").then((existing) => contentHash(JSON.parse(existing)) === hash2).catch(() => false);
+    if (reused) return { path, reused: true };
     await writeJsonAtomic(path, value);
-    return path;
+    return { path, reused: false };
+  }
+  async writeContentAddressedArtifact(category, value, extension = "json") {
+    await this.ensureStorage();
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(category) || !/^[a-z0-9]+$/.test(extension))
+      throw new Error("Content-addressed artifact category or extension is invalid");
+    const bytes = typeof value === "string" ? Buffer.from(value) : Buffer.from(value);
+    const hash2 = contentHash({ contents: bytes.toString("base64") });
+    const path = join8(this.runRoot, "artifacts", category, `${hash2}.${extension}`);
+    const reused = await readFile7(path).then((existing) => Buffer.compare(existing, bytes) === 0).catch(() => false);
+    if (reused) return { path, hash: hash2, reused: true };
+    await mkdir4(dirname5(path), { recursive: true });
+    await writeFile3(path, bytes, { mode: 384 });
+    return { path, hash: hash2, reused: false };
   }
   async writeWorkspace(value) {
     await this.ensureStorage();
@@ -35413,6 +35634,26 @@ function createProgressDecisionPacket(input) {
 }
 
 // packages/runtime/src/runner.ts
+function populateMissingGraphContext(graph, repositoryEvidence) {
+  const evidencePaths = repositoryEvidence.files.map(({ path }) => path);
+  return {
+    ...graph,
+    nodes: graph.nodes.map(
+      (node2) => node2.kind === "commit" || node2.contextSelector.relevantPaths.length > 0 ? node2 : {
+        ...node2,
+        contextSelector: {
+          ...node2.contextSelector,
+          relevantPaths: [
+            .../* @__PURE__ */ new Set([
+              ...groundedRelevantPaths(evidencePaths, node2.objective),
+              ...groundedRelevantPaths(repositoryEvidence.trackedPaths, node2.objective)
+            ])
+          ].slice(0, 4)
+        }
+      }
+    )
+  };
+}
 function persistedBaseline(value, family) {
   if (typeof value !== "object" || value === null) return void 0;
   const candidate = value;
@@ -35532,6 +35773,8 @@ async function createRun(task, options) {
     graph = compileGraph(contract, completionProbes);
   }
   graph = applyProbePlan(graph, contract, graphProbePlan);
+  graph = populateMissingGraphContext(graph, repositoryEvidence);
+  await validatePlannedContext(graph, repository.root);
   const store = await RunStore.create(
     repository.root,
     contract,
@@ -35583,14 +35826,6 @@ async function configureRunProbes(store, input) {
   }
 }
 async function executeWorker(input) {
-  const capsule = createContextCapsule({
-    contract: input.contract,
-    node: input.node,
-    ...input.predecessorEvidence ? { predecessorEvidence: input.predecessorEvidence } : {},
-    ...input.probeResults ? { probeResults: input.probeResults } : {}
-  });
-  const capsuleHash = contentHash(capsule);
-  await input.store.writeCapsule(capsuleHash, capsule);
   let invocationId = input.resume?.invocationId ?? randomUUID7();
   let resumeSessionId;
   if (input.resume) {
@@ -35638,6 +35873,15 @@ async function executeWorker(input) {
       invocationId = randomUUID7();
     }
   }
+  const { capsule, capsuleHash } = await prepareWorkerContext({
+    store: input.store,
+    invocationId,
+    contract: input.contract,
+    node: input.node,
+    repositoryPath: input.workspace.path,
+    predecessorEvidence: input.predecessorEvidence ?? [],
+    probeResults: input.probeResults ?? []
+  });
   if (!resumeSessionId) {
     await input.store.append("runtime", "invocation.started", {
       invocationId,
@@ -35895,7 +36139,7 @@ function repairAmendment(graph, verification, failures) {
     contextSelector: {
       includeRepositoryInstructions: true,
       predecessorResults: verification.dependsOn,
-      relevantPaths: []
+      relevantPaths: verification.contextSelector.relevantPaths
     },
     progressProbes: [],
     completionProbes: [],
@@ -36834,7 +37078,8 @@ async function handleAction(input) {
         }))
       },
       state,
-      graphHistory: await store.loadGraphHistory()
+      graphHistory: await store.loadGraphHistory(),
+      contextReceipts: (await store.loadEvents()).filter(({ type }) => type === "context.selected").map(({ data }) => ContextSelectionReceiptSchema.parse(data.receipt))
     };
   if (input.action === "trace") return { events: await store.loadEvents() };
   if (input.action === "probes") {

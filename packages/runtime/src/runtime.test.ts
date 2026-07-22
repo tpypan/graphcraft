@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  ContextSelectionReceiptSchema,
   evidenceSnapshot,
   interruptionReason,
   reconcilePersistedInvocation,
@@ -441,6 +442,13 @@ describe("durable runtime", () => {
       "classifyTask",
     );
     expect(evidence.files.map(({ path }) => path)).toContain("package.json");
+    const created = await createRun(
+      "Fix task classification without matching fixture path substrings",
+      { cwd: repository },
+    );
+    expect(
+      created.graph.nodes.find(({ id }) => id === "implement")?.contextSelector.relevantPaths,
+    ).toContain("src/graph.ts");
   });
 
   it("prioritizes task identifiers and acronyms over incidental planning prose", async () => {
@@ -522,6 +530,12 @@ describe("durable runtime", () => {
     expect(
       (await created.store.loadEvents()).filter(({ type }) => type === "held_out.checked"),
     ).toHaveLength(1);
+    const contextReceipts = (await created.store.loadEvents())
+      .filter(({ type }) => type === "context.selected")
+      .map(({ data }) => ContextSelectionReceiptSchema.parse(data.receipt));
+    expect(contextReceipts).toHaveLength(2);
+    expect(contextReceipts[0]?.reused.repositoryInventory).toBe(false);
+    expect(contextReceipts[1]?.reused.repositoryInventory).toBe(true);
     expect(state.tokens.total).toBe(38);
     expect(adapter.semanticRequests).toHaveLength(1);
     expect(adapter.semanticRequests[0]).toMatchObject({
@@ -630,6 +644,30 @@ describe("durable runtime", () => {
     expect(adapter.calls).toEqual(["implement"]);
     expect(adapter.semanticRequests).toHaveLength(0);
     expect((await created.store.loadEvents()).map(({ type }) => type)).toContain("run.completed");
+    expect(
+      created.graph.nodes
+        .filter(({ kind }) => kind !== "commit")
+        .every(({ contextSelector }) => contextSelector.relevantPaths.length > 0),
+    ).toBe(true);
+    const contextEvent = (await created.store.loadEvents()).find(
+      ({ type }) => type === "context.selected",
+    );
+    const receipt = ContextSelectionReceiptSchema.parse(contextEvent?.data.receipt);
+    const repositoryInventory = JSON.parse(
+      await readFile(receipt.omitted.repositoryInventory.artifact, "utf8"),
+    ) as string[];
+    expect(receipt.selected.repositoryPaths.length).toBeGreaterThan(0);
+    expect(
+      receipt.selected.repositoryPaths.every((path) => repositoryInventory.includes(path)),
+    ).toBe(true);
+    expect(receipt.omitted.repositoryPathCount).toBe(
+      repositoryInventory.length - receipt.selected.repositoryPaths.length,
+    );
+    expect(receipt.omitted).toMatchObject({
+      rawHostTranscripts: true,
+      rawProbeOutputs: true,
+    });
+    expect(receipt.capsule.characters).toBeLessThanOrEqual(24_000);
 
     const eventCount = (await created.store.loadEvents()).length;
     const resumed = await executeRun({ store: created.store, adapter, approve: true });
@@ -1807,6 +1845,9 @@ describe("durable runtime", () => {
     expect(adapter.calls).toEqual([]);
     expect(state.tokens.total).toBe(14);
     expect(
+      (await created.store.loadEvents()).filter(({ type }) => type === "context.selected"),
+    ).toHaveLength(0);
+    expect(
       (await created.store.loadEvents()).find(
         ({ type, data }) => type === "invocation.finished" && data.recovered === true,
       ),
@@ -1961,6 +2002,18 @@ describe("durable runtime", () => {
     const completed = await executeRun({ store: created.store, adapter: resumeAdapter });
     expect(completed.status).toBe("completed");
     expect(resumeAdapter.requests[0]?.resumeSessionId).toBeTruthy();
+    const contextReceipts = (await created.store.loadEvents())
+      .filter(
+        ({ type, data }) =>
+          type === "context.selected" &&
+          (data.receipt as { nodeId?: string } | undefined)?.nodeId === "implement",
+      )
+      .map(({ data }) => ContextSelectionReceiptSchema.parse(data.receipt));
+    expect(contextReceipts).toHaveLength(2);
+    expect(contextReceipts[1]?.reused).toMatchObject({
+      capsule: true,
+      repositoryInventory: true,
+    });
   });
 
   it("coordinates an active stop and leaves no running node state", async () => {

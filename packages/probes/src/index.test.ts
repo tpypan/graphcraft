@@ -135,6 +135,27 @@ describe("task-specific probe planning", () => {
     expect(second.result.summary).toContain("No tracked files match");
   });
 
+  it("keeps raw command output out of model-visible probe summaries", async () => {
+    const { root } = await createRepository();
+    await writeFile(join(root, "noisy.mjs"), `console.error("${"failure ".repeat(1_000)}");\n`);
+
+    const executed = await runProbe(
+      {
+        id: "noisy-check",
+        kind: "command",
+        command: "node",
+        args: ["noisy.mjs"],
+        expectedExitCode: 0,
+        timeoutMs: 1_000,
+      },
+      root,
+    );
+
+    expect(executed.output.length).toBeGreaterThan(5_000);
+    expect(executed.result.summary.length).toBeLessThan(1_100);
+    expect(executed.result.summary).toContain("…");
+  });
+
   it("rejects unsafe or unsupported edited probe plans", async () => {
     const { root } = await createRepository();
     const invalid = {

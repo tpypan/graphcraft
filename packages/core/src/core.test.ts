@@ -4,16 +4,20 @@ import {
   applyGraphAmendment,
   classifyProgress,
   classifyTask,
+  contextCapsuleCharacters,
   codexGraphPlanJsonSchema,
   codexSemanticVerdictJsonSchema,
   codexWorkerResultJsonSchema,
   compileGraph,
   compilePlannedGraph,
   compileRunContract,
+  contentHash,
+  createContextCapsule,
   createHeldOutProbePlan,
   createRunEvent,
   evidenceSnapshot,
   graphPlanShape,
+  MAX_CONTEXT_CAPSULE_CHARACTERS,
   resolveHeldOutProbes,
   reduceEvents,
   semanticVerdictJsonSchema,
@@ -125,6 +129,56 @@ describe("run contracts and graphs", () => {
       type: "object",
       additionalProperties: false,
     });
+  });
+
+  it("bounds every worker context capsule before host execution", () => {
+    const contract = compileRunContract("Implement a substantial context feature", repository);
+    const graph = compileGraph(contract, [
+      {
+        id: "tests",
+        kind: "command",
+        command: "npm",
+        args: ["test"],
+        expectedExitCode: 0,
+        timeoutMs: 1_000,
+      },
+    ]);
+    const capsule = createContextCapsule({
+      contract,
+      node: {
+        ...graph.nodes[0]!,
+        objective: "Implement the bounded context feature",
+        contextSelector: {
+          ...graph.nodes[0]!.contextSelector,
+          relevantPaths: Array.from({ length: 100 }, (_, index) => `src/path-${index}.ts`),
+        },
+      },
+      predecessorEvidence: Array.from(
+        { length: 20 },
+        (_, index) => `predecessor-${index}: ${"raw log ".repeat(1_000)}`,
+      ),
+      probeResults: Array.from({ length: 30 }, (_, index) => ({
+        probeId: `probe-${index}`,
+        kind: "command" as const,
+        passed: false,
+        signature: contentHash(index),
+        summary: `failure ${"output ".repeat(1_000)}`,
+        durationMs: 1,
+      })),
+    });
+
+    expect(contextCapsuleCharacters(capsule)).toBeLessThanOrEqual(MAX_CONTEXT_CAPSULE_CHARACTERS);
+    expect(capsule.objective).toBe("Implement the bounded context feature");
+    expect(capsule.predecessorEvidence[0]).toContain("[truncated]");
+    expect(capsule.predecessorEvidence).toHaveLength(3);
+    expect(capsule.probeEvidence.length).toBeLessThanOrEqual(16);
+    expect(capsule.relevantPaths).toHaveLength(32);
+    expect(() =>
+      createContextCapsule({
+        contract,
+        node: { ...graph.nodes[0]!, objective: "x".repeat(MAX_CONTEXT_CAPSULE_CHARACTERS) },
+      }),
+    ).toThrow(/exceeds.*characters/);
   });
 
   it("exports Codex-compatible strict output schemas", () => {

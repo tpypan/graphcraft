@@ -49,7 +49,7 @@ Graphcraft displays a concise run contract before doing work. Use `--yes` only w
 - Keeps the finish line, permissions, repository policy, and acceptance anchors outside worker control.
 - Creates an isolated Git worktree without stashing, cleaning, or resetting the current checkout.
 - Stores a hashed append-only event log and rebuildable state under the repository's local `.graphcraft/` directory.
-- Gives each worker a small context capsule instead of replaying raw transcripts.
+- Gives each worker a grounded, size-bounded context capsule, records what was selected, omitted, and reused, and never replays raw transcripts or probe logs.
 - Infers deterministic, task-family-specific progress and completion probes from repository evidence, then lets users inspect or replace the versioned probe plan before approval.
 - Keeps executable completion definitions in an integrity-hashed held-out plan, gives planner graphs only opaque references, and blocks omitted, substituted, or weakened checks before acceptance.
 - Runs approved probes outside model context and classifies progress as advanced, learning, stalled, regressed, oscillating, blocked, or done.

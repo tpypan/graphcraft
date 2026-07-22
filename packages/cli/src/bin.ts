@@ -164,16 +164,13 @@ program
   .argument("[run]")
   .option("-C, --cwd <path>", "repository path", process.cwd())
   .action(async (run: string | undefined, options: { cwd: string }) => {
-    const store = await storeFor(options.cwd, run);
     console.log(
       JSON.stringify(
-        {
-          contract: await store.loadContract(),
-          graph: await store.loadGraph(),
-          probePlan: await store.loadProbePlan(),
-          state: await store.loadState(),
-          graphHistory: await store.loadGraphHistory(),
-        },
+        await handleAction({
+          action: "inspect",
+          repository: options.cwd,
+          ...(run ? { run } : {}),
+        }),
         null,
         2,
       ),

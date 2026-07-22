@@ -410,6 +410,43 @@ export const ContextCapsuleSchema = z.strictObject({
   probeEvidence: z.array(z.string()),
 });
 
+export const ContextSelectionReceiptSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  runId: z.uuid(),
+  nodeId: z.string().min(1),
+  capsule: z.strictObject({
+    hash: z.string().regex(/^[a-f0-9]{64}$/),
+    path: z.string().min(1),
+    characters: z.number().int().nonnegative(),
+  }),
+  selected: z.strictObject({
+    repositoryPaths: z.array(z.string()),
+    predecessorNodeIds: z.array(z.string()),
+    predecessorEvidenceHashes: z.array(z.string().regex(/^[a-f0-9]{64}$/)),
+    probeIds: z.array(z.string()),
+    probeSignatures: z.array(z.string().regex(/^[a-f0-9]{64}$/)),
+    acceptanceAnchorIds: z.array(z.string()),
+  }),
+  omitted: z.strictObject({
+    repositoryPathCount: z.number().int().nonnegative(),
+    declaredRepositoryPaths: z.array(z.string()),
+    predecessorNodeIds: z.array(z.string()),
+    probeIds: z.array(z.string()),
+    repositoryInventory: z.strictObject({
+      digest: z.string().regex(/^[a-f0-9]{64}$/),
+      artifact: z.string().min(1),
+      totalPathCount: z.number().int().nonnegative(),
+    }),
+    rawHostTranscripts: z.literal(true),
+    rawProbeOutputs: z.literal(true),
+  }),
+  reused: z.strictObject({
+    capsule: z.boolean(),
+    repositoryInventory: z.boolean(),
+    artifacts: z.array(z.string()),
+  }),
+});
+
 export const SemanticVerifierContextSchema = z.strictObject({
   schemaVersion: z.literal(1),
   phase: z.enum(["progress", "completion"]),
@@ -507,6 +544,7 @@ export const RunEventTypeSchema = z.enum([
   "control.override",
   "control.decision_required",
   "control.resolved",
+  "context.selected",
   "held_out.checked",
   "semantic.verdict",
   "tokens.recorded",
@@ -612,6 +650,7 @@ export type ControlDecisionPacket = z.infer<typeof ControlDecisionPacketSchema>;
 export type TokenUsage = z.infer<typeof TokenUsageSchema>;
 export type WorkerResult = z.infer<typeof WorkerResultSchema>;
 export type ContextCapsule = z.infer<typeof ContextCapsuleSchema>;
+export type ContextSelectionReceipt = z.infer<typeof ContextSelectionReceiptSchema>;
 export type SemanticVerifierContext = z.infer<typeof SemanticVerifierContextSchema>;
 export type SemanticVerdict = z.infer<typeof SemanticVerdictSchema>;
 export type HostCapabilities = z.infer<typeof HostCapabilitiesSchema>;
