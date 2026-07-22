@@ -1,6 +1,9 @@
-import { spawn } from "node:child_process";
+import crossSpawn from "cross-spawn";
 import { z } from "zod";
-import { contentHash } from "@graphcraft/core";
+import { contentHash, resolveTrustedExecutable, terminateChildProcessTree } from "@graphcraft/core";
+
+export const GITHUB_COMMAND_TERMINATION_GRACE_MS = 2_000;
+export const GITHUB_COMMAND_SETTLEMENT_GRACE_MS = 2_000;
 
 const PermissionSchema = z.enum(["ADMIN", "MAINTAIN", "WRITE", "TRIAGE", "READ", "NONE"]);
 
@@ -209,10 +212,15 @@ async function runCommand(
   options: GitHubCommandOptions,
   args: string[],
 ): Promise<{ stdout: string; stderr: string }> {
-  const command = options.command ?? "gh";
+  const command =
+    options.command ??
+    (await resolveTrustedExecutable("gh", {
+      environment: options.env ?? process.env,
+      untrustedCwd: options.cwd,
+    }));
   const commandArgs = [...(options.commandArgs ?? []), ...args];
   return await new Promise((resolve, reject) => {
-    const child = spawn(command, commandArgs, {
+    const child = crossSpawn.spawn(command, commandArgs, {
       cwd: options.cwd,
       env: options.env ?? process.env,
       shell: false,
@@ -222,18 +230,67 @@ async function runCommand(
     let stderr = "";
     let outputBytes = 0;
     let failure: string | undefined;
+    let settled = false;
     let forceTimer: NodeJS.Timeout | undefined;
+    let settlementTimer: NodeJS.Timeout | undefined;
+    const timeoutMs = options.timeoutMs ?? 60_000;
+    let timeout: NodeJS.Timeout | undefined;
+
+    const cleanup = (): void => {
+      if (timeout) clearTimeout(timeout);
+      if (forceTimer) clearTimeout(forceTimer);
+      if (settlementTimer) clearTimeout(settlementTimer);
+    };
+    const complete = (exitCode: number | null, error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      try {
+        child.stdout.destroy();
+        child.stderr.destroy();
+        child.unref();
+      } catch {
+        // Cleanup must not hide the bounded GitHub command outcome.
+      }
+      if (error) {
+        reject(error);
+        return;
+      }
+      if (failure) {
+        reject(new GitHubCommandError(failure, exitCode ?? 1));
+        return;
+      }
+      const code = exitCode ?? 1;
+      if (code === 0) resolve({ stdout, stderr });
+      else
+        reject(
+          new GitHubCommandError(
+            stderr.trim() || stdout.trim() || `${command} ${commandArgs[0] ?? ""} exited ${code}`,
+            code,
+          ),
+        );
+    };
     const terminate = (reason: string): void => {
-      if (failure) return;
+      if (failure || settled) return;
       failure = reason;
-      child.kill("SIGTERM");
-      forceTimer = setTimeout(() => child.kill("SIGKILL"), 2_000);
+      if (timeout) clearTimeout(timeout);
+      try {
+        terminateChildProcessTree(child, "SIGTERM");
+      } catch {
+        // Escalation and bounded settlement still apply when graceful delivery fails.
+      }
+      forceTimer = setTimeout(() => {
+        try {
+          terminateChildProcessTree(child, "SIGKILL");
+        } catch {
+          // Bounded settlement below prevents an unresponsive child from hanging the caller.
+        }
+        settlementTimer = setTimeout(() => complete(null), GITHUB_COMMAND_SETTLEMENT_GRACE_MS);
+        settlementTimer.unref();
+      }, GITHUB_COMMAND_TERMINATION_GRACE_MS);
       forceTimer.unref();
     };
-    const timeout = setTimeout(
-      () => terminate(`gh exceeded its ${options.timeoutMs ?? 60_000}ms timeout`),
-      options.timeoutMs ?? 60_000,
-    );
+    timeout = setTimeout(() => terminate(`gh exceeded its ${timeoutMs}ms timeout`), timeoutMs);
     timeout.unref();
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
@@ -249,25 +306,8 @@ async function runCommand(
         return terminate("gh output exceeded the 16MiB safety limit");
       stderr += chunk;
     });
-    child.once("error", (error) => {
-      clearTimeout(timeout);
-      if (forceTimer) clearTimeout(forceTimer);
-      reject(error);
-    });
-    child.once("close", (exitCode) => {
-      clearTimeout(timeout);
-      if (forceTimer) clearTimeout(forceTimer);
-      if (failure) return reject(new GitHubCommandError(failure, exitCode ?? 1));
-      const code = exitCode ?? 1;
-      if (code === 0) resolve({ stdout, stderr });
-      else
-        reject(
-          new GitHubCommandError(
-            stderr.trim() || stdout.trim() || `${command} ${commandArgs[0] ?? ""} exited ${code}`,
-            code,
-          ),
-        );
-    });
+    child.once("error", (error) => complete(null, error));
+    child.once("close", (exitCode) => complete(exitCode));
   });
 }
 
@@ -496,6 +536,76 @@ const PageInfoSchema = z.strictObject({
   hasNextPage: z.boolean(),
   endCursor: z.string().nullable(),
 });
+
+export const GITHUB_GRAPHQL_OPERATION_COST_BUDGET = 100;
+export const GITHUB_GRAPHQL_PAGINATION_PAGE_LIMIT = 32;
+
+class GraphQLPaginationBudget {
+  private pages = 0;
+  private cost = 0;
+
+  connection(label: string): GraphQLPaginationConnection {
+    return new GraphQLPaginationConnection(this, label);
+  }
+
+  reservePage(label: string): void {
+    if (this.pages >= GITHUB_GRAPHQL_PAGINATION_PAGE_LIMIT)
+      throw new Error(
+        `GitHub ${label} pagination exceeded its ${GITHUB_GRAPHQL_PAGINATION_PAGE_LIMIT}-page operation limit`,
+      );
+    this.pages += 1;
+  }
+
+  recordCost(label: string, cost: number, hasNextPage: boolean): void {
+    this.cost += cost;
+    if (
+      this.cost > GITHUB_GRAPHQL_OPERATION_COST_BUDGET ||
+      (hasNextPage && this.cost >= GITHUB_GRAPHQL_OPERATION_COST_BUDGET)
+    )
+      throw new Error(
+        `GitHub ${label} pagination exhausted its ${GITHUB_GRAPHQL_OPERATION_COST_BUDGET}-point GraphQL operation budget`,
+      );
+    if (hasNextPage && this.pages >= GITHUB_GRAPHQL_PAGINATION_PAGE_LIMIT)
+      throw new Error(
+        `GitHub ${label} pagination exceeded its ${GITHUB_GRAPHQL_PAGINATION_PAGE_LIMIT}-page operation limit`,
+      );
+  }
+}
+
+class GraphQLPaginationConnection {
+  private readonly requestedCursors = new Set<string>();
+
+  constructor(
+    private readonly budget: GraphQLPaginationBudget,
+    private readonly label: string,
+  ) {}
+
+  reserve(cursor: string | undefined): void {
+    if (cursor) {
+      if (this.requestedCursors.has(cursor))
+        throw new Error(`GitHub ${this.label} pagination repeated cursor ${cursor}`);
+      this.requestedCursors.add(cursor);
+    }
+    this.budget.reservePage(this.label);
+  }
+
+  next(pageInfo: z.infer<typeof PageInfoSchema>, cost: number): string | undefined {
+    this.budget.recordCost(this.label, cost, pageInfo.hasNextPage);
+    if (!pageInfo.hasNextPage) return undefined;
+    const cursor = pageInfo.endCursor ?? undefined;
+    if (!cursor) throw new Error(`GitHub ${this.label} pagination omitted its next cursor`);
+    if (this.requestedCursors.has(cursor))
+      throw new Error(`GitHub ${this.label} pagination repeated cursor ${cursor}`);
+    return cursor;
+  }
+}
+
+export class GitHubLifecycleConsistencyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GitHubLifecycleConsistencyError";
+  }
+}
 
 const PullRequestIdentitySchema = z.object({
   number: z.number().int().positive(),
@@ -777,8 +887,10 @@ export async function listGitHubPullRequestsForHead(
 ): Promise<GitHubPullRequestCandidate[]> {
   const { owner, name } = repositoryParts(input.nameWithOwner);
   const pullRequests: GitHubPullRequestCandidate[] = [];
+  const pagination = new GraphQLPaginationBudget().connection("pull-request");
   let cursor: string | undefined;
   do {
+    pagination.reserve(cursor);
     const response = PullRequestsByHeadResponseSchema.parse(
       await graphql(options, input.host, PULL_REQUESTS_BY_HEAD_QUERY, {
         owner,
@@ -804,11 +916,7 @@ export async function listGitHubPullRequestsForHead(
         }),
       ),
     );
-    cursor = connection.pageInfo.hasNextPage
-      ? (connection.pageInfo.endCursor ?? undefined)
-      : undefined;
-    if (connection.pageInfo.hasNextPage && !cursor)
-      throw new Error("GitHub pull-request pagination omitted its next cursor");
+    cursor = pagination.next(connection.pageInfo, response.data.rateLimit.cost);
   } while (cursor);
   return pullRequests;
 }
@@ -875,7 +983,9 @@ export async function readGitHubReviewThread(
   let cursor: string | undefined;
   let thread: Omit<GitHubReviewThreadState, "comments"> | undefined;
   const comments: GitHubReviewThreadState["comments"] = [];
+  const pagination = new GraphQLPaginationBudget().connection("review-thread comment");
   do {
+    pagination.reserve(cursor);
     const response = ReviewThreadPageResponseSchema.parse(
       await graphql(options, input.host, REVIEW_THREAD_QUERY, {
         threadId: input.threadId,
@@ -903,11 +1013,7 @@ export async function readGitHubReviewThread(
         createdAt,
       })),
     );
-    cursor = node.comments.pageInfo.hasNextPage
-      ? (node.comments.pageInfo.endCursor ?? undefined)
-      : undefined;
-    if (node.comments.pageInfo.hasNextPage && !cursor)
-      throw new Error(`GitHub review thread ${input.threadId} omitted its next comment cursor`);
+    cursor = pagination.next(node.comments.pageInfo, response.data.rateLimit.cost);
   } while (cursor);
   if (!thread) throw new Error(`GitHub review thread ${input.threadId} is unavailable`);
   return GitHubReviewThreadStateSchema.parse({ ...thread, comments });
@@ -983,6 +1089,7 @@ async function collectThreads(input: {
   owner: string;
   name: string;
   number: number;
+  paginationBudget: GraphQLPaginationBudget;
 }): Promise<{
   identity: z.infer<typeof PullRequestIdentitySchema>;
   repositoryUrl: string;
@@ -994,7 +1101,9 @@ async function collectThreads(input: {
   let repositoryUrl = "";
   let viewerPermission: z.infer<typeof PermissionSchema> | undefined;
   const threads: z.infer<typeof ReviewThreadSchema>[] = [];
+  const pagination = input.paginationBudget.connection("review-thread");
   do {
+    pagination.reserve(cursor);
     const response = ThreadPageResponseSchema.parse(
       await graphql(input.options, input.host, THREADS_QUERY, {
         owner: input.owner,
@@ -1032,11 +1141,7 @@ async function collectThreads(input: {
         });
       }),
     );
-    cursor = page.reviewThreads.pageInfo.hasNextPage
-      ? (page.reviewThreads.pageInfo.endCursor ?? undefined)
-      : undefined;
-    if (page.reviewThreads.pageInfo.hasNextPage && !cursor)
-      throw new Error("GitHub review-thread pagination omitted its next cursor");
+    cursor = pagination.next(page.reviewThreads.pageInfo, response.data.rateLimit.cost);
   } while (cursor);
   if (!identity || !viewerPermission) throw new Error("GitHub returned no pull request snapshot");
   return { identity, repositoryUrl, viewerPermission, threads };
@@ -1049,10 +1154,13 @@ async function collectReviews(input: {
   name: string;
   number: number;
   binding: { headSha: string; baseSha: string };
+  paginationBudget: GraphQLPaginationBudget;
 }): Promise<z.infer<typeof PullRequestReviewSchema>[]> {
   let cursor: string | undefined;
   const reviews: z.infer<typeof PullRequestReviewSchema>[] = [];
+  const pagination = input.paginationBudget.connection("review");
   do {
+    pagination.reserve(cursor);
     const response = ReviewsPageResponseSchema.parse(
       await graphql(input.options, input.host, REVIEWS_QUERY, {
         owner: input.owner,
@@ -1074,11 +1182,7 @@ async function collectReviews(input: {
         }),
       ),
     );
-    cursor = pullRequest.reviews.pageInfo.hasNextPage
-      ? (pullRequest.reviews.pageInfo.endCursor ?? undefined)
-      : undefined;
-    if (pullRequest.reviews.pageInfo.hasNextPage && !cursor)
-      throw new Error("GitHub review pagination omitted its next cursor");
+    cursor = pagination.next(pullRequest.reviews.pageInfo, response.data.rateLimit.cost);
   } while (cursor);
   return reviews;
 }
@@ -1089,10 +1193,13 @@ async function collectChecks(input: {
   owner: string;
   name: string;
   headSha: string;
+  paginationBudget: GraphQLPaginationBudget;
 }): Promise<z.infer<typeof CheckObservationSchema>[]> {
   let cursor: string | undefined;
   const checks: z.infer<typeof CheckObservationSchema>[] = [];
+  const pagination = input.paginationBudget.connection("check");
   do {
+    pagination.reserve(cursor);
     const response = ChecksPageResponseSchema.parse(
       await graphql(input.options, input.host, CHECKS_QUERY, {
         owner: input.owner,
@@ -1127,11 +1234,10 @@ async function collectChecks(input: {
             }),
       );
     }
-    cursor = contexts?.pageInfo.hasNextPage
-      ? (contexts.pageInfo.endCursor ?? undefined)
-      : undefined;
-    if (contexts?.pageInfo.hasNextPage && !cursor)
-      throw new Error("GitHub check pagination omitted its next cursor");
+    cursor = pagination.next(
+      contexts?.pageInfo ?? { hasNextPage: false, endCursor: null },
+      response.data.rateLimit.cost,
+    );
   } while (cursor);
   return checks;
 }
@@ -1202,7 +1308,7 @@ const ApiRateLimitSchema = z.object({
   }),
 });
 
-async function rateLimit(
+export async function readGitHubRateLimits(
   options: GitHubCommandOptions,
   host: string,
 ): Promise<GitHubPullRequestSnapshot["rateLimit"]> {
@@ -1224,7 +1330,10 @@ async function currentBinding(input: {
   owner: string;
   name: string;
   number: number;
+  paginationBudget: GraphQLPaginationBudget;
 }): Promise<{ headSha: string; baseSha: string }> {
+  const pagination = input.paginationBudget.connection("pull-request identity");
+  pagination.reserve(undefined);
   const response = IdentityResponseSchema.parse(
     await graphql(input.options, input.host, IDENTITY_QUERY, {
       owner: input.owner,
@@ -1232,9 +1341,57 @@ async function currentBinding(input: {
       number: input.number,
     }),
   );
+  pagination.next({ hasNextPage: false, endCursor: null }, response.data.rateLimit.cost);
   return {
     headSha: response.data.repository.pullRequest.headRefOid,
     baseSha: response.data.repository.pullRequest.baseRefOid,
+  };
+}
+
+type GitHubSnapshotLifecycleState = Pick<
+  GitHubPullRequestSnapshot,
+  | "repository"
+  | "pullRequest"
+  | "branchProtection"
+  | "requiredChecks"
+  | "checks"
+  | "reviewThreads"
+  | "reviews"
+> & {
+  binding: Pick<GitHubPullRequestSnapshot["binding"], "headSha" | "baseSha">;
+};
+
+function lifecycleFingerprint(input: GitHubSnapshotLifecycleState): string {
+  const requiredCheckKey = (check: { context: string; appId?: number | undefined }): string =>
+    `${check.context}:${check.appId ?? ""}`;
+  return contentHash({
+    ...input,
+    binding: { ...input.binding },
+    branchProtection: {
+      ...input.branchProtection,
+      requiredStatusChecks: [...input.branchProtection.requiredStatusChecks].sort((left, right) =>
+        requiredCheckKey(left).localeCompare(requiredCheckKey(right)),
+      ),
+    },
+    requiredChecks: input.requiredChecks
+      .map((check) => ({ ...check, matchingCheckIds: [...check.matchingCheckIds].sort() }))
+      .sort((left, right) => requiredCheckKey(left).localeCompare(requiredCheckKey(right))),
+    checks: [...input.checks].sort((left, right) => left.id.localeCompare(right.id)),
+    reviewThreads: [...input.reviewThreads].sort((left, right) => left.id.localeCompare(right.id)),
+    reviews: [...input.reviews].sort((left, right) => left.id.localeCompare(right.id)),
+  });
+}
+
+function snapshotLifecycleState(snapshot: GitHubPullRequestSnapshot): GitHubSnapshotLifecycleState {
+  return {
+    repository: snapshot.repository,
+    pullRequest: snapshot.pullRequest,
+    binding: { headSha: snapshot.binding.headSha, baseSha: snapshot.binding.baseSha },
+    branchProtection: snapshot.branchProtection,
+    requiredChecks: snapshot.requiredChecks,
+    checks: snapshot.checks,
+    reviewThreads: snapshot.reviewThreads,
+    reviews: snapshot.reviews,
   };
 }
 
@@ -1244,16 +1401,49 @@ export async function assertGitHubSnapshotCurrent(
 ): Promise<void> {
   const parsed = GitHubPullRequestSnapshotSchema.parse(snapshot);
   const { owner, name } = repositoryParts(parsed.repository.nameWithOwner);
-  const current = await currentBinding({
+  const paginationBudget = new GraphQLPaginationBudget();
+  const collectionInput = {
+    options,
+    host: parsed.repository.host,
+    nameWithOwner: parsed.repository.nameWithOwner,
+    owner,
+    name,
+    number: parsed.pullRequest.number,
+    paginationBudget,
+  };
+  const first = await collectSnapshotLifecycle(collectionInput);
+  const current = await collectSnapshotLifecycle(collectionInput);
+  const finalBinding = await currentBinding({
     options,
     host: parsed.repository.host,
     owner,
     name,
     number: parsed.pullRequest.number,
+    paginationBudget,
   });
-  if (current.headSha !== parsed.binding.headSha || current.baseSha !== parsed.binding.baseSha)
+  if (
+    first.pullRequest.number !== parsed.pullRequest.number ||
+    current.pullRequest.number !== parsed.pullRequest.number ||
+    first.binding.headSha !== parsed.binding.headSha ||
+    first.binding.baseSha !== parsed.binding.baseSha ||
+    current.binding.headSha !== parsed.binding.headSha ||
+    current.binding.baseSha !== parsed.binding.baseSha ||
+    finalBinding.headSha !== parsed.binding.headSha ||
+    finalBinding.baseSha !== parsed.binding.baseSha
+  )
     throw new Error(
-      `GitHub snapshot ${parsed.snapshotId} is stale: ${parsed.binding.headSha}/${parsed.binding.baseSha} changed to ${current.headSha}/${current.baseSha}`,
+      `GitHub snapshot ${parsed.snapshotId} is stale: ${parsed.binding.headSha}/${parsed.binding.baseSha} changed during lifecycle revalidation`,
+    );
+  const expectedFingerprint = lifecycleFingerprint(snapshotLifecycleState(parsed));
+  const firstFingerprint = lifecycleFingerprint(first);
+  const currentFingerprint = lifecycleFingerprint(current);
+  if (currentFingerprint !== firstFingerprint)
+    throw new GitHubLifecycleConsistencyError(
+      `GitHub snapshot ${parsed.snapshotId} mutable lifecycle changed during revalidation: ${firstFingerprint} changed to ${currentFingerprint}`,
+    );
+  if (currentFingerprint !== expectedFingerprint)
+    throw new GitHubLifecycleConsistencyError(
+      `GitHub snapshot ${parsed.snapshotId} lifecycle is stale: ${expectedFingerprint} changed to ${currentFingerprint}`,
     );
 }
 
@@ -1427,62 +1617,38 @@ export function classifyGitHubPullRequestLifecycle(
   });
 }
 
-export async function captureGitHubPullRequestSnapshot(
-  options: GitHubCommandOptions & { pullRequest?: string | number },
-): Promise<GitHubPullRequestSnapshot> {
-  const capability = await probeGitHub(options);
-  if (!capability.readyForSnapshot || !capability.host || !capability.nameWithOwner)
-    throw new Error(`GitHub snapshot preflight failed: ${capability.errors.join("; ")}`);
-  const number = await pullRequestNumber(options, options.pullRequest);
-  const { owner, name } = repositoryParts(capability.nameWithOwner);
-  const collected = await collectThreads({
-    options,
-    host: capability.host,
-    owner,
-    name,
-    number,
-  });
+async function collectSnapshotLifecycle(input: {
+  options: GitHubCommandOptions;
+  host: string;
+  nameWithOwner: string;
+  owner: string;
+  name: string;
+  number: number;
+  expectedBinding?: { headSha: string; baseSha: string };
+  paginationBudget: GraphQLPaginationBudget;
+}): Promise<GitHubSnapshotLifecycleState> {
+  const collected = await collectThreads(input);
   const binding = {
     headSha: collected.identity.headRefOid,
     baseSha: collected.identity.baseRefOid,
   };
-  const branchProtection = await readBranchProtection(options, {
-    host: capability.host,
-    nameWithOwner: capability.nameWithOwner,
-    branch: collected.identity.baseRefName,
-  });
+  if (input.expectedBinding) assertBound(input.expectedBinding, collected.identity);
+  const [branchProtection, reviews, checks] = await Promise.all([
+    readBranchProtection(input.options, {
+      host: input.host,
+      nameWithOwner: input.nameWithOwner,
+      branch: collected.identity.baseRefName,
+    }),
+    collectReviews({ ...input, binding }),
+    collectChecks({ ...input, headSha: binding.headSha }),
+  ]);
   if (branchProtection.status === "unknown")
     throw new Error(`GitHub snapshot preflight failed: ${branchProtection.error}`);
-  const [reviews, checks, limits] = await Promise.all([
-    collectReviews({ options, host: capability.host, owner, name, number, binding }),
-    collectChecks({
-      options,
-      host: capability.host,
-      owner,
-      name,
-      headSha: binding.headSha,
-    }),
-    rateLimit(options, capability.host),
-  ]);
-  const finalBinding = await currentBinding({
-    options,
-    host: capability.host,
-    owner,
-    name,
-    number,
-  });
-  if (finalBinding.headSha !== binding.headSha || finalBinding.baseSha !== binding.baseSha)
-    throw new Error(
-      `GitHub snapshot became stale during capture: ${binding.headSha}/${binding.baseSha} changed to ${finalBinding.headSha}/${finalBinding.baseSha}`,
-    );
-  const capturedAt = new Date().toISOString();
-  const value = {
-    schemaVersion: 1 as const,
-    contentTrust: "untrusted_external" as const,
+  return {
     repository: {
-      nameWithOwner: capability.nameWithOwner,
+      nameWithOwner: input.nameWithOwner,
       url: collected.repositoryUrl,
-      host: capability.host,
+      host: input.host,
       viewerPermission: collected.viewerPermission,
     },
     pullRequest: {
@@ -1501,12 +1667,65 @@ export async function captureGitHubPullRequestSnapshot(
         : {}),
       updatedAt: collected.identity.updatedAt,
     },
-    binding: { ...binding, capturedAt },
+    binding,
     branchProtection,
     requiredChecks: requiredCheckObservations(branchProtection, checks),
     checks,
     reviewThreads: collected.threads,
     reviews,
+  };
+}
+
+export async function captureGitHubPullRequestSnapshot(
+  options: GitHubCommandOptions & { pullRequest?: string | number },
+): Promise<GitHubPullRequestSnapshot> {
+  const capability = await probeGitHub(options);
+  if (!capability.readyForSnapshot || !capability.host || !capability.nameWithOwner)
+    throw new Error(`GitHub snapshot preflight failed: ${capability.errors.join("; ")}`);
+  const number = await pullRequestNumber(options, options.pullRequest);
+  const { owner, name } = repositoryParts(capability.nameWithOwner);
+  const paginationBudget = new GraphQLPaginationBudget();
+  const collectionInput = {
+    options,
+    host: capability.host,
+    nameWithOwner: capability.nameWithOwner,
+    owner,
+    name,
+    number,
+    paginationBudget,
+  };
+  const first = await collectSnapshotLifecycle(collectionInput);
+  const [stable, limits] = await Promise.all([
+    collectSnapshotLifecycle({ ...collectionInput, expectedBinding: first.binding }),
+    readGitHubRateLimits(options, capability.host),
+  ]);
+  const finalBinding = await currentBinding({
+    options,
+    host: capability.host,
+    owner,
+    name,
+    number,
+    paginationBudget,
+  });
+  if (
+    finalBinding.headSha !== stable.binding.headSha ||
+    finalBinding.baseSha !== stable.binding.baseSha
+  )
+    throw new Error(
+      `GitHub snapshot became stale during capture: ${stable.binding.headSha}/${stable.binding.baseSha} changed to ${finalBinding.headSha}/${finalBinding.baseSha}`,
+    );
+  const firstFingerprint = lifecycleFingerprint(first);
+  const stableFingerprint = lifecycleFingerprint(stable);
+  if (stableFingerprint !== firstFingerprint)
+    throw new GitHubLifecycleConsistencyError(
+      `GitHub snapshot mutable lifecycle changed during capture: ${firstFingerprint} changed to ${stableFingerprint}`,
+    );
+  const capturedAt = new Date().toISOString();
+  const value = {
+    schemaVersion: 1 as const,
+    contentTrust: "untrusted_external" as const,
+    ...stable,
+    binding: { ...stable.binding, capturedAt },
     rateLimit: limits,
   };
   return GitHubPullRequestSnapshotSchema.parse({

@@ -1,8 +1,14 @@
+import { EventEmitter } from "node:events";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { PassThrough } from "node:stream";
+import crossSpawn from "cross-spawn";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  GITHUB_COMMAND_SETTLEMENT_GRACE_MS,
+  GITHUB_COMMAND_TERMINATION_GRACE_MS,
+  GitHubLifecycleConsistencyError,
   addGitHubReviewThreadReply,
   assertGitHubPushCapability,
   assertGitHubSnapshotCurrent,
@@ -20,6 +26,8 @@ import {
 const temporaryRoots: string[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
   await Promise.all(
     temporaryRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })),
   );
@@ -85,6 +93,14 @@ const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
 fs.appendFileSync(logPath, JSON.stringify(args) + "\\n");
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
 const fail = (message, code = 1) => { process.stderr.write(message + "\\n"); process.exit(code); };
+const collectionCount = (operation) => fs.readFileSync(logPath, "utf8")
+  .split("\\n")
+  .filter(Boolean)
+  .map((line) => JSON.parse(line))
+  .filter((call) =>
+    call.some((argument) => argument.includes(operation)) &&
+    !call.some((argument) => argument.startsWith("cursor="))
+  ).length;
 if (args[0] === "--version") { console.log("gh version 2.80.0"); process.exit(0); }
 if (args[0] === "auth") {
   if (state.authenticated) { console.log("github.com authenticated"); process.exit(0); }
@@ -159,7 +175,9 @@ if (endpoint && endpoint.startsWith("repos/tpypan/graphcraft/branches/")) {
         contexts: ["tests", "lint"],
         checks: [{ context: "tests", app_id: 1 }, { context: "lint", app_id: null }],
       },
-      required_pull_request_reviews: { required_approving_review_count: 1 },
+      required_pull_request_reviews: {
+        required_approving_review_count: state.requiredApprovingReviewCount ?? 1,
+      },
     });
   } else send({ protected: state.protected !== false });
   process.exit(0);
@@ -178,19 +196,21 @@ for (let index = 0; index < args.length - 1; index += 1) {
   }
 }
 const query = fields.query || "";
-const rateLimit = { cost: 1, remaining: 4999, resetAt: "2027-01-15T08:00:00.000Z" };
+const rateLimit = { cost: state.graphqlPageCost ?? 1, remaining: 4999, resetAt: "2027-01-15T08:00:00.000Z" };
 const identity = {
   number: 42,
   url: "https://github.com/tpypan/graphcraft/pull/42",
   title: "Durable GitHub snapshots",
-  state: "OPEN",
+  state: state.pullRequestState ?? "OPEN",
   isDraft: false,
   headRefName: "snapshot-layer",
   baseRefName: "main",
   headRefOid: state.headSha,
   baseRefOid: state.baseSha,
   mergeable: "MERGEABLE",
-  reviewDecision: "CHANGES_REQUESTED",
+  reviewDecision: state.greenLifecycle
+    ? (state.reviewVersion === 1 ? "REVIEW_REQUIRED" : "APPROVED")
+    : "CHANGES_REQUESTED",
   updatedAt: "2026-07-21T20:00:00.000Z",
 };
 if (query.includes("GraphcraftReviewThread")) {
@@ -215,7 +235,9 @@ if (query.includes("GraphcraftReviewThread")) {
           url: comment.url,
           createdAt: comment.createdAt,
         })),
-        pageInfo: { hasNextPage: next < thread.comments.length, endCursor: next < thread.comments.length ? String(next) : null },
+        pageInfo: state.repeatReviewCommentCursor
+          ? { hasNextPage: true, endCursor: "comment-repeat" }
+          : { hasNextPage: next < thread.comments.length, endCursor: next < thread.comments.length ? String(next) : null },
       },
     }, rateLimit } });
   }
@@ -265,7 +287,11 @@ if (query.includes("GraphcraftPullRequestsByHead")) {
         headSha: undefined,
         baseSha: undefined,
       })),
-      pageInfo: { hasNextPage: next < matching.length, endCursor: next < matching.length ? String(next) : null },
+      pageInfo: state.repeatPullRequestCursor
+        ? { hasNextPage: true, endCursor: "pull-repeat" }
+        : state.advancePullRequestCursor
+          ? { hasNextPage: true, endCursor: String(start + 1) }
+          : { hasNextPage: next < matching.length, endCursor: next < matching.length ? String(next) : null },
     } },
     rateLimit,
   } });
@@ -273,6 +299,12 @@ if (query.includes("GraphcraftPullRequestsByHead")) {
 }
 if (query.includes("GraphcraftPullRequestThreads")) {
   const second = fields.cursor === "thread-next";
+  const threadVersion =
+    state.threadVersion === 1 ||
+    (state.mutateThreadOnCollection &&
+      collectionCount("GraphcraftPullRequestThreads") >= state.mutateThreadOnCollection)
+      ? 1
+      : 0;
   send({ data: {
     repository: {
       url: "https://github.com/tpypan/graphcraft",
@@ -280,7 +312,7 @@ if (query.includes("GraphcraftPullRequestThreads")) {
       pullRequest: { ...identity, reviewThreads: {
         nodes: [{
           id: second ? "thread-2" : "thread-1",
-          isResolved: second,
+          isResolved: second || (state.greenLifecycle ? threadVersion !== 1 : threadVersion === 1),
           isOutdated: false,
           path: second ? "src/b.ts" : "src/a.ts",
           line: second ? 20 : 10,
@@ -292,7 +324,9 @@ if (query.includes("GraphcraftPullRequestThreads")) {
             createdAt: "2026-07-21T20:00:00.000Z",
           }] },
         }],
-        pageInfo: { hasNextPage: !second, endCursor: second ? null : "thread-next" },
+        pageInfo: state.repeatSnapshotThreadCursor
+          ? { hasNextPage: true, endCursor: "thread-next" }
+          : { hasNextPage: !second, endCursor: second ? null : "thread-next" },
       } },
     },
     rateLimit,
@@ -301,6 +335,12 @@ if (query.includes("GraphcraftPullRequestThreads")) {
 }
 if (query.includes("GraphcraftPullRequestReviews")) {
   const second = fields.cursor === "review-next";
+  const reviewVersion =
+    state.reviewVersion === 1 ||
+    (state.mutateReviewOnCollection &&
+      collectionCount("GraphcraftPullRequestReviews") >= state.mutateReviewOnCollection)
+      ? 1
+      : 0;
   send({ data: {
     repository: { pullRequest: {
       headRefOid: state.headSha,
@@ -308,12 +348,16 @@ if (query.includes("GraphcraftPullRequestReviews")) {
       reviews: {
         nodes: [{
           id: second ? "review-2" : "review-1",
-          state: second ? "APPROVED" : "CHANGES_REQUESTED",
+          state: second
+            ? (reviewVersion === 1 ? "DISMISSED" : "APPROVED")
+            : "CHANGES_REQUESTED",
           author: { login: second ? "reviewer-b" : "reviewer-a" },
           commit: { oid: state.headSha },
           submittedAt: "2026-07-21T20:00:00.000Z",
         }],
-        pageInfo: { hasNextPage: !second, endCursor: second ? null : "review-next" },
+        pageInfo: state.repeatSnapshotReviewCursor
+          ? { hasNextPage: true, endCursor: "review-next" }
+          : { hasNextPage: !second, endCursor: second ? null : "review-next" },
       },
     } },
     rateLimit,
@@ -322,14 +366,22 @@ if (query.includes("GraphcraftPullRequestReviews")) {
 }
 if (query.includes("GraphcraftCommitChecks")) {
   const second = fields.cursor === "check-next";
+  const checkVersion =
+    state.checkVersion === 1 ||
+    (state.mutateCheckOnCollection &&
+      collectionCount("GraphcraftCommitChecks") >= state.mutateCheckOnCollection)
+      ? 1
+      : 0;
   send({ data: {
     repository: { object: {
       oid: state.headSha,
       statusCheckRollup: { contexts: {
         nodes: second
-          ? [{ __typename: "StatusContext", id: "status-1", context: "lint", state: "PENDING", targetUrl: "https://github.com/checks/lint" }]
-          : [{ __typename: "CheckRun", id: "check-1", databaseId: 101, name: "tests", status: "COMPLETED", conclusion: "SUCCESS", detailsUrl: "https://github.com/checks/tests", app: { databaseId: 1 } }],
-        pageInfo: { hasNextPage: !second, endCursor: second ? null : "check-next" },
+          ? [{ __typename: "StatusContext", id: "status-1", context: "lint", state: state.greenLifecycle ? "SUCCESS" : "PENDING", targetUrl: "https://github.com/checks/lint" }]
+          : [{ __typename: "CheckRun", id: "check-1", databaseId: 101, name: "tests", status: checkVersion === 1 ? "IN_PROGRESS" : "COMPLETED", conclusion: checkVersion === 1 ? null : "SUCCESS", detailsUrl: "https://github.com/checks/tests", app: { databaseId: 1 } }],
+        pageInfo: state.repeatSnapshotCheckCursor
+          ? { hasNextPage: true, endCursor: "check-next" }
+          : { hasNextPage: !second, endCursor: second ? null : "check-next" },
       } },
     } },
     rateLimit,
@@ -359,7 +411,51 @@ fail("unknown GraphQL operation");
   };
 }
 
+async function expectLifecycleConsistency(
+  promise: Promise<unknown>,
+  message: RegExp,
+): Promise<void> {
+  let observed: unknown;
+  try {
+    await promise;
+  } catch (error) {
+    observed = error;
+  }
+  expect(observed).toBeInstanceOf(GitHubLifecycleConsistencyError);
+  expect(observed).toMatchObject({ message: expect.stringMatching(message) });
+}
+
 describe("GitHub capability and snapshot layer", () => {
+  it("settles after escalation when a timed-out GitHub child never emits close", async () => {
+    vi.useFakeTimers();
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill: vi.fn(() => true),
+      unref: vi.fn(),
+    });
+    vi.spyOn(crossSpawn, "spawn").mockReturnValue(child as never);
+
+    const probing = probeGitHub({
+      command: "gh-fixture",
+      cwd: process.cwd(),
+      timeoutMs: 10,
+    });
+    await vi.advanceTimersByTimeAsync(
+      10 + GITHUB_COMMAND_TERMINATION_GRACE_MS + GITHUB_COMMAND_SETTLEMENT_GRACE_MS + 1,
+    );
+
+    await expect(probing).resolves.toMatchObject({
+      installed: false,
+      errors: [expect.stringMatching(/exceeded its 10ms timeout/i)],
+    });
+    expect(child.kill).toHaveBeenNthCalledWith(1, "SIGTERM");
+    expect(child.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
+    expect(child.stdout.destroyed).toBe(true);
+    expect(child.stderr.destroyed).toBe(true);
+    expect(child.unref).toHaveBeenCalledOnce();
+  });
+
   it("fully paginates one SHA-bound read-only pull request snapshot", async () => {
     const fixture = await fakeGitHub();
     const snapshot = await captureGitHubPullRequestSnapshot(fixture);
@@ -392,10 +488,10 @@ describe("GitHub capability and snapshot layer", () => {
       calls.filter((args) =>
         args.some((argument) => argument.includes("GraphcraftPullRequestThreads")),
       ),
-    ).toHaveLength(2);
-    expect(calls.filter((args) => args.includes("cursor=thread-next"))).toHaveLength(1);
-    expect(calls.filter((args) => args.includes("cursor=review-next"))).toHaveLength(1);
-    expect(calls.filter((args) => args.includes("cursor=check-next"))).toHaveLength(1);
+    ).toHaveLength(4);
+    expect(calls.filter((args) => args.includes("cursor=thread-next"))).toHaveLength(2);
+    expect(calls.filter((args) => args.includes("cursor=review-next"))).toHaveLength(2);
+    expect(calls.filter((args) => args.includes("cursor=check-next"))).toHaveLength(2);
     expect(
       calls.every(([command]) =>
         ["--version", "auth", "repo", "pr", "api"].includes(command ?? ""),
@@ -408,6 +504,150 @@ describe("GitHub capability and snapshot layer", () => {
         ),
       ),
     ).toBe(false);
+  });
+
+  it.each([
+    ["review-thread", "mutateThreadOnCollection"],
+    ["review", "mutateReviewOnCollection"],
+    ["check", "mutateCheckOnCollection"],
+  ] as const)("rejects a same-SHA %s mutation during capture", async (_kind, mutationKey) => {
+    const fixture = await fakeGitHub({ greenLifecycle: true, [mutationKey]: 2 });
+
+    await expectLifecycleConsistency(
+      captureGitHubPullRequestSnapshot(fixture),
+      /mutable lifecycle changed during capture/,
+    );
+    const state = JSON.parse(await readFile(fixture.statePath, "utf8")) as {
+      headSha: string;
+      baseSha: string;
+    };
+    expect(state).toMatchObject({ headSha: "a".repeat(40), baseSha: "b".repeat(40) });
+  });
+
+  it.each([
+    ["review-thread", "threadVersion"],
+    ["review", "reviewVersion"],
+    ["check", "checkVersion"],
+  ] as const)(
+    "rejects a same-SHA %s mutation before accepting a previously green snapshot",
+    async (_kind, versionKey) => {
+      const fixture = await fakeGitHub({ greenLifecycle: true });
+      const snapshot = await captureGitHubPullRequestSnapshot(fixture);
+      const expected = {
+        host: snapshot.repository.host,
+        nameWithOwner: snapshot.repository.nameWithOwner,
+        number: snapshot.pullRequest.number,
+        headRefName: snapshot.pullRequest.headRefName,
+        baseRefName: snapshot.pullRequest.baseRefName,
+        headSha: snapshot.binding.headSha,
+        baseSha: snapshot.binding.baseSha,
+      };
+      expect(classifyGitHubPullRequestLifecycle(snapshot, expected).status).toBe("green");
+      const state = JSON.parse(await readFile(fixture.statePath, "utf8")) as Record<
+        string,
+        unknown
+      >;
+      state[versionKey] = 1;
+      await writeFile(fixture.statePath, `${JSON.stringify(state)}\n`);
+
+      await expectLifecycleConsistency(
+        assertGitHubSnapshotCurrent(fixture, snapshot),
+        /lifecycle is stale/,
+      );
+    },
+  );
+
+  it("types a same-SHA mutation between lifecycle revalidation passes as transient", async () => {
+    const fixture = await fakeGitHub({ greenLifecycle: true, mutateCheckOnCollection: 4 });
+    const snapshot = await captureGitHubPullRequestSnapshot(fixture);
+
+    await expectLifecycleConsistency(
+      assertGitHubSnapshotCurrent(fixture, snapshot),
+      /mutable lifecycle changed during revalidation/,
+    );
+  });
+
+  it.each([
+    ["pull-request state", "pullRequestState", "CLOSED"],
+    ["branch protection", "requiredApprovingReviewCount", 2],
+  ] as const)("types same-SHA %s drift as transient", async (_kind, key, value) => {
+    const fixture = await fakeGitHub({ greenLifecycle: true });
+    const snapshot = await captureGitHubPullRequestSnapshot(fixture);
+    const state = JSON.parse(await readFile(fixture.statePath, "utf8")) as Record<string, unknown>;
+    state[key] = value;
+    await writeFile(fixture.statePath, `${JSON.stringify(state)}\n`);
+
+    await expectLifecycleConsistency(
+      assertGitHubSnapshotCurrent(fixture, snapshot),
+      /lifecycle is stale/,
+    );
+  });
+
+  it("normalizes lifecycle collection order during revalidation", async () => {
+    const fixture = await fakeGitHub({ greenLifecycle: true });
+    const snapshot = await captureGitHubPullRequestSnapshot(fixture);
+    const reordered = {
+      ...snapshot,
+      branchProtection: {
+        ...snapshot.branchProtection,
+        requiredStatusChecks: [...snapshot.branchProtection.requiredStatusChecks].reverse(),
+      },
+      requiredChecks: [...snapshot.requiredChecks].reverse(),
+      checks: [...snapshot.checks].reverse(),
+      reviewThreads: [...snapshot.reviewThreads].reverse(),
+      reviews: [...snapshot.reviews].reverse(),
+    };
+
+    await expect(assertGitHubSnapshotCurrent(fixture, reordered)).resolves.toBeUndefined();
+  });
+
+  it("rejects repeated cursors in all five GitHub pagination loops", async () => {
+    const headRefName = "graphcraft/repeated-cursor";
+    const pullRequests = await fakeGitHub({ repeatPullRequestCursor: true });
+    await expect(
+      listGitHubPullRequestsForHead(pullRequests, {
+        host: "github.com",
+        nameWithOwner: "tpypan/graphcraft",
+        headRefName,
+      }),
+    ).rejects.toThrow(/pull-request pagination repeated cursor/);
+
+    const comments = await fakeGitHub({ repeatReviewCommentCursor: true });
+    await expect(
+      readGitHubReviewThread(comments, { host: "github.com", threadId: "thread-action" }),
+    ).rejects.toThrow(/review-thread comment pagination repeated cursor/);
+
+    for (const flag of [
+      "repeatSnapshotThreadCursor",
+      "repeatSnapshotReviewCursor",
+      "repeatSnapshotCheckCursor",
+    ]) {
+      const snapshot = await fakeGitHub({ [flag]: true });
+      await expect(captureGitHubPullRequestSnapshot(snapshot)).rejects.toThrow(
+        /pagination repeated cursor/,
+      );
+    }
+  });
+
+  it("bounds advancing cursors by GraphQL cost and page ceilings", async () => {
+    const headRefName = "graphcraft/advancing-cursor";
+    const costly = await fakeGitHub({ advancePullRequestCursor: true, graphqlPageCost: 25 });
+    await expect(
+      listGitHubPullRequestsForHead(costly, {
+        host: "github.com",
+        nameWithOwner: "tpypan/graphcraft",
+        headRefName,
+      }),
+    ).rejects.toThrow(/100-point GraphQL operation budget/);
+
+    const endless = await fakeGitHub({ advancePullRequestCursor: true, graphqlPageCost: 0 });
+    await expect(
+      listGitHubPullRequestsForHead(endless, {
+        host: "github.com",
+        nameWithOwner: "tpypan/graphcraft",
+        headRefName,
+      }),
+    ).rejects.toThrow(/32-page operation limit/);
   });
 
   it("paginates one review thread and confirms explicit reply and resolution mutations", async () => {

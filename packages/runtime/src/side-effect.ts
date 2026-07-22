@@ -26,10 +26,14 @@ export interface ExecuteSideEffectInput {
   store: RunStore;
   claim: SideEffectClaim;
   reconcile: (claim: SideEffectClaim) => Promise<SideEffectReconciliation>;
-  act: (claim: SideEffectClaim) => Promise<Record<string, unknown>>;
+  act: (
+    claim: SideEffectClaim,
+    markDispatched?: () => Promise<void>,
+  ) => Promise<Record<string, unknown>>;
   boundary?: (point: SideEffectBoundary) => void | Promise<void>;
   revalidateConfirmed?: boolean;
   durableDispatch?: boolean;
+  deferError?: (error: unknown) => boolean;
 }
 
 export class SideEffectBoundaryInterruption extends Error {
@@ -72,6 +76,7 @@ async function reconcileAndRecord(
   try {
     reconciliation = await input.reconcile(claim);
   } catch (error) {
+    if (input.deferError?.(error)) throw error;
     const reason = `Unable to reconcile ${claim.kind} ${claim.actionId}: ${
       error instanceof Error ? error.message : String(error)
     }`;
@@ -169,17 +174,24 @@ export async function executeSideEffect(
   }
 
   await crossSideEffectBoundary(input.boundary, "before_act");
-  if (input.durableDispatch)
-    await input.store.append(
-      "runtime",
-      "side_effect.dispatched",
-      { actionId: claim.actionId },
-      claim.actionId,
-    );
+  let dispatched = entry.dispatchedAt !== undefined;
+  const markDispatched = input.durableDispatch
+    ? async (): Promise<void> => {
+        if (dispatched) return;
+        await input.store.append(
+          "runtime",
+          "side_effect.dispatched",
+          { actionId: claim.actionId },
+          claim.actionId,
+        );
+        dispatched = true;
+      }
+    : undefined;
   try {
-    await input.act(claim);
+    await input.act(claim, markDispatched);
   } catch (error) {
     if (error instanceof SideEffectBoundaryInterruption) throw error;
+    if (!dispatched && input.deferError?.(error)) throw error;
     const reason = error instanceof Error ? error.message : String(error);
     const afterFailure = await reconcileAndRecord(input, claim, "after_confirmation_reconcile");
     if (afterFailure.status === "applied") return await confirm(input, claim, afterFailure);
@@ -201,6 +213,8 @@ export async function executeSideEffect(
         : reason,
     );
   }
+  if (input.durableDispatch && !dispatched)
+    throw new Error(`Durable ${claim.kind} ${claim.actionId} acted without a dispatch checkpoint`);
   await crossSideEffectBoundary(input.boundary, "after_act");
 
   const after = await reconcileAndRecord(input, claim, "after_confirmation_reconcile");

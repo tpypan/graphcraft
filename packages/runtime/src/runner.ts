@@ -12,6 +12,7 @@ import {
   compilePlannedGraph,
   compileRunContract,
   contentHash,
+  createModelAuthorityBoundary,
   deterministicTokenUsage,
   evidenceSnapshot,
   interruptionReason,
@@ -41,6 +42,7 @@ import {
   type RunState,
   type SideEffectClaim,
   type TokenUsage,
+  type UntrustedInputSource,
   type SemanticVerdict,
   type WorkerResult,
 } from "@graphcraft/core";
@@ -53,6 +55,7 @@ import {
   workspaceDigest,
   type ExecutedProbe,
 } from "@graphcraft/probes";
+import { GitHubLifecycleConsistencyError } from "@graphcraft/github";
 import { RunLock } from "./lock.ts";
 import { applyRunGraphAmendmentLocked } from "./amendment.ts";
 import { requestRunControl, RunControlChannel } from "./control.ts";
@@ -101,6 +104,7 @@ import { assessRunProgress, createProgressDecisionPacket } from "./trajectory.ts
 import {
   capturePullRequestLifecycleProbe,
   createPullRequestClaim,
+  deferGitHubLifecycleConsistency,
   evaluateGitHubLifecycleWait,
   hasReviewThreadActions,
   performPullRequestCreation,
@@ -360,6 +364,17 @@ export async function createRun(
         repositoryEvidence,
         probePlan: graphProbePlan,
         verificationProbes: completionProbes,
+        authorityBoundary: createModelAuthorityBoundary([
+          {
+            source: "task_or_issue_text",
+            location: "contract.task, contract.outcome, and task-derived anchor descriptions",
+          },
+          {
+            source: "repository_content",
+            location: "repositoryEvidence and repository reads",
+          },
+          { source: "command_output", location: "any read-only tool output" },
+        ]),
       },
       options.signal ?? new AbortController().signal,
     );
@@ -524,6 +539,28 @@ async function executeWorker(input: {
     predecessorEvidence: input.predecessorEvidence ?? [],
     probeResults: input.probeResults ?? [],
   });
+  const authorityInputs: Array<{ source: UntrustedInputSource; location: string }> = [
+    {
+      source: "task_or_issue_text",
+      location: "capsule.objective and task-derived acceptance anchor descriptions",
+    },
+    {
+      source: "repository_content",
+      location: "capsule.relevantPaths and repository reads",
+    },
+  ];
+  if (input.node.sideEffectClass === "workspace_write" || capsule.probeEvidence.length > 0)
+    authorityInputs.push({
+      source: "command_output",
+      location: "capsule.probeEvidence and tool command output",
+    });
+  if (capsule.predecessorEvidence.length > 0)
+    authorityInputs.push({ source: "worker_output", location: "capsule.predecessorEvidence" });
+  if (input.node.id.startsWith("repair-review-"))
+    authorityInputs.push({ source: "review_comment", location: "capsule.objective" });
+  if (input.node.id.startsWith("repair-review-") || input.node.id.startsWith("repair-ci-"))
+    authorityInputs.push({ source: "external_event", location: "capsule.objective" });
+  const authorityBoundary = createModelAuthorityBoundary(authorityInputs);
   if (!input.resume || !resumeSessionId) {
     await input.store.append("runtime", "invocation.started", {
       invocationId,
@@ -555,6 +592,7 @@ async function executeWorker(input: {
       capsule,
       allowedTools:
         input.node.sideEffectClass === "workspace_write" ? ["read", "write", "shell"] : ["read"],
+      authorityBoundary,
       ...(resumeSessionId ? { resumeSessionId } : {}),
     },
     input.signal,
@@ -745,6 +783,31 @@ async function runSemanticVerification(input: {
     input.workspace.path,
     input.contract.scope.exclude,
   );
+  const semanticAuthorityInputs: Array<{ source: UntrustedInputSource; location: string }> = [
+    {
+      source: "task_or_issue_text",
+      location: "context.objective and task-derived acceptance anchor descriptions",
+    },
+    {
+      source: "repository_content",
+      location: "context.relevantPaths and repository reads",
+    },
+    {
+      source: "command_output",
+      location: "context.baselineProbeEvidence and context.currentProbeEvidence",
+    },
+    {
+      source: "worker_output",
+      location: "context.workerSummary and context.workerEvidence",
+    },
+  ];
+  if (input.node.id.startsWith("repair-review-"))
+    semanticAuthorityInputs.push({
+      source: "review_comment",
+      location: "context.objective",
+    });
+  if (input.node.id.startsWith("repair-review-") || input.node.id.startsWith("repair-ci-"))
+    semanticAuthorityInputs.push({ source: "external_event", location: "context.objective" });
   let verdictPersisted = false;
   try {
     const result = await input.adapter.verify(
@@ -752,6 +815,7 @@ async function runSemanticVerification(input: {
         invocationId,
         repositoryPath: input.workspace.path,
         context,
+        authorityBoundary: createModelAuthorityBoundary(semanticAuthorityInputs),
       },
       input.signal,
     );
@@ -1862,6 +1926,31 @@ export async function executeRun(input: {
       if (request) await controlChannel.clear(request.requestId);
       return await input.store.loadState();
     };
+    const deferLifecycleConsistency = async (
+      node: GraphNode,
+      error: GitHubLifecycleConsistencyError,
+    ): Promise<RunState | undefined> => {
+      const deferred = await deferGitHubLifecycleConsistency({
+        store: input.store,
+        node,
+        workspace,
+        error,
+      });
+      await input.store.append("runtime", "run.waiting", {
+        reason: `Waiting for stable GitHub lifecycle evidence for ${node.id}: ${deferred.evidence.join("; ")}`,
+        nodeId: node.id,
+        nextWakeAt: deferred.nextWakeAt,
+      });
+      if (!input.superviseWaits) return await input.store.loadState();
+      if (!(await sleepUntilWake(deferred.nextWakeAt, signal)))
+        return await finishInterruption(node.id);
+      await input.store.append("runtime", "run.started", {
+        workspace,
+        wakeNodeId: node.id,
+        wakeAt: new Date().toISOString(),
+      });
+      return undefined;
+    };
     const recoveries = new Map<string, RecoverableInvocation>();
     for (const interruptedNodeId of interruptedNodeIds) {
       const recovery = await recoverableInvocation(
@@ -1909,6 +1998,36 @@ export async function executeRun(input: {
       graph = await input.store.loadGraph();
       if (["paused", "stopped", "blocked", "failed", "completed"].includes(state.status))
         return state;
+      const deferredPullRequest = graph.nodes.find(
+        (node) =>
+          node.kind === "pull_request" &&
+          state.nodes[node.id]?.status === "waiting" &&
+          state.waits.some(({ nodeId, status }) => nodeId === node.id && status === "waiting"),
+      );
+      if (deferredPullRequest) {
+        const wait = state.waits.find(({ nodeId }) => nodeId === deferredPullRequest.id)!;
+        if (Date.now() < Date.parse(wait.nextWakeAt)) {
+          await input.store.append("runtime", "run.waiting", {
+            reason: `Waiting for stable GitHub lifecycle evidence for ${deferredPullRequest.id}: ${wait.evidence.join("; ")}`,
+            nodeId: deferredPullRequest.id,
+            nextWakeAt: wait.nextWakeAt,
+          });
+          if (!input.superviseWaits) return await input.store.loadState();
+          if (!(await sleepUntilWake(wait.nextWakeAt, signal)))
+            return await finishInterruption(deferredPullRequest.id);
+          await input.store.append("runtime", "run.started", {
+            workspace,
+            wakeNodeId: deferredPullRequest.id,
+            wakeAt: new Date().toISOString(),
+          });
+          continue;
+        }
+        await input.store.append("runtime", "node.reset", {
+          nodeId: deferredPullRequest.id,
+          reason: "Retrying SHA-bound pull-request lifecycle capture after its durable wake",
+        });
+        continue;
+      }
       const batchSelection = readyBatch(graph, state, input.maxWorkers ?? 1);
       const batch = batchSelection.nodes;
       if (batch.length === 0) {
@@ -2069,47 +2188,99 @@ export async function executeRun(input: {
       const current = batch[0]!;
 
       if (current.kind === "wait") {
+        let outcome: Awaited<ReturnType<typeof evaluateGitHubLifecycleWait>>;
         if (current.waitCondition?.kind === "github_pull_request") {
-          try {
-            const reconciliationEvidence = await reconcilePendingGitHubActions({
-              store: input.store,
-              node: current,
-              workspace,
-              ...(input.github ? { options: input.github } : {}),
-              ...(input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}),
-            });
-            if (reconciliationEvidence.length > 0)
-              await input.store.append("runtime", "node.progress", {
-                nodeId: current.id,
-                classification: "advanced",
-                summary: "Reconciled pending review-thread mutations",
-                evidence: reconciliationEvidence,
-              });
-          } catch (error) {
-            if (error instanceof SideEffectBoundaryInterruption) throw error;
-            const reason = error instanceof Error ? error.message : String(error);
-            await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
-            await input.store.append("runtime", "run.blocked", {
-              reason,
-              evidence: ["Pending review-thread mutation could not be reconciled"],
-            });
-            return await input.store.loadState();
-          }
-        }
-        const outcome =
-          current.waitCondition?.kind === "github_pull_request"
-            ? await evaluateGitHubLifecycleWait({
+          const durableWait = (await input.store.loadState()).waits.find(
+            ({ nodeId }) => nodeId === current.id,
+          );
+          const timeoutAt = current.waitCondition.timeoutAt;
+          const settleBeforeReconciliation =
+            durableWait !== undefined &&
+            (durableWait.status !== "waiting" ||
+              (timeoutAt !== undefined && Date.now() >= Date.parse(timeoutAt)));
+          if (settleBeforeReconciliation) {
+            try {
+              outcome = await evaluateGitHubLifecycleWait({
                 store: input.store,
                 node: current,
                 workspace,
                 contract,
                 ...(input.github ? { options: input.github } : {}),
-              })
-            : await evaluateWaitNode({
+              });
+            } catch (error) {
+              const reason = error instanceof Error ? error.message : String(error);
+              await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+              await input.store.append("runtime", "run.blocked", {
+                reason,
+                evidence: ["GitHub lifecycle evaluation failed without a safe deferred wake"],
+              });
+              return await input.store.loadState();
+            }
+          } else if (
+            durableWait?.status === "waiting" &&
+            Date.now() < Date.parse(durableWait.nextWakeAt)
+          ) {
+            outcome = {
+              status: "waiting",
+              nextWakeAt: durableWait.nextWakeAt,
+              evidence: durableWait.evidence,
+            };
+          } else {
+            try {
+              const reconciliationEvidence = await reconcilePendingGitHubActions({
                 store: input.store,
                 node: current,
-                workspacePath: workspace.path,
+                workspace,
+                ...(input.github ? { options: input.github } : {}),
+                ...(input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}),
               });
+              if (reconciliationEvidence.length > 0)
+                await input.store.append("runtime", "node.progress", {
+                  nodeId: current.id,
+                  classification: "advanced",
+                  summary: "Reconciled pending GitHub mutations",
+                  evidence: reconciliationEvidence,
+                });
+            } catch (error) {
+              if (error instanceof SideEffectBoundaryInterruption) throw error;
+              if (error instanceof GitHubLifecycleConsistencyError) {
+                const deferred = await deferLifecycleConsistency(current, error);
+                if (deferred) return deferred;
+                continue;
+              }
+              const reason = error instanceof Error ? error.message : String(error);
+              await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+              await input.store.append("runtime", "run.blocked", {
+                reason,
+                evidence: ["Pending GitHub mutation could not be reconciled"],
+              });
+              return await input.store.loadState();
+            }
+            try {
+              outcome = await evaluateGitHubLifecycleWait({
+                store: input.store,
+                node: current,
+                workspace,
+                contract,
+                ...(input.github ? { options: input.github } : {}),
+              });
+            } catch (error) {
+              const reason = error instanceof Error ? error.message : String(error);
+              await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
+              await input.store.append("runtime", "run.blocked", {
+                reason,
+                evidence: ["GitHub lifecycle evaluation failed without a safe deferred wake"],
+              });
+              return await input.store.loadState();
+            }
+          }
+        } else {
+          outcome = await evaluateWaitNode({
+            store: input.store,
+            node: current,
+            workspacePath: workspace.path,
+          });
+        }
         if (outcome.status === "satisfied") {
           const control = await evaluateSuccessfulControl({
             store: input.store,
@@ -2303,6 +2474,11 @@ export async function executeRun(input: {
               continue;
             } catch (error) {
               if (error instanceof SideEffectBoundaryInterruption) throw error;
+              if (error instanceof GitHubLifecycleConsistencyError) {
+                const deferred = await deferLifecycleConsistency(current, error);
+                if (deferred) return deferred;
+                continue;
+              }
               const reason = error instanceof Error ? error.message : String(error);
               await input.store.append("probe", "node.progress", {
                 nodeId: current.id,
@@ -2796,6 +2972,16 @@ export async function executeRun(input: {
           );
           if (signal.aborted) return await finishInterruption(current.id);
           const lifecycleEvidence = lifecycle.map(({ result: probe }) => probe.summary);
+          const consistencyWait = (await input.store.loadState()).waits.find(
+            ({ nodeId, status }) => nodeId === current.id && status === "waiting",
+          );
+          if (consistencyWait)
+            await input.store.append(
+              "runtime",
+              "wait.satisfied",
+              { nodeId: current.id, evidence: lifecycleEvidence },
+              current.id,
+            );
           if (lifecycle.some(({ result: probe }) => !probe.passed)) {
             const reason = `Pull-request lifecycle evidence did not satisfy the approved probe: ${lifecycleEvidence.join("; ")}`;
             await input.store.append("probe", "node.progress", {
@@ -2847,6 +3033,11 @@ export async function executeRun(input: {
           await crossSideEffectBoundary(input.sideEffectBoundary, "after_node_acceptance");
         } catch (error) {
           if (error instanceof SideEffectBoundaryInterruption) throw error;
+          if (error instanceof GitHubLifecycleConsistencyError) {
+            const deferred = await deferLifecycleConsistency(current, error);
+            if (deferred) return deferred;
+            continue;
+          }
           await input.store.append("runtime", "node.failed", {
             nodeId: current.id,
             reason: (error as Error).message,

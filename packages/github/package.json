@@ -6,6 +6,7 @@
   "exports": "./src/index.ts",
   "dependencies": {
     "@graphcraft/core": "workspace:^",
+    "cross-spawn": "7.0.6",
     "zod": "4.4.3"
   }
 }

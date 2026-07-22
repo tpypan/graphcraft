@@ -16,7 +16,10 @@ import {
   captureGitHubPullRequestSnapshot,
   classifyGitHubPullRequestLifecycle,
   createGitHubPullRequest,
+  GITHUB_GRAPHQL_OPERATION_COST_BUDGET,
+  GitHubLifecycleConsistencyError,
   listGitHubPullRequestsForHead,
+  readGitHubRateLimits,
   readGitHubReviewThread,
   readGitHubPullRequestIdentity,
   rerequestGitHubCheckRun,
@@ -1115,7 +1118,7 @@ async function reconcileReviewResolution(
       status: "unknown",
       evidence: [...evidence, `Review thread ${thread.id} lost its confirmed action reply`],
     };
-  if (!thread.isResolved && thread.comments.at(-1)?.id !== reply.id)
+  if (thread.comments.at(-1)?.id !== reply.id)
     return {
       status: "unknown",
       evidence: [
@@ -1279,6 +1282,7 @@ async function reconcileCheckRerun(
   try {
     current = await currentBoundCheck(workspace, expected, options);
   } catch (error) {
+    if (error instanceof GitHubLifecycleConsistencyError) throw error;
     return {
       status: "unknown",
       evidence: [error instanceof Error ? error.message : String(error)],
@@ -1330,6 +1334,7 @@ async function performCheckRerun(
   workspace: RunWorkspace,
   claim: SideEffectClaim,
   options: GitHubExecutionOptions,
+  markDispatched?: () => Promise<void>,
   boundary?: (point: SideEffectBoundary) => void | Promise<void>,
 ): Promise<Record<string, unknown>> {
   const expected = checkRerunPrecondition(claim);
@@ -1343,6 +1348,7 @@ async function performCheckRerun(
     (check.conclusion ?? null) !== expected.checkConclusion
   )
     throw new Error(`Check run ${expected.checkId} moved before rerun`);
+  await markDispatched?.();
   await crossSideEffectBoundary(boundary, "after_action_prepare");
   await rerequestGitHubCheckRun(commandOptions(workspace, options), {
     host: expected.host,
@@ -1414,9 +1420,16 @@ export async function rerunLifecycleChecks(input: {
       claim,
       reconcile: async (currentClaim) =>
         await reconcileCheckRerun(input.workspace, currentClaim, options),
-      act: async (currentClaim) =>
-        await performCheckRerun(input.workspace, currentClaim, options, input.boundary),
+      act: async (currentClaim, markDispatched) =>
+        await performCheckRerun(
+          input.workspace,
+          currentClaim,
+          options,
+          markDispatched,
+          input.boundary,
+        ),
       durableDispatch: true,
+      deferError: (error) => error instanceof GitHubLifecycleConsistencyError,
       ...(input.boundary ? { boundary: input.boundary } : {}),
     });
     evidence.push(
@@ -1542,15 +1555,26 @@ export async function reconcilePendingGitHubActions(input: {
           return await reconcileReviewResolution(input.workspace, claim, options);
         return await reconcileCheckRerun(input.workspace, claim, options);
       },
-      act: async (claim) => {
+      act: async (claim, markDispatched) => {
         if (claim.kind === "github_pr_comment")
           return await performReviewReply(input.workspace, claim, options, input.boundary);
         if (claim.kind === "github_review_thread_resolve")
           return await performReviewResolution(input.workspace, claim, options, input.boundary);
-        return await performCheckRerun(input.workspace, claim, options, input.boundary);
+        return await performCheckRerun(
+          input.workspace,
+          claim,
+          options,
+          markDispatched,
+          input.boundary,
+        );
       },
       revalidateConfirmed: true,
       ...(entry.claim.kind === "github_check_rerun" ? { durableDispatch: true } : {}),
+      ...(entry.claim.kind === "github_check_rerun"
+        ? {
+            deferError: (error: unknown) => error instanceof GitHubLifecycleConsistencyError,
+          }
+        : {}),
       ...(input.boundary ? { boundary: input.boundary } : {}),
     });
     evidence.push(
@@ -1585,12 +1609,137 @@ export type GitHubLifecycleWaitOutcome =
     };
 
 const MAX_GITHUB_WAIT_BACKOFF_MS = 300_000;
+export const GITHUB_SNAPSHOT_CORE_RATE_LIMIT_BUDGET = 10;
+export const GITHUB_SNAPSHOT_GRAPHQL_RATE_LIMIT_BUDGET = GITHUB_GRAPHQL_OPERATION_COST_BUDGET;
+const GITHUB_RATE_LIMIT_RESET_GRACE_MS = 1_000;
+
+type GitHubRateLimits = Awaited<ReturnType<typeof readGitHubRateLimits>>;
+
+function githubRateLimitDeferral(
+  limits: GitHubRateLimits,
+  now: number,
+  pollIntervalMs: number,
+  timeoutAt: string | undefined,
+  exhaustedOnly: boolean,
+): { nextWakeAt: string; evidence: string[] } | undefined {
+  const constrained = [
+    {
+      resource: "core",
+      budget: GITHUB_SNAPSHOT_CORE_RATE_LIMIT_BUDGET,
+      limit: limits.core,
+    },
+    {
+      resource: "graphql",
+      budget: GITHUB_SNAPSHOT_GRAPHQL_RATE_LIMIT_BUDGET,
+      limit: limits.graphql,
+    },
+  ].filter(({ budget, limit }) =>
+    exhaustedOnly ? limit.remaining === 0 : limit.remaining < budget,
+  );
+  if (constrained.length === 0) return undefined;
+  const resetWakeAt = Math.max(
+    now + pollIntervalMs,
+    ...constrained.map(({ limit }) => Date.parse(limit.resetAt) + GITHUB_RATE_LIMIT_RESET_GRACE_MS),
+  );
+  const boundedWakeAt = timeoutAt ? Math.min(resetWakeAt, Date.parse(timeoutAt)) : resetWakeAt;
+  const nextWakeAt = new Date(boundedWakeAt).toISOString();
+  return {
+    nextWakeAt,
+    evidence: [
+      ...constrained.map(
+        ({ resource, budget, limit }) =>
+          `GitHub snapshot ${resource} rate-limit budget: remaining=${limit.remaining}, required=${budget}, resetAt=${limit.resetAt}`,
+      ),
+      `GitHub lifecycle capture deferred until ${nextWakeAt}`,
+    ],
+  };
+}
+
+async function deferForGitHubRateLimits(input: {
+  store: RunStore;
+  nodeId: string;
+  limits: GitHubRateLimits;
+  now: number;
+  pollIntervalMs: number;
+  timeoutAt?: string;
+  exhaustedOnly?: boolean;
+}): Promise<Extract<GitHubLifecycleWaitOutcome, { status: "waiting" }> | undefined> {
+  const deferral = githubRateLimitDeferral(
+    input.limits,
+    input.now,
+    input.pollIntervalMs,
+    input.timeoutAt,
+    input.exhaustedOnly ?? false,
+  );
+  if (!deferral) return undefined;
+  await input.store.append(
+    "runtime",
+    "wait.observed",
+    {
+      nodeId: input.nodeId,
+      nextWakeAt: deferral.nextWakeAt,
+      evidence: deferral.evidence,
+    },
+    input.nodeId,
+  );
+  return { status: "waiting", ...deferral };
+}
 
 function githubWaitBackoffMs(pollIntervalMs: number, observations: number): number {
   return Math.min(
     pollIntervalMs * 2 ** Math.min(Math.max(0, observations - 1), 4),
     MAX_GITHUB_WAIT_BACKOFF_MS,
   );
+}
+
+export async function deferGitHubLifecycleConsistency(input: {
+  store: RunStore;
+  node: GraphNode;
+  workspace: RunWorkspace;
+  error: GitHubLifecycleConsistencyError;
+  now?: number;
+}): Promise<{ nextWakeAt: string; evidence: string[] }> {
+  const now = input.now ?? Date.now();
+  let wait = (await input.store.loadState()).waits.find(({ nodeId }) => nodeId === input.node.id);
+  if (!wait) {
+    const condition =
+      input.node.kind === "wait" && input.node.waitCondition?.kind === "github_pull_request"
+        ? input.node.waitCondition
+        : { kind: "github_pull_request" as const, pollIntervalMs: 30_000 };
+    const registeredAt = new Date(now).toISOString();
+    wait = WaitRuntimeStateSchema.parse({
+      nodeId: input.node.id,
+      condition,
+      workspacePath: input.workspace.path,
+      status: "waiting",
+      registeredAt,
+      nextWakeAt: registeredAt,
+      observations: 0,
+      evidence: [],
+      updatedAt: registeredAt,
+    });
+    await input.store.append("runtime", "wait.registered", { wait }, input.node.id);
+  }
+  if (wait.status !== "waiting")
+    throw new Error(`GitHub consistency wait ${input.node.id} is already ${wait.status}`);
+  const condition = wait.condition;
+  const pollIntervalMs =
+    condition.kind === "github_pull_request" ? condition.pollIntervalMs : 30_000;
+  const timeoutAt = condition.kind === "github_pull_request" ? condition.timeoutAt : undefined;
+  const delay = githubWaitBackoffMs(pollIntervalMs, wait.observations + 1);
+  const wake = timeoutAt ? Math.min(now + delay, Date.parse(timeoutAt)) : now + delay;
+  const nextWakeAt = new Date(wake).toISOString();
+  const evidence = [
+    input.error.message,
+    `GitHub lifecycle changed at the same bound SHAs; revalidation will retry at ${nextWakeAt}`,
+  ];
+  await input.store.append(
+    "runtime",
+    "wait.observed",
+    { nodeId: input.node.id, nextWakeAt, evidence },
+    input.node.id,
+  );
+  return { nextWakeAt, evidence };
 }
 
 export async function evaluateGitHubLifecycleWait(input: {
@@ -1627,10 +1776,33 @@ export async function evaluateGitHubLifecycleWait(input: {
   }
   if (wait.status === "satisfied") return { status: "satisfied", evidence: wait.evidence };
   if (wait.status === "timed_out") return { status: "timed_out", evidence: wait.evidence };
+  if (condition.timeoutAt && now >= Date.parse(condition.timeoutAt)) {
+    const evidence = [
+      ...wait.evidence,
+      `GitHub lifecycle wait timed out at ${condition.timeoutAt}`,
+    ];
+    await input.store.append(
+      "runtime",
+      "wait.timed_out",
+      { nodeId: input.node.id, evidence },
+      input.node.id,
+    );
+    return { status: "timed_out", evidence };
+  }
   if (now < Date.parse(wait.nextWakeAt))
     return { status: "waiting", nextWakeAt: wait.nextWakeAt, evidence: wait.evidence };
 
   binding = lifecycleBinding(state, input.node);
+  const github = commandOptions(input.workspace, input.options);
+  const rateLimitDeferral = await deferForGitHubRateLimits({
+    store: input.store,
+    nodeId: input.node.id,
+    limits: await readGitHubRateLimits(github, binding.expected.host),
+    now,
+    pollIntervalMs: condition.pollIntervalMs,
+    ...(condition.timeoutAt ? { timeoutAt: condition.timeoutAt } : {}),
+  });
+  if (rateLimitDeferral) return rateLimitDeferral;
   const baseMovementEvidence: string[] = [];
   const observedBaseSha = await remoteBranchSha(
     input.workspace,
@@ -1682,24 +1854,55 @@ export async function evaluateGitHubLifecycleWait(input: {
   }
   const originalExpected = pullRequestPrecondition(binding.pullRequestClaim);
   const boundaryNodeId = input.node.dependsOn[0];
-  let lifecycle = await captureExpectedPullRequestLifecycle(
-    input.workspace,
-    input.contract,
-    binding.expected,
-    binding.number,
-    {
-      id: `${input.node.id}-lifecycle`,
-      kind: "github_snapshot",
-      pullRequest: "run_branch",
-      expectedState: "open",
-      requiredChecks: "success",
-      reviewThreads: "resolved",
-    },
-    binding.pullRequestResult.baseSha === originalExpected.baseSha &&
-      (boundaryNodeId !== binding.pullRequestClaim.nodeId ||
-        binding.pullRequestResult.headSha === originalExpected.headSha),
-    input.options ?? {},
-  );
+  let lifecycle: CapturedPullRequestLifecycle;
+  try {
+    lifecycle = await captureExpectedPullRequestLifecycle(
+      input.workspace,
+      input.contract,
+      binding.expected,
+      binding.number,
+      {
+        id: `${input.node.id}-lifecycle`,
+        kind: "github_snapshot",
+        pullRequest: "run_branch",
+        expectedState: "open",
+        requiredChecks: "success",
+        reviewThreads: "resolved",
+      },
+      binding.pullRequestResult.baseSha === originalExpected.baseSha &&
+        (boundaryNodeId !== binding.pullRequestClaim.nodeId ||
+          binding.pullRequestResult.headSha === originalExpected.headSha),
+      input.options ?? {},
+    );
+  } catch (error) {
+    if (error instanceof GitHubLifecycleConsistencyError) {
+      const deferral = await deferGitHubLifecycleConsistency({
+        store: input.store,
+        node: input.node,
+        workspace: input.workspace,
+        error,
+        now,
+      });
+      return { status: "waiting", ...deferral };
+    }
+    let refreshedLimits: GitHubRateLimits;
+    try {
+      refreshedLimits = await readGitHubRateLimits(github, binding.expected.host);
+    } catch {
+      throw error;
+    }
+    const deferral = await deferForGitHubRateLimits({
+      store: input.store,
+      nodeId: input.node.id,
+      limits: refreshedLimits,
+      now,
+      pollIntervalMs: condition.pollIntervalMs,
+      exhaustedOnly: true,
+      ...(condition.timeoutAt ? { timeoutAt: condition.timeoutAt } : {}),
+    });
+    if (deferral) return deferral;
+    throw error;
+  }
   const observedHumanDecision = lifecycle.pullRequestDecision.isDraft
     ? "draft"
     : lifecycle.pullRequestDecision.reviewDecision === "CHANGES_REQUESTED"
@@ -1792,25 +1995,6 @@ export async function evaluateGitHubLifecycleWait(input: {
     );
   }
   const evidence = [...baseMovementEvidence, ...lifecycle.classification.evidence];
-  const timedOut = condition.timeoutAt && now >= Date.parse(condition.timeoutAt);
-  if (timedOut) {
-    const timeoutEvidence = [
-      ...evidence,
-      `GitHub lifecycle wait timed out at ${condition.timeoutAt}`,
-    ];
-    await input.store.append(
-      "runtime",
-      "wait.timed_out",
-      {
-        nodeId: input.node.id,
-        evidence: timeoutEvidence,
-        signature: lifecycle.classification.signature,
-        probeResult: lifecycle.result,
-      },
-      input.node.id,
-    );
-    return { status: "timed_out", evidence: timeoutEvidence, lifecycle };
-  }
   if (lifecycle.classification.status === "green") {
     await input.store.append(
       "runtime",
@@ -1849,8 +2033,20 @@ export async function evaluateGitHubLifecycleWait(input: {
   const unchangedAtDurableMaximumBackoff =
     wait.lastSignature === lifecycle.classification.signature &&
     githubWaitBackoffMs(condition.pollIntervalMs, wait.observations) === MAX_GITHUB_WAIT_BACKOFF_MS;
-  if (unchangedAtDurableMaximumBackoff)
+  if (unchangedAtDurableMaximumBackoff) {
+    await input.store.append(
+      "runtime",
+      "wait.rearmed",
+      {
+        nodeId: input.node.id,
+        nextWakeAt,
+        evidence,
+        signature: lifecycle.classification.signature,
+      },
+      input.node.id,
+    );
     return { status: "waiting", nextWakeAt, evidence, lifecycle };
+  }
   await input.store.append(
     "runtime",
     "wait.observed",
