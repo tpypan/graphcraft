@@ -1,8 +1,9 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -39,6 +40,21 @@ import { amendRunGraph } from "./amendment.ts";
 
 const execFileAsync = promisify(execFile);
 const temporaryRoots: string[] = [];
+const storageFixturesRoot = fileURLToPath(new URL("./fixtures/storage", import.meta.url));
+
+async function snapshotFiles(root: string): Promise<Record<string, string>> {
+  const snapshot: Record<string, string> = {};
+  const visit = async (directory: string): Promise<void> => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) await visit(path);
+      else if (entry.isFile())
+        snapshot[relative(root, path)] = (await readFile(path)).toString("base64");
+    }
+  };
+  await visit(root);
+  return snapshot;
+}
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -1283,6 +1299,110 @@ describe("durable runtime", () => {
     expect(JSON.parse(await readFile(join(created.store.runRoot, "state.json"), "utf8"))).toEqual(
       state,
     );
+  });
+
+  it.each(["0.1.0", "0.1.1"])(
+    "migrates released %s pre-manifest storage once, backs it up, and resumes it",
+    async (release) => {
+      const repository = await createRepository();
+      const fixture = JSON.parse(
+        await readFile(join(storageFixturesRoot, `v${release}`, "fixture.json"), "utf8"),
+      ) as { release: string; tag: string; commit: string; runId: string };
+      expect(fixture).toMatchObject({ release, tag: `v${release}` });
+      expect(fixture.commit).toMatch(/^[a-f0-9]{40}$/);
+      const sourceRoot = join(storageFixturesRoot, `v${release}`, "run");
+      const runRoot = join(repository, ".graphcraft", "runs", fixture.runId);
+      await cp(sourceRoot, runRoot, { recursive: true });
+      const releasedSnapshot = await snapshotFiles(runRoot);
+      const legacyStore = new RunStore(repository, fixture.runId);
+      const concurrentStore = new RunStore(repository, fixture.runId);
+
+      expect(
+        (await Promise.all([legacyStore.loadState(), concurrentStore.loadState()])).map(
+          ({ status }) => status,
+        ),
+      ).toEqual(["completed", "completed"]);
+      const manifest = JSON.parse(
+        await readFile(join(legacyStore.runRoot, "storage.json"), "utf8"),
+      ) as { schemaVersion: number; migratedFrom: number; formats: Record<string, number> };
+      const backupRoot = join(
+        legacyStore.graphcraftRoot,
+        "migration-backups",
+        legacyStore.runId,
+        "0-to-1",
+      );
+      const [contract, graph, probePlan, events] = await Promise.all([
+        legacyStore.loadContract(),
+        legacyStore.loadGraph(),
+        legacyStore.loadProbePlan(),
+        legacyStore.loadEvents(),
+      ]);
+
+      expect(manifest).toMatchObject({
+        schemaVersion: 1,
+        migratedFrom: 0,
+        formats: {
+          contract: 1,
+          graph: 1,
+          probePlan: 1,
+          events: 1,
+          state: 1,
+          workspace: 1,
+          capsules: 1,
+          invocationEvents: 1,
+          semanticReports: 1,
+          rawArtifacts: 1,
+          controlRequests: 1,
+          locks: 1,
+        },
+      });
+      expect(contract.runId).toBe(fixture.runId);
+      expect(graph.runId).toBe(fixture.runId);
+      expect(probePlan.family).toBe(graph.family);
+      expect(events).toHaveLength(12);
+      expect(await snapshotFiles(backupRoot)).toEqual(releasedSnapshot);
+
+      const adapter = new FakeAdapter(async () => {
+        throw new Error("a completed released run must not invoke a worker during resume");
+      });
+      expect((await executeRun({ store: legacyStore, adapter, approve: true })).status).toBe(
+        "completed",
+      );
+      expect(adapter.calls).toHaveLength(0);
+    },
+  );
+
+  it("refuses a future storage schema without changing durable run files", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a future storage fixture feature", {
+      cwd: repository,
+    });
+    const eventsBefore = await readFile(created.store.eventsPath(), "utf8");
+    const statePath = join(created.store.runRoot, "state.json");
+    const stateBefore = await readFile(statePath, "utf8");
+    await writeFile(
+      join(created.store.runRoot, "storage.json"),
+      JSON.stringify({ schemaVersion: 999, runId: created.contract.runId }),
+    );
+
+    const futureStore = new RunStore(repository, created.contract.runId);
+    await expect(futureStore.loadState()).rejects.toThrow(
+      /future storage schema 999.*No files were changed/,
+    );
+    expect(await readFile(created.store.eventsPath(), "utf8")).toBe(eventsBefore);
+    expect(await readFile(statePath, "utf8")).toBe(stateBefore);
+    await expect(
+      readFile(
+        join(
+          created.store.graphcraftRoot,
+          "migration-backups",
+          created.store.runId,
+          "0-to-1",
+          "events.jsonl",
+        ),
+        "utf8",
+      ),
+    ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("persists a validated user-edited probe plan before approval", async () => {

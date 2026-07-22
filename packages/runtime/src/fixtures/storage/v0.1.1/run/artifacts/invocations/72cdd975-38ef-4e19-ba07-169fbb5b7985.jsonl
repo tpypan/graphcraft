@@ -1,0 +1,3 @@
+{"type":"started","invocationId":"72cdd975-38ef-4e19-ba07-169fbb5b7985"}
+{"type":"usage","usage":{"input":10,"cachedInput":2,"output":4,"reasoning":0,"total":14}}
+{"type":"result","result":{"status":"completed","summary":"Completed published fixture","changedPaths":[],"evidence":["published fixture evidence"]}}

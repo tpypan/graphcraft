@@ -21,6 +21,7 @@ import {
   type RunState,
 } from "@graphcraft/core";
 import { writeJsonAtomic } from "./json.ts";
+import { ensureCurrentRunStorage, writeCurrentRunStorageManifest } from "./migration.ts";
 
 export class RunStore {
   readonly repositoryRoot: string;
@@ -28,12 +29,24 @@ export class RunStore {
   readonly graphcraftRoot: string;
   readonly runRoot: string;
   private appendTail: Promise<void> = Promise.resolve();
+  private initializing = false;
+  private storageReady: Promise<unknown> | undefined;
 
   constructor(repositoryRoot: string, runId: string) {
     this.repositoryRoot = repositoryRoot;
     this.runId = runId;
     this.graphcraftRoot = join(repositoryRoot, ".graphcraft");
     this.runRoot = join(this.graphcraftRoot, "runs", runId);
+  }
+
+  private async ensureStorage(): Promise<void> {
+    if (this.initializing) return;
+    this.storageReady ??= ensureCurrentRunStorage({
+      graphcraftRoot: this.graphcraftRoot,
+      runRoot: this.runRoot,
+      runId: this.runId,
+    });
+    await this.storageReady;
   }
 
   static async create(
@@ -43,6 +56,7 @@ export class RunStore {
     inputProbePlan?: ProbePlan,
   ): Promise<RunStore> {
     const store = new RunStore(repositoryRoot, contract.runId);
+    store.initializing = true;
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
     await Promise.all([
       mkdir(join(store.runRoot, "artifacts"), { recursive: true }),
@@ -67,6 +81,8 @@ export class RunStore {
       mode: 0o600,
     });
     await store.materialize([event]);
+    await writeCurrentRunStorageManifest(store.runRoot, store.runId, 1);
+    store.initializing = false;
     return store;
   }
 
@@ -75,20 +91,24 @@ export class RunStore {
   }
 
   async saveContract(contract: RunContract): Promise<void> {
+    await this.ensureStorage();
     await writeJsonAtomic(join(this.runRoot, "contract.json"), RunContractSchema.parse(contract));
   }
 
   async loadContract(): Promise<RunContract> {
+    await this.ensureStorage();
     return RunContractSchema.parse(
       JSON.parse(await readFile(join(this.runRoot, "contract.json"), "utf8")),
     );
   }
 
   async saveGraph(graph: Graph): Promise<void> {
+    await this.ensureStorage();
     await writeJsonAtomic(join(this.runRoot, "graph.json"), GraphSchema.parse(graph));
   }
 
   async loadGraph(): Promise<Graph> {
+    await this.ensureStorage();
     const events = await this.loadEvents();
     const eventGraph = events.findLast(
       (event) =>
@@ -106,10 +126,12 @@ export class RunStore {
   }
 
   async saveProbePlan(probePlan: ProbePlan): Promise<void> {
+    await this.ensureStorage();
     await writeJsonAtomic(join(this.runRoot, "probe-plan.json"), ProbePlanSchema.parse(probePlan));
   }
 
   async loadProbePlan(): Promise<ProbePlan> {
+    await this.ensureStorage();
     const events = await this.loadEvents();
     const eventPlan = events.findLast(
       (event) =>
@@ -134,6 +156,7 @@ export class RunStore {
   }
 
   async loadEvents(): Promise<RunEvent[]> {
+    await this.ensureStorage();
     const content = await readFile(this.eventsPath(), "utf8");
     return content
       .split("\n")
@@ -142,6 +165,7 @@ export class RunStore {
   }
 
   async loadState(): Promise<RunState> {
+    await this.ensureStorage();
     try {
       return RunStateSchema.parse(
         JSON.parse(await readFile(join(this.runRoot, "state.json"), "utf8")),
@@ -157,6 +181,7 @@ export class RunStore {
     data: Record<string, unknown>,
     causationId = this.runId,
   ): Promise<RunEvent> {
+    await this.ensureStorage();
     const operation = this.appendTail.then(async () => {
       const events = await this.loadEvents();
       const event = createRunEvent({
@@ -179,6 +204,7 @@ export class RunStore {
   }
 
   async rebuildViews(): Promise<RunState> {
+    await this.ensureStorage();
     const events = await this.loadEvents();
     const createdGraph = GraphSchema.parse(events[0]?.data.graph);
     let graph = createdGraph;
@@ -196,6 +222,7 @@ export class RunStore {
   }
 
   async writeArtifact(relativePath: string, value: string | Uint8Array): Promise<string> {
+    await this.ensureStorage();
     const path = join(this.runRoot, "artifacts", relativePath);
     await mkdir(dirname(path), { recursive: true });
     await writeFile(path, value, { mode: 0o600 });
@@ -203,6 +230,7 @@ export class RunStore {
   }
 
   async appendInvocationEvent(invocationId: string, event: HostEvent): Promise<string> {
+    await this.ensureStorage();
     const path = join(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
     await mkdir(dirname(path), { recursive: true });
     await appendFile(path, `${JSON.stringify(HostEventSchema.parse(event))}\n`, {
@@ -213,6 +241,7 @@ export class RunStore {
   }
 
   async loadInvocationEvents(invocationId: string): Promise<HostEvent[]> {
+    await this.ensureStorage();
     const path = join(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
     const content = await readFile(path, "utf8");
     return content
@@ -222,6 +251,7 @@ export class RunStore {
   }
 
   async loadGraphHistory(): Promise<GraphRevisionRecord[]> {
+    await this.ensureStorage();
     const events = await this.loadEvents();
     let previous = GraphSchema.parse(events[0]?.data.graph);
     const history: GraphRevisionRecord[] = [];
@@ -279,16 +309,19 @@ export class RunStore {
   }
 
   async writeCapsule(hash: string, value: unknown): Promise<string> {
+    await this.ensureStorage();
     const path = join(this.runRoot, "capsules", `${hash}.json`);
     await writeJsonAtomic(path, value);
     return path;
   }
 
   async writeWorkspace(value: unknown): Promise<void> {
+    await this.ensureStorage();
     await writeJsonAtomic(join(this.runRoot, "workspace.json"), value);
   }
 
   async loadWorkspace<T>(): Promise<T> {
+    await this.ensureStorage();
     return JSON.parse(await readFile(join(this.runRoot, "workspace.json"), "utf8")) as T;
   }
 

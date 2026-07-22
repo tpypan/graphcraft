@@ -3,4 +3,5 @@ coverage
 dist
 docs/research
 node_modules
+packages/runtime/src/fixtures/storage/*/run
 pnpm-lock.yaml

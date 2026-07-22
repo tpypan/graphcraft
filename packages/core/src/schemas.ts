@@ -459,6 +459,26 @@ export const RunStateSchema = z.strictObject({
   updatedAt: z.iso.datetime(),
 });
 
+export const RunStorageManifestSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  runId: z.uuid(),
+  migratedFrom: z.union([z.literal(0), z.literal(1)]),
+  formats: z.strictObject({
+    contract: z.literal(1),
+    graph: z.literal(1),
+    probePlan: z.literal(1),
+    events: z.literal(1),
+    state: z.literal(1),
+    workspace: z.literal(1),
+    capsules: z.literal(1),
+    invocationEvents: z.literal(1),
+    semanticReports: z.literal(1),
+    rawArtifacts: z.literal(1),
+    controlRequests: z.literal(1),
+    locks: z.literal(1),
+  }),
+});
+
 export type FinishLine = z.infer<typeof FinishLineSchema>;
 export type Permission = z.infer<typeof PermissionSchema>;
 export type AcceptanceAnchor = z.infer<typeof AcceptanceAnchorSchema>;
@@ -490,6 +510,7 @@ export type RunControlRequest = z.infer<typeof RunControlRequestSchema>;
 export type HostEvent = z.infer<typeof HostEventSchema>;
 export type RunEvent = z.infer<typeof RunEventSchema>;
 export type RunState = z.infer<typeof RunStateSchema>;
+export type RunStorageManifest = z.infer<typeof RunStorageManifestSchema>;
 
 export const workerResultJsonSchema = z.toJSONSchema(WorkerResultSchema, { target: "draft-7" });
 export const graphPlanJsonSchema = z.toJSONSchema(GraphPlanSchema, { target: "draft-7" });

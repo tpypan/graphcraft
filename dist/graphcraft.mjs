@@ -3374,7 +3374,7 @@ function useColor() {
 var program = new Command();
 
 // packages/cli/src/bin.ts
-import { readFile as readFile6 } from "node:fs/promises";
+import { readFile as readFile7 } from "node:fs/promises";
 
 // packages/cli/src/index.ts
 import { createInterface as createInterface3 } from "node:readline/promises";
@@ -3382,7 +3382,7 @@ import { spawn as spawn4 } from "node:child_process";
 import { access as access2, chmod, copyFile, mkdir as mkdir5 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname as dirname6, join as join9, resolve as resolve3 } from "node:path";
+import { dirname as dirname6, join as join10, resolve as resolve3 } from "node:path";
 import { stdin, stdout } from "node:process";
 
 // package.json
@@ -18409,6 +18409,25 @@ var RunStateSchema = external_exports.strictObject({
   stopReason: external_exports.string().optional(),
   updatedAt: external_exports.iso.datetime()
 });
+var RunStorageManifestSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  runId: external_exports.uuid(),
+  migratedFrom: external_exports.union([external_exports.literal(0), external_exports.literal(1)]),
+  formats: external_exports.strictObject({
+    contract: external_exports.literal(1),
+    graph: external_exports.literal(1),
+    probePlan: external_exports.literal(1),
+    events: external_exports.literal(1),
+    state: external_exports.literal(1),
+    workspace: external_exports.literal(1),
+    capsules: external_exports.literal(1),
+    invocationEvents: external_exports.literal(1),
+    semanticReports: external_exports.literal(1),
+    rawArtifacts: external_exports.literal(1),
+    controlRequests: external_exports.literal(1),
+    locks: external_exports.literal(1)
+  })
+});
 var workerResultJsonSchema = external_exports.toJSONSchema(WorkerResultSchema, { target: "draft-7" });
 var graphPlanJsonSchema = external_exports.toJSONSchema(GraphPlanSchema, { target: "draft-7" });
 var semanticVerdictJsonSchema = external_exports.toJSONSchema(SemanticVerdictSchema, {
@@ -20817,14 +20836,106 @@ async function decideRunControl(store, input) {
   }
 }
 
+// packages/runtime/src/migration.ts
+import { cp, readFile as readFile3 } from "node:fs/promises";
+import { join as join5 } from "node:path";
+var CURRENT_RUN_STORAGE_VERSION = 1;
+function manifest(runId, migratedFrom) {
+  return RunStorageManifestSchema.parse({
+    schemaVersion: CURRENT_RUN_STORAGE_VERSION,
+    runId,
+    migratedFrom,
+    formats: {
+      contract: 1,
+      graph: 1,
+      probePlan: 1,
+      events: 1,
+      state: 1,
+      workspace: 1,
+      capsules: 1,
+      invocationEvents: 1,
+      semanticReports: 1,
+      rawArtifacts: 1,
+      controlRequests: 1,
+      locks: 1
+    }
+  });
+}
+function runStorageManifestPath(runRoot) {
+  return join5(runRoot, "storage.json");
+}
+async function writeCurrentRunStorageManifest(runRoot, runId, migratedFrom) {
+  const value = manifest(runId, migratedFrom);
+  await writeJsonAtomic(runStorageManifestPath(runRoot), value);
+  return value;
+}
+async function ensureCurrentRunStorage(input) {
+  const path2 = runStorageManifestPath(input.runRoot);
+  let raw;
+  try {
+    raw = JSON.parse(await readFile3(path2, "utf8"));
+  } catch (error51) {
+    if (error51.code !== "ENOENT")
+      throw new Error(
+        `Run ${input.runId} has an unreadable storage manifest: ${error51.message}`
+      );
+  }
+  if (raw !== void 0) {
+    const version2 = typeof raw === "object" && raw !== null ? raw.schemaVersion : void 0;
+    if (typeof version2 === "number" && version2 > CURRENT_RUN_STORAGE_VERSION)
+      throw new Error(
+        `Run ${input.runId} uses future storage schema ${version2}; this Graphcraft supports through ${CURRENT_RUN_STORAGE_VERSION}. No files were changed.`
+      );
+    if (version2 !== CURRENT_RUN_STORAGE_VERSION)
+      throw new Error(
+        `Run ${input.runId} uses unsupported storage schema ${String(version2)}; no migration path is available. No files were changed.`
+      );
+    const parsed = RunStorageManifestSchema.parse(raw);
+    if (parsed.runId !== input.runId)
+      throw new Error(`Run storage manifest belongs to ${parsed.runId}, not ${input.runId}`);
+    return parsed;
+  }
+  await readFile3(join5(input.runRoot, "events.jsonl"), "utf8").catch((error51) => {
+    throw new Error(
+      `Legacy run ${input.runId} cannot migrate because events.jsonl is unavailable: ${error51.message}`
+    );
+  });
+  const lock = new RunLock(join5(input.graphcraftRoot, "locks", `${input.runId}.migration.lock`));
+  try {
+    await lock.acquire();
+  } catch (error51) {
+    if (!(error51 instanceof Error) || !error51.message.includes("already active")) throw error51;
+    const deadline = Date.now() + 5e3;
+    while (Date.now() <= deadline) {
+      const migrated = await readFile3(path2, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
+      if (migrated) return migrated;
+      await new Promise((resolve4) => setTimeout(resolve4, 10));
+    }
+    throw new Error(`Timed out waiting for storage migration of run ${input.runId}`);
+  }
+  try {
+    const migrated = await readFile3(path2, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
+    if (migrated) return migrated;
+    const backupRoot = join5(input.graphcraftRoot, "migration-backups", input.runId, "0-to-1");
+    await cp(input.runRoot, backupRoot, {
+      recursive: true,
+      force: true,
+      errorOnExist: false
+    });
+    return await writeCurrentRunStorageManifest(input.runRoot, input.runId, 0);
+  } finally {
+    await lock.release();
+  }
+}
+
 // packages/runtime/src/repository.ts
-import { appendFile, mkdir as mkdir3, readFile as readFile4 } from "node:fs/promises";
-import { basename, dirname as dirname4, isAbsolute as isAbsolute2, join as join6, resolve as resolve2 } from "node:path";
+import { appendFile, mkdir as mkdir3, readFile as readFile5 } from "node:fs/promises";
+import { basename, dirname as dirname4, isAbsolute as isAbsolute2, join as join7, resolve as resolve2 } from "node:path";
 
 // packages/probes/src/index.ts
-import { access, readFile as readFile3, stat as stat2 } from "node:fs/promises";
+import { access, readFile as readFile4, stat as stat2 } from "node:fs/promises";
 import { constants } from "node:fs";
-import { dirname as dirname3, join as join5, resolve, sep } from "node:path";
+import { dirname as dirname3, join as join6, resolve, sep } from "node:path";
 
 // packages/probes/src/process.ts
 import { spawn as spawn3 } from "node:child_process";
@@ -20914,7 +21025,7 @@ async function runProbe(spec, repositoryPath, signal) {
       exists = false;
     }
     let contains = true;
-    if (exists && spec.contains) contains = (await readFile3(path2, "utf8")).includes(spec.contains);
+    if (exists && spec.contains) contains = (await readFile4(path2, "utf8")).includes(spec.contains);
     const passed2 = exists === spec.shouldExist && contains;
     const summary = `${spec.path} ${exists ? "exists" : "does not exist"}${spec.contains ? ` and ${contains ? "contains" : "does not contain"} the required text` : ""}`;
     return {
@@ -21061,19 +21172,19 @@ async function packageCandidates(repositoryPath, family, terms) {
   const tracked = await runProcess("git", ["ls-files"], { cwd: repositoryPath });
   if (tracked.exitCode !== 0) return [];
   const manifests = tracked.stdout.split("\n").filter((path2) => path2 === "package.json" || path2.endsWith("/package.json")).slice(0, 100);
-  const rootManifest = manifests.includes("package.json") ? JSON.parse(await readFile3(join5(repositoryPath, "package.json"), "utf8")) : void 0;
+  const rootManifest = manifests.includes("package.json") ? JSON.parse(await readFile4(join6(repositoryPath, "package.json"), "utf8")) : void 0;
   const candidates = [];
   for (const manifestPath of manifests) {
-    const manifest = JSON.parse(await readFile3(join5(repositoryPath, manifestPath), "utf8"));
+    const manifest2 = JSON.parse(await readFile4(join6(repositoryPath, manifestPath), "utf8"));
     const directory = dirname3(manifestPath) === "." ? void 0 : dirname3(manifestPath);
     const relevant = !directory || terms.some(
-      (term) => directory.toLowerCase().includes(term) || manifest.name?.toLowerCase().includes(term)
+      (term) => directory.toLowerCase().includes(term) || manifest2.name?.toLowerCase().includes(term)
     );
     if (!relevant) continue;
-    for (const name of Object.keys(manifest.scripts ?? {}).sort()) {
+    for (const name of Object.keys(manifest2.scripts ?? {}).sort()) {
       const purpose = familyScriptPurpose(family, name, terms);
       if (!purpose) continue;
-      const command = packageCommand(manifest.packageManager ?? rootManifest?.packageManager, name);
+      const command = packageCommand(manifest2.packageManager ?? rootManifest?.packageManager, name);
       candidates.push({
         root: !directory,
         item: {
@@ -21176,7 +21287,7 @@ async function discoverProbePlan(repositoryPath, task, baseSha) {
     items.push(completion);
   }
   try {
-    await access(join5(repositoryPath, "pyproject.toml"));
+    await access(join6(repositoryPath, "pyproject.toml"));
     items.push({
       phase: "completion",
       purpose: "regression",
@@ -21194,7 +21305,7 @@ async function discoverProbePlan(repositoryPath, task, baseSha) {
   } catch {
   }
   try {
-    await access(join5(repositoryPath, "go.mod"));
+    await access(join6(repositoryPath, "go.mod"));
     items.push({
       phase: "completion",
       purpose: "regression",
@@ -21324,7 +21435,7 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
   ) : [];
   const taskMatches = await Promise.all(
     matchedPaths.map(async (path2) => {
-      const content = await readFile4(join6(repositoryRoot, path2), "utf8").catch(() => "");
+      const content = await readFile5(join7(repositoryRoot, path2), "utf8").catch(() => "");
       const normalized = content.toLowerCase();
       const score = searchTerms.filter((term) => normalized.includes(term)).length;
       const pathScore = searchTerms.filter((term) => path2.toLowerCase().includes(term)).length;
@@ -21349,7 +21460,7 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
   for (const path2 of baselinePaths) {
     if (remainingCharacters <= 0 || files.length >= 7) break;
     if (files.some((file2) => file2.path === path2)) continue;
-    const content = await readFile4(join6(repositoryRoot, path2), "utf8").catch(() => "");
+    const content = await readFile5(join7(repositoryRoot, path2), "utf8").catch(() => "");
     const limit = Math.min(2e3, remainingCharacters);
     const selected = content.slice(0, limit);
     files.push({ path: path2, content: selected, truncated: selected.length < content.length });
@@ -21368,7 +21479,7 @@ async function ensureGraphcraftIgnored(repositoryRoot) {
   const excludePath = isAbsolute2(rawExcludePath) ? rawExcludePath : resolve2(repositoryRoot, rawExcludePath);
   let content = "";
   try {
-    content = await readFile4(excludePath, "utf8");
+    content = await readFile5(excludePath, "utf8");
   } catch {
     await mkdir3(dirname4(excludePath), { recursive: true });
   }
@@ -21380,11 +21491,11 @@ function slug(task) {
 }
 async function createRunWorkspace(contract) {
   const branch = `graphcraft/${contract.runId.slice(0, 8)}-${slug(contract.task)}`;
-  const parent = join6(
+  const parent = join7(
     dirname4(contract.repository.root),
     `.${basename(contract.repository.root)}-graphcraft-worktrees`
   );
-  const path2 = join6(parent, contract.runId);
+  const path2 = join7(parent, contract.runId);
   await mkdir3(parent, { recursive: true });
   const registered = await git(contract.repository.root, ["worktree", "list", "--porcelain"]);
   if (registered.includes(`worktree ${path2}`)) return { path: path2, branch, created: false };
@@ -21411,31 +21522,43 @@ async function createAtomicCommit(workspace, task) {
 
 // packages/runtime/src/runner.ts
 import { randomUUID as randomUUID6 } from "node:crypto";
-import { join as join8 } from "node:path";
+import { join as join9 } from "node:path";
 
 // packages/runtime/src/store.ts
-import { appendFile as appendFile2, mkdir as mkdir4, readFile as readFile5, readdir, writeFile as writeFile3 } from "node:fs/promises";
-import { dirname as dirname5, join as join7 } from "node:path";
+import { appendFile as appendFile2, mkdir as mkdir4, readFile as readFile6, readdir, writeFile as writeFile3 } from "node:fs/promises";
+import { dirname as dirname5, join as join8 } from "node:path";
 var RunStore = class _RunStore {
   repositoryRoot;
   runId;
   graphcraftRoot;
   runRoot;
   appendTail = Promise.resolve();
+  initializing = false;
+  storageReady;
   constructor(repositoryRoot, runId) {
     this.repositoryRoot = repositoryRoot;
     this.runId = runId;
-    this.graphcraftRoot = join7(repositoryRoot, ".graphcraft");
-    this.runRoot = join7(this.graphcraftRoot, "runs", runId);
+    this.graphcraftRoot = join8(repositoryRoot, ".graphcraft");
+    this.runRoot = join8(this.graphcraftRoot, "runs", runId);
+  }
+  async ensureStorage() {
+    if (this.initializing) return;
+    this.storageReady ??= ensureCurrentRunStorage({
+      graphcraftRoot: this.graphcraftRoot,
+      runRoot: this.runRoot,
+      runId: this.runId
+    });
+    await this.storageReady;
   }
   static async create(repositoryRoot, contract, graph, inputProbePlan) {
     const store = new _RunStore(repositoryRoot, contract.runId);
+    store.initializing = true;
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
     await Promise.all([
-      mkdir4(join7(store.runRoot, "artifacts"), { recursive: true }),
-      mkdir4(join7(store.runRoot, "capsules"), { recursive: true }),
-      mkdir4(join7(store.runRoot, "reports"), { recursive: true }),
-      mkdir4(join7(store.graphcraftRoot, "locks"), { recursive: true })
+      mkdir4(join8(store.runRoot, "artifacts"), { recursive: true }),
+      mkdir4(join8(store.runRoot, "capsules"), { recursive: true }),
+      mkdir4(join8(store.runRoot, "reports"), { recursive: true }),
+      mkdir4(join8(store.graphcraftRoot, "locks"), { recursive: true })
     ]);
     await Promise.all([
       store.saveContract(contract),
@@ -21455,72 +21578,83 @@ var RunStore = class _RunStore {
       mode: 384
     });
     await store.materialize([event]);
+    await writeCurrentRunStorageManifest(store.runRoot, store.runId, 1);
+    store.initializing = false;
     return store;
   }
   eventsPath() {
-    return join7(this.runRoot, "events.jsonl");
+    return join8(this.runRoot, "events.jsonl");
   }
   async saveContract(contract) {
-    await writeJsonAtomic(join7(this.runRoot, "contract.json"), RunContractSchema.parse(contract));
+    await this.ensureStorage();
+    await writeJsonAtomic(join8(this.runRoot, "contract.json"), RunContractSchema.parse(contract));
   }
   async loadContract() {
+    await this.ensureStorage();
     return RunContractSchema.parse(
-      JSON.parse(await readFile5(join7(this.runRoot, "contract.json"), "utf8"))
+      JSON.parse(await readFile6(join8(this.runRoot, "contract.json"), "utf8"))
     );
   }
   async saveGraph(graph) {
-    await writeJsonAtomic(join7(this.runRoot, "graph.json"), GraphSchema.parse(graph));
+    await this.ensureStorage();
+    await writeJsonAtomic(join8(this.runRoot, "graph.json"), GraphSchema.parse(graph));
   }
   async loadGraph() {
+    await this.ensureStorage();
     const events = await this.loadEvents();
     const eventGraph = events.findLast(
       (event) => (event.type === "run.created" || event.type === "graph.amended") && event.data.graph
     )?.data.graph;
     if (eventGraph) {
       const graph = GraphSchema.parse(eventGraph);
-      const materialized = await readFile5(join7(this.runRoot, "graph.json"), "utf8").then((value) => GraphSchema.parse(JSON.parse(value))).catch(() => void 0);
+      const materialized = await readFile6(join8(this.runRoot, "graph.json"), "utf8").then((value) => GraphSchema.parse(JSON.parse(value))).catch(() => void 0);
       if (JSON.stringify(materialized) !== JSON.stringify(graph)) await this.saveGraph(graph);
       return graph;
     }
-    return GraphSchema.parse(JSON.parse(await readFile5(join7(this.runRoot, "graph.json"), "utf8")));
+    return GraphSchema.parse(JSON.parse(await readFile6(join8(this.runRoot, "graph.json"), "utf8")));
   }
   async saveProbePlan(probePlan) {
-    await writeJsonAtomic(join7(this.runRoot, "probe-plan.json"), ProbePlanSchema.parse(probePlan));
+    await this.ensureStorage();
+    await writeJsonAtomic(join8(this.runRoot, "probe-plan.json"), ProbePlanSchema.parse(probePlan));
   }
   async loadProbePlan() {
+    await this.ensureStorage();
     const events = await this.loadEvents();
     const eventPlan = events.findLast(
       (event) => (event.type === "run.created" || event.type === "graph.amended") && event.data.probePlan
     )?.data.probePlan;
     if (eventPlan) {
       const probePlan = ProbePlanSchema.parse(eventPlan);
-      const materialized = await readFile5(join7(this.runRoot, "probe-plan.json"), "utf8").then((value) => ProbePlanSchema.parse(JSON.parse(value))).catch(() => void 0);
+      const materialized = await readFile6(join8(this.runRoot, "probe-plan.json"), "utf8").then((value) => ProbePlanSchema.parse(JSON.parse(value))).catch(() => void 0);
       if (JSON.stringify(materialized) !== JSON.stringify(probePlan))
         await this.saveProbePlan(probePlan);
       return probePlan;
     }
     try {
       return ProbePlanSchema.parse(
-        JSON.parse(await readFile5(join7(this.runRoot, "probe-plan.json"), "utf8"))
+        JSON.parse(await readFile6(join8(this.runRoot, "probe-plan.json"), "utf8"))
       );
     } catch {
       return probePlanFromGraph(await this.loadGraph());
     }
   }
   async loadEvents() {
-    const content = await readFile5(this.eventsPath(), "utf8");
+    await this.ensureStorage();
+    const content = await readFile6(this.eventsPath(), "utf8");
     return content.split("\n").filter(Boolean).map((line) => RunEventSchema.parse(JSON.parse(line)));
   }
   async loadState() {
+    await this.ensureStorage();
     try {
       return RunStateSchema.parse(
-        JSON.parse(await readFile5(join7(this.runRoot, "state.json"), "utf8"))
+        JSON.parse(await readFile6(join8(this.runRoot, "state.json"), "utf8"))
       );
     } catch {
       return await this.rebuildViews();
     }
   }
   async append(actor, type, data, causationId = this.runId) {
+    await this.ensureStorage();
     const operation = this.appendTail.then(async () => {
       const events = await this.loadEvents();
       const event = createRunEvent({
@@ -21543,6 +21677,7 @@ var RunStore = class _RunStore {
     return await operation;
   }
   async rebuildViews() {
+    await this.ensureStorage();
     const events = await this.loadEvents();
     const createdGraph = GraphSchema.parse(events[0]?.data.graph);
     let graph = createdGraph;
@@ -21557,13 +21692,15 @@ var RunStore = class _RunStore {
     return await this.materialize(events);
   }
   async writeArtifact(relativePath, value) {
-    const path2 = join7(this.runRoot, "artifacts", relativePath);
+    await this.ensureStorage();
+    const path2 = join8(this.runRoot, "artifacts", relativePath);
     await mkdir4(dirname5(path2), { recursive: true });
     await writeFile3(path2, value, { mode: 384 });
     return path2;
   }
   async appendInvocationEvent(invocationId, event) {
-    const path2 = join7(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+    await this.ensureStorage();
+    const path2 = join8(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
     await mkdir4(dirname5(path2), { recursive: true });
     await appendFile2(path2, `${JSON.stringify(HostEventSchema.parse(event))}
 `, {
@@ -21573,11 +21710,13 @@ var RunStore = class _RunStore {
     return path2;
   }
   async loadInvocationEvents(invocationId) {
-    const path2 = join7(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
-    const content = await readFile5(path2, "utf8");
+    await this.ensureStorage();
+    const path2 = join8(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+    const content = await readFile6(path2, "utf8");
     return content.split("\n").filter(Boolean).map((line) => HostEventSchema.parse(JSON.parse(line)));
   }
   async loadGraphHistory() {
+    await this.ensureStorage();
     const events = await this.loadEvents();
     let previous = GraphSchema.parse(events[0]?.data.graph);
     const history = [];
@@ -21621,25 +21760,28 @@ var RunStore = class _RunStore {
     return history;
   }
   async writeCapsule(hash2, value) {
-    const path2 = join7(this.runRoot, "capsules", `${hash2}.json`);
+    await this.ensureStorage();
+    const path2 = join8(this.runRoot, "capsules", `${hash2}.json`);
     await writeJsonAtomic(path2, value);
     return path2;
   }
   async writeWorkspace(value) {
-    await writeJsonAtomic(join7(this.runRoot, "workspace.json"), value);
+    await this.ensureStorage();
+    await writeJsonAtomic(join8(this.runRoot, "workspace.json"), value);
   }
   async loadWorkspace() {
-    return JSON.parse(await readFile5(join7(this.runRoot, "workspace.json"), "utf8"));
+    await this.ensureStorage();
+    return JSON.parse(await readFile6(join8(this.runRoot, "workspace.json"), "utf8"));
   }
   async materialize(events) {
     const state = reduceEvents(events);
-    await writeJsonAtomic(join7(this.runRoot, "state.json"), state);
+    await writeJsonAtomic(join8(this.runRoot, "state.json"), state);
     return state;
   }
 };
 async function listRunIds(repositoryRoot) {
   try {
-    const entries = await readdir(join7(repositoryRoot, ".graphcraft", "runs"), {
+    const entries = await readdir(join8(repositoryRoot, ".graphcraft", "runs"), {
       withFileTypes: true
     });
     return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
@@ -21782,7 +21924,7 @@ async function createRun(task, options) {
   return { contract, graph, store, probePlan };
 }
 async function configureRunProbes(store, input) {
-  const lock = new RunLock(join8(store.graphcraftRoot, "locks", `${store.runId}.lock`));
+  const lock = new RunLock(join9(store.graphcraftRoot, "locks", `${store.runId}.lock`));
   await lock.acquire();
   try {
     const state = await store.loadState();
@@ -21824,7 +21966,7 @@ async function executeWorker(input) {
     await recordMissingUsage(input.store, input.resume);
     const reconciliation = await input.adapter.reconcile(input.resume);
     if (reconciliation.state === "completed" && reconciliation.result) {
-      const artifact2 = join8(
+      const artifact2 = join9(
         input.store.runRoot,
         "artifacts",
         "invocations",
@@ -21874,7 +22016,7 @@ async function executeWorker(input) {
   let error51;
   let errorCause;
   let termination;
-  let artifact = join8(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+  let artifact = join9(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
   const execution = input.adapter.execute(
     {
       invocationId,
@@ -22356,7 +22498,7 @@ async function executeRun(input) {
   const externalSignal = input.signal ?? new AbortController().signal;
   const contract = await input.store.loadContract();
   let graph = await input.store.loadGraph();
-  const lock = new RunLock(join8(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
+  const lock = new RunLock(join9(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
   await lock.acquire();
   const controlChannel = new RunControlChannel(input.store.graphcraftRoot, contract.runId);
   const controlAbort = new AbortController();
@@ -22806,7 +22948,7 @@ async function runHostCommand(command, args, allowFailure = false) {
 async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
   const moduleDirectory = dirname6(fileURLToPath(moduleUrl));
   const candidates = [
-    join9(moduleDirectory, "mcp.mjs"),
+    join10(moduleDirectory, "mcp.mjs"),
     resolve3(moduleDirectory, "../../../dist/mcp.mjs"),
     resolve3(process.cwd(), "dist/mcp.mjs")
   ];
@@ -22820,11 +22962,11 @@ async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
   throw new Error("dist/mcp.mjs is missing; run pnpm build before installing Graphcraft");
 }
 function resolveGraphcraftHome(configuredHome = process.env.GRAPHCRAFT_HOME) {
-  return configuredHome?.trim() ? resolve3(configuredHome) : join9(homedir(), ".graphcraft");
+  return configuredHome?.trim() ? resolve3(configuredHome) : join10(homedir(), ".graphcraft");
 }
 async function stageBundledMcp(sourcePath, graphcraftHome = resolveGraphcraftHome()) {
-  const runtimeDirectory = join9(graphcraftHome, "runtime", GRAPHCRAFT_VERSION);
-  const runtimePath = join9(runtimeDirectory, "mcp.mjs");
+  const runtimeDirectory = join10(graphcraftHome, "runtime", GRAPHCRAFT_VERSION);
+  const runtimePath = join10(runtimeDirectory, "mcp.mjs");
   await mkdir5(runtimeDirectory, { recursive: true });
   if (resolve3(sourcePath) !== resolve3(runtimePath)) await copyFile(sourcePath, runtimePath);
   await chmod(runtimePath, 493);
@@ -23164,7 +23306,7 @@ program2.command("inspect").description("Show the contract, graph, anchors, and 
   );
 });
 program2.command("probes").description("Show or replace the deterministic probe plan before approval").argument("[run]").option("-C, --cwd <path>", "repository path", process.cwd()).option("--set <file>", "replace the probe plan from a JSON file").action(async (run, options) => {
-  const probePlan = options.set ? JSON.parse(await readFile6(options.set, "utf8")) : void 0;
+  const probePlan = options.set ? JSON.parse(await readFile7(options.set, "utf8")) : void 0;
   const result = await handleAction({
     action: "probes",
     repository: options.cwd,
@@ -23175,7 +23317,7 @@ program2.command("probes").description("Show or replace the deterministic probe 
 });
 program2.command("amend").description("Apply an evidence-backed amendment to unfinished graph work").argument("[run]").option("-C, --cwd <path>", "repository path", process.cwd()).requiredOption("--set <file>", "graph amendment proposal JSON file").option("--approve", "record explicit user approval for authority expansion").action(
   async (run, options) => {
-    const amendment = JSON.parse(await readFile6(options.set, "utf8"));
+    const amendment = JSON.parse(await readFile7(options.set, "utf8"));
     console.log(
       JSON.stringify(
         await handleAction({

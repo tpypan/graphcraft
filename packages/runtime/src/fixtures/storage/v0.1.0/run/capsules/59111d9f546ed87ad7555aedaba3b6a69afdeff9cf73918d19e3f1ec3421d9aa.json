@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "runId": "4fb62db5-61de-4d3a-9fba-1d6409d58b0f",
+  "nodeId": "implement",
+  "objective": "Audit the substantial released storage example",
+  "finishLine": {
+    "kind": "local_verified"
+  },
+  "constraints": [
+    "Stay inside the approved scope: **/*",
+    "Do not touch excluded paths: .graphcraft/**, .git/**",
+    "Do not weaken tests, repository policy, acceptance anchors, or the finish line.",
+    "Preserve unrelated work and report evidence, not confidence."
+  ],
+  "acceptanceAnchors": [
+    {
+      "id": "user-outcome",
+      "description": "Audit the substantial released storage example",
+      "owner": "user",
+      "evidenceSource": "approved run contract",
+      "mutationPolicy": "user_approval"
+    },
+    {
+      "id": "repository-policy",
+      "description": "Obey repository instructions and preserve unrelated work",
+      "owner": "repository",
+      "evidenceSource": "AGENTS.md and repository state",
+      "mutationPolicy": "immutable"
+    }
+  ],
+  "predecessorEvidence": [],
+  "relevantPaths": [],
+  "probeEvidence": [
+    "workspace-diff: pass - No workspace changes"
+  ]
+}

@@ -1,0 +1,176 @@
+{
+  "schemaVersion": 1,
+  "runId": "4fb62db5-61de-4d3a-9fba-1d6409d58b0f",
+  "family": "audit",
+  "nodes": [
+    {
+      "id": "implement",
+      "kind": "investigation",
+      "objective": "Audit the substantial released storage example",
+      "dependsOn": [],
+      "scope": [
+        "**/*"
+      ],
+      "contextSelector": {
+        "includeRepositoryInstructions": true,
+        "predecessorResults": [],
+        "relevantPaths": []
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": [
+          "status",
+          "summary",
+          "changedPaths",
+          "evidence"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "completed",
+              "blocked",
+              "failed"
+            ]
+          },
+          "summary": {
+            "type": "string"
+          },
+          "changedPaths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "nextSuggestedObjective": {
+            "type": "string"
+          }
+        }
+      },
+      "progressProbes": [
+        {
+          "id": "workspace-diff",
+          "kind": "git_diff",
+          "baseSha": "234ddc06fa2bcbede65e236e9275e95bed6f0701",
+          "requireChanges": false
+        }
+      ],
+      "completionProbes": [],
+      "sideEffectClass": "none",
+      "status": "pending"
+    },
+    {
+      "id": "verify",
+      "kind": "verification",
+      "objective": "Verify the approved outcome: Audit the substantial released storage example",
+      "dependsOn": [
+        "implement"
+      ],
+      "scope": [
+        "**/*"
+      ],
+      "contextSelector": {
+        "includeRepositoryInstructions": true,
+        "predecessorResults": [
+          "implement"
+        ],
+        "relevantPaths": []
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": [
+          "status",
+          "summary",
+          "changedPaths",
+          "evidence"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "completed",
+              "blocked",
+              "failed"
+            ]
+          },
+          "summary": {
+            "type": "string"
+          },
+          "changedPaths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "nextSuggestedObjective": {
+            "type": "string"
+          }
+        }
+      },
+      "progressProbes": [],
+      "completionProbes": [
+        {
+          "id": "package-test",
+          "kind": "command",
+          "command": "pnpm",
+          "args": [
+            "test"
+          ],
+          "expectedExitCode": 0,
+          "timeoutMs": 300000
+        }
+      ],
+      "sideEffectClass": "none",
+      "status": "pending"
+    }
+  ],
+  "anchors": [
+    {
+      "id": "user-outcome",
+      "description": "Audit the substantial released storage example",
+      "owner": "user",
+      "evidenceSource": "approved run contract",
+      "mutationPolicy": "user_approval"
+    },
+    {
+      "id": "repository-policy",
+      "description": "Obey repository instructions and preserve unrelated work",
+      "owner": "repository",
+      "evidenceSource": "AGENTS.md and repository state",
+      "mutationPolicy": "immutable"
+    }
+  ],
+  "controlEdges": [
+    {
+      "from": "user-outcome",
+      "to": "implement",
+      "relation": "vetoes"
+    },
+    {
+      "from": "user-outcome",
+      "to": "verify",
+      "relation": "vetoes"
+    },
+    {
+      "from": "repository-policy",
+      "to": "implement",
+      "relation": "vetoes"
+    },
+    {
+      "from": "repository-policy",
+      "to": "verify",
+      "relation": "vetoes"
+    }
+  ],
+  "revision": 0
+}

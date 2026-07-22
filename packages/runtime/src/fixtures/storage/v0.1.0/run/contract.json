@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "runId": "4fb62db5-61de-4d3a-9fba-1d6409d58b0f",
+  "task": "Audit the substantial released storage example",
+  "outcome": "Audit the substantial released storage example",
+  "finishLine": {
+    "kind": "local_verified"
+  },
+  "repository": {
+    "root": "/private/tmp/graphcraft-release-fixtures.5iiC3q/v0.1.0-repo",
+    "baseRef": "main",
+    "baseSha": "234ddc06fa2bcbede65e236e9275e95bed6f0701"
+  },
+  "scope": {
+    "include": [
+      "**/*"
+    ],
+    "exclude": [
+      ".graphcraft/**",
+      ".git/**"
+    ]
+  },
+  "permissions": [
+    "read_repository",
+    "write_repository",
+    "run_commands",
+    "create_worktree"
+  ],
+  "acceptanceAnchors": [
+    {
+      "id": "user-outcome",
+      "description": "Audit the substantial released storage example",
+      "owner": "user",
+      "evidenceSource": "approved run contract",
+      "mutationPolicy": "user_approval"
+    },
+    {
+      "id": "repository-policy",
+      "description": "Obey repository instructions and preserve unrelated work",
+      "owner": "repository",
+      "evidenceSource": "AGENTS.md and repository state",
+      "mutationPolicy": "immutable"
+    }
+  ]
+}

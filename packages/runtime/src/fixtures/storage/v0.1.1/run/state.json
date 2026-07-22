@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "runId": "2796b182-8050-4473-8336-ebfb8d270ce5",
+  "status": "completed",
+  "lastEventSequence": 12,
+  "nodes": {
+    "implement": {
+      "status": "accepted",
+      "attempts": 1,
+      "lastSummary": "Completed published fixture",
+      "lastProgress": "done",
+      "acceptedAt": "2026-07-22T00:51:03.669Z"
+    },
+    "verify": {
+      "status": "accepted",
+      "attempts": 1,
+      "lastProgress": "done",
+      "acceptedAt": "2026-07-22T00:51:03.854Z"
+    }
+  },
+  "latestProgressEvidence": [
+    "pnpm exited 0: > @tpypan/graphcraft@0.1.1 test /private/tmp/graphcraft-release-fixtures.5iiC3q/.v0.1.1-repo-graphcraft-worktrees/2796b182-8050-4473-8336-ebfb8d270ce5\n> node -p 1\n\n1"
+  ],
+  "tokens": {
+    "input": 10,
+    "cachedInput": 2,
+    "output": 4,
+    "reasoning": 0,
+    "total": 14
+  },
+  "updatedAt": "2026-07-22T00:51:03.856Z"
+}
