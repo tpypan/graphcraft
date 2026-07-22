@@ -29,6 +29,7 @@ const actualFiles = pack.files.map(({ path }) => path).sort();
 const expectedFiles = [
   "LICENSE",
   "README.md",
+  "benchmarks/stable-v1.json",
   "dist/graphcraft.mjs",
   "dist/mcp.mjs",
   "package.json",

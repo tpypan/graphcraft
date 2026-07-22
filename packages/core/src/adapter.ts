@@ -34,6 +34,11 @@ export interface RepositoryPlanningEvidence {
   files: RepositoryEvidenceFile[];
 }
 
+export interface HostExecutionPolicy {
+  model: string;
+  effort: "low" | "medium" | "high" | "xhigh";
+}
+
 export interface PlanningResult {
   plan: GraphPlan;
   usage?: TokenUsage;

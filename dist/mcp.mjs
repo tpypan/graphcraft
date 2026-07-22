@@ -30991,6 +30991,7 @@ var package_default = {
     graphcraft: "dist/graphcraft.mjs"
   },
   files: [
+    "benchmarks/stable-v1.json",
     "dist/graphcraft.mjs",
     "dist/mcp.mjs"
   ],
@@ -31730,6 +31731,114 @@ function codexStrictSchema(value) {
 var codexWorkerResultJsonSchema = codexStrictSchema(workerResultJsonSchema);
 var codexGraphPlanJsonSchema = codexStrictSchema(graphPlanJsonSchema);
 var codexSemanticVerdictJsonSchema = codexStrictSchema(semanticVerdictJsonSchema);
+
+// packages/core/src/benchmark.ts
+var BenchmarkTaskFamilySchema = external_exports.enum([
+  "bug",
+  "feature",
+  "migration",
+  "refactor",
+  "audit",
+  "pr_repair"
+]);
+var BenchmarkAssertionSchema = external_exports.discriminatedUnion("kind", [
+  external_exports.strictObject({ kind: external_exports.literal("summary_contains"), value: external_exports.string().min(1) }),
+  external_exports.strictObject({ kind: external_exports.literal("exists"), path: external_exports.string().min(1) }),
+  external_exports.strictObject({ kind: external_exports.literal("absent"), path: external_exports.string().min(1) }),
+  external_exports.strictObject({ kind: external_exports.literal("contains"), path: external_exports.string().min(1), value: external_exports.string() }),
+  external_exports.strictObject({ kind: external_exports.literal("not_contains"), path: external_exports.string().min(1), value: external_exports.string() }),
+  external_exports.strictObject({ kind: external_exports.literal("equals"), path: external_exports.string().min(1), value: external_exports.string() })
+]);
+var BenchmarkCheckSchema = external_exports.strictObject({
+  command: external_exports.string().min(1),
+  args: external_exports.array(external_exports.string()).default([]),
+  expectedExitCode: external_exports.number().int().default(0),
+  timeoutMs: external_exports.number().int().positive().default(3e5)
+});
+var BenchmarkTaskSchema = external_exports.strictObject({
+  id: external_exports.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
+  family: BenchmarkTaskFamilySchema,
+  task: external_exports.string().min(1),
+  finishLine: external_exports.literal("local_verified").default("local_verified"),
+  initialFiles: external_exports.record(external_exports.string().min(1), external_exports.string()).refine((value) => Object.keys(value).length > 0),
+  checks: external_exports.array(BenchmarkCheckSchema).min(1),
+  acceptance: external_exports.array(BenchmarkAssertionSchema).min(1),
+  repetitions: external_exports.number().int().positive().default(3)
+});
+var BenchmarkSuiteSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  id: external_exports.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
+  version: external_exports.number().int().positive(),
+  description: external_exports.string().min(1),
+  tasks: external_exports.array(BenchmarkTaskSchema).min(1)
+});
+var BenchmarkScheduleEntrySchema = external_exports.strictObject({
+  trialId: external_exports.string().min(1),
+  order: external_exports.number().int().nonnegative(),
+  taskId: external_exports.string().min(1),
+  family: BenchmarkTaskFamilySchema,
+  host: external_exports.enum(["codex", "claude"]),
+  mode: external_exports.enum(["baseline", "graphcraft"]),
+  repetition: external_exports.number().int().positive(),
+  seed: external_exports.string().min(1)
+});
+var BenchmarkAssertionResultSchema = external_exports.strictObject({
+  path: external_exports.string().min(1),
+  passed: external_exports.boolean(),
+  summary: external_exports.string().min(1)
+});
+var BenchmarkModelPolicySchema = external_exports.strictObject({
+  codex: external_exports.string().min(1).optional(),
+  claude: external_exports.string().min(1).optional()
+}).refine((value) => value.codex !== void 0 || value.claude !== void 0, {
+  message: "At least one benchmark model policy is required"
+});
+var BenchmarkEffortPolicySchema = external_exports.enum(["low", "medium", "high", "xhigh"]);
+var BenchmarkTrialResultSchema = external_exports.strictObject({
+  trial: BenchmarkScheduleEntrySchema,
+  hostVersion: external_exports.string().min(1),
+  modelPolicy: external_exports.string().min(1),
+  effortPolicy: BenchmarkEffortPolicySchema,
+  permissionPolicy: external_exports.literal("local_read_write_shell_no_external"),
+  acceptanceScorerDigest: external_exports.string().min(1),
+  repositoryDigest: external_exports.string().min(1),
+  baseSha: external_exports.string().min(1),
+  executionStatus: external_exports.enum(["completed", "blocked", "failed", "error"]),
+  accepted: external_exports.boolean(),
+  acceptance: external_exports.array(BenchmarkAssertionResultSchema),
+  usage: TokenUsageSchema,
+  usageReconciled: external_exports.boolean(),
+  limitations: external_exports.array(external_exports.string()),
+  durationMs: external_exports.number().int().nonnegative(),
+  humanInterventions: external_exports.number().int().nonnegative(),
+  failureTrace: external_exports.array(external_exports.string())
+});
+var BenchmarkReportSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  status: external_exports.enum(["running", "complete"]),
+  suite: external_exports.strictObject({
+    id: external_exports.string().min(1),
+    version: external_exports.number().int().positive(),
+    digest: external_exports.string().min(1)
+  }),
+  startedAt: external_exports.iso.datetime(),
+  updatedAt: external_exports.iso.datetime(),
+  seed: external_exports.string().min(1),
+  randomized: external_exports.literal(true),
+  modelPolicy: BenchmarkModelPolicySchema,
+  effortPolicy: BenchmarkEffortPolicySchema,
+  permissionPolicy: external_exports.literal("local_read_write_shell_no_external"),
+  scorerPolicy: external_exports.literal("declared_checks_plus_suite_assertions"),
+  environment: external_exports.strictObject({
+    platform: external_exports.string().min(1),
+    architecture: external_exports.string().min(1),
+    nodeVersion: external_exports.string().min(1)
+  }),
+  limitations: external_exports.array(external_exports.string()),
+  schedule: external_exports.array(BenchmarkScheduleEntrySchema).min(1),
+  results: external_exports.array(BenchmarkTrialResultSchema),
+  summary: external_exports.record(external_exports.string(), external_exports.unknown())
+});
 
 // packages/core/src/capsule.ts
 var MAX_CONTEXT_CAPSULE_CHARACTERS = 24e3;
@@ -33371,6 +33480,10 @@ async function codexAuthenticated() {
   });
 }
 var CodexAdapter = class {
+  constructor(policy) {
+    this.policy = policy;
+  }
+  policy;
   id = "codex";
   async probe() {
     const result = await commandVersion("codex");
@@ -33387,28 +33500,12 @@ var CodexAdapter = class {
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-plan-"));
     const schemaPath = join(schemaDirectory, "graph-plan.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexGraphPlanJsonSchema), "utf8");
-    const child = spawn(
-      "codex",
-      [
-        "exec",
-        "--json",
-        "--ephemeral",
-        "--ignore-user-config",
-        "-C",
-        request.repositoryPath,
-        "-s",
-        "read-only",
-        "--output-schema",
-        schemaPath,
-        "-"
-      ],
-      {
-        cwd: request.repositoryPath,
-        env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
-        shell: false,
-        stdio: ["pipe", "pipe", "pipe"]
-      }
-    );
+    const child = spawn("codex", codexPlannerArgs(request, schemaPath, this.policy), {
+      cwd: request.repositoryPath,
+      env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"]
+    });
     const exitPromise = new Promise(
       (resolve4) => child.once("close", (code) => resolve4(code ?? 1))
     );
@@ -33457,7 +33554,7 @@ var CodexAdapter = class {
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-verify-"));
     const schemaPath = join(schemaDirectory, "semantic-verdict.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexSemanticVerdictJsonSchema), "utf8");
-    const child = spawn("codex", codexSemanticVerifierArgs(request, schemaPath), {
+    const child = spawn("codex", codexSemanticVerifierArgs(request, schemaPath, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
       shell: false,
@@ -33509,7 +33606,7 @@ var CodexAdapter = class {
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-"));
     const schemaPath = join(schemaDirectory, "worker-result.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexWorkerResultJsonSchema), "utf8");
-    const args = codexWorkerArgs(request, schemaPath);
+    const args = codexWorkerArgs(request, schemaPath, this.policy);
     const child = spawn("codex", args, {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -33589,13 +33686,33 @@ var CodexAdapter = class {
     return reconcilePersistedInvocation(invocation);
   }
 };
-function codexWorkerArgs(request, schemaPath) {
+function codexPolicyArgs(policy) {
+  return policy ? ["--model", policy.model, "--config", `model_reasoning_effort="${policy.effort}"`] : [];
+}
+function codexPlannerArgs(request, schemaPath, policy) {
+  return [
+    "exec",
+    "--json",
+    "--ephemeral",
+    "--ignore-user-config",
+    ...codexPolicyArgs(policy),
+    "-C",
+    request.repositoryPath,
+    "-s",
+    "read-only",
+    "--output-schema",
+    schemaPath,
+    "-"
+  ];
+}
+function codexWorkerArgs(request, schemaPath, policy) {
   if (request.resumeSessionId) {
     return [
       "exec",
       "resume",
       "--json",
       "--ignore-user-config",
+      ...codexPolicyArgs(policy),
       "--output-schema",
       schemaPath,
       request.resumeSessionId,
@@ -33606,6 +33723,7 @@ function codexWorkerArgs(request, schemaPath) {
     "exec",
     "--json",
     "--ignore-user-config",
+    ...codexPolicyArgs(policy),
     "-C",
     request.repositoryPath,
     "-s",
@@ -33615,12 +33733,13 @@ function codexWorkerArgs(request, schemaPath) {
     "-"
   ];
 }
-function codexSemanticVerifierArgs(request, schemaPath) {
+function codexSemanticVerifierArgs(request, schemaPath, policy) {
   return [
     "exec",
     "--json",
     "--ephemeral",
     "--ignore-user-config",
+    ...codexPolicyArgs(policy),
     "-C",
     request.repositoryPath,
     "-s",
@@ -33710,6 +33829,10 @@ async function claudeAuthenticated() {
   });
 }
 var ClaudeAdapter = class {
+  constructor(policy) {
+    this.policy = policy;
+  }
+  policy;
   id = "claude";
   async probe() {
     const result = await claudeVersion();
@@ -33723,34 +33846,12 @@ var ClaudeAdapter = class {
     });
   }
   async plan(request, signal) {
-    const child = spawn2(
-      "claude",
-      [
-        "--print",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--permission-mode",
-        "dontAsk",
-        "--effort",
-        "low",
-        "--tools",
-        "",
-        "--disable-slash-commands",
-        "--strict-mcp-config",
-        "--mcp-config",
-        '{"mcpServers":{}}',
-        "--json-schema",
-        JSON.stringify(graphPlanJsonSchema),
-        renderPlannerPrompt(request)
-      ],
-      {
-        cwd: request.repositoryPath,
-        env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"]
-      }
-    );
+    const child = spawn2("claude", claudePlannerArgs(request, this.policy), {
+      cwd: request.repositoryPath,
+      env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
     const exitPromise = new Promise(
       (resolve4) => child.once("close", (code) => resolve4(code ?? 1))
     );
@@ -33793,7 +33894,7 @@ var ClaudeAdapter = class {
     }
   }
   async verify(request, signal) {
-    const child = spawn2("claude", claudeSemanticVerifierArgs(request), {
+    const child = spawn2("claude", claudeSemanticVerifierArgs(request, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
       shell: false,
@@ -33839,7 +33940,7 @@ var ClaudeAdapter = class {
     }
   }
   async *execute(request, signal) {
-    const args = claudeWorkerArgs(request);
+    const args = claudeWorkerArgs(request, this.policy);
     const child = spawn2("claude", args, {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -33912,7 +34013,31 @@ var ClaudeAdapter = class {
     return reconcilePersistedInvocation(invocation);
   }
 };
-function claudeWorkerArgs(request) {
+function claudePolicyArgs(policy, fallbackEffort) {
+  const effort = policy?.effort ?? fallbackEffort;
+  return [...policy ? ["--model", policy.model] : [], ...effort ? ["--effort", effort] : []];
+}
+function claudePlannerArgs(request, policy) {
+  return [
+    "--print",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--permission-mode",
+    "dontAsk",
+    ...claudePolicyArgs(policy, "low"),
+    "--tools",
+    "",
+    "--disable-slash-commands",
+    "--strict-mcp-config",
+    "--mcp-config",
+    '{"mcpServers":{}}',
+    "--json-schema",
+    JSON.stringify(graphPlanJsonSchema),
+    renderPlannerPrompt(request)
+  ];
+}
+function claudeWorkerArgs(request, policy) {
   const writable = request.allowedTools.includes("write");
   return [
     "--print",
@@ -33921,6 +34046,7 @@ function claudeWorkerArgs(request) {
     "--verbose",
     "--permission-mode",
     writable ? "acceptEdits" : "dontAsk",
+    ...claudePolicyArgs(policy),
     "--allowedTools",
     writable ? "Bash(*),Edit,Write,Read,Glob,Grep" : "Read,Glob,Grep",
     "--disable-slash-commands",
@@ -33933,7 +34059,7 @@ function claudeWorkerArgs(request) {
     renderWorkerPrompt(request.capsule)
   ];
 }
-function claudeSemanticVerifierArgs(request) {
+function claudeSemanticVerifierArgs(request, policy) {
   return [
     "--print",
     "--output-format",
@@ -33941,8 +34067,7 @@ function claudeSemanticVerifierArgs(request) {
     "--verbose",
     "--permission-mode",
     "dontAsk",
-    "--effort",
-    "low",
+    ...claudePolicyArgs(policy, "low"),
     "--tools",
     "Read,Glob,Grep",
     "--allowedTools",
@@ -34172,123 +34297,10 @@ async function amendRunGraph(store, input, actor = "runtime") {
   }
 }
 
-// packages/runtime/src/control.ts
-import { randomUUID as randomUUID4 } from "node:crypto";
-import { readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
-import { join as join3 } from "node:path";
-var RunControlChannel = class {
-  constructor(graphcraftRoot, runId) {
-    this.graphcraftRoot = graphcraftRoot;
-    this.runId = runId;
-    this.path = join3(graphcraftRoot, "controls", `${runId}.json`);
-  }
-  graphcraftRoot;
-  runId;
-  path;
-  async request(action, reason) {
-    const existing = await this.read();
-    if (existing?.action === "stop" && action === "pause") return existing;
-    const request = RunControlRequestSchema.parse({
-      schemaVersion: 1,
-      requestId: randomUUID4(),
-      runId: this.runId,
-      action,
-      cause: action === "pause" ? "user_pause" : "user_stop",
-      reason,
-      requestedAt: (/* @__PURE__ */ new Date()).toISOString(),
-      requestedByPid: process.pid
-    });
-    await writeJsonAtomic(this.path, request);
-    return request;
-  }
-  async read() {
-    try {
-      return RunControlRequestSchema.parse(JSON.parse(await readFile2(this.path, "utf8")));
-    } catch {
-      return void 0;
-    }
-  }
-  watch(onRequest, intervalMs = 100) {
-    let stopped = false;
-    let lastRequestId;
-    let inFlight = Promise.resolve();
-    const poll = () => {
-      if (stopped) return;
-      inFlight = inFlight.then(async () => {
-        const request = await this.read();
-        if (request && request.requestId !== lastRequestId) {
-          lastRequestId = request.requestId;
-          onRequest(request);
-        }
-      });
-    };
-    const timer = setInterval(poll, intervalMs);
-    timer.unref();
-    poll();
-    return async () => {
-      stopped = true;
-      clearInterval(timer);
-      await inFlight;
-    };
-  }
-  async clear(requestId) {
-    const current = await this.read();
-    if (current?.requestId !== requestId) return;
-    await unlink2(this.path).catch((error51) => {
-      if (error51.code !== "ENOENT") throw error51;
-    });
-  }
-};
-function targetReached(action, state) {
-  if (action === "pause") return ["paused", "stopped", "completed"].includes(state.status);
-  return ["stopped", "completed"].includes(state.status);
-}
-async function requestRunControl(store, action, reason = action === "pause" ? "Paused by user" : "Stopped by user", waitMs = 1e4) {
-  let state = await store.loadState();
-  if (targetReached(action, state)) return state;
-  const channel = new RunControlChannel(store.graphcraftRoot, store.runId);
-  const request = await channel.request(action, reason);
-  const lockPath = join3(store.graphcraftRoot, "locks", `${store.runId}.lock`);
-  const deadline = Date.now() + waitMs;
-  while (Date.now() <= deadline) {
-    const lock = new RunLock(lockPath);
-    try {
-      await lock.acquire();
-      try {
-        state = await store.loadState();
-        if (!targetReached(action, state)) {
-          await store.append("runtime", "control.applied", {
-            request,
-            outcome: "owner_unavailable",
-            termination: null
-          });
-          await store.append("user", action === "pause" ? "run.paused" : "run.stopped", {
-            reason,
-            requestId: request.requestId,
-            cause: request.cause
-          });
-          state = await store.loadState();
-        }
-        await channel.clear(request.requestId);
-        return state;
-      } finally {
-        await lock.release();
-      }
-    } catch (error51) {
-      if (!(error51 instanceof Error) || error51.message !== "Graphcraft run is already active")
-        throw error51;
-    }
-    await new Promise((resolve4) => setTimeout(resolve4, 50));
-  }
-  throw new Error(
-    `The active Graphcraft process did not acknowledge ${action} within ${waitMs}ms; the durable request remains pending`
-  );
-}
-
 // packages/probes/src/index.ts
-import { access, readFile as readFile3, stat as stat2 } from "node:fs/promises";
+import { access, readFile as readFile2, stat as stat2 } from "node:fs/promises";
 import { constants } from "node:fs";
-import { dirname as dirname3, join as join4, resolve, sep } from "node:path";
+import { dirname as dirname3, join as join3, resolve, sep } from "node:path";
 
 // packages/probes/src/process.ts
 import { spawn as spawn3 } from "node:child_process";
@@ -34298,7 +34310,7 @@ async function runProcess(command, args, options) {
   return await new Promise((resolve4, reject) => {
     const child = spawn3(command, args, {
       cwd: options.cwd,
-      env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
+      env: { ...process.env, ...options.env, NO_COLOR: "1", FORCE_COLOR: "0" },
       shell: false,
       stdio: ["ignore", "pipe", "pipe"]
     });
@@ -34380,7 +34392,7 @@ async function runProbe(spec, repositoryPath, signal) {
       exists = false;
     }
     let contains = true;
-    if (exists && spec.contains) contains = (await readFile3(path, "utf8")).includes(spec.contains);
+    if (exists && spec.contains) contains = (await readFile2(path, "utf8")).includes(spec.contains);
     const passed2 = exists === spec.shouldExist && contains;
     const summary = `${spec.path} ${exists ? "exists" : "does not exist"}${spec.contains ? ` and ${contains ? "contains" : "does not contain"} the required text` : ""}`;
     return {
@@ -34528,10 +34540,10 @@ async function packageCandidates(repositoryPath, family, terms) {
   const tracked = await runProcess("git", ["ls-files"], { cwd: repositoryPath });
   if (tracked.exitCode !== 0) return [];
   const manifests = tracked.stdout.split("\n").filter((path) => path === "package.json" || path.endsWith("/package.json")).slice(0, 100);
-  const rootManifest = manifests.includes("package.json") ? JSON.parse(await readFile3(join4(repositoryPath, "package.json"), "utf8")) : void 0;
+  const rootManifest = manifests.includes("package.json") ? JSON.parse(await readFile2(join3(repositoryPath, "package.json"), "utf8")) : void 0;
   const candidates = [];
   for (const manifestPath of manifests) {
-    const manifest2 = JSON.parse(await readFile3(join4(repositoryPath, manifestPath), "utf8"));
+    const manifest2 = JSON.parse(await readFile2(join3(repositoryPath, manifestPath), "utf8"));
     const directory = dirname3(manifestPath) === "." ? void 0 : dirname3(manifestPath);
     const relevant = !directory || terms.some(
       (term) => directory.toLowerCase().includes(term) || manifest2.name?.toLowerCase().includes(term)
@@ -34645,7 +34657,7 @@ async function discoverProbePlan(repositoryPath, task, baseSha) {
     items.push(completion);
   }
   try {
-    await access(join4(repositoryPath, "pyproject.toml"));
+    await access(join3(repositoryPath, "pyproject.toml"));
     items.push({
       phase: "completion",
       purpose: "regression",
@@ -34663,7 +34675,7 @@ async function discoverProbePlan(repositoryPath, task, baseSha) {
   } catch {
   }
   try {
-    await access(join4(repositoryPath, "go.mod"));
+    await access(join3(repositoryPath, "go.mod"));
     items.push({
       phase: "completion",
       purpose: "regression",
@@ -34691,131 +34703,121 @@ async function discoverProbePlan(repositoryPath, task, baseSha) {
   return await validateProbePlan({ schemaVersion: 1, family, items }, repositoryPath);
 }
 
-// packages/runtime/src/context.ts
-var contextStopWords = /* @__PURE__ */ new Set([
-  "acceptance",
-  "approved",
-  "complete",
-  "completion",
-  "feature",
-  "implement",
-  "implementation",
-  "repository",
-  "substantial",
-  "verify"
-]);
-function contextTerms(objective) {
-  return [
-    ...new Set(
-      (objective.toLowerCase().match(/[a-z0-9][a-z0-9._/-]{2,}/g) ?? []).filter(
-        (term) => !contextStopWords.has(term)
-      )
-    )
-  ].slice(0, 12);
-}
-function groundedRelevantPaths(paths, objective) {
-  const terms = contextTerms(objective);
-  return [...new Set(paths)].filter(
-    (path) => path.length > 0 && !path.startsWith("dist/") && !path.endsWith(".map") && !path.endsWith(".lock")
-  ).map((path) => {
-    const normalized = path.toLowerCase();
-    const affinity = terms.filter((term) => normalized.includes(term)).length;
-    const source = /(?:^|\/)(?:src|test|tests)\//.test(path) ? 2 : 0;
-    const policy = /(?:^|\/)(?:agents\.md|package\.json|pyproject\.toml|go\.mod)$/i.test(path) ? 1 : 0;
-    return { path, score: affinity * 4 + source + policy };
-  }).sort((left, right) => right.score - left.score || left.path.localeCompare(right.path)).slice(0, 4).map(({ path }) => path);
-}
-function selectedTrackedPaths(inventory, selected) {
-  const matches = /* @__PURE__ */ new Set();
-  for (const path of inventory)
-    if (selected.some((candidate) => path === candidate || path.startsWith(`${candidate}/`)))
-      matches.add(path);
-  return matches;
-}
-async function prepareWorkerContext(input) {
-  const tracked = await runProcess(
-    "git",
-    ["ls-files", "--cached", "--others", "--exclude-standard"],
-    {
-      cwd: input.repositoryPath,
-      timeoutMs: 3e4
+// packages/runtime/src/runner.ts
+import { randomUUID as randomUUID7 } from "node:crypto";
+import { join as join9 } from "node:path";
+
+// packages/runtime/src/control.ts
+import { randomUUID as randomUUID4 } from "node:crypto";
+import { readFile as readFile3, unlink as unlink2 } from "node:fs/promises";
+import { join as join4 } from "node:path";
+var RunControlChannel = class {
+  constructor(graphcraftRoot, runId) {
+    this.graphcraftRoot = graphcraftRoot;
+    this.runId = runId;
+    this.path = join4(graphcraftRoot, "controls", `${runId}.json`);
+  }
+  graphcraftRoot;
+  runId;
+  path;
+  async request(action, reason) {
+    const existing = await this.read();
+    if (existing?.action === "stop" && action === "pause") return existing;
+    const request = RunControlRequestSchema.parse({
+      schemaVersion: 1,
+      requestId: randomUUID4(),
+      runId: this.runId,
+      action,
+      cause: action === "pause" ? "user_pause" : "user_stop",
+      reason,
+      requestedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      requestedByPid: process.pid
+    });
+    await writeJsonAtomic(this.path, request);
+    return request;
+  }
+  async read() {
+    try {
+      return RunControlRequestSchema.parse(JSON.parse(await readFile3(this.path, "utf8")));
+    } catch {
+      return void 0;
     }
-  );
-  if (tracked.exitCode !== 0) throw new Error("Unable to inventory repository context");
-  const repositoryPaths = tracked.stdout.split("\n").filter(Boolean).sort();
-  const inventory = await input.store.writeContentAddressedArtifact(
-    "context-repositories",
-    `${JSON.stringify(repositoryPaths)}
-`
-  );
-  const relevantPaths = input.node.contextSelector.relevantPaths.length ? input.node.contextSelector.relevantPaths : groundedRelevantPaths(repositoryPaths, input.node.objective);
-  if (input.node.kind !== "commit" && relevantPaths.length === 0)
-    throw new Error(`Node ${input.node.id} has no grounded repository context`);
-  const node2 = {
-    ...input.node,
-    contextSelector: { ...input.node.contextSelector, relevantPaths }
-  };
-  const capsule = createContextCapsule({
-    contract: input.contract,
-    node: node2,
-    predecessorEvidence: input.predecessorEvidence,
-    probeResults: input.probeResults
-  });
-  const capsuleHash = contentHash(capsule);
-  const storedCapsule = await input.store.writeCapsule(capsuleHash, capsule);
-  const matchedPaths = selectedTrackedPaths(repositoryPaths, capsule.relevantPaths);
-  const selectedPredecessorNodeIds = input.node.contextSelector.predecessorResults.filter(
-    (nodeId) => capsule.predecessorEvidence.some((value) => value.startsWith(`${nodeId}:`))
-  );
-  const selectedProbeResults = input.probeResults.filter(
-    ({ probeId }) => capsule.probeEvidence.some((value) => value.startsWith(`${probeId}:`))
-  );
-  const reusedArtifacts = [
-    ...storedCapsule.reused ? [storedCapsule.path] : [],
-    ...inventory.reused ? [inventory.path] : []
-  ];
-  const receipt = ContextSelectionReceiptSchema.parse({
-    schemaVersion: 1,
-    runId: input.contract.runId,
-    nodeId: input.node.id,
-    capsule: {
-      hash: capsuleHash,
-      path: storedCapsule.path,
-      characters: contextCapsuleCharacters(capsule)
-    },
-    selected: {
-      repositoryPaths: capsule.relevantPaths,
-      predecessorNodeIds: selectedPredecessorNodeIds,
-      predecessorEvidenceHashes: capsule.predecessorEvidence.map((value) => contentHash(value)),
-      probeIds: selectedProbeResults.map(({ probeId }) => probeId),
-      probeSignatures: selectedProbeResults.map(({ signature }) => signature),
-      acceptanceAnchorIds: capsule.acceptanceAnchors.map(({ id }) => id)
-    },
-    omitted: {
-      repositoryPathCount: repositoryPaths.length - matchedPaths.size,
-      declaredRepositoryPaths: input.node.contextSelector.relevantPaths.filter(
-        (path) => !capsule.relevantPaths.includes(path)
-      ),
-      predecessorNodeIds: input.node.dependsOn.filter(
-        (nodeId) => !selectedPredecessorNodeIds.includes(nodeId)
-      ),
-      probeIds: input.probeResults.filter(({ probeId }) => !selectedProbeResults.some((result) => result.probeId === probeId)).map(({ probeId }) => probeId),
-      repositoryInventory: {
-        digest: inventory.hash,
-        artifact: inventory.path,
-        totalPathCount: repositoryPaths.length
-      },
-      rawHostTranscripts: true,
-      rawProbeOutputs: true
-    },
-    reused: {
-      capsule: storedCapsule.reused,
-      repositoryInventory: inventory.reused,
-      artifacts: reusedArtifacts
+  }
+  watch(onRequest, intervalMs = 100) {
+    let stopped = false;
+    let lastRequestId;
+    let inFlight = Promise.resolve();
+    const poll = () => {
+      if (stopped) return;
+      inFlight = inFlight.then(async () => {
+        const request = await this.read();
+        if (request && request.requestId !== lastRequestId) {
+          lastRequestId = request.requestId;
+          onRequest(request);
+        }
+      });
+    };
+    const timer = setInterval(poll, intervalMs);
+    timer.unref();
+    poll();
+    return async () => {
+      stopped = true;
+      clearInterval(timer);
+      await inFlight;
+    };
+  }
+  async clear(requestId) {
+    const current = await this.read();
+    if (current?.requestId !== requestId) return;
+    await unlink2(this.path).catch((error51) => {
+      if (error51.code !== "ENOENT") throw error51;
+    });
+  }
+};
+function targetReached(action, state) {
+  if (action === "pause") return ["paused", "stopped", "completed"].includes(state.status);
+  return ["stopped", "completed"].includes(state.status);
+}
+async function requestRunControl(store, action, reason = action === "pause" ? "Paused by user" : "Stopped by user", waitMs = 1e4) {
+  let state = await store.loadState();
+  if (targetReached(action, state)) return state;
+  const channel = new RunControlChannel(store.graphcraftRoot, store.runId);
+  const request = await channel.request(action, reason);
+  const lockPath = join4(store.graphcraftRoot, "locks", `${store.runId}.lock`);
+  const deadline = Date.now() + waitMs;
+  while (Date.now() <= deadline) {
+    const lock = new RunLock(lockPath);
+    try {
+      await lock.acquire();
+      try {
+        state = await store.loadState();
+        if (!targetReached(action, state)) {
+          await store.append("runtime", "control.applied", {
+            request,
+            outcome: "owner_unavailable",
+            termination: null
+          });
+          await store.append("user", action === "pause" ? "run.paused" : "run.stopped", {
+            reason,
+            requestId: request.requestId,
+            cause: request.cause
+          });
+          state = await store.loadState();
+        }
+        await channel.clear(request.requestId);
+        return state;
+      } finally {
+        await lock.release();
+      }
+    } catch (error51) {
+      if (!(error51 instanceof Error) || error51.message !== "Graphcraft run is already active")
+        throw error51;
     }
-  });
-  await input.store.append("runtime", "context.selected", { receipt }, input.invocationId);
-  return { capsule, capsuleHash, receipt };
+    await new Promise((resolve4) => setTimeout(resolve4, 50));
+  }
+  throw new Error(
+    `The active Graphcraft process did not acknowledge ${action} within ${waitMs}ms; the durable request remains pending`
+  );
 }
 
 // packages/runtime/src/governance.ts
@@ -35202,228 +35204,9 @@ async function decideRunControl(store, input) {
   }
 }
 
-// packages/runtime/src/held-out.ts
-import { readFile as readFile4, stat as stat3 } from "node:fs/promises";
-import { isAbsolute as isAbsolute2, relative, resolve as resolve2, sep as sep2 } from "node:path";
-function relativeRepositoryPath(repositoryRoot, candidate) {
-  const root = resolve2(repositoryRoot);
-  const path = resolve2(repositoryRoot, candidate);
-  if (path !== root && !path.startsWith(`${root}${sep2}`)) return void 0;
-  const result = relative(root, path);
-  return result && !isAbsolute2(result) ? result : void 0;
-}
-function possibleFileArguments(values) {
-  return values.map((value) => value.replace(/^["']|["']$/g, "").replace(/[;&|]+$/g, "")).filter(
-    (value) => !value.startsWith("-") && (value.startsWith(".") || value.includes("/") || /\.[a-z0-9]{1,8}$/i.test(value))
-  );
-}
-async function fileIntegrity(repositoryRoot, cwd, values) {
-  const result = [];
-  for (const value of possibleFileArguments(values)) {
-    const path = relativeRepositoryPath(repositoryRoot, resolve2(repositoryRoot, cwd ?? ".", value));
-    if (!path) continue;
-    const details = await stat3(resolve2(repositoryRoot, path)).catch(() => void 0);
-    if (!details?.isFile()) continue;
-    const contents = await readFile4(resolve2(repositoryRoot, path));
-    result.push({
-      kind: "file",
-      path,
-      valueHash: contentHash({ path, contents: contents.toString("base64") })
-    });
-  }
-  return result;
-}
-async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot) {
-  const integrity = {};
-  for (const item of probePlan.items.filter(({ phase }) => phase === "completion")) {
-    if (item.probe.kind === "held_out")
-      throw new Error("An approved probe plan cannot contain held-out references");
-    const protectedValues = [];
-    if (item.probe.kind === "command") {
-      protectedValues.push(
-        ...await fileIntegrity(repositoryRoot, item.probe.cwd, item.probe.args)
-      );
-    }
-    const match = /^(.*package\.json) script (.+)$/.exec(item.source);
-    if (!match) {
-      integrity[item.probe.id] = protectedValues;
-      continue;
-    }
-    const path = match[1];
-    const script = match[2];
-    const manifestPath = relativeRepositoryPath(repositoryRoot, path);
-    if (!manifestPath) throw new Error(`Completion script ${script} escapes the repository`);
-    const manifest2 = JSON.parse(await readFile4(resolve2(repositoryRoot, manifestPath), "utf8"));
-    const value = manifest2.scripts?.[script];
-    if (!value) throw new Error(`Completion script ${script} is missing from ${manifestPath}`);
-    protectedValues.push({
-      kind: "package_script",
-      path: manifestPath,
-      script,
-      valueHash: contentHash({ path: manifestPath, script, value })
-    });
-    const scriptDirectory = manifestPath.includes("/") ? manifestPath.slice(0, manifestPath.lastIndexOf("/")) : void 0;
-    protectedValues.push(
-      ...await fileIntegrity(repositoryRoot, scriptDirectory, value.split(/\s+/))
-    );
-    const unique2 = new Map(
-      protectedValues.map((entry) => [
-        `${entry.kind}:${entry.path}${entry.kind === "package_script" ? `:${entry.script}` : ""}`,
-        entry
-      ])
-    );
-    integrity[item.probe.id] = [...unique2.values()];
-  }
-  return createHeldOutProbePlan(runId, probePlan, integrity);
-}
-async function heldOutIntegrityFailures(plan, repositoryPath) {
-  const failures = [];
-  for (const entry of plan.probes) {
-    const changedKinds = /* @__PURE__ */ new Set();
-    let signature = "";
-    for (const integrity of entry.integrity) {
-      let actualHash;
-      if (integrity.kind === "package_script") {
-        const manifest2 = await readFile4(resolve2(repositoryPath, integrity.path), "utf8").then(
-          (value2) => JSON.parse(value2)
-        ).catch(() => void 0);
-        const value = manifest2?.scripts?.[integrity.script];
-        actualHash = value ? contentHash({ path: integrity.path, script: integrity.script, value }) : contentHash({ missing: true, path: integrity.path, script: integrity.script });
-      } else {
-        const contents = await readFile4(resolve2(repositoryPath, integrity.path)).catch(
-          () => void 0
-        );
-        actualHash = contents ? contentHash({ path: integrity.path, contents: contents.toString("base64") }) : contentHash({ missing: true, path: integrity.path });
-      }
-      if (actualHash === integrity.valueHash) continue;
-      changedKinds.add(integrity.kind);
-      signature += actualHash;
-    }
-    if (changedKinds.size > 0) {
-      const detail = [
-        changedKinds.has("package_script") ? "package script definition" : void 0,
-        changedKinds.has("file") ? "protected measurement file" : void 0
-      ].filter(Boolean).join(" and ");
-      failures.push({
-        probeId: `${entry.probe.id}-integrity`,
-        kind: "file",
-        passed: false,
-        signature: contentHash(signature),
-        summary: `Approved completion check ${entry.probe.id} changed or was removed; restore its ${detail}`,
-        durationMs: 0
-      });
-    }
-  }
-  return failures;
-}
-function actionableHeldOutFailures(results) {
-  return results.map((result) => {
-    if (result.probeId.endsWith("-integrity")) return result;
-    const separator = result.summary.indexOf(":");
-    const detail = separator >= 0 ? result.summary.slice(separator + 1).trim() : "";
-    return {
-      ...result,
-      summary: `Completion check ${result.probeId} failed${detail ? `: ${detail}` : ""}`
-    };
-  });
-}
-
-// packages/runtime/src/migration.ts
-import { cp, readFile as readFile5 } from "node:fs/promises";
-import { join as join6 } from "node:path";
-var CURRENT_RUN_STORAGE_VERSION = 1;
-function manifest(runId, migratedFrom) {
-  return RunStorageManifestSchema.parse({
-    schemaVersion: CURRENT_RUN_STORAGE_VERSION,
-    runId,
-    migratedFrom,
-    formats: {
-      contract: 1,
-      graph: 1,
-      probePlan: 1,
-      heldOutProbes: 1,
-      events: 1,
-      state: 1,
-      workspace: 1,
-      capsules: 1,
-      invocationEvents: 1,
-      semanticReports: 1,
-      rawArtifacts: 1,
-      controlRequests: 1,
-      locks: 1
-    }
-  });
-}
-function runStorageManifestPath(runRoot) {
-  return join6(runRoot, "storage.json");
-}
-async function writeCurrentRunStorageManifest(runRoot, runId, migratedFrom) {
-  const value = manifest(runId, migratedFrom);
-  await writeJsonAtomic(runStorageManifestPath(runRoot), value);
-  return value;
-}
-async function ensureCurrentRunStorage(input) {
-  const path = runStorageManifestPath(input.runRoot);
-  let raw;
-  try {
-    raw = JSON.parse(await readFile5(path, "utf8"));
-  } catch (error51) {
-    if (error51.code !== "ENOENT")
-      throw new Error(
-        `Run ${input.runId} has an unreadable storage manifest: ${error51.message}`
-      );
-  }
-  if (raw !== void 0) {
-    const version2 = typeof raw === "object" && raw !== null ? raw.schemaVersion : void 0;
-    if (typeof version2 === "number" && version2 > CURRENT_RUN_STORAGE_VERSION)
-      throw new Error(
-        `Run ${input.runId} uses future storage schema ${version2}; this Graphcraft supports through ${CURRENT_RUN_STORAGE_VERSION}. No files were changed.`
-      );
-    if (version2 !== CURRENT_RUN_STORAGE_VERSION)
-      throw new Error(
-        `Run ${input.runId} uses unsupported storage schema ${String(version2)}; no migration path is available. No files were changed.`
-      );
-    const parsed = RunStorageManifestSchema.parse(raw);
-    if (parsed.runId !== input.runId)
-      throw new Error(`Run storage manifest belongs to ${parsed.runId}, not ${input.runId}`);
-    return parsed;
-  }
-  await readFile5(join6(input.runRoot, "events.jsonl"), "utf8").catch((error51) => {
-    throw new Error(
-      `Legacy run ${input.runId} cannot migrate because events.jsonl is unavailable: ${error51.message}`
-    );
-  });
-  const lock = new RunLock(join6(input.graphcraftRoot, "locks", `${input.runId}.migration.lock`));
-  try {
-    await lock.acquire();
-  } catch (error51) {
-    if (!(error51 instanceof Error) || !error51.message.includes("already active")) throw error51;
-    const deadline = Date.now() + 5e3;
-    while (Date.now() <= deadline) {
-      const migrated = await readFile5(path, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
-      if (migrated) return migrated;
-      await new Promise((resolve4) => setTimeout(resolve4, 10));
-    }
-    throw new Error(`Timed out waiting for storage migration of run ${input.runId}`);
-  }
-  try {
-    const migrated = await readFile5(path, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
-    if (migrated) return migrated;
-    const backupRoot = join6(input.graphcraftRoot, "migration-backups", input.runId, "0-to-1");
-    await cp(input.runRoot, backupRoot, {
-      recursive: true,
-      force: true,
-      errorOnExist: false
-    });
-    return await writeCurrentRunStorageManifest(input.runRoot, input.runId, 0);
-  } finally {
-    await lock.release();
-  }
-}
-
 // packages/runtime/src/repository.ts
-import { appendFile, mkdir as mkdir3, readFile as readFile6 } from "node:fs/promises";
-import { basename, dirname as dirname4, isAbsolute as isAbsolute3, join as join7, resolve as resolve3 } from "node:path";
+import { appendFile, mkdir as mkdir3, readFile as readFile4 } from "node:fs/promises";
+import { basename, dirname as dirname4, isAbsolute as isAbsolute2, join as join6, resolve as resolve2 } from "node:path";
 async function git(repositoryPath, args) {
   const result = await runProcess("git", args, { cwd: repositoryPath, timeoutMs: 12e4 });
   if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `git ${args[0]} failed`);
@@ -35525,7 +35308,7 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
   ) : [];
   const taskMatches = await Promise.all(
     matchedPaths.map(async (path) => {
-      const content = await readFile6(join7(repositoryRoot, path), "utf8").catch(() => "");
+      const content = await readFile4(join6(repositoryRoot, path), "utf8").catch(() => "");
       const normalized = content.toLowerCase();
       const score = searchTerms.filter((term) => normalized.includes(term)).length;
       const pathScore = searchTerms.filter((term) => path.toLowerCase().includes(term)).length;
@@ -35550,7 +35333,7 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
   for (const path of baselinePaths) {
     if (remainingCharacters <= 0 || files.length >= 7) break;
     if (files.some((file2) => file2.path === path)) continue;
-    const content = await readFile6(join7(repositoryRoot, path), "utf8").catch(() => "");
+    const content = await readFile4(join6(repositoryRoot, path), "utf8").catch(() => "");
     const limit = Math.min(2e3, remainingCharacters);
     const selected = content.slice(0, limit);
     files.push({ path, content: selected, truncated: selected.length < content.length });
@@ -35566,10 +35349,10 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
 }
 async function ensureGraphcraftIgnored(repositoryRoot) {
   const rawExcludePath = await git(repositoryRoot, ["rev-parse", "--git-path", "info/exclude"]);
-  const excludePath = isAbsolute3(rawExcludePath) ? rawExcludePath : resolve3(repositoryRoot, rawExcludePath);
+  const excludePath = isAbsolute2(rawExcludePath) ? rawExcludePath : resolve2(repositoryRoot, rawExcludePath);
   let content = "";
   try {
-    content = await readFile6(excludePath, "utf8");
+    content = await readFile4(excludePath, "utf8");
   } catch {
     await mkdir3(dirname4(excludePath), { recursive: true });
   }
@@ -35581,11 +35364,11 @@ function slug(task) {
 }
 async function createRunWorkspace(contract) {
   const branch = `graphcraft/${contract.runId.slice(0, 8)}-${slug(contract.task)}`;
-  const parent = join7(
+  const parent = join6(
     dirname4(contract.repository.root),
     `.${basename(contract.repository.root)}-graphcraft-worktrees`
   );
-  const path = join7(parent, contract.runId);
+  const path = join6(parent, contract.runId);
   await mkdir3(parent, { recursive: true });
   const registered = await git(contract.repository.root, ["worktree", "list", "--porcelain"]);
   if (registered.includes(`worktree ${path}`)) return { path, branch, created: false };
@@ -35610,13 +35393,104 @@ async function createAtomicCommit(workspace, task) {
   return await git(workspace.path, ["rev-parse", "HEAD"]);
 }
 
-// packages/runtime/src/runner.ts
-import { randomUUID as randomUUID7 } from "node:crypto";
-import { join as join9 } from "node:path";
+// packages/runtime/src/store.ts
+import { appendFile as appendFile2, mkdir as mkdir4, readFile as readFile6, readdir, writeFile as writeFile3 } from "node:fs/promises";
+import { dirname as dirname5, join as join8 } from "node:path";
+
+// packages/runtime/src/migration.ts
+import { cp, readFile as readFile5 } from "node:fs/promises";
+import { join as join7 } from "node:path";
+var CURRENT_RUN_STORAGE_VERSION = 1;
+function manifest(runId, migratedFrom) {
+  return RunStorageManifestSchema.parse({
+    schemaVersion: CURRENT_RUN_STORAGE_VERSION,
+    runId,
+    migratedFrom,
+    formats: {
+      contract: 1,
+      graph: 1,
+      probePlan: 1,
+      heldOutProbes: 1,
+      events: 1,
+      state: 1,
+      workspace: 1,
+      capsules: 1,
+      invocationEvents: 1,
+      semanticReports: 1,
+      rawArtifacts: 1,
+      controlRequests: 1,
+      locks: 1
+    }
+  });
+}
+function runStorageManifestPath(runRoot) {
+  return join7(runRoot, "storage.json");
+}
+async function writeCurrentRunStorageManifest(runRoot, runId, migratedFrom) {
+  const value = manifest(runId, migratedFrom);
+  await writeJsonAtomic(runStorageManifestPath(runRoot), value);
+  return value;
+}
+async function ensureCurrentRunStorage(input) {
+  const path = runStorageManifestPath(input.runRoot);
+  let raw;
+  try {
+    raw = JSON.parse(await readFile5(path, "utf8"));
+  } catch (error51) {
+    if (error51.code !== "ENOENT")
+      throw new Error(
+        `Run ${input.runId} has an unreadable storage manifest: ${error51.message}`
+      );
+  }
+  if (raw !== void 0) {
+    const version2 = typeof raw === "object" && raw !== null ? raw.schemaVersion : void 0;
+    if (typeof version2 === "number" && version2 > CURRENT_RUN_STORAGE_VERSION)
+      throw new Error(
+        `Run ${input.runId} uses future storage schema ${version2}; this Graphcraft supports through ${CURRENT_RUN_STORAGE_VERSION}. No files were changed.`
+      );
+    if (version2 !== CURRENT_RUN_STORAGE_VERSION)
+      throw new Error(
+        `Run ${input.runId} uses unsupported storage schema ${String(version2)}; no migration path is available. No files were changed.`
+      );
+    const parsed = RunStorageManifestSchema.parse(raw);
+    if (parsed.runId !== input.runId)
+      throw new Error(`Run storage manifest belongs to ${parsed.runId}, not ${input.runId}`);
+    return parsed;
+  }
+  await readFile5(join7(input.runRoot, "events.jsonl"), "utf8").catch((error51) => {
+    throw new Error(
+      `Legacy run ${input.runId} cannot migrate because events.jsonl is unavailable: ${error51.message}`
+    );
+  });
+  const lock = new RunLock(join7(input.graphcraftRoot, "locks", `${input.runId}.migration.lock`));
+  try {
+    await lock.acquire();
+  } catch (error51) {
+    if (!(error51 instanceof Error) || !error51.message.includes("already active")) throw error51;
+    const deadline = Date.now() + 5e3;
+    while (Date.now() <= deadline) {
+      const migrated = await readFile5(path, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
+      if (migrated) return migrated;
+      await new Promise((resolve4) => setTimeout(resolve4, 10));
+    }
+    throw new Error(`Timed out waiting for storage migration of run ${input.runId}`);
+  }
+  try {
+    const migrated = await readFile5(path, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
+    if (migrated) return migrated;
+    const backupRoot = join7(input.graphcraftRoot, "migration-backups", input.runId, "0-to-1");
+    await cp(input.runRoot, backupRoot, {
+      recursive: true,
+      force: true,
+      errorOnExist: false
+    });
+    return await writeCurrentRunStorageManifest(input.runRoot, input.runId, 0);
+  } finally {
+    await lock.release();
+  }
+}
 
 // packages/runtime/src/store.ts
-import { appendFile as appendFile2, mkdir as mkdir4, readFile as readFile7, readdir, writeFile as writeFile3 } from "node:fs/promises";
-import { dirname as dirname5, join as join8 } from "node:path";
 var RunStore = class _RunStore {
   repositoryRoot;
   runId;
@@ -35690,7 +35564,7 @@ var RunStore = class _RunStore {
   async loadContract() {
     await this.ensureStorage();
     return RunContractSchema.parse(
-      JSON.parse(await readFile7(join8(this.runRoot, "contract.json"), "utf8"))
+      JSON.parse(await readFile6(join8(this.runRoot, "contract.json"), "utf8"))
     );
   }
   async saveGraph(graph) {
@@ -35705,11 +35579,11 @@ var RunStore = class _RunStore {
     )?.data.graph;
     if (eventGraph) {
       const graph = GraphSchema.parse(eventGraph);
-      const materialized = await readFile7(join8(this.runRoot, "graph.json"), "utf8").then((value) => GraphSchema.parse(JSON.parse(value))).catch(() => void 0);
+      const materialized = await readFile6(join8(this.runRoot, "graph.json"), "utf8").then((value) => GraphSchema.parse(JSON.parse(value))).catch(() => void 0);
       if (JSON.stringify(materialized) !== JSON.stringify(graph)) await this.saveGraph(graph);
       return graph;
     }
-    return GraphSchema.parse(JSON.parse(await readFile7(join8(this.runRoot, "graph.json"), "utf8")));
+    return GraphSchema.parse(JSON.parse(await readFile6(join8(this.runRoot, "graph.json"), "utf8")));
   }
   async saveProbePlan(probePlan) {
     await this.ensureStorage();
@@ -35723,14 +35597,14 @@ var RunStore = class _RunStore {
     )?.data.probePlan;
     if (eventPlan) {
       const probePlan = ProbePlanSchema.parse(eventPlan);
-      const materialized = await readFile7(join8(this.runRoot, "probe-plan.json"), "utf8").then((value) => ProbePlanSchema.parse(JSON.parse(value))).catch(() => void 0);
+      const materialized = await readFile6(join8(this.runRoot, "probe-plan.json"), "utf8").then((value) => ProbePlanSchema.parse(JSON.parse(value))).catch(() => void 0);
       if (JSON.stringify(materialized) !== JSON.stringify(probePlan))
         await this.saveProbePlan(probePlan);
       return probePlan;
     }
     try {
       return ProbePlanSchema.parse(
-        JSON.parse(await readFile7(join8(this.runRoot, "probe-plan.json"), "utf8"))
+        JSON.parse(await readFile6(join8(this.runRoot, "probe-plan.json"), "utf8"))
       );
     } catch {
       return probePlanFromGraph(await this.loadGraph());
@@ -35751,7 +35625,7 @@ var RunStore = class _RunStore {
     )?.data.heldOutProbePlan;
     if (eventPlan) {
       const heldOutProbePlan = validateHeldOutProbePlan(HeldOutProbePlanSchema.parse(eventPlan));
-      const materialized = await readFile7(join8(this.runRoot, "held-out-probes.json"), "utf8").then((value) => validateHeldOutProbePlan(HeldOutProbePlanSchema.parse(JSON.parse(value)))).catch(() => void 0);
+      const materialized = await readFile6(join8(this.runRoot, "held-out-probes.json"), "utf8").then((value) => validateHeldOutProbePlan(HeldOutProbePlanSchema.parse(JSON.parse(value)))).catch(() => void 0);
       if (JSON.stringify(materialized) !== JSON.stringify(heldOutProbePlan))
         await this.saveHeldOutProbePlan(heldOutProbePlan);
       return heldOutProbePlan;
@@ -35759,7 +35633,7 @@ var RunStore = class _RunStore {
     try {
       return validateHeldOutProbePlan(
         HeldOutProbePlanSchema.parse(
-          JSON.parse(await readFile7(join8(this.runRoot, "held-out-probes.json"), "utf8"))
+          JSON.parse(await readFile6(join8(this.runRoot, "held-out-probes.json"), "utf8"))
         )
       );
     } catch {
@@ -35768,7 +35642,7 @@ var RunStore = class _RunStore {
   }
   async loadEvents() {
     await this.ensureStorage();
-    const content = await readFile7(this.eventsPath(), "utf8");
+    const content = await readFile6(this.eventsPath(), "utf8");
     const events = content.split("\n").filter(Boolean).map((line) => RunEventSchema.parse(JSON.parse(line)));
     for (const [index, event] of events.entries()) {
       verifyRunEvent(event);
@@ -35780,7 +35654,7 @@ var RunStore = class _RunStore {
   async loadState() {
     await this.ensureStorage();
     try {
-      const value = JSON.parse(await readFile7(join8(this.runRoot, "state.json"), "utf8"));
+      const value = JSON.parse(await readFile6(join8(this.runRoot, "state.json"), "utf8"));
       if (!("tokenLedger" in value)) return await this.rebuildViews();
       return RunStateSchema.parse(value);
     } catch {
@@ -35855,7 +35729,7 @@ var RunStore = class _RunStore {
   async loadInvocationEvents(invocationId) {
     await this.ensureStorage();
     const path = join8(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
-    const content = await readFile7(path, "utf8");
+    const content = await readFile6(path, "utf8");
     return content.split("\n").filter(Boolean).map((line) => HostEventSchema.parse(JSON.parse(line)));
   }
   async loadGraphHistory() {
@@ -35905,7 +35779,7 @@ var RunStore = class _RunStore {
   async writeCapsule(hash2, value) {
     await this.ensureStorage();
     const path = join8(this.runRoot, "capsules", `${hash2}.json`);
-    const reused = await readFile7(path, "utf8").then((existing) => contentHash(JSON.parse(existing)) === hash2).catch(() => false);
+    const reused = await readFile6(path, "utf8").then((existing) => contentHash(JSON.parse(existing)) === hash2).catch(() => false);
     if (reused) return { path, reused: true };
     await writeJsonAtomic(path, value);
     return { path, reused: false };
@@ -35917,7 +35791,7 @@ var RunStore = class _RunStore {
     const bytes = typeof value === "string" ? Buffer.from(value) : Buffer.from(value);
     const hash2 = contentHash({ contents: bytes.toString("base64") });
     const path = join8(this.runRoot, "artifacts", category, `${hash2}.${extension}`);
-    const reused = await readFile7(path).then((existing) => Buffer.compare(existing, bytes) === 0).catch(() => false);
+    const reused = await readFile6(path).then((existing) => Buffer.compare(existing, bytes) === 0).catch(() => false);
     if (reused) return { path, hash: hash2, reused: true };
     await mkdir4(dirname5(path), { recursive: true });
     await writeFile3(path, bytes, { mode: 384 });
@@ -35929,7 +35803,7 @@ var RunStore = class _RunStore {
   }
   async loadWorkspace() {
     await this.ensureStorage();
-    return JSON.parse(await readFile7(join8(this.runRoot, "workspace.json"), "utf8"));
+    return JSON.parse(await readFile6(join8(this.runRoot, "workspace.json"), "utf8"));
   }
   async materialize(events) {
     const state = reduceEvents(events);
@@ -35964,6 +35838,259 @@ async function resolveRunId(repositoryRoot, reference) {
   if (matches.length !== 1)
     throw new Error(`Run reference ${reference} matched ${matches.length} runs`);
   return matches[0];
+}
+
+// packages/runtime/src/context.ts
+var contextStopWords = /* @__PURE__ */ new Set([
+  "acceptance",
+  "approved",
+  "complete",
+  "completion",
+  "feature",
+  "implement",
+  "implementation",
+  "repository",
+  "substantial",
+  "verify"
+]);
+function contextTerms(objective) {
+  return [
+    ...new Set(
+      (objective.toLowerCase().match(/[a-z0-9][a-z0-9._/-]{2,}/g) ?? []).filter(
+        (term) => !contextStopWords.has(term)
+      )
+    )
+  ].slice(0, 12);
+}
+function groundedRelevantPaths(paths, objective) {
+  const terms = contextTerms(objective);
+  return [...new Set(paths)].filter(
+    (path) => path.length > 0 && !path.startsWith("dist/") && !path.endsWith(".map") && !path.endsWith(".lock")
+  ).map((path) => {
+    const normalized = path.toLowerCase();
+    const affinity = terms.filter((term) => normalized.includes(term)).length;
+    const source = /(?:^|\/)(?:src|test|tests)\//.test(path) ? 2 : 0;
+    const policy = /(?:^|\/)(?:agents\.md|package\.json|pyproject\.toml|go\.mod)$/i.test(path) ? 1 : 0;
+    return { path, score: affinity * 4 + source + policy };
+  }).sort((left, right) => right.score - left.score || left.path.localeCompare(right.path)).slice(0, 4).map(({ path }) => path);
+}
+function selectedTrackedPaths(inventory, selected) {
+  const matches = /* @__PURE__ */ new Set();
+  for (const path of inventory)
+    if (selected.some((candidate) => path === candidate || path.startsWith(`${candidate}/`)))
+      matches.add(path);
+  return matches;
+}
+async function prepareWorkerContext(input) {
+  const tracked = await runProcess(
+    "git",
+    ["ls-files", "--cached", "--others", "--exclude-standard"],
+    {
+      cwd: input.repositoryPath,
+      timeoutMs: 3e4
+    }
+  );
+  if (tracked.exitCode !== 0) throw new Error("Unable to inventory repository context");
+  const repositoryPaths = tracked.stdout.split("\n").filter(Boolean).sort();
+  const inventory = await input.store.writeContentAddressedArtifact(
+    "context-repositories",
+    `${JSON.stringify(repositoryPaths)}
+`
+  );
+  const relevantPaths = input.node.contextSelector.relevantPaths.length ? input.node.contextSelector.relevantPaths : groundedRelevantPaths(repositoryPaths, input.node.objective);
+  if (input.node.kind !== "commit" && relevantPaths.length === 0)
+    throw new Error(`Node ${input.node.id} has no grounded repository context`);
+  const node2 = {
+    ...input.node,
+    contextSelector: { ...input.node.contextSelector, relevantPaths }
+  };
+  const capsule = createContextCapsule({
+    contract: input.contract,
+    node: node2,
+    predecessorEvidence: input.predecessorEvidence,
+    probeResults: input.probeResults
+  });
+  const capsuleHash = contentHash(capsule);
+  const storedCapsule = await input.store.writeCapsule(capsuleHash, capsule);
+  const matchedPaths = selectedTrackedPaths(repositoryPaths, capsule.relevantPaths);
+  const selectedPredecessorNodeIds = input.node.contextSelector.predecessorResults.filter(
+    (nodeId) => capsule.predecessorEvidence.some((value) => value.startsWith(`${nodeId}:`))
+  );
+  const selectedProbeResults = input.probeResults.filter(
+    ({ probeId }) => capsule.probeEvidence.some((value) => value.startsWith(`${probeId}:`))
+  );
+  const reusedArtifacts = [
+    ...storedCapsule.reused ? [storedCapsule.path] : [],
+    ...inventory.reused ? [inventory.path] : []
+  ];
+  const receipt = ContextSelectionReceiptSchema.parse({
+    schemaVersion: 1,
+    runId: input.contract.runId,
+    nodeId: input.node.id,
+    capsule: {
+      hash: capsuleHash,
+      path: storedCapsule.path,
+      characters: contextCapsuleCharacters(capsule)
+    },
+    selected: {
+      repositoryPaths: capsule.relevantPaths,
+      predecessorNodeIds: selectedPredecessorNodeIds,
+      predecessorEvidenceHashes: capsule.predecessorEvidence.map((value) => contentHash(value)),
+      probeIds: selectedProbeResults.map(({ probeId }) => probeId),
+      probeSignatures: selectedProbeResults.map(({ signature }) => signature),
+      acceptanceAnchorIds: capsule.acceptanceAnchors.map(({ id }) => id)
+    },
+    omitted: {
+      repositoryPathCount: repositoryPaths.length - matchedPaths.size,
+      declaredRepositoryPaths: input.node.contextSelector.relevantPaths.filter(
+        (path) => !capsule.relevantPaths.includes(path)
+      ),
+      predecessorNodeIds: input.node.dependsOn.filter(
+        (nodeId) => !selectedPredecessorNodeIds.includes(nodeId)
+      ),
+      probeIds: input.probeResults.filter(({ probeId }) => !selectedProbeResults.some((result) => result.probeId === probeId)).map(({ probeId }) => probeId),
+      repositoryInventory: {
+        digest: inventory.hash,
+        artifact: inventory.path,
+        totalPathCount: repositoryPaths.length
+      },
+      rawHostTranscripts: true,
+      rawProbeOutputs: true
+    },
+    reused: {
+      capsule: storedCapsule.reused,
+      repositoryInventory: inventory.reused,
+      artifacts: reusedArtifacts
+    }
+  });
+  await input.store.append("runtime", "context.selected", { receipt }, input.invocationId);
+  return { capsule, capsuleHash, receipt };
+}
+
+// packages/runtime/src/held-out.ts
+import { readFile as readFile7, stat as stat3 } from "node:fs/promises";
+import { isAbsolute as isAbsolute3, relative, resolve as resolve3, sep as sep2 } from "node:path";
+function relativeRepositoryPath(repositoryRoot, candidate) {
+  const root = resolve3(repositoryRoot);
+  const path = resolve3(repositoryRoot, candidate);
+  if (path !== root && !path.startsWith(`${root}${sep2}`)) return void 0;
+  const result = relative(root, path);
+  return result && !isAbsolute3(result) ? result : void 0;
+}
+function possibleFileArguments(values) {
+  return values.map((value) => value.replace(/^["']|["']$/g, "").replace(/[;&|]+$/g, "")).filter(
+    (value) => !value.startsWith("-") && (value.startsWith(".") || value.includes("/") || /\.[a-z0-9]{1,8}$/i.test(value))
+  );
+}
+async function fileIntegrity(repositoryRoot, cwd, values) {
+  const result = [];
+  for (const value of possibleFileArguments(values)) {
+    const path = relativeRepositoryPath(repositoryRoot, resolve3(repositoryRoot, cwd ?? ".", value));
+    if (!path) continue;
+    const details = await stat3(resolve3(repositoryRoot, path)).catch(() => void 0);
+    if (!details?.isFile()) continue;
+    const contents = await readFile7(resolve3(repositoryRoot, path));
+    result.push({
+      kind: "file",
+      path,
+      valueHash: contentHash({ path, contents: contents.toString("base64") })
+    });
+  }
+  return result;
+}
+async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot) {
+  const integrity = {};
+  for (const item of probePlan.items.filter(({ phase }) => phase === "completion")) {
+    if (item.probe.kind === "held_out")
+      throw new Error("An approved probe plan cannot contain held-out references");
+    const protectedValues = [];
+    if (item.probe.kind === "command") {
+      protectedValues.push(
+        ...await fileIntegrity(repositoryRoot, item.probe.cwd, item.probe.args)
+      );
+    }
+    const match = /^(.*package\.json) script (.+)$/.exec(item.source);
+    if (!match) {
+      integrity[item.probe.id] = protectedValues;
+      continue;
+    }
+    const path = match[1];
+    const script = match[2];
+    const manifestPath = relativeRepositoryPath(repositoryRoot, path);
+    if (!manifestPath) throw new Error(`Completion script ${script} escapes the repository`);
+    const manifest2 = JSON.parse(await readFile7(resolve3(repositoryRoot, manifestPath), "utf8"));
+    const value = manifest2.scripts?.[script];
+    if (!value) throw new Error(`Completion script ${script} is missing from ${manifestPath}`);
+    protectedValues.push({
+      kind: "package_script",
+      path: manifestPath,
+      script,
+      valueHash: contentHash({ path: manifestPath, script, value })
+    });
+    const scriptDirectory = manifestPath.includes("/") ? manifestPath.slice(0, manifestPath.lastIndexOf("/")) : void 0;
+    protectedValues.push(
+      ...await fileIntegrity(repositoryRoot, scriptDirectory, value.split(/\s+/))
+    );
+    const unique2 = new Map(
+      protectedValues.map((entry) => [
+        `${entry.kind}:${entry.path}${entry.kind === "package_script" ? `:${entry.script}` : ""}`,
+        entry
+      ])
+    );
+    integrity[item.probe.id] = [...unique2.values()];
+  }
+  return createHeldOutProbePlan(runId, probePlan, integrity);
+}
+async function heldOutIntegrityFailures(plan, repositoryPath) {
+  const failures = [];
+  for (const entry of plan.probes) {
+    const changedKinds = /* @__PURE__ */ new Set();
+    let signature = "";
+    for (const integrity of entry.integrity) {
+      let actualHash;
+      if (integrity.kind === "package_script") {
+        const manifest2 = await readFile7(resolve3(repositoryPath, integrity.path), "utf8").then(
+          (value2) => JSON.parse(value2)
+        ).catch(() => void 0);
+        const value = manifest2?.scripts?.[integrity.script];
+        actualHash = value ? contentHash({ path: integrity.path, script: integrity.script, value }) : contentHash({ missing: true, path: integrity.path, script: integrity.script });
+      } else {
+        const contents = await readFile7(resolve3(repositoryPath, integrity.path)).catch(
+          () => void 0
+        );
+        actualHash = contents ? contentHash({ path: integrity.path, contents: contents.toString("base64") }) : contentHash({ missing: true, path: integrity.path });
+      }
+      if (actualHash === integrity.valueHash) continue;
+      changedKinds.add(integrity.kind);
+      signature += actualHash;
+    }
+    if (changedKinds.size > 0) {
+      const detail = [
+        changedKinds.has("package_script") ? "package script definition" : void 0,
+        changedKinds.has("file") ? "protected measurement file" : void 0
+      ].filter(Boolean).join(" and ");
+      failures.push({
+        probeId: `${entry.probe.id}-integrity`,
+        kind: "file",
+        passed: false,
+        signature: contentHash(signature),
+        summary: `Approved completion check ${entry.probe.id} changed or was removed; restore its ${detail}`,
+        durationMs: 0
+      });
+    }
+  }
+  return failures;
+}
+function actionableHeldOutFailures(results) {
+  return results.map((result) => {
+    if (result.probeId.endsWith("-integrity")) return result;
+    const separator = result.summary.indexOf(":");
+    const detail = separator >= 0 ? result.summary.slice(separator + 1).trim() : "";
+    return {
+      ...result,
+      summary: `Completion check ${result.probeId} failed${detail ? `: ${detail}` : ""}`
+    };
+  });
 }
 
 // packages/runtime/src/trajectory.ts
@@ -37566,8 +37693,8 @@ async function executeRun(input) {
 
 // packages/cli/src/index.ts
 var GRAPHCRAFT_VERSION = package_default.version;
-function createAdapter(host) {
-  return host === "claude" ? new ClaudeAdapter() : new CodexAdapter();
+function createAdapter(host, policy) {
+  return host === "claude" ? new ClaudeAdapter(policy) : new CodexAdapter(policy);
 }
 function assessTaskShape(task) {
   const value = task.trim();

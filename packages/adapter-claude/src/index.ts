@@ -16,6 +16,7 @@ import {
   workerResultJsonSchema,
   semanticVerdictJsonSchema,
   type HostAdapter,
+  type HostExecutionPolicy,
   type HostEvent,
   type InvocationRecord,
   type PlanningRequest,
@@ -109,6 +110,8 @@ async function claudeAuthenticated(): Promise<boolean> {
 export class ClaudeAdapter implements HostAdapter {
   readonly id = "claude" as const;
 
+  constructor(private readonly policy?: HostExecutionPolicy) {}
+
   async probe() {
     const result = await claudeVersion();
     const authenticated = result.installed && (await claudeAuthenticated());
@@ -122,34 +125,12 @@ export class ClaudeAdapter implements HostAdapter {
   }
 
   async plan(request: PlanningRequest, signal: AbortSignal): Promise<PlanningResult> {
-    const child = spawn(
-      "claude",
-      [
-        "--print",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--permission-mode",
-        "dontAsk",
-        "--effort",
-        "low",
-        "--tools",
-        "",
-        "--disable-slash-commands",
-        "--strict-mcp-config",
-        "--mcp-config",
-        '{"mcpServers":{}}',
-        "--json-schema",
-        JSON.stringify(graphPlanJsonSchema),
-        renderPlannerPrompt(request),
-      ],
-      {
-        cwd: request.repositoryPath,
-        env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
+    const child = spawn("claude", claudePlannerArgs(request, this.policy), {
+      cwd: request.repositoryPath,
+      env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     const exitPromise = new Promise<number>((resolve) =>
       child.once("close", (code) => resolve(code ?? 1)),
     );
@@ -196,7 +177,7 @@ export class ClaudeAdapter implements HostAdapter {
     request: SemanticVerificationRequest,
     signal: AbortSignal,
   ): Promise<SemanticVerificationResult> {
-    const child = spawn("claude", claudeSemanticVerifierArgs(request), {
+    const child = spawn("claude", claudeSemanticVerifierArgs(request, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
       shell: false,
@@ -244,7 +225,7 @@ export class ClaudeAdapter implements HostAdapter {
   }
 
   async *execute(request: WorkerRequest, signal: AbortSignal): AsyncIterable<HostEvent> {
-    const args = claudeWorkerArgs(request);
+    const args = claudeWorkerArgs(request, this.policy);
     const child = spawn("claude", args, {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -323,7 +304,39 @@ export class ClaudeAdapter implements HostAdapter {
   }
 }
 
-export function claudeWorkerArgs(request: WorkerRequest): string[] {
+function claudePolicyArgs(
+  policy?: HostExecutionPolicy,
+  fallbackEffort?: HostExecutionPolicy["effort"],
+): string[] {
+  const effort = policy?.effort ?? fallbackEffort;
+  return [...(policy ? ["--model", policy.model] : []), ...(effort ? ["--effort", effort] : [])];
+}
+
+export function claudePlannerArgs(
+  request: PlanningRequest,
+  policy?: HostExecutionPolicy,
+): string[] {
+  return [
+    "--print",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--permission-mode",
+    "dontAsk",
+    ...claudePolicyArgs(policy, "low"),
+    "--tools",
+    "",
+    "--disable-slash-commands",
+    "--strict-mcp-config",
+    "--mcp-config",
+    '{"mcpServers":{}}',
+    "--json-schema",
+    JSON.stringify(graphPlanJsonSchema),
+    renderPlannerPrompt(request),
+  ];
+}
+
+export function claudeWorkerArgs(request: WorkerRequest, policy?: HostExecutionPolicy): string[] {
   const writable = request.allowedTools.includes("write");
   return [
     "--print",
@@ -332,6 +345,7 @@ export function claudeWorkerArgs(request: WorkerRequest): string[] {
     "--verbose",
     "--permission-mode",
     writable ? "acceptEdits" : "dontAsk",
+    ...claudePolicyArgs(policy),
     "--allowedTools",
     writable ? "Bash(*),Edit,Write,Read,Glob,Grep" : "Read,Glob,Grep",
     "--disable-slash-commands",
@@ -347,7 +361,10 @@ export function claudeWorkerArgs(request: WorkerRequest): string[] {
   ];
 }
 
-export function claudeSemanticVerifierArgs(request: SemanticVerificationRequest): string[] {
+export function claudeSemanticVerifierArgs(
+  request: SemanticVerificationRequest,
+  policy?: HostExecutionPolicy,
+): string[] {
   return [
     "--print",
     "--output-format",
@@ -355,8 +372,7 @@ export function claudeSemanticVerifierArgs(request: SemanticVerificationRequest)
     "--verbose",
     "--permission-mode",
     "dontAsk",
-    "--effort",
-    "low",
+    ...claudePolicyArgs(policy, "low"),
     "--tools",
     "Read,Glob,Grep",
     "--allowedTools",

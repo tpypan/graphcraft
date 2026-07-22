@@ -3,11 +3,13 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { describe, expect, it } from "vitest";
 import {
+  codexPlannerArgs,
   codexSemanticVerifierArgs,
   codexUsage,
   codexWorkerArgs,
 } from "../packages/adapter-codex/src/index.ts";
 import {
+  claudePlannerArgs,
   claudeSemanticVerifierArgs,
   claudeUsage,
   claudeWorkerArgs,
@@ -16,6 +18,8 @@ import {
   reconcilePersistedInvocation,
   ChildTerminationController,
   type InvocationRecord,
+  type HostExecutionPolicy,
+  type PlanningRequest,
   type SemanticVerificationRequest,
   type WorkerRequest,
 } from "../packages/core/src/index.ts";
@@ -38,6 +42,21 @@ function semanticRequest(): SemanticVerificationRequest {
     invocationId: randomUUID(),
     repositoryPath: "/tmp/graphcraft fixture",
     context: {} as SemanticVerificationRequest["context"],
+  };
+}
+
+function planningRequest(): PlanningRequest {
+  return {
+    repositoryPath: "/tmp/graphcraft fixture",
+    contract: { task: "Plan the benchmark fixture" } as PlanningRequest["contract"],
+    repositoryEvidence: {
+      trackedPathCount: 1,
+      trackedPaths: ["source.js"],
+      trackedPathsTruncated: false,
+      files: [],
+    },
+    probePlan: { schemaVersion: 1, family: "feature", items: [] },
+    verificationProbes: [],
   };
 }
 
@@ -127,9 +146,47 @@ describe("native host continuation protocol", () => {
     expect(codex).not.toContain("resume");
 
     const claude = claudeSemanticVerifierArgs(semanticRequest());
+    expect(claude.slice(claude.indexOf("--effort"), claude.indexOf("--effort") + 2)).toEqual([
+      "--effort",
+      "low",
+    ]);
     expect(claude[claude.indexOf("--tools") + 1]).toBe("Read,Glob,Grep");
     expect(claude[claude.indexOf("--allowedTools") + 1]).toBe("Read,Glob,Grep");
     expect(claude.join(" ")).not.toMatch(/Bash|Edit|Write|--resume|--session-id/);
+  });
+
+  it("applies explicit model and effort policies to every host invocation path", () => {
+    const policy: HostExecutionPolicy = { model: "benchmark-model", effort: "xhigh" };
+    const codexInvocations = [
+      codexPlannerArgs(planningRequest(), "/tmp/plan.schema.json", policy),
+      codexWorkerArgs(request(), "/tmp/worker.schema.json", policy),
+      codexWorkerArgs(request("codex-thread"), "/tmp/worker.schema.json", policy),
+      codexSemanticVerifierArgs(semanticRequest(), "/tmp/verdict.schema.json", policy),
+    ];
+    for (const args of codexInvocations) {
+      expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2)).toEqual([
+        "--model",
+        "benchmark-model",
+      ]);
+      expect(args).toContain('model_reasoning_effort="xhigh"');
+    }
+
+    const claudeInvocations = [
+      claudePlannerArgs(planningRequest(), policy),
+      claudeWorkerArgs(request(), policy),
+      claudeWorkerArgs(request("claude-session"), policy),
+      claudeSemanticVerifierArgs(semanticRequest(), policy),
+    ];
+    for (const args of claudeInvocations) {
+      expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2)).toEqual([
+        "--model",
+        "benchmark-model",
+      ]);
+      expect(args.slice(args.indexOf("--effort"), args.indexOf("--effort") + 2)).toEqual([
+        "--effort",
+        "xhigh",
+      ]);
+    }
   });
 
   it("reconciles durable results before resumable or repository-recovery states", () => {

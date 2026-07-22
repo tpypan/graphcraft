@@ -3374,15 +3374,202 @@ function useColor() {
 var program = new Command();
 
 // packages/cli/src/bin.ts
-import { readFile as readFile8 } from "node:fs/promises";
+import { readFile as readFile9 } from "node:fs/promises";
+import { join as join12, resolve as resolve6 } from "node:path";
+
+// benchmarks/stable-v1.json
+var stable_v1_default = {
+  schemaVersion: 1,
+  id: "stable-v1",
+  version: 1,
+  description: "Versioned local corpus for matched Codex and Claude baseline-versus-Graphcraft trials.",
+  tasks: [
+    {
+      id: "bug-empty-input",
+      family: "bug",
+      task: "Fix normalizeName so empty input returns an empty string, preserve non-empty trimming, add or update regression coverage, and run the declared checks.",
+      finishLine: "local_verified",
+      initialFiles: {
+        "package.json": '{"name":"benchmark-bug-empty-input","private":true,"type":"module","scripts":{"test":"node verify.mjs"}}\n',
+        "src.js": "export function normalizeName(value) { return value.trim() || 'unknown'; }\n",
+        "verify.mjs": "import { normalizeName } from './src.js'; if (normalizeName('') !== '' || normalizeName('  Ada  ') !== 'Ada') process.exit(1);\n"
+      },
+      checks: [{ command: "node", args: ["verify.mjs"] }],
+      acceptance: [
+        { kind: "contains", path: "src.js", value: "return value.trim()" },
+        { kind: "not_contains", path: "src.js", value: "unknown" }
+      ],
+      repetitions: 3
+    },
+    {
+      id: "bug-inclusive-range",
+      family: "bug",
+      task: "Fix range so it includes the requested end value without changing its start behavior, add regression coverage, and run the declared checks.",
+      finishLine: "local_verified",
+      initialFiles: {
+        "package.json": '{"name":"benchmark-bug-inclusive-range","private":true,"type":"module","scripts":{"test":"node verify.mjs"}}\n',
+        "range.js": "export function range(start, end) { return Array.from({ length: end - start }, (_, index) => start + index); }\n",
+        "verify.mjs": "import { range } from './range.js'; if (JSON.stringify(range(2, 4)) !== '[2,3,4]') process.exit(1);\n"
+      },
+      checks: [{ command: "node", args: ["verify.mjs"] }],
+      acceptance: [{ kind: "contains", path: "range.js", value: "end - start + 1" }],
+      repetitions: 3
+    },
+    {
+      id: "feature-uppercase-slug",
+      family: "feature",
+      task: "Add an exported upperSlug helper that trims input, replaces whitespace with hyphens, uppercases the result, and passes the declared checks.",
+      finishLine: "local_verified",
+      initialFiles: {
+        "package.json": '{"name":"benchmark-feature-uppercase-slug","private":true,"type":"module","scripts":{"test":"node verify.mjs"}}\n',
+        "slug.js": "export function slug(value) { return value.trim().replace(/\\s+/g, '-').toLowerCase(); }\n",
+        "verify.mjs": "import { upperSlug } from './slug.js'; if (upperSlug('  hello world ') !== 'HELLO-WORLD') process.exit(1);\n"
+      },
+      checks: [{ command: "node", args: ["verify.mjs"] }],
+      acceptance: [
+        { kind: "contains", path: "slug.js", value: "export function upperSlug" },
+        { kind: "contains", path: "slug.js", value: "toUpperCase" }
+      ],
+      repetitions: 3
+    },
+    {
+      id: "feature-summary-report",
+      family: "feature",
+      task: "Add report.js with an exported summarize function returning count and total for numeric inputs, reject non-numeric values, and run the declared checks.",
+      finishLine: "local_verified",
+      initialFiles: {
+        "package.json": '{"name":"benchmark-feature-summary-report","private":true,"type":"module","scripts":{"test":"node verify.mjs"}}\n',
+        "index.js": "export const version = 1;\n",
+        "verify.mjs": "import { summarize } from './report.js'; const value = summarize([2,3,5]); if (value.count !== 3 || value.total !== 10) process.exit(1); let rejected = false; try { summarize([1,'x']); } catch { rejected = true; } if (!rejected) process.exit(1);\n"
+      },
+      checks: [{ command: "node", args: ["verify.mjs"] }],
+      acceptance: [
+        { kind: "exists", path: "report.js" },
+        { kind: "contains", path: "report.js", value: "count" },
+        { kind: "contains", path: "report.js", value: "total" }
+      ],
+      repetitions: 3
+    },
+    {
+      id: "migration-client-v3",
+      family: "migration",
+      task: "Migrate every createClientV2 use to createClientV3, remove the v2 export, preserve behavior, and run the declared checks.",
+      finishLine: "local_verified",
+      initialFiles: {
+        "package.json": '{"name":"benchmark-migration-client-v3","private":true,"type":"module","scripts":{"test":"node verify.mjs"}}\n',
+        "client.js": "export const createClientV2 = () => ({ version: 2 }); export const createClientV3 = () => ({ version: 3 });\n",
+        "app.js": "import { createClientV2 } from './client.js'; export const client = createClientV2();\n",
+        "verify.mjs": "const app = await import('./app.js'); const source = await import('node:fs/promises').then(fs => fs.readFile('client.js','utf8')); if (app.client.version !== 3 || source.includes('createClientV2')) process.exit(1);\n"
+      },
+      checks: [{ command: "node", args: ["verify.mjs"] }],
+      acceptance: [
+        { kind: "contains", path: "app.js", value: "createClientV3" },
+        { kind: "not_contains", path: "client.js", value: "createClientV2" }
+      ],
+      repetitions: 3
+    },
+    {
+      id: "migration-timeout-key",
+      family: "migration",
+      task: "Migrate the timeoutSeconds configuration to timeoutMs everywhere, convert the value correctly, remove the old key, and run the declared checks.",
+      finishLine: "local_verified",
+      initialFiles: {
+        "package.json": '{"name":"benchmark-migration-timeout-key","private":true,"type":"module","scripts":{"test":"node verify.mjs"}}\n',
+        "config.json": '{"timeoutSeconds":5}\n',
+        "config.js": "import data from './config.json' with { type: 'json' }; export const timeout = data.timeoutSeconds * 1000;\n",
+        "verify.mjs": "import { timeout } from './config.js'; const data = JSON.parse(await import('node:fs/promises').then(fs => fs.readFile('config.json','utf8'))); if (timeout !== 5000 || data.timeoutMs !== 5000 || 'timeoutSeconds' in data) process.exit(1);\n"
+      },
+      checks: [{ command: "node", args: ["verify.mjs"] }],
+      acceptance: [
+        { kind: "contains", path: "config.json", value: "timeoutMs" },
+        { kind: "not_contains", path: "config.json", value: "timeoutSeconds" },
+        { kind: "contains", path: "config.js", value: "timeoutMs" }
+      ],
+      repetitions: 3
+    },
+    {
+      id: "refactor-shared-clamp",
+      family: "refactor",
+      task: "Refactor the duplicated clamp logic into one shared exported helper without changing behavior and run the declared checks.",
+      finishLine: "local_verified",
+      initialFiles: {
+        "package.json": '{"name":"benchmark-refactor-shared-clamp","private":true,"type":"module","scripts":{"test":"node verify.mjs"}}\n',
+        "values.js": "export function volume(value) { return Math.max(0, Math.min(100, value)); } export function brightness(value) { return Math.max(0, Math.min(100, value)); }\n",
+        "verify.mjs": "import { volume, brightness, clamp } from './values.js'; if (volume(120) !== 100 || brightness(-2) !== 0 || clamp(40) !== 40) process.exit(1);\n"
+      },
+      checks: [{ command: "node", args: ["verify.mjs"] }],
+      acceptance: [
+        { kind: "contains", path: "values.js", value: "export function clamp" },
+        { kind: "contains", path: "values.js", value: "return clamp(value)" }
+      ],
+      repetitions: 3
+    },
+    {
+      id: "audit-api-boundary",
+      family: "audit",
+      task: "Audit the API boundary for validation, error handling, and missing tests; return a read-only report with Findings, Evidence, and Unknowns grounded in api.js; run the declared checks.",
+      finishLine: "local_verified",
+      initialFiles: {
+        "package.json": '{"name":"benchmark-audit-api-boundary","private":true,"type":"module","scripts":{"test":"node verify.mjs"}}\n',
+        "api.js": "export async function handle(input) { return JSON.parse(input); }\n",
+        "verify.mjs": `import { handle } from './api.js'; const value = await handle('{"ok":true}'); if (value.ok !== true) process.exit(1);
+`
+      },
+      checks: [{ command: "node", args: ["verify.mjs"] }],
+      acceptance: [
+        { kind: "summary_contains", value: "Findings" },
+        { kind: "summary_contains", value: "Evidence" },
+        { kind: "summary_contains", value: "Unknowns" },
+        { kind: "summary_contains", value: "api.js" }
+      ],
+      repetitions: 3
+    },
+    {
+      id: "pr-repair-email-validation",
+      family: "pr_repair",
+      task: "Address review feedback by making parseEmail reject values without exactly one @ separator, preserve trimming and lowercase normalization, and run the declared checks.",
+      finishLine: "local_verified",
+      initialFiles: {
+        "package.json": '{"name":"benchmark-pr-repair-email-validation","private":true,"type":"module","scripts":{"test":"node verify.mjs"}}\n',
+        "email.js": "export function parseEmail(value) { return value.trim().toLowerCase(); }\n",
+        "REVIEW.md": "Review: parseEmail currently accepts malformed addresses. Require exactly one @ separator.\n",
+        "verify.mjs": "import { parseEmail } from './email.js'; if (parseEmail(' A@B.COM ') !== 'a@b.com') process.exit(1); for (const bad of ['abc','a@@b']) { let rejected = false; try { parseEmail(bad); } catch { rejected = true; } if (!rejected) process.exit(1); }\n"
+      },
+      checks: [{ command: "node", args: ["verify.mjs"] }],
+      acceptance: [
+        { kind: "contains", path: "email.js", value: "split" },
+        { kind: "contains", path: "email.js", value: "throw" }
+      ],
+      repetitions: 3
+    },
+    {
+      id: "pr-repair-null-owner",
+      family: "pr_repair",
+      task: "Address review feedback by making ownerLabel handle a null owner as Unassigned while preserving named-owner output, add regression coverage, and run the declared checks.",
+      finishLine: "local_verified",
+      initialFiles: {
+        "package.json": '{"name":"benchmark-pr-repair-null-owner","private":true,"type":"module","scripts":{"test":"node verify.mjs"}}\n',
+        "owner.js": "export function ownerLabel(owner) { return `Owner: ${owner.name}`; }\n",
+        "REVIEW.md": "Review: owner can be null for imported records. Render Unassigned instead of throwing.\n",
+        "verify.mjs": "import { ownerLabel } from './owner.js'; if (ownerLabel(null) !== 'Unassigned' || ownerLabel({name:'Ada'}) !== 'Owner: Ada') process.exit(1);\n"
+      },
+      checks: [{ command: "node", args: ["verify.mjs"] }],
+      acceptance: [
+        { kind: "contains", path: "owner.js", value: "Unassigned" },
+        { kind: "contains", path: "owner.js", value: "owner.name" }
+      ],
+      repetitions: 3
+    }
+  ]
+};
 
 // packages/cli/src/index.ts
 import { createInterface as createInterface3 } from "node:readline/promises";
 import { spawn as spawn4 } from "node:child_process";
-import { access as access2, chmod, copyFile, mkdir as mkdir5 } from "node:fs/promises";
+import { access as access3, chmod, copyFile, mkdir as mkdir6 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname as dirname6, join as join10, resolve as resolve4 } from "node:path";
+import { dirname as dirname7, join as join11, resolve as resolve5 } from "node:path";
 import { stdin, stdout } from "node:process";
 
 // package.json
@@ -3415,6 +3602,7 @@ var package_default = {
     graphcraft: "dist/graphcraft.mjs"
   },
   files: [
+    "benchmarks/stable-v1.json",
     "dist/graphcraft.mjs",
     "dist/mcp.mjs"
   ],
@@ -3462,24 +3650,6 @@ function reconcilePersistedInvocation(invocation) {
   if (result?.type === "result") return { state: "completed", result: result.result };
   if (invocation.hostSessionId) return { state: "in_progress" };
   return { state: "not_started" };
-}
-
-// packages/core/src/canonical.ts
-import { createHash } from "node:crypto";
-function sortValue(value) {
-  if (Array.isArray(value)) return value.map(sortValue);
-  if (value !== null && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).map(([key, entry]) => [key, sortValue(entry)])
-    );
-  }
-  return value;
-}
-function canonicalJson(value) {
-  return JSON.stringify(sortValue(value));
-}
-function contentHash(value) {
-  return createHash("sha256").update(canonicalJson(value)).digest("hex");
 }
 
 // node_modules/.pnpm/zod@4.4.3/node_modules/zod/v4/classic/external.js
@@ -17996,6 +18166,24 @@ function date4(params) {
 // node_modules/.pnpm/zod@4.4.3/node_modules/zod/v4/classic/external.js
 config(en_default());
 
+// packages/core/src/canonical.ts
+import { createHash } from "node:crypto";
+function sortValue(value) {
+  if (Array.isArray(value)) return value.map(sortValue);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).map(([key, entry]) => [key, sortValue(entry)])
+    );
+  }
+  return value;
+}
+function canonicalJson(value) {
+  return JSON.stringify(sortValue(value));
+}
+function contentHash(value) {
+  return createHash("sha256").update(canonicalJson(value)).digest("hex");
+}
+
 // packages/core/src/schemas.ts
 var FinishLineSchema = external_exports.discriminatedUnion("kind", [
   external_exports.strictObject({ kind: external_exports.literal("local_verified") }),
@@ -18668,6 +18856,223 @@ function codexStrictSchema(value) {
 var codexWorkerResultJsonSchema = codexStrictSchema(workerResultJsonSchema);
 var codexGraphPlanJsonSchema = codexStrictSchema(graphPlanJsonSchema);
 var codexSemanticVerdictJsonSchema = codexStrictSchema(semanticVerdictJsonSchema);
+
+// packages/core/src/benchmark.ts
+var BenchmarkTaskFamilySchema = external_exports.enum([
+  "bug",
+  "feature",
+  "migration",
+  "refactor",
+  "audit",
+  "pr_repair"
+]);
+var BenchmarkAssertionSchema = external_exports.discriminatedUnion("kind", [
+  external_exports.strictObject({ kind: external_exports.literal("summary_contains"), value: external_exports.string().min(1) }),
+  external_exports.strictObject({ kind: external_exports.literal("exists"), path: external_exports.string().min(1) }),
+  external_exports.strictObject({ kind: external_exports.literal("absent"), path: external_exports.string().min(1) }),
+  external_exports.strictObject({ kind: external_exports.literal("contains"), path: external_exports.string().min(1), value: external_exports.string() }),
+  external_exports.strictObject({ kind: external_exports.literal("not_contains"), path: external_exports.string().min(1), value: external_exports.string() }),
+  external_exports.strictObject({ kind: external_exports.literal("equals"), path: external_exports.string().min(1), value: external_exports.string() })
+]);
+var BenchmarkCheckSchema = external_exports.strictObject({
+  command: external_exports.string().min(1),
+  args: external_exports.array(external_exports.string()).default([]),
+  expectedExitCode: external_exports.number().int().default(0),
+  timeoutMs: external_exports.number().int().positive().default(3e5)
+});
+var BenchmarkTaskSchema = external_exports.strictObject({
+  id: external_exports.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
+  family: BenchmarkTaskFamilySchema,
+  task: external_exports.string().min(1),
+  finishLine: external_exports.literal("local_verified").default("local_verified"),
+  initialFiles: external_exports.record(external_exports.string().min(1), external_exports.string()).refine((value) => Object.keys(value).length > 0),
+  checks: external_exports.array(BenchmarkCheckSchema).min(1),
+  acceptance: external_exports.array(BenchmarkAssertionSchema).min(1),
+  repetitions: external_exports.number().int().positive().default(3)
+});
+var BenchmarkSuiteSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  id: external_exports.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
+  version: external_exports.number().int().positive(),
+  description: external_exports.string().min(1),
+  tasks: external_exports.array(BenchmarkTaskSchema).min(1)
+});
+var BenchmarkScheduleEntrySchema = external_exports.strictObject({
+  trialId: external_exports.string().min(1),
+  order: external_exports.number().int().nonnegative(),
+  taskId: external_exports.string().min(1),
+  family: BenchmarkTaskFamilySchema,
+  host: external_exports.enum(["codex", "claude"]),
+  mode: external_exports.enum(["baseline", "graphcraft"]),
+  repetition: external_exports.number().int().positive(),
+  seed: external_exports.string().min(1)
+});
+var BenchmarkAssertionResultSchema = external_exports.strictObject({
+  path: external_exports.string().min(1),
+  passed: external_exports.boolean(),
+  summary: external_exports.string().min(1)
+});
+var BenchmarkModelPolicySchema = external_exports.strictObject({
+  codex: external_exports.string().min(1).optional(),
+  claude: external_exports.string().min(1).optional()
+}).refine((value) => value.codex !== void 0 || value.claude !== void 0, {
+  message: "At least one benchmark model policy is required"
+});
+var BenchmarkEffortPolicySchema = external_exports.enum(["low", "medium", "high", "xhigh"]);
+var BenchmarkTrialResultSchema = external_exports.strictObject({
+  trial: BenchmarkScheduleEntrySchema,
+  hostVersion: external_exports.string().min(1),
+  modelPolicy: external_exports.string().min(1),
+  effortPolicy: BenchmarkEffortPolicySchema,
+  permissionPolicy: external_exports.literal("local_read_write_shell_no_external"),
+  acceptanceScorerDigest: external_exports.string().min(1),
+  repositoryDigest: external_exports.string().min(1),
+  baseSha: external_exports.string().min(1),
+  executionStatus: external_exports.enum(["completed", "blocked", "failed", "error"]),
+  accepted: external_exports.boolean(),
+  acceptance: external_exports.array(BenchmarkAssertionResultSchema),
+  usage: TokenUsageSchema,
+  usageReconciled: external_exports.boolean(),
+  limitations: external_exports.array(external_exports.string()),
+  durationMs: external_exports.number().int().nonnegative(),
+  humanInterventions: external_exports.number().int().nonnegative(),
+  failureTrace: external_exports.array(external_exports.string())
+});
+var BenchmarkReportSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  status: external_exports.enum(["running", "complete"]),
+  suite: external_exports.strictObject({
+    id: external_exports.string().min(1),
+    version: external_exports.number().int().positive(),
+    digest: external_exports.string().min(1)
+  }),
+  startedAt: external_exports.iso.datetime(),
+  updatedAt: external_exports.iso.datetime(),
+  seed: external_exports.string().min(1),
+  randomized: external_exports.literal(true),
+  modelPolicy: BenchmarkModelPolicySchema,
+  effortPolicy: BenchmarkEffortPolicySchema,
+  permissionPolicy: external_exports.literal("local_read_write_shell_no_external"),
+  scorerPolicy: external_exports.literal("declared_checks_plus_suite_assertions"),
+  environment: external_exports.strictObject({
+    platform: external_exports.string().min(1),
+    architecture: external_exports.string().min(1),
+    nodeVersion: external_exports.string().min(1)
+  }),
+  limitations: external_exports.array(external_exports.string()),
+  schedule: external_exports.array(BenchmarkScheduleEntrySchema).min(1),
+  results: external_exports.array(BenchmarkTrialResultSchema),
+  summary: external_exports.record(external_exports.string(), external_exports.unknown())
+});
+function seededRandom(seed) {
+  let state = Number.parseInt(contentHash(seed).slice(0, 8), 16) >>> 0;
+  return () => {
+    state += 1831565813;
+    let value = state;
+    value = Math.imul(value ^ value >>> 15, value | 1);
+    value ^= value + Math.imul(value ^ value >>> 7, value | 61);
+    return ((value ^ value >>> 14) >>> 0) / 4294967296;
+  };
+}
+function createBenchmarkSchedule(input) {
+  const suite = BenchmarkSuiteSchema.parse(input.suite);
+  const hosts = [...new Set(input.hosts)].sort();
+  if (hosts.length === 0) throw new Error("A benchmark schedule requires at least one host");
+  const entries = suite.tasks.flatMap(
+    (task) => hosts.flatMap(
+      (host) => ["baseline", "graphcraft"].flatMap(
+        (mode) => Array.from({ length: input.repetitions ?? task.repetitions }, (_, index) => ({
+          taskId: task.id,
+          family: task.family,
+          host,
+          mode,
+          repetition: index + 1
+        }))
+      )
+    )
+  );
+  const random = seededRandom(`${suite.id}:${suite.version}:${input.seed}`);
+  for (let index = entries.length - 1; index > 0; index -= 1) {
+    const swap = Math.floor(random() * (index + 1));
+    [entries[index], entries[swap]] = [entries[swap], entries[index]];
+  }
+  return entries.map(
+    (entry, order) => BenchmarkScheduleEntrySchema.parse({
+      ...entry,
+      order,
+      seed: input.seed,
+      trialId: contentHash({ suite: suite.id, version: suite.version, seed: input.seed, ...entry })
+    })
+  );
+}
+function median(values) {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[middle - 1] + sorted[middle]) / 2 : sorted[middle];
+}
+function modeStats(results, mode) {
+  const selected = results.filter((result) => result.trial.mode === mode);
+  const accepted = selected.filter((result) => result.accepted);
+  const reconciled = selected.filter((result) => result.usageReconciled);
+  return {
+    trials: selected.length,
+    accepted: accepted.length,
+    unsuccessful: selected.length - accepted.length,
+    acceptanceRate: selected.length ? accepted.length / selected.length : 0,
+    reconciledTokenTrials: reconciled.length,
+    medianAcceptedTokens: median(
+      accepted.filter((result) => result.usageReconciled).map((result) => result.usage.total)
+    )
+  };
+}
+function matchedTrialControls(results) {
+  const groups = /* @__PURE__ */ new Map();
+  for (const result of results) {
+    const key = `${result.trial.host}:${result.trial.taskId}:${result.trial.repetition}`;
+    groups.set(key, [...groups.get(key) ?? [], result]);
+  }
+  return [...groups.values()].every((group) => {
+    if (group.length !== 2 || new Set(group.map(({ trial }) => trial.mode)).size !== 2)
+      return false;
+    const [first, second] = group;
+    return first.repositoryDigest === second.repositoryDigest && first.baseSha === second.baseSha && first.hostVersion === second.hostVersion && first.modelPolicy === second.modelPolicy && first.effortPolicy === second.effortPolicy && first.permissionPolicy === second.permissionPolicy && first.acceptanceScorerDigest === second.acceptanceScorerDigest;
+  });
+}
+function summarizeBenchmark(results, schedule = results.map(({ trial }) => trial)) {
+  const parsed = results.map((result) => BenchmarkTrialResultSchema.parse(result));
+  const parsedSchedule = schedule.map((entry) => BenchmarkScheduleEntrySchema.parse(entry));
+  return Object.fromEntries(
+    ["codex", "claude"].map((host) => {
+      const selected = parsed.filter((result) => result.trial.host === host);
+      const expected = parsedSchedule.filter((trial) => trial.host === host);
+      const baseline = modeStats(selected, "baseline");
+      const graphcraft = modeStats(selected, "graphcraft");
+      const stableHostVersion = new Set(selected.map(({ hostVersion }) => hostVersion)).size <= 1;
+      const completeSchedule = selected.length === expected.length && new Set(selected.map(({ trial }) => trial.trialId)).size === expected.length && selected.every(({ trial }) => expected.some(({ trialId }) => trialId === trial.trialId));
+      const matchedControls = matchedTrialControls(selected);
+      const comparable = completeSchedule && matchedControls && stableHostVersion && baseline.trials > 0 && baseline.trials === graphcraft.trials && baseline.reconciledTokenTrials === baseline.trials && graphcraft.reconciledTokenTrials === graphcraft.trials && baseline.medianAcceptedTokens !== null && baseline.medianAcceptedTokens > 0 && graphcraft.medianAcceptedTokens !== null;
+      const tokenReductionPercent = comparable ? (baseline.medianAcceptedTokens - graphcraft.medianAcceptedTokens) / baseline.medianAcceptedTokens * 100 : null;
+      const acceptanceDeltaPoints = comparable ? (graphcraft.acceptanceRate - baseline.acceptanceRate) * 100 : null;
+      return [
+        host,
+        {
+          baseline,
+          graphcraft,
+          gate: {
+            completeSchedule,
+            matchedControls,
+            stableHostVersion,
+            comparable,
+            tokenReductionPercent,
+            acceptanceDeltaPoints,
+            passes: comparable && tokenReductionPercent !== null && acceptanceDeltaPoints !== null ? tokenReductionPercent >= 20 && acceptanceDeltaPoints >= -5 : null
+          }
+        }
+      ];
+    })
+  );
+}
 
 // packages/core/src/capsule.ts
 var MAX_CONTEXT_CAPSULE_CHARACTERS = 24e3;
@@ -20278,22 +20683,22 @@ function codexUsage(value) {
   return normalizeTokenUsage("codex", value);
 }
 async function commandVersion(command) {
-  return await new Promise((resolve5) => {
+  return await new Promise((resolve7) => {
     const child = spawn(command, ["--version"], { stdio: ["ignore", "pipe", "ignore"] });
     let output = "";
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       output += chunk;
     });
-    child.once("error", () => resolve5({ installed: false }));
+    child.once("error", () => resolve7({ installed: false }));
     child.once(
       "close",
-      (code) => resolve5(code === 0 ? { installed: true, version: output.trim() } : { installed: false })
+      (code) => resolve7(code === 0 ? { installed: true, version: output.trim() } : { installed: false })
     );
   });
 }
 async function codexAuthenticated() {
-  return await new Promise((resolve5) => {
+  return await new Promise((resolve7) => {
     const child = spawn("codex", ["login", "status"], { stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     child.stdout.setEncoding("utf8");
@@ -20304,11 +20709,15 @@ async function codexAuthenticated() {
     child.stderr.on("data", (chunk) => {
       output += chunk;
     });
-    child.once("error", () => resolve5(false));
-    child.once("close", (code) => resolve5(code === 0 && !/not logged in/i.test(output)));
+    child.once("error", () => resolve7(false));
+    child.once("close", (code) => resolve7(code === 0 && !/not logged in/i.test(output)));
   });
 }
 var CodexAdapter = class {
+  constructor(policy) {
+    this.policy = policy;
+  }
+  policy;
   id = "codex";
   async probe() {
     const result = await commandVersion("codex");
@@ -20325,30 +20734,14 @@ var CodexAdapter = class {
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-plan-"));
     const schemaPath = join(schemaDirectory, "graph-plan.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexGraphPlanJsonSchema), "utf8");
-    const child = spawn(
-      "codex",
-      [
-        "exec",
-        "--json",
-        "--ephemeral",
-        "--ignore-user-config",
-        "-C",
-        request.repositoryPath,
-        "-s",
-        "read-only",
-        "--output-schema",
-        schemaPath,
-        "-"
-      ],
-      {
-        cwd: request.repositoryPath,
-        env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
-        shell: false,
-        stdio: ["pipe", "pipe", "pipe"]
-      }
-    );
+    const child = spawn("codex", codexPlannerArgs(request, schemaPath, this.policy), {
+      cwd: request.repositoryPath,
+      env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"]
+    });
     const exitPromise = new Promise(
-      (resolve5) => child.once("close", (code) => resolve5(code ?? 1))
+      (resolve7) => child.once("close", (code) => resolve7(code ?? 1))
     );
     const abort = () => {
       child.kill("SIGTERM");
@@ -20395,14 +20788,14 @@ var CodexAdapter = class {
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-verify-"));
     const schemaPath = join(schemaDirectory, "semantic-verdict.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexSemanticVerdictJsonSchema), "utf8");
-    const child = spawn("codex", codexSemanticVerifierArgs(request, schemaPath), {
+    const child = spawn("codex", codexSemanticVerifierArgs(request, schemaPath, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
       shell: false,
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve5) => child.once("close", (code, closeSignal) => resolve5({ code, signal: closeSignal }))
+      (resolve7) => child.once("close", (code, closeSignal) => resolve7({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderSemanticVerifierPrompt(request.context));
@@ -20447,7 +20840,7 @@ var CodexAdapter = class {
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-"));
     const schemaPath = join(schemaDirectory, "worker-result.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexWorkerResultJsonSchema), "utf8");
-    const args = codexWorkerArgs(request, schemaPath);
+    const args = codexWorkerArgs(request, schemaPath, this.policy);
     const child = spawn("codex", args, {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -20455,7 +20848,7 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve5) => child.once("close", (code, closeSignal) => resolve5({ code, signal: closeSignal }))
+      (resolve7) => child.once("close", (code, closeSignal) => resolve7({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderWorkerPrompt(request.capsule));
@@ -20527,13 +20920,33 @@ var CodexAdapter = class {
     return reconcilePersistedInvocation(invocation);
   }
 };
-function codexWorkerArgs(request, schemaPath) {
+function codexPolicyArgs(policy) {
+  return policy ? ["--model", policy.model, "--config", `model_reasoning_effort="${policy.effort}"`] : [];
+}
+function codexPlannerArgs(request, schemaPath, policy) {
+  return [
+    "exec",
+    "--json",
+    "--ephemeral",
+    "--ignore-user-config",
+    ...codexPolicyArgs(policy),
+    "-C",
+    request.repositoryPath,
+    "-s",
+    "read-only",
+    "--output-schema",
+    schemaPath,
+    "-"
+  ];
+}
+function codexWorkerArgs(request, schemaPath, policy) {
   if (request.resumeSessionId) {
     return [
       "exec",
       "resume",
       "--json",
       "--ignore-user-config",
+      ...codexPolicyArgs(policy),
       "--output-schema",
       schemaPath,
       request.resumeSessionId,
@@ -20544,6 +20957,7 @@ function codexWorkerArgs(request, schemaPath) {
     "exec",
     "--json",
     "--ignore-user-config",
+    ...codexPolicyArgs(policy),
     "-C",
     request.repositoryPath,
     "-s",
@@ -20553,12 +20967,13 @@ function codexWorkerArgs(request, schemaPath) {
     "-"
   ];
 }
-function codexSemanticVerifierArgs(request, schemaPath) {
+function codexSemanticVerifierArgs(request, schemaPath, policy) {
   return [
     "exec",
     "--json",
     "--ephemeral",
     "--ignore-user-config",
+    ...codexPolicyArgs(policy),
     "-C",
     request.repositoryPath,
     "-s",
@@ -20612,22 +21027,22 @@ function claudeUsage(value) {
   return normalizeTokenUsage("claude", value);
 }
 async function claudeVersion() {
-  return await new Promise((resolve5) => {
+  return await new Promise((resolve7) => {
     const child = spawn2("claude", ["--version"], { stdio: ["ignore", "pipe", "ignore"] });
     let output = "";
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       output += chunk;
     });
-    child.once("error", () => resolve5({ installed: false }));
+    child.once("error", () => resolve7({ installed: false }));
     child.once(
       "close",
-      (code) => resolve5(code === 0 ? { installed: true, version: output.trim() } : { installed: false })
+      (code) => resolve7(code === 0 ? { installed: true, version: output.trim() } : { installed: false })
     );
   });
 }
 async function claudeAuthenticated() {
-  return await new Promise((resolve5) => {
+  return await new Promise((resolve7) => {
     const child = spawn2("claude", ["auth", "status", "--json"], {
       stdio: ["ignore", "pipe", "ignore"]
     });
@@ -20636,18 +21051,22 @@ async function claudeAuthenticated() {
     child.stdout.on("data", (chunk) => {
       output += chunk;
     });
-    child.once("error", () => resolve5(false));
+    child.once("error", () => resolve7(false));
     child.once("close", (code) => {
       try {
         const status2 = JSON.parse(output);
-        resolve5(code === 0 && status2.loggedIn === true);
+        resolve7(code === 0 && status2.loggedIn === true);
       } catch {
-        resolve5(false);
+        resolve7(false);
       }
     });
   });
 }
 var ClaudeAdapter = class {
+  constructor(policy) {
+    this.policy = policy;
+  }
+  policy;
   id = "claude";
   async probe() {
     const result = await claudeVersion();
@@ -20661,36 +21080,14 @@ var ClaudeAdapter = class {
     });
   }
   async plan(request, signal) {
-    const child = spawn2(
-      "claude",
-      [
-        "--print",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--permission-mode",
-        "dontAsk",
-        "--effort",
-        "low",
-        "--tools",
-        "",
-        "--disable-slash-commands",
-        "--strict-mcp-config",
-        "--mcp-config",
-        '{"mcpServers":{}}',
-        "--json-schema",
-        JSON.stringify(graphPlanJsonSchema),
-        renderPlannerPrompt(request)
-      ],
-      {
-        cwd: request.repositoryPath,
-        env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"]
-      }
-    );
+    const child = spawn2("claude", claudePlannerArgs(request, this.policy), {
+      cwd: request.repositoryPath,
+      env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
     const exitPromise = new Promise(
-      (resolve5) => child.once("close", (code) => resolve5(code ?? 1))
+      (resolve7) => child.once("close", (code) => resolve7(code ?? 1))
     );
     const abort = () => {
       child.kill("SIGTERM");
@@ -20731,14 +21128,14 @@ var ClaudeAdapter = class {
     }
   }
   async verify(request, signal) {
-    const child = spawn2("claude", claudeSemanticVerifierArgs(request), {
+    const child = spawn2("claude", claudeSemanticVerifierArgs(request, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
       shell: false,
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve5) => child.once("close", (code, closeSignal) => resolve5({ code, signal: closeSignal }))
+      (resolve7) => child.once("close", (code, closeSignal) => resolve7({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     let stderr = "";
@@ -20777,7 +21174,7 @@ var ClaudeAdapter = class {
     }
   }
   async *execute(request, signal) {
-    const args = claudeWorkerArgs(request);
+    const args = claudeWorkerArgs(request, this.policy);
     const child = spawn2("claude", args, {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -20785,7 +21182,7 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve5) => child.once("close", (code, closeSignal) => resolve5({ code, signal: closeSignal }))
+      (resolve7) => child.once("close", (code, closeSignal) => resolve7({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     yield { type: "started", invocationId: request.invocationId };
@@ -20850,7 +21247,31 @@ var ClaudeAdapter = class {
     return reconcilePersistedInvocation(invocation);
   }
 };
-function claudeWorkerArgs(request) {
+function claudePolicyArgs(policy, fallbackEffort) {
+  const effort = policy?.effort ?? fallbackEffort;
+  return [...policy ? ["--model", policy.model] : [], ...effort ? ["--effort", effort] : []];
+}
+function claudePlannerArgs(request, policy) {
+  return [
+    "--print",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--permission-mode",
+    "dontAsk",
+    ...claudePolicyArgs(policy, "low"),
+    "--tools",
+    "",
+    "--disable-slash-commands",
+    "--strict-mcp-config",
+    "--mcp-config",
+    '{"mcpServers":{}}',
+    "--json-schema",
+    JSON.stringify(graphPlanJsonSchema),
+    renderPlannerPrompt(request)
+  ];
+}
+function claudeWorkerArgs(request, policy) {
   const writable = request.allowedTools.includes("write");
   return [
     "--print",
@@ -20859,6 +21280,7 @@ function claudeWorkerArgs(request) {
     "--verbose",
     "--permission-mode",
     writable ? "acceptEdits" : "dontAsk",
+    ...claudePolicyArgs(policy),
     "--allowedTools",
     writable ? "Bash(*),Edit,Write,Read,Glob,Grep" : "Read,Glob,Grep",
     "--disable-slash-commands",
@@ -20871,7 +21293,7 @@ function claudeWorkerArgs(request) {
     renderWorkerPrompt(request.capsule)
   ];
 }
-function claudeSemanticVerifierArgs(request) {
+function claudeSemanticVerifierArgs(request, policy) {
   return [
     "--print",
     "--output-format",
@@ -20879,8 +21301,7 @@ function claudeSemanticVerifierArgs(request) {
     "--verbose",
     "--permission-mode",
     "dontAsk",
-    "--effort",
-    "low",
+    ...claudePolicyArgs(policy, "low"),
     "--tools",
     "Read,Glob,Grep",
     "--allowedTools",
@@ -21110,133 +21531,26 @@ async function amendRunGraph(store, input, actor = "runtime") {
   }
 }
 
-// packages/runtime/src/control.ts
-import { randomUUID as randomUUID4 } from "node:crypto";
-import { readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
-import { join as join3 } from "node:path";
-var RunControlChannel = class {
-  constructor(graphcraftRoot, runId) {
-    this.graphcraftRoot = graphcraftRoot;
-    this.runId = runId;
-    this.path = join3(graphcraftRoot, "controls", `${runId}.json`);
-  }
-  graphcraftRoot;
-  runId;
-  path;
-  async request(action, reason) {
-    const existing = await this.read();
-    if (existing?.action === "stop" && action === "pause") return existing;
-    const request = RunControlRequestSchema.parse({
-      schemaVersion: 1,
-      requestId: randomUUID4(),
-      runId: this.runId,
-      action,
-      cause: action === "pause" ? "user_pause" : "user_stop",
-      reason,
-      requestedAt: (/* @__PURE__ */ new Date()).toISOString(),
-      requestedByPid: process.pid
-    });
-    await writeJsonAtomic(this.path, request);
-    return request;
-  }
-  async read() {
-    try {
-      return RunControlRequestSchema.parse(JSON.parse(await readFile2(this.path, "utf8")));
-    } catch {
-      return void 0;
-    }
-  }
-  watch(onRequest, intervalMs = 100) {
-    let stopped = false;
-    let lastRequestId;
-    let inFlight = Promise.resolve();
-    const poll = () => {
-      if (stopped) return;
-      inFlight = inFlight.then(async () => {
-        const request = await this.read();
-        if (request && request.requestId !== lastRequestId) {
-          lastRequestId = request.requestId;
-          onRequest(request);
-        }
-      });
-    };
-    const timer = setInterval(poll, intervalMs);
-    timer.unref();
-    poll();
-    return async () => {
-      stopped = true;
-      clearInterval(timer);
-      await inFlight;
-    };
-  }
-  async clear(requestId) {
-    const current = await this.read();
-    if (current?.requestId !== requestId) return;
-    await unlink2(this.path).catch((error51) => {
-      if (error51.code !== "ENOENT") throw error51;
-    });
-  }
-};
-function targetReached(action, state) {
-  if (action === "pause") return ["paused", "stopped", "completed"].includes(state.status);
-  return ["stopped", "completed"].includes(state.status);
-}
-async function requestRunControl(store, action, reason = action === "pause" ? "Paused by user" : "Stopped by user", waitMs = 1e4) {
-  let state = await store.loadState();
-  if (targetReached(action, state)) return state;
-  const channel = new RunControlChannel(store.graphcraftRoot, store.runId);
-  const request = await channel.request(action, reason);
-  const lockPath = join3(store.graphcraftRoot, "locks", `${store.runId}.lock`);
-  const deadline = Date.now() + waitMs;
-  while (Date.now() <= deadline) {
-    const lock = new RunLock(lockPath);
-    try {
-      await lock.acquire();
-      try {
-        state = await store.loadState();
-        if (!targetReached(action, state)) {
-          await store.append("runtime", "control.applied", {
-            request,
-            outcome: "owner_unavailable",
-            termination: null
-          });
-          await store.append("user", action === "pause" ? "run.paused" : "run.stopped", {
-            reason,
-            requestId: request.requestId,
-            cause: request.cause
-          });
-          state = await store.loadState();
-        }
-        await channel.clear(request.requestId);
-        return state;
-      } finally {
-        await lock.release();
-      }
-    } catch (error51) {
-      if (!(error51 instanceof Error) || error51.message !== "Graphcraft run is already active")
-        throw error51;
-    }
-    await new Promise((resolve5) => setTimeout(resolve5, 50));
-  }
-  throw new Error(
-    `The active Graphcraft process did not acknowledge ${action} within ${waitMs}ms; the durable request remains pending`
-  );
-}
+// packages/runtime/src/benchmark.ts
+import { randomUUID as randomUUID8 } from "node:crypto";
+import { access as access2, mkdir as mkdir5, mkdtemp as mkdtemp2, readFile as readFile8, rename as rename2, rm as rm2, writeFile as writeFile4 } from "node:fs/promises";
+import { tmpdir as tmpdir2 } from "node:os";
+import { dirname as dirname6, isAbsolute as isAbsolute4, join as join10, resolve as resolve4, sep as sep3 } from "node:path";
 
 // packages/probes/src/index.ts
-import { access, readFile as readFile3, stat as stat2 } from "node:fs/promises";
+import { access, readFile as readFile2, stat as stat2 } from "node:fs/promises";
 import { constants } from "node:fs";
-import { dirname as dirname3, join as join4, resolve, sep } from "node:path";
+import { dirname as dirname3, join as join3, resolve, sep } from "node:path";
 
 // packages/probes/src/process.ts
 import { spawn as spawn3 } from "node:child_process";
 async function runProcess(command, args, options) {
   const started = performance.now();
   const timeoutMs = options.timeoutMs ?? 12e4;
-  return await new Promise((resolve5, reject) => {
+  return await new Promise((resolve7, reject) => {
     const child = spawn3(command, args, {
       cwd: options.cwd,
-      env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
+      env: { ...process.env, ...options.env, NO_COLOR: "1", FORCE_COLOR: "0" },
       shell: false,
       stdio: ["ignore", "pipe", "pipe"]
     });
@@ -21265,7 +21579,7 @@ async function runProcess(command, args, options) {
     child.once("close", (code) => {
       clearTimeout(timer);
       options.signal?.removeEventListener("abort", abort);
-      resolve5({
+      resolve7({
         exitCode: code ?? (timedOut ? 124 : 1),
         stdout: stdout2,
         stderr,
@@ -21318,7 +21632,7 @@ async function runProbe(spec, repositoryPath, signal) {
       exists = false;
     }
     let contains = true;
-    if (exists && spec.contains) contains = (await readFile3(path2, "utf8")).includes(spec.contains);
+    if (exists && spec.contains) contains = (await readFile2(path2, "utf8")).includes(spec.contains);
     const passed2 = exists === spec.shouldExist && contains;
     const summary = `${spec.path} ${exists ? "exists" : "does not exist"}${spec.contains ? ` and ${contains ? "contains" : "does not contain"} the required text` : ""}`;
     return {
@@ -21466,10 +21780,10 @@ async function packageCandidates(repositoryPath, family, terms) {
   const tracked = await runProcess("git", ["ls-files"], { cwd: repositoryPath });
   if (tracked.exitCode !== 0) return [];
   const manifests = tracked.stdout.split("\n").filter((path2) => path2 === "package.json" || path2.endsWith("/package.json")).slice(0, 100);
-  const rootManifest = manifests.includes("package.json") ? JSON.parse(await readFile3(join4(repositoryPath, "package.json"), "utf8")) : void 0;
+  const rootManifest = manifests.includes("package.json") ? JSON.parse(await readFile2(join3(repositoryPath, "package.json"), "utf8")) : void 0;
   const candidates = [];
   for (const manifestPath of manifests) {
-    const manifest2 = JSON.parse(await readFile3(join4(repositoryPath, manifestPath), "utf8"));
+    const manifest2 = JSON.parse(await readFile2(join3(repositoryPath, manifestPath), "utf8"));
     const directory = dirname3(manifestPath) === "." ? void 0 : dirname3(manifestPath);
     const relevant = !directory || terms.some(
       (term) => directory.toLowerCase().includes(term) || manifest2.name?.toLowerCase().includes(term)
@@ -21583,7 +21897,7 @@ async function discoverProbePlan(repositoryPath, task, baseSha) {
     items.push(completion);
   }
   try {
-    await access(join4(repositoryPath, "pyproject.toml"));
+    await access(join3(repositoryPath, "pyproject.toml"));
     items.push({
       phase: "completion",
       purpose: "regression",
@@ -21601,7 +21915,7 @@ async function discoverProbePlan(repositoryPath, task, baseSha) {
   } catch {
   }
   try {
-    await access(join4(repositoryPath, "go.mod"));
+    await access(join3(repositoryPath, "go.mod"));
     items.push({
       phase: "completion",
       purpose: "regression",
@@ -21629,131 +21943,121 @@ async function discoverProbePlan(repositoryPath, task, baseSha) {
   return await validateProbePlan({ schemaVersion: 1, family, items }, repositoryPath);
 }
 
-// packages/runtime/src/context.ts
-var contextStopWords = /* @__PURE__ */ new Set([
-  "acceptance",
-  "approved",
-  "complete",
-  "completion",
-  "feature",
-  "implement",
-  "implementation",
-  "repository",
-  "substantial",
-  "verify"
-]);
-function contextTerms(objective) {
-  return [
-    ...new Set(
-      (objective.toLowerCase().match(/[a-z0-9][a-z0-9._/-]{2,}/g) ?? []).filter(
-        (term) => !contextStopWords.has(term)
-      )
-    )
-  ].slice(0, 12);
-}
-function groundedRelevantPaths(paths, objective) {
-  const terms = contextTerms(objective);
-  return [...new Set(paths)].filter(
-    (path2) => path2.length > 0 && !path2.startsWith("dist/") && !path2.endsWith(".map") && !path2.endsWith(".lock")
-  ).map((path2) => {
-    const normalized = path2.toLowerCase();
-    const affinity = terms.filter((term) => normalized.includes(term)).length;
-    const source = /(?:^|\/)(?:src|test|tests)\//.test(path2) ? 2 : 0;
-    const policy = /(?:^|\/)(?:agents\.md|package\.json|pyproject\.toml|go\.mod)$/i.test(path2) ? 1 : 0;
-    return { path: path2, score: affinity * 4 + source + policy };
-  }).sort((left, right) => right.score - left.score || left.path.localeCompare(right.path)).slice(0, 4).map(({ path: path2 }) => path2);
-}
-function selectedTrackedPaths(inventory, selected) {
-  const matches = /* @__PURE__ */ new Set();
-  for (const path2 of inventory)
-    if (selected.some((candidate) => path2 === candidate || path2.startsWith(`${candidate}/`)))
-      matches.add(path2);
-  return matches;
-}
-async function prepareWorkerContext(input) {
-  const tracked = await runProcess(
-    "git",
-    ["ls-files", "--cached", "--others", "--exclude-standard"],
-    {
-      cwd: input.repositoryPath,
-      timeoutMs: 3e4
+// packages/runtime/src/runner.ts
+import { randomUUID as randomUUID7 } from "node:crypto";
+import { join as join9 } from "node:path";
+
+// packages/runtime/src/control.ts
+import { randomUUID as randomUUID4 } from "node:crypto";
+import { readFile as readFile3, unlink as unlink2 } from "node:fs/promises";
+import { join as join4 } from "node:path";
+var RunControlChannel = class {
+  constructor(graphcraftRoot, runId) {
+    this.graphcraftRoot = graphcraftRoot;
+    this.runId = runId;
+    this.path = join4(graphcraftRoot, "controls", `${runId}.json`);
+  }
+  graphcraftRoot;
+  runId;
+  path;
+  async request(action, reason) {
+    const existing = await this.read();
+    if (existing?.action === "stop" && action === "pause") return existing;
+    const request = RunControlRequestSchema.parse({
+      schemaVersion: 1,
+      requestId: randomUUID4(),
+      runId: this.runId,
+      action,
+      cause: action === "pause" ? "user_pause" : "user_stop",
+      reason,
+      requestedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      requestedByPid: process.pid
+    });
+    await writeJsonAtomic(this.path, request);
+    return request;
+  }
+  async read() {
+    try {
+      return RunControlRequestSchema.parse(JSON.parse(await readFile3(this.path, "utf8")));
+    } catch {
+      return void 0;
     }
-  );
-  if (tracked.exitCode !== 0) throw new Error("Unable to inventory repository context");
-  const repositoryPaths = tracked.stdout.split("\n").filter(Boolean).sort();
-  const inventory = await input.store.writeContentAddressedArtifact(
-    "context-repositories",
-    `${JSON.stringify(repositoryPaths)}
-`
-  );
-  const relevantPaths = input.node.contextSelector.relevantPaths.length ? input.node.contextSelector.relevantPaths : groundedRelevantPaths(repositoryPaths, input.node.objective);
-  if (input.node.kind !== "commit" && relevantPaths.length === 0)
-    throw new Error(`Node ${input.node.id} has no grounded repository context`);
-  const node2 = {
-    ...input.node,
-    contextSelector: { ...input.node.contextSelector, relevantPaths }
-  };
-  const capsule = createContextCapsule({
-    contract: input.contract,
-    node: node2,
-    predecessorEvidence: input.predecessorEvidence,
-    probeResults: input.probeResults
-  });
-  const capsuleHash = contentHash(capsule);
-  const storedCapsule = await input.store.writeCapsule(capsuleHash, capsule);
-  const matchedPaths = selectedTrackedPaths(repositoryPaths, capsule.relevantPaths);
-  const selectedPredecessorNodeIds = input.node.contextSelector.predecessorResults.filter(
-    (nodeId) => capsule.predecessorEvidence.some((value) => value.startsWith(`${nodeId}:`))
-  );
-  const selectedProbeResults = input.probeResults.filter(
-    ({ probeId }) => capsule.probeEvidence.some((value) => value.startsWith(`${probeId}:`))
-  );
-  const reusedArtifacts = [
-    ...storedCapsule.reused ? [storedCapsule.path] : [],
-    ...inventory.reused ? [inventory.path] : []
-  ];
-  const receipt = ContextSelectionReceiptSchema.parse({
-    schemaVersion: 1,
-    runId: input.contract.runId,
-    nodeId: input.node.id,
-    capsule: {
-      hash: capsuleHash,
-      path: storedCapsule.path,
-      characters: contextCapsuleCharacters(capsule)
-    },
-    selected: {
-      repositoryPaths: capsule.relevantPaths,
-      predecessorNodeIds: selectedPredecessorNodeIds,
-      predecessorEvidenceHashes: capsule.predecessorEvidence.map((value) => contentHash(value)),
-      probeIds: selectedProbeResults.map(({ probeId }) => probeId),
-      probeSignatures: selectedProbeResults.map(({ signature }) => signature),
-      acceptanceAnchorIds: capsule.acceptanceAnchors.map(({ id }) => id)
-    },
-    omitted: {
-      repositoryPathCount: repositoryPaths.length - matchedPaths.size,
-      declaredRepositoryPaths: input.node.contextSelector.relevantPaths.filter(
-        (path2) => !capsule.relevantPaths.includes(path2)
-      ),
-      predecessorNodeIds: input.node.dependsOn.filter(
-        (nodeId) => !selectedPredecessorNodeIds.includes(nodeId)
-      ),
-      probeIds: input.probeResults.filter(({ probeId }) => !selectedProbeResults.some((result) => result.probeId === probeId)).map(({ probeId }) => probeId),
-      repositoryInventory: {
-        digest: inventory.hash,
-        artifact: inventory.path,
-        totalPathCount: repositoryPaths.length
-      },
-      rawHostTranscripts: true,
-      rawProbeOutputs: true
-    },
-    reused: {
-      capsule: storedCapsule.reused,
-      repositoryInventory: inventory.reused,
-      artifacts: reusedArtifacts
+  }
+  watch(onRequest, intervalMs = 100) {
+    let stopped = false;
+    let lastRequestId;
+    let inFlight = Promise.resolve();
+    const poll = () => {
+      if (stopped) return;
+      inFlight = inFlight.then(async () => {
+        const request = await this.read();
+        if (request && request.requestId !== lastRequestId) {
+          lastRequestId = request.requestId;
+          onRequest(request);
+        }
+      });
+    };
+    const timer = setInterval(poll, intervalMs);
+    timer.unref();
+    poll();
+    return async () => {
+      stopped = true;
+      clearInterval(timer);
+      await inFlight;
+    };
+  }
+  async clear(requestId) {
+    const current = await this.read();
+    if (current?.requestId !== requestId) return;
+    await unlink2(this.path).catch((error51) => {
+      if (error51.code !== "ENOENT") throw error51;
+    });
+  }
+};
+function targetReached(action, state) {
+  if (action === "pause") return ["paused", "stopped", "completed"].includes(state.status);
+  return ["stopped", "completed"].includes(state.status);
+}
+async function requestRunControl(store, action, reason = action === "pause" ? "Paused by user" : "Stopped by user", waitMs = 1e4) {
+  let state = await store.loadState();
+  if (targetReached(action, state)) return state;
+  const channel = new RunControlChannel(store.graphcraftRoot, store.runId);
+  const request = await channel.request(action, reason);
+  const lockPath = join4(store.graphcraftRoot, "locks", `${store.runId}.lock`);
+  const deadline = Date.now() + waitMs;
+  while (Date.now() <= deadline) {
+    const lock = new RunLock(lockPath);
+    try {
+      await lock.acquire();
+      try {
+        state = await store.loadState();
+        if (!targetReached(action, state)) {
+          await store.append("runtime", "control.applied", {
+            request,
+            outcome: "owner_unavailable",
+            termination: null
+          });
+          await store.append("user", action === "pause" ? "run.paused" : "run.stopped", {
+            reason,
+            requestId: request.requestId,
+            cause: request.cause
+          });
+          state = await store.loadState();
+        }
+        await channel.clear(request.requestId);
+        return state;
+      } finally {
+        await lock.release();
+      }
+    } catch (error51) {
+      if (!(error51 instanceof Error) || error51.message !== "Graphcraft run is already active")
+        throw error51;
     }
-  });
-  await input.store.append("runtime", "context.selected", { receipt }, input.invocationId);
-  return { capsule, capsuleHash, receipt };
+    await new Promise((resolve7) => setTimeout(resolve7, 50));
+  }
+  throw new Error(
+    `The active Graphcraft process did not acknowledge ${action} within ${waitMs}ms; the durable request remains pending`
+  );
 }
 
 // packages/runtime/src/governance.ts
@@ -22140,228 +22444,9 @@ async function decideRunControl(store, input) {
   }
 }
 
-// packages/runtime/src/held-out.ts
-import { readFile as readFile4, stat as stat3 } from "node:fs/promises";
-import { isAbsolute as isAbsolute2, relative, resolve as resolve2, sep as sep2 } from "node:path";
-function relativeRepositoryPath(repositoryRoot, candidate) {
-  const root = resolve2(repositoryRoot);
-  const path2 = resolve2(repositoryRoot, candidate);
-  if (path2 !== root && !path2.startsWith(`${root}${sep2}`)) return void 0;
-  const result = relative(root, path2);
-  return result && !isAbsolute2(result) ? result : void 0;
-}
-function possibleFileArguments(values) {
-  return values.map((value) => value.replace(/^["']|["']$/g, "").replace(/[;&|]+$/g, "")).filter(
-    (value) => !value.startsWith("-") && (value.startsWith(".") || value.includes("/") || /\.[a-z0-9]{1,8}$/i.test(value))
-  );
-}
-async function fileIntegrity(repositoryRoot, cwd, values) {
-  const result = [];
-  for (const value of possibleFileArguments(values)) {
-    const path2 = relativeRepositoryPath(repositoryRoot, resolve2(repositoryRoot, cwd ?? ".", value));
-    if (!path2) continue;
-    const details = await stat3(resolve2(repositoryRoot, path2)).catch(() => void 0);
-    if (!details?.isFile()) continue;
-    const contents = await readFile4(resolve2(repositoryRoot, path2));
-    result.push({
-      kind: "file",
-      path: path2,
-      valueHash: contentHash({ path: path2, contents: contents.toString("base64") })
-    });
-  }
-  return result;
-}
-async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot) {
-  const integrity = {};
-  for (const item of probePlan.items.filter(({ phase }) => phase === "completion")) {
-    if (item.probe.kind === "held_out")
-      throw new Error("An approved probe plan cannot contain held-out references");
-    const protectedValues = [];
-    if (item.probe.kind === "command") {
-      protectedValues.push(
-        ...await fileIntegrity(repositoryRoot, item.probe.cwd, item.probe.args)
-      );
-    }
-    const match = /^(.*package\.json) script (.+)$/.exec(item.source);
-    if (!match) {
-      integrity[item.probe.id] = protectedValues;
-      continue;
-    }
-    const path2 = match[1];
-    const script = match[2];
-    const manifestPath = relativeRepositoryPath(repositoryRoot, path2);
-    if (!manifestPath) throw new Error(`Completion script ${script} escapes the repository`);
-    const manifest2 = JSON.parse(await readFile4(resolve2(repositoryRoot, manifestPath), "utf8"));
-    const value = manifest2.scripts?.[script];
-    if (!value) throw new Error(`Completion script ${script} is missing from ${manifestPath}`);
-    protectedValues.push({
-      kind: "package_script",
-      path: manifestPath,
-      script,
-      valueHash: contentHash({ path: manifestPath, script, value })
-    });
-    const scriptDirectory = manifestPath.includes("/") ? manifestPath.slice(0, manifestPath.lastIndexOf("/")) : void 0;
-    protectedValues.push(
-      ...await fileIntegrity(repositoryRoot, scriptDirectory, value.split(/\s+/))
-    );
-    const unique2 = new Map(
-      protectedValues.map((entry) => [
-        `${entry.kind}:${entry.path}${entry.kind === "package_script" ? `:${entry.script}` : ""}`,
-        entry
-      ])
-    );
-    integrity[item.probe.id] = [...unique2.values()];
-  }
-  return createHeldOutProbePlan(runId, probePlan, integrity);
-}
-async function heldOutIntegrityFailures(plan, repositoryPath) {
-  const failures = [];
-  for (const entry of plan.probes) {
-    const changedKinds = /* @__PURE__ */ new Set();
-    let signature = "";
-    for (const integrity of entry.integrity) {
-      let actualHash;
-      if (integrity.kind === "package_script") {
-        const manifest2 = await readFile4(resolve2(repositoryPath, integrity.path), "utf8").then(
-          (value2) => JSON.parse(value2)
-        ).catch(() => void 0);
-        const value = manifest2?.scripts?.[integrity.script];
-        actualHash = value ? contentHash({ path: integrity.path, script: integrity.script, value }) : contentHash({ missing: true, path: integrity.path, script: integrity.script });
-      } else {
-        const contents = await readFile4(resolve2(repositoryPath, integrity.path)).catch(
-          () => void 0
-        );
-        actualHash = contents ? contentHash({ path: integrity.path, contents: contents.toString("base64") }) : contentHash({ missing: true, path: integrity.path });
-      }
-      if (actualHash === integrity.valueHash) continue;
-      changedKinds.add(integrity.kind);
-      signature += actualHash;
-    }
-    if (changedKinds.size > 0) {
-      const detail = [
-        changedKinds.has("package_script") ? "package script definition" : void 0,
-        changedKinds.has("file") ? "protected measurement file" : void 0
-      ].filter(Boolean).join(" and ");
-      failures.push({
-        probeId: `${entry.probe.id}-integrity`,
-        kind: "file",
-        passed: false,
-        signature: contentHash(signature),
-        summary: `Approved completion check ${entry.probe.id} changed or was removed; restore its ${detail}`,
-        durationMs: 0
-      });
-    }
-  }
-  return failures;
-}
-function actionableHeldOutFailures(results) {
-  return results.map((result) => {
-    if (result.probeId.endsWith("-integrity")) return result;
-    const separator = result.summary.indexOf(":");
-    const detail = separator >= 0 ? result.summary.slice(separator + 1).trim() : "";
-    return {
-      ...result,
-      summary: `Completion check ${result.probeId} failed${detail ? `: ${detail}` : ""}`
-    };
-  });
-}
-
-// packages/runtime/src/migration.ts
-import { cp, readFile as readFile5 } from "node:fs/promises";
-import { join as join6 } from "node:path";
-var CURRENT_RUN_STORAGE_VERSION = 1;
-function manifest(runId, migratedFrom) {
-  return RunStorageManifestSchema.parse({
-    schemaVersion: CURRENT_RUN_STORAGE_VERSION,
-    runId,
-    migratedFrom,
-    formats: {
-      contract: 1,
-      graph: 1,
-      probePlan: 1,
-      heldOutProbes: 1,
-      events: 1,
-      state: 1,
-      workspace: 1,
-      capsules: 1,
-      invocationEvents: 1,
-      semanticReports: 1,
-      rawArtifacts: 1,
-      controlRequests: 1,
-      locks: 1
-    }
-  });
-}
-function runStorageManifestPath(runRoot) {
-  return join6(runRoot, "storage.json");
-}
-async function writeCurrentRunStorageManifest(runRoot, runId, migratedFrom) {
-  const value = manifest(runId, migratedFrom);
-  await writeJsonAtomic(runStorageManifestPath(runRoot), value);
-  return value;
-}
-async function ensureCurrentRunStorage(input) {
-  const path2 = runStorageManifestPath(input.runRoot);
-  let raw;
-  try {
-    raw = JSON.parse(await readFile5(path2, "utf8"));
-  } catch (error51) {
-    if (error51.code !== "ENOENT")
-      throw new Error(
-        `Run ${input.runId} has an unreadable storage manifest: ${error51.message}`
-      );
-  }
-  if (raw !== void 0) {
-    const version2 = typeof raw === "object" && raw !== null ? raw.schemaVersion : void 0;
-    if (typeof version2 === "number" && version2 > CURRENT_RUN_STORAGE_VERSION)
-      throw new Error(
-        `Run ${input.runId} uses future storage schema ${version2}; this Graphcraft supports through ${CURRENT_RUN_STORAGE_VERSION}. No files were changed.`
-      );
-    if (version2 !== CURRENT_RUN_STORAGE_VERSION)
-      throw new Error(
-        `Run ${input.runId} uses unsupported storage schema ${String(version2)}; no migration path is available. No files were changed.`
-      );
-    const parsed = RunStorageManifestSchema.parse(raw);
-    if (parsed.runId !== input.runId)
-      throw new Error(`Run storage manifest belongs to ${parsed.runId}, not ${input.runId}`);
-    return parsed;
-  }
-  await readFile5(join6(input.runRoot, "events.jsonl"), "utf8").catch((error51) => {
-    throw new Error(
-      `Legacy run ${input.runId} cannot migrate because events.jsonl is unavailable: ${error51.message}`
-    );
-  });
-  const lock = new RunLock(join6(input.graphcraftRoot, "locks", `${input.runId}.migration.lock`));
-  try {
-    await lock.acquire();
-  } catch (error51) {
-    if (!(error51 instanceof Error) || !error51.message.includes("already active")) throw error51;
-    const deadline = Date.now() + 5e3;
-    while (Date.now() <= deadline) {
-      const migrated = await readFile5(path2, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
-      if (migrated) return migrated;
-      await new Promise((resolve5) => setTimeout(resolve5, 10));
-    }
-    throw new Error(`Timed out waiting for storage migration of run ${input.runId}`);
-  }
-  try {
-    const migrated = await readFile5(path2, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
-    if (migrated) return migrated;
-    const backupRoot = join6(input.graphcraftRoot, "migration-backups", input.runId, "0-to-1");
-    await cp(input.runRoot, backupRoot, {
-      recursive: true,
-      force: true,
-      errorOnExist: false
-    });
-    return await writeCurrentRunStorageManifest(input.runRoot, input.runId, 0);
-  } finally {
-    await lock.release();
-  }
-}
-
 // packages/runtime/src/repository.ts
-import { appendFile, mkdir as mkdir3, readFile as readFile6 } from "node:fs/promises";
-import { basename, dirname as dirname4, isAbsolute as isAbsolute3, join as join7, resolve as resolve3 } from "node:path";
+import { appendFile, mkdir as mkdir3, readFile as readFile4 } from "node:fs/promises";
+import { basename, dirname as dirname4, isAbsolute as isAbsolute2, join as join6, resolve as resolve2 } from "node:path";
 async function git(repositoryPath, args) {
   const result = await runProcess("git", args, { cwd: repositoryPath, timeoutMs: 12e4 });
   if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `git ${args[0]} failed`);
@@ -22463,7 +22548,7 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
   ) : [];
   const taskMatches = await Promise.all(
     matchedPaths.map(async (path2) => {
-      const content = await readFile6(join7(repositoryRoot, path2), "utf8").catch(() => "");
+      const content = await readFile4(join6(repositoryRoot, path2), "utf8").catch(() => "");
       const normalized = content.toLowerCase();
       const score = searchTerms.filter((term) => normalized.includes(term)).length;
       const pathScore = searchTerms.filter((term) => path2.toLowerCase().includes(term)).length;
@@ -22488,7 +22573,7 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
   for (const path2 of baselinePaths) {
     if (remainingCharacters <= 0 || files.length >= 7) break;
     if (files.some((file2) => file2.path === path2)) continue;
-    const content = await readFile6(join7(repositoryRoot, path2), "utf8").catch(() => "");
+    const content = await readFile4(join6(repositoryRoot, path2), "utf8").catch(() => "");
     const limit = Math.min(2e3, remainingCharacters);
     const selected = content.slice(0, limit);
     files.push({ path: path2, content: selected, truncated: selected.length < content.length });
@@ -22504,10 +22589,10 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
 }
 async function ensureGraphcraftIgnored(repositoryRoot) {
   const rawExcludePath = await git(repositoryRoot, ["rev-parse", "--git-path", "info/exclude"]);
-  const excludePath = isAbsolute3(rawExcludePath) ? rawExcludePath : resolve3(repositoryRoot, rawExcludePath);
+  const excludePath = isAbsolute2(rawExcludePath) ? rawExcludePath : resolve2(repositoryRoot, rawExcludePath);
   let content = "";
   try {
-    content = await readFile6(excludePath, "utf8");
+    content = await readFile4(excludePath, "utf8");
   } catch {
     await mkdir3(dirname4(excludePath), { recursive: true });
   }
@@ -22519,11 +22604,11 @@ function slug(task) {
 }
 async function createRunWorkspace(contract) {
   const branch = `graphcraft/${contract.runId.slice(0, 8)}-${slug(contract.task)}`;
-  const parent = join7(
+  const parent = join6(
     dirname4(contract.repository.root),
     `.${basename(contract.repository.root)}-graphcraft-worktrees`
   );
-  const path2 = join7(parent, contract.runId);
+  const path2 = join6(parent, contract.runId);
   await mkdir3(parent, { recursive: true });
   const registered = await git(contract.repository.root, ["worktree", "list", "--porcelain"]);
   if (registered.includes(`worktree ${path2}`)) return { path: path2, branch, created: false };
@@ -22548,13 +22633,104 @@ async function createAtomicCommit(workspace, task) {
   return await git(workspace.path, ["rev-parse", "HEAD"]);
 }
 
-// packages/runtime/src/runner.ts
-import { randomUUID as randomUUID7 } from "node:crypto";
-import { join as join9 } from "node:path";
+// packages/runtime/src/store.ts
+import { appendFile as appendFile2, mkdir as mkdir4, readFile as readFile6, readdir, writeFile as writeFile3 } from "node:fs/promises";
+import { dirname as dirname5, join as join8 } from "node:path";
+
+// packages/runtime/src/migration.ts
+import { cp, readFile as readFile5 } from "node:fs/promises";
+import { join as join7 } from "node:path";
+var CURRENT_RUN_STORAGE_VERSION = 1;
+function manifest(runId, migratedFrom) {
+  return RunStorageManifestSchema.parse({
+    schemaVersion: CURRENT_RUN_STORAGE_VERSION,
+    runId,
+    migratedFrom,
+    formats: {
+      contract: 1,
+      graph: 1,
+      probePlan: 1,
+      heldOutProbes: 1,
+      events: 1,
+      state: 1,
+      workspace: 1,
+      capsules: 1,
+      invocationEvents: 1,
+      semanticReports: 1,
+      rawArtifacts: 1,
+      controlRequests: 1,
+      locks: 1
+    }
+  });
+}
+function runStorageManifestPath(runRoot) {
+  return join7(runRoot, "storage.json");
+}
+async function writeCurrentRunStorageManifest(runRoot, runId, migratedFrom) {
+  const value = manifest(runId, migratedFrom);
+  await writeJsonAtomic(runStorageManifestPath(runRoot), value);
+  return value;
+}
+async function ensureCurrentRunStorage(input) {
+  const path2 = runStorageManifestPath(input.runRoot);
+  let raw;
+  try {
+    raw = JSON.parse(await readFile5(path2, "utf8"));
+  } catch (error51) {
+    if (error51.code !== "ENOENT")
+      throw new Error(
+        `Run ${input.runId} has an unreadable storage manifest: ${error51.message}`
+      );
+  }
+  if (raw !== void 0) {
+    const version2 = typeof raw === "object" && raw !== null ? raw.schemaVersion : void 0;
+    if (typeof version2 === "number" && version2 > CURRENT_RUN_STORAGE_VERSION)
+      throw new Error(
+        `Run ${input.runId} uses future storage schema ${version2}; this Graphcraft supports through ${CURRENT_RUN_STORAGE_VERSION}. No files were changed.`
+      );
+    if (version2 !== CURRENT_RUN_STORAGE_VERSION)
+      throw new Error(
+        `Run ${input.runId} uses unsupported storage schema ${String(version2)}; no migration path is available. No files were changed.`
+      );
+    const parsed = RunStorageManifestSchema.parse(raw);
+    if (parsed.runId !== input.runId)
+      throw new Error(`Run storage manifest belongs to ${parsed.runId}, not ${input.runId}`);
+    return parsed;
+  }
+  await readFile5(join7(input.runRoot, "events.jsonl"), "utf8").catch((error51) => {
+    throw new Error(
+      `Legacy run ${input.runId} cannot migrate because events.jsonl is unavailable: ${error51.message}`
+    );
+  });
+  const lock = new RunLock(join7(input.graphcraftRoot, "locks", `${input.runId}.migration.lock`));
+  try {
+    await lock.acquire();
+  } catch (error51) {
+    if (!(error51 instanceof Error) || !error51.message.includes("already active")) throw error51;
+    const deadline = Date.now() + 5e3;
+    while (Date.now() <= deadline) {
+      const migrated = await readFile5(path2, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
+      if (migrated) return migrated;
+      await new Promise((resolve7) => setTimeout(resolve7, 10));
+    }
+    throw new Error(`Timed out waiting for storage migration of run ${input.runId}`);
+  }
+  try {
+    const migrated = await readFile5(path2, "utf8").then((value) => RunStorageManifestSchema.parse(JSON.parse(value))).catch(() => void 0);
+    if (migrated) return migrated;
+    const backupRoot = join7(input.graphcraftRoot, "migration-backups", input.runId, "0-to-1");
+    await cp(input.runRoot, backupRoot, {
+      recursive: true,
+      force: true,
+      errorOnExist: false
+    });
+    return await writeCurrentRunStorageManifest(input.runRoot, input.runId, 0);
+  } finally {
+    await lock.release();
+  }
+}
 
 // packages/runtime/src/store.ts
-import { appendFile as appendFile2, mkdir as mkdir4, readFile as readFile7, readdir, writeFile as writeFile3 } from "node:fs/promises";
-import { dirname as dirname5, join as join8 } from "node:path";
 var RunStore = class _RunStore {
   repositoryRoot;
   runId;
@@ -22628,7 +22804,7 @@ var RunStore = class _RunStore {
   async loadContract() {
     await this.ensureStorage();
     return RunContractSchema.parse(
-      JSON.parse(await readFile7(join8(this.runRoot, "contract.json"), "utf8"))
+      JSON.parse(await readFile6(join8(this.runRoot, "contract.json"), "utf8"))
     );
   }
   async saveGraph(graph) {
@@ -22643,11 +22819,11 @@ var RunStore = class _RunStore {
     )?.data.graph;
     if (eventGraph) {
       const graph = GraphSchema.parse(eventGraph);
-      const materialized = await readFile7(join8(this.runRoot, "graph.json"), "utf8").then((value) => GraphSchema.parse(JSON.parse(value))).catch(() => void 0);
+      const materialized = await readFile6(join8(this.runRoot, "graph.json"), "utf8").then((value) => GraphSchema.parse(JSON.parse(value))).catch(() => void 0);
       if (JSON.stringify(materialized) !== JSON.stringify(graph)) await this.saveGraph(graph);
       return graph;
     }
-    return GraphSchema.parse(JSON.parse(await readFile7(join8(this.runRoot, "graph.json"), "utf8")));
+    return GraphSchema.parse(JSON.parse(await readFile6(join8(this.runRoot, "graph.json"), "utf8")));
   }
   async saveProbePlan(probePlan) {
     await this.ensureStorage();
@@ -22661,14 +22837,14 @@ var RunStore = class _RunStore {
     )?.data.probePlan;
     if (eventPlan) {
       const probePlan = ProbePlanSchema.parse(eventPlan);
-      const materialized = await readFile7(join8(this.runRoot, "probe-plan.json"), "utf8").then((value) => ProbePlanSchema.parse(JSON.parse(value))).catch(() => void 0);
+      const materialized = await readFile6(join8(this.runRoot, "probe-plan.json"), "utf8").then((value) => ProbePlanSchema.parse(JSON.parse(value))).catch(() => void 0);
       if (JSON.stringify(materialized) !== JSON.stringify(probePlan))
         await this.saveProbePlan(probePlan);
       return probePlan;
     }
     try {
       return ProbePlanSchema.parse(
-        JSON.parse(await readFile7(join8(this.runRoot, "probe-plan.json"), "utf8"))
+        JSON.parse(await readFile6(join8(this.runRoot, "probe-plan.json"), "utf8"))
       );
     } catch {
       return probePlanFromGraph(await this.loadGraph());
@@ -22689,7 +22865,7 @@ var RunStore = class _RunStore {
     )?.data.heldOutProbePlan;
     if (eventPlan) {
       const heldOutProbePlan = validateHeldOutProbePlan(HeldOutProbePlanSchema.parse(eventPlan));
-      const materialized = await readFile7(join8(this.runRoot, "held-out-probes.json"), "utf8").then((value) => validateHeldOutProbePlan(HeldOutProbePlanSchema.parse(JSON.parse(value)))).catch(() => void 0);
+      const materialized = await readFile6(join8(this.runRoot, "held-out-probes.json"), "utf8").then((value) => validateHeldOutProbePlan(HeldOutProbePlanSchema.parse(JSON.parse(value)))).catch(() => void 0);
       if (JSON.stringify(materialized) !== JSON.stringify(heldOutProbePlan))
         await this.saveHeldOutProbePlan(heldOutProbePlan);
       return heldOutProbePlan;
@@ -22697,7 +22873,7 @@ var RunStore = class _RunStore {
     try {
       return validateHeldOutProbePlan(
         HeldOutProbePlanSchema.parse(
-          JSON.parse(await readFile7(join8(this.runRoot, "held-out-probes.json"), "utf8"))
+          JSON.parse(await readFile6(join8(this.runRoot, "held-out-probes.json"), "utf8"))
         )
       );
     } catch {
@@ -22706,7 +22882,7 @@ var RunStore = class _RunStore {
   }
   async loadEvents() {
     await this.ensureStorage();
-    const content = await readFile7(this.eventsPath(), "utf8");
+    const content = await readFile6(this.eventsPath(), "utf8");
     const events = content.split("\n").filter(Boolean).map((line) => RunEventSchema.parse(JSON.parse(line)));
     for (const [index, event] of events.entries()) {
       verifyRunEvent(event);
@@ -22718,7 +22894,7 @@ var RunStore = class _RunStore {
   async loadState() {
     await this.ensureStorage();
     try {
-      const value = JSON.parse(await readFile7(join8(this.runRoot, "state.json"), "utf8"));
+      const value = JSON.parse(await readFile6(join8(this.runRoot, "state.json"), "utf8"));
       if (!("tokenLedger" in value)) return await this.rebuildViews();
       return RunStateSchema.parse(value);
     } catch {
@@ -22793,7 +22969,7 @@ var RunStore = class _RunStore {
   async loadInvocationEvents(invocationId) {
     await this.ensureStorage();
     const path2 = join8(this.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
-    const content = await readFile7(path2, "utf8");
+    const content = await readFile6(path2, "utf8");
     return content.split("\n").filter(Boolean).map((line) => HostEventSchema.parse(JSON.parse(line)));
   }
   async loadGraphHistory() {
@@ -22843,7 +23019,7 @@ var RunStore = class _RunStore {
   async writeCapsule(hash2, value) {
     await this.ensureStorage();
     const path2 = join8(this.runRoot, "capsules", `${hash2}.json`);
-    const reused = await readFile7(path2, "utf8").then((existing) => contentHash(JSON.parse(existing)) === hash2).catch(() => false);
+    const reused = await readFile6(path2, "utf8").then((existing) => contentHash(JSON.parse(existing)) === hash2).catch(() => false);
     if (reused) return { path: path2, reused: true };
     await writeJsonAtomic(path2, value);
     return { path: path2, reused: false };
@@ -22855,7 +23031,7 @@ var RunStore = class _RunStore {
     const bytes = typeof value === "string" ? Buffer.from(value) : Buffer.from(value);
     const hash2 = contentHash({ contents: bytes.toString("base64") });
     const path2 = join8(this.runRoot, "artifacts", category, `${hash2}.${extension}`);
-    const reused = await readFile7(path2).then((existing) => Buffer.compare(existing, bytes) === 0).catch(() => false);
+    const reused = await readFile6(path2).then((existing) => Buffer.compare(existing, bytes) === 0).catch(() => false);
     if (reused) return { path: path2, hash: hash2, reused: true };
     await mkdir4(dirname5(path2), { recursive: true });
     await writeFile3(path2, bytes, { mode: 384 });
@@ -22867,7 +23043,7 @@ var RunStore = class _RunStore {
   }
   async loadWorkspace() {
     await this.ensureStorage();
-    return JSON.parse(await readFile7(join8(this.runRoot, "workspace.json"), "utf8"));
+    return JSON.parse(await readFile6(join8(this.runRoot, "workspace.json"), "utf8"));
   }
   async materialize(events) {
     const state = reduceEvents(events);
@@ -22902,6 +23078,259 @@ async function resolveRunId(repositoryRoot, reference) {
   if (matches.length !== 1)
     throw new Error(`Run reference ${reference} matched ${matches.length} runs`);
   return matches[0];
+}
+
+// packages/runtime/src/context.ts
+var contextStopWords = /* @__PURE__ */ new Set([
+  "acceptance",
+  "approved",
+  "complete",
+  "completion",
+  "feature",
+  "implement",
+  "implementation",
+  "repository",
+  "substantial",
+  "verify"
+]);
+function contextTerms(objective) {
+  return [
+    ...new Set(
+      (objective.toLowerCase().match(/[a-z0-9][a-z0-9._/-]{2,}/g) ?? []).filter(
+        (term) => !contextStopWords.has(term)
+      )
+    )
+  ].slice(0, 12);
+}
+function groundedRelevantPaths(paths, objective) {
+  const terms = contextTerms(objective);
+  return [...new Set(paths)].filter(
+    (path2) => path2.length > 0 && !path2.startsWith("dist/") && !path2.endsWith(".map") && !path2.endsWith(".lock")
+  ).map((path2) => {
+    const normalized = path2.toLowerCase();
+    const affinity = terms.filter((term) => normalized.includes(term)).length;
+    const source = /(?:^|\/)(?:src|test|tests)\//.test(path2) ? 2 : 0;
+    const policy = /(?:^|\/)(?:agents\.md|package\.json|pyproject\.toml|go\.mod)$/i.test(path2) ? 1 : 0;
+    return { path: path2, score: affinity * 4 + source + policy };
+  }).sort((left, right) => right.score - left.score || left.path.localeCompare(right.path)).slice(0, 4).map(({ path: path2 }) => path2);
+}
+function selectedTrackedPaths(inventory, selected) {
+  const matches = /* @__PURE__ */ new Set();
+  for (const path2 of inventory)
+    if (selected.some((candidate) => path2 === candidate || path2.startsWith(`${candidate}/`)))
+      matches.add(path2);
+  return matches;
+}
+async function prepareWorkerContext(input) {
+  const tracked = await runProcess(
+    "git",
+    ["ls-files", "--cached", "--others", "--exclude-standard"],
+    {
+      cwd: input.repositoryPath,
+      timeoutMs: 3e4
+    }
+  );
+  if (tracked.exitCode !== 0) throw new Error("Unable to inventory repository context");
+  const repositoryPaths = tracked.stdout.split("\n").filter(Boolean).sort();
+  const inventory = await input.store.writeContentAddressedArtifact(
+    "context-repositories",
+    `${JSON.stringify(repositoryPaths)}
+`
+  );
+  const relevantPaths = input.node.contextSelector.relevantPaths.length ? input.node.contextSelector.relevantPaths : groundedRelevantPaths(repositoryPaths, input.node.objective);
+  if (input.node.kind !== "commit" && relevantPaths.length === 0)
+    throw new Error(`Node ${input.node.id} has no grounded repository context`);
+  const node2 = {
+    ...input.node,
+    contextSelector: { ...input.node.contextSelector, relevantPaths }
+  };
+  const capsule = createContextCapsule({
+    contract: input.contract,
+    node: node2,
+    predecessorEvidence: input.predecessorEvidence,
+    probeResults: input.probeResults
+  });
+  const capsuleHash = contentHash(capsule);
+  const storedCapsule = await input.store.writeCapsule(capsuleHash, capsule);
+  const matchedPaths = selectedTrackedPaths(repositoryPaths, capsule.relevantPaths);
+  const selectedPredecessorNodeIds = input.node.contextSelector.predecessorResults.filter(
+    (nodeId) => capsule.predecessorEvidence.some((value) => value.startsWith(`${nodeId}:`))
+  );
+  const selectedProbeResults = input.probeResults.filter(
+    ({ probeId }) => capsule.probeEvidence.some((value) => value.startsWith(`${probeId}:`))
+  );
+  const reusedArtifacts = [
+    ...storedCapsule.reused ? [storedCapsule.path] : [],
+    ...inventory.reused ? [inventory.path] : []
+  ];
+  const receipt = ContextSelectionReceiptSchema.parse({
+    schemaVersion: 1,
+    runId: input.contract.runId,
+    nodeId: input.node.id,
+    capsule: {
+      hash: capsuleHash,
+      path: storedCapsule.path,
+      characters: contextCapsuleCharacters(capsule)
+    },
+    selected: {
+      repositoryPaths: capsule.relevantPaths,
+      predecessorNodeIds: selectedPredecessorNodeIds,
+      predecessorEvidenceHashes: capsule.predecessorEvidence.map((value) => contentHash(value)),
+      probeIds: selectedProbeResults.map(({ probeId }) => probeId),
+      probeSignatures: selectedProbeResults.map(({ signature }) => signature),
+      acceptanceAnchorIds: capsule.acceptanceAnchors.map(({ id }) => id)
+    },
+    omitted: {
+      repositoryPathCount: repositoryPaths.length - matchedPaths.size,
+      declaredRepositoryPaths: input.node.contextSelector.relevantPaths.filter(
+        (path2) => !capsule.relevantPaths.includes(path2)
+      ),
+      predecessorNodeIds: input.node.dependsOn.filter(
+        (nodeId) => !selectedPredecessorNodeIds.includes(nodeId)
+      ),
+      probeIds: input.probeResults.filter(({ probeId }) => !selectedProbeResults.some((result) => result.probeId === probeId)).map(({ probeId }) => probeId),
+      repositoryInventory: {
+        digest: inventory.hash,
+        artifact: inventory.path,
+        totalPathCount: repositoryPaths.length
+      },
+      rawHostTranscripts: true,
+      rawProbeOutputs: true
+    },
+    reused: {
+      capsule: storedCapsule.reused,
+      repositoryInventory: inventory.reused,
+      artifacts: reusedArtifacts
+    }
+  });
+  await input.store.append("runtime", "context.selected", { receipt }, input.invocationId);
+  return { capsule, capsuleHash, receipt };
+}
+
+// packages/runtime/src/held-out.ts
+import { readFile as readFile7, stat as stat3 } from "node:fs/promises";
+import { isAbsolute as isAbsolute3, relative, resolve as resolve3, sep as sep2 } from "node:path";
+function relativeRepositoryPath(repositoryRoot, candidate) {
+  const root = resolve3(repositoryRoot);
+  const path2 = resolve3(repositoryRoot, candidate);
+  if (path2 !== root && !path2.startsWith(`${root}${sep2}`)) return void 0;
+  const result = relative(root, path2);
+  return result && !isAbsolute3(result) ? result : void 0;
+}
+function possibleFileArguments(values) {
+  return values.map((value) => value.replace(/^["']|["']$/g, "").replace(/[;&|]+$/g, "")).filter(
+    (value) => !value.startsWith("-") && (value.startsWith(".") || value.includes("/") || /\.[a-z0-9]{1,8}$/i.test(value))
+  );
+}
+async function fileIntegrity(repositoryRoot, cwd, values) {
+  const result = [];
+  for (const value of possibleFileArguments(values)) {
+    const path2 = relativeRepositoryPath(repositoryRoot, resolve3(repositoryRoot, cwd ?? ".", value));
+    if (!path2) continue;
+    const details = await stat3(resolve3(repositoryRoot, path2)).catch(() => void 0);
+    if (!details?.isFile()) continue;
+    const contents = await readFile7(resolve3(repositoryRoot, path2));
+    result.push({
+      kind: "file",
+      path: path2,
+      valueHash: contentHash({ path: path2, contents: contents.toString("base64") })
+    });
+  }
+  return result;
+}
+async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot) {
+  const integrity = {};
+  for (const item of probePlan.items.filter(({ phase }) => phase === "completion")) {
+    if (item.probe.kind === "held_out")
+      throw new Error("An approved probe plan cannot contain held-out references");
+    const protectedValues = [];
+    if (item.probe.kind === "command") {
+      protectedValues.push(
+        ...await fileIntegrity(repositoryRoot, item.probe.cwd, item.probe.args)
+      );
+    }
+    const match = /^(.*package\.json) script (.+)$/.exec(item.source);
+    if (!match) {
+      integrity[item.probe.id] = protectedValues;
+      continue;
+    }
+    const path2 = match[1];
+    const script = match[2];
+    const manifestPath = relativeRepositoryPath(repositoryRoot, path2);
+    if (!manifestPath) throw new Error(`Completion script ${script} escapes the repository`);
+    const manifest2 = JSON.parse(await readFile7(resolve3(repositoryRoot, manifestPath), "utf8"));
+    const value = manifest2.scripts?.[script];
+    if (!value) throw new Error(`Completion script ${script} is missing from ${manifestPath}`);
+    protectedValues.push({
+      kind: "package_script",
+      path: manifestPath,
+      script,
+      valueHash: contentHash({ path: manifestPath, script, value })
+    });
+    const scriptDirectory = manifestPath.includes("/") ? manifestPath.slice(0, manifestPath.lastIndexOf("/")) : void 0;
+    protectedValues.push(
+      ...await fileIntegrity(repositoryRoot, scriptDirectory, value.split(/\s+/))
+    );
+    const unique2 = new Map(
+      protectedValues.map((entry) => [
+        `${entry.kind}:${entry.path}${entry.kind === "package_script" ? `:${entry.script}` : ""}`,
+        entry
+      ])
+    );
+    integrity[item.probe.id] = [...unique2.values()];
+  }
+  return createHeldOutProbePlan(runId, probePlan, integrity);
+}
+async function heldOutIntegrityFailures(plan, repositoryPath) {
+  const failures = [];
+  for (const entry of plan.probes) {
+    const changedKinds = /* @__PURE__ */ new Set();
+    let signature = "";
+    for (const integrity of entry.integrity) {
+      let actualHash;
+      if (integrity.kind === "package_script") {
+        const manifest2 = await readFile7(resolve3(repositoryPath, integrity.path), "utf8").then(
+          (value2) => JSON.parse(value2)
+        ).catch(() => void 0);
+        const value = manifest2?.scripts?.[integrity.script];
+        actualHash = value ? contentHash({ path: integrity.path, script: integrity.script, value }) : contentHash({ missing: true, path: integrity.path, script: integrity.script });
+      } else {
+        const contents = await readFile7(resolve3(repositoryPath, integrity.path)).catch(
+          () => void 0
+        );
+        actualHash = contents ? contentHash({ path: integrity.path, contents: contents.toString("base64") }) : contentHash({ missing: true, path: integrity.path });
+      }
+      if (actualHash === integrity.valueHash) continue;
+      changedKinds.add(integrity.kind);
+      signature += actualHash;
+    }
+    if (changedKinds.size > 0) {
+      const detail = [
+        changedKinds.has("package_script") ? "package script definition" : void 0,
+        changedKinds.has("file") ? "protected measurement file" : void 0
+      ].filter(Boolean).join(" and ");
+      failures.push({
+        probeId: `${entry.probe.id}-integrity`,
+        kind: "file",
+        passed: false,
+        signature: contentHash(signature),
+        summary: `Approved completion check ${entry.probe.id} changed or was removed; restore its ${detail}`,
+        durationMs: 0
+      });
+    }
+  }
+  return failures;
+}
+function actionableHeldOutFailures(results) {
+  return results.map((result) => {
+    if (result.probeId.endsWith("-integrity")) return result;
+    const separator = result.summary.indexOf(":");
+    const detail = separator >= 0 ? result.summary.slice(separator + 1).trim() : "";
+    return {
+      ...result,
+      summary: `Completion check ${result.probeId} failed${detail ? `: ${detail}` : ""}`
+    };
+  });
 }
 
 // packages/runtime/src/trajectory.ts
@@ -24502,10 +24931,428 @@ async function executeRun(input) {
   }
 }
 
+// packages/runtime/src/benchmark.ts
+var tokenDimensions = [
+  "input",
+  "cachedInput",
+  "uncachedInput",
+  "output",
+  "reasoning",
+  "total"
+];
+var permissionPolicy = "local_read_write_shell_no_external";
+var scorerPolicy = "declared_checks_plus_suite_assertions";
+function safeFixturePath(root, path2) {
+  if (isAbsolute4(path2) || path2.split(/[\\/]/).includes(".."))
+    throw new Error(`Benchmark fixture path is unsafe: ${path2}`);
+  const resolved = resolve4(root, path2);
+  if (resolved !== root && !resolved.startsWith(`${root}${sep3}`))
+    throw new Error(`Benchmark fixture path escapes its repository: ${path2}`);
+  return resolved;
+}
+async function loadBenchmarkSuite(path2) {
+  return BenchmarkSuiteSchema.parse(JSON.parse(await readFile8(resolve4(path2), "utf8")));
+}
+async function materializeTask(task) {
+  const repository = await mkdtemp2(join10(tmpdir2(), `graphcraft-benchmark-${task.id}-`));
+  for (const [path2, value] of Object.entries(task.initialFiles)) {
+    const target = safeFixturePath(repository, path2);
+    await mkdir5(dirname6(target), { recursive: true });
+    await writeFile4(target, value, "utf8");
+  }
+  const initialized = await runProcess("git", ["init", "-b", "main"], { cwd: repository });
+  if (initialized.exitCode !== 0) throw new Error(`Unable to initialize ${task.id}`);
+  await runProcess("git", ["add", "."], { cwd: repository });
+  const committed = await runProcess(
+    "git",
+    [
+      "-c",
+      "commit.gpgSign=false",
+      "-c",
+      "user.name=Graphcraft Benchmark",
+      "-c",
+      "user.email=benchmark@graphcraft.local",
+      "commit",
+      "-m",
+      `fixture ${task.id}`
+    ],
+    {
+      cwd: repository,
+      env: {
+        GIT_AUTHOR_DATE: "2026-01-01T00:00:00Z",
+        GIT_COMMITTER_DATE: "2026-01-01T00:00:00Z"
+      }
+    }
+  );
+  if (committed.exitCode !== 0) throw new Error(`Unable to commit fixture ${task.id}`);
+  const head = await runProcess("git", ["rev-parse", "HEAD"], { cwd: repository });
+  if (head.exitCode !== 0 || !head.stdout.trim())
+    throw new Error(`Unable to hash fixture ${task.id}`);
+  return {
+    repository,
+    repositoryDigest: contentHash(task.initialFiles),
+    baseSha: head.stdout.trim()
+  };
+}
+async function scoreAcceptance(task, repository, summaryEvidence = "") {
+  const results = [];
+  for (const [index, check2] of task.checks.entries()) {
+    try {
+      const result = await runProcess(check2.command, check2.args, {
+        cwd: repository,
+        timeoutMs: check2.timeoutMs
+      });
+      const passed = !result.timedOut && result.exitCode === check2.expectedExitCode;
+      results.push({
+        path: `$check:${index + 1}`,
+        passed,
+        summary: `${check2.command} ${check2.args.join(" ")} ${result.timedOut ? "timed out" : `exited ${result.exitCode}`} (expected ${check2.expectedExitCode})`
+      });
+    } catch (error51) {
+      results.push({
+        path: `$check:${index + 1}`,
+        passed: false,
+        summary: `${check2.command} could not run: ${error51 instanceof Error ? error51.message : String(error51)}`
+      });
+    }
+  }
+  for (const assertion of task.acceptance) {
+    if (assertion.kind === "summary_contains") {
+      const passed2 = summaryEvidence.includes(assertion.value);
+      results.push({
+        path: "$summary",
+        passed: passed2,
+        summary: `run summary ${passed2 ? "contains" : "does not contain"} ${assertion.value}`
+      });
+      continue;
+    }
+    const target = safeFixturePath(repository, assertion.path);
+    let exists = true;
+    try {
+      await access2(target);
+    } catch {
+      exists = false;
+    }
+    if (assertion.kind === "exists" || assertion.kind === "absent") {
+      const passed2 = assertion.kind === "exists" ? exists : !exists;
+      results.push({
+        path: assertion.path,
+        passed: passed2,
+        summary: `${assertion.path} ${exists ? "exists" : "is absent"}`
+      });
+      continue;
+    }
+    const value = exists ? await readFile8(target, "utf8") : "";
+    const passed = exists && (assertion.kind === "equals" ? value === assertion.value : assertion.kind === "not_contains" ? !value.includes(assertion.value) : value.includes(assertion.value));
+    results.push({
+      path: assertion.path,
+      passed,
+      summary: `${assertion.path} ${passed ? "satisfies" : "does not satisfy"} ${assertion.kind}`
+    });
+  }
+  return results;
+}
+function usageSummary(usages) {
+  const usage = aggregateTokenUsage(usages.length ? usages : [unavailableTokenUsage()]);
+  const limitations = tokenDimensions.filter(
+    (dimension) => ["estimated", "unavailable", "legacy_unknown"].includes(usage.availability[dimension])
+  ).map((dimension) => `${dimension}:${usage.availability[dimension]}`);
+  return { usage, reconciled: limitations.length === 0, limitations };
+}
+async function runBaselineTrial(input) {
+  const started = performance.now();
+  const usages = [];
+  const failureTrace = [];
+  const summaryEvidence = [];
+  let resultStatus = "error";
+  const capsule = ContextCapsuleSchema.parse({
+    schemaVersion: 1,
+    runId: randomUUID8(),
+    nodeId: `baseline-${input.task.id}`,
+    objective: input.task.task,
+    finishLine: { kind: "local_verified" },
+    constraints: [
+      "Work only in this repository.",
+      "Follow repository instructions and run the declared checks.",
+      "Do not commit, push, weaken checks, or claim completion without repository evidence."
+    ],
+    acceptanceAnchors: [
+      {
+        id: "benchmark-outcome",
+        description: "The task outcome must satisfy an external deterministic scorer",
+        owner: "held_out_eval",
+        evidenceSource: "benchmark harness",
+        mutationPolicy: "immutable"
+      }
+    ],
+    predecessorEvidence: [],
+    relevantPaths: Object.keys(input.task.initialFiles).sort(),
+    probeEvidence: []
+  });
+  try {
+    for await (const event of input.adapter.execute(
+      {
+        invocationId: input.trial.trialId,
+        repositoryPath: input.repository,
+        capsule,
+        allowedTools: ["read", "write", "shell"]
+      },
+      new AbortController().signal
+    )) {
+      if (event.type === "usage") usages.push(event.usage);
+      if (event.type === "result") {
+        resultStatus = event.result.status;
+        summaryEvidence.push(event.result.summary, ...event.result.evidence);
+      }
+      if (event.type === "error") {
+        resultStatus = "error";
+        failureTrace.push(event.message);
+      }
+      if (event.type === "terminated") {
+        resultStatus = "error";
+        failureTrace.push(`${event.termination.cause}: ${event.termination.outcome}`);
+      }
+    }
+  } catch (error51) {
+    resultStatus = "error";
+    failureTrace.push(error51 instanceof Error ? error51.message : String(error51));
+  }
+  const acceptance = await scoreAcceptance(
+    input.task,
+    input.repository,
+    summaryEvidence.join("\n")
+  );
+  failureTrace.push(
+    ...acceptance.filter(({ passed }) => !passed).map(({ summary }) => `acceptance: ${summary}`)
+  );
+  const tokens = usageSummary(usages);
+  return BenchmarkTrialResultSchema.parse({
+    trial: input.trial,
+    hostVersion: input.hostVersion,
+    modelPolicy: input.policy.model,
+    effortPolicy: input.policy.effort,
+    permissionPolicy,
+    acceptanceScorerDigest: contentHash({
+      checks: input.task.checks,
+      acceptance: input.task.acceptance
+    }),
+    repositoryDigest: input.repositoryDigest,
+    baseSha: input.baseSha,
+    executionStatus: resultStatus,
+    accepted: resultStatus === "completed" && acceptance.every(({ passed }) => passed),
+    acceptance,
+    usage: tokens.usage,
+    usageReconciled: tokens.reconciled,
+    limitations: tokens.limitations,
+    durationMs: Math.round(performance.now() - started),
+    humanInterventions: 0,
+    failureTrace
+  });
+}
+async function runGraphcraftTrial(input) {
+  const started = performance.now();
+  const failureTrace = [];
+  let executionStatus = "error";
+  let acceptanceRepository = input.repository;
+  let summaryEvidence = "";
+  let tokens = usageSummary([]);
+  try {
+    const created = await createRun(input.task.task, {
+      cwd: input.repository,
+      planner: input.adapter,
+      finishLine: "local_verified"
+    });
+    const state = await executeRun({ store: created.store, adapter: input.adapter, approve: true });
+    executionStatus = state.status === "completed" ? "completed" : state.status === "blocked" ? "blocked" : "failed";
+    const report = usageSummary(state.tokenLedger.map(({ usage }) => usage));
+    tokens = report;
+    const workspace = await created.store.loadWorkspace();
+    acceptanceRepository = workspace.path;
+    summaryEvidence = [
+      ...Object.values(state.nodes).map((node2) => node2.lastSummary).filter((value) => typeof value === "string"),
+      ...state.latestProgressEvidence
+    ].join("\n");
+    const events = await created.store.loadEvents();
+    failureTrace.push(
+      ...events.filter(({ type }) => type === "node.failed" || type === "run.blocked").map(({ data }) => String(data.reason ?? "run blocked"))
+    );
+  } catch (error51) {
+    failureTrace.push(error51 instanceof Error ? error51.message : String(error51));
+  }
+  const acceptance = await scoreAcceptance(input.task, acceptanceRepository, summaryEvidence);
+  failureTrace.push(
+    ...acceptance.filter(({ passed }) => !passed).map(({ summary }) => `acceptance: ${summary}`)
+  );
+  return BenchmarkTrialResultSchema.parse({
+    trial: input.trial,
+    hostVersion: input.hostVersion,
+    modelPolicy: input.policy.model,
+    effortPolicy: input.policy.effort,
+    permissionPolicy,
+    acceptanceScorerDigest: contentHash({
+      checks: input.task.checks,
+      acceptance: input.task.acceptance
+    }),
+    repositoryDigest: input.repositoryDigest,
+    baseSha: input.baseSha,
+    executionStatus,
+    accepted: executionStatus === "completed" && acceptance.every(({ passed }) => passed),
+    acceptance,
+    usage: tokens.usage,
+    usageReconciled: tokens.reconciled,
+    limitations: tokens.limitations,
+    durationMs: Math.round(performance.now() - started),
+    humanInterventions: 0,
+    failureTrace
+  });
+}
+async function runBenchmark(input) {
+  const suite = BenchmarkSuiteSchema.parse(input.suite);
+  const hosts = [...new Set(input.hosts)].sort();
+  if (hosts.length === 0) throw new Error("A benchmark requires at least one host");
+  const policies = {};
+  for (const host of hosts) {
+    const policy = input.policies[host];
+    if (!policy?.model.trim()) throw new Error(`An explicit --${host}-model policy is required`);
+    if (!["low", "medium", "high", "xhigh"].includes(policy.effort))
+      throw new Error(`Unsupported ${host} benchmark effort policy: ${policy.effort}`);
+    policies[host] = { model: policy.model.trim(), effort: policy.effort };
+  }
+  const efforts = new Set(hosts.map((host) => policies[host].effort));
+  if (efforts.size !== 1)
+    throw new Error("Matched cross-host benchmarks require one shared effort policy");
+  const effortPolicy = policies[hosts[0]].effort;
+  const modelPolicy = {};
+  for (const host of hosts) modelPolicy[host] = policies[host].model;
+  const schedule = createBenchmarkSchedule({
+    suite,
+    hosts,
+    seed: input.seed,
+    ...input.repetitions ? { repetitions: input.repetitions } : {}
+  });
+  const outputPath = resolve4(input.outputPath);
+  const suiteDigest = contentHash(suite);
+  const environment = {
+    platform: process.platform,
+    architecture: process.arch,
+    nodeVersion: process.version
+  };
+  const byTask = new Map(suite.tasks.map((task) => [task.id, task]));
+  let startedAt = (/* @__PURE__ */ new Date()).toISOString();
+  let results = [];
+  let existingReport;
+  try {
+    const existing = BenchmarkReportSchema.parse(JSON.parse(await readFile8(outputPath, "utf8")));
+    if (existing.suite.id !== suite.id || existing.suite.version !== suite.version || existing.suite.digest !== suiteDigest || existing.seed !== input.seed || JSON.stringify(existing.modelPolicy) !== JSON.stringify(modelPolicy) || existing.effortPolicy !== effortPolicy || JSON.stringify(existing.environment) !== JSON.stringify(environment) || JSON.stringify(existing.schedule) !== JSON.stringify(schedule))
+      throw new Error("The existing benchmark report does not match this suite and schedule");
+    startedAt = existing.startedAt;
+    results = existing.results;
+    existingReport = existing;
+  } catch (error51) {
+    if (error51.code !== "ENOENT") {
+      if (error51 instanceof SyntaxError)
+        throw new Error(`Benchmark report is not valid JSON: ${outputPath}`);
+      if (error51 instanceof Error && !error51.message.includes("ENOENT")) throw error51;
+    }
+  }
+  const scheduledIds = new Set(schedule.map(({ trialId }) => trialId));
+  if (results.some(({ trial }) => !scheduledIds.has(trial.trialId)))
+    throw new Error("The existing benchmark report contains a trial outside the current schedule");
+  if (new Set(results.map(({ trial }) => trial.trialId)).size !== results.length)
+    throw new Error("The existing benchmark report contains duplicated trial results");
+  if (results.some(
+    ({ trial, modelPolicy: resultModel, effortPolicy: resultEffort, ...result }) => JSON.stringify(trial) !== JSON.stringify(schedule.find(({ trialId }) => trialId === trial.trialId)) || resultModel !== policies[trial.host].model || resultEffort !== policies[trial.host].effort || result.repositoryDigest !== contentHash(byTask.get(trial.taskId).initialFiles) || result.acceptanceScorerDigest !== contentHash({
+      checks: byTask.get(trial.taskId).checks,
+      acceptance: byTask.get(trial.taskId).acceptance
+    }) || result.acceptance.length !== byTask.get(trial.taskId).checks.length + byTask.get(trial.taskId).acceptance.length || result.accepted !== (result.executionStatus === "completed" && result.acceptance.every(({ passed }) => passed))
+  ))
+    throw new Error("The existing benchmark report contains mismatched trial controls");
+  if (existingReport?.status === "complete") return { outputPath, report: existingReport };
+  const limitations = [
+    "Stable efficiency claims require at least three complete trials per task and host.",
+    "Blinded human defect review remains outside this deterministic harness slice."
+  ];
+  const persist = async (status2) => {
+    const report2 = BenchmarkReportSchema.parse({
+      schemaVersion: 1,
+      status: status2,
+      suite: { id: suite.id, version: suite.version, digest: suiteDigest },
+      startedAt,
+      updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      seed: input.seed,
+      randomized: true,
+      modelPolicy,
+      effortPolicy,
+      permissionPolicy,
+      scorerPolicy,
+      environment,
+      limitations,
+      schedule,
+      results,
+      summary: summarizeBenchmark(results, schedule)
+    });
+    await mkdir5(dirname6(outputPath), { recursive: true });
+    const temporary = `${outputPath}.${process.pid}.tmp`;
+    await writeFile4(temporary, `${JSON.stringify(report2, null, 2)}
+`, "utf8");
+    await rename2(temporary, outputPath);
+    return report2;
+  };
+  const hostVersions = /* @__PURE__ */ new Map();
+  for (const host of hosts) {
+    const adapter = input.adapters[host];
+    if (!adapter) throw new Error(`No ${host} benchmark adapter was configured`);
+    const capabilities = await adapter.probe();
+    if (!capabilities.installed || !capabilities.authenticated || !capabilities.structuredOutput)
+      throw new Error(`${host} is not ready for structured benchmark execution`);
+    hostVersions.set(host, capabilities.version ?? "unknown");
+  }
+  await persist("running");
+  const completedTrialIds = new Set(results.map(({ trial }) => trial.trialId));
+  for (const trial of schedule) {
+    if (completedTrialIds.has(trial.trialId)) continue;
+    const task = byTask.get(trial.taskId);
+    const adapter = input.adapters[trial.host];
+    input.observer?.(
+      `[${trial.order + 1}/${schedule.length}] ${trial.host} ${trial.mode} ${trial.taskId} #${trial.repetition}`
+    );
+    const fixture = await materializeTask(task);
+    try {
+      results.push(
+        trial.mode === "baseline" ? await runBaselineTrial({
+          trial,
+          task,
+          adapter,
+          repository: fixture.repository,
+          repositoryDigest: fixture.repositoryDigest,
+          baseSha: fixture.baseSha,
+          hostVersion: hostVersions.get(trial.host),
+          policy: policies[trial.host]
+        }) : await runGraphcraftTrial({
+          trial,
+          task,
+          adapter,
+          repository: fixture.repository,
+          repositoryDigest: fixture.repositoryDigest,
+          baseSha: fixture.baseSha,
+          hostVersion: hostVersions.get(trial.host),
+          policy: policies[trial.host]
+        })
+      );
+    } finally {
+      await rm2(fixture.repository, { recursive: true, force: true });
+    }
+    completedTrialIds.add(trial.trialId);
+    await persist("running");
+  }
+  const report = await persist("complete");
+  return { outputPath, report };
+}
+
 // packages/cli/src/index.ts
 var GRAPHCRAFT_VERSION = package_default.version;
-function createAdapter(host) {
-  return host === "claude" ? new ClaudeAdapter() : new CodexAdapter();
+function createAdapter(host, policy) {
+  return host === "claude" ? new ClaudeAdapter(policy) : new CodexAdapter(policy);
 }
 async function runHostCommand(command, args, allowFailure = false) {
   const exitCode = await new Promise((resolveExit, reject) => {
@@ -24517,15 +25364,15 @@ async function runHostCommand(command, args, allowFailure = false) {
     throw new Error(`${command} ${args.join(" ")} exited ${exitCode}`);
 }
 async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
-  const moduleDirectory = dirname6(fileURLToPath(moduleUrl));
+  const moduleDirectory = dirname7(fileURLToPath(moduleUrl));
   const candidates = [
-    join10(moduleDirectory, "mcp.mjs"),
-    resolve4(moduleDirectory, "../../../dist/mcp.mjs"),
-    resolve4(process.cwd(), "dist/mcp.mjs")
+    join11(moduleDirectory, "mcp.mjs"),
+    resolve5(moduleDirectory, "../../../dist/mcp.mjs"),
+    resolve5(process.cwd(), "dist/mcp.mjs")
   ];
   for (const candidate of candidates) {
     try {
-      await access2(candidate);
+      await access3(candidate);
       return candidate;
     } catch {
     }
@@ -24533,13 +25380,13 @@ async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
   throw new Error("dist/mcp.mjs is missing; run pnpm build before installing Graphcraft");
 }
 function resolveGraphcraftHome(configuredHome = process.env.GRAPHCRAFT_HOME) {
-  return configuredHome?.trim() ? resolve4(configuredHome) : join10(homedir(), ".graphcraft");
+  return configuredHome?.trim() ? resolve5(configuredHome) : join11(homedir(), ".graphcraft");
 }
 async function stageBundledMcp(sourcePath, graphcraftHome = resolveGraphcraftHome()) {
-  const runtimeDirectory = join10(graphcraftHome, "runtime", GRAPHCRAFT_VERSION);
-  const runtimePath = join10(runtimeDirectory, "mcp.mjs");
-  await mkdir5(runtimeDirectory, { recursive: true });
-  if (resolve4(sourcePath) !== resolve4(runtimePath)) await copyFile(sourcePath, runtimePath);
+  const runtimeDirectory = join11(graphcraftHome, "runtime", GRAPHCRAFT_VERSION);
+  const runtimePath = join11(runtimeDirectory, "mcp.mjs");
+  await mkdir6(runtimeDirectory, { recursive: true });
+  if (resolve5(sourcePath) !== resolve5(runtimePath)) await copyFile(sourcePath, runtimePath);
   await chmod(runtimePath, 493);
   return runtimePath;
 }
@@ -24853,6 +25700,72 @@ function executionSignal() {
     }
   };
 }
+program2.command("benchmark").description("Run a randomized matched Graphcraft and baseline evaluation suite").argument("<suite>", "versioned benchmark suite JSON").option("-C, --cwd <path>", "repository used to store local reports", process.cwd()).addOption(
+  new Option("--host <host>", "host or hosts to evaluate").choices(["codex", "claude", "both"]).default("both")
+).option("--repetitions <count>", "override repetitions per task, host, and mode").option("--seed <seed>", "deterministic schedule seed", "graphcraft-stable-v1").option("--output <path>", "report path").option("--codex-model <model>", "exact Codex model used for every Codex trial").option("--claude-model <model>", "exact Claude model used for every Claude trial").addOption(
+  new Option("--effort <effort>", "shared effort used for every trial").choices([
+    "low",
+    "medium",
+    "high",
+    "xhigh"
+  ])
+).option("--dry-run", "validate and print the randomized schedule without model calls").action(
+  async (suitePath, options) => {
+    const suite = suitePath === "stable-v1" ? BenchmarkSuiteSchema.parse(stable_v1_default) : await loadBenchmarkSuite(suitePath);
+    const hosts = options.host === "both" ? ["codex", "claude"] : [options.host];
+    const repetitions = options.repetitions ? Number(options.repetitions) : void 0;
+    if (repetitions !== void 0 && (!Number.isInteger(repetitions) || repetitions <= 0))
+      throw new Error("--repetitions must be a positive integer");
+    const schedule = createBenchmarkSchedule({
+      suite,
+      hosts,
+      seed: options.seed,
+      ...repetitions ? { repetitions } : {}
+    });
+    if (options.dryRun) {
+      console.log(
+        JSON.stringify(
+          {
+            suite: { id: suite.id, version: suite.version, tasks: suite.tasks.length },
+            trials: schedule.length,
+            seed: options.seed,
+            schedule
+          },
+          null,
+          2
+        )
+      );
+      return;
+    }
+    if (!options.effort) throw new Error("--effort is required for benchmark execution");
+    const policies = {};
+    for (const host of hosts) {
+      const model = host === "codex" ? options.codexModel : options.claudeModel;
+      if (!model?.trim()) throw new Error(`--${host}-model is required for ${host} trials`);
+      policies[host] = { model: model.trim(), effort: options.effort };
+    }
+    const timestamp = (/* @__PURE__ */ new Date()).toISOString().replaceAll(/[:.]/g, "-");
+    const outputPath = resolve6(
+      options.output ?? join12(options.cwd, ".graphcraft", "benchmarks", suite.id, `${timestamp}.json`)
+    );
+    const adapters = Object.fromEntries(
+      hosts.map((host) => [host, createAdapter(host, policies[host])])
+    );
+    const result = await runBenchmark({
+      suite,
+      hosts,
+      adapters,
+      policies,
+      seed: options.seed,
+      ...repetitions ? { repetitions } : {},
+      outputPath,
+      observer: (message) => console.log(message)
+    });
+    console.log(
+      JSON.stringify({ outputPath: result.outputPath, summary: result.report.summary }, null, 2)
+    );
+  }
+);
 program2.command("install").description("Register the bundled Graphcraft MCP server with a coding-agent host").addOption(
   new Option("--host <host>", "host to configure").choices(["codex", "claude"]).makeOptionMandatory()
 ).action(async (options) => {
@@ -24935,7 +25848,7 @@ program2.command("inspect").description("Show the contract, graph, anchors, and 
   );
 });
 program2.command("probes").description("Show or replace the deterministic probe plan before approval").argument("[run]").option("-C, --cwd <path>", "repository path", process.cwd()).option("--set <file>", "replace the probe plan from a JSON file").action(async (run, options) => {
-  const probePlan = options.set ? JSON.parse(await readFile8(options.set, "utf8")) : void 0;
+  const probePlan = options.set ? JSON.parse(await readFile9(options.set, "utf8")) : void 0;
   const result = await handleAction({
     action: "probes",
     repository: options.cwd,
@@ -24946,7 +25859,7 @@ program2.command("probes").description("Show or replace the deterministic probe 
 });
 program2.command("amend").description("Apply an evidence-backed amendment to unfinished graph work").argument("[run]").option("-C, --cwd <path>", "repository path", process.cwd()).requiredOption("--set <file>", "graph amendment proposal JSON file").option("--approve", "record explicit user approval for authority expansion").action(
   async (run, options) => {
-    const amendment = JSON.parse(await readFile8(options.set, "utf8"));
+    const amendment = JSON.parse(await readFile9(options.set, "utf8"));
     console.log(
       JSON.stringify(
         await handleAction({

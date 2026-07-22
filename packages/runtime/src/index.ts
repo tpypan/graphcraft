@@ -1,4 +1,5 @@
 export * from "./amendment.ts";
+export * from "./benchmark.ts";
 export * from "./control.ts";
 export * from "./context.ts";
 export * from "./governance.ts";

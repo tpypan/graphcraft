@@ -16,6 +16,7 @@ import {
   type Graph,
   type GraphAmendment,
   type HostAdapter,
+  type HostExecutionPolicy,
   type ProbePlan,
   type RunContract,
   type RunState,
@@ -36,8 +37,8 @@ import {
 export type HostName = "codex" | "claude";
 export const GRAPHCRAFT_VERSION = packageMetadata.version;
 
-export function createAdapter(host: HostName): HostAdapter {
-  return host === "claude" ? new ClaudeAdapter() : new CodexAdapter();
+export function createAdapter(host: HostName, policy?: HostExecutionPolicy): HostAdapter {
+  return host === "claude" ? new ClaudeAdapter(policy) : new CodexAdapter(policy);
 }
 
 async function runHostCommand(

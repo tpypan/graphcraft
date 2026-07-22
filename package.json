@@ -27,6 +27,7 @@
     "graphcraft": "dist/graphcraft.mjs"
   },
   "files": [
+    "benchmarks/stable-v1.json",
     "dist/graphcraft.mjs",
     "dist/mcp.mjs"
   ],

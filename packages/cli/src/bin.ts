@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { Command, Option } from "commander";
 import { readFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import stableBenchmarkSuite from "../../../benchmarks/stable-v1.json" with { type: "json" };
 import {
   askForApproval,
   assessTaskShape,
@@ -16,8 +18,14 @@ import {
   uninstallHost,
   type HostName,
 } from "./index.ts";
-import { createRun, executeRun } from "@graphcraft/runtime";
-import type { GraphAmendment, ProbePlan } from "@graphcraft/core";
+import { createRun, executeRun, loadBenchmarkSuite, runBenchmark } from "@graphcraft/runtime";
+import {
+  BenchmarkSuiteSchema,
+  createBenchmarkSchedule,
+  type GraphAmendment,
+  type HostExecutionPolicy,
+  type ProbePlan,
+} from "@graphcraft/core";
 
 const program = new Command()
   .name("graphcraft")
@@ -45,6 +53,106 @@ function executionSignal(): { signal: AbortSignal; dispose: () => void } {
     },
   };
 }
+
+program
+  .command("benchmark")
+  .description("Run a randomized matched Graphcraft and baseline evaluation suite")
+  .argument("<suite>", "versioned benchmark suite JSON")
+  .option("-C, --cwd <path>", "repository used to store local reports", process.cwd())
+  .addOption(
+    new Option("--host <host>", "host or hosts to evaluate")
+      .choices(["codex", "claude", "both"])
+      .default("both"),
+  )
+  .option("--repetitions <count>", "override repetitions per task, host, and mode")
+  .option("--seed <seed>", "deterministic schedule seed", "graphcraft-stable-v1")
+  .option("--output <path>", "report path")
+  .option("--codex-model <model>", "exact Codex model used for every Codex trial")
+  .option("--claude-model <model>", "exact Claude model used for every Claude trial")
+  .addOption(
+    new Option("--effort <effort>", "shared effort used for every trial").choices([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]),
+  )
+  .option("--dry-run", "validate and print the randomized schedule without model calls")
+  .action(
+    async (
+      suitePath: string,
+      options: {
+        cwd: string;
+        host: "codex" | "claude" | "both";
+        repetitions?: string;
+        seed: string;
+        output?: string;
+        codexModel?: string;
+        claudeModel?: string;
+        effort?: HostExecutionPolicy["effort"];
+        dryRun?: boolean;
+      },
+    ) => {
+      const suite =
+        suitePath === "stable-v1"
+          ? BenchmarkSuiteSchema.parse(stableBenchmarkSuite)
+          : await loadBenchmarkSuite(suitePath);
+      const hosts: Array<"codex" | "claude"> =
+        options.host === "both" ? ["codex", "claude"] : [options.host];
+      const repetitions = options.repetitions ? Number(options.repetitions) : undefined;
+      if (repetitions !== undefined && (!Number.isInteger(repetitions) || repetitions <= 0))
+        throw new Error("--repetitions must be a positive integer");
+      const schedule = createBenchmarkSchedule({
+        suite,
+        hosts,
+        seed: options.seed,
+        ...(repetitions ? { repetitions } : {}),
+      });
+      if (options.dryRun) {
+        console.log(
+          JSON.stringify(
+            {
+              suite: { id: suite.id, version: suite.version, tasks: suite.tasks.length },
+              trials: schedule.length,
+              seed: options.seed,
+              schedule,
+            },
+            null,
+            2,
+          ),
+        );
+        return;
+      }
+      if (!options.effort) throw new Error("--effort is required for benchmark execution");
+      const policies: Partial<Record<HostName, HostExecutionPolicy>> = {};
+      for (const host of hosts) {
+        const model = host === "codex" ? options.codexModel : options.claudeModel;
+        if (!model?.trim()) throw new Error(`--${host}-model is required for ${host} trials`);
+        policies[host] = { model: model.trim(), effort: options.effort };
+      }
+      const timestamp = new Date().toISOString().replaceAll(/[:.]/g, "-");
+      const outputPath = resolve(
+        options.output ??
+          join(options.cwd, ".graphcraft", "benchmarks", suite.id, `${timestamp}.json`),
+      );
+      const adapters = Object.fromEntries(
+        hosts.map((host) => [host, createAdapter(host, policies[host])]),
+      );
+      const result = await runBenchmark({
+        suite,
+        hosts,
+        adapters,
+        policies,
+        seed: options.seed,
+        ...(repetitions ? { repetitions } : {}),
+        outputPath,
+        observer: (message) => console.log(message),
+      });
+      console.log(
+        JSON.stringify({ outputPath: result.outputPath, summary: result.report.summary }, null, 2),
+      );
+    },
+  );
 
 program
   .command("install")

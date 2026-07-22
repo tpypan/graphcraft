@@ -62,6 +62,7 @@ Graphcraft displays a concise run contract before doing work. Use `--yes` only w
 - Checkpoints host sessions and results during execution, resumes the same host session when safe, and falls back to repository evidence when switching hosts or native continuation is unavailable.
 - Accepts pause or stop from another CLI process, terminates the active child with bounded escalation, and records the exact cause and outcome before releasing the run lock.
 - Tracks cached, uncached, output, reasoning, and total tokens with explicit provider availability, and reports planning, worker, repair, semantic-verification, and Graphcraft-overhead costs by phase and node.
+- Provides an experimental matched benchmark harness with a versioned ten-task public corpus, fresh deterministic fixtures, explicit model/effort controls, executable external scoring, atomic checkpoints, and resumable randomized trials.
 
 ## Commands
 
@@ -78,16 +79,19 @@ graphcraft resume [run]
 graphcraft stop [run]
 graphcraft trace [run]
 graphcraft doctor
+graphcraft benchmark <suite> --host both --codex-model <model> --claude-model <model> --effort <level>
 graphcraft uninstall --host <codex|claude>
 ```
 
 Small localized tasks bypass Graphcraft by default using measured task-shape signals rather than request length. Pass `--force` when you deliberately want a durable graph.
 
+Use `stable-v1` as the bundled benchmark suite name. A dry run validates and prints its schedule without requiring model options. Real trials require an explicit model for every selected host and one shared `low`, `medium`, `high`, or `xhigh` effort policy; reports remain local under `.graphcraft/benchmarks/` unless `--output` is supplied.
+
 ## Evidence and scope
 
 The [v0.1 implementation report](docs/V0.1.md) records the acceptance boundary, architecture, tests, real-host dogfood, and known gaps. Research and competitive rationale live under [docs/research](docs/research).
 
-Graphcraft does not yet claim stable reliability or a 20% token-savings gate. Those require a future matched multi-task, dual-host benchmark.
+Graphcraft does not yet claim stable reliability or a 20% token-savings gate. The harness and public fixtures exist, but repeated real Codex and Claude trials, blinded defect review, and a passing stable gate remain outstanding.
 
 ## Development
 

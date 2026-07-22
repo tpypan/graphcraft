@@ -11,14 +11,14 @@ export interface ProcessResult {
 export async function runProcess(
   command: string,
   args: string[],
-  options: { cwd: string; timeoutMs?: number; signal?: AbortSignal },
+  options: { cwd: string; timeoutMs?: number; signal?: AbortSignal; env?: NodeJS.ProcessEnv },
 ): Promise<ProcessResult> {
   const started = performance.now();
   const timeoutMs = options.timeoutMs ?? 120_000;
   return await new Promise<ProcessResult>((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
-      env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
+      env: { ...process.env, ...options.env, NO_COLOR: "1", FORCE_COLOR: "0" },
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
     });

@@ -1,4 +1,5 @@
 export * from "./adapter.ts";
+export * from "./benchmark.ts";
 export * from "./canonical.ts";
 export * from "./capsule.ts";
 export * from "./events.ts";

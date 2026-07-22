@@ -19,6 +19,7 @@ import {
   renderSemanticVerifierPrompt,
   renderWorkerPrompt,
   type HostAdapter,
+  type HostExecutionPolicy,
   type HostEvent,
   type InvocationRecord,
   type PlanningRequest,
@@ -119,6 +120,8 @@ async function codexAuthenticated(): Promise<boolean> {
 export class CodexAdapter implements HostAdapter {
   readonly id = "codex" as const;
 
+  constructor(private readonly policy?: HostExecutionPolicy) {}
+
   async probe() {
     const result = await commandVersion("codex");
     const authenticated = result.installed && (await codexAuthenticated());
@@ -135,28 +138,12 @@ export class CodexAdapter implements HostAdapter {
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-plan-"));
     const schemaPath = join(schemaDirectory, "graph-plan.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexGraphPlanJsonSchema), "utf8");
-    const child = spawn(
-      "codex",
-      [
-        "exec",
-        "--json",
-        "--ephemeral",
-        "--ignore-user-config",
-        "-C",
-        request.repositoryPath,
-        "-s",
-        "read-only",
-        "--output-schema",
-        schemaPath,
-        "-",
-      ],
-      {
-        cwd: request.repositoryPath,
-        env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
-        shell: false,
-        stdio: ["pipe", "pipe", "pipe"],
-      },
-    );
+    const child = spawn("codex", codexPlannerArgs(request, schemaPath, this.policy), {
+      cwd: request.repositoryPath,
+      env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
     const exitPromise = new Promise<number>((resolve) =>
       child.once("close", (code) => resolve(code ?? 1)),
     );
@@ -210,7 +197,7 @@ export class CodexAdapter implements HostAdapter {
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-verify-"));
     const schemaPath = join(schemaDirectory, "semantic-verdict.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexSemanticVerdictJsonSchema), "utf8");
-    const child = spawn("codex", codexSemanticVerifierArgs(request, schemaPath), {
+    const child = spawn("codex", codexSemanticVerifierArgs(request, schemaPath, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
       shell: false,
@@ -264,7 +251,7 @@ export class CodexAdapter implements HostAdapter {
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-"));
     const schemaPath = join(schemaDirectory, "worker-result.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexWorkerResultJsonSchema), "utf8");
-    const args = codexWorkerArgs(request, schemaPath);
+    const args = codexWorkerArgs(request, schemaPath, this.policy);
     const child = spawn("codex", args, {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -351,13 +338,45 @@ export class CodexAdapter implements HostAdapter {
   }
 }
 
-export function codexWorkerArgs(request: WorkerRequest, schemaPath: string): string[] {
+function codexPolicyArgs(policy?: HostExecutionPolicy): string[] {
+  return policy
+    ? ["--model", policy.model, "--config", `model_reasoning_effort="${policy.effort}"`]
+    : [];
+}
+
+export function codexPlannerArgs(
+  request: PlanningRequest,
+  schemaPath: string,
+  policy?: HostExecutionPolicy,
+): string[] {
+  return [
+    "exec",
+    "--json",
+    "--ephemeral",
+    "--ignore-user-config",
+    ...codexPolicyArgs(policy),
+    "-C",
+    request.repositoryPath,
+    "-s",
+    "read-only",
+    "--output-schema",
+    schemaPath,
+    "-",
+  ];
+}
+
+export function codexWorkerArgs(
+  request: WorkerRequest,
+  schemaPath: string,
+  policy?: HostExecutionPolicy,
+): string[] {
   if (request.resumeSessionId) {
     return [
       "exec",
       "resume",
       "--json",
       "--ignore-user-config",
+      ...codexPolicyArgs(policy),
       "--output-schema",
       schemaPath,
       request.resumeSessionId,
@@ -368,6 +387,7 @@ export function codexWorkerArgs(request: WorkerRequest, schemaPath: string): str
     "exec",
     "--json",
     "--ignore-user-config",
+    ...codexPolicyArgs(policy),
     "-C",
     request.repositoryPath,
     "-s",
@@ -381,12 +401,14 @@ export function codexWorkerArgs(request: WorkerRequest, schemaPath: string): str
 export function codexSemanticVerifierArgs(
   request: SemanticVerificationRequest,
   schemaPath: string,
+  policy?: HostExecutionPolicy,
 ): string[] {
   return [
     "exec",
     "--json",
     "--ephemeral",
     "--ignore-user-config",
+    ...codexPolicyArgs(policy),
     "-C",
     request.repositoryPath,
     "-s",
