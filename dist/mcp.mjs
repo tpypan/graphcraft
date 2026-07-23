@@ -418,11 +418,11 @@ var require_codegen = __commonJS({
         const rhs = this.rhs === void 0 ? "" : ` = ${this.rhs}`;
         return `${varKind} ${this.name}${rhs};` + _n;
       }
-      optimizeNames(names, constants2) {
+      optimizeNames(names, constants3) {
         if (!names[this.name.str])
           return;
         if (this.rhs)
-          this.rhs = optimizeExpr(this.rhs, names, constants2);
+          this.rhs = optimizeExpr(this.rhs, names, constants3);
         return this;
       }
       get names() {
@@ -439,10 +439,10 @@ var require_codegen = __commonJS({
       render({ _n }) {
         return `${this.lhs} = ${this.rhs};` + _n;
       }
-      optimizeNames(names, constants2) {
+      optimizeNames(names, constants3) {
         if (this.lhs instanceof code_1.Name && !names[this.lhs.str] && !this.sideEffects)
           return;
-        this.rhs = optimizeExpr(this.rhs, names, constants2);
+        this.rhs = optimizeExpr(this.rhs, names, constants3);
         return this;
       }
       get names() {
@@ -503,8 +503,8 @@ var require_codegen = __commonJS({
       optimizeNodes() {
         return `${this.code}` ? this : void 0;
       }
-      optimizeNames(names, constants2) {
-        this.code = optimizeExpr(this.code, names, constants2);
+      optimizeNames(names, constants3) {
+        this.code = optimizeExpr(this.code, names, constants3);
         return this;
       }
       get names() {
@@ -533,12 +533,12 @@ var require_codegen = __commonJS({
         }
         return nodes.length > 0 ? this : void 0;
       }
-      optimizeNames(names, constants2) {
+      optimizeNames(names, constants3) {
         const { nodes } = this;
         let i = nodes.length;
         while (i--) {
           const n = nodes[i];
-          if (n.optimizeNames(names, constants2))
+          if (n.optimizeNames(names, constants3))
             continue;
           subtractNames(names, n.names);
           nodes.splice(i, 1);
@@ -591,12 +591,12 @@ var require_codegen = __commonJS({
           return void 0;
         return this;
       }
-      optimizeNames(names, constants2) {
+      optimizeNames(names, constants3) {
         var _a3;
-        this.else = (_a3 = this.else) === null || _a3 === void 0 ? void 0 : _a3.optimizeNames(names, constants2);
-        if (!(super.optimizeNames(names, constants2) || this.else))
+        this.else = (_a3 = this.else) === null || _a3 === void 0 ? void 0 : _a3.optimizeNames(names, constants3);
+        if (!(super.optimizeNames(names, constants3) || this.else))
           return;
-        this.condition = optimizeExpr(this.condition, names, constants2);
+        this.condition = optimizeExpr(this.condition, names, constants3);
         return this;
       }
       get names() {
@@ -619,10 +619,10 @@ var require_codegen = __commonJS({
       render(opts) {
         return `for(${this.iteration})` + super.render(opts);
       }
-      optimizeNames(names, constants2) {
-        if (!super.optimizeNames(names, constants2))
+      optimizeNames(names, constants3) {
+        if (!super.optimizeNames(names, constants3))
           return;
-        this.iteration = optimizeExpr(this.iteration, names, constants2);
+        this.iteration = optimizeExpr(this.iteration, names, constants3);
         return this;
       }
       get names() {
@@ -658,10 +658,10 @@ var require_codegen = __commonJS({
       render(opts) {
         return `for(${this.varKind} ${this.name} ${this.loop} ${this.iterable})` + super.render(opts);
       }
-      optimizeNames(names, constants2) {
-        if (!super.optimizeNames(names, constants2))
+      optimizeNames(names, constants3) {
+        if (!super.optimizeNames(names, constants3))
           return;
-        this.iterable = optimizeExpr(this.iterable, names, constants2);
+        this.iterable = optimizeExpr(this.iterable, names, constants3);
         return this;
       }
       get names() {
@@ -703,11 +703,11 @@ var require_codegen = __commonJS({
         (_b = this.finally) === null || _b === void 0 ? void 0 : _b.optimizeNodes();
         return this;
       }
-      optimizeNames(names, constants2) {
+      optimizeNames(names, constants3) {
         var _a3, _b;
-        super.optimizeNames(names, constants2);
-        (_a3 = this.catch) === null || _a3 === void 0 ? void 0 : _a3.optimizeNames(names, constants2);
-        (_b = this.finally) === null || _b === void 0 ? void 0 : _b.optimizeNames(names, constants2);
+        super.optimizeNames(names, constants3);
+        (_a3 = this.catch) === null || _a3 === void 0 ? void 0 : _a3.optimizeNames(names, constants3);
+        (_b = this.finally) === null || _b === void 0 ? void 0 : _b.optimizeNames(names, constants3);
         return this;
       }
       get names() {
@@ -1008,7 +1008,7 @@ var require_codegen = __commonJS({
     function addExprNames(names, from) {
       return from instanceof code_1._CodeOrName ? addNames(names, from.names) : names;
     }
-    function optimizeExpr(expr, names, constants2) {
+    function optimizeExpr(expr, names, constants3) {
       if (expr instanceof code_1.Name)
         return replaceName(expr);
       if (!canOptimize(expr))
@@ -1023,14 +1023,14 @@ var require_codegen = __commonJS({
         return items;
       }, []));
       function replaceName(n) {
-        const c = constants2[n.str];
+        const c = constants3[n.str];
         if (c === void 0 || names[n.str] !== 1)
           return n;
         delete names[n.str];
         return c;
       }
       function canOptimize(e) {
-        return e instanceof code_1._Code && e._items.some((c) => c instanceof code_1.Name && names[c.str] === 1 && constants2[c.str] !== void 0);
+        return e instanceof code_1._Code && e._items.some((c) => c instanceof code_1.Name && names[c.str] === 1 && constants3[c.str] !== void 0);
       }
     }
     function subtractNames(names, from) {
@@ -31467,9 +31467,9 @@ var EMPTY_COMPLETION_RESULT = {
 import { createInterface } from "node:readline/promises";
 import { createHash as createHash6, randomUUID as randomUUID9 } from "node:crypto";
 import {
-  access as access2,
+  access as access3,
   chmod as chmod2,
-  lstat as lstat9,
+  lstat as lstat10,
   mkdir as mkdir5,
   mkdtemp as mkdtemp2,
   open as open8,
@@ -31480,7 +31480,7 @@ import {
 } from "node:fs/promises";
 import { homedir, platform, tmpdir as tmpdir2 } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname as dirname9, isAbsolute as isAbsolute9, join as join14, resolve as resolve13 } from "node:path";
+import { dirname as dirname10, isAbsolute as isAbsolute9, join as join14, resolve as resolve13 } from "node:path";
 var import_cross_spawn5 = __toESM(require_cross_spawn(), 1);
 
 // package.json
@@ -32264,9 +32264,12 @@ var HostCapabilitiesSchema = external_exports.strictObject({
   installed: external_exports.boolean(),
   authenticated: external_exports.boolean(),
   version: external_exports.string().optional(),
+  protocolProfile: external_exports.string().min(1).nullable(),
   structuredOutput: external_exports.boolean(),
   streamingEvents: external_exports.boolean(),
-  tokenReporting: external_exports.boolean()
+  tokenReporting: external_exports.boolean(),
+  cancellation: external_exports.boolean(),
+  resume: external_exports.boolean()
 });
 var InterruptionCauseSchema = external_exports.enum([
   "user_pause",
@@ -34177,6 +34180,157 @@ function resolveHeldOutProbes(input, heldOutInput) {
   return resolved;
 }
 
+// packages/core/src/host-capabilities.ts
+var REQUIRED_HOST_PROTOCOL_CAPABILITIES = [
+  "structuredOutput",
+  "streamingEvents",
+  "tokenReporting",
+  "cancellation",
+  "resume"
+];
+var HOST_PROTOCOL_PROFILES = Object.freeze([
+  Object.freeze({
+    id: "codex-cli@0.144.6",
+    host: "codex",
+    version: "0.144.6",
+    reportedVersion: "codex-cli 0.144.6",
+    structuredOutput: true,
+    streamingEvents: true,
+    tokenReporting: true,
+    cancellation: true,
+    resume: true
+  }),
+  Object.freeze({
+    id: "claude-code@2.1.212",
+    host: "claude",
+    version: "2.1.212",
+    reportedVersion: "2.1.212 (Claude Code)",
+    structuredOutput: true,
+    streamingEvents: true,
+    tokenReporting: true,
+    cancellation: true,
+    resume: true
+  })
+]);
+function parseHostProtocolVersion(value) {
+  if (!value) return void 0;
+  const matches = [...value.matchAll(/\b(\d+)\.(\d+)\.(\d+)\b/gu)];
+  if (matches.length !== 1) return void 0;
+  const rawParts = matches[0].slice(1, 4);
+  if (rawParts.some((part) => part.length > 1 && part.startsWith("0"))) return void 0;
+  const parts = rawParts.map(Number);
+  if (parts.some((part) => !Number.isSafeInteger(part))) return void 0;
+  return parts.join(".");
+}
+function stripSingleHostVersionLineEnding(output) {
+  if (output.endsWith("\r\n")) return output.slice(0, -2);
+  if (output.endsWith("\n")) return output.slice(0, -1);
+  return output;
+}
+function resolveHostProtocolProfile(host, reportedVersion) {
+  return HOST_PROTOCOL_PROFILES.find(
+    (profile) => profile.host === host && profile.reportedVersion === reportedVersion
+  );
+}
+function recordedHostProtocolVersions(host) {
+  return HOST_PROTOCOL_PROFILES.filter((profile) => profile.host === host).map(
+    ({ version: version2 }) => version2
+  );
+}
+function hostCapabilitiesFromProtocolProfile(host, discovery) {
+  const profile = discovery.installed ? resolveHostProtocolProfile(host, discovery.version) : void 0;
+  return HostCapabilitiesSchema.parse({
+    installed: discovery.installed,
+    authenticated: discovery.installed && discovery.authenticated,
+    ...discovery.version ? { version: discovery.version } : {},
+    protocolProfile: profile?.id ?? null,
+    structuredOutput: profile?.structuredOutput ?? false,
+    streamingEvents: profile?.streamingEvents ?? false,
+    tokenReporting: profile?.tokenReporting ?? false,
+    cancellation: profile?.cancellation ?? false,
+    resume: profile?.resume ?? false
+  });
+}
+var RequiredHostCapabilityDiagnosticSchema = external_exports.strictObject({
+  ready: external_exports.boolean(),
+  status: external_exports.enum([
+    "ready",
+    "missing",
+    "unsupported_protocol",
+    "unauthenticated",
+    "missing_capabilities"
+  ]),
+  protocolProfile: external_exports.string().min(1).nullable(),
+  missingCapabilities: external_exports.array(external_exports.enum(REQUIRED_HOST_PROTOCOL_CAPABILITIES)),
+  detail: external_exports.string().min(1)
+});
+var HostCapabilityAdmissionError = class extends Error {
+  constructor(diagnostic) {
+    super(diagnostic.detail);
+    this.diagnostic = diagnostic;
+  }
+  diagnostic;
+  name = "HostCapabilityAdmissionError";
+};
+function hasMatchingRecordedProfile(owner, capabilities) {
+  if (!capabilities.protocolProfile) return false;
+  if (owner === "test") return true;
+  return resolveHostProtocolProfile(owner, capabilities.version)?.id === capabilities.protocolProfile;
+}
+function diagnoseRequiredHostCapabilities(owner, capabilities) {
+  if (!capabilities.installed) {
+    return {
+      ready: false,
+      status: "missing",
+      protocolProfile: null,
+      missingCapabilities: [...REQUIRED_HOST_PROTOCOL_CAPABILITIES],
+      detail: `${owner} is not installed`
+    };
+  }
+  if (!hasMatchingRecordedProfile(owner, capabilities)) {
+    return {
+      ready: false,
+      status: "unsupported_protocol",
+      protocolProfile: capabilities.protocolProfile,
+      missingCapabilities: [...REQUIRED_HOST_PROTOCOL_CAPABILITIES],
+      detail: `${owner} ${capabilities.version ?? "version unknown"} has no matching recorded protocol profile`
+    };
+  }
+  if (!capabilities.authenticated) {
+    return {
+      ready: false,
+      status: "unauthenticated",
+      protocolProfile: capabilities.protocolProfile,
+      missingCapabilities: [],
+      detail: `${owner} is not authenticated`
+    };
+  }
+  const missingCapabilities = REQUIRED_HOST_PROTOCOL_CAPABILITIES.filter(
+    (capability) => !capabilities[capability]
+  );
+  if (missingCapabilities.length > 0) {
+    return {
+      ready: false,
+      status: "missing_capabilities",
+      protocolProfile: capabilities.protocolProfile,
+      missingCapabilities,
+      detail: `${owner} protocol profile ${capabilities.protocolProfile} lacks required capabilities: ${missingCapabilities.join(", ")}`
+    };
+  }
+  return {
+    ready: true,
+    status: "ready",
+    protocolProfile: capabilities.protocolProfile,
+    missingCapabilities: [],
+    detail: `${owner} protocol profile ${capabilities.protocolProfile} is ready`
+  };
+}
+function assertRequiredHostCapabilities(owner, capabilities) {
+  const diagnostic = diagnoseRequiredHostCapabilities(owner, capabilities);
+  if (!diagnostic.ready) throw new HostCapabilityAdmissionError(diagnostic);
+  return diagnostic;
+}
+
 // packages/core/src/leases.ts
 function progressVector(probeResults, family) {
   const passedProbeIds = probeResults.filter(({ passed }) => passed).map(({ probeId }) => probeId).sort();
@@ -34906,8 +35060,9 @@ function reduceEvents(events) {
 
 // packages/core/src/subprocess.ts
 import { spawn } from "node:child_process";
-import { realpath, stat } from "node:fs/promises";
-import { extname, isAbsolute as isAbsolute2, join, relative, resolve, sep, win32 } from "node:path";
+import { constants } from "node:fs";
+import { access, lstat, realpath, stat } from "node:fs/promises";
+import { dirname, extname, isAbsolute as isAbsolute2, join, relative, resolve, sep, win32 } from "node:path";
 var HOST_CAPABILITY_PROBE_TIMEOUT_MS = 1e4;
 var HOST_CAPABILITY_PROBE_SETTLE_GRACE_MS = 2500;
 var HOST_TERMINATION_GRACE_MS = 2e3;
@@ -34950,20 +35105,55 @@ function pathIsWithin(root, candidate) {
   const relation = relative(resolve(root), resolve(candidate));
   return relation === "" || relation !== ".." && !relation.startsWith(`..${sep}`) && !isAbsolute2(relation);
 }
+async function discoverRepositoryTrustRoots(cwd) {
+  const roots = [];
+  let current = resolve(cwd);
+  while (true) {
+    if (await lstat(join(current, ".git")).then(
+      () => true,
+      () => false
+    ))
+      roots.push(current);
+    const parent = dirname(current);
+    if (parent === current) return roots;
+    current = parent;
+  }
+}
 async function resolveTrustedExecutable(command, options = {}) {
   const selectedPlatform = options.platform ?? process.platform;
-  if (selectedPlatform !== "win32" || isAbsolute2(command) || /[\\/]/u.test(command)) {
+  const windows = selectedPlatform === "win32";
+  const hasPathSeparator = windows ? /[\\/]/u.test(command) : command.includes("/");
+  if (isAbsolute2(command) || hasPathSeparator) {
     return command;
   }
-  if (/^node(?:\.exe)?$/iu.test(command)) return process.execPath;
+  if (windows ? /^node(?:\.exe)?$/iu.test(command) : command === "node") {
+    return process.execPath;
+  }
   const environment = options.environment ?? process.env;
-  const searchPath = environmentValue(environment, "PATH") ?? "";
-  const pathExtensions = (environmentValue(environment, "PATHEXT") ?? ".COM;.EXE;.BAT;.CMD").split(";").map((value) => value.trim()).filter(Boolean);
-  const suffixes = extname(command) ? ["", ...pathExtensions] : [...pathExtensions, ""];
-  const untrustedRoot = options.untrustedCwd ? await realpath(resolve(options.untrustedCwd)).catch(() => resolve(options.untrustedCwd)) : void 0;
-  for (const rawDirectory of searchPath.split(";")) {
-    const directory = rawDirectory.trim().replace(/^"|"$/gu, "");
+  const searchPath = windows ? environmentValue(environment, "PATH") ?? "" : environment.PATH ?? "";
+  const pathExtensions = windows ? (environmentValue(environment, "PATHEXT") ?? ".COM;.EXE;.BAT;.CMD").split(";").map((value) => value.trim()).filter(Boolean) : [];
+  const suffixes = windows ? extname(command) ? ["", ...pathExtensions] : [...pathExtensions, ""] : [""];
+  const untrustedResolvedRoots = [
+    ...new Set(
+      [options.untrustedCwd, ...options.untrustedRoots ?? []].filter((root) => root !== void 0).map((root) => resolve(root))
+    )
+  ];
+  const untrustedRoots = await Promise.all(
+    untrustedResolvedRoots.map(async (root) => ({
+      resolved: root,
+      canonical: await realpath(root).catch(() => root)
+    }))
+  );
+  for (const rawDirectory of searchPath.split(windows ? ";" : ":")) {
+    const directory = windows ? rawDirectory.trim().replace(/^"|"$/gu, "") : rawDirectory;
     if (!directory || !isAbsolute2(directory)) continue;
+    if (!windows && untrustedRoots.length > 0) {
+      if (untrustedRoots.some((root) => pathIsWithin(root.resolved, directory))) continue;
+      const canonicalDirectory = await realpath(directory).catch(() => void 0);
+      if (!canonicalDirectory || untrustedRoots.some((root) => pathIsWithin(root.canonical, canonicalDirectory))) {
+        continue;
+      }
+    }
     for (const suffix of suffixes) {
       const candidate = join(directory, `${command}${suffix}`);
       try {
@@ -34972,13 +35162,16 @@ async function resolveTrustedExecutable(command, options = {}) {
           realpath(candidate)
         ]);
         if (!candidateStatus.isFile()) continue;
-        if (untrustedRoot && pathIsWithin(untrustedRoot, canonicalCandidate)) continue;
+        if (untrustedRoots.some((root) => pathIsWithin(root.canonical, canonicalCandidate))) {
+          continue;
+        }
+        if (!windows) await access(canonicalCandidate, constants.X_OK);
         return canonicalCandidate;
       } catch {
       }
     }
   }
-  throw new Error(`Unable to resolve trusted Windows executable: ${command}`);
+  throw new Error(`Unable to resolve trusted ${windows ? "Windows " : ""}executable: ${command}`);
 }
 function windowsTaskkillExecutable(environment) {
   const systemRoot = environmentValue(environment, "SystemRoot");
@@ -35257,13 +35450,12 @@ function parseSemanticVerdict(value) {
 function codexUsage(value) {
   return normalizeTokenUsage("codex", value);
 }
-async function runCapabilityProbe(command, args, captureErrorOutput = false) {
-  let executable;
-  try {
-    executable = await resolveTrustedExecutable(command, { untrustedCwd: process.cwd() });
-  } catch {
-    return { code: null, output: "", overflowed: false, terminated: false };
-  }
+async function codexUntrustedRoots(repositoryPath) {
+  const paths = [.../* @__PURE__ */ new Set([process.cwd(), ...repositoryPath ? [repositoryPath] : []])];
+  const discovered = await Promise.all(paths.map(discoverRepositoryTrustRoots));
+  return [.../* @__PURE__ */ new Set([...paths, ...discovered.flat()])];
+}
+async function runCapabilityProbe(executable, args, captureErrorOutput = false) {
   return await new Promise((resolve14) => {
     const child = spawn2(executable, args, { stdio: ["ignore", "pipe", "pipe"] });
     const output = new BoundedTextCapture(ADAPTER_STDERR_LIMIT_BYTES);
@@ -35294,7 +35486,7 @@ async function runCapabilityProbe(command, args, captureErrorOutput = false) {
     timeout = setTimeout(() => {
       timeoutAbort.abort({
         cause: "timeout",
-        reason: `${command} capability probe timed out`
+        reason: `${executable} capability probe timed out`
       });
       if (settled) return;
       settlement = setTimeout(() => {
@@ -35308,13 +35500,22 @@ async function runCapabilityProbe(command, args, captureErrorOutput = false) {
     timeout.unref();
   });
 }
-async function commandVersion(command) {
-  const result = await runCapabilityProbe(command, ["--version"]);
-  return result.code === 0 && !result.overflowed && !result.terminated ? { installed: true, version: result.output.trim() } : { installed: false };
+async function codexVersion(executable) {
+  const result = await runCapabilityProbe(executable, ["--version"]);
+  return result.code === 0 && !result.overflowed && !result.terminated ? { installed: true, version: stripSingleHostVersionLineEnding(result.output) } : { installed: false };
 }
-async function codexAuthenticated() {
-  const result = await runCapabilityProbe("codex", ["login", "status"], true);
-  return result.code === 0 && !result.overflowed && !result.terminated && !/not logged in/i.test(result.output);
+async function codexAuthenticated(executable) {
+  const result = await runCapabilityProbe(executable, ["login", "status"], true);
+  return result.code === 0 && !result.overflowed && !result.terminated && !/(?:^|\r?\n)Not logged in\.?($|\r?\n)/u.test(result.output) && /(?:^|\r?\n)Logged in(?: using [^\r\n]+)?\.?($|\r?\n)/u.test(result.output);
+}
+async function probeCodexExecutable(executable) {
+  const result = await codexVersion(executable);
+  const authenticated = result.installed && await codexAuthenticated(executable);
+  return hostCapabilitiesFromProtocolProfile("codex", {
+    installed: result.installed,
+    authenticated,
+    ...result.version ? { version: result.version } : {}
+  });
 }
 var CodexAdapter = class {
   constructor(policy) {
@@ -35322,24 +35523,44 @@ var CodexAdapter = class {
   }
   policy;
   id = "codex";
+  async resolveReadyExecutable(repositoryPath) {
+    let executable;
+    try {
+      executable = await resolveTrustedExecutable("codex", {
+        untrustedRoots: await codexUntrustedRoots(repositoryPath)
+      });
+    } catch {
+      assertRequiredHostCapabilities(
+        this.id,
+        hostCapabilitiesFromProtocolProfile("codex", {
+          installed: false,
+          authenticated: false
+        })
+      );
+      throw new Error("Unreachable Codex capability admission state");
+    }
+    assertRequiredHostCapabilities(this.id, await probeCodexExecutable(executable));
+    return executable;
+  }
   async probe() {
-    const result = await commandVersion("codex");
-    const authenticated = result.installed && await codexAuthenticated();
-    return HostCapabilitiesSchema.parse({
-      ...result,
-      authenticated,
-      structuredOutput: result.installed,
-      streamingEvents: result.installed,
-      tokenReporting: result.installed
-    });
+    let executable;
+    try {
+      executable = await resolveTrustedExecutable("codex", {
+        untrustedRoots: await codexUntrustedRoots()
+      });
+    } catch {
+      return hostCapabilitiesFromProtocolProfile("codex", {
+        installed: false,
+        authenticated: false
+      });
+    }
+    return await probeCodexExecutable(executable);
   }
   async plan(request, signal) {
+    const executable = await this.resolveReadyExecutable(request.repositoryPath);
     const schemaDirectory = await mkdtemp(join2(tmpdir(), "graphcraft-codex-plan-"));
     const schemaPath = join2(schemaDirectory, "graph-plan.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexGraphPlanJsonSchema), "utf8");
-    const executable = await resolveTrustedExecutable("codex", {
-      untrustedCwd: request.repositoryPath
-    });
     const child = spawn2(executable, codexPlannerArgs(request, schemaPath, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -35397,12 +35618,10 @@ var CodexAdapter = class {
     }
   }
   async verify(request, signal) {
+    const executable = await this.resolveReadyExecutable(request.repositoryPath);
     const schemaDirectory = await mkdtemp(join2(tmpdir(), "graphcraft-codex-verify-"));
     const schemaPath = join2(schemaDirectory, "semantic-verdict.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexSemanticVerdictJsonSchema), "utf8");
-    const executable = await resolveTrustedExecutable("codex", {
-      untrustedCwd: request.repositoryPath
-    });
     const child = spawn2(executable, codexSemanticVerifierArgs(request, schemaPath, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -35460,13 +35679,11 @@ var CodexAdapter = class {
     }
   }
   async *execute(request, signal) {
+    const executable = await this.resolveReadyExecutable(request.repositoryPath);
     const schemaDirectory = await mkdtemp(join2(tmpdir(), "graphcraft-codex-"));
     const schemaPath = join2(schemaDirectory, "worker-result.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexWorkerResultJsonSchema), "utf8");
     const args = codexWorkerArgs(request, schemaPath, this.policy);
-    const executable = await resolveTrustedExecutable("codex", {
-      untrustedCwd: request.repositoryPath
-    });
     const child = spawn2(executable, args, {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -35793,13 +36010,12 @@ function parseSemanticVerdict2(value) {
 function claudeUsage(value) {
   return normalizeTokenUsage("claude", value);
 }
-async function runCapabilityProbe2(args) {
-  let executable;
-  try {
-    executable = await resolveTrustedExecutable("claude", { untrustedCwd: process.cwd() });
-  } catch {
-    return { code: null, output: "", overflowed: false, terminated: false };
-  }
+async function claudeUntrustedRoots(repositoryPath) {
+  const paths = [.../* @__PURE__ */ new Set([process.cwd(), ...repositoryPath ? [repositoryPath] : []])];
+  const discovered = await Promise.all(paths.map(discoverRepositoryTrustRoots));
+  return [.../* @__PURE__ */ new Set([...paths, ...discovered.flat()])];
+}
+async function runCapabilityProbe2(executable, args) {
   return await new Promise((resolve14) => {
     const child = spawn3(executable, args, { stdio: ["ignore", "pipe", "ignore"] });
     const output = new BoundedTextCapture2(ADAPTER_STDERR_LIMIT_BYTES2);
@@ -35840,12 +36056,12 @@ async function runCapabilityProbe2(args) {
     timeout.unref();
   });
 }
-async function claudeVersion() {
-  const result = await runCapabilityProbe2(["--version"]);
-  return result.code === 0 && !result.overflowed && !result.terminated ? { installed: true, version: result.output.trim() } : { installed: false };
+async function claudeVersion(executable) {
+  const result = await runCapabilityProbe2(executable, ["--version"]);
+  return result.code === 0 && !result.overflowed && !result.terminated ? { installed: true, version: stripSingleHostVersionLineEnding(result.output) } : { installed: false };
 }
-async function claudeAuthenticated() {
-  const result = await runCapabilityProbe2(["auth", "status", "--json"]);
+async function claudeAuthenticated(executable) {
+  const result = await runCapabilityProbe2(executable, ["auth", "status", "--json"]);
   if (result.code !== 0 || result.overflowed || result.terminated) return false;
   try {
     const status3 = JSON.parse(result.output);
@@ -35854,27 +36070,56 @@ async function claudeAuthenticated() {
     return false;
   }
 }
+async function probeClaudeExecutable(executable) {
+  const result = await claudeVersion(executable);
+  const authenticated = result.installed && await claudeAuthenticated(executable);
+  return hostCapabilitiesFromProtocolProfile("claude", {
+    installed: result.installed,
+    authenticated,
+    ...result.version ? { version: result.version } : {}
+  });
+}
 var ClaudeAdapter = class {
   constructor(policy) {
     this.policy = policy;
   }
   policy;
   id = "claude";
+  async resolveReadyExecutable(repositoryPath) {
+    let executable;
+    try {
+      executable = await resolveTrustedExecutable("claude", {
+        untrustedRoots: await claudeUntrustedRoots(repositoryPath)
+      });
+    } catch {
+      assertRequiredHostCapabilities(
+        this.id,
+        hostCapabilitiesFromProtocolProfile("claude", {
+          installed: false,
+          authenticated: false
+        })
+      );
+      throw new Error("Unreachable Claude capability admission state");
+    }
+    assertRequiredHostCapabilities(this.id, await probeClaudeExecutable(executable));
+    return executable;
+  }
   async probe() {
-    const result = await claudeVersion();
-    const authenticated = result.installed && await claudeAuthenticated();
-    return HostCapabilitiesSchema.parse({
-      ...result,
-      authenticated,
-      structuredOutput: result.installed,
-      streamingEvents: result.installed,
-      tokenReporting: result.installed
-    });
+    let executable;
+    try {
+      executable = await resolveTrustedExecutable("claude", {
+        untrustedRoots: await claudeUntrustedRoots()
+      });
+    } catch {
+      return hostCapabilitiesFromProtocolProfile("claude", {
+        installed: false,
+        authenticated: false
+      });
+    }
+    return await probeClaudeExecutable(executable);
   }
   async plan(request, signal) {
-    const executable = await resolveTrustedExecutable("claude", {
-      untrustedCwd: request.repositoryPath
-    });
+    const executable = await this.resolveReadyExecutable(request.repositoryPath);
     const child = spawn3(executable, claudePlannerArgs(request, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -35928,9 +36173,7 @@ var ClaudeAdapter = class {
     }
   }
   async verify(request, signal) {
-    const executable = await resolveTrustedExecutable("claude", {
-      untrustedCwd: request.repositoryPath
-    });
+    const executable = await this.resolveReadyExecutable(request.repositoryPath);
     const child = spawn3(executable, claudeSemanticVerifierArgs(request, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -35984,10 +36227,8 @@ var ClaudeAdapter = class {
     }
   }
   async *execute(request, signal) {
+    const executable = await this.resolveReadyExecutable(request.repositoryPath);
     const args = claudeWorkerArgs(request, this.policy);
-    const executable = await resolveTrustedExecutable("claude", {
-      untrustedCwd: request.repositoryPath
-    });
     const child = spawn3(executable, args, {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -36496,9 +36737,9 @@ async function readBranchProtection(options, input) {
 }
 async function probeGitHub(options) {
   const errors = [];
-  let commandVersion2;
+  let commandVersion;
   try {
-    commandVersion2 = (await runCommand(options, ["--version"])).stdout.split("\n")[0]?.trim();
+    commandVersion = (await runCommand(options, ["--version"])).stdout.split("\n")[0]?.trim();
   } catch (error51) {
     errors.push(`GitHub CLI is unavailable: ${errorMessage(error51)}`);
     return GitHubCapabilityReportSchema.parse({
@@ -36522,7 +36763,7 @@ async function probeGitHub(options) {
       authenticated: false,
       repositoryAccessible: false,
       readyForSnapshot: false,
-      commandVersion: commandVersion2,
+      commandVersion,
       canRead: false,
       canWrite: false,
       errors
@@ -36546,7 +36787,7 @@ async function probeGitHub(options) {
       authenticated: true,
       repositoryAccessible: false,
       readyForSnapshot: false,
-      commandVersion: commandVersion2,
+      commandVersion,
       canRead: false,
       canWrite: false,
       errors
@@ -36570,7 +36811,7 @@ async function probeGitHub(options) {
     authenticated: true,
     repositoryAccessible: true,
     readyForSnapshot: canRead && branchProtection.status !== "unknown",
-    commandVersion: commandVersion2,
+    commandVersion,
     host,
     nameWithOwner: repository.nameWithOwner,
     url: repository.url,
@@ -37552,19 +37793,19 @@ import { join as join4 } from "node:path";
 import { hostname as hostname3 } from "node:os";
 import { randomUUID as randomUUID3 } from "node:crypto";
 import { constants as fsConstants2 } from "node:fs";
-import { lstat as lstat2, open as open3, unlink } from "node:fs/promises";
-import { basename, dirname as dirname3, resolve as resolve3 } from "node:path";
+import { lstat as lstat3, open as open3, unlink } from "node:fs/promises";
+import { basename, dirname as dirname4, resolve as resolve3 } from "node:path";
 
 // packages/runtime/src/secure-fs.ts
 import { spawn as spawn4 } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { chmod, lstat, mkdir as mkdir2, open as open2, readdir } from "node:fs/promises";
-import { dirname as dirname2, isAbsolute as isAbsolute3, join as join3, relative as relative2, resolve as resolve2, sep as sep2, win32 as win322 } from "node:path";
+import { chmod, lstat as lstat2, mkdir as mkdir2, open as open2, readdir } from "node:fs/promises";
+import { dirname as dirname3, isAbsolute as isAbsolute3, join as join3, relative as relative2, resolve as resolve2, sep as sep2, win32 as win322 } from "node:path";
 
 // packages/runtime/src/json.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
 import { mkdir, open, rename, rm as rm2 } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname as dirname2 } from "node:path";
 
 // packages/runtime/src/redaction.ts
 var secretKey = /(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|passwd|credential)/i;
@@ -37805,7 +38046,7 @@ function assertPersistenceSafe(value, label) {
 
 // packages/runtime/src/json.ts
 async function writeJsonAtomic(path, value) {
-  await mkdir(dirname(path), { recursive: true });
+  await mkdir(dirname2(path), { recursive: true });
   const temporaryPath = `${path}.${process.pid}.${randomUUID2()}.tmp`;
   try {
     const handle = await open(temporaryPath, "wx", 384);
@@ -37857,8 +38098,8 @@ async function replacePathAtomic(temporaryPath, path) {
       delayMs = Math.min(100, delayMs * 2);
     }
   }
-  const sourceDirectory = dirname(temporaryPath);
-  const targetDirectory = dirname(path);
+  const sourceDirectory = dirname2(temporaryPath);
+  const targetDirectory = dirname2(path);
   await syncDirectory(targetDirectory);
   if (sourceDirectory !== targetDirectory) await syncDirectory(sourceDirectory);
 }
@@ -38053,7 +38294,7 @@ function rememberDarwinEntry(path, fingerprint) {
   }
 }
 async function inspectPrivateEntry(path) {
-  const status3 = await lstat(path, { bigint: true });
+  const status3 = await lstat2(path, { bigint: true });
   const identityFingerprint = privateEntryIdentityFingerprint(status3);
   const publicationIdentityFingerprint = privatePublicationIdentityFingerprint(status3);
   const metadataFingerprint = identityFingerprint === void 0 ? void 0 : `${identityFingerprint}:${status3.ctimeNs}`;
@@ -38330,7 +38571,7 @@ async function validatePrivatePath(ownedRoot, relativePath) {
   const relation = relative2(root, absolute);
   if (relation === ".." || relation.startsWith(`..${sep2}`) || isAbsolute3(relation))
     throw new Error(`Private path escapes its owned root: ${relativePath}`);
-  const rootStatus = await lstat(root);
+  const rootStatus = await lstat2(root);
   if (rootStatus.isSymbolicLink()) rejectSymbolicLink(root);
   if (!rootStatus.isDirectory()) throw new Error(`Private root is not a directory: ${root}`);
   let current = root;
@@ -38338,7 +38579,7 @@ async function validatePrivatePath(ownedRoot, relativePath) {
     current = join3(current, segment);
     let status3;
     try {
-      status3 = await lstat(current);
+      status3 = await lstat2(current);
     } catch (error51) {
       if (isMissing(error51)) return absolute;
       throw error51;
@@ -38362,7 +38603,7 @@ async function readBoundedRegularFile(path, maximumBytes, options) {
   const noFollow = process.platform === "win32" ? 0 : fsConstants.O_NOFOLLOW;
   for (let replacementAttempt = 0; ; replacementAttempt += 1) {
     try {
-      const observed = await lstat(absolute, { bigint: true });
+      const observed = await lstat2(absolute, { bigint: true });
       assertPrivateRegularFile(absolute, observed, options.allowMultipleLinks);
       if (observed.size > BigInt(maximumBytes))
         throw new Error(`Private file exceeds its ${maximumBytes}-byte bounded read limit`);
@@ -38414,12 +38655,12 @@ async function ensurePrivateDirectory(path, ownedRoot = path) {
   let candidate = absolute;
   while (true) {
     try {
-      await lstat(candidate);
+      await lstat2(candidate);
       break;
     } catch (error51) {
       if (!isMissing(error51)) throw error51;
       missingDirectories.push(candidate);
-      const parent = dirname2(candidate);
+      const parent = dirname3(candidate);
       if (parent === candidate)
         throw new Error(`Private directory has no existing ancestor: ${absolute}`);
       candidate = parent;
@@ -38427,7 +38668,7 @@ async function ensurePrivateDirectory(path, ownedRoot = path) {
   }
   await mkdir2(absolute, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
   if (absolute !== root) await validatePrivatePath(root, relativePath);
-  const status3 = await lstat(absolute);
+  const status3 = await lstat2(absolute);
   if (status3.isSymbolicLink()) rejectSymbolicLink(path);
   if (!status3.isDirectory()) throw new Error(`Private directory path is not a directory: ${path}`);
   const directories = [root];
@@ -38447,7 +38688,7 @@ async function ensurePrivateDirectory(path, ownedRoot = path) {
   }
   for (const directory of missingDirectories.reverse()) {
     await syncDirectory(directory);
-    await syncDirectory(dirname2(directory));
+    await syncDirectory(dirname3(directory));
   }
 }
 var activePrivateDirectoryMutations = /* @__PURE__ */ new WeakSet();
@@ -38499,7 +38740,7 @@ async function publishPrivateFileAtomic(input) {
   const absolute = resolve2(input.path);
   const root = resolve2(input.ownedRoot);
   const sourceDirectory = resolve2(input.sourceDirectory);
-  const targetDirectory = dirname2(absolute);
+  const targetDirectory = dirname3(absolute);
   const relativePath = relative2(root, absolute);
   await validatePrivatePath(root, relativePath);
   const parentPaths = [.../* @__PURE__ */ new Set([sourceDirectory, targetDirectory])];
@@ -38596,7 +38837,7 @@ async function writePrivateJsonAtomic(path, value, ownedRoot, options = {}) {
   await publishPrivateFileAtomic({
     path: absolute,
     ownedRoot,
-    sourceDirectory: dirname2(absolute),
+    sourceDirectory: dirname3(absolute),
     hardenOnPosix: false,
     supersessionPolicy: options.supersessionPolicy ?? "strict",
     publish: async () => await writeJsonAtomic(absolute, value)
@@ -38608,7 +38849,7 @@ async function hardenPrivateFile(path, ownedRoot) {
     await validatePrivatePath(ownedRoot, relative2(resolve2(ownedRoot), absolute));
   let status3;
   try {
-    status3 = await lstat(absolute);
+    status3 = await lstat2(absolute);
   } catch (error51) {
     if (isMissing(error51)) return;
     throw error51;
@@ -38621,7 +38862,7 @@ async function hardenPrivateFile(path, ownedRoot) {
     else await hardenWindowsEntries([{ kind: "file", path: absolute }]);
   } catch (error51) {
     try {
-      await lstat(absolute);
+      await lstat2(absolute);
     } catch (inspectionError) {
       if (isMissing(inspectionError)) return;
       throw inspectionError;
@@ -38745,11 +38986,11 @@ function processExists(pid) {
   }
 }
 function lockOwnedRoot(path) {
-  let candidate = dirname3(path);
+  let candidate = dirname4(path);
   while (true) {
     if (basename(candidate) === ".graphcraft") return candidate;
-    const parent = dirname3(candidate);
-    if (parent === candidate) return dirname3(path);
+    const parent = dirname4(candidate);
+    if (parent === candidate) return dirname4(path);
     candidate = parent;
   }
 }
@@ -38759,7 +39000,7 @@ async function readLockRecord(path, ownedRoot) {
 async function pathNamesLockDescriptor(path, ownedRoot, descriptorStatus, token) {
   let pathStatus;
   try {
-    pathStatus = await lstat2(path, { bigint: true });
+    pathStatus = await lstat3(path, { bigint: true });
   } catch (error51) {
     if (error51.code === "ENOENT") return false;
     throw error51;
@@ -38792,14 +39033,14 @@ var RunLock = class {
     let contentionAttempts = 0;
     while (true) {
       await ensurePrivateDirectory(this.ownedRoot);
-      await ensurePrivateDirectory(dirname3(this.path), this.ownedRoot);
+      await ensurePrivateDirectory(dirname4(this.path), this.ownedRoot);
       await hardenPrivateFile(this.path, this.ownedRoot);
       let descriptorOpened = false;
       try {
         await publishPrivateFileAtomic({
           path: this.path,
           ownedRoot: this.ownedRoot,
-          sourceDirectory: dirname3(this.path),
+          sourceDirectory: dirname4(this.path),
           hardenOnPosix: true,
           publish: async () => {
             const handle = await open3(this.path, "wx", 384);
@@ -38862,7 +39103,7 @@ var RunLock = class {
         try {
           observed = await readLockRecord(this.path, this.ownedRoot);
           record2 = parseLockRecord(observed);
-          observedStatus = await lstat2(this.path, { bigint: true });
+          observedStatus = await lstat3(this.path, { bigint: true });
         } catch {
         }
         const heartbeatAge = observedStatus ? Math.max(0, Date.now() - Number(observedStatus.mtimeMs)) : Number.POSITIVE_INFINITY;
@@ -38877,7 +39118,7 @@ var RunLock = class {
               throw readError;
             }
           );
-          const currentStatus = await lstat2(this.path, { bigint: true }).catch(
+          const currentStatus = await lstat3(this.path, { bigint: true }).catch(
             (statusError) => {
               if (statusError.code === "ENOENT") return void 0;
               throw statusError;
@@ -38932,7 +39173,7 @@ var RunLock = class {
   }
   async mutateLockDirectory(operation) {
     return await serializePrivatePathMutation(this.path, async () => {
-      const mutation = await preparePrivateDirectoryMutation(dirname3(this.path), this.ownedRoot);
+      const mutation = await preparePrivateDirectoryMutation(dirname4(this.path), this.ownedRoot);
       try {
         return await operation();
       } finally {
@@ -39104,8 +39345,8 @@ async function amendRunGraph(store, input, actor = "runtime") {
 // packages/runtime/src/artifact-policy.ts
 import { createHash as createHash2, randomUUID as randomUUID4 } from "node:crypto";
 import { constants as fsConstants3 } from "node:fs";
-import { lstat as lstat3, open as open4, readdir as readdir2, rmdir, unlink as unlink2 } from "node:fs/promises";
-import { basename as basename2, dirname as dirname4, isAbsolute as isAbsolute4, join as join5, posix, relative as relative3, resolve as resolve4, win32 as win323 } from "node:path";
+import { lstat as lstat4, open as open4, readdir as readdir2, rmdir, unlink as unlink2 } from "node:fs/promises";
+import { basename as basename2, dirname as dirname5, isAbsolute as isAbsolute4, join as join5, posix, relative as relative3, resolve as resolve4, win32 as win323 } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 var MIB3 = 1024 * 1024;
 var ATOMIC_STAGING_DIRECTORY = ".artifact-staging";
@@ -39178,7 +39419,7 @@ function isMissing2(error51) {
 }
 async function targetStatus(path) {
   try {
-    return await lstat3(path);
+    return await lstat4(path);
   } catch (error51) {
     if (isMissing2(error51)) return void 0;
     throw error51;
@@ -39188,7 +39429,7 @@ function sameFileSnapshot2(left, right) {
   return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
 }
 async function readBoundedArtifactInventory(path) {
-  const observed = await lstat3(path, { bigint: true });
+  const observed = await lstat4(path, { bigint: true });
   assertRegularPrivateTarget(path, observed);
   if (observed.size > BigInt(MAX_ARTIFACT_INVENTORY_BYTES))
     throw new Error(
@@ -39329,7 +39570,7 @@ async function cleanupAtomicStaging(root, lease) {
     const path = join5(stagingRoot, item.name);
     if (!item.isFile() || item.isSymbolicLink())
       throw new Error(`Unsupported entry in artifact staging directory: ${path}`);
-    assertRegularPrivateTarget(path, await lstat3(path));
+    assertRegularPrivateTarget(path, await lstat4(path));
     lease.assertHeld();
     const mutation2 = await preparePrivateDirectoryMutation(stagingRoot, root);
     let bodyFailureWasThrown2 = false;
@@ -39360,7 +39601,7 @@ async function cleanupAtomicStaging(root, lease) {
     await syncDirectory(stagingRoot);
     lease.assertHeld();
   }
-  const parent = dirname4(stagingRoot);
+  const parent = dirname5(stagingRoot);
   lease.assertHeld();
   const mutation = await preparePrivateDirectoryMutation(parent, root);
   let bodyFailureWasThrown = false;
@@ -39396,7 +39637,7 @@ async function removePrivateFile(root, relativePath, lease) {
   });
   lease.assertHeld();
   if (path) {
-    const parent = dirname4(path);
+    const parent = dirname5(path);
     lease.assertHeld();
     const mutation = await preparePrivateDirectoryMutation(parent, root);
     let bodyFailureWasThrown = false;
@@ -39739,8 +39980,8 @@ var RunArtifactStore = class {
       throw new Error("Run artifact reserve must be smaller than the run quota");
     if (policy.runReservedBytes < policy.invocationReservedBytes)
       throw new Error("Run artifact reserve must cover the invocation recovery reserve");
-    const runParent = dirname4(resolve4(runRoot));
-    const lockRoot = basename2(runParent) === "runs" ? dirname4(runParent) : runParent;
+    const runParent = dirname5(resolve4(runRoot));
+    const lockRoot = basename2(runParent) === "runs" ? dirname5(runParent) : runParent;
     this.mutationLockPath = join5(lockRoot, "locks", `${runId}.artifacts.lock`);
   }
   runRoot;
@@ -40163,7 +40404,7 @@ var RunArtifactStore = class {
           continue;
         }
         if (!item.isFile()) throw new Error(`Unsupported entry in artifact tree: ${absolute}`);
-        const metadata = await lstat3(absolute);
+        const metadata = await lstat4(absolute);
         assertRegularPrivateTarget(absolute, metadata);
         files.push({
           path: relativePath,
@@ -40687,9 +40928,9 @@ var RunArtifactStore = class {
 };
 
 // packages/probes/src/index.ts
-import { access, readFile, stat as stat3 } from "node:fs/promises";
-import { constants } from "node:fs";
-import { dirname as dirname5, join as join6, resolve as resolve5, sep as sep3 } from "node:path";
+import { access as access2, readFile, stat as stat3 } from "node:fs/promises";
+import { constants as constants2 } from "node:fs";
+import { dirname as dirname6, join as join6, resolve as resolve5, sep as sep3 } from "node:path";
 
 // packages/probes/src/process.ts
 var import_cross_spawn4 = __toESM(require_cross_spawn(), 1);
@@ -40925,7 +41166,7 @@ async function runProbe(spec, repositoryPath, signal) {
     const path = resolve5(repositoryPath, spec.path);
     let exists = true;
     try {
-      await access(path, constants.F_OK);
+      await access2(path, constants2.F_OK);
     } catch {
       exists = false;
     }
@@ -41079,7 +41320,7 @@ async function packageCandidates(repositoryPath, family, terms) {
   const candidates = [];
   for (const manifestPath of manifests) {
     const manifest2 = JSON.parse(await readFile(join6(repositoryPath, manifestPath), "utf8"));
-    const directory = dirname5(manifestPath) === "." ? void 0 : dirname5(manifestPath);
+    const directory = dirname6(manifestPath) === "." ? void 0 : dirname6(manifestPath);
     const relevant = !directory || terms.some(
       (term) => directory.toLowerCase().includes(term) || manifest2.name?.toLowerCase().includes(term)
     );
@@ -41213,7 +41454,7 @@ async function discoverProbePlan(repositoryPath, task, baseSha, options = {}) {
     items.push(completion);
   }
   try {
-    await access(join6(repositoryPath, "pyproject.toml"));
+    await access2(join6(repositoryPath, "pyproject.toml"));
     items.push({
       phase: "completion",
       purpose: "regression",
@@ -41231,7 +41472,7 @@ async function discoverProbePlan(repositoryPath, task, baseSha, options = {}) {
   } catch {
   }
   try {
-    await access(join6(repositoryPath, "go.mod"));
+    await access2(join6(repositoryPath, "go.mod"));
     items.push({
       phase: "completion",
       purpose: "regression",
@@ -41266,7 +41507,7 @@ import { join as join12 } from "node:path";
 // packages/runtime/src/control.ts
 import { randomUUID as randomUUID5 } from "node:crypto";
 import { unlink as unlink3 } from "node:fs/promises";
-import { dirname as dirname6, join as join7 } from "node:path";
+import { dirname as dirname7, join as join7 } from "node:path";
 var CONTROL_REQUEST_MAX_BYTES = 64 * 1024;
 var RunControlChannel = class {
   constructor(graphcraftRoot2, runId) {
@@ -41281,7 +41522,7 @@ var RunControlChannel = class {
   async ensureStorage() {
     this.storageReady ??= (async () => {
       await ensurePrivateDirectory(this.graphcraftRoot);
-      await ensurePrivateDirectory(dirname6(this.path), this.graphcraftRoot);
+      await ensurePrivateDirectory(dirname7(this.path), this.graphcraftRoot);
     })();
     try {
       await this.storageReady;
@@ -42116,8 +42357,8 @@ async function decideRunControl(store, input) {
 }
 
 // packages/runtime/src/repository.ts
-import { appendFile, lstat as lstat4, mkdir as mkdir3, readFile as readFile2, readlink } from "node:fs/promises";
-import { basename as basename3, dirname as dirname7, isAbsolute as isAbsolute5, join as join9, resolve as resolve6 } from "node:path";
+import { appendFile, lstat as lstat5, mkdir as mkdir3, readFile as readFile2, readlink } from "node:fs/promises";
+import { basename as basename3, dirname as dirname8, isAbsolute as isAbsolute5, join as join9, resolve as resolve6 } from "node:path";
 
 // packages/runtime/src/side-effect.ts
 var SideEffectBoundaryInterruption = class extends Error {
@@ -42432,7 +42673,7 @@ async function ensureGraphcraftIgnored(repositoryRoot) {
   try {
     content = await readFile2(excludePath, "utf8");
   } catch {
-    await mkdir3(dirname7(excludePath), { recursive: true });
+    await mkdir3(dirname8(excludePath), { recursive: true });
   }
   if (!content.split("\n").includes(".graphcraft/"))
     await appendFile(excludePath, "\n.graphcraft/\n", "utf8");
@@ -42443,7 +42684,7 @@ function slug(task) {
 async function createRunWorkspace(contract) {
   const branch = `graphcraft/${contract.runId.slice(0, 8)}-${slug(contract.task)}`;
   const parent = join9(
-    dirname7(contract.repository.root),
+    dirname8(contract.repository.root),
     `.${basename3(contract.repository.root)}-graphcraft-worktrees`
   );
   const path = join9(parent, contract.runId);
@@ -42475,7 +42716,7 @@ async function commitContentDigest(repositoryPath) {
   const changes = await Promise.all(
     paths.map(async (path) => {
       const absolutePath = join9(repositoryPath, path);
-      const stats = await lstat4(absolutePath).catch(() => void 0);
+      const stats = await lstat5(absolutePath).catch(() => void 0);
       if (!stats) return { path, kind: "absent" };
       if (stats.isSymbolicLink())
         return { path, kind: "symlink", target: await readlink(absolutePath) };
@@ -42701,14 +42942,14 @@ async function reconcileAtomicPush(workspace, claim) {
 
 // packages/runtime/src/store.ts
 import { constants as fsConstants5 } from "node:fs";
-import { lstat as lstat6, open as open6, readdir as readdir4 } from "node:fs/promises";
+import { lstat as lstat7, open as open6, readdir as readdir4 } from "node:fs/promises";
 import { join as join11, relative as relative5, resolve as resolve8 } from "node:path";
 import { TextDecoder as TextDecoder2 } from "node:util";
 
 // packages/runtime/src/migration.ts
 import { createHash as createHash4 } from "node:crypto";
 import { constants as fsConstants4 } from "node:fs";
-import { lstat as lstat5, mkdir as mkdir4, open as open5, readdir as readdir3, rename as rename2, rm as rm3 } from "node:fs/promises";
+import { lstat as lstat6, mkdir as mkdir4, open as open5, readdir as readdir3, rename as rename2, rm as rm3 } from "node:fs/promises";
 import { join as join10, relative as relative4, resolve as resolve7 } from "node:path";
 import { isDeepStrictEqual as isDeepStrictEqual2 } from "node:util";
 var CURRENT_RUN_STORAGE_VERSION = 2;
@@ -42964,7 +43205,7 @@ async function acquireActiveAwareLock(path, lease) {
 }
 async function status2(path) {
   try {
-    return await lstat5(path);
+    return await lstat6(path);
   } catch (error51) {
     if (error51.code === "ENOENT") return void 0;
     throw error51;
@@ -43090,7 +43331,7 @@ function legacyTreeDigest(entries, ignoredRootName) {
   return createHash4("sha256").update(JSON.stringify(values)).digest("hex");
 }
 async function scanLegacyTreeMetadata(root, options, lease) {
-  const rootMetadata = await migrationStep(lease, async () => await lstat5(root, { bigint: true }));
+  const rootMetadata = await migrationStep(lease, async () => await lstat6(root, { bigint: true }));
   if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory())
     throw new Error("Storage migration cannot scan an unsafe legacy run root");
   let entryCount = 0;
@@ -43114,7 +43355,7 @@ async function scanLegacyTreeMetadata(root, options, lease) {
         throw new Error(
           `Legacy run contains more than the ${LEGACY_MIGRATION_RESOURCE_LIMITS.maximumEntryCount}-entry safe migration limit; prune legacy run state before retrying`
         );
-      const metadata = await migrationStep(lease, async () => await lstat5(path, { bigint: true }));
+      const metadata = await migrationStep(lease, async () => await lstat6(path, { bigint: true }));
       if (metadata.isSymbolicLink())
         throw new Error("Storage migration cannot scan a symbolic link; no backup was created");
       if (metadata.isDirectory()) {
@@ -43226,7 +43467,7 @@ function advanceLegacyEventLineLength(chunk, previousLength) {
 }
 async function readLegacySnapshotFile(expected, options, lease) {
   assertLegacyFileMetadata(
-    await migrationStep(lease, async () => await lstat5(expected.path, { bigint: true })),
+    await migrationStep(lease, async () => await lstat6(expected.path, { bigint: true })),
     expected,
     "before opening"
   );
@@ -43275,7 +43516,7 @@ async function readLegacySnapshotFile(expected, options, lease) {
       "while being read"
     );
     assertLegacyFileMetadata(
-      await migrationStep(lease, async () => await lstat5(expected.path, { bigint: true })),
+      await migrationStep(lease, async () => await lstat6(expected.path, { bigint: true })),
       expected,
       "after reading"
     );
@@ -43438,7 +43679,7 @@ async function syncBackupFile(path, observed, lease) {
       throw new Error(`Storage migration backup payload changed before fsync: ${path}`);
     await migrationStep(lease, async () => await handle.sync());
     const after = await migrationStep(lease, async () => await handle.stat());
-    const current = await migrationStep(lease, async () => await lstat5(path));
+    const current = await migrationStep(lease, async () => await lstat6(path));
     if (backupEntryFingerprint(after) !== expected || backupEntryFingerprint(current) !== expected)
       throw new Error(`Storage migration backup payload changed during fsync: ${path}`);
   } catch (error51) {
@@ -43449,7 +43690,7 @@ async function syncBackupFile(path, observed, lease) {
 }
 async function syncBackupTree(root, lease) {
   const visit = async (directory) => {
-    const observed = await migrationStep(lease, async () => await lstat5(directory));
+    const observed = await migrationStep(lease, async () => await lstat6(directory));
     if (observed.isSymbolicLink() || !observed.isDirectory())
       throw new Error(`Storage migration backup directory is unsafe: ${directory}`);
     const expected = backupEntryFingerprint(observed);
@@ -43458,11 +43699,11 @@ async function syncBackupTree(root, lease) {
     )) {
       lease.assertHeld();
       const path = join10(directory, name);
-      const metadata = await migrationStep(lease, async () => await lstat5(path));
+      const metadata = await migrationStep(lease, async () => await lstat6(path));
       if (metadata.isDirectory() && !metadata.isSymbolicLink()) await visit(path);
       else await syncBackupFile(path, metadata, lease);
     }
-    if (backupEntryFingerprint(await migrationStep(lease, async () => await lstat5(directory))) !== expected)
+    if (backupEntryFingerprint(await migrationStep(lease, async () => await lstat6(directory))) !== expected)
       throw new Error(`Storage migration backup directory changed during fsync: ${directory}`);
     await migrationStep(lease, async () => await syncDirectory(directory));
   };
@@ -43486,7 +43727,7 @@ async function checkpointBackup(hook, checkpoint, lease) {
 }
 async function copyLegacySnapshotFile(source, destinationPath, lease, checkpoint) {
   assertLegacyFileMetadata(
-    await migrationStep(lease, async () => await lstat5(source.path, { bigint: true })),
+    await migrationStep(lease, async () => await lstat6(source.path, { bigint: true })),
     source,
     "before backup copy"
   );
@@ -43545,7 +43786,7 @@ async function copyLegacySnapshotFile(source, destinationPath, lease, checkpoint
       "during backup copy"
     );
     assertLegacyFileMetadata(
-      await migrationStep(lease, async () => await lstat5(source.path, { bigint: true })),
+      await migrationStep(lease, async () => await lstat6(source.path, { bigint: true })),
       source,
       "after backup copy"
     );
@@ -43560,7 +43801,7 @@ async function copyLegacySnapshotFile(source, destinationPath, lease, checkpoint
     );
     const destinationPathMetadata = await migrationStep(
       lease,
-      async () => await lstat5(destinationPath, { bigint: true })
+      async () => await lstat6(destinationPath, { bigint: true })
     );
     if (destination.isSymbolicLink() || !destination.isFile() || destination.nlink > 1n || destination.size !== BigInt(source.bytes) || legacyMetadataFingerprint(destination) !== legacyMetadataFingerprint(destinationPathMetadata))
       throw new Error(
@@ -43583,7 +43824,7 @@ async function copyLegacySnapshot(sourceRoot, temporaryRoot, snapshot, lease, ch
     lease.assertHeld();
     if (entry.kind !== "directory") continue;
     assertLegacyDirectoryMetadata(
-      await migrationStep(lease, async () => await lstat5(entry.path, { bigint: true })),
+      await migrationStep(lease, async () => await lstat6(entry.path, { bigint: true })),
       entry,
       "before backup copy"
     );
@@ -43703,7 +43944,7 @@ async function ensureCompleteBackup(input, sourceSnapshot, lease, checkpoint) {
     const completionPath = join10(temporaryRoot, BACKUP_COMPLETION_FILE);
     await migrationStep(lease, async () => await writeJsonAtomic(completionPath, completion));
     await migrationStep(lease, async () => await hardenPrivateFile(completionPath, temporaryRoot));
-    const completionStatus = await migrationStep(lease, async () => await lstat5(completionPath));
+    const completionStatus = await migrationStep(lease, async () => await lstat6(completionPath));
     await syncBackupFile(completionPath, completionStatus, lease);
     await migrationStep(lease, async () => await syncDirectory(temporaryRoot));
     await migrationStep(lease, async () => await rename2(temporaryRoot, backupRoot));
@@ -43736,7 +43977,7 @@ async function validateLegacyRun(runRoot, runId, lease) {
   });
   await migrationStep(lease, async () => {
     try {
-      await lstat5(join10(runRoot, "events.jsonl"));
+      await lstat6(join10(runRoot, "events.jsonl"));
     } catch (error51) {
       throw new Error(
         `Legacy run ${runId} cannot migrate because events.jsonl is unavailable: ${error51 instanceof Error ? error51.message : String(error51)}`
@@ -44140,7 +44381,7 @@ var RunStore = class _RunStore {
     } catch (error51) {
       if (error51.code !== "EEXIST") throw error51;
       await validatePrivatePath(this.runRoot, "events.jsonl");
-      observed = await lstat6(this.eventsPath(), { bigint: true });
+      observed = await lstat7(this.eventsPath(), { bigint: true });
       assertEventLogFile(this.eventsPath(), observed);
       handle = await open6(
         this.eventsPath(),
@@ -44153,7 +44394,7 @@ var RunStore = class _RunStore {
       assertEventLogFile(this.eventsPath(), before);
       if (observed && !sameFileIdentity(observed, before))
         throw new Error("Run event log changed before its append descriptor was opened");
-      const pathBefore = await lstat6(this.eventsPath(), { bigint: true });
+      const pathBefore = await lstat7(this.eventsPath(), { bigint: true });
       assertEventLogFile(this.eventsPath(), pathBefore);
       if (!sameFileIdentity(before, pathBefore))
         throw new Error("Run event log path changed before append");
@@ -44162,7 +44403,7 @@ var RunStore = class _RunStore {
       await handle.writeFile(line, "utf8");
       await handle.sync();
       const after = await handle.stat({ bigint: true });
-      const pathAfter = await lstat6(this.eventsPath(), { bigint: true });
+      const pathAfter = await lstat7(this.eventsPath(), { bigint: true });
       assertEventLogFile(this.eventsPath(), after);
       assertEventLogFile(this.eventsPath(), pathAfter);
       if (!sameFileIdentity(after, pathAfter))
@@ -44619,7 +44860,7 @@ async function resolveRunId(repositoryRoot, reference) {
 // packages/runtime/src/scope.ts
 import { createHash as createHash5 } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { lstat as lstat7, readlink as readlink2 } from "node:fs/promises";
+import { lstat as lstat8, readlink as readlink2 } from "node:fs/promises";
 import { isAbsolute as isAbsolute6, matchesGlob, relative as relative6, resolve as resolve9, sep as sep4 } from "node:path";
 var maximumChangedPaths = 1e4;
 async function gitOutput(repositoryPath, args) {
@@ -44648,7 +44889,7 @@ async function pathSignature(repositoryPath, path) {
   const absolute = confinedPath(repositoryPath, path);
   let status3;
   try {
-    status3 = await lstat7(absolute);
+    status3 = await lstat8(absolute);
   } catch (error51) {
     if (error51.code === "ENOENT") return "missing";
     throw error51;
@@ -44951,7 +45192,7 @@ async function prepareWorkerContext(input) {
 }
 
 // packages/runtime/src/wait.ts
-import { lstat as lstat8, readFile as readFile3, readlink as readlink3 } from "node:fs/promises";
+import { lstat as lstat9, readFile as readFile3, readlink as readlink3 } from "node:fs/promises";
 import { setTimeout as waitForTimeout } from "node:timers/promises";
 import { isAbsolute as isAbsolute7, resolve as resolve10, sep as sep5 } from "node:path";
 function waitPath(root, path) {
@@ -44964,7 +45205,7 @@ function waitPath(root, path) {
 }
 async function fileSignature(root, path) {
   const absolute = waitPath(root, path);
-  const stats = await lstat8(absolute).catch(() => void 0);
+  const stats = await lstat9(absolute).catch(() => void 0);
   if (!stats) return contentHash({ kind: "absent", path });
   if (stats.isSymbolicLink())
     return contentHash({ kind: "symlink", path, target: await readlink3(absolute) });
@@ -46958,11 +47199,7 @@ async function createRun(task, options) {
   let planningUsage;
   if (options.planner) {
     const capabilities = await options.planner.probe();
-    if (!capabilities.installed || !capabilities.authenticated || !capabilities.structuredOutput || !capabilities.streamingEvents) {
-      throw new Error(
-        `${options.planner.id} is not authenticated or does not provide the required structured unattended interface`
-      );
-    }
+    assertRequiredHostCapabilities(options.planner.id, capabilities);
     const planned = await options.planner.plan(
       {
         contract,
@@ -47158,10 +47395,40 @@ async function executeWorker(input) {
   let result;
   let error51;
   let errorCause;
+  let capabilityDiagnostic;
   let termination;
   let usageReceipts = 0;
   const tokenPhase = input.node.id.startsWith("repair-") ? "repair" : "worker";
   let artifact = join12(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+  const preInvocationDiagnostic = diagnoseRequiredHostCapabilities(
+    input.adapter.id,
+    await input.adapter.probe()
+  );
+  if (!preInvocationDiagnostic.ready) {
+    artifact = await input.store.appendInvocationEvent(invocationId, {
+      type: "error",
+      message: preInvocationDiagnostic.detail
+    });
+    await input.store.append(
+      "runtime",
+      "invocation.finished",
+      {
+        invocationId,
+        nodeId: input.node.id,
+        artifact,
+        success: false,
+        reason: preInvocationDiagnostic.detail,
+        capabilityDiagnostic: preInvocationDiagnostic
+      },
+      invocationId
+    );
+    return {
+      invocationId,
+      error: preInvocationDiagnostic.detail,
+      capabilityDiagnostic: preInvocationDiagnostic,
+      artifact
+    };
+  }
   const execution = input.adapter.execute(
     {
       invocationId,
@@ -47180,9 +47447,15 @@ async function executeWorker(input) {
       next = await iterator.next();
     } catch (cause) {
       error51 = cause instanceof Error ? cause.message : String(cause);
-      errorCause = "host_crash";
-      const event2 = { type: "error", message: error51, cause: errorCause };
+      const capabilityError = cause instanceof HostCapabilityAdmissionError;
+      if (!capabilityError) errorCause = "host_crash";
+      const event2 = {
+        type: "error",
+        message: error51,
+        ...errorCause ? { cause: errorCause } : {}
+      };
       artifact = await input.store.appendInvocationEvent(invocationId, event2);
+      if (capabilityError) capabilityDiagnostic = cause.diagnostic;
       break;
     }
     if (next.done) break;
@@ -47229,7 +47502,7 @@ async function executeWorker(input) {
       if (event.cause === "host_crash" || event.cause === "timeout") errorCause = event.cause;
     }
   }
-  if (usageReceipts === 0)
+  if (usageReceipts === 0 && !capabilityDiagnostic)
     await input.store.append(
       "host",
       "tokens.recorded",
@@ -47252,7 +47525,8 @@ async function executeWorker(input) {
       success: Boolean(result) && !error51 && !termination,
       interrupted: Boolean(termination),
       ...termination ? { termination } : {},
-      ...errorCause ? { errorCause } : {}
+      ...errorCause ? { errorCause } : {},
+      ...capabilityDiagnostic ? { reason: capabilityDiagnostic.detail, capabilityDiagnostic } : {}
     },
     invocationId
   );
@@ -47261,6 +47535,7 @@ async function executeWorker(input) {
     ...result ? { result } : {},
     ...error51 ? { error: error51 } : {},
     ...errorCause ? { errorCause } : {},
+    ...capabilityDiagnostic ? { capabilityDiagnostic } : {},
     ...termination ? { termination } : {},
     artifact
   };
@@ -47541,9 +47816,20 @@ async function runSemanticVerification(input) {
   );
   const failVerification = async (error51) => {
     const failure = error51 instanceof Error ? error51 : new Error(String(error51));
+    const capabilityDiagnostic = error51 instanceof HostCapabilityAdmissionError ? error51.diagnostic : void 0;
     const artifact2 = await input.store.writeArtifact(
       `semantic/${invocationId}-error.json`,
-      `${JSON.stringify({ schemaVersion: 1, host: input.adapter.id, context, error: failure.message }, null, 2)}
+      `${JSON.stringify(
+        {
+          schemaVersion: 1,
+          host: input.adapter.id,
+          context,
+          error: failure.message,
+          ...capabilityDiagnostic ? { capabilityDiagnostic } : {}
+        },
+        null,
+        2
+      )}
 `
     );
     await input.store.append(
@@ -47558,6 +47844,7 @@ async function runSemanticVerification(input) {
         contextHash,
         beforeDigest: beforeScope.digest,
         error: failure.message,
+        ...capabilityDiagnostic ? { capabilityDiagnostic } : {},
         artifact: artifact2
       },
       invocationId
@@ -47566,6 +47853,7 @@ async function runSemanticVerification(input) {
   };
   let result;
   try {
+    assertRequiredHostCapabilities(input.adapter.id, await input.adapter.probe());
     result = await input.adapter.verify(
       {
         invocationId,
@@ -48692,6 +48980,15 @@ async function executeWorkNode(input) {
       ...worker.termination ? { termination: worker.termination } : {},
       artifact: worker.artifact
     };
+  if (worker.capabilityDiagnostic) {
+    const reason2 = `Host capability admission failed before worker invocation: ${worker.error}`;
+    await input.store.append("host", "node.failed", {
+      nodeId: input.node.id,
+      invocationId: worker.invocationId,
+      reason: reason2
+    });
+    return { status: "failed", nodeId: input.node.id, reason: reason2 };
+  }
   if (!worker.result || worker.error || worker.result.status !== "completed") {
     const detail = worker.error ?? worker.result?.summary ?? "Worker did not complete the node";
     const cause = worker.errorCause ?? "host_crash";
@@ -49082,10 +49379,11 @@ async function executeRun(input) {
     const ensureAdapterReady = async () => {
       if (adapterReady) return true;
       const capabilities = await input.adapter.probe();
-      adapterReady = capabilities.installed && capabilities.authenticated && capabilities.structuredOutput && capabilities.streamingEvents;
+      const diagnostic = diagnoseRequiredHostCapabilities(input.adapter.id, capabilities);
+      adapterReady = diagnostic.ready;
       if (!adapterReady)
         await input.store.append("runtime", "run.blocked", {
-          reason: `${input.adapter.id} is not authenticated or does not provide the required structured unattended interface`
+          reason: diagnostic.detail
         });
       return adapterReady;
     };
@@ -50312,7 +50610,7 @@ async function executeRun(input) {
 
 // packages/runtime/src/supervisor.ts
 import { open as open7, readdir as readdir5 } from "node:fs/promises";
-import { dirname as dirname8, join as join13, relative as relative8, resolve as resolve12 } from "node:path";
+import { dirname as dirname9, join as join13, relative as relative8, resolve as resolve12 } from "node:path";
 var KIB3 = 1024;
 var SUPERVISOR_LOG_MAX_BYTES = 64 * KIB3;
 var SUPERVISOR_LOG_RETAIN_BYTES = 32 * KIB3;
@@ -50420,10 +50718,6 @@ var RUNTIME_MANIFEST = "runtime.json";
 var REGISTRATION_RECEIPT_MAX_BYTES = 16 * 1024;
 var RUNTIME_MANIFEST_MAX_BYTES = 16 * 1024;
 var MANAGED_RUNTIME_MAX_BYTES = 32 * 1024 * 1024;
-var HOST_MINIMUM_VERSIONS = {
-  codex: "0.144.6",
-  claude: "2.1.212"
-};
 function createAdapter(host, policy) {
   return host === "claude" ? new ClaudeAdapter(policy) : new CodexAdapter(policy);
 }
@@ -50547,7 +50841,7 @@ async function readRuntimeManifest(path) {
       path,
       384,
       RUNTIME_MANIFEST_MAX_BYTES,
-      dirname9(dirname9(path))
+      dirname10(dirname10(path))
     );
     return source ? parseRuntimeManifest(JSON.parse(source.toString("utf8"))) : void 0;
   } catch {
@@ -50578,7 +50872,7 @@ async function loadBundledMcpRuntime(sourcePath) {
   };
 }
 async function runtimePairMatches(runtimeDirectory, bundled) {
-  const runtimeRoot = dirname9(runtimeDirectory);
+  const runtimeRoot = dirname10(runtimeDirectory);
   if (await runtimeDirectoryKind(runtimeDirectory) !== "directory") return false;
   if (!await managedDirectoryMatches(runtimeDirectory, 448)) return false;
   if (!await runtimePairHasExactEntries(runtimeDirectory, bundled)) return false;
@@ -50623,7 +50917,7 @@ async function runtimePairHasExactEntries(runtimeDirectory, bundled) {
 }
 async function runtimeDirectoryKind(path) {
   try {
-    const metadata = await lstat9(path);
+    const metadata = await lstat10(path);
     return metadata.isDirectory() && !metadata.isSymbolicLink() ? "directory" : "other";
   } catch (error51) {
     if (error51.code === "ENOENT") return "missing";
@@ -50635,7 +50929,7 @@ function modeMatches(mode, expectedMode) {
 }
 async function managedDirectoryMatches(path, expectedMode) {
   try {
-    const metadata = await lstat9(path);
+    const metadata = await lstat10(path);
     return metadata.isDirectory() && !metadata.isSymbolicLink() && modeMatches(metadata.mode, expectedMode);
   } catch {
     return false;
@@ -50659,7 +50953,7 @@ async function readRegularFile(path, expectedMode, maximumBytes = MANAGED_RUNTIM
   if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0) return void 0;
   let pathMetadata;
   try {
-    pathMetadata = await lstat9(path);
+    pathMetadata = await lstat10(path);
   } catch {
     return void 0;
   }
@@ -50667,14 +50961,14 @@ async function readRegularFile(path, expectedMode, maximumBytes = MANAGED_RUNTIM
     return void 0;
   try {
     const source = await readPrivateFileBounded(path, maximumBytes, ownedRoot);
-    const finalPathMetadata = await lstat9(path);
+    const finalPathMetadata = await lstat10(path);
     return finalPathMetadata.isFile() && !finalPathMetadata.isSymbolicLink() && modeMatches(finalPathMetadata.mode, expectedMode) && finalPathMetadata.dev === pathMetadata.dev && finalPathMetadata.ino === pathMetadata.ino && finalPathMetadata.size === source.byteLength ? source : void 0;
   } catch {
     return void 0;
   }
 }
 async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
-  const moduleDirectory = dirname9(fileURLToPath(moduleUrl));
+  const moduleDirectory = dirname10(fileURLToPath(moduleUrl));
   const candidates = [
     join14(moduleDirectory, "mcp.mjs"),
     resolve13(moduleDirectory, "../../../dist/mcp.mjs"),
@@ -50682,7 +50976,7 @@ async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
   ];
   for (const candidate of candidates) {
     try {
-      await access2(candidate);
+      await access3(candidate);
       return candidate;
     } catch {
     }
@@ -50814,7 +51108,7 @@ async function readRegistrationReceiptBytes(graphcraftHome, host) {
   const source = await readRegularFile(path, 384, REGISTRATION_RECEIPT_MAX_BYTES, graphcraftHome);
   if (source) return source;
   try {
-    await lstat9(path);
+    await lstat10(path);
   } catch (error51) {
     if (error51.code === "ENOENT") return void 0;
     throw error51;
@@ -50845,7 +51139,7 @@ async function verifiedReceiptRuntimePath(graphcraftHome, receipt) {
 }
 async function readManagedRuntimeFile(graphcraftHome, runtimePath, expectedMode) {
   const runtimeRoot = join14(graphcraftHome, "runtime");
-  const runtimeDirectory = dirname9(runtimePath);
+  const runtimeDirectory = dirname10(runtimePath);
   if (await runtimeDirectoryKind(runtimeRoot) !== "directory" || await runtimeDirectoryKind(runtimeDirectory) !== "directory")
     return void 0;
   try {
@@ -50880,37 +51174,40 @@ function compareVersion(left, right) {
   return 0;
 }
 function hostCompatibilityDiagnostic(host, capabilities) {
-  const minimumVersion = HOST_MINIMUM_VERSIONS[host];
+  const supportedVersions = recordedHostProtocolVersions(host);
   if (!capabilities.installed) {
     return {
       status: "missing",
-      minimumVersion,
+      supportedVersions,
       authenticated: false,
       exactTestedVersion: false,
       detail: `${host} is not installed`
     };
   }
-  const installed = parseVersion(capabilities.version);
-  const minimum = parseVersion(minimumVersion);
-  if (!installed) {
+  const installedVersion = parseHostProtocolVersion(capabilities.version);
+  if (!installedVersion) {
     return {
       status: "unknown",
       ...capabilities.version ? { installedVersion: capabilities.version } : {},
-      minimumVersion,
+      supportedVersions,
       authenticated: capabilities.authenticated,
       exactTestedVersion: false,
       detail: `${host} did not report a parseable semantic version`
     };
   }
-  const exactTestedVersion = compareVersion(installed, minimum) === 0;
-  const compatible = compareVersion(installed, minimum) >= 0;
+  const profile = resolveHostProtocolProfile(host, capabilities.version);
+  const missingCapabilities = REQUIRED_HOST_PROTOCOL_CAPABILITIES.filter(
+    (capability) => !capabilities[capability]
+  );
+  const compatible = profile !== void 0 && capabilities.protocolProfile === profile.id && missingCapabilities.length === 0;
   return {
     status: compatible ? "compatible" : "unsupported",
     ...capabilities.version ? { installedVersion: capabilities.version } : {},
-    minimumVersion,
+    supportedVersions,
+    ...profile ? { protocolProfile: profile.id } : {},
     authenticated: capabilities.authenticated,
-    exactTestedVersion,
-    detail: compatible ? exactTestedVersion ? `${host} matches the recorded live-test version` : `${host} meets the minimum version; this exact version is not in the recorded live-test matrix` : `${host} is older than the minimum supported version`
+    exactTestedVersion: compatible,
+    detail: compatible ? `${host} matches recorded protocol profile ${profile.id}` : profile ? `${host} ${installedVersion} did not report the complete recorded protocol profile` : `${host} ${installedVersion} has no recorded protocol profile; supported versions: ${supportedVersions.join(", ")}`
   };
 }
 async function installationDiagnostics(options = {}) {
