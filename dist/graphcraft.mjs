@@ -26005,7 +26005,7 @@ async function publishPrivateFileAtomic(input) {
         Promise.all(parentPaths.map(inspectPrivateEntry)),
         inspectPrivateEntry(absolute)
       ]);
-      let requiresFallbackHardening = false;
+      let requiresParentHardening = false;
       for (const [index, parentAfter] of parentsAfter.entries()) {
         const parentBefore = parentsBefore[index];
         if (parentAfter.entry.kind !== "directory")
@@ -26016,7 +26016,7 @@ async function publishPrivateFileAtomic(input) {
           throw new Error(
             `Private publication parent changed filesystem identity: ${parentAfter.entry.path}`
           );
-        requiresFallbackHardening ||= parentBefore.identityFingerprint === void 0 || parentAfter.identityFingerprint === void 0;
+        requiresParentHardening ||= parentBefore.identityFingerprint === void 0 || parentAfter.identityFingerprint === void 0;
       }
       if (fileAfter.entry.kind !== "file")
         throw new Error(`Published private path is not a regular file: ${absolute}`);
@@ -26027,16 +26027,17 @@ async function publishPrivateFileAtomic(input) {
       });
       if (resolve2(publication.path) !== absolute)
         throw new Error(`Published private file changed filesystem identity: ${absolute}`);
-      const superseded = publicationIdentity !== void 0 && fileAfter.publicationIdentityFingerprint !== void 0 && fileAfter.publicationIdentityFingerprint !== publicationIdentity;
+      await hardenWindowsEntriesLocked(
+        requiresParentHardening ? [...parentsAfter.map(({ entry }) => entry), fileAfter.entry] : [fileAfter.entry],
+        true
+      );
+      const finalFile = await inspectPrivateEntry(absolute);
+      if (finalFile.entry.kind !== "file")
+        throw new Error(`Published private path is not a regular file: ${absolute}`);
+      const superseded = publicationIdentity !== void 0 && finalFile.publicationIdentityFingerprint !== void 0 && finalFile.publicationIdentityFingerprint !== publicationIdentity;
       if (superseded && input.supersessionPolicy !== "reconstructable_projection")
         throw new Error(`Published private file changed filesystem identity: ${absolute}`);
-      requiresFallbackHardening ||= superseded || publicationIdentity === void 0 || fileAfter.publicationIdentityFingerprint === void 0;
-      if (requiresFallbackHardening)
-        await hardenWindowsEntriesLocked(
-          [...parentsAfter.map(({ entry }) => entry), fileAfter.entry],
-          true
-        );
-      else
+      if (!requiresParentHardening)
         for (const parentAfter of parentsAfter)
           rememberWindowsIdentity(parentAfter.identityFingerprint, parentAfter.metadataFingerprint);
     });
@@ -37871,6 +37872,11 @@ async function materializeTask(task) {
     }
     const initialized = await runProcess("git", ["init", "-b", "main"], { cwd: repository });
     if (initialized.exitCode !== 0) throw new Error(`Unable to initialize ${task.id}`);
+    const configured = await runProcess("git", ["config", "core.autocrlf", "false"], {
+      cwd: repository
+    });
+    if (configured.exitCode !== 0)
+      throw new Error(`Unable to configure deterministic line endings for ${task.id}`);
     const staged = await runProcess("git", ["add", "."], { cwd: repository });
     if (staged.exitCode !== 0) throw new Error(`Unable to stage fixture ${task.id}`);
     const committed = await runProcess(
