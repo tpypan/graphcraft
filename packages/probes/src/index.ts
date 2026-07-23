@@ -282,25 +282,40 @@ interface Candidate {
   root: boolean;
 }
 
+async function readUtf8File(path: string, signal?: AbortSignal): Promise<string> {
+  return await readFile(path, {
+    encoding: "utf8",
+    ...(signal ? { signal } : {}),
+  });
+}
+
 async function packageCandidates(
   repositoryPath: string,
   family: ProbePlan["family"],
   terms: string[],
+  signal?: AbortSignal,
 ): Promise<Candidate[]> {
-  const tracked = await runProcess("git", ["ls-files"], { cwd: repositoryPath });
+  signal?.throwIfAborted();
+  const tracked = await runProcess("git", ["ls-files"], {
+    cwd: repositoryPath,
+    ...(signal ? { signal } : {}),
+  });
+  signal?.throwIfAborted();
   if (tracked.exitCode !== 0) return [];
   const manifests = tracked.stdout
     .split("\n")
     .filter((path) => path === "package.json" || path.endsWith("/package.json"))
     .slice(0, 100);
   const rootManifest = manifests.includes("package.json")
-    ? (JSON.parse(await readFile(join(repositoryPath, "package.json"), "utf8")) as {
+    ? (JSON.parse(await readUtf8File(join(repositoryPath, "package.json"), signal)) as {
         packageManager?: string;
       })
     : undefined;
+  signal?.throwIfAborted();
   const candidates: Candidate[] = [];
   for (const manifestPath of manifests) {
-    const manifest = JSON.parse(await readFile(join(repositoryPath, manifestPath), "utf8")) as {
+    signal?.throwIfAborted();
+    const manifest = JSON.parse(await readUtf8File(join(repositoryPath, manifestPath), signal)) as {
       name?: string;
       packageManager?: string;
       scripts?: Record<string, string>;
@@ -414,8 +429,10 @@ export async function discoverProbePlan(
   baseSha: string,
   options: {
     finishLine?: "local_verified" | "committed" | "pushed" | "pr_open";
+    signal?: AbortSignal;
   } = {},
 ): Promise<ProbePlan> {
+  options.signal?.throwIfAborted();
   const family = classifyTask(task);
   const terms = taskTerms(task);
   const inventoryTerms = terms.length ? terms : [family];
@@ -462,8 +479,9 @@ export async function discoverProbePlan(
   }
 
   const selected = selectPackageCandidates(
-    await packageCandidates(repositoryPath, family, inventoryTerms),
+    await packageCandidates(repositoryPath, family, inventoryTerms, options.signal),
   );
+  options.signal?.throwIfAborted();
   for (const completion of selected) {
     if (completion.purpose !== "regression") items.push({ ...completion, phase: "progress" });
     items.push(completion);
@@ -518,6 +536,7 @@ export async function discoverProbePlan(
     });
   }
 
+  options.signal?.throwIfAborted();
   return await validateProbePlan({ schemaVersion: 1, family, items }, repositoryPath);
 }
 

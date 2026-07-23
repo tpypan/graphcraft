@@ -5,11 +5,13 @@ import {
   cp,
   mkdtemp,
   mkdir,
+  open,
   readFile,
   readdir,
   rename,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -19,12 +21,14 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ContextSelectionReceiptSchema,
+  HostTerminationError,
   REQUIRED_HOST_PROTOCOL_CAPABILITIES,
   assertRequiredHostCapabilities,
   evidenceSnapshot,
   hostCapabilitiesFromProtocolProfile,
   interruptionReason,
   reconcilePersistedInvocation,
+  resolveTrustedExecutable,
   tokenCostReport,
 } from "@graphcraft/core";
 import type {
@@ -629,7 +633,7 @@ class FakeAdapter implements HostAdapter {
     this.emitUsage = emitUsage;
   }
 
-  async probe(): Promise<HostCapabilities> {
+  async probe(_signal?: AbortSignal): Promise<HostCapabilities> {
     if (this.id !== "test") {
       const version = this.id === "codex" ? "codex-cli 0.144.6" : "2.1.212 (Claude Code)";
       return hostCapabilitiesFromProtocolProfile(this.id, {
@@ -842,7 +846,10 @@ class FakeAdapter implements HostAdapter {
     return reconcilePersistedInvocation(invocation);
   }
 
-  async verify(request: SemanticVerificationRequest): Promise<SemanticVerificationResult> {
+  async verify(
+    request: SemanticVerificationRequest,
+    _signal?: AbortSignal,
+  ): Promise<SemanticVerificationResult> {
     this.semanticRequests.push(request);
     if (this.semanticAct) return await this.semanticAct(request);
     return {
@@ -854,6 +861,67 @@ class FakeAdapter implements HostAdapter {
       },
       usage: reportedUsage(2, 0, 1),
     };
+  }
+}
+
+async function expectBoundedRunCreationCancellation(
+  blockedGitPrefix: string[],
+  reason: string,
+): Promise<void> {
+  const repository = await createRepository();
+  const planner = new FakeAdapter(async () => undefined);
+  const cancellation = new AbortController();
+  const originalPath = process.env.PATH;
+  const originalGit = await resolveTrustedExecutable("git", { untrustedCwd: repository });
+  const fakeBin = join(repository, "..", ".run-creation-bin");
+  const fakeGit = join(fakeBin, "git");
+  const marker = join(repository, "..", "run-creation-subprocess-started");
+  await mkdir(fakeBin);
+  await writeFile(
+    fakeGit,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const args = process.argv.slice(2);
+const blockedPrefix = ${JSON.stringify(blockedGitPrefix)};
+if (blockedPrefix.every((value, index) => args[index] === value)) {
+  fs.writeFileSync(${JSON.stringify(marker)}, "started\\n");
+  setInterval(() => {}, 1_000);
+} else {
+  const result = spawnSync(${JSON.stringify(originalGit)}, args, { stdio: "inherit" });
+  if (result.error) throw result.error;
+  process.exit(result.status ?? 1);
+}
+`,
+  );
+  await chmod(fakeGit, 0o700);
+  process.env.PATH = `${fakeBin}${delimiter}${originalPath ?? ""}`;
+
+  try {
+    const creation = createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+      planner,
+      signal: cancellation.signal,
+    });
+    await waitFor(() =>
+      stat(marker).then(
+        () => true,
+        () => false,
+      ),
+    );
+
+    const startedAt = performance.now();
+    cancellation.abort({ cause: "cancellation", reason });
+
+    await expect(creation).rejects.toMatchObject({
+      name: "RunCreationInterruptedError",
+      message: reason,
+    });
+    expect(performance.now() - startedAt).toBeLessThan(5_000);
+    await expect(readdir(join(repository, ".graphcraft", "runs"))).rejects.toThrow();
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
   }
 }
 
@@ -8557,6 +8625,135 @@ process.stdin.on("end", () => {
     },
   );
 
+  it("honors planner cancellation before durable run creation", async () => {
+    const repository = await createRepository();
+    const planner = new FakeAdapter(async () => undefined);
+    const plan = planner.plan.bind(planner);
+    const cancellation = new AbortController();
+    planner.plan = async (request, signal) => {
+      const result = await plan(request, signal);
+      cancellation.abort({ cause: "cancellation", reason: "Cancelled after graph planning" });
+      return result;
+    };
+
+    await expect(
+      createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+        planner,
+        signal: cancellation.signal,
+      }),
+    ).rejects.toMatchObject({
+      name: "RunCreationInterruptedError",
+      message: "Cancelled after graph planning",
+    });
+    expect(planner.planningRequests).toHaveLength(1);
+    await expect(readdir(join(repository, ".graphcraft", "runs"))).rejects.toThrow();
+  });
+
+  it("normalizes planner admission termination before durable run creation", async () => {
+    const repository = await createRepository();
+    const planner = new FakeAdapter(async () => undefined);
+    const cancellation = new AbortController();
+    let probeStarted = false;
+    planner.probe = async (signal) => {
+      if (!signal) throw new Error("Planner capability probes must receive a cancellation signal");
+      probeStarted = true;
+      await waitForAbort(signal);
+      const reason = interruptionReason(signal.reason);
+      throw new HostTerminationError({
+        cause: reason.cause,
+        outcome: "graceful",
+        requestedSignal: "SIGTERM",
+        exitCode: null,
+        exitSignal: "SIGTERM",
+      });
+    };
+
+    const creation = createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+      planner,
+      signal: cancellation.signal,
+    });
+    await waitFor(() => probeStarted);
+    cancellation.abort({ cause: "cancellation", reason: "SIGINT during planner admission" });
+
+    await expect(creation).rejects.toMatchObject({
+      name: "RunCreationInterruptedError",
+      message: "SIGINT during planner admission",
+    });
+    await expect(readdir(join(repository, ".graphcraft", "runs"))).rejects.toThrow();
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "cancels a blocked planned-context subprocess before durable run creation",
+    () =>
+      expectBoundedRunCreationCancellation(
+        ["ls-files", "--"],
+        "SIGINT during planned context validation",
+      ),
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "cancels a blocked repository-discovery subprocess before durable run creation",
+    () =>
+      expectBoundedRunCreationCancellation(
+        ["rev-parse", "--show-toplevel"],
+        "SIGINT during repository discovery",
+      ),
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "cancels blocked probe and evidence discovery before durable run creation",
+    () =>
+      expectBoundedRunCreationCancellation(
+        ["ls-files"],
+        "SIGINT during probe and evidence discovery",
+      ),
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "cancels a blocked held-out integrity subprocess before durable run creation",
+    () =>
+      expectBoundedRunCreationCancellation(
+        ["hash-object"],
+        "SIGINT during held-out integrity capture",
+      ),
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "cancels a blocked planning-evidence file read before durable run creation",
+    async () => {
+      const repository = await createRepository();
+      const fifo = join(repository, "..", "blocked-package-json");
+      await execFileAsync("mkfifo", [fifo]);
+      await rm(join(repository, "package.json"));
+      await symlink(fifo, join(repository, "package.json"));
+      const cancellation = new AbortController();
+      const creation = createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+        signal: cancellation.signal,
+      });
+      const writer = await open(fifo, "w");
+
+      try {
+        const startedAt = performance.now();
+        cancellation.abort({
+          cause: "cancellation",
+          reason: "SIGINT during planning evidence read",
+        });
+
+        await expect(creation).rejects.toMatchObject({
+          name: "RunCreationInterruptedError",
+          message: "SIGINT during planning evidence read",
+        });
+        expect(performance.now() - startedAt).toBeLessThan(5_000);
+        await expect(readdir(join(repository, ".graphcraft", "runs"))).rejects.toThrow();
+      } finally {
+        await writer.close();
+      }
+    },
+  );
+
   it.each(REQUIRED_HOST_PROTOCOL_CAPABILITIES)(
     "blocks execution before workspace creation when %s is unavailable",
     async (capability) => {
@@ -8575,6 +8772,245 @@ process.stdin.on("end", () => {
       await expect(created.store.loadWorkspace()).rejects.toThrow();
     },
   );
+
+  it.each(["pause", "stop"] as const)(
+    "settles a %s request while the initial host capability probe is running",
+    async (action) => {
+      const repository = await createRepository();
+      const adapter = new FakeAdapter(async () => undefined);
+      let probeStarted = false;
+      adapter.probe = async (signal) => {
+        if (!signal)
+          throw new Error("Runtime capability probes must receive a cancellation signal");
+        probeStarted = true;
+        await waitForAbort(signal);
+        const reason = interruptionReason(signal.reason);
+        throw new HostTerminationError({
+          cause: reason.cause,
+          outcome: "graceful",
+          requestedSignal: "SIGTERM",
+          exitCode: null,
+          exitSignal: "SIGTERM",
+        });
+      };
+      const created = await createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+      });
+      const execution = executeRun({ store: created.store, adapter, approve: true });
+      await waitFor(() => probeStarted);
+
+      const startedAt = performance.now();
+      const [requestedState, settledState] = await Promise.all([
+        requestRunControl(
+          created.store,
+          action,
+          `${action === "pause" ? "Pause" : "Stop"} during host capability admission`,
+          5_000,
+        ),
+        execution,
+      ]);
+      const settlementLatencyMs = performance.now() - startedAt;
+
+      expect(requestedState.status).toBe(action === "pause" ? "paused" : "stopped");
+      expect(settledState.status).toBe(action === "pause" ? "paused" : "stopped");
+      expect(settlementLatencyMs).toBeLessThan(5_000);
+      expect(adapter.calls).toEqual([]);
+      await expect(created.store.loadWorkspace()).rejects.toThrow();
+
+      const events = await created.store.loadEvents();
+      expect(events.find(({ type }) => type === "run.blocked")).toBeUndefined();
+      const applied = events.findLast(({ type }) => type === "control.applied");
+      expect(applied).toMatchObject({
+        data: {
+          action,
+          cause: action === "pause" ? "user_pause" : "user_stop",
+          outcome: "graceful",
+          termination: {
+            cause: action === "pause" ? "user_pause" : "user_stop",
+            requestedSignal: "SIGTERM",
+          },
+        },
+      });
+      const request = applied?.data.request as { requestedAt?: string } | undefined;
+      expect(
+        Date.parse(applied?.timestamp ?? "") - Date.parse(request?.requestedAt ?? ""),
+      ).toBeLessThanOrEqual(5_000);
+      const controlChannel = new RunControlChannel(
+        created.store.graphcraftRoot,
+        created.contract.runId,
+      );
+      await expect(controlChannel.read()).resolves.toBeUndefined();
+      const lock = new RunLock(
+        join(created.store.graphcraftRoot, "locks", `${created.contract.runId}.lock`),
+      );
+      await lock.acquire();
+      await lock.release();
+    },
+  );
+
+  it("records probe cancellation before a worker as an interruption without model usage", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async () => undefined);
+    const ready = await adapter.probe();
+    let probes = 0;
+    adapter.probe = async (signal) => {
+      probes += 1;
+      if (probes === 1) return ready;
+      if (!signal) throw new Error("Worker capability probes must receive a cancellation signal");
+      await waitForAbort(signal);
+      const reason = interruptionReason(signal.reason);
+      throw new HostTerminationError({
+        cause: reason.cause,
+        outcome: "graceful",
+        requestedSignal: "SIGTERM",
+        exitCode: null,
+        exitSignal: "SIGTERM",
+      });
+    };
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    const execution = executeRun({ store: created.store, adapter, approve: true });
+    await waitFor(() => probes === 2);
+
+    const [requestedState, settledState] = await Promise.all([
+      requestRunControl(created.store, "pause", "Pause before worker invocation", 5_000),
+      execution,
+    ]);
+
+    expect(requestedState.status).toBe("paused");
+    expect(settledState.status).toBe("paused");
+    expect(adapter.calls).toEqual([]);
+    expect(settledState.tokenLedger.filter(({ phase }) => phase === "worker")).toEqual([]);
+    const events = await created.store.loadEvents();
+    expect(events.find(({ type }) => type === "run.blocked")).toBeUndefined();
+    expect(events.find(({ type }) => type === "node.failed")).toBeUndefined();
+    expect(events.findLast(({ type }) => type === "invocation.finished")).toMatchObject({
+      data: {
+        success: false,
+        interrupted: true,
+        termination: { cause: "user_pause", outcome: "graceful" },
+      },
+    });
+    expect(events.findLast(({ type }) => type === "control.applied")).toMatchObject({
+      data: {
+        action: "pause",
+        cause: "user_pause",
+        outcome: "graceful",
+        termination: { cause: "user_pause" },
+      },
+    });
+  });
+
+  it("records semantic-admission probe cancellation as an interruption instead of a blocker", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async () => undefined);
+    const ready = await adapter.probe();
+    let probes = 0;
+    adapter.probe = async (signal) => {
+      probes += 1;
+      if (probes < 4) return ready;
+      if (!signal) throw new Error("Semantic capability probes must receive a cancellation signal");
+      await waitForAbort(signal);
+      const reason = interruptionReason(signal.reason);
+      throw new HostTerminationError({
+        cause: reason.cause,
+        outcome: "graceful",
+        requestedSignal: "SIGTERM",
+        exitCode: null,
+        exitSignal: "SIGTERM",
+      });
+    };
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+      planner: adapter,
+    });
+    const execution = executeRun({ store: created.store, adapter, approve: true });
+    await waitFor(() => probes === 4);
+
+    const [requestedState, settledState] = await Promise.all([
+      requestRunControl(created.store, "pause", "Pause before semantic verification", 5_000),
+      execution,
+    ]);
+
+    expect(requestedState.status).toBe("paused");
+    expect(settledState.status).toBe("paused");
+    expect(adapter.calls).toEqual(["investigate"]);
+    expect(adapter.semanticRequests).toEqual([]);
+    expect(
+      settledState.tokenLedger.filter(({ phase }) => phase === "semantic_verification"),
+    ).toEqual([]);
+    expect(tokenCostReport(settledState.tokenLedger).reconciled).toBe(true);
+    const events = await created.store.loadEvents();
+    expect(events.find(({ type }) => type === "run.blocked")).toBeUndefined();
+    expect(events.find(({ type }) => type === "node.failed")).toBeUndefined();
+    expect(events.findLast(({ type }) => type === "semantic.started")).toBeUndefined();
+    expect(events.findLast(({ type }) => type === "semantic.verdict")).toBeUndefined();
+    expect(events.findLast(({ type }) => type === "control.applied")).toMatchObject({
+      data: {
+        action: "pause",
+        cause: "user_pause",
+        outcome: "graceful",
+        termination: { cause: "user_pause" },
+      },
+    });
+  });
+
+  it("reconciles provisional semantic usage when internal admission is cancelled", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async () => undefined);
+    let semanticAdmissionStarted = false;
+    adapter.verify = async (request, signal) => {
+      adapter.semanticRequests.push(request);
+      if (!signal) throw new Error("Semantic adapter admission requires a cancellation signal");
+      semanticAdmissionStarted = true;
+      await waitForAbort(signal);
+      const reason = interruptionReason(signal.reason);
+      throw new HostTerminationError(
+        {
+          cause: reason.cause,
+          outcome: "graceful",
+          requestedSignal: "SIGTERM",
+          exitCode: null,
+          exitSignal: "SIGTERM",
+        },
+        true,
+      );
+    };
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+      planner: adapter,
+    });
+    const execution = executeRun({ store: created.store, adapter, approve: true });
+    await waitFor(() => semanticAdmissionStarted);
+
+    const [requestedState, settledState] = await Promise.all([
+      requestRunControl(created.store, "pause", "Pause during semantic adapter admission", 5_000),
+      execution,
+    ]);
+
+    expect(requestedState.status).toBe("paused");
+    expect(settledState.status).toBe("paused");
+    expect(adapter.semanticRequests).toHaveLength(1);
+    expect(
+      settledState.tokenLedger.filter(({ phase }) => phase === "semantic_verification"),
+    ).toEqual([
+      expect.objectContaining({ missing: false, usage: expect.objectContaining({ total: 0 }) }),
+    ]);
+    expect(tokenCostReport(settledState.tokenLedger).reconciled).toBe(true);
+    const events = await created.store.loadEvents();
+    expect(events.findLast(({ type }) => type === "semantic.started")).toBeDefined();
+    expect(events.findLast(({ type }) => type === "semantic.verdict")).toBeUndefined();
+    expect(events.find(({ type }) => type === "run.blocked")).toBeUndefined();
+    expect(events.findLast(({ type }) => type === "control.applied")).toMatchObject({
+      data: {
+        action: "pause",
+        cause: "user_pause",
+        outcome: "graceful",
+        termination: { cause: "user_pause" },
+      },
+    });
+  });
 
   it.each([
     ["authentication loss", "unauthenticated"],
@@ -8713,6 +9149,8 @@ process.stdin.on("end", () => {
     expect(adapter.semanticRequests).toEqual([]);
     expect(state.status).toBe("blocked");
     expect(state.stopReason).toMatch(/semantic progress verification failed.*not authenticated/i);
+    expect(state.tokenLedger.filter(({ phase }) => phase === "semantic_verification")).toEqual([]);
+    expect(tokenCostReport(state.tokenLedger).reconciled).toBe(true);
     expect(
       (await created.store.loadEvents()).findLast(({ type }) => type === "semantic.verdict"),
     ).toMatchObject({ data: { error: expect.stringMatching(/not authenticated/i) } });
@@ -8744,6 +9182,10 @@ process.stdin.on("end", () => {
     expect(adapter.semanticRequests).toEqual([]);
     expect(state.status).toBe("blocked");
     expect(state.stopReason).toMatch(/semantic progress verification failed.*not authenticated/i);
+    expect(state.tokenLedger.filter(({ phase }) => phase === "semantic_verification")).toEqual([
+      expect.objectContaining({ missing: false, usage: expect.objectContaining({ total: 0 }) }),
+    ]);
+    expect(tokenCostReport(state.tokenLedger).reconciled).toBe(true);
     expect(
       (await created.store.loadEvents()).findLast(({ type }) => type === "semantic.verdict"),
     ).toMatchObject({

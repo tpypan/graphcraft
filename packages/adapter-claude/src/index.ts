@@ -11,6 +11,7 @@ import {
   discoverRepositoryTrustRoots,
   graphPlanJsonSchema,
   hostCapabilitiesFromProtocolProfile,
+  interruptionReason,
   normalizeTokenUsage,
   reconcilePersistedInvocation,
   resolveTrustedExecutable,
@@ -92,62 +93,102 @@ async function claudeUntrustedRoots(repositoryPath?: string): Promise<string[]> 
   return [...new Set([...paths, ...discovered.flat()])];
 }
 
+function abortedCapabilityProbeError(signal: AbortSignal): HostTerminationError {
+  const reason = interruptionReason(signal.reason);
+  return new HostTerminationError(
+    {
+      cause: reason.cause,
+      outcome: "already_exited",
+      requestedSignal: "SIGTERM",
+      exitCode: null,
+      exitSignal: null,
+    },
+    true,
+  );
+}
+
 async function runCapabilityProbe(
   executable: string,
   args: string[],
+  signal?: AbortSignal,
 ): Promise<{ code: number | null; output: string; overflowed: boolean; terminated: boolean }> {
-  return await new Promise((resolve) => {
+  if (signal?.aborted) throw abortedCapabilityProbeError(signal);
+  return await new Promise((resolve, reject) => {
     const child = spawn(executable, args, { stdio: ["ignore", "pipe", "ignore"] });
     const output = new BoundedTextCapture(ADAPTER_STDERR_LIMIT_BYTES);
-    const timeoutAbort = new AbortController();
-    const terminationController = new ChildTerminationController(child, timeoutAbort.signal);
+    const probeAbort = new AbortController();
+    const terminationController = new ChildTerminationController(child, probeAbort.signal);
+    let abortSource: "caller" | "timeout" | undefined;
     let settled = false;
     let settlement: NodeJS.Timeout | undefined;
     let timeout: NodeJS.Timeout | undefined;
-    const complete = (code: number | null, signal: NodeJS.Signals | null): void => {
+    const requestAbort = (source: "caller" | "timeout", reason: unknown): void => {
+      if (probeAbort.signal.aborted) return;
+      abortSource = source;
+      probeAbort.abort(reason);
+    };
+    const abortFromCaller = (): void => requestAbort("caller", signal?.reason);
+    const complete = (code: number | null, closeSignal: NodeJS.Signals | null): void => {
       if (settled) return;
       settled = true;
       if (timeout) clearTimeout(timeout);
       if (settlement) clearTimeout(settlement);
-      const termination = terminationController.finish(code, signal);
-      resolve({
+      probeAbort.signal.removeEventListener("abort", scheduleSettlement);
+      signal?.removeEventListener("abort", abortFromCaller);
+      const termination = terminationController.finish(code, closeSignal);
+      const result = {
         code,
         output: output.text(),
         overflowed: output.overflowed,
         terminated: termination !== undefined,
-      });
+      };
+      if (abortSource === "caller" || (abortSource === "timeout" && signal?.aborted)) {
+        reject(
+          termination
+            ? new HostTerminationError(termination, true)
+            : abortedCapabilityProbeError(abortSource === "caller" ? signal! : probeAbort.signal),
+        );
+        return;
+      }
+      resolve(result);
     };
-    child.stdout.on("data", (chunk: Buffer | string) => output.append(chunk));
-    child.once("error", () => complete(null, null));
-    child.once("close", complete);
-    timeout = setTimeout(() => {
-      timeoutAbort.abort({
-        cause: "timeout",
-        reason: "claude capability probe timed out",
-      });
-      if (settled) return;
+    const scheduleSettlement = (): void => {
+      if (settled || settlement) return;
       settlement = setTimeout(() => {
         child.stdout.destroy();
         child.unref?.();
         complete(null, null);
       }, HOST_CAPABILITY_PROBE_SETTLE_GRACE_MS);
       settlement.unref();
+    };
+    child.stdout.on("data", (chunk: Buffer | string) => output.append(chunk));
+    child.once("error", () => complete(null, null));
+    child.once("close", complete);
+    probeAbort.signal.addEventListener("abort", scheduleSettlement, { once: true });
+    timeout = setTimeout(() => {
+      requestAbort("timeout", {
+        cause: "timeout",
+        reason: "claude capability probe timed out",
+      });
     }, HOST_CAPABILITY_PROBE_TIMEOUT_MS);
     timeout.unref();
+    signal?.addEventListener("abort", abortFromCaller, { once: true });
+    if (signal?.aborted) abortFromCaller();
   });
 }
 
 async function claudeVersion(
   executable: string,
+  signal?: AbortSignal,
 ): Promise<{ installed: boolean; version?: string }> {
-  const result = await runCapabilityProbe(executable, ["--version"]);
+  const result = await runCapabilityProbe(executable, ["--version"], signal);
   return result.code === 0 && !result.overflowed && !result.terminated
     ? { installed: true, version: stripSingleHostVersionLineEnding(result.output) }
     : { installed: false };
 }
 
-async function claudeAuthenticated(executable: string): Promise<boolean> {
-  const result = await runCapabilityProbe(executable, ["auth", "status", "--json"]);
+async function claudeAuthenticated(executable: string, signal?: AbortSignal): Promise<boolean> {
+  const result = await runCapabilityProbe(executable, ["auth", "status", "--json"], signal);
   if (result.code !== 0 || result.overflowed || result.terminated) return false;
   try {
     const status = JSON.parse(result.output) as { loggedIn?: boolean };
@@ -157,9 +198,12 @@ async function claudeAuthenticated(executable: string): Promise<boolean> {
   }
 }
 
-export async function probeClaudeExecutable(executable: string) {
-  const result = await claudeVersion(executable);
-  const authenticated = result.installed && (await claudeAuthenticated(executable));
+export async function probeClaudeExecutable(executable: string, signal?: AbortSignal) {
+  if (signal?.aborted) throw abortedCapabilityProbeError(signal);
+  const result = await claudeVersion(executable, signal);
+  if (signal?.aborted) throw abortedCapabilityProbeError(signal);
+  const authenticated = result.installed && (await claudeAuthenticated(executable, signal));
+  if (signal?.aborted) throw abortedCapabilityProbeError(signal);
   return hostCapabilitiesFromProtocolProfile("claude", {
     installed: result.installed,
     authenticated,
@@ -172,13 +216,18 @@ export class ClaudeAdapter implements HostAdapter {
 
   constructor(private readonly policy?: HostExecutionPolicy) {}
 
-  private async resolveReadyExecutable(repositoryPath: string): Promise<string> {
+  private async resolveReadyExecutable(
+    repositoryPath: string,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    if (signal?.aborted) throw abortedCapabilityProbeError(signal);
     let executable: string;
     try {
       executable = await resolveTrustedExecutable("claude", {
         untrustedRoots: await claudeUntrustedRoots(repositoryPath),
       });
     } catch {
+      if (signal?.aborted) throw abortedCapabilityProbeError(signal);
       assertRequiredHostCapabilities(
         this.id,
         hostCapabilitiesFromProtocolProfile("claude", {
@@ -188,27 +237,34 @@ export class ClaudeAdapter implements HostAdapter {
       );
       throw new Error("Unreachable Claude capability admission state");
     }
-    assertRequiredHostCapabilities(this.id, await probeClaudeExecutable(executable));
+    if (signal?.aborted) throw abortedCapabilityProbeError(signal);
+    const capabilities = await probeClaudeExecutable(executable, signal);
+    if (signal?.aborted) throw abortedCapabilityProbeError(signal);
+    assertRequiredHostCapabilities(this.id, capabilities);
     return executable;
   }
 
-  async probe() {
+  async probe(signal?: AbortSignal) {
+    if (signal?.aborted) throw abortedCapabilityProbeError(signal);
     let executable: string;
     try {
       executable = await resolveTrustedExecutable("claude", {
         untrustedRoots: await claudeUntrustedRoots(),
       });
     } catch {
+      if (signal?.aborted) throw abortedCapabilityProbeError(signal);
       return hostCapabilitiesFromProtocolProfile("claude", {
         installed: false,
         authenticated: false,
       });
     }
-    return await probeClaudeExecutable(executable);
+    if (signal?.aborted) throw abortedCapabilityProbeError(signal);
+    return await probeClaudeExecutable(executable, signal);
   }
 
   async plan(request: PlanningRequest, signal: AbortSignal): Promise<PlanningResult> {
-    const executable = await this.resolveReadyExecutable(request.repositoryPath);
+    const executable = await this.resolveReadyExecutable(request.repositoryPath, signal);
+    if (signal.aborted) throw abortedCapabilityProbeError(signal);
     const child = spawn(executable, claudePlannerArgs(request, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -268,7 +324,8 @@ export class ClaudeAdapter implements HostAdapter {
     request: SemanticVerificationRequest,
     signal: AbortSignal,
   ): Promise<SemanticVerificationResult> {
-    const executable = await this.resolveReadyExecutable(request.repositoryPath);
+    const executable = await this.resolveReadyExecutable(request.repositoryPath, signal);
+    if (signal.aborted) throw abortedCapabilityProbeError(signal);
     const child = spawn(executable, claudeSemanticVerifierArgs(request, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -325,8 +382,9 @@ export class ClaudeAdapter implements HostAdapter {
   }
 
   async *execute(request: WorkerRequest, signal: AbortSignal): AsyncIterable<HostEvent> {
-    const executable = await this.resolveReadyExecutable(request.repositoryPath);
+    const executable = await this.resolveReadyExecutable(request.repositoryPath, signal);
     const args = claudeWorkerArgs(request, this.policy);
+    if (signal.aborted) throw abortedCapabilityProbeError(signal);
     const child = spawn(executable, args, {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },

@@ -58,6 +58,7 @@ interface FakeChildOutput {
   stdout?: string | Buffer;
   stderr?: string | Buffer;
   exitCode?: number;
+  afterClose?: () => void;
 }
 
 function queueChild(output: FakeChildOutput): FakeChild {
@@ -66,7 +67,10 @@ function queueChild(output: FakeChildOutput): FakeChild {
     setImmediate(() => {
       child.stdout.end(output.stdout ?? "");
       child.stderr.end(output.stderr ?? "");
-      setImmediate(() => child.emit("close", output.exitCode ?? 0, null));
+      setImmediate(() => {
+        child.emit("close", output.exitCode ?? 0, null);
+        output.afterClose?.();
+      });
     });
     return child as unknown as ChildProcess;
   });
@@ -616,6 +620,175 @@ describe("bounded adapter streams", () => {
       }
     },
   );
+
+  it("rejects an already-aborted capability probe without spawning", async () => {
+    for (const { adapter } of rawAdapters()) {
+      const abort = new AbortController();
+      abort.abort({ cause: "user_stop", reason: "Do not start capability discovery" });
+
+      await expect(adapter.probe(abort.signal)).rejects.toMatchObject({
+        name: "HostTerminationError",
+        beforeModelInvocation: true,
+        termination: {
+          cause: "user_stop",
+          outcome: "already_exited",
+          requestedSignal: "SIGTERM",
+          exitCode: null,
+          exitSignal: null,
+        },
+      });
+    }
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves cancellation that races natural version or authentication settlement", async () => {
+    for (const phase of ["version", "authentication"] as const) {
+      for (const { adapter } of rawAdapters()) {
+        const abort = new AbortController();
+        const cancelAfterClose = (): void =>
+          abort.abort({ cause: "user_pause", reason: `Pause after ${phase} settlement` });
+        if (phase === "version") {
+          queueChild({ exitCode: 1, afterClose: cancelAfterClose });
+        } else {
+          queueChild({
+            stdout: adapter.id === "codex" ? "codex-cli 0.144.6\n" : "2.1.212 (Claude Code)\n",
+          });
+          queueChild({
+            stdout: adapter.id === "codex" ? "Not logged in\n" : '{"loggedIn":false}\n',
+            afterClose: cancelAfterClose,
+          });
+        }
+
+        await expect(adapter.probe(abort.signal)).rejects.toMatchObject({
+          name: "HostTerminationError",
+          beforeModelInvocation: true,
+          termination: {
+            cause: "user_pause",
+            outcome: "already_exited",
+            requestedSignal: "SIGTERM",
+            exitCode: null,
+            exitSignal: null,
+          },
+        });
+      }
+    }
+  });
+
+  it("cancels hanging capability probes from either adapter before their timeout", async () => {
+    for (const { adapter } of rawAdapters()) {
+      const callOffset = spawnMock.mock.calls.length;
+      const { child, spawned } = queueTerminatingChild();
+      const abort = new AbortController();
+      const probing = adapter.probe(abort.signal);
+      await spawned;
+      const rejected = expect(probing).rejects.toMatchObject({
+        name: "HostTerminationError",
+        beforeModelInvocation: true,
+        termination: expect.objectContaining({
+          cause: "user_pause",
+          outcome: process.platform === "win32" ? "forced" : "graceful",
+          requestedSignal: "SIGTERM",
+        }),
+      });
+
+      abort.abort({ cause: "user_pause", reason: "Cancel capability discovery" });
+      await rejected;
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+      expect(spawnMock.mock.calls).toHaveLength(callOffset + 1);
+    }
+  });
+
+  it("bounds caller-cancelled capability probes when their child never emits close", async () => {
+    vi.useFakeTimers();
+    for (const { adapter } of rawAdapters()) {
+      const { child, spawned } = queueNeverClosingChild();
+      const abort = new AbortController();
+      const probing = adapter.probe(abort.signal);
+      let settled = false;
+      void probing.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+      await spawned;
+      const rejected = expect(probing).rejects.toMatchObject({
+        name: "HostTerminationError",
+        beforeModelInvocation: true,
+        termination: expect.objectContaining({
+          cause: "user_stop",
+          outcome: "forced",
+          requestedSignal: process.platform === "win32" ? "SIGTERM" : "SIGKILL",
+        }),
+      });
+
+      abort.abort({ cause: "user_stop", reason: "Bound capability settlement" });
+      await vi.advanceTimersByTimeAsync(HOST_CAPABILITY_PROBE_SETTLE_GRACE_MS - 1);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await rejected;
+      expect(child.kill).toHaveBeenNthCalledWith(1, "SIGTERM");
+      expect(child.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
+      expect(child.stdout.destroyed).toBe(true);
+    }
+  });
+
+  it("keeps the timeout receipt when caller cancellation arrives during settlement", async () => {
+    vi.useFakeTimers();
+    for (const { adapter } of rawAdapters()) {
+      const { child, spawned } = queueNeverClosingChild();
+      const abort = new AbortController();
+      const probing = adapter.probe(abort.signal);
+      await spawned;
+      const rejected = expect(probing).rejects.toMatchObject({
+        name: "HostTerminationError",
+        beforeModelInvocation: true,
+        termination: expect.objectContaining({
+          cause: "timeout",
+          outcome: "forced",
+          requestedSignal: process.platform === "win32" ? "SIGTERM" : "SIGKILL",
+        }),
+      });
+
+      await vi.advanceTimersByTimeAsync(HOST_CAPABILITY_PROBE_TIMEOUT_MS);
+      abort.abort({ cause: "user_pause", reason: "Caller arrived after the probe timeout" });
+      await vi.advanceTimersByTimeAsync(HOST_CAPABILITY_PROBE_SETTLE_GRACE_MS);
+
+      await rejected;
+      expect(child.kill).toHaveBeenNthCalledWith(1, "SIGTERM");
+      expect(child.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
+    }
+  });
+
+  it("threads cancellation through direct adapter admission before model spawn", async () => {
+    for (const { adapter } of rawAdapters()) {
+      const operations = [
+        (signal: AbortSignal) => adapter.plan(planningRequest(), signal),
+        (signal: AbortSignal) => adapter.verify(semanticRequest(), signal),
+        async (signal: AbortSignal) =>
+          await collectEvents(adapter.execute(workerRequest(), signal)),
+      ];
+      for (const operation of operations) {
+        const callOffset = spawnMock.mock.calls.length;
+        const { child, spawned } = queueTerminatingChild();
+        const abort = new AbortController();
+        const running = operation(abort.signal);
+        await spawned;
+        const rejected = expect(running).rejects.toMatchObject({
+          name: "HostTerminationError",
+          beforeModelInvocation: true,
+          termination: expect.objectContaining({ cause: "cancellation" }),
+        });
+
+        abort.abort({ cause: "cancellation", reason: "Cancel direct adapter admission" });
+        await rejected;
+        expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+        expect(spawnMock.mock.calls).toHaveLength(callOffset + 1);
+      }
+    }
+  });
 
   it("bounds hanging capability probes and terminates their process tree", async () => {
     vi.useFakeTimers();

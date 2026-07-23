@@ -15,7 +15,10 @@ export interface InterruptionReason {
 }
 
 export class HostTerminationError extends Error {
-  constructor(readonly termination: HostTermination) {
+  constructor(
+    readonly termination: HostTermination,
+    readonly beforeModelInvocation = false,
+  ) {
     super(`Host child terminated after ${termination.cause}`);
     this.name = "HostTerminationError";
   }

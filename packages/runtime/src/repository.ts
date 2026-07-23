@@ -15,23 +15,49 @@ import {
   type SideEffectReconciliation,
 } from "./side-effect.ts";
 
-async function gitRaw(repositoryPath: string, args: string[]): Promise<string> {
-  const result = await runProcess("git", args, { cwd: repositoryPath, timeoutMs: 120_000 });
+async function gitRaw(
+  repositoryPath: string,
+  args: string[],
+  signal?: AbortSignal,
+): Promise<string> {
+  signal?.throwIfAborted();
+  const result = await runProcess("git", args, {
+    cwd: repositoryPath,
+    timeoutMs: 120_000,
+    ...(signal ? { signal } : {}),
+  });
+  signal?.throwIfAborted();
   if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `git ${args[0]} failed`);
   return result.stdout;
 }
 
-async function git(repositoryPath: string, args: string[]): Promise<string> {
-  return (await gitRaw(repositoryPath, args)).trim();
+async function git(repositoryPath: string, args: string[], signal?: AbortSignal): Promise<string> {
+  return (await gitRaw(repositoryPath, args, signal)).trim();
 }
 
-export async function discoverRepository(cwd: string): Promise<RepositoryIdentity> {
-  const root = await git(cwd, ["rev-parse", "--show-toplevel"]);
-  const baseSha = await git(root, ["rev-parse", "HEAD"]);
+async function readUtf8(path: string, signal?: AbortSignal): Promise<string> {
+  return await readFile(path, {
+    encoding: "utf8",
+    ...(signal ? { signal } : {}),
+  });
+}
+
+export async function discoverRepository(
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<RepositoryIdentity> {
+  const root = await git(cwd, ["rev-parse", "--show-toplevel"], signal);
+  const baseSha = await git(root, ["rev-parse", "HEAD"], signal);
   const baseRef =
-    (await git(root, ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(() => "HEAD")) || "HEAD";
-  const remote = await git(root, ["remote", "get-url", "origin"]).catch(() => undefined);
-  await ensureGraphcraftIgnored(root);
+    (await git(root, ["symbolic-ref", "--quiet", "--short", "HEAD"], signal).catch(() => {
+      signal?.throwIfAborted();
+      return "HEAD";
+    })) || "HEAD";
+  const remote = await git(root, ["remote", "get-url", "origin"], signal).catch(() => {
+    signal?.throwIfAborted();
+    return undefined;
+  });
+  await ensureGraphcraftIgnored(root, signal);
   return { root, baseRef, baseSha, ...(remote ? { remote } : {}) };
 }
 
@@ -128,17 +154,25 @@ function taskSnippet(content: string, terms: string[], maximumCharacters: number
 export async function discoverPlanningEvidence(
   repositoryRoot: string,
   task: string,
+  signal?: AbortSignal,
 ): Promise<RepositoryPlanningEvidence> {
-  const trackedPaths = (await git(repositoryRoot, ["ls-files"])).split("\n").filter(Boolean);
+  const trackedPaths = (await git(repositoryRoot, ["ls-files"], signal))
+    .split("\n")
+    .filter(Boolean);
   const files: RepositoryPlanningEvidence["files"] = [];
   let remainingCharacters = 24_000;
   const searchTerms = planningSearchTerms(task);
   const searchPattern = searchTerms.join("|");
   const matchedPaths = searchPattern
     ? (
-        await git(repositoryRoot, ["grep", "-l", "-I", "-i", "-E", searchPattern, "--"]).catch(
-          () => "",
-        )
+        await git(
+          repositoryRoot,
+          ["grep", "-l", "-I", "-i", "-E", searchPattern, "--"],
+          signal,
+        ).catch(() => {
+          signal?.throwIfAborted();
+          return "";
+        })
       )
         .split("\n")
         .filter(
@@ -151,7 +185,11 @@ export async function discoverPlanningEvidence(
     : [];
   const taskMatches = await Promise.all(
     matchedPaths.map(async (path) => {
-      const content = await readFile(join(repositoryRoot, path), "utf8").catch(() => "");
+      signal?.throwIfAborted();
+      const content = await readUtf8(join(repositoryRoot, path), signal).catch(() => {
+        signal?.throwIfAborted();
+        return "";
+      });
       const normalized = content.toLowerCase();
       const score = searchTerms.filter((term) => normalized.includes(term)).length;
       const pathScore = searchTerms.filter((term) => path.toLowerCase().includes(term)).length;
@@ -159,6 +197,7 @@ export async function discoverPlanningEvidence(
       return { path, content, score, pathScore, source };
     }),
   );
+  signal?.throwIfAborted();
   taskMatches.sort(
     (left, right) =>
       right.source - left.source ||
@@ -167,6 +206,7 @@ export async function discoverPlanningEvidence(
       left.path.localeCompare(right.path),
   );
   for (const { path, content } of taskMatches.slice(0, 3)) {
+    signal?.throwIfAborted();
     const selected = taskSnippet(content, searchTerms, Math.min(3_000, remainingCharacters));
     if (!selected) continue;
     files.push({ path, content: selected, truncated: selected.length < content.length });
@@ -181,9 +221,13 @@ export async function discoverPlanningEvidence(
       return leftDepth - rightDepth || left.localeCompare(right);
     });
   for (const path of baselinePaths) {
+    signal?.throwIfAborted();
     if (remainingCharacters <= 0 || files.length >= 7) break;
     if (files.some((file) => file.path === path)) continue;
-    const content = await readFile(join(repositoryRoot, path), "utf8").catch(() => "");
+    const content = await readUtf8(join(repositoryRoot, path), signal).catch(() => {
+      signal?.throwIfAborted();
+      return "";
+    });
     const limit = Math.min(2_000, remainingCharacters);
     const selected = content.slice(0, limit);
     files.push({ path, content: selected, truncated: selected.length < content.length });
@@ -199,17 +243,26 @@ export async function discoverPlanningEvidence(
   };
 }
 
-async function ensureGraphcraftIgnored(repositoryRoot: string): Promise<void> {
-  const rawExcludePath = await git(repositoryRoot, ["rev-parse", "--git-path", "info/exclude"]);
+async function ensureGraphcraftIgnored(
+  repositoryRoot: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const rawExcludePath = await git(
+    repositoryRoot,
+    ["rev-parse", "--git-path", "info/exclude"],
+    signal,
+  );
   const excludePath = isAbsolute(rawExcludePath)
     ? rawExcludePath
     : resolve(repositoryRoot, rawExcludePath);
   let content = "";
   try {
-    content = await readFile(excludePath, "utf8");
+    content = await readUtf8(excludePath, signal);
   } catch {
+    signal?.throwIfAborted();
     await mkdir(dirname(excludePath), { recursive: true });
   }
+  signal?.throwIfAborted();
   if (!content.split("\n").includes(".graphcraft/"))
     await appendFile(excludePath, "\n.graphcraft/\n", "utf8");
 }

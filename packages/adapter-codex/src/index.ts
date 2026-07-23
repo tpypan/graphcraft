@@ -16,6 +16,7 @@ import {
   codexWorkerResultJsonSchema,
   discoverRepositoryTrustRoots,
   hostCapabilitiesFromProtocolProfile,
+  interruptionReason,
   normalizeTokenUsage,
   reconcilePersistedInvocation,
   resolveTrustedExecutable,
@@ -107,44 +108,68 @@ async function codexUntrustedRoots(repositoryPath?: string): Promise<string[]> {
   return [...new Set([...paths, ...discovered.flat()])];
 }
 
+function abortedCapabilityProbeError(signal: AbortSignal): HostTerminationError {
+  const reason = interruptionReason(signal.reason);
+  return new HostTerminationError(
+    {
+      cause: reason.cause,
+      outcome: "already_exited",
+      requestedSignal: "SIGTERM",
+      exitCode: null,
+      exitSignal: null,
+    },
+    true,
+  );
+}
+
 async function runCapabilityProbe(
   executable: string,
   args: string[],
   captureErrorOutput = false,
+  signal?: AbortSignal,
 ): Promise<{ code: number | null; output: string; overflowed: boolean; terminated: boolean }> {
-  return await new Promise((resolve) => {
+  if (signal?.aborted) throw abortedCapabilityProbeError(signal);
+  return await new Promise((resolve, reject) => {
     const child = spawn(executable, args, { stdio: ["ignore", "pipe", "pipe"] });
     const output = new BoundedTextCapture(ADAPTER_STDERR_LIMIT_BYTES);
-    const timeoutAbort = new AbortController();
-    const terminationController = new ChildTerminationController(child, timeoutAbort.signal);
+    const probeAbort = new AbortController();
+    const terminationController = new ChildTerminationController(child, probeAbort.signal);
+    let abortSource: "caller" | "timeout" | undefined;
     let settled = false;
     let settlement: NodeJS.Timeout | undefined;
     let timeout: NodeJS.Timeout | undefined;
-    const complete = (code: number | null, signal: NodeJS.Signals | null): void => {
+    const requestAbort = (source: "caller" | "timeout", reason: unknown): void => {
+      if (probeAbort.signal.aborted) return;
+      abortSource = source;
+      probeAbort.abort(reason);
+    };
+    const abortFromCaller = (): void => requestAbort("caller", signal?.reason);
+    const complete = (code: number | null, closeSignal: NodeJS.Signals | null): void => {
       if (settled) return;
       settled = true;
       if (timeout) clearTimeout(timeout);
       if (settlement) clearTimeout(settlement);
-      const termination = terminationController.finish(code, signal);
-      resolve({
+      probeAbort.signal.removeEventListener("abort", scheduleSettlement);
+      signal?.removeEventListener("abort", abortFromCaller);
+      const termination = terminationController.finish(code, closeSignal);
+      const result = {
         code,
         output: output.text(),
         overflowed: output.overflowed,
         terminated: termination !== undefined,
-      });
+      };
+      if (abortSource === "caller" || (abortSource === "timeout" && signal?.aborted)) {
+        reject(
+          termination
+            ? new HostTerminationError(termination, true)
+            : abortedCapabilityProbeError(abortSource === "caller" ? signal! : probeAbort.signal),
+        );
+        return;
+      }
+      resolve(result);
     };
-    child.stdout.on("data", (chunk: Buffer | string) => output.append(chunk));
-    if (captureErrorOutput) {
-      child.stderr.on("data", (chunk: Buffer | string) => output.append(chunk));
-    }
-    child.once("error", () => complete(null, null));
-    child.once("close", complete);
-    timeout = setTimeout(() => {
-      timeoutAbort.abort({
-        cause: "timeout",
-        reason: `${executable} capability probe timed out`,
-      });
-      if (settled) return;
+    const scheduleSettlement = (): void => {
+      if (settled || settlement) return;
       settlement = setTimeout(() => {
         child.stdout.destroy();
         child.stderr.destroy();
@@ -152,20 +177,38 @@ async function runCapabilityProbe(
         complete(null, null);
       }, HOST_CAPABILITY_PROBE_SETTLE_GRACE_MS);
       settlement.unref();
+    };
+    child.stdout.on("data", (chunk: Buffer | string) => output.append(chunk));
+    if (captureErrorOutput) {
+      child.stderr.on("data", (chunk: Buffer | string) => output.append(chunk));
+    }
+    child.once("error", () => complete(null, null));
+    child.once("close", complete);
+    probeAbort.signal.addEventListener("abort", scheduleSettlement, { once: true });
+    timeout = setTimeout(() => {
+      requestAbort("timeout", {
+        cause: "timeout",
+        reason: `${executable} capability probe timed out`,
+      });
     }, HOST_CAPABILITY_PROBE_TIMEOUT_MS);
     timeout.unref();
+    signal?.addEventListener("abort", abortFromCaller, { once: true });
+    if (signal?.aborted) abortFromCaller();
   });
 }
 
-async function codexVersion(executable: string): Promise<{ installed: boolean; version?: string }> {
-  const result = await runCapabilityProbe(executable, ["--version"]);
+async function codexVersion(
+  executable: string,
+  signal?: AbortSignal,
+): Promise<{ installed: boolean; version?: string }> {
+  const result = await runCapabilityProbe(executable, ["--version"], false, signal);
   return result.code === 0 && !result.overflowed && !result.terminated
     ? { installed: true, version: stripSingleHostVersionLineEnding(result.output) }
     : { installed: false };
 }
 
-async function codexAuthenticated(executable: string): Promise<boolean> {
-  const result = await runCapabilityProbe(executable, ["login", "status"], true);
+async function codexAuthenticated(executable: string, signal?: AbortSignal): Promise<boolean> {
+  const result = await runCapabilityProbe(executable, ["login", "status"], true, signal);
   return (
     result.code === 0 &&
     !result.overflowed &&
@@ -175,9 +218,12 @@ async function codexAuthenticated(executable: string): Promise<boolean> {
   );
 }
 
-export async function probeCodexExecutable(executable: string) {
-  const result = await codexVersion(executable);
-  const authenticated = result.installed && (await codexAuthenticated(executable));
+export async function probeCodexExecutable(executable: string, signal?: AbortSignal) {
+  if (signal?.aborted) throw abortedCapabilityProbeError(signal);
+  const result = await codexVersion(executable, signal);
+  if (signal?.aborted) throw abortedCapabilityProbeError(signal);
+  const authenticated = result.installed && (await codexAuthenticated(executable, signal));
+  if (signal?.aborted) throw abortedCapabilityProbeError(signal);
   return hostCapabilitiesFromProtocolProfile("codex", {
     installed: result.installed,
     authenticated,
@@ -190,13 +236,18 @@ export class CodexAdapter implements HostAdapter {
 
   constructor(private readonly policy?: HostExecutionPolicy) {}
 
-  private async resolveReadyExecutable(repositoryPath: string): Promise<string> {
+  private async resolveReadyExecutable(
+    repositoryPath: string,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    if (signal?.aborted) throw abortedCapabilityProbeError(signal);
     let executable: string;
     try {
       executable = await resolveTrustedExecutable("codex", {
         untrustedRoots: await codexUntrustedRoots(repositoryPath),
       });
     } catch {
+      if (signal?.aborted) throw abortedCapabilityProbeError(signal);
       assertRequiredHostCapabilities(
         this.id,
         hostCapabilitiesFromProtocolProfile("codex", {
@@ -206,30 +257,40 @@ export class CodexAdapter implements HostAdapter {
       );
       throw new Error("Unreachable Codex capability admission state");
     }
-    assertRequiredHostCapabilities(this.id, await probeCodexExecutable(executable));
+    if (signal?.aborted) throw abortedCapabilityProbeError(signal);
+    const capabilities = await probeCodexExecutable(executable, signal);
+    if (signal?.aborted) throw abortedCapabilityProbeError(signal);
+    assertRequiredHostCapabilities(this.id, capabilities);
     return executable;
   }
 
-  async probe() {
+  async probe(signal?: AbortSignal) {
+    if (signal?.aborted) throw abortedCapabilityProbeError(signal);
     let executable: string;
     try {
       executable = await resolveTrustedExecutable("codex", {
         untrustedRoots: await codexUntrustedRoots(),
       });
     } catch {
+      if (signal?.aborted) throw abortedCapabilityProbeError(signal);
       return hostCapabilitiesFromProtocolProfile("codex", {
         installed: false,
         authenticated: false,
       });
     }
-    return await probeCodexExecutable(executable);
+    if (signal?.aborted) throw abortedCapabilityProbeError(signal);
+    return await probeCodexExecutable(executable, signal);
   }
 
   async plan(request: PlanningRequest, signal: AbortSignal): Promise<PlanningResult> {
-    const executable = await this.resolveReadyExecutable(request.repositoryPath);
+    const executable = await this.resolveReadyExecutable(request.repositoryPath, signal);
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-plan-"));
     const schemaPath = join(schemaDirectory, "graph-plan.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexGraphPlanJsonSchema), "utf8");
+    if (signal.aborted) {
+      await rm(schemaDirectory, { recursive: true, force: true });
+      throw abortedCapabilityProbeError(signal);
+    }
     const child = spawn(executable, codexPlannerArgs(request, schemaPath, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -294,10 +355,14 @@ export class CodexAdapter implements HostAdapter {
     request: SemanticVerificationRequest,
     signal: AbortSignal,
   ): Promise<SemanticVerificationResult> {
-    const executable = await this.resolveReadyExecutable(request.repositoryPath);
+    const executable = await this.resolveReadyExecutable(request.repositoryPath, signal);
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-verify-"));
     const schemaPath = join(schemaDirectory, "semantic-verdict.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexSemanticVerdictJsonSchema), "utf8");
+    if (signal.aborted) {
+      await rm(schemaDirectory, { recursive: true, force: true });
+      throw abortedCapabilityProbeError(signal);
+    }
     const child = spawn(executable, codexSemanticVerifierArgs(request, schemaPath, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -357,11 +422,15 @@ export class CodexAdapter implements HostAdapter {
   }
 
   async *execute(request: WorkerRequest, signal: AbortSignal): AsyncIterable<HostEvent> {
-    const executable = await this.resolveReadyExecutable(request.repositoryPath);
+    const executable = await this.resolveReadyExecutable(request.repositoryPath, signal);
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-"));
     const schemaPath = join(schemaDirectory, "worker-result.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexWorkerResultJsonSchema), "utf8");
     const args = codexWorkerArgs(request, schemaPath, this.policy);
+    if (signal.aborted) {
+      await rm(schemaDirectory, { recursive: true, force: true });
+      throw abortedCapabilityProbeError(signal);
+    }
     const child = spawn(executable, args, {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },

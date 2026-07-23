@@ -305,13 +305,15 @@ program
       }
       const finishLine = await prepareFinishLine(task, options.cwd, options.finishLine);
       const adapter = createAdapter(options.host);
+      const planning = executionSignal();
       const created = await createRun(task, {
         cwd: options.cwd,
         planner: adapter,
+        signal: planning.signal,
         finishLine,
         ...(options.include ? { include: options.include } : {}),
         ...(options.exclude ? { exclude: options.exclude } : {}),
-      });
+      }).finally(planning.dispose);
       const approved =
         options.yes || (await askForApproval(created.contract, created.graph, created.probePlan));
       if (!approved) {

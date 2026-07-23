@@ -34,6 +34,7 @@ import {
   type GraphPlanner,
   type GraphNode,
   type HostAdapter,
+  type HostCapabilities,
   type HostEvent,
   type HostTermination,
   type HeldOutProbePlan,
@@ -142,6 +143,33 @@ export interface RunObserverEvent {
 }
 
 export type RunObserver = (event: RunObserverEvent) => void;
+
+function assertRunCreationActive(signal?: AbortSignal, durableRunId?: string): void {
+  if (!signal?.aborted) return;
+  const reason = interruptionReason(signal.reason);
+  const error = new Error(
+    durableRunId
+      ? `${reason.reason}. Durable run ${durableRunId} was saved and can be inspected or resumed.`
+      : reason.reason,
+  );
+  error.name = "RunCreationInterruptedError";
+  throw error;
+}
+
+async function runCreationStep<T>(
+  signal: AbortSignal | undefined,
+  step: () => Promise<T>,
+): Promise<T> {
+  assertRunCreationActive(signal);
+  try {
+    const result = await step();
+    assertRunCreationActive(signal);
+    return result;
+  } catch (error) {
+    assertRunCreationActive(signal);
+    throw error;
+  }
+}
 
 function populateMissingGraphContext(
   graph: Graph,
@@ -298,7 +326,11 @@ async function recordMissingUsage(
     );
 }
 
-async function validatePlannedContext(graph: Graph, repositoryPath: string): Promise<void> {
+async function validatePlannedContext(
+  graph: Graph,
+  repositoryPath: string,
+  signal?: AbortSignal,
+): Promise<void> {
   for (const node of graph.nodes) {
     if (
       node.kind === "commit" ||
@@ -310,10 +342,13 @@ async function validatePlannedContext(graph: Graph, repositoryPath: string): Pro
     if (node.contextSelector.relevantPaths.length === 0)
       throw new Error(`Planned node ${node.id} did not select repository evidence`);
     for (const relevantPath of node.contextSelector.relevantPaths) {
+      assertRunCreationActive(signal);
       const result = await runProcess("git", ["ls-files", "--", relevantPath], {
         cwd: repositoryPath,
         timeoutMs: 30_000,
+        ...(signal ? { signal } : {}),
       });
+      assertRunCreationActive(signal);
       if (result.exitCode !== 0 || result.stdout.trim().length === 0)
         throw new Error(
           `Planned node ${node.id} selected nonexistent or untracked context path ${relevantPath}`,
@@ -331,23 +366,26 @@ export async function createRun(
   store: RunStore;
   probePlan: ProbePlan;
 }> {
-  const repository = await discoverRepository(options.cwd);
+  const repository = await runCreationStep(options.signal, () =>
+    discoverRepository(options.cwd, options.signal),
+  );
   const persistedTask = redactString(task);
   const contract = compileRunContract(persistedTask, repository, {
     ...(options.finishLine ? { finishLine: options.finishLine } : {}),
     ...(options.include ? { include: options.include } : {}),
     ...(options.exclude ? { exclude: options.exclude } : {}),
   });
-  const [probePlan, repositoryEvidence] = await Promise.all([
-    discoverProbePlan(repository.root, persistedTask, repository.baseSha, {
-      ...(contract.finishLine.kind === "pr_open" ? { finishLine: "pr_open" } : {}),
-    }),
-    discoverPlanningEvidence(repository.root, persistedTask),
-  ]);
-  const heldOutProbePlan = await createRuntimeHeldOutProbePlan(
-    contract.runId,
-    probePlan,
-    repository.root,
+  const [probePlan, repositoryEvidence] = await runCreationStep(options.signal, () =>
+    Promise.all([
+      discoverProbePlan(repository.root, persistedTask, repository.baseSha, {
+        ...(contract.finishLine.kind === "pr_open" ? { finishLine: "pr_open" } : {}),
+        ...(options.signal ? { signal: options.signal } : {}),
+      }),
+      discoverPlanningEvidence(repository.root, persistedTask, options.signal),
+    ]),
+  );
+  const heldOutProbePlan = await runCreationStep(options.signal, () =>
+    createRuntimeHeldOutProbePlan(contract.runId, probePlan, repository.root, options.signal),
   );
   const graphProbePlan = workerVisibleProbePlan(probePlan, heldOutProbePlan);
   const completionProbes = graphProbePlan.items
@@ -357,31 +395,36 @@ export async function createRun(
   let graph: Graph;
   let planningUsage: TokenUsage | undefined;
   if (options.planner) {
-    const capabilities = await options.planner.probe();
-    assertRequiredHostCapabilities(options.planner.id, capabilities);
-    const planned = await options.planner.plan(
-      {
-        contract,
-        repositoryPath: repository.root,
-        repositoryEvidence,
-        probePlan: graphProbePlan,
-        verificationProbes: completionProbes,
-        authorityBoundary: createModelAuthorityBoundary([
-          {
-            source: "task_or_issue_text",
-            location: "contract.task, contract.outcome, and task-derived anchor descriptions",
-          },
-          {
-            source: "repository_content",
-            location: "repositoryEvidence and repository reads",
-          },
-          { source: "command_output", location: "any read-only tool output" },
-        ]),
-      },
-      options.signal ?? new AbortController().signal,
+    const planner = options.planner;
+    const planningSignal = options.signal ?? new AbortController().signal;
+    const capabilities = await runCreationStep(options.signal, () => planner.probe(planningSignal));
+    assertRequiredHostCapabilities(planner.id, capabilities);
+    const planned = await runCreationStep(options.signal, () =>
+      planner.plan(
+        {
+          contract,
+          repositoryPath: repository.root,
+          repositoryEvidence,
+          probePlan: graphProbePlan,
+          verificationProbes: completionProbes,
+          authorityBoundary: createModelAuthorityBoundary([
+            {
+              source: "task_or_issue_text",
+              location: "contract.task, contract.outcome, and task-derived anchor descriptions",
+            },
+            {
+              source: "repository_content",
+              location: "repositoryEvidence and repository reads",
+            },
+            { source: "command_output", location: "any read-only tool output" },
+          ]),
+        },
+        planningSignal,
+      ),
     );
     graph = compilePlannedGraph(contract, planned.plan, completionProbes, approvedProbes);
-    await validatePlannedContext(graph, repository.root);
+    await validatePlannedContext(graph, repository.root, options.signal);
+    assertRunCreationActive(options.signal);
     planningUsage = planned.usage;
   } else {
     graph = compileGraph(contract, completionProbes);
@@ -395,7 +438,8 @@ export async function createRun(
     approvedProbes,
   });
   graph = optimized.graph;
-  await validatePlannedContext(graph, repository.root);
+  await validatePlannedContext(graph, repository.root, options.signal);
+  assertRunCreationActive(options.signal);
   const store = await RunStore.create(
     repository.root,
     contract,
@@ -416,6 +460,7 @@ export async function createRun(
       host: options.planner.id,
       missing: !planningUsage,
     });
+  assertRunCreationActive(options.signal, contract.runId);
   return { contract, graph, store, probePlan };
 }
 
@@ -589,10 +634,33 @@ async function executeWorker(input: {
   const tokenPhase = input.node.id.startsWith("repair-") ? "repair" : "worker";
 
   let artifact = join(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
-  const preInvocationDiagnostic = diagnoseRequiredHostCapabilities(
-    input.adapter.id,
-    await input.adapter.probe(),
-  );
+  let preInvocationDiagnostic: RequiredHostCapabilityDiagnostic;
+  try {
+    preInvocationDiagnostic = diagnoseRequiredHostCapabilities(
+      input.adapter.id,
+      await input.adapter.probe(input.signal),
+    );
+  } catch (cause) {
+    if (!(cause instanceof HostTerminationError) || !input.signal.aborted) throw cause;
+    artifact = await input.store.appendInvocationEvent(invocationId, {
+      type: "terminated",
+      termination: cause.termination,
+    });
+    await input.store.append(
+      "runtime",
+      "invocation.finished",
+      {
+        invocationId,
+        nodeId: input.node.id,
+        artifact,
+        success: false,
+        interrupted: true,
+        termination: cause.termination,
+      },
+      invocationId,
+    );
+    return { invocationId, termination: cause.termination, artifact };
+  }
   if (!preInvocationDiagnostic.ready) {
     artifact = await input.store.appendInvocationEvent(invocationId, {
       type: "error",
@@ -631,11 +699,20 @@ async function executeWorker(input: {
     input.signal,
   );
   const iterator = execution[Symbol.asyncIterator]();
+  let hostStarted = false;
   while (true) {
     let next: IteratorResult<HostEvent>;
     try {
       next = await iterator.next();
     } catch (cause) {
+      if (cause instanceof HostTerminationError) {
+        termination = cause.termination;
+        artifact = await input.store.appendInvocationEvent(invocationId, {
+          type: "terminated",
+          termination,
+        });
+        break;
+      }
       error = cause instanceof Error ? cause.message : String(cause);
       const capabilityError = cause instanceof HostCapabilityAdmissionError;
       if (!capabilityError) errorCause = "host_crash";
@@ -660,6 +737,7 @@ async function executeWorker(input: {
     }
     const event = parsedEvent.data;
     artifact = await input.store.appendInvocationEvent(invocationId, event);
+    if (event.type === "started") hostStarted = true;
     if (event.type === "session") {
       await input.store.append(
         "host",
@@ -692,7 +770,7 @@ async function executeWorker(input: {
       if (event.cause === "host_crash" || event.cause === "timeout") errorCause = event.cause;
     }
   }
-  if (usageReceipts === 0 && !capabilityDiagnostic)
+  if (hostStarted && usageReceipts === 0 && !capabilityDiagnostic)
     await input.store.append(
       "host",
       "tokens.recorded",
@@ -1108,35 +1186,6 @@ async function runSemanticVerification(input: {
     });
   if (input.node.id.startsWith("repair-review-") || input.node.id.startsWith("repair-ci-"))
     semanticAuthorityInputs.push({ source: "external_event", location: "context.objective" });
-  await input.store.append(
-    "runtime",
-    "semantic.started",
-    {
-      invocationId,
-      nodeId: input.node.id,
-      phase: input.phase,
-      host: input.adapter.id,
-      checkpointId,
-      contextHash,
-      beforeDigest: beforeScope.digest,
-      scopeBaseline: beforeScope,
-    },
-    invocationId,
-  );
-  await input.store.append(
-    "host",
-    "tokens.recorded",
-    {
-      usage: unavailableTokenUsage(),
-      phase: "semantic_verification",
-      nodeId: input.node.id,
-      host: input.adapter.id,
-      missing: true,
-      provisional: true,
-      semanticCheckpointId: checkpointId,
-    },
-    invocationId,
-  );
   const failVerification = async (error: unknown): Promise<never> => {
     const failure = error instanceof Error ? error : new Error(String(error));
     const capabilityDiagnostic =
@@ -1174,9 +1223,58 @@ async function runSemanticVerification(input: {
     );
     throw new SemanticVerificationFailure(failure.message, { cause: error });
   };
+  try {
+    assertRequiredHostCapabilities(input.adapter.id, await input.adapter.probe(input.signal));
+  } catch (error) {
+    if (error instanceof HostTerminationError) throw error;
+    return failVerification(error);
+  }
+  await input.store.append(
+    "runtime",
+    "semantic.started",
+    {
+      invocationId,
+      nodeId: input.node.id,
+      phase: input.phase,
+      host: input.adapter.id,
+      checkpointId,
+      contextHash,
+      beforeDigest: beforeScope.digest,
+      scopeBaseline: beforeScope,
+    },
+    invocationId,
+  );
+  await input.store.append(
+    "host",
+    "tokens.recorded",
+    {
+      usage: unavailableTokenUsage(),
+      phase: "semantic_verification",
+      nodeId: input.node.id,
+      host: input.adapter.id,
+      missing: true,
+      provisional: true,
+      semanticCheckpointId: checkpointId,
+    },
+    invocationId,
+  );
+  const recordNoModelUsage = async (): Promise<void> => {
+    await input.store.append(
+      "host",
+      "tokens.recorded",
+      {
+        usage: deterministicTokenUsage(),
+        phase: "semantic_verification",
+        nodeId: input.node.id,
+        host: input.adapter.id,
+        beforeModelInvocation: true,
+        semanticCheckpointId: checkpointId,
+      },
+      invocationId,
+    );
+  };
   let result: SemanticVerificationResult;
   try {
-    assertRequiredHostCapabilities(input.adapter.id, await input.adapter.probe());
     result = await input.adapter.verify(
       {
         invocationId,
@@ -1187,7 +1285,11 @@ async function runSemanticVerification(input: {
       input.signal,
     );
   } catch (error) {
-    if (error instanceof HostTerminationError) throw error;
+    if (error instanceof HostTerminationError) {
+      if (error.beforeModelInvocation) await recordNoModelUsage();
+      throw error;
+    }
+    if (error instanceof HostCapabilityAdmissionError) await recordNoModelUsage();
     return failVerification(error);
   }
 
@@ -3207,32 +3309,6 @@ export async function executeRun(input: {
       state = await input.store.loadState();
     }
 
-    let adapterReady = false;
-    const ensureAdapterReady = async (): Promise<boolean> => {
-      if (adapterReady) return true;
-      const capabilities = await input.adapter.probe();
-      const diagnostic = diagnoseRequiredHostCapabilities(input.adapter.id, capabilities);
-      adapterReady = diagnostic.ready;
-      if (!adapterReady)
-        await input.store.append("runtime", "run.blocked", {
-          reason: diagnostic.detail,
-        });
-      return adapterReady;
-    };
-
-    const initialBatch = readyBatch(graph, state, input.maxWorkers ?? 1).nodes;
-    if (
-      initialBatch.some((candidate) => !["wait", "commit"].includes(candidate.kind)) &&
-      !(await ensureAdapterReady())
-    )
-      return await input.store.loadState();
-    if (!workspace)
-      try {
-        workspace = await input.store.loadWorkspace<RunWorkspace>();
-      } catch {
-        workspace = await createRunWorkspace(contract);
-        await input.store.writeWorkspace(workspace);
-      }
     const finishInterruption = async (
       nodeIds?: string | string[],
       termination?: HostTermination,
@@ -3280,6 +3356,44 @@ export async function executeRun(input: {
       if (request) await controlChannel.clear(request.requestId);
       return await input.store.loadState();
     };
+
+    let adapterReady = false;
+    let adapterProbeTermination: HostTermination | undefined;
+    const ensureAdapterReady = async (): Promise<boolean> => {
+      if (adapterReady) return true;
+      let capabilities: HostCapabilities;
+      try {
+        capabilities = await input.adapter.probe(signal);
+      } catch (error) {
+        if (!(error instanceof HostTerminationError) || !signal.aborted) throw error;
+        adapterProbeTermination = error.termination;
+        return false;
+      }
+      if (signal.aborted) return false;
+      const diagnostic = diagnoseRequiredHostCapabilities(input.adapter.id, capabilities);
+      adapterReady = diagnostic.ready;
+      if (!adapterReady)
+        await input.store.append("runtime", "run.blocked", {
+          reason: diagnostic.detail,
+        });
+      return adapterReady;
+    };
+
+    const initialBatch = readyBatch(graph, state, input.maxWorkers ?? 1).nodes;
+    if (
+      initialBatch.some((candidate) => !["wait", "commit"].includes(candidate.kind)) &&
+      !(await ensureAdapterReady())
+    )
+      return signal.aborted
+        ? await finishInterruption(undefined, adapterProbeTermination)
+        : await input.store.loadState();
+    if (!workspace)
+      try {
+        workspace = await input.store.loadWorkspace<RunWorkspace>();
+      } catch {
+        workspace = await createRunWorkspace(contract);
+        await input.store.writeWorkspace(workspace);
+      }
     const deferLifecycleConsistency = async (
       node: GraphNode,
       error: GitHubLifecycleConsistencyError,
@@ -3437,7 +3551,9 @@ export async function executeRun(input: {
         batch.some((candidate) => !["wait", "commit"].includes(candidate.kind)) &&
         !(await ensureAdapterReady())
       )
-        return await input.store.loadState();
+        return signal.aborted
+          ? await finishInterruption(undefined, adapterProbeTermination)
+          : await input.store.loadState();
 
       const reuseSessions = new Map<string, { hostSessionId: string; sourceNodeId: string }>();
       for (const candidate of batch) {

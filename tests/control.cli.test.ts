@@ -72,7 +72,7 @@ function processExists(pid: number): boolean {
 
 async function runOwner(
   repository: string,
-  mode: "wait" | "complete",
+  mode: "wait" | "complete" | "probe",
   pidPath: string,
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   const child = spawn(
@@ -100,6 +100,49 @@ async function controlCli(repository: string, action: "pause" | "stop"): Promise
 }
 
 describe("cross-process run control", () => {
+  it(
+    "settles a capability probe from a second CLI process without an orphan or blocker",
+    async () => {
+      const repository = await createRepository();
+      const created = await createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+      });
+      await created.store.append("user", "run.approved", { approved: true });
+      const pidPath = join(repository, "probe-child.pid");
+      const owner = runOwner(repository, "probe", pidPath);
+      await waitForFile(pidPath);
+      const probePid = Number((await readFile(pidPath, "utf8")).trim());
+
+      const startedAt = performance.now();
+      await controlCli(repository, "pause");
+      const settlementLatencyMs = performance.now() - startedAt;
+      const settledOwner = await owner;
+
+      expect(settledOwner.code, settledOwner.stderr).toBe(0);
+      expect(settlementLatencyMs).toBeLessThan(5_000);
+      expect(processExists(probePid)).toBe(false);
+      const state = await created.store.loadState();
+      expect(state.status).toBe("paused");
+      await expect(created.store.loadWorkspace()).rejects.toThrow();
+      const events = await created.store.loadEvents();
+      expect(events.find(({ type }) => type === "run.blocked")).toBeUndefined();
+      const applied = events.findLast(({ type }) => type === "control.applied");
+      expect(applied).toMatchObject({
+        data: {
+          action: "pause",
+          cause: "user_pause",
+          outcome: "forced",
+          termination: { cause: "user_pause", outcome: "forced" },
+        },
+      });
+      const request = applied?.data.request as { requestedAt?: string } | undefined;
+      expect(
+        Date.parse(applied?.timestamp ?? "") - Date.parse(request?.requestedAt ?? ""),
+      ).toBeLessThanOrEqual(5_000);
+    },
+    controlCliTestTimeout,
+  );
+
   const controlCliLifecycle = async (): Promise<void> => {
     const repository = await createRepository();
     const pausedRun = await createRun("Implement a substantial feature across the fixture", {

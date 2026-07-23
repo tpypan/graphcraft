@@ -4,6 +4,7 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   ChildTerminationController,
+  HostTerminationError,
   reconcilePersistedInvocation,
   type HostAdapter,
   type HostCapabilities,
@@ -27,11 +28,30 @@ class ControlFixtureAdapter implements HostAdapter {
   readonly id = "test" as const;
 
   constructor(
-    private readonly mode: "wait" | "complete",
+    private readonly mode: "wait" | "complete" | "probe",
     private readonly pidPath: string,
   ) {}
 
-  async probe(): Promise<HostCapabilities> {
+  async probe(signal?: AbortSignal): Promise<HostCapabilities> {
+    if (this.mode === "probe") {
+      if (!signal) throw new Error("The control fixture probe requires a cancellation signal");
+      const child = spawn(
+        process.execPath,
+        ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
+        { stdio: "ignore" },
+      );
+      await once(child, "spawn");
+      await writeFile(this.pidPath, `${child.pid}\n`);
+      const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+        (resolve) =>
+          child.once("close", (code, closeSignal) => resolve({ code, signal: closeSignal })),
+      );
+      const termination = new ChildTerminationController(child, signal, 200);
+      const exit = await termination.waitForExit(closed);
+      const receipt = termination.finish(exit.code, exit.signal);
+      if (receipt) throw new HostTerminationError(receipt);
+      throw new Error("Fixture capability child exited unexpectedly");
+    }
     return {
       installed: true,
       authenticated: true,
@@ -93,8 +113,8 @@ class ControlFixtureAdapter implements HostAdapter {
 }
 
 const [repositoryPath, mode, pidPath] = process.argv.slice(2);
-if (!repositoryPath || (mode !== "wait" && mode !== "complete") || !pidPath)
-  throw new Error("usage: control-runner <repository> <wait|complete> <pid-path>");
+if (!repositoryPath || (mode !== "wait" && mode !== "complete" && mode !== "probe") || !pidPath)
+  throw new Error("usage: control-runner <repository> <wait|complete|probe> <pid-path>");
 const repository = await discoverRepository(repositoryPath);
 const runId = await resolveRunId(repository.root);
 const store = new RunStore(repository.root, runId);

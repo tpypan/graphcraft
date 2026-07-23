@@ -10,6 +10,7 @@ import {
   type ProbePlan,
   type ProbeResult,
 } from "@graphcraft/core";
+import { runProcess } from "@graphcraft/probes";
 
 const execFileAsync = promisify(execFile);
 
@@ -21,12 +22,37 @@ function relativeRepositoryPath(repositoryRoot: string, candidate: string): stri
   return result && !isAbsolute(result) ? result.split(sep).join("/") : undefined;
 }
 
-async function gitObjectValueHash(repositoryRoot: string, path: string): Promise<string> {
-  const { stdout } = await execFileAsync(
-    "git",
-    ["hash-object", `--path=${path.replaceAll("\\", "/")}`, resolve(repositoryRoot, path)],
-    { cwd: repositoryRoot, encoding: "utf8", maxBuffer: 1024 * 1024 },
-  );
+async function gitObjectValueHash(
+  repositoryRoot: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  signal?.throwIfAborted();
+  const args = [
+    "hash-object",
+    `--path=${path.replaceAll("\\", "/")}`,
+    resolve(repositoryRoot, path),
+  ];
+  const stdout = signal
+    ? await runProcess("git", args, {
+        cwd: repositoryRoot,
+        signal,
+        timeoutMs: 120_000,
+        maxOutputBytesPerStream: 1024 * 1024,
+      }).then((result) => {
+        signal.throwIfAborted();
+        if (result.exitCode !== 0)
+          throw new Error(result.stderr.trim() || `git hash-object failed for ${path}`);
+        return result.stdout;
+      })
+    : (
+        await execFileAsync("git", args, {
+          cwd: repositoryRoot,
+          encoding: "utf8",
+          maxBuffer: 1024 * 1024,
+        })
+      ).stdout;
+  signal?.throwIfAborted();
   const objectHash = stdout.trim();
   if (!/^[a-f0-9]{40,64}$/.test(objectHash))
     throw new Error(`Unable to establish held-out integrity for ${path}`);
@@ -37,14 +63,21 @@ async function fileValueHash(
   repositoryRoot: string,
   path: string,
   algorithm: "git_hash_object" | undefined,
+  signal?: AbortSignal,
 ): Promise<string> {
   if (algorithm === "git_hash_object") {
     const details = await stat(resolve(repositoryRoot, path)).catch(() => undefined);
+    signal?.throwIfAborted();
     return details?.isFile()
-      ? await gitObjectValueHash(repositoryRoot, path)
+      ? await gitObjectValueHash(repositoryRoot, path, signal)
       : contentHash({ missing: true, path, algorithm });
   }
-  const contents = await readFile(resolve(repositoryRoot, path)).catch(() => undefined);
+  const contents = await readFile(resolve(repositoryRoot, path), {
+    ...(signal ? { signal } : {}),
+  }).catch(() => {
+    signal?.throwIfAborted();
+    return undefined;
+  });
   return contents
     ? contentHash({ path, contents: contents.toString("base64") })
     : contentHash({ missing: true, path });
@@ -64,18 +97,21 @@ async function fileIntegrity(
   repositoryRoot: string,
   cwd: string | undefined,
   values: string[],
+  signal?: AbortSignal,
 ): Promise<HeldOutProbeIntegrity[]> {
   const result: HeldOutProbeIntegrity[] = [];
   for (const value of possibleFileArguments(values)) {
+    signal?.throwIfAborted();
     const path = relativeRepositoryPath(repositoryRoot, resolve(repositoryRoot, cwd ?? ".", value));
     if (!path) continue;
     const details = await stat(resolve(repositoryRoot, path)).catch(() => undefined);
+    signal?.throwIfAborted();
     if (!details?.isFile()) continue;
     result.push({
       kind: "file",
       path,
       algorithm: "git_hash_object",
-      valueHash: await fileValueHash(repositoryRoot, path, "git_hash_object"),
+      valueHash: await fileValueHash(repositoryRoot, path, "git_hash_object", signal),
     });
   }
   return result;
@@ -85,15 +121,17 @@ export async function createRuntimeHeldOutProbePlan(
   runId: string,
   probePlan: ProbePlan,
   repositoryRoot: string,
+  signal?: AbortSignal,
 ): Promise<HeldOutProbePlan> {
   const integrity: Record<string, HeldOutProbeIntegrity[]> = {};
   for (const item of probePlan.items.filter(({ phase }) => phase === "completion")) {
+    signal?.throwIfAborted();
     if (item.probe.kind === "held_out")
       throw new Error("An approved probe plan cannot contain held-out references");
     const protectedValues: HeldOutProbeIntegrity[] = [];
     if (item.probe.kind === "command") {
       protectedValues.push(
-        ...(await fileIntegrity(repositoryRoot, item.probe.cwd, item.probe.args)),
+        ...(await fileIntegrity(repositoryRoot, item.probe.cwd, item.probe.args, signal)),
       );
     }
     const match = /^(.*package\.json) script (.+)$/.exec(item.source);
@@ -105,9 +143,13 @@ export async function createRuntimeHeldOutProbePlan(
     const script = match[2]!;
     const manifestPath = relativeRepositoryPath(repositoryRoot, path);
     if (!manifestPath) throw new Error(`Completion script ${script} escapes the repository`);
-    const manifest = JSON.parse(await readFile(resolve(repositoryRoot, manifestPath), "utf8")) as {
-      scripts?: Record<string, string>;
-    };
+    const manifest = JSON.parse(
+      await readFile(resolve(repositoryRoot, manifestPath), {
+        encoding: "utf8",
+        ...(signal ? { signal } : {}),
+      }),
+    ) as { scripts?: Record<string, string> };
+    signal?.throwIfAborted();
     const value = manifest.scripts?.[script];
     if (!value) throw new Error(`Completion script ${script} is missing from ${manifestPath}`);
     protectedValues.push({
@@ -120,7 +162,7 @@ export async function createRuntimeHeldOutProbePlan(
       ? manifestPath.slice(0, manifestPath.lastIndexOf("/"))
       : undefined;
     protectedValues.push(
-      ...(await fileIntegrity(repositoryRoot, scriptDirectory, value.split(/\s+/))),
+      ...(await fileIntegrity(repositoryRoot, scriptDirectory, value.split(/\s+/), signal)),
     );
     const unique = new Map(
       protectedValues.map((entry) => [

@@ -51,7 +51,7 @@ export interface PlanningResult {
 
 export interface GraphPlanner {
   readonly id: "codex" | "claude" | "test";
-  probe(): Promise<HostCapabilities>;
+  probe(signal?: AbortSignal): Promise<HostCapabilities>;
   plan(request: PlanningRequest, signal: AbortSignal): Promise<PlanningResult>;
 }
 
