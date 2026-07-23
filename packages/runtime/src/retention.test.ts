@@ -684,6 +684,47 @@ describe("run-state retention", () => {
     await expect(readFile(evidence, "utf8")).resolves.toBe("appeared after planning\n");
   });
 
+  it("refuses recovery-journal delete and prune plans while probe-process evidence remains", async () => {
+    const { repository } = await createRepository();
+    const { store } = await createCompletedRun(repository);
+    await setStateUpdatedAt(store, "2026-01-01T00:00:00.000Z");
+    const plan = await planRunRetention({
+      repositoryRoot: repository,
+      runReference: store.runId,
+    });
+    await expect(
+      applyRunRetention({
+        plan,
+        confirmRunId: store.runId,
+        onCheckpoint: ({ boundary }) => {
+          if (boundary === "after_journal") throw new Error("retain recovery journal");
+        },
+      }),
+    ).rejects.toThrow("retain recovery journal");
+
+    const processState = probeProcessStatePath(repository, store.runId);
+    const evidence = join(processState, `${"c".repeat(64)}.jsonl`);
+    await mkdir(processState, { recursive: true });
+    await writeFile(evidence, "appeared before recovery planning\n", { mode: 0o600 });
+
+    await expect(
+      planRunRetention({ repositoryRoot: repository, runReference: store.runId }),
+    ).rejects.toThrow(/probe-process ownership evidence remains/i);
+    await expect(
+      planCompletedRunPrune({
+        repositoryRoot: repository,
+        completedBefore: "2026-02-01T00:00:00.000Z",
+        keepNewest: 0,
+      }),
+    ).rejects.toThrow(/probe-process ownership evidence remains/i);
+    await expect(applyRunRetention({ plan, confirmRunId: store.runId })).rejects.toThrow(
+      /probe-process ownership evidence remains/i,
+    );
+    expect(await pathExists(store.runRoot)).toBe(true);
+    expect(await pathExists(journalPath(repository, store.runId))).toBe(true);
+    await expect(readFile(evidence, "utf8")).resolves.toBe("appeared before recovery planning\n");
+  });
+
   it("preserves malformed probe-process ownership evidence", async () => {
     const { repository } = await createRepository();
     const { store } = await createCompletedRun(repository);

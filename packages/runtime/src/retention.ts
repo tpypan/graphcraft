@@ -585,7 +585,10 @@ export async function planRunRetention(input: {
   const repositoryRoot = resolve(input.repositoryRoot);
   if (RUN_ID_PATTERN.test(input.runReference)) {
     const journal = await readRetentionJournal(repositoryRoot, input.runReference);
-    if (journal) return planFromJournal(repositoryRoot, journal);
+    if (journal) {
+      await assertNoProbeProcessState(repositoryRoot, journal.runId);
+      return planFromJournal(repositoryRoot, journal);
+    }
   }
   const runId = await resolveRunId(repositoryRoot, input.runReference);
   return await inspectDeletableRun(repositoryRoot, runId);
@@ -926,12 +929,14 @@ export async function planCompletedRunPrune(input: {
     ({ runId, journal }) => journal !== undefined || !keptRunIds.has(runId),
   );
   const deletionPlans: RunRetentionPlan[] = [];
-  for (const { runId, journal } of selected)
+  for (const { runId, journal } of selected) {
+    if (journal) await assertNoProbeProcessState(repositoryRoot, runId);
     deletionPlans.push(
       journal
         ? planFromJournal(repositoryRoot, journal)
         : await inspectDeletableRun(repositoryRoot, runId),
     );
+  }
   return {
     schemaVersion: 1,
     action: "prune_completed_run_state",
