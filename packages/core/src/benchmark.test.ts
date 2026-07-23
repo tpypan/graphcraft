@@ -403,6 +403,28 @@ describe("matched benchmark protocol", () => {
         accepted: true,
         reviewPacket: {
           ...result.reviewPacket,
+          transcript: {
+            ...result.reviewPacket.transcript,
+            omittedBytes: 1,
+            truncated: true,
+            digest: contentHash({
+              mediaType: result.reviewPacket.transcript.mediaType,
+              text: result.reviewPacket.transcript.text,
+              observedBytes: result.reviewPacket.transcript.observedBytes,
+              omittedBytes: 1,
+              truncated: true,
+            }),
+          },
+        },
+      }),
+    ).toThrow(/truncated transcript evidence cannot be accepted as review-complete/);
+
+    expect(() =>
+      BenchmarkTrialResultSchema.parse({
+        ...result,
+        accepted: true,
+        reviewPacket: {
+          ...result.reviewPacket,
           captureFailures: ["binary patch payload omitted; review is incomplete"],
         },
       }),

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve, sep } from "node:path";
 import {
   BenchmarkSuiteSchema,
+  BenchmarkScheduleEntrySchema,
   BenchmarkReportSchema,
   BenchmarkReviewPacketSchema,
   BenchmarkSourceIdentitySchema,
@@ -12,6 +13,7 @@ import {
   BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES,
   ContextCapsuleSchema,
   HostCapabilityAdmissionError,
+  HostEventSchema,
   RequiredHostCapabilityDiagnosticSchema,
   aggregateTokenUsage,
   assertRequiredHostCapabilities,
@@ -48,6 +50,12 @@ const tokenDimensions = [
 const scorerPolicy = "fixture_bound_scorers_plus_suite_assertions" as const;
 const reviewPolicy = "bounded_redacted_patch_and_transcript_v1" as const;
 const PATCH_PROCESS_CAPTURE_LIMIT_BYTES = 2 * BENCHMARK_REVIEW_PATCH_LIMIT_BYTES;
+const TRANSCRIPT_OMISSION_MARKER = Buffer.from(
+  "\n[GRAPHCRAFT REVIEW EVIDENCE MIDDLE OMITTED]\n",
+  "utf8",
+);
+const TRANSCRIPT_INCOMPLETE_FAILURE =
+  "transcript review evidence exceeded its retained bound; review is incomplete";
 const reportLimitations = [
   "Stable efficiency claims require at least three jointly accepted reconciled baseline/Graphcraft pairs per task and host.",
   "Each trial retains a bounded redacted patch and transcript packet; blinded reviewer assignment and defect labels remain external.",
@@ -155,6 +163,90 @@ function boundedReviewEvidence(
   };
 }
 
+class BoundedTranscriptCapture {
+  private complete = Buffer.alloc(0);
+  private head: Buffer | undefined;
+  private tail = Buffer.alloc(0);
+  private observedBytes = 0;
+
+  append(entry: unknown): void {
+    const serialized = JSON.stringify(redactValue(entry)) ?? "null";
+    const chunk = Buffer.from(`${redactString(serialized)}\n`, "utf8");
+    this.observedBytes += chunk.length;
+    if (
+      !this.head &&
+      this.complete.length + chunk.length <= BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES
+    ) {
+      this.complete = Buffer.concat([this.complete, chunk]);
+      return;
+    }
+
+    const retainedContentBytes =
+      BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES - TRANSCRIPT_OMISSION_MARKER.length;
+    const headBytes = Math.floor(retainedContentBytes / 2);
+    if (!this.head) {
+      const headSource =
+        this.complete.length >= headBytes
+          ? this.complete
+          : Buffer.concat([this.complete, utf8Prefix(chunk, headBytes - this.complete.length)]);
+      this.head = Buffer.from(utf8Prefix(headSource, headBytes));
+      const tailSource =
+        chunk.length >= retainedContentBytes
+          ? chunk
+          : Buffer.concat([utf8Suffix(this.complete, retainedContentBytes), chunk]);
+      this.tail = Buffer.from(utf8Suffix(tailSource, retainedContentBytes));
+      this.complete = Buffer.alloc(0);
+      return;
+    }
+
+    const tailSource =
+      chunk.length >= retainedContentBytes ? chunk : Buffer.concat([this.tail, chunk]);
+    this.tail = Buffer.from(utf8Suffix(tailSource, retainedContentBytes));
+  }
+
+  evidence() {
+    if (!this.head) {
+      const text = this.complete.toString("utf8");
+      return {
+        mediaType: "application/x-ndjson" as const,
+        text,
+        observedBytes: this.observedBytes,
+        retainedBytes: this.complete.length,
+        omittedBytes: 0,
+        truncated: false,
+        digest: reviewEvidenceDigest({
+          mediaType: "application/x-ndjson",
+          text,
+          observedBytes: this.observedBytes,
+          omittedBytes: 0,
+          truncated: false,
+        }),
+      };
+    }
+    const retainedContentBytes =
+      BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES - TRANSCRIPT_OMISSION_MARKER.length;
+    const tail = utf8Suffix(this.tail, retainedContentBytes - this.head.length);
+    const text = Buffer.concat([this.head, TRANSCRIPT_OMISSION_MARKER, tail]).toString("utf8");
+    const retainedBytes = Buffer.byteLength(text);
+    const omittedBytes = Math.max(0, this.observedBytes - this.head.length - tail.length);
+    return {
+      mediaType: "application/x-ndjson" as const,
+      text,
+      observedBytes: this.observedBytes,
+      retainedBytes,
+      omittedBytes,
+      truncated: true,
+      digest: reviewEvidenceDigest({
+        mediaType: "application/x-ndjson",
+        text,
+        observedBytes: this.observedBytes,
+        omittedBytes,
+        truncated: true,
+      }),
+    };
+  }
+}
+
 async function capturePatch(repository: string, baseSha: string) {
   const temporaryRoot = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-review-index-"));
   const environment = { GIT_INDEX_FILE: join(temporaryRoot, "index") };
@@ -251,17 +343,10 @@ async function capturePatch(repository: string, baseSha: string) {
   }
 }
 
-function transcriptText(entries: unknown[]): string {
-  return (
-    entries.map((entry) => JSON.stringify(redactValue(entry))).join("\n") +
-    (entries.length > 0 ? "\n" : "")
-  );
-}
-
 async function captureReviewPacket(input: {
   repository: string;
   baseSha: string;
-  transcript: unknown[];
+  transcript: BoundedTranscriptCapture;
   captureFailures?: string[];
 }): Promise<BenchmarkReviewPacket> {
   const captureFailures = [...(input.captureFailures ?? [])];
@@ -275,10 +360,12 @@ async function captureReviewPacket(input: {
     captureFailures.push(failure);
     patch = boundedReviewEvidence("text/x-diff", `[GRAPHCRAFT ${failure}]\n`);
   }
+  const transcript = input.transcript.evidence();
+  if (transcript.truncated) captureFailures.push(TRANSCRIPT_INCOMPLETE_FAILURE);
   return BenchmarkReviewPacketSchema.parse({
     schemaVersion: 1,
     patch,
-    transcript: boundedReviewEvidence("application/x-ndjson", transcriptText(input.transcript)),
+    transcript,
     captureFailures: captureFailures.map((failure) => redactString(failure)),
   });
 }
@@ -579,7 +666,7 @@ async function runBaselineTrial(input: {
   const usages: TokenUsage[] = [];
   const failureTrace: string[] = [];
   const summaryEvidence: string[] = [];
-  const transcript: unknown[] = [];
+  const transcript = new BoundedTranscriptCapture();
   let resultStatus: "completed" | "blocked" | "failed" | "error" = "error";
   const capsule = ContextCapsuleSchema.parse({
     schemaVersion: 1,
@@ -606,7 +693,7 @@ async function runBaselineTrial(input: {
     probeEvidence: [],
   });
   try {
-    for await (const event of input.adapter.execute(
+    for await (const candidate of input.adapter.execute(
       {
         invocationId: input.trial.trialId,
         repositoryPath: input.repository,
@@ -615,7 +702,8 @@ async function runBaselineTrial(input: {
       },
       new AbortController().signal,
     )) {
-      transcript.push({ source: "baseline_host_event", event });
+      const event = HostEventSchema.parse(candidate);
+      transcript.append({ source: "baseline_host_event", event });
       if (event.type === "usage") usages.push(event.usage);
       if (event.type === "result") {
         resultStatus = event.result.status;
@@ -695,7 +783,7 @@ async function runGraphcraftTrial(input: {
   let summaryEvidence = "";
   let tokens = usageSummary([]);
   let store: Awaited<ReturnType<typeof createRun>>["store"] | undefined;
-  const transcript: unknown[] = [];
+  const transcript = new BoundedTranscriptCapture();
   const transcriptCaptureFailures: string[] = [];
   try {
     const created = await createRun(input.task.task, {
@@ -744,7 +832,7 @@ async function runGraphcraftTrial(input: {
     }
     try {
       const events = await store.loadEvents();
-      transcript.push(...events.map((event) => ({ source: "graphcraft_run_event", event })));
+      for (const event of events) transcript.append({ source: "graphcraft_run_event", event });
       const invocationIds = [
         ...new Set(
           events.flatMap(({ data }) =>
@@ -755,13 +843,12 @@ async function runGraphcraftTrial(input: {
       for (const invocationId of invocationIds) {
         try {
           const invocationEvents = await store.loadInvocationEvents(invocationId);
-          transcript.push(
-            ...invocationEvents.map((event) => ({
+          for (const event of invocationEvents)
+            transcript.append({
               source: "graphcraft_host_event",
               invocationId,
               event,
-            })),
-          );
+            });
         } catch (error) {
           transcriptCaptureFailures.push(
             `invocation transcript ${invocationId} capture failed: ${
@@ -817,6 +904,73 @@ async function runGraphcraftTrial(input: {
     failureTrace,
     reviewPacket,
   });
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function appendUniqueString(values: unknown, value: string): unknown {
+  if (!Array.isArray(values) || !values.every((entry) => typeof entry === "string")) return values;
+  return values.includes(value) ? values : [...values, value];
+}
+
+function parseBenchmarkReportWithReviewMigration(value: unknown): {
+  report: BenchmarkReport;
+  migrated: boolean;
+} {
+  const record = objectRecord(value);
+  if (record?.reviewPolicy !== reviewPolicy || !Array.isArray(record.results))
+    return { report: BenchmarkReportSchema.parse(value), migrated: false };
+
+  let migrated = false;
+  const legacyResults: BenchmarkTrialResult[] = [];
+  const results = record.results.map((candidate) => {
+    const result = objectRecord(candidate);
+    const packet = objectRecord(result?.reviewPacket);
+    const transcript = objectRecord(packet?.transcript);
+    if (
+      result?.accepted !== true ||
+      transcript?.truncated !== true ||
+      !Array.isArray(packet?.captureFailures) ||
+      packet.captureFailures.length !== 0
+    ) {
+      const parsed = BenchmarkTrialResultSchema.parse(candidate);
+      legacyResults.push(parsed);
+      return parsed;
+    }
+
+    migrated = true;
+    const { reviewPacket: _reviewPacket, ...legacyResult } = result;
+    legacyResults.push(BenchmarkTrialResultSchema.parse(legacyResult));
+    return BenchmarkTrialResultSchema.parse({
+      ...result,
+      accepted: false,
+      limitations: appendUniqueString(result.limitations, "review_transcript:truncated"),
+      failureTrace: appendUniqueString(
+        result.failureTrace,
+        `review packet: ${TRANSCRIPT_INCOMPLETE_FAILURE}`,
+      ),
+      reviewPacket: {
+        ...packet,
+        captureFailures: [TRANSCRIPT_INCOMPLETE_FAILURE],
+      },
+    });
+  });
+  if (!migrated) return { report: BenchmarkReportSchema.parse(value), migrated: false };
+  const schedule = BenchmarkScheduleEntrySchema.array().parse(record.schedule);
+  if (contentHash(record.summary) !== contentHash(summarizeBenchmark(legacyResults, schedule)))
+    throw new Error("The existing benchmark report summary does not match its trial evidence");
+  return {
+    report: BenchmarkReportSchema.parse({
+      ...record,
+      results,
+      summary: summarizeBenchmark(results, schedule),
+    }),
+    migrated: true,
+  };
 }
 
 export async function runBenchmark(input: {
@@ -878,8 +1032,13 @@ export async function runBenchmark(input: {
   let startedAt = new Date().toISOString();
   let results: BenchmarkTrialResult[] = [];
   let existingReport: BenchmarkReport | undefined;
+  let existingReportMigrated = false;
   try {
-    const existing = BenchmarkReportSchema.parse(JSON.parse(await readFile(outputPath, "utf8")));
+    const loaded = parseBenchmarkReportWithReviewMigration(
+      JSON.parse(await readFile(outputPath, "utf8")),
+    );
+    const existing = loaded.report;
+    existingReportMigrated = loaded.migrated;
     if (existing.environment.graphcraftVersion !== graphcraftVersion)
       throw new Error(
         "The existing benchmark report Graphcraft version identity does not match this execution",
@@ -950,6 +1109,7 @@ export async function runBenchmark(input: {
     throw new Error("The existing benchmark report summary does not match its trial evidence");
   if (existingReport && contentHash(existingReport.limitations) !== contentHash(reportLimitations))
     throw new Error("The existing benchmark report limitations do not match this harness");
+  if (existingReportMigrated && existingReport) await writeJsonAtomic(outputPath, existingReport);
   if (existingReport?.status === "complete") return { outputPath, report: existingReport };
   const persist = async (status: "running" | "complete"): Promise<BenchmarkReport> => {
     const report = BenchmarkReportSchema.parse(

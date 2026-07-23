@@ -80,6 +80,8 @@ class BenchmarkAdapter implements HostAdapter {
       binaryBaselineSecret?: string;
       ignoredBaselineSecret?: string;
       oversizedGraphcraftPatch?: boolean;
+      baselineTranscriptMessageCount?: number;
+      oversizedBaselineEvent?: boolean;
       capabilities?: Partial<HostCapabilities>;
       capabilitySequence?: HostCapabilities[];
       expectDeterministicLfFixture?: boolean;
@@ -173,6 +175,15 @@ class BenchmarkAdapter implements HostAdapter {
     }
     yield { type: "started", invocationId: request.invocationId };
     yield { type: "session", hostSessionId: request.invocationId };
+    if (
+      this.options.baselineTranscriptMessageCount &&
+      request.capsule.nodeId.startsWith("baseline-")
+    ) {
+      for (let index = 0; index < this.options.baselineTranscriptMessageCount; index += 1)
+        yield { type: "message", text: `message-${index}:${"x".repeat(64 * 1024)}` };
+    }
+    if (this.options.oversizedBaselineEvent && request.capsule.nodeId.startsWith("baseline-"))
+      yield { type: "message", text: "x".repeat(300 * 1024) };
     if (this.options.failureMessage) {
       yield { type: "error", message: this.options.failureMessage };
       return;
@@ -930,6 +941,113 @@ describe("benchmark harness", () => {
       expect(truncatedGraphcraft.failureTrace).toEqual(
         expect.arrayContaining([expect.stringContaining("patch review evidence exceeded")]),
       );
+
+      const truncatedTranscript = await runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: { codex: new BenchmarkAdapter({ baselineTranscriptMessageCount: 48 }) },
+        policies,
+        graphcraftVersion,
+        seed: "bounded-transcript-seed",
+        repetitions: 1,
+        outputPath: join(root, "bounded-transcript-report.json"),
+      });
+      const transcriptLimitedBaseline = truncatedTranscript.report.results.find(
+        ({ trial }) => trial.mode === "baseline",
+      )!;
+      expect(transcriptLimitedBaseline).toMatchObject({ accepted: false });
+      expect(transcriptLimitedBaseline.reviewPacket?.transcript.truncated).toBe(true);
+      expect(transcriptLimitedBaseline.reviewPacket?.transcript.observedBytes).toBeGreaterThan(
+        3 * 1024 * 1024,
+      );
+      expect(transcriptLimitedBaseline.reviewPacket?.transcript.retainedBytes).toBeLessThanOrEqual(
+        64 * 1024,
+      );
+      expect(transcriptLimitedBaseline.reviewPacket?.captureFailures).toEqual(
+        expect.arrayContaining([expect.stringContaining("transcript review evidence exceeded")]),
+      );
+      expect(transcriptLimitedBaseline.failureTrace).toEqual(
+        expect.arrayContaining([expect.stringContaining("transcript review evidence exceeded")]),
+      );
+
+      const legacyOutputPath = join(root, "legacy-truncated-transcript-report.json");
+      const legacyReport = structuredClone(truncatedTranscript.report);
+      const legacyBaseline = legacyReport.results.find(({ trial }) => trial.mode === "baseline")!;
+      legacyBaseline.accepted = true;
+      legacyBaseline.reviewPacket!.captureFailures = [];
+      legacyBaseline.failureTrace = legacyBaseline.failureTrace.filter(
+        (entry) => !entry.includes("transcript review evidence exceeded"),
+      );
+      const legacySummaryResults = structuredClone(legacyReport.results);
+      const legacySummaryBaseline = legacySummaryResults.find(
+        ({ trial }) => trial.mode === "baseline",
+      )!;
+      legacySummaryBaseline.accepted = true;
+      delete legacySummaryBaseline.reviewPacket;
+      legacyReport.summary = summarizeBenchmark(legacySummaryResults, legacyReport.schedule);
+      await writeFile(legacyOutputPath, `${JSON.stringify(legacyReport, null, 2)}\n`, "utf8");
+
+      const migratedLegacy = await runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: {},
+        policies,
+        graphcraftVersion,
+        seed: "bounded-transcript-seed",
+        repetitions: 1,
+        outputPath: legacyOutputPath,
+      });
+      const migratedBaseline = migratedLegacy.report.results.find(
+        ({ trial }) => trial.mode === "baseline",
+      )!;
+      expect(migratedBaseline.accepted).toBe(false);
+      expect(migratedBaseline.reviewPacket?.captureFailures).toEqual([
+        expect.stringContaining("transcript review evidence exceeded"),
+      ]);
+      const persistedLegacy = JSON.parse(await readFile(legacyOutputPath, "utf8")) as {
+        results: typeof migratedLegacy.report.results;
+      };
+      expect(persistedLegacy.results.find(({ trial }) => trial.mode === "baseline")).toMatchObject({
+        accepted: false,
+        reviewPacket: {
+          captureFailures: [expect.stringContaining("transcript review evidence exceeded")],
+        },
+      });
+
+      const tamperedLegacyPath = join(root, "tampered-legacy-transcript-report.json");
+      const tamperedLegacy = { ...legacyReport, summary: { tampered: true } };
+      const tamperedLegacyBytes = `${JSON.stringify(tamperedLegacy, null, 2)}\n`;
+      await writeFile(tamperedLegacyPath, tamperedLegacyBytes, "utf8");
+      await expect(
+        runBenchmark({
+          suite,
+          hosts: ["codex"],
+          adapters: {},
+          policies,
+          graphcraftVersion,
+          seed: "bounded-transcript-seed",
+          repetitions: 1,
+          outputPath: tamperedLegacyPath,
+        }),
+      ).rejects.toThrow(/summary does not match its trial evidence/);
+      await expect(readFile(tamperedLegacyPath, "utf8")).resolves.toBe(tamperedLegacyBytes);
+
+      const oversizedEvent = await runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: { codex: new BenchmarkAdapter({ oversizedBaselineEvent: true }) },
+        policies,
+        graphcraftVersion,
+        seed: "oversized-host-event-seed",
+        repetitions: 1,
+        outputPath: join(root, "oversized-host-event-report.json"),
+      });
+      const oversizedEventBaseline = oversizedEvent.report.results.find(
+        ({ trial }) => trial.mode === "baseline",
+      )!;
+      expect(oversizedEventBaseline).toMatchObject({ accepted: false, executionStatus: "error" });
+      expect(oversizedEventBaseline.reviewPacket?.transcript.observedBytes).toBeLessThan(16 * 1024);
+      expect(oversizedEventBaseline.failureTrace.join("\n")).toMatch(/too_big|too big/i);
 
       const providerLimited = usage(10, 4);
       providerLimited.availability.reasoning = "unavailable";

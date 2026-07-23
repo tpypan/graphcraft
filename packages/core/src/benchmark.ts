@@ -240,6 +240,13 @@ export const BenchmarkTrialResultSchema = z
         message: "A trial with truncated patch evidence cannot be accepted as review-complete",
       });
     }
+    if (result.accepted && result.reviewPacket?.transcript.truncated) {
+      context.addIssue({
+        code: "custom",
+        path: ["accepted"],
+        message: "A trial with truncated transcript evidence cannot be accepted as review-complete",
+      });
+    }
   });
 
 export const BenchmarkReportSchema = z
