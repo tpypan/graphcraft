@@ -278,6 +278,27 @@ interface LegacyTreeSnapshot {
   digest: string;
 }
 
+export type LegacySnapshotRefreshEntryEvidence =
+  | {
+      kind: "directory";
+      relativePath: string;
+      fingerprint: string;
+    }
+  | {
+      kind: "file";
+      relativePath: string;
+      fingerprint: string;
+      bytes: number;
+      hash: string;
+    };
+
+/** Metadata and content evidence used to validate the post-ACL source refresh. @internal */
+export interface LegacySnapshotRefreshEvidence {
+  rootFingerprint: string;
+  entries: LegacySnapshotRefreshEntryEvidence[];
+  digest: string;
+}
+
 interface LegacyTreeCaptureOptions {
   ignoredRootName?: string;
   rejectBackupMarker?: boolean;
@@ -351,6 +372,71 @@ function legacySnapshotView(snapshot: LegacyTreeSnapshot): unknown {
     })),
     digest: snapshot.digest,
   };
+}
+
+function legacySnapshotRefreshEvidence(
+  snapshot: LegacyTreeSnapshot,
+): LegacySnapshotRefreshEvidence {
+  return {
+    rootFingerprint: snapshot.rootFingerprint,
+    entries: snapshot.entries.map((entry) =>
+      entry.kind === "directory"
+        ? {
+            kind: entry.kind,
+            relativePath: entry.relativePath,
+            fingerprint: entry.fingerprint,
+          }
+        : {
+            kind: entry.kind,
+            relativePath: entry.relativePath,
+            fingerprint: entry.fingerprint,
+            bytes: entry.bytes,
+            hash: entry.hash,
+          },
+    ),
+    digest: snapshot.digest,
+  };
+}
+
+function legacyMetadataFingerprintWithoutCtime(fingerprint: string): string {
+  const fields = fingerprint.split(":");
+  if (fields.length !== 7 || fields.some((field) => !/^\d+$/u.test(field)))
+    throw new Error("Legacy migration metadata fingerprint is malformed");
+  return fields.slice(0, -1).join(":");
+}
+
+function legacySnapshotRefreshInvariantView(snapshot: LegacySnapshotRefreshEvidence): unknown {
+  return {
+    rootFingerprint: legacyMetadataFingerprintWithoutCtime(snapshot.rootFingerprint),
+    entries: snapshot.entries.map((entry) => ({
+      kind: entry.kind,
+      relativePath: entry.relativePath,
+      fingerprint: legacyMetadataFingerprintWithoutCtime(entry.fingerprint),
+      ...(entry.kind === "file" ? { bytes: entry.bytes, hash: entry.hash } : {}),
+    })),
+    digest: snapshot.digest,
+  };
+}
+
+/**
+ * Accept a source recapture after owned backup directories have been secured
+ * only when Windows ACL inheritance changed ctime and nothing else.
+ *
+ * @internal
+ */
+export function assertLegacySnapshotRefreshIsCtimeOnly(
+  preflight: LegacySnapshotRefreshEvidence,
+  refreshed: LegacySnapshotRefreshEvidence,
+): void {
+  if (
+    !isDeepStrictEqual(
+      legacySnapshotRefreshInvariantView(preflight),
+      legacySnapshotRefreshInvariantView(refreshed),
+    )
+  )
+    throw new Error(
+      "Legacy run tree changed while preparing secure backup storage; no backup was created",
+    );
 }
 
 function legacySnapshotContents(snapshot: LegacyTreeSnapshot): unknown {
@@ -980,6 +1066,19 @@ async function ensureCompleteBackup(
   await ensurePrivateDirectory(backupBase, input.graphcraftRoot);
   await ensurePrivateDirectory(backupParent, input.graphcraftRoot);
 
+  // Securing the owned backup parents can update inherited Windows ACLs on
+  // existing descendants and therefore their ctime. Recapture after that
+  // bounded mutation, require every stable metadata/content field to match,
+  // and use this exact refreshed snapshot for all copy-time checks.
+  const refreshedSource = await captureLegacyTreeSnapshot(input.runRoot, {
+    rejectBackupMarker: true,
+    enforceDestinationLimits: true,
+  });
+  assertLegacySnapshotRefreshIsCtimeOnly(
+    legacySnapshotRefreshEvidence(sourceSnapshot),
+    legacySnapshotRefreshEvidence(refreshedSource),
+  );
+
   const step = `${input.sourceVersion}-to-${CURRENT_RUN_STORAGE_VERSION}`;
   const backupRoot = join(backupParent, step);
   const existing = await status(backupRoot);
@@ -992,7 +1091,7 @@ async function ensureCompleteBackup(
       runId: input.runId,
       marker: validated.marker,
       backupSnapshot: validated.snapshot,
-      sourceSnapshot,
+      sourceSnapshot: refreshedSource,
     });
     await hardenPrivateTree(backupRoot, input.graphcraftRoot);
     await syncBackupTree(backupRoot);
@@ -1010,7 +1109,7 @@ async function ensureCompleteBackup(
   }
 
   try {
-    await copyLegacySnapshot(input.runRoot, temporaryRoot, sourceSnapshot);
+    await copyLegacySnapshot(input.runRoot, temporaryRoot, refreshedSource);
     await hardenPrivateTree(temporaryRoot, input.graphcraftRoot);
     await syncBackupTree(temporaryRoot);
     const completion: BackupCompletion = {
@@ -1019,7 +1118,7 @@ async function ensureCompleteBackup(
       runId: input.runId,
       sourceVersion: input.sourceVersion,
       targetVersion: CURRENT_RUN_STORAGE_VERSION,
-      treeDigest: sourceSnapshot.digest,
+      treeDigest: refreshedSource.digest,
     };
     const completionPath = join(temporaryRoot, BACKUP_COMPLETION_FILE);
     await writeJsonAtomic(completionPath, completion);

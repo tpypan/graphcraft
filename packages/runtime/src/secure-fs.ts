@@ -20,7 +20,7 @@ interface PrivateEntry {
   path: string;
 }
 
-const hardenedWindowsEntries = new Map<string, string>();
+const hardenedWindowsIdentities = new Map<string, string>();
 const hardenedDarwinEntries = new Map<string, string>();
 
 /*
@@ -183,15 +183,34 @@ function windowsPowerShellExecutable(): string {
   return win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
 }
 
-function rememberWindowsEntry(path: string, fingerprint: string | undefined): void {
-  if (fingerprint === undefined) return;
-  hardenedWindowsEntries.delete(path);
-  hardenedWindowsEntries.set(path, fingerprint);
-  while (hardenedWindowsEntries.size > WINDOWS_ACL_CACHE_LIMIT) {
-    const oldest = hardenedWindowsEntries.keys().next().value as string | undefined;
+function rememberWindowsIdentity(
+  fingerprint: string | undefined,
+  metadataFingerprint: string | undefined,
+): void {
+  if (fingerprint === undefined || metadataFingerprint === undefined) return;
+  hardenedWindowsIdentities.delete(fingerprint);
+  hardenedWindowsIdentities.set(fingerprint, metadataFingerprint);
+  while (hardenedWindowsIdentities.size > WINDOWS_ACL_CACHE_LIMIT) {
+    const oldest = hardenedWindowsIdentities.keys().next().value as string | undefined;
     if (oldest === undefined) break;
-    hardenedWindowsEntries.delete(oldest);
+    hardenedWindowsIdentities.delete(oldest);
   }
+}
+
+/**
+ * Return a stable filesystem-object identity for the Windows ACL cache.
+ *
+ * ACLs follow an object across content writes and renames, while ctime changes
+ * for both ordinary writes and ACL updates on Windows. Device, inode, and
+ * birth time still change when a path is replaced. Unknown inode identities
+ * deliberately remain uncached so enforcement fails closed.
+ *
+ * @internal
+ */
+export function privateEntryIdentityFingerprint(
+  status: Pick<BigIntStats, "dev" | "ino" | "birthtimeNs">,
+): string | undefined {
+  return status.ino === 0n ? undefined : `${status.dev}:${status.ino}:${status.birthtimeNs}`;
 }
 
 function rememberDarwinEntry(path: string, fingerprint: string | undefined): void {
@@ -207,21 +226,29 @@ function rememberDarwinEntry(path: string, fingerprint: string | undefined): voi
 
 async function inspectPrivateEntry(path: string): Promise<{
   entry: PrivateEntry;
-  fingerprint: string | undefined;
+  identityFingerprint: string | undefined;
+  metadataFingerprint: string | undefined;
 }> {
   const status = await lstat(path, { bigint: true });
-  const fingerprint =
-    status.ino === 0n
-      ? undefined
-      : `${status.dev}:${status.ino}:${status.birthtimeNs}:${status.ctimeNs}`;
+  const identityFingerprint = privateEntryIdentityFingerprint(status);
+  const metadataFingerprint =
+    identityFingerprint === undefined ? undefined : `${identityFingerprint}:${status.ctimeNs}`;
   if (status.isSymbolicLink()) rejectSymbolicLink(path);
   if (status.isFile()) {
     if (status.nlink > 1n) rejectMultiplyLinkedFile(path);
-    return { entry: { kind: "file", path }, fingerprint };
+    return {
+      entry: { kind: "file", path },
+      identityFingerprint,
+      metadataFingerprint,
+    };
   }
   if (!status.isDirectory())
     throw new Error(`Private tree contains an unsupported filesystem entry: ${path}`);
-  return { entry: { kind: "directory", path }, fingerprint };
+  return {
+    entry: { kind: "directory", path },
+    identityFingerprint,
+    metadataFingerprint,
+  };
 }
 
 async function collectPrivateTree(root: string): Promise<PrivateEntry[]> {
@@ -325,25 +352,32 @@ async function runWindowsAclBatch(entries: PrivateEntry[]): Promise<void> {
 
 async function hardenWindowsEntries(entries: PrivateEntry[], force = false): Promise<void> {
   if (supportsPosixModes || entries.length === 0) return;
-  const pending: PrivateEntry[] = [];
+  const pending: Array<{
+    entry: PrivateEntry;
+    identityFingerprint: string | undefined;
+  }> = [];
   for (const entry of entries) {
     const inspected = await inspectPrivateEntry(entry.path);
     if (inspected.entry.kind !== entry.kind)
       throw new Error(`Private ACL target changed filesystem kind: ${entry.path}`);
     if (
       force ||
-      inspected.fingerprint === undefined ||
-      hardenedWindowsEntries.get(entry.path) !== inspected.fingerprint
+      inspected.identityFingerprint === undefined ||
+      hardenedWindowsIdentities.get(inspected.identityFingerprint) !== inspected.metadataFingerprint
     )
-      pending.push(entry);
+      pending.push({ entry, identityFingerprint: inspected.identityFingerprint });
+    else rememberWindowsIdentity(inspected.identityFingerprint, inspected.metadataFingerprint);
   }
   if (pending.length === 0) return;
-  await runWindowsAclBatch(pending);
-  for (const entry of pending) {
+  await runWindowsAclBatch(pending.map(({ entry }) => entry));
+  for (const { entry, identityFingerprint } of pending) {
     const inspected = await inspectPrivateEntry(entry.path);
     if (inspected.entry.kind !== entry.kind)
       throw new Error(`Private ACL target changed filesystem kind: ${entry.path}`);
-    rememberWindowsEntry(entry.path, inspected.fingerprint);
+    if (identityFingerprint !== undefined && inspected.identityFingerprint !== identityFingerprint)
+      throw new Error(`Private ACL target changed filesystem identity: ${entry.path}`);
+    if (inspected.identityFingerprint === identityFingerprint)
+      rememberWindowsIdentity(identityFingerprint, inspected.metadataFingerprint);
   }
 }
 
@@ -412,8 +446,8 @@ async function hardenPosixEntries(entries: PrivateEntry[], force = false): Promi
         throw new Error(`Private ACL target changed filesystem kind: ${entry.path}`);
       if (
         force ||
-        inspected.fingerprint === undefined ||
-        hardenedDarwinEntries.get(entry.path) !== inspected.fingerprint
+        inspected.metadataFingerprint === undefined ||
+        hardenedDarwinEntries.get(entry.path) !== inspected.metadataFingerprint
       )
         pending.push(entry);
     }
@@ -429,7 +463,7 @@ async function hardenPosixEntries(entries: PrivateEntry[], force = false): Promi
       const inspected = await inspectPrivateEntry(entry.path);
       if (inspected.entry.kind !== entry.kind)
         throw new Error(`Private ACL target changed filesystem kind: ${entry.path}`);
-      rememberDarwinEntry(entry.path, inspected.fingerprint);
+      rememberDarwinEntry(entry.path, inspected.metadataFingerprint);
     }
 }
 
@@ -651,6 +685,84 @@ export async function hardenPrivateFile(path: string, ownedRoot?: string): Promi
     }
     throw error;
   }
+}
+
+export interface PrivateFileMutationCheckpoint {
+  readonly path: string;
+  readonly identityFingerprint: string | undefined;
+  readonly metadataFingerprint: string | undefined;
+}
+
+const activePrivateFileMutations = new WeakSet<PrivateFileMutationCheckpoint>();
+
+/**
+ * Harden an existing private file immediately before a known in-place write.
+ * The returned checkpoint lets the matching finalizer advance the Windows ACL
+ * cache without treating arbitrary content changes as proof that the ACL is
+ * still safe. Callers must not span unrelated work with this checkpoint.
+ *
+ * @internal
+ */
+export async function preparePrivateFileMutation(
+  path: string,
+  ownedRoot?: string,
+): Promise<PrivateFileMutationCheckpoint> {
+  const absolute = resolve(path);
+  await hardenPrivateFile(absolute, ownedRoot);
+  try {
+    const inspected = await inspectPrivateEntry(absolute);
+    if (inspected.entry.kind !== "file")
+      throw new Error(`Private mutation path is not a regular file: ${absolute}`);
+    const checkpoint = {
+      path: absolute,
+      identityFingerprint: inspected.identityFingerprint,
+      metadataFingerprint: inspected.metadataFingerprint,
+    };
+    activePrivateFileMutations.add(checkpoint);
+    return checkpoint;
+  } catch (error) {
+    if (!isMissing(error)) throw error;
+    const checkpoint = {
+      path: absolute,
+      identityFingerprint: undefined,
+      metadataFingerprint: undefined,
+    };
+    activePrivateFileMutations.add(checkpoint);
+    return checkpoint;
+  }
+}
+
+/** Finish a private in-place write begun by preparePrivateFileMutation. @internal */
+export async function finalizePrivateFileMutation(
+  checkpoint: PrivateFileMutationCheckpoint,
+  ownedRoot?: string,
+): Promise<void> {
+  if (
+    !activePrivateFileMutations.delete(checkpoint) ||
+    supportsPosixModes ||
+    checkpoint.identityFingerprint === undefined
+  ) {
+    await hardenPrivateFile(checkpoint.path, ownedRoot);
+    return;
+  }
+  if (ownedRoot !== undefined)
+    await validatePrivatePath(ownedRoot, relative(resolve(ownedRoot), resolve(checkpoint.path)));
+  let inspected;
+  try {
+    inspected = await inspectPrivateEntry(checkpoint.path);
+  } catch (error) {
+    if (isMissing(error)) return;
+    throw error;
+  }
+  if (
+    inspected.entry.kind === "file" &&
+    inspected.identityFingerprint === checkpoint.identityFingerprint &&
+    hardenedWindowsIdentities.get(checkpoint.identityFingerprint) === checkpoint.metadataFingerprint
+  ) {
+    rememberWindowsIdentity(inspected.identityFingerprint, inspected.metadataFingerprint);
+    return;
+  }
+  await hardenPrivateFile(checkpoint.path, ownedRoot);
 }
 
 /** Harden a Graphcraft-owned tree without following symbolic links. */

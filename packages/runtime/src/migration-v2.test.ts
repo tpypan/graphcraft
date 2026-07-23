@@ -23,7 +23,9 @@ import {
   CURRENT_RUN_STORAGE_VERSION,
   LEGACY_MIGRATION_DESTINATION_LIMITS,
   LEGACY_MIGRATION_RESOURCE_LIMITS,
+  assertLegacySnapshotRefreshIsCtimeOnly,
   ensureCurrentRunStorage,
+  type LegacySnapshotRefreshEvidence,
   writeCurrentRunStorageManifest,
 } from "./migration.ts";
 import {
@@ -169,6 +171,39 @@ async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 2_000): Pr
   }
 }
 
+function sampleLegacySnapshotRefreshEvidence(): LegacySnapshotRefreshEvidence {
+  return {
+    rootFingerprint: "10:20:16832:1:0:1000:2000",
+    entries: [
+      {
+        kind: "directory",
+        relativePath: "artifacts",
+        fingerprint: "10:21:16832:1:0:1001:2001",
+      },
+      {
+        kind: "file",
+        relativePath: "events.jsonl",
+        fingerprint: "10:22:33152:1:12:1002:2002",
+        bytes: 12,
+        hash: "a".repeat(64),
+      },
+    ],
+    digest: "b".repeat(64),
+  };
+}
+
+function replaceLegacyFingerprintField(fingerprint: string, field: number, value: string): string {
+  const fields = fingerprint.split(":");
+  fields[field] = value;
+  return fields.join(":");
+}
+
+function sampleLegacyRefreshFile(evidence: LegacySnapshotRefreshEvidence) {
+  const entry = evidence.entries[1];
+  if (entry?.kind !== "file") throw new Error("Expected the sample legacy file evidence");
+  return entry;
+}
+
 describe("run storage schema v2 migration", () => {
   it("keeps mirrored migration destination limits aligned with RunStore", () => {
     expect(LEGACY_MIGRATION_DESTINATION_LIMITS).toEqual({
@@ -179,6 +214,76 @@ describe("run storage schema v2 migration", () => {
       maximumMetadataBytes: RUN_METADATA_MAX_BYTES,
       maximumWorkspaceBytes: RUN_WORKSPACE_MAX_BYTES,
     });
+  });
+
+  it("accepts a post-backup-parent source refresh with ctime-only metadata drift", () => {
+    const preflight = sampleLegacySnapshotRefreshEvidence();
+    const refreshed = structuredClone(preflight);
+    refreshed.rootFingerprint = replaceLegacyFingerprintField(refreshed.rootFingerprint, 6, "3000");
+    refreshed.entries.forEach((entry, index) => {
+      entry.fingerprint = replaceLegacyFingerprintField(entry.fingerprint, 6, String(3001 + index));
+    });
+
+    expect(() => assertLegacySnapshotRefreshIsCtimeOnly(preflight, refreshed)).not.toThrow();
+  });
+
+  it.each([
+    [
+      "path",
+      (evidence: LegacySnapshotRefreshEvidence) => {
+        sampleLegacyRefreshFile(evidence).relativePath = "renamed-events.jsonl";
+      },
+    ],
+    [
+      "filesystem identity",
+      (evidence: LegacySnapshotRefreshEvidence) => {
+        const file = sampleLegacyRefreshFile(evidence);
+        file.fingerprint = replaceLegacyFingerprintField(file.fingerprint, 1, "99");
+      },
+    ],
+    [
+      "mode",
+      (evidence: LegacySnapshotRefreshEvidence) => {
+        const file = sampleLegacyRefreshFile(evidence);
+        file.fingerprint = replaceLegacyFingerprintField(file.fingerprint, 2, "33216");
+      },
+    ],
+    [
+      "link count",
+      (evidence: LegacySnapshotRefreshEvidence) => {
+        const file = sampleLegacyRefreshFile(evidence);
+        file.fingerprint = replaceLegacyFingerprintField(file.fingerprint, 3, "2");
+      },
+    ],
+    [
+      "size",
+      (evidence: LegacySnapshotRefreshEvidence) => {
+        const file = sampleLegacyRefreshFile(evidence);
+        file.fingerprint = replaceLegacyFingerprintField(file.fingerprint, 4, "13");
+        file.bytes = 13;
+      },
+    ],
+    [
+      "mtime",
+      (evidence: LegacySnapshotRefreshEvidence) => {
+        const file = sampleLegacyRefreshFile(evidence);
+        file.fingerprint = replaceLegacyFingerprintField(file.fingerprint, 5, "1003");
+      },
+    ],
+    [
+      "content hash",
+      (evidence: LegacySnapshotRefreshEvidence) => {
+        sampleLegacyRefreshFile(evidence).hash = "c".repeat(64);
+      },
+    ],
+  ])("rejects a post-backup-parent source refresh with changed %s", (_label, mutate) => {
+    const preflight = sampleLegacySnapshotRefreshEvidence();
+    const refreshed = structuredClone(preflight);
+    mutate(refreshed);
+
+    expect(() => assertLegacySnapshotRefreshIsCtimeOnly(preflight, refreshed)).toThrow(
+      /changed while preparing secure backup storage/,
+    );
   });
 
   it("concurrently migrates manifestless v0 after a complete backup without truncating artifacts", async () => {

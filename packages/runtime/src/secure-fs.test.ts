@@ -14,14 +14,17 @@ import {
 import { tmpdir } from "node:os";
 import { join, relative, win32 } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { compileGraph, compileRunContract } from "@graphcraft/core";
 import {
   ensurePrivateDirectory,
   hardenPrivateFile,
   hardenPrivateTree,
+  privateEntryIdentityFingerprint,
   readPrivateFileBounded,
   readRegularFileBounded,
   validatePrivatePath,
 } from "./secure-fs.ts";
+import { RunStore } from "./store.ts";
 
 const temporaryRoots: string[] = [];
 
@@ -69,15 +72,26 @@ async function grantWindowsEveryone(path: string): Promise<void> {
     String.raw`
 $ErrorActionPreference = 'Stop'
 $path = [Environment]::GetEnvironmentVariable('GRAPHCRAFT_ACL_TEST_PATH')
-$acl = Get-Acl -LiteralPath $path
+$attributes = [System.IO.File]::GetAttributes($path)
+$isDirectory = ($attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+if ($isDirectory) {
+  $item = [System.IO.DirectoryInfo]::new($path)
+  $inheritance = ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit)
+} else {
+  $item = [System.IO.FileInfo]::new($path)
+  $inheritance = [System.Security.AccessControl.InheritanceFlags]::None
+}
+$acl = $item.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)
 $everyone = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
 $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
   $everyone,
   [System.Security.AccessControl.FileSystemRights]::FullControl,
+  $inheritance,
+  [System.Security.AccessControl.PropagationFlags]::None,
   [System.Security.AccessControl.AccessControlType]::Allow
 )
 [void]$acl.AddAccessRule($rule)
-Set-Acl -LiteralPath $path -AclObject $acl
+$item.SetAccessControl($acl)
 `,
   );
 }
@@ -102,11 +116,18 @@ async function expectWindowsOwnerOnly(path: string): Promise<void> {
 $ErrorActionPreference = 'Stop'
 $path = [Environment]::GetEnvironmentVariable('GRAPHCRAFT_ACL_TEST_PATH')
 $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-$item = Get-Item -LiteralPath $path -Force
-$acl = Get-Acl -LiteralPath $path
+$attributes = [System.IO.File]::GetAttributes($path)
+$isDirectory = ($attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+if ($isDirectory) {
+  $item = [System.IO.DirectoryInfo]::new($path)
+} else {
+  $item = [System.IO.FileInfo]::new($path)
+}
+$sections = ([System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner)
+$acl = $item.GetAccessControl($sections)
 $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier])
 $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
-$expectedInheritance = if ($item.PSIsContainer) {
+$expectedInheritance = if ($isDirectory) {
   ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit)
 } else {
   [System.Security.AccessControl.InheritanceFlags]::None
@@ -125,6 +146,28 @@ if (-not $acl.AreAccessRulesProtected -or $owner.Value -ne $sid.Value -or
 }
 
 describe("secure filesystem permissions", () => {
+  it("keys the Windows ACL cache by stable object identity, not mutable timestamps", () => {
+    const before = {
+      dev: 11n,
+      ino: 22n,
+      birthtimeNs: 33n,
+      ctimeNs: 44n,
+      mtimeNs: 55n,
+    };
+    const afterWrite = {
+      ...before,
+      ctimeNs: 66n,
+      mtimeNs: 77n,
+    };
+    const fingerprint = privateEntryIdentityFingerprint(before);
+
+    expect(fingerprint).toBe("11:22:33");
+    expect(privateEntryIdentityFingerprint(afterWrite)).toBe(fingerprint);
+    expect(privateEntryIdentityFingerprint({ ...before, ino: 23n })).not.toBe(fingerprint);
+    expect(privateEntryIdentityFingerprint({ ...before, birthtimeNs: 34n })).not.toBe(fingerprint);
+    expect(privateEntryIdentityFingerprint({ ...before, ino: 0n })).toBeUndefined();
+  });
+
   it("reads a validated private file within its explicit byte limit", async () => {
     const root = await temporaryRoot();
     const file = join(root, "private.txt");
@@ -376,6 +419,48 @@ describe("secure filesystem permissions", () => {
       await hardenPrivateTree(tree);
 
       for (const path of [tree, file]) await expectWindowsOwnerOnly(path);
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "re-enforces cached Windows ACLs after same-object ACL drift",
+    async () => {
+      const root = await temporaryRoot();
+      const directory = join(root, "cached directory");
+      const file = join(directory, "cached file.json");
+      await ensurePrivateDirectory(directory);
+      await writeFile(file, "{}\n");
+      await hardenPrivateFile(file, directory);
+
+      await grantWindowsEveryone(directory);
+      await grantWindowsEveryone(file);
+      await writeFile(file, '{"changed":true}\n');
+      await ensurePrivateDirectory(directory);
+      await hardenPrivateFile(file, directory);
+
+      for (const path of [directory, file]) await expectWindowsOwnerOnly(path);
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "re-hardens the event log before an in-place append and safely advances its cache",
+    async () => {
+      const root = await temporaryRoot();
+      const contract = compileRunContract(
+        "Exercise Windows event-log ACL recovery",
+        { root, baseRef: "main", baseSha: "a".repeat(40) },
+        { finishLine: "local_verified" },
+      );
+      const graph = compileGraph(contract, [
+        { id: "verification-file", kind: "file", path: "verified.txt", shouldExist: true },
+      ]);
+      const store = await RunStore.create(root, contract, graph);
+
+      await grantWindowsEveryone(store.eventsPath());
+      await store.append("runtime", "run.paused", { reason: "ACL recovery append" });
+      await store.append("runtime", "run.started", { reason: "cached follow-up append" });
+
+      await expectWindowsOwnerOnly(store.eventsPath());
     },
   );
 });

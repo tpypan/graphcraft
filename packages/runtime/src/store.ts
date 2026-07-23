@@ -35,7 +35,8 @@ import { assertPersistenceSafe, redactTextBytes, redactValue } from "./redaction
 import { RunArtifactStore, type ArtifactPreview } from "./artifact-policy.ts";
 import {
   ensurePrivateDirectory,
-  hardenPrivateFile,
+  finalizePrivateFileMutation,
+  preparePrivateFileMutation,
   readPrivateFileBounded,
   validatePrivatePath,
 } from "./secure-fs.ts";
@@ -388,6 +389,7 @@ export class RunStore {
 
   private async appendEventLine(line: string, expectedLogBytes: number): Promise<void> {
     await validatePrivatePath(this.runRoot, "events.jsonl");
+    const aclMutation = await preparePrivateFileMutation(this.eventsPath(), this.runRoot);
     let created = false;
     let observed: BigIntStats | undefined;
     let handle;
@@ -436,9 +438,12 @@ export class RunStore {
       if (after.size !== before.size + BigInt(Buffer.byteLength(line)))
         throw new Error("Run event log append did not persist exactly one event line");
     } finally {
-      await handle.close();
+      try {
+        await handle.close();
+      } finally {
+        await finalizePrivateFileMutation(aclMutation, this.runRoot);
+      }
     }
-    await hardenPrivateFile(this.eventsPath(), this.runRoot);
     if (created) await syncDirectory(this.runRoot);
   }
 
