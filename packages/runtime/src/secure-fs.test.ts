@@ -23,6 +23,7 @@ import {
   hardenPrivateTree,
   preparePrivateDirectoryMutation,
   privateEntryIdentityFingerprint,
+  privatePublicationIdentityFingerprint,
   publishPrivateFileAtomic,
   readPrivateFileBounded,
   readRegularFileBounded,
@@ -197,6 +198,19 @@ describe("secure filesystem permissions", () => {
     expect(privateEntryIdentityFingerprint({ ...before, ino: 23n })).not.toBe(fingerprint);
     expect(privateEntryIdentityFingerprint({ ...before, birthtimeNs: 34n })).not.toBe(fingerprint);
     expect(privateEntryIdentityFingerprint({ ...before, ino: 0n })).toBeUndefined();
+  });
+
+  it("compares Windows atomic publications by device and nonzero inode instead of birth time", () => {
+    const before = { dev: 11n, ino: 22n, birthtimeNs: 33n };
+    const fingerprint = privatePublicationIdentityFingerprint(before);
+
+    expect(fingerprint).toBe("11:22");
+    expect(privatePublicationIdentityFingerprint({ ...before, birthtimeNs: 34n })).toBe(
+      fingerprint,
+    );
+    expect(privatePublicationIdentityFingerprint({ ...before, dev: 12n })).not.toBe(fingerprint);
+    expect(privatePublicationIdentityFingerprint({ ...before, ino: 23n })).not.toBe(fingerprint);
+    expect(privatePublicationIdentityFingerprint({ ...before, ino: 0n })).toBeUndefined();
   });
 
   it("reads a validated private file within its explicit byte limit", async () => {
@@ -606,6 +620,40 @@ describe("secure filesystem permissions", () => {
       await expectWindowsOwnerExclusive(path);
       await hardenPrivateFile(path, ownedRoot);
       await expectWindowsOwnerOnly(path);
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "preserves descriptor publication identity across Windows atomic replacements",
+    async () => {
+      const root = await temporaryRoot();
+      const ownedRoot = join(root, "descriptor publication identity");
+      const path = join(ownedRoot, "state.json");
+      await ensurePrivateDirectory(ownedRoot);
+
+      for (const sequence of [1, 2]) {
+        let publication: Awaited<ReturnType<typeof writeJsonAtomic>> | undefined;
+        await publishPrivateFileAtomic({
+          path,
+          ownedRoot,
+          sourceDirectory: ownedRoot,
+          hardenOnPosix: false,
+          publish: async () => {
+            publication = await writeJsonAtomic(path, { sequence });
+            return publication;
+          },
+        });
+        if (publication === undefined) throw new Error("Expected an atomic publication receipt");
+        const finalStatus = await lstat(path, { bigint: true });
+        const receiptIdentity = privatePublicationIdentityFingerprint({
+          dev: publication.device,
+          ino: publication.inode,
+          birthtimeNs: publication.birthtimeNs,
+        });
+
+        expect(receiptIdentity).toBeDefined();
+        expect(privatePublicationIdentityFingerprint(finalStatus)).toBe(receiptIdentity);
+      }
     },
   );
 

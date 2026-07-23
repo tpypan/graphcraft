@@ -226,6 +226,22 @@ export function privateEntryIdentityFingerprint(
   return status.ino === 0n ? undefined : `${status.dev}:${status.ino}:${status.birthtimeNs}`;
 }
 
+/**
+ * Return the descriptor-to-path identity used after atomic publication.
+ *
+ * A device plus a nonzero inode identifies the published object. Birth time is
+ * deliberately excluded because Windows may report a different creation time
+ * after a valid atomic rename or replacement. Unknown inode identities remain
+ * untrusted so callers can fall back to explicit owner-only hardening.
+ *
+ * @internal
+ */
+export function privatePublicationIdentityFingerprint(
+  status: Pick<BigIntStats, "dev" | "ino" | "birthtimeNs">,
+): string | undefined {
+  return status.ino === 0n ? undefined : `${status.dev}:${status.ino}`;
+}
+
 function rememberDarwinEntry(path: string, fingerprint: string | undefined): void {
   if (fingerprint === undefined) return;
   hardenedDarwinEntries.delete(path);
@@ -240,10 +256,12 @@ function rememberDarwinEntry(path: string, fingerprint: string | undefined): voi
 async function inspectPrivateEntry(path: string): Promise<{
   entry: PrivateEntry;
   identityFingerprint: string | undefined;
+  publicationIdentityFingerprint: string | undefined;
   metadataFingerprint: string | undefined;
 }> {
   const status = await lstat(path, { bigint: true });
   const identityFingerprint = privateEntryIdentityFingerprint(status);
+  const publicationIdentityFingerprint = privatePublicationIdentityFingerprint(status);
   const metadataFingerprint =
     identityFingerprint === undefined ? undefined : `${identityFingerprint}:${status.ctimeNs}`;
   if (status.isSymbolicLink()) rejectSymbolicLink(path);
@@ -252,6 +270,7 @@ async function inspectPrivateEntry(path: string): Promise<{
     return {
       entry: { kind: "file", path },
       identityFingerprint,
+      publicationIdentityFingerprint,
       metadataFingerprint,
     };
   }
@@ -260,6 +279,7 @@ async function inspectPrivateEntry(path: string): Promise<{
   return {
     entry: { kind: "directory", path },
     identityFingerprint,
+    publicationIdentityFingerprint,
     metadataFingerprint,
   };
 }
@@ -909,7 +929,7 @@ export async function publishPrivateFileAtomic(input: {
       if (fileAfter.entry.kind !== "file")
         throw new Error(`Published private path is not a regular file: ${absolute}`);
 
-      const publicationIdentity = privateEntryIdentityFingerprint({
+      const publicationIdentity = privatePublicationIdentityFingerprint({
         dev: publication.device,
         ino: publication.inode,
         birthtimeNs: publication.birthtimeNs,
@@ -918,14 +938,14 @@ export async function publishPrivateFileAtomic(input: {
         throw new Error(`Published private file changed filesystem identity: ${absolute}`);
       const superseded =
         publicationIdentity !== undefined &&
-        fileAfter.identityFingerprint !== undefined &&
-        fileAfter.identityFingerprint !== publicationIdentity;
+        fileAfter.publicationIdentityFingerprint !== undefined &&
+        fileAfter.publicationIdentityFingerprint !== publicationIdentity;
       if (superseded && input.supersessionPolicy !== "reconstructable_projection")
         throw new Error(`Published private file changed filesystem identity: ${absolute}`);
       requiresFallbackHardening ||=
         superseded ||
         publicationIdentity === undefined ||
-        fileAfter.identityFingerprint === undefined;
+        fileAfter.publicationIdentityFingerprint === undefined;
       if (requiresFallbackHardening)
         await hardenWindowsEntriesLocked(
           [...parentsAfter.map(({ entry }) => entry), fileAfter.entry],
