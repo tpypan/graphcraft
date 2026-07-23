@@ -38029,6 +38029,9 @@ function rememberWindowsIdentity(fingerprint, metadataFingerprint) {
 function privateEntryIdentityFingerprint(status3) {
   return status3.ino === 0n ? void 0 : `${status3.dev}:${status3.ino}:${status3.birthtimeNs}`;
 }
+function privatePublicationIdentityFingerprint(status3) {
+  return status3.ino === 0n ? void 0 : `${status3.dev}:${status3.ino}`;
+}
 function rememberDarwinEntry(path, fingerprint) {
   if (fingerprint === void 0) return;
   hardenedDarwinEntries.delete(path);
@@ -38042,6 +38045,7 @@ function rememberDarwinEntry(path, fingerprint) {
 async function inspectPrivateEntry(path) {
   const status3 = await lstat(path, { bigint: true });
   const identityFingerprint = privateEntryIdentityFingerprint(status3);
+  const publicationIdentityFingerprint = privatePublicationIdentityFingerprint(status3);
   const metadataFingerprint = identityFingerprint === void 0 ? void 0 : `${identityFingerprint}:${status3.ctimeNs}`;
   if (status3.isSymbolicLink()) rejectSymbolicLink(path);
   if (status3.isFile()) {
@@ -38049,6 +38053,7 @@ async function inspectPrivateEntry(path) {
     return {
       entry: { kind: "file", path },
       identityFingerprint,
+      publicationIdentityFingerprint,
       metadataFingerprint
     };
   }
@@ -38057,6 +38062,7 @@ async function inspectPrivateEntry(path) {
   return {
     entry: { kind: "directory", path },
     identityFingerprint,
+    publicationIdentityFingerprint,
     metadataFingerprint
   };
 }
@@ -38553,17 +38559,17 @@ async function publishPrivateFileAtomic(input) {
       }
       if (fileAfter.entry.kind !== "file")
         throw new Error(`Published private path is not a regular file: ${absolute}`);
-      const publicationIdentity = privateEntryIdentityFingerprint({
+      const publicationIdentity = privatePublicationIdentityFingerprint({
         dev: publication.device,
         ino: publication.inode,
         birthtimeNs: publication.birthtimeNs
       });
       if (resolve2(publication.path) !== absolute)
         throw new Error(`Published private file changed filesystem identity: ${absolute}`);
-      const superseded = publicationIdentity !== void 0 && fileAfter.identityFingerprint !== void 0 && fileAfter.identityFingerprint !== publicationIdentity;
+      const superseded = publicationIdentity !== void 0 && fileAfter.publicationIdentityFingerprint !== void 0 && fileAfter.publicationIdentityFingerprint !== publicationIdentity;
       if (superseded && input.supersessionPolicy !== "reconstructable_projection")
         throw new Error(`Published private file changed filesystem identity: ${absolute}`);
-      requiresFallbackHardening ||= superseded || publicationIdentity === void 0 || fileAfter.identityFingerprint === void 0;
+      requiresFallbackHardening ||= superseded || publicationIdentity === void 0 || fileAfter.publicationIdentityFingerprint === void 0;
       if (requiresFallbackHardening)
         await hardenWindowsEntriesLocked(
           [...parentsAfter.map(({ entry }) => entry), fileAfter.entry],

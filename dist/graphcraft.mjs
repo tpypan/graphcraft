@@ -25239,6 +25239,9 @@ function rememberWindowsIdentity(fingerprint, metadataFingerprint) {
 function privateEntryIdentityFingerprint(status3) {
   return status3.ino === 0n ? void 0 : `${status3.dev}:${status3.ino}:${status3.birthtimeNs}`;
 }
+function privatePublicationIdentityFingerprint(status3) {
+  return status3.ino === 0n ? void 0 : `${status3.dev}:${status3.ino}`;
+}
 function rememberDarwinEntry(path2, fingerprint) {
   if (fingerprint === void 0) return;
   hardenedDarwinEntries.delete(path2);
@@ -25252,6 +25255,7 @@ function rememberDarwinEntry(path2, fingerprint) {
 async function inspectPrivateEntry(path2) {
   const status3 = await lstat(path2, { bigint: true });
   const identityFingerprint = privateEntryIdentityFingerprint(status3);
+  const publicationIdentityFingerprint = privatePublicationIdentityFingerprint(status3);
   const metadataFingerprint = identityFingerprint === void 0 ? void 0 : `${identityFingerprint}:${status3.ctimeNs}`;
   if (status3.isSymbolicLink()) rejectSymbolicLink(path2);
   if (status3.isFile()) {
@@ -25259,6 +25263,7 @@ async function inspectPrivateEntry(path2) {
     return {
       entry: { kind: "file", path: path2 },
       identityFingerprint,
+      publicationIdentityFingerprint,
       metadataFingerprint
     };
   }
@@ -25267,6 +25272,7 @@ async function inspectPrivateEntry(path2) {
   return {
     entry: { kind: "directory", path: path2 },
     identityFingerprint,
+    publicationIdentityFingerprint,
     metadataFingerprint
   };
 }
@@ -25763,17 +25769,17 @@ async function publishPrivateFileAtomic(input) {
       }
       if (fileAfter.entry.kind !== "file")
         throw new Error(`Published private path is not a regular file: ${absolute}`);
-      const publicationIdentity = privateEntryIdentityFingerprint({
+      const publicationIdentity = privatePublicationIdentityFingerprint({
         dev: publication.device,
         ino: publication.inode,
         birthtimeNs: publication.birthtimeNs
       });
       if (resolve2(publication.path) !== absolute)
         throw new Error(`Published private file changed filesystem identity: ${absolute}`);
-      const superseded = publicationIdentity !== void 0 && fileAfter.identityFingerprint !== void 0 && fileAfter.identityFingerprint !== publicationIdentity;
+      const superseded = publicationIdentity !== void 0 && fileAfter.publicationIdentityFingerprint !== void 0 && fileAfter.publicationIdentityFingerprint !== publicationIdentity;
       if (superseded && input.supersessionPolicy !== "reconstructable_projection")
         throw new Error(`Published private file changed filesystem identity: ${absolute}`);
-      requiresFallbackHardening ||= superseded || publicationIdentity === void 0 || fileAfter.identityFingerprint === void 0;
+      requiresFallbackHardening ||= superseded || publicationIdentity === void 0 || fileAfter.publicationIdentityFingerprint === void 0;
       if (requiresFallbackHardening)
         await hardenWindowsEntriesLocked(
           [...parentsAfter.map(({ entry }) => entry), fileAfter.entry],
@@ -38149,12 +38155,14 @@ async function writeRetentionJournal(repositoryRoot, journal) {
   if (!persisted || !isDeepStrictEqual3(persisted, journal))
     throw refusal(journal.runId, "retention journal was not persisted exactly");
 }
-async function removeRetentionJournal(repositoryRoot, runId) {
+async function removeRetentionJournal(repositoryRoot, runId, assertLeaseHeld) {
   const existing = await readRetentionJournal(repositoryRoot, runId);
   if (!existing) return;
   const graphcraftRoot2 = join15(repositoryRoot, ".graphcraft");
   const path2 = retentionJournalPath(repositoryRoot, runId);
+  assertLeaseHeld();
   await hardenPrivateFile(path2, graphcraftRoot2);
+  assertLeaseHeld();
   await unlink4(path2).catch((error51) => {
     if (error51.code !== "ENOENT") throw error51;
   });
@@ -38382,33 +38390,46 @@ async function validateTargets(graphcraftRoot2, targets, journaled) {
   }
   return existing;
 }
-async function removeTargets(graphcraftRoot2, targets, runId, onCheckpoint) {
+async function removeTargets(graphcraftRoot2, targets, runId, onCheckpoint, assertLeaseHeld) {
   let removedAuxiliary = false;
   for (const target of targets.slice(1)) {
-    if (!await validateTarget(graphcraftRoot2, target)) continue;
+    assertLeaseHeld();
+    const exists = await validateTarget(graphcraftRoot2, target);
+    assertLeaseHeld();
+    if (!exists) continue;
     if (target.kind === "directory") await rm5(target.path, { recursive: true, force: true });
     else
       await unlink4(target.path).catch((error51) => {
         if (error51.code !== "ENOENT") throw error51;
       });
+    assertLeaseHeld();
     removedAuxiliary = true;
   }
   if (removedAuxiliary) await onCheckpoint?.({ boundary: "after_auxiliary", runId });
   const run = targets[0];
-  if (!await validateTarget(graphcraftRoot2, run)) return;
+  assertLeaseHeld();
+  const runExists = await validateTarget(graphcraftRoot2, run);
+  assertLeaseHeld();
+  if (!runExists) return;
   await onCheckpoint?.({ boundary: "before_run", runId });
   await onCheckpoint?.({ boundary: "during_run", runId });
-  if (await validateTarget(graphcraftRoot2, run))
+  const stillExists = await validateTarget(graphcraftRoot2, run);
+  assertLeaseHeld();
+  if (stillExists) {
     await rm5(run.path, { recursive: true, force: true });
+    assertLeaseHeld();
+  }
   await onCheckpoint?.({ boundary: "after_run", runId });
 }
-async function syncRetentionTargetParents(targets) {
+async function syncRetentionTargetParents(targets, assertLeaseHeld) {
   for (const parent of new Set(targets.map(({ path: path2 }) => dirname10(path2)))) {
+    assertLeaseHeld();
     try {
       await syncDirectory(parent);
     } catch (error51) {
       if (!isMissing3(error51)) throw error51;
     }
+    assertLeaseHeld();
   }
 }
 function createRetentionJournal(plan, existingTargetIds) {
@@ -38435,19 +38456,35 @@ async function applyRetention(plan, confirmRunId, validateEligibility, options =
   );
   const runLock = new RunLock(join15(graphcraftRoot2, "locks", `${plan.runId}.lock`));
   const artifactLock = new RunLock(join15(graphcraftRoot2, "locks", `${plan.runId}.artifacts.lock`));
-  let retentionLockAcquired = false;
-  let supervisorLockAcquired = false;
-  let runLockAcquired = false;
-  let artifactLockAcquired = false;
+  const locks = [retentionLock, supervisorLock, runLock, artifactLock];
+  const acquiredLocks = [];
+  const observedSignals = [];
+  let causalFailure;
+  let cleanupFailure;
+  let bodyFailureWasThrown = false;
+  const rememberCausalFailure = (error51) => causalFailure ??= { error: error51 };
+  const assertLeaseHeld = () => {
+    if (causalFailure) throw causalFailure.error;
+  };
+  const checkpoint = async (value) => {
+    assertLeaseHeld();
+    await options.onCheckpoint?.(value);
+    assertLeaseHeld();
+  };
   try {
-    await retentionLock.acquire();
-    retentionLockAcquired = true;
-    await supervisorLock.acquire();
-    supervisorLockAcquired = true;
-    await runLock.acquire();
-    runLockAcquired = true;
-    await artifactLock.acquire();
-    artifactLockAcquired = true;
+    for (const lock of locks) {
+      const signal = lock.signal;
+      const recordLoss = () => {
+        rememberCausalFailure(signal.reason);
+      };
+      observedSignals.push({ signal, recordLoss });
+      if (signal.aborted) recordLoss();
+      else signal.addEventListener("abort", recordLoss, { once: true });
+      assertLeaseHeld();
+      await lock.acquire();
+      acquiredLocks.push(lock);
+      assertLeaseHeld();
+    }
     const targets = retentionTargets(repositoryRoot, plan.runId);
     let journal = await readRetentionJournal(repositoryRoot, plan.runId);
     if (journal) {
@@ -38463,20 +38500,24 @@ async function applyRetention(plan, confirmRunId, validateEligibility, options =
       validateEligibility?.(current);
       const existingTargetIds = await validateTargets(graphcraftRoot2, targets, false);
       journal = createRetentionJournal(current, existingTargetIds);
+      assertLeaseHeld();
       await writeRetentionJournal(repositoryRoot, journal);
-      await options.onCheckpoint?.({ boundary: "after_journal", runId: plan.runId });
+      await checkpoint({ boundary: "after_journal", runId: plan.runId });
     }
-    await removeTargets(graphcraftRoot2, targets, plan.runId, options.onCheckpoint);
+    assertLeaseHeld();
+    await removeTargets(graphcraftRoot2, targets, plan.runId, checkpoint, assertLeaseHeld);
     const remaining = await validateTargets(graphcraftRoot2, targets, true);
+    assertLeaseHeld();
     if (remaining.size > 0)
       throw refusal(
         plan.runId,
         `targets remained after deletion (${[...remaining].join(", ")}); recovery journal was preserved`
       );
     if (!options.deferJournalCleanup) {
-      await syncRetentionTargetParents(targets);
-      await options.onCheckpoint?.({ boundary: "before_journal_cleanup", runId: plan.runId });
-      await removeRetentionJournal(repositoryRoot, plan.runId);
+      await syncRetentionTargetParents(targets, assertLeaseHeld);
+      await checkpoint({ boundary: "before_journal_cleanup", runId: plan.runId });
+      await removeRetentionJournal(repositoryRoot, plan.runId, assertLeaseHeld);
+      assertLeaseHeld();
     }
     return {
       schemaVersion: 1,
@@ -38484,11 +38525,23 @@ async function applyRetention(plan, confirmRunId, validateEligibility, options =
       deletedPaths: targets.filter(({ id }) => journal.existingTargetIds.includes(id)).map(({ path: path2 }) => path2),
       preservedWorkspace: journal.preservedWorkspace
     };
+  } catch (error51) {
+    bodyFailureWasThrown = true;
+    throw rememberCausalFailure(error51).error;
   } finally {
-    if (artifactLockAcquired) await artifactLock.release();
-    if (runLockAcquired) await runLock.release();
-    if (supervisorLockAcquired) await supervisorLock.release();
-    if (retentionLockAcquired) await retentionLock.release();
+    for (let index = acquiredLocks.length - 1; index >= 0; index -= 1) {
+      try {
+        await acquiredLocks[index].release();
+      } catch (error51) {
+        cleanupFailure ??= { error: error51 };
+      }
+    }
+    for (const { signal, recordLoss } of observedSignals)
+      signal.removeEventListener("abort", recordLoss);
+    if (!bodyFailureWasThrown) {
+      if (causalFailure) throw causalFailure.error;
+      if (cleanupFailure) throw cleanupFailure.error;
+    }
   }
 }
 async function applyRunRetention(input) {
