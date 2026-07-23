@@ -357,12 +357,18 @@ async function writeRetentionJournal(
     throw refusal(journal.runId, "retention journal was not persisted exactly");
 }
 
-async function removeRetentionJournal(repositoryRoot: string, runId: string): Promise<void> {
+async function removeRetentionJournal(
+  repositoryRoot: string,
+  runId: string,
+  assertLeaseHeld: () => void,
+): Promise<void> {
   const existing = await readRetentionJournal(repositoryRoot, runId);
   if (!existing) return;
   const graphcraftRoot = join(repositoryRoot, ".graphcraft");
   const path = retentionJournalPath(repositoryRoot, runId);
+  assertLeaseHeld();
   await hardenPrivateFile(path, graphcraftRoot);
+  assertLeaseHeld();
   await unlink(path).catch((error: NodeJS.ErrnoException) => {
     if (error.code !== "ENOENT") throw error;
   });
@@ -640,36 +646,53 @@ async function removeTargets(
   graphcraftRoot: string,
   targets: RetentionTarget[],
   runId: string,
-  onCheckpoint?: RunRetentionHook,
+  onCheckpoint: RunRetentionHook | undefined,
+  assertLeaseHeld: () => void,
 ): Promise<void> {
   let removedAuxiliary = false;
   for (const target of targets.slice(1)) {
-    if (!(await validateTarget(graphcraftRoot, target))) continue;
+    assertLeaseHeld();
+    const exists = await validateTarget(graphcraftRoot, target);
+    assertLeaseHeld();
+    if (!exists) continue;
     if (target.kind === "directory") await rm(target.path, { recursive: true, force: true });
     else
       await unlink(target.path).catch((error: NodeJS.ErrnoException) => {
         if (error.code !== "ENOENT") throw error;
       });
+    assertLeaseHeld();
     removedAuxiliary = true;
   }
   if (removedAuxiliary) await onCheckpoint?.({ boundary: "after_auxiliary", runId });
 
   const run = targets[0]!;
-  if (!(await validateTarget(graphcraftRoot, run))) return;
+  assertLeaseHeld();
+  const runExists = await validateTarget(graphcraftRoot, run);
+  assertLeaseHeld();
+  if (!runExists) return;
   await onCheckpoint?.({ boundary: "before_run", runId });
   await onCheckpoint?.({ boundary: "during_run", runId });
-  if (await validateTarget(graphcraftRoot, run))
+  const stillExists = await validateTarget(graphcraftRoot, run);
+  assertLeaseHeld();
+  if (stillExists) {
     await rm(run.path, { recursive: true, force: true });
+    assertLeaseHeld();
+  }
   await onCheckpoint?.({ boundary: "after_run", runId });
 }
 
-async function syncRetentionTargetParents(targets: RetentionTarget[]): Promise<void> {
+async function syncRetentionTargetParents(
+  targets: RetentionTarget[],
+  assertLeaseHeld: () => void,
+): Promise<void> {
   for (const parent of new Set(targets.map(({ path }) => dirname(path)))) {
+    assertLeaseHeld();
     try {
       await syncDirectory(parent);
     } catch (error) {
       if (!isMissing(error)) throw error;
     }
+    assertLeaseHeld();
   }
 }
 
@@ -710,19 +733,39 @@ async function applyRetention(
   );
   const runLock = new RunLock(join(graphcraftRoot, "locks", `${plan.runId}.lock`));
   const artifactLock = new RunLock(join(graphcraftRoot, "locks", `${plan.runId}.artifacts.lock`));
-  let retentionLockAcquired = false;
-  let supervisorLockAcquired = false;
-  let runLockAcquired = false;
-  let artifactLockAcquired = false;
+  const locks = [retentionLock, supervisorLock, runLock, artifactLock];
+  const acquiredLocks: RunLock[] = [];
+  const observedSignals: Array<{
+    signal: AbortSignal;
+    recordLoss: () => void;
+  }> = [];
+  let causalFailure: { error: unknown } | undefined;
+  let cleanupFailure: { error: unknown } | undefined;
+  let bodyFailureWasThrown = false;
+  const rememberCausalFailure = (error: unknown): { error: unknown } =>
+    (causalFailure ??= { error });
+  const assertLeaseHeld = (): void => {
+    if (causalFailure) throw causalFailure.error;
+  };
+  const checkpoint: RunRetentionHook = async (value) => {
+    assertLeaseHeld();
+    await options.onCheckpoint?.(value);
+    assertLeaseHeld();
+  };
   try {
-    await retentionLock.acquire();
-    retentionLockAcquired = true;
-    await supervisorLock.acquire();
-    supervisorLockAcquired = true;
-    await runLock.acquire();
-    runLockAcquired = true;
-    await artifactLock.acquire();
-    artifactLockAcquired = true;
+    for (const lock of locks) {
+      const signal = lock.signal;
+      const recordLoss = (): void => {
+        rememberCausalFailure(signal.reason);
+      };
+      observedSignals.push({ signal, recordLoss });
+      if (signal.aborted) recordLoss();
+      else signal.addEventListener("abort", recordLoss, { once: true });
+      assertLeaseHeld();
+      await lock.acquire();
+      acquiredLocks.push(lock);
+      assertLeaseHeld();
+    }
 
     const targets = retentionTargets(repositoryRoot, plan.runId);
     let journal = await readRetentionJournal(repositoryRoot, plan.runId);
@@ -739,21 +782,25 @@ async function applyRetention(
       validateEligibility?.(current);
       const existingTargetIds = await validateTargets(graphcraftRoot, targets, false);
       journal = createRetentionJournal(current, existingTargetIds);
+      assertLeaseHeld();
       await writeRetentionJournal(repositoryRoot, journal);
-      await options.onCheckpoint?.({ boundary: "after_journal", runId: plan.runId });
+      await checkpoint({ boundary: "after_journal", runId: plan.runId });
     }
 
-    await removeTargets(graphcraftRoot, targets, plan.runId, options.onCheckpoint);
+    assertLeaseHeld();
+    await removeTargets(graphcraftRoot, targets, plan.runId, checkpoint, assertLeaseHeld);
     const remaining = await validateTargets(graphcraftRoot, targets, true);
+    assertLeaseHeld();
     if (remaining.size > 0)
       throw refusal(
         plan.runId,
         `targets remained after deletion (${[...remaining].join(", ")}); recovery journal was preserved`,
       );
     if (!options.deferJournalCleanup) {
-      await syncRetentionTargetParents(targets);
-      await options.onCheckpoint?.({ boundary: "before_journal_cleanup", runId: plan.runId });
-      await removeRetentionJournal(repositoryRoot, plan.runId);
+      await syncRetentionTargetParents(targets, assertLeaseHeld);
+      await checkpoint({ boundary: "before_journal_cleanup", runId: plan.runId });
+      await removeRetentionJournal(repositoryRoot, plan.runId, assertLeaseHeld);
+      assertLeaseHeld();
     }
     return {
       schemaVersion: 1,
@@ -763,11 +810,23 @@ async function applyRetention(
         .map(({ path }) => path),
       preservedWorkspace: journal.preservedWorkspace,
     };
+  } catch (error) {
+    bodyFailureWasThrown = true;
+    throw rememberCausalFailure(error).error;
   } finally {
-    if (artifactLockAcquired) await artifactLock.release();
-    if (runLockAcquired) await runLock.release();
-    if (supervisorLockAcquired) await supervisorLock.release();
-    if (retentionLockAcquired) await retentionLock.release();
+    for (let index = acquiredLocks.length - 1; index >= 0; index -= 1) {
+      try {
+        await acquiredLocks[index]!.release();
+      } catch (error) {
+        cleanupFailure ??= { error };
+      }
+    }
+    for (const { signal, recordLoss } of observedSignals)
+      signal.removeEventListener("abort", recordLoss);
+    if (!bodyFailureWasThrown) {
+      if (causalFailure) throw causalFailure.error;
+      if (cleanupFailure) throw cleanupFailure.error;
+    }
   }
 }
 

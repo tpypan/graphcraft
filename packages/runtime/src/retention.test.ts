@@ -17,7 +17,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   RunEventSchema,
   compileGraph,
@@ -214,6 +214,8 @@ async function seedAuxiliaryState(
 }
 
 describe("run-state retention", () => {
+  const retentionLeaseNames = ["retention", "supervisor", "run", "artifact"] as const;
+
   it("builds a read-only plan with durable state and preserved workspace details", async () => {
     const { root, repository } = await createRepository();
     const { store, workspace } = await createCompletedRun(repository);
@@ -355,6 +357,133 @@ describe("run-state retention", () => {
       expect(await readFile(join(workspace.path, "preserved.txt"), "utf8")).toBe(
         `${store.runId}\n`,
       );
+    },
+  );
+
+  it.each(
+    retentionLeaseNames.flatMap((lockName) =>
+      (["after_journal", "during_run"] as const).map((boundary) => [lockName, boundary] as const),
+    ),
+  )(
+    "preserves recoverable evidence when the %s lease is lost at %s",
+    async (lockName, boundary) => {
+      const { repository } = await createRepository();
+      const { store, workspace } = await createCompletedRun(repository);
+      await seedAuxiliaryState(repository, store.runId, `${lockName}:${boundary}`);
+      const plan = await planRunRetention({
+        repositoryRoot: repository,
+        runReference: store.runId,
+      });
+      const controllers = retentionLeaseNames.map(() => new AbortController());
+      const leaseFailure = new Error(
+        `Graphcraft ${lockName} retention lease was lost at ${boundary}`,
+      );
+      let injected = false;
+      let journalAtLoss: string | undefined;
+      let runAtLoss: Record<string, string> | undefined;
+      const signal = vi.spyOn(RunLock.prototype, "signal", "get");
+      for (const controller of controllers) signal.mockReturnValueOnce(controller.signal);
+      const release = vi.spyOn(RunLock.prototype, "release");
+
+      try {
+        await expect(
+          applyRunRetention({
+            plan,
+            confirmRunId: store.runId,
+            onCheckpoint: async (checkpoint) => {
+              if (injected || checkpoint.boundary !== boundary) return;
+              injected = true;
+              journalAtLoss = await readFile(journalPath(repository, store.runId), "utf8");
+              runAtLoss = await treeSnapshot(store.runRoot);
+              controllers[retentionLeaseNames.indexOf(lockName)]!.abort(leaseFailure);
+            },
+          }),
+        ).rejects.toBe(leaseFailure);
+        expect(release).toHaveBeenCalledTimes(4);
+      } finally {
+        signal.mockRestore();
+        release.mockRestore();
+      }
+
+      expect(injected).toBe(true);
+      if (!journalAtLoss || !runAtLoss) throw new Error("Expected lease-loss evidence snapshot");
+      const persistedJournal = await readFile(journalPath(repository, store.runId), "utf8");
+      expect(persistedJournal).toBe(journalAtLoss);
+      expect(
+        (JSON.parse(persistedJournal) as { existingTargetIds: string[] }).existingTargetIds,
+      ).toEqual(["run", "control", "supervisor", "migration_backup"]);
+      expect(await treeSnapshot(store.runRoot)).toEqual(runAtLoss);
+      expect(await pathExists(plan.deletePaths[0]!)).toBe(true);
+      for (const path of plan.deletePaths.slice(1))
+        expect(await pathExists(path)).toBe(boundary === "after_journal");
+
+      const recoveryPlan = await planRunRetention({
+        repositoryRoot: repository,
+        runReference: store.runId,
+      });
+      const result = await applyRunRetention({
+        plan: recoveryPlan,
+        confirmRunId: store.runId,
+      });
+
+      expect(result.deletedPaths).toEqual(plan.deletePaths);
+      expect(await pathExists(journalPath(repository, store.runId))).toBe(false);
+      for (const path of plan.deletePaths) expect(await pathExists(path)).toBe(false);
+      expect(await readFile(join(workspace.path, "preserved.txt"), "utf8")).toBe(
+        `${store.runId}\n`,
+      );
+    },
+  );
+
+  it.each(["body", "lease"] as const)(
+    "attempts every lock release without replacing the original %s failure",
+    async (failureKind) => {
+      const { repository } = await createRepository();
+      const { store } = await createCompletedRun(repository);
+      await seedAuxiliaryState(repository, store.runId, failureKind);
+      const plan = await planRunRetention({
+        repositoryRoot: repository,
+        runReference: store.runId,
+      });
+      const causalFailure = new Error(`original retention ${failureKind} failure`);
+      const releaseFailures = retentionLeaseNames.map(
+        (lockName) => new Error(`${lockName} release failed`),
+      );
+      const controllers = retentionLeaseNames.map(() => new AbortController());
+      const signal = vi.spyOn(RunLock.prototype, "signal", "get");
+      for (const controller of controllers) signal.mockReturnValueOnce(controller.signal);
+      const releaseLock = RunLock.prototype.release;
+      let releaseCalls = 0;
+      const release = vi.spyOn(RunLock.prototype, "release").mockImplementation(async function (
+        this: RunLock,
+      ) {
+        const failure = releaseFailures[releaseCalls]!;
+        releaseCalls += 1;
+        await releaseLock.call(this);
+        throw failure;
+      });
+
+      try {
+        await expect(
+          applyRunRetention({
+            plan,
+            confirmRunId: store.runId,
+            onCheckpoint: ({ boundary }) => {
+              if (boundary !== "after_journal") return;
+              if (failureKind === "body") throw causalFailure;
+              controllers[3]!.abort(causalFailure);
+            },
+          }),
+        ).rejects.toBe(causalFailure);
+        expect(release).toHaveBeenCalledTimes(4);
+        expect(releaseCalls).toBe(4);
+      } finally {
+        signal.mockRestore();
+        release.mockRestore();
+      }
+
+      expect(await pathExists(journalPath(repository, store.runId))).toBe(true);
+      for (const path of plan.deletePaths) expect(await pathExists(path)).toBe(true);
     },
   );
 
