@@ -37975,7 +37975,17 @@ try {
     }
     if ($failures.Count -gt 0) {
       $kind = if ($isDirectory) { 'D' } else { 'F' }
-      throw "Graphcraft owner-only ACL verification failed for target $targetIndex ($kind): $($failures -join ',')"
+      $ownerClass = if ($owner.Value -eq $sid.Value) { 'current' } else { 'other' }
+      $protection = if ($verified.AreAccessRulesProtected) { 'protected' } else { 'unprotected' }
+      $aceDiagnostics = [System.Collections.Generic.List[string]]::new()
+      foreach ($rule in $rules) {
+        $identityClass = if ($rule.IdentityReference.Value -eq $sid.Value) { 'current' } else { 'other' }
+        $inherited = $rule.IsInherited.ToString().ToLowerInvariant()
+        [void]$aceDiagnostics.Add(
+          "identity=$identityClass,type=$([int]($rule.AccessControlType)),rights=$([int]($rule.FileSystemRights)),inherited=$inherited,inheritance=$([int]($rule.InheritanceFlags)),propagation=$([int]($rule.PropagationFlags))"
+        )
+      }
+      throw "Graphcraft owner-only ACL verification failed for target $targetIndex ($kind): $($failures -join ','); protection=$protection;owner=$ownerClass;aces=[$($aceDiagnostics -join '|')]"
     }
   }
   [Console]::Out.WriteLine("GRAPHCRAFT_ACL_OK:$($targets.Count)")
@@ -39715,11 +39725,12 @@ function entryFor(path, kind, format, source, stored, previous, reason, disposit
   };
 }
 var RunArtifactStore = class {
-  constructor(runRoot, runId, policy = DEFAULT_ARTIFACT_POLICY, publicationHook) {
+  constructor(runRoot, runId, policy = DEFAULT_ARTIFACT_POLICY, publicationHook, parentSignal) {
     this.runRoot = runRoot;
     this.runId = runId;
     this.policy = policy;
     this.publicationHook = publicationHook;
+    this.parentSignal = parentSignal;
     if (!RUN_ID_PATTERN.test(runId)) throw new Error(`Invalid Graphcraft run ID: ${runId}`);
     ArtifactPolicySchema.parse(policy);
     if (policy.invocationReservedBytes >= policy.invocationTranscriptBytes)
@@ -39736,27 +39747,38 @@ var RunArtifactStore = class {
   runId;
   policy;
   publicationHook;
+  parentSignal;
   inventoryRelativePath = "artifact-inventory.json";
   mutationLockPath;
   tail = Promise.resolve();
   validatedFiles = /* @__PURE__ */ new Map();
   async acquireMutationLock() {
     while (true) {
+      if (this.parentSignal?.aborted) throw this.parentSignal.reason;
       const lock = new RunLock(this.mutationLockPath);
       try {
         await lock.acquire();
+        if (this.parentSignal?.aborted) {
+          try {
+            await lock.release();
+          } catch {
+          }
+          throw this.parentSignal.reason;
+        }
         return lock;
       } catch (error51) {
+        if (this.parentSignal?.aborted) throw this.parentSignal.reason;
         if (error51.code === "ENOENT") continue;
         if (!(error51 instanceof Error) || !error51.message.includes("already active")) throw error51;
       }
       await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+      if (this.parentSignal?.aborted) throw this.parentSignal.reason;
     }
   }
   serializeMutation(operation) {
     const current = this.tail.then(async () => {
       const lock = await this.acquireMutationLock();
-      const signal = lock.signal;
+      const signal = this.parentSignal ? AbortSignal.any([lock.signal, this.parentSignal]) : lock.signal;
       let causalFailure;
       let leaseFailure;
       let cleanupFailure;
@@ -42743,12 +42765,12 @@ async function validateRunStorageRoot(input) {
   if (validated !== runRoot)
     throw new Error(`Run storage path escaped the Graphcraft state directory: ${input.runRoot}`);
 }
-async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom) {
+async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom, lease) {
   const value = manifest(runId, migratedFrom);
-  await ensurePrivateDirectory(runRoot);
+  await migrationStep(lease, async () => await ensurePrivateDirectory(runRoot));
   const path = runStorageManifestPath(runRoot);
-  await writeJsonAtomic(path, value);
-  await hardenPrivateFile(path, runRoot);
+  await migrationStep(lease, async () => await writeJsonAtomic(path, value));
+  await migrationStep(lease, async () => await hardenPrivateFile(path, runRoot));
   return value;
 }
 async function writeCurrentRunStorageManifest(runRoot, runId, migratedFrom) {
@@ -42814,6 +42836,102 @@ async function inspectStorage(runRoot, runId) {
 function isActiveLockError(error51) {
   return error51 instanceof Error && error51.message.includes("already active");
 }
+function createMigrationLeaseContext(initialSignal) {
+  const loss = new AbortController();
+  const listeners = /* @__PURE__ */ new Map();
+  let causalFailure;
+  let leaseFailure;
+  const rememberCausalFailure = (error51) => causalFailure ??= { error: error51 };
+  const recordSignalLoss = (signal) => {
+    leaseFailure ??= { error: signal.reason };
+    rememberCausalFailure(leaseFailure.error);
+    if (!loss.signal.aborted) loss.abort(leaseFailure.error);
+  };
+  const addSignal = (signal) => {
+    if (listeners.has(signal)) return;
+    const listener = () => recordSignalLoss(signal);
+    listeners.set(signal, listener);
+    if (signal.aborted) listener();
+    else signal.addEventListener("abort", listener, { once: true });
+  };
+  const assertHeld = () => {
+    if (leaseFailure) throw leaseFailure.error;
+  };
+  const observe2 = async (operation) => {
+    try {
+      return await operation();
+    } catch (error51) {
+      throw rememberCausalFailure(error51).error;
+    }
+  };
+  const wait = async (milliseconds) => {
+    assertHeld();
+    await observe2(
+      async () => await new Promise((resolveWait, rejectWait) => {
+        if (loss.signal.aborted) {
+          rejectWait(loss.signal.reason);
+          return;
+        }
+        const timeout = setTimeout(() => {
+          loss.signal.removeEventListener("abort", onAbort);
+          resolveWait();
+        }, milliseconds);
+        const onAbort = () => {
+          clearTimeout(timeout);
+          rejectWait(loss.signal.reason);
+        };
+        loss.signal.addEventListener("abort", onAbort, { once: true });
+      })
+    );
+    assertHeld();
+  };
+  addSignal(initialSignal);
+  return {
+    signal: loss.signal,
+    addSignal,
+    assertHeld,
+    dispose: () => {
+      for (const [signal, listener] of listeners) signal.removeEventListener("abort", listener);
+      listeners.clear();
+    },
+    failure: () => causalFailure,
+    isLost: () => leaseFailure !== void 0,
+    observe: observe2,
+    recordFailure: (error51) => rememberCausalFailure(error51).error,
+    wait
+  };
+}
+async function migrationStep(lease, operation) {
+  if (!lease) return await operation();
+  lease.assertHeld();
+  const result = await lease.observe(operation);
+  lease.assertHeld();
+  return result;
+}
+async function closeMigrationHandles(lease, handles) {
+  for (const handle of handles) {
+    if (!handle) continue;
+    try {
+      await handle.close();
+    } catch (error51) {
+      lease.recordFailure(error51);
+    }
+  }
+  const causalFailure = lease.failure();
+  if (causalFailure) throw causalFailure.error;
+}
+async function acquireMigrationHandle(lease, operation) {
+  lease.assertHeld();
+  const handle = await lease.observe(operation);
+  try {
+    lease.assertHeld();
+    return handle;
+  } catch (error51) {
+    const causalFailure = lease.recordFailure(error51);
+    await handle.close().catch(() => void 0);
+    throw causalFailure;
+  }
+}
 async function acquireMigrationLock(input) {
   const lockPath = join10(input.graphcraftRoot, "locks", `${input.runId}.migration.lock`);
   while (true) {
@@ -42830,16 +42948,18 @@ async function acquireMigrationLock(input) {
     await new Promise((resolve14) => setTimeout(resolve14, 25));
   }
 }
-async function acquireActiveAwareLock(path) {
+async function acquireActiveAwareLock(path, lease) {
   while (true) {
+    lease.assertHeld();
     const lock = new RunLock(path);
     try {
       await lock.acquire();
       return lock;
     } catch (error51) {
-      if (!isActiveLockError(error51)) throw error51;
+      lease.assertHeld();
+      if (!isActiveLockError(error51)) throw lease.recordFailure(error51);
     }
-    await new Promise((resolve14) => setTimeout(resolve14, 25));
+    await lease.wait(25);
   }
 }
 async function status2(path) {
@@ -42969,16 +43089,19 @@ function legacyTreeDigest(entries, ignoredRootName) {
   );
   return createHash4("sha256").update(JSON.stringify(values)).digest("hex");
 }
-async function scanLegacyTreeMetadata(root, options) {
-  const rootMetadata = await lstat5(root, { bigint: true });
+async function scanLegacyTreeMetadata(root, options, lease) {
+  const rootMetadata = await migrationStep(lease, async () => await lstat5(root, { bigint: true }));
   if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory())
     throw new Error("Storage migration cannot scan an unsafe legacy run root");
   let entryCount = 0;
   let fileCount = 0;
   const entries = [];
   const visit = async (directory, relativeDirectory) => {
-    const names = (await readdir3(directory)).sort((left, right) => left.localeCompare(right));
+    const names = (await migrationStep(lease, async () => await readdir3(directory))).sort(
+      (left, right) => left.localeCompare(right)
+    );
     for (const name of names) {
+      lease.assertHeld();
       if (relativeDirectory.length === 0 && name === options.ignoredRootName) continue;
       if (relativeDirectory.length === 0 && options.rejectBackupMarker && name === BACKUP_COMPLETION_FILE)
         throw new Error(
@@ -42991,7 +43114,7 @@ async function scanLegacyTreeMetadata(root, options) {
         throw new Error(
           `Legacy run contains more than the ${LEGACY_MIGRATION_RESOURCE_LIMITS.maximumEntryCount}-entry safe migration limit; prune legacy run state before retrying`
         );
-      const metadata = await lstat5(path, { bigint: true });
+      const metadata = await migrationStep(lease, async () => await lstat5(path, { bigint: true }));
       if (metadata.isSymbolicLink())
         throw new Error("Storage migration cannot scan a symbolic link; no backup was created");
       if (metadata.isDirectory()) {
@@ -43101,24 +43224,35 @@ function advanceLegacyEventLineLength(chunk, previousLength) {
   }
   return length;
 }
-async function readLegacySnapshotFile(expected, options) {
+async function readLegacySnapshotFile(expected, options, lease) {
   assertLegacyFileMetadata(
-    await lstat5(expected.path, { bigint: true }),
+    await migrationStep(lease, async () => await lstat5(expected.path, { bigint: true })),
     expected,
     "before opening"
   );
   const noFollow = process.platform === "win32" ? 0 : fsConstants4.O_NOFOLLOW;
-  const handle = await open5(expected.path, fsConstants4.O_RDONLY | noFollow);
+  const handle = await acquireMigrationHandle(
+    lease,
+    async () => await open5(expected.path, fsConstants4.O_RDONLY | noFollow)
+  );
   const hash2 = createHash4("sha256");
   const redactionChunks = options.scanRedaction ? [] : void 0;
   const buffer = Buffer.alloc(Math.min(MIGRATION_COPY_CHUNK_BYTES, Math.max(1, expected.bytes)));
   let position = 0;
   let eventLineLength = 0;
   try {
-    assertLegacyFileMetadata(await handle.stat({ bigint: true }), expected, "when opened");
+    assertLegacyFileMetadata(
+      await migrationStep(lease, async () => await handle.stat({ bigint: true })),
+      expected,
+      "when opened"
+    );
     while (position < expected.bytes) {
+      lease.assertHeld();
       const requested = Math.min(buffer.length, expected.bytes - position);
-      const { bytesRead } = await handle.read(buffer, 0, requested, position);
+      const { bytesRead } = await migrationStep(
+        lease,
+        async () => await handle.read(buffer, 0, requested, position)
+      );
       if (bytesRead === 0)
         throw new Error(
           `Legacy file ${expected.relativePath} changed while being read; no backup was created`
@@ -43131,18 +43265,24 @@ async function readLegacySnapshotFile(expected, options) {
       position += bytesRead;
     }
     const extra = Buffer.alloc(1);
-    if ((await handle.read(extra, 0, 1, position)).bytesRead !== 0)
+    if ((await migrationStep(lease, async () => await handle.read(extra, 0, 1, position))).bytesRead !== 0)
       throw new Error(
         `Legacy file ${expected.relativePath} changed while being read; no backup was created`
       );
-    assertLegacyFileMetadata(await handle.stat({ bigint: true }), expected, "while being read");
     assertLegacyFileMetadata(
-      await lstat5(expected.path, { bigint: true }),
+      await migrationStep(lease, async () => await handle.stat({ bigint: true })),
+      expected,
+      "while being read"
+    );
+    assertLegacyFileMetadata(
+      await migrationStep(lease, async () => await lstat5(expected.path, { bigint: true })),
       expected,
       "after reading"
     );
+  } catch (error51) {
+    throw lease.recordFailure(error51);
   } finally {
-    await handle.close();
+    await closeMigrationHandles(lease, [handle]);
   }
   if (position !== expected.bytes)
     throw new Error(
@@ -43161,8 +43301,8 @@ async function readLegacySnapshotFile(expected, options) {
   }
   return hash2.digest("hex");
 }
-async function captureLegacyTreeSnapshot(root, options = {}) {
-  const metadata = await scanLegacyTreeMetadata(root, options);
+async function captureLegacyTreeSnapshot(root, lease, options = {}) {
+  const metadata = await scanLegacyTreeMetadata(root, options, lease);
   assertLegacyResourceLimits(metadata);
   if (options.enforceDestinationLimits) assertLegacyDestinationLimits(metadata);
   const entries = [];
@@ -43172,11 +43312,11 @@ async function captureLegacyTreeSnapshot(root, options = {}) {
       entries.push(entry);
       continue;
     }
-    const file2 = { ...entry, hash: await readLegacySnapshotFile(entry, options) };
+    const file2 = { ...entry, hash: await readLegacySnapshotFile(entry, options, lease) };
     entries.push(file2);
     files.push(file2);
   }
-  const after = await scanLegacyTreeMetadata(root, options);
+  const after = await scanLegacyTreeMetadata(root, options, lease);
   if (!isDeepStrictEqual2(legacyMetadataView(metadata), legacyMetadataView(after)))
     throw new Error("Legacy run tree changed during migration preflight; no backup was created");
   return {
@@ -43186,8 +43326,8 @@ async function captureLegacyTreeSnapshot(root, options = {}) {
     digest: legacyTreeDigest(entries)
   };
 }
-async function assertLegacyTreeRedactionSafe(root) {
-  return await captureLegacyTreeSnapshot(root, {
+async function assertLegacyTreeRedactionSafe(root, lease) {
+  return await captureLegacyTreeSnapshot(root, lease, {
     rejectBackupMarker: true,
     scanRedaction: true,
     enforceDestinationLimits: true
@@ -43201,25 +43341,26 @@ function parseBackupCompletion(value, input) {
     throw new Error("backup completion marker does not match this migration");
   return marker;
 }
-async function validateCompleteBackup(backupRoot, input) {
-  let marker;
-  try {
-    marker = parseBackupCompletion(
-      JSON.parse(
-        (await readPrivateFileBounded(
-          join10(backupRoot, BACKUP_COMPLETION_FILE),
-          MIGRATION_DESCRIPTOR_MAX_BYTES,
-          backupRoot
-        )).toString("utf8")
-      ),
-      input
-    );
-  } catch (error51) {
-    throw new Error(
-      `Existing storage migration backup is incomplete or unverified: ${error51 instanceof Error ? error51.message : String(error51)}`
-    );
-  }
-  const snapshot = await captureLegacyTreeSnapshot(backupRoot, {
+async function validateCompleteBackup(backupRoot, input, lease) {
+  const marker = await migrationStep(lease, async () => {
+    try {
+      return parseBackupCompletion(
+        JSON.parse(
+          (await readPrivateFileBounded(
+            join10(backupRoot, BACKUP_COMPLETION_FILE),
+            MIGRATION_DESCRIPTOR_MAX_BYTES,
+            backupRoot
+          )).toString("utf8")
+        ),
+        input
+      );
+    } catch (error51) {
+      throw new Error(
+        `Existing storage migration backup is incomplete or unverified: ${error51 instanceof Error ? error51.message : String(error51)}`
+      );
+    }
+  });
+  const snapshot = await captureLegacyTreeSnapshot(backupRoot, lease, {
     ignoredRootName: BACKUP_COMPLETION_FILE
   });
   for (const requiredPath of [
@@ -43234,22 +43375,23 @@ async function validateCompleteBackup(backupRoot, input) {
     throw new Error("Existing storage migration backup digest does not match its contents");
   return { marker, snapshot };
 }
-async function hasMigrationOwnedInventory(runRoot, backupSnapshot, runId) {
+async function hasMigrationOwnedInventory(runRoot, backupSnapshot, runId, lease) {
   const inventoryPath = join10(runRoot, ARTIFACT_INVENTORY_FILE);
-  const inventoryStatus = await status2(inventoryPath);
+  const inventoryStatus = await migrationStep(lease, async () => await status2(inventoryPath));
   if (!inventoryStatus) return false;
   if (inventoryStatus.isSymbolicLink() || !inventoryStatus.isFile())
     throw new Error(`Storage migration intermediate inventory is unsafe: ${inventoryPath}`);
   if (backupSnapshot.entries.some(({ relativePath }) => relativePath === ARTIFACT_INVENTORY_FILE))
     return false;
-  let inventory;
-  try {
-    inventory = await readBoundedArtifactInventory(inventoryPath);
-  } catch (error51) {
-    throw new Error(
-      `Storage migration intermediate inventory is invalid: ${error51 instanceof Error ? error51.message : String(error51)}`
-    );
-  }
+  const inventory = await migrationStep(lease, async () => {
+    try {
+      return await readBoundedArtifactInventory(inventoryPath);
+    } catch (error51) {
+      throw new Error(
+        `Storage migration intermediate inventory is invalid: ${error51 instanceof Error ? error51.message : String(error51)}`
+      );
+    }
+  });
   if (inventory.runId !== runId)
     throw new Error(
       `Storage migration intermediate inventory belongs to ${inventory.runId}, not ${runId}`
@@ -43262,9 +43404,9 @@ async function hasMigrationOwnedInventory(runRoot, backupSnapshot, runId) {
     );
   return true;
 }
-async function validateBackupMatchesLegacyRun(input) {
+async function validateBackupMatchesLegacyRun(input, lease) {
   if (input.sourceSnapshot.digest === input.marker.treeDigest) return;
-  if (await hasMigrationOwnedInventory(input.runRoot, input.backupSnapshot, input.runId) && legacyTreeDigest(input.sourceSnapshot.entries, ARTIFACT_INVENTORY_FILE) === input.marker.treeDigest)
+  if (await hasMigrationOwnedInventory(input.runRoot, input.backupSnapshot, input.runId, lease) && legacyTreeDigest(input.sourceSnapshot.entries, ARTIFACT_INVENTORY_FILE) === input.marker.treeDigest)
     return;
   throw new Error(
     "Existing storage migration backup does not match the current legacy run tree; refusing to reuse a stale protected backup"
@@ -43281,101 +43423,129 @@ function backupEntryFingerprint(metadata) {
     metadata.ctimeMs
   ].join(":");
 }
-async function syncBackupFile(path, observed) {
+async function syncBackupFile(path, observed, lease) {
   if (observed.isSymbolicLink() || !observed.isFile() || observed.nlink > 1)
     throw new Error(`Storage migration backup payload is unsafe: ${path}`);
   const expected = backupEntryFingerprint(observed);
   const noFollow = process.platform === "win32" ? 0 : fsConstants4.O_NOFOLLOW;
-  const handle = await open5(path, fsConstants4.O_RDWR | noFollow);
+  const handle = await acquireMigrationHandle(
+    lease,
+    async () => await open5(path, fsConstants4.O_RDWR | noFollow)
+  );
   try {
-    const before = await handle.stat();
+    const before = await migrationStep(lease, async () => await handle.stat());
     if (before.isSymbolicLink() || !before.isFile() || before.nlink > 1 || backupEntryFingerprint(before) !== expected)
       throw new Error(`Storage migration backup payload changed before fsync: ${path}`);
-    await handle.sync();
-    const after = await handle.stat();
-    const current = await lstat5(path);
+    await migrationStep(lease, async () => await handle.sync());
+    const after = await migrationStep(lease, async () => await handle.stat());
+    const current = await migrationStep(lease, async () => await lstat5(path));
     if (backupEntryFingerprint(after) !== expected || backupEntryFingerprint(current) !== expected)
       throw new Error(`Storage migration backup payload changed during fsync: ${path}`);
+  } catch (error51) {
+    throw lease.recordFailure(error51);
   } finally {
-    await handle.close();
+    await closeMigrationHandles(lease, [handle]);
   }
 }
-async function syncBackupTree(root) {
+async function syncBackupTree(root, lease) {
   const visit = async (directory) => {
-    const observed = await lstat5(directory);
+    const observed = await migrationStep(lease, async () => await lstat5(directory));
     if (observed.isSymbolicLink() || !observed.isDirectory())
       throw new Error(`Storage migration backup directory is unsafe: ${directory}`);
     const expected = backupEntryFingerprint(observed);
-    for (const name of (await readdir3(directory)).sort(
+    for (const name of (await migrationStep(lease, async () => await readdir3(directory))).sort(
       (left, right) => left.localeCompare(right)
     )) {
+      lease.assertHeld();
       const path = join10(directory, name);
-      const metadata = await lstat5(path);
+      const metadata = await migrationStep(lease, async () => await lstat5(path));
       if (metadata.isDirectory() && !metadata.isSymbolicLink()) await visit(path);
-      else await syncBackupFile(path, metadata);
+      else await syncBackupFile(path, metadata, lease);
     }
-    if (backupEntryFingerprint(await lstat5(directory)) !== expected)
+    if (backupEntryFingerprint(await migrationStep(lease, async () => await lstat5(directory))) !== expected)
       throw new Error(`Storage migration backup directory changed during fsync: ${directory}`);
-    await syncDirectory(directory);
+    await migrationStep(lease, async () => await syncDirectory(directory));
   };
   await visit(root);
 }
-async function writeAll(handle, chunk, position) {
+async function writeAll(handle, chunk, position, lease) {
   let written = 0;
   while (written < chunk.length) {
-    const result = await handle.write(chunk, written, chunk.length - written, position + written);
+    const result = await migrationStep(
+      lease,
+      async () => await handle.write(chunk, written, chunk.length - written, position + written)
+    );
     if (result.bytesWritten === 0)
       throw new Error("Storage migration backup destination stopped accepting bytes");
     written += result.bytesWritten;
   }
 }
-async function copyLegacySnapshotFile(source, destinationPath) {
+async function checkpointBackup(hook, checkpoint, lease) {
+  if (!hook) return;
+  await migrationStep(lease, async () => await hook(checkpoint));
+}
+async function copyLegacySnapshotFile(source, destinationPath, lease, checkpoint) {
   assertLegacyFileMetadata(
-    await lstat5(source.path, { bigint: true }),
+    await migrationStep(lease, async () => await lstat5(source.path, { bigint: true })),
     source,
     "before backup copy"
   );
   const noFollow = process.platform === "win32" ? 0 : fsConstants4.O_NOFOLLOW;
-  const sourceHandle = await open5(source.path, fsConstants4.O_RDONLY | noFollow);
+  const sourceHandle = await acquireMigrationHandle(
+    lease,
+    async () => await open5(source.path, fsConstants4.O_RDONLY | noFollow)
+  );
   let destinationHandle;
   try {
     assertLegacyFileMetadata(
-      await sourceHandle.stat({ bigint: true }),
+      await migrationStep(lease, async () => await sourceHandle.stat({ bigint: true })),
       source,
       "when opened for backup copy"
     );
-    destinationHandle = await open5(
-      destinationPath,
-      fsConstants4.O_WRONLY | fsConstants4.O_CREAT | fsConstants4.O_EXCL | noFollow,
-      384
+    destinationHandle = await acquireMigrationHandle(
+      lease,
+      async () => await open5(
+        destinationPath,
+        fsConstants4.O_WRONLY | fsConstants4.O_CREAT | fsConstants4.O_EXCL | noFollow,
+        384
+      )
     );
     const hash2 = createHash4("sha256");
     const buffer = Buffer.alloc(Math.min(MIGRATION_COPY_CHUNK_BYTES, Math.max(1, source.bytes)));
     let position = 0;
     while (position < source.bytes) {
+      lease.assertHeld();
       const requested = Math.min(buffer.length, source.bytes - position);
-      const { bytesRead } = await sourceHandle.read(buffer, 0, requested, position);
+      const { bytesRead } = await migrationStep(
+        lease,
+        async () => await sourceHandle.read(buffer, 0, requested, position)
+      );
       if (bytesRead === 0)
         throw new Error(
           `Legacy file ${source.relativePath} changed during backup copy; no backup was created`
         );
       const chunk = buffer.subarray(0, bytesRead);
       hash2.update(chunk);
-      await writeAll(destinationHandle, chunk, position);
+      await writeAll(destinationHandle, chunk, position, lease);
       position += bytesRead;
+      await checkpointBackup(
+        checkpoint,
+        { boundary: "after_chunk", relativePath: source.relativePath, copiedBytes: position },
+        lease
+      );
     }
     const extra = Buffer.alloc(1);
-    if ((await sourceHandle.read(extra, 0, 1, position)).bytesRead !== 0)
+    if ((await migrationStep(lease, async () => await sourceHandle.read(extra, 0, 1, position))).bytesRead !== 0)
       throw new Error(
         `Legacy file ${source.relativePath} changed during backup copy; no backup was created`
       );
     assertLegacyFileMetadata(
-      await sourceHandle.stat({ bigint: true }),
+      await migrationStep(lease, async () => await sourceHandle.stat({ bigint: true })),
       source,
       "during backup copy"
     );
     assertLegacyFileMetadata(
-      await lstat5(source.path, { bigint: true }),
+      await migrationStep(lease, async () => await lstat5(source.path, { bigint: true })),
       source,
       "after backup copy"
     );
@@ -43383,55 +43553,95 @@ async function copyLegacySnapshotFile(source, destinationPath) {
       throw new Error(
         `Legacy file ${source.relativePath} content changed during backup copy; no backup was created`
       );
-    await destinationHandle.sync();
-    const destination = await destinationHandle.stat({ bigint: true });
-    const destinationPathMetadata = await lstat5(destinationPath, { bigint: true });
+    await migrationStep(lease, async () => await destinationHandle.sync());
+    const destination = await migrationStep(
+      lease,
+      async () => await destinationHandle.stat({ bigint: true })
+    );
+    const destinationPathMetadata = await migrationStep(
+      lease,
+      async () => await lstat5(destinationPath, { bigint: true })
+    );
     if (destination.isSymbolicLink() || !destination.isFile() || destination.nlink > 1n || destination.size !== BigInt(source.bytes) || legacyMetadataFingerprint(destination) !== legacyMetadataFingerprint(destinationPathMetadata))
       throw new Error(
         `Storage migration backup destination changed while copying ${source.relativePath}`
       );
+    await checkpointBackup(
+      checkpoint,
+      { boundary: "after_entry", relativePath: source.relativePath, kind: "file" },
+      lease
+    );
+  } catch (error51) {
+    throw lease.recordFailure(error51);
   } finally {
-    await destinationHandle?.close().catch(() => void 0);
-    await sourceHandle.close();
+    await closeMigrationHandles(lease, [destinationHandle, sourceHandle]);
   }
 }
-async function copyLegacySnapshot(sourceRoot, temporaryRoot, snapshot) {
-  await mkdir4(temporaryRoot, { mode: 448 });
+async function copyLegacySnapshot(sourceRoot, temporaryRoot, snapshot, lease, checkpoint) {
+  await migrationStep(lease, async () => await mkdir4(temporaryRoot, { mode: 448 }));
   for (const entry of snapshot.entries) {
+    lease.assertHeld();
     if (entry.kind !== "directory") continue;
     assertLegacyDirectoryMetadata(
-      await lstat5(entry.path, { bigint: true }),
+      await migrationStep(lease, async () => await lstat5(entry.path, { bigint: true })),
       entry,
       "before backup copy"
     );
-    await mkdir4(join10(temporaryRoot, ...entry.relativePath.split("/")), { mode: 448 });
+    await migrationStep(
+      lease,
+      async () => await mkdir4(join10(temporaryRoot, ...entry.relativePath.split("/")), { mode: 448 })
+    );
+    await checkpointBackup(
+      checkpoint,
+      { boundary: "after_entry", relativePath: entry.relativePath, kind: "directory" },
+      lease
+    );
   }
-  for (const file2 of snapshot.files)
-    await copyLegacySnapshotFile(file2, join10(temporaryRoot, ...file2.relativePath.split("/")));
-  const sourceAfterCopy = await captureLegacyTreeSnapshot(sourceRoot, {
+  for (const file2 of snapshot.files) {
+    lease.assertHeld();
+    await copyLegacySnapshotFile(
+      file2,
+      join10(temporaryRoot, ...file2.relativePath.split("/")),
+      lease,
+      checkpoint
+    );
+  }
+  const sourceAfterCopy = await captureLegacyTreeSnapshot(sourceRoot, lease, {
     rejectBackupMarker: true,
     enforceDestinationLimits: true
   });
   if (!isDeepStrictEqual2(legacySnapshotView(sourceAfterCopy), legacySnapshotView(snapshot)))
     throw new Error("Legacy run tree changed during backup copy; no backup was created");
-  const copied = await captureLegacyTreeSnapshot(temporaryRoot);
+  const copied = await captureLegacyTreeSnapshot(temporaryRoot, lease);
   if (!isDeepStrictEqual2(legacySnapshotContents(copied), legacySnapshotContents(snapshot)))
     throw new Error("Storage migration backup digest does not match the preflight snapshot");
 }
-async function ensureCompleteBackup(input, sourceSnapshot) {
-  const verifiedSource = await captureLegacyTreeSnapshot(input.runRoot, {
+async function ensureCompleteBackup(input, sourceSnapshot, lease, checkpoint) {
+  const verifiedSource = await captureLegacyTreeSnapshot(input.runRoot, lease, {
     rejectBackupMarker: true,
     enforceDestinationLimits: true
   });
   if (!isDeepStrictEqual2(legacySnapshotView(verifiedSource), legacySnapshotView(sourceSnapshot)))
     throw new Error("Legacy run tree changed after migration preflight; no backup was created");
-  await ensurePrivateDirectory(input.graphcraftRoot);
-  await validatePrivatePath(input.graphcraftRoot, relative4(input.graphcraftRoot, input.runRoot));
+  await migrationStep(lease, async () => await ensurePrivateDirectory(input.graphcraftRoot));
+  await migrationStep(
+    lease,
+    async () => await validatePrivatePath(
+      input.graphcraftRoot,
+      relative4(input.graphcraftRoot, input.runRoot)
+    )
+  );
   const backupBase = join10(input.graphcraftRoot, "migration-backups");
   const backupParent = join10(backupBase, input.runId);
-  await ensurePrivateDirectory(backupBase, input.graphcraftRoot);
-  await ensurePrivateDirectory(backupParent, input.graphcraftRoot);
-  const refreshedSource = await captureLegacyTreeSnapshot(input.runRoot, {
+  await migrationStep(
+    lease,
+    async () => await ensurePrivateDirectory(backupBase, input.graphcraftRoot)
+  );
+  await migrationStep(
+    lease,
+    async () => await ensurePrivateDirectory(backupParent, input.graphcraftRoot)
+  );
+  const refreshedSource = await captureLegacyTreeSnapshot(input.runRoot, lease, {
     rejectBackupMarker: true,
     enforceDestinationLimits: true
   });
@@ -43441,35 +43651,47 @@ async function ensureCompleteBackup(input, sourceSnapshot) {
   );
   const step = `${input.sourceVersion}-to-${CURRENT_RUN_STORAGE_VERSION}`;
   const backupRoot = join10(backupParent, step);
-  const existing = await status2(backupRoot);
+  const existing = await migrationStep(lease, async () => await status2(backupRoot));
   if (existing) {
     if (existing.isSymbolicLink() || !existing.isDirectory())
       throw new Error(`Storage migration backup target is unsafe: ${backupRoot}`);
-    const validated = await validateCompleteBackup(backupRoot, input);
-    await validateBackupMatchesLegacyRun({
-      runRoot: input.runRoot,
-      runId: input.runId,
-      marker: validated.marker,
-      backupSnapshot: validated.snapshot,
-      sourceSnapshot: refreshedSource
-    });
-    await hardenPrivateTree(backupRoot, input.graphcraftRoot);
-    await syncBackupTree(backupRoot);
-    await syncDirectory(backupParent);
+    const validated = await validateCompleteBackup(backupRoot, input, lease);
+    await validateBackupMatchesLegacyRun(
+      {
+        runRoot: input.runRoot,
+        runId: input.runId,
+        marker: validated.marker,
+        backupSnapshot: validated.snapshot,
+        sourceSnapshot: refreshedSource
+      },
+      lease
+    );
+    await migrationStep(
+      lease,
+      async () => await hardenPrivateTree(backupRoot, input.graphcraftRoot)
+    );
+    await syncBackupTree(backupRoot, lease);
+    await migrationStep(lease, async () => await syncDirectory(backupParent));
     return backupRoot;
   }
   const temporaryRoot = join10(backupParent, `.${step}.tmp`);
-  const staleTemporary = await status2(temporaryRoot);
+  const staleTemporary = await migrationStep(lease, async () => await status2(temporaryRoot));
   if (staleTemporary) {
     if (staleTemporary.isSymbolicLink() || !staleTemporary.isDirectory())
       throw new Error(`Storage migration temporary backup target is unsafe: ${temporaryRoot}`);
-    await rm3(temporaryRoot, { recursive: true, force: true });
-    await syncDirectory(backupParent);
+    await migrationStep(
+      lease,
+      async () => await rm3(temporaryRoot, { recursive: true, force: true })
+    );
+    await migrationStep(lease, async () => await syncDirectory(backupParent));
   }
   try {
-    await copyLegacySnapshot(input.runRoot, temporaryRoot, refreshedSource);
-    await hardenPrivateTree(temporaryRoot, input.graphcraftRoot);
-    await syncBackupTree(temporaryRoot);
+    await copyLegacySnapshot(input.runRoot, temporaryRoot, refreshedSource, lease, checkpoint);
+    await migrationStep(
+      lease,
+      async () => await hardenPrivateTree(temporaryRoot, input.graphcraftRoot)
+    );
+    await syncBackupTree(temporaryRoot, lease);
     const completion = {
       schemaVersion: 1,
       kind: "graphcraft_storage_migration_backup",
@@ -43479,32 +43701,51 @@ async function ensureCompleteBackup(input, sourceSnapshot) {
       treeDigest: refreshedSource.digest
     };
     const completionPath = join10(temporaryRoot, BACKUP_COMPLETION_FILE);
-    await writeJsonAtomic(completionPath, completion);
-    await hardenPrivateFile(completionPath, temporaryRoot);
-    await syncBackupFile(completionPath, await lstat5(completionPath));
-    await syncDirectory(temporaryRoot);
-    await rename2(temporaryRoot, backupRoot);
-    await syncDirectory(backupParent);
+    await migrationStep(lease, async () => await writeJsonAtomic(completionPath, completion));
+    await migrationStep(lease, async () => await hardenPrivateFile(completionPath, temporaryRoot));
+    const completionStatus = await migrationStep(lease, async () => await lstat5(completionPath));
+    await syncBackupFile(completionPath, completionStatus, lease);
+    await migrationStep(lease, async () => await syncDirectory(temporaryRoot));
+    await migrationStep(lease, async () => await rename2(temporaryRoot, backupRoot));
+    await migrationStep(lease, async () => await syncDirectory(backupParent));
     return backupRoot;
   } catch (error51) {
-    await rm3(temporaryRoot, { recursive: true, force: true }).then(async () => await syncDirectory(backupParent)).catch(() => void 0);
-    throw error51;
+    const causalFailure = lease.recordFailure(error51);
+    if (!lease.isLost()) {
+      try {
+        await migrationStep(
+          lease,
+          async () => await rm3(temporaryRoot, { recursive: true, force: true })
+        );
+        await migrationStep(lease, async () => await syncDirectory(backupParent));
+      } catch {
+      }
+    }
+    throw causalFailure;
   }
 }
-async function validateLegacyRun(runRoot, runId) {
-  await validatePrivatePath(runRoot, "events.jsonl").catch((error51) => {
-    throw new Error(
-      `Legacy run ${runId} cannot migrate because events.jsonl is unsafe: ${error51 instanceof Error ? error51.message : String(error51)}`
-    );
+async function validateLegacyRun(runRoot, runId, lease) {
+  await migrationStep(lease, async () => {
+    try {
+      await validatePrivatePath(runRoot, "events.jsonl");
+    } catch (error51) {
+      throw new Error(
+        `Legacy run ${runId} cannot migrate because events.jsonl is unsafe: ${error51 instanceof Error ? error51.message : String(error51)}`
+      );
+    }
   });
-  await lstat5(join10(runRoot, "events.jsonl")).catch((error51) => {
-    throw new Error(
-      `Legacy run ${runId} cannot migrate because events.jsonl is unavailable: ${error51 instanceof Error ? error51.message : String(error51)}`
-    );
+  await migrationStep(lease, async () => {
+    try {
+      await lstat5(join10(runRoot, "events.jsonl"));
+    } catch (error51) {
+      throw new Error(
+        `Legacy run ${runId} cannot migrate because events.jsonl is unavailable: ${error51 instanceof Error ? error51.message : String(error51)}`
+      );
+    }
   });
 }
-async function assertMigratedInventoryCurrent(artifactStore, expected) {
-  const current = await artifactStore.inventory();
+async function assertMigratedInventoryCurrent(artifactStore, expected, lease) {
+  const current = await migrationStep(lease, async () => await artifactStore.inventory());
   if (!isDeepStrictEqual2(current, expected))
     throw new Error(
       "Storage migration artifact inventory changed after durable migration; refusing manifest publication"
@@ -43518,42 +43759,85 @@ async function ensureCurrentRunStorage(input) {
   const acquisition = await acquireMigrationLock(input);
   if (acquisition.manifest) return acquisition.manifest;
   const migrationLock = acquisition.lock;
+  const lease = createMigrationLeaseContext(migrationLock.signal);
   let runLock;
+  let bodyFailureWasThrown = false;
   try {
     runLock = await acquireActiveAwareLock(
-      join10(input.graphcraftRoot, "locks", `${input.runId}.lock`)
+      join10(input.graphcraftRoot, "locks", `${input.runId}.lock`),
+      lease
     );
-    await validateRunStorageRoot(input);
-    const storage = await inspectStorage(input.runRoot, input.runId);
+    lease.addSignal(runLock.signal);
+    lease.assertHeld();
+    await migrationStep(lease, async () => await validateRunStorageRoot(input));
+    const storage = await migrationStep(
+      lease,
+      async () => await inspectStorage(input.runRoot, input.runId)
+    );
     if (storage.version === CURRENT_RUN_STORAGE_VERSION) return storage.manifest;
-    await validateLegacyRun(input.runRoot, input.runId);
-    const sourceSnapshot = await assertLegacyTreeRedactionSafe(input.runRoot);
-    await input.onBoundary?.("after_preflight");
+    await validateLegacyRun(input.runRoot, input.runId, lease);
+    const sourceSnapshot = await assertLegacyTreeRedactionSafe(input.runRoot, lease);
+    if (input.onBoundary)
+      await migrationStep(lease, async () => await input.onBoundary("after_preflight"));
     const backupInput = {
       graphcraftRoot: input.graphcraftRoot,
       runRoot: input.runRoot,
       runId: input.runId,
       sourceVersion: storage.version
     };
-    await ensureCompleteBackup(backupInput, sourceSnapshot);
-    await input.onBoundary?.("after_backup");
-    const artifactStore = new RunArtifactStore(input.runRoot, input.runId);
-    const migratedInventory = await artifactStore.migrateLegacy();
-    await assertMigratedInventoryCurrent(artifactStore, migratedInventory);
-    await hardenPrivateTree(input.runRoot, input.graphcraftRoot);
-    await input.onBoundary?.("after_inventory");
-    await assertMigratedInventoryCurrent(artifactStore, migratedInventory);
-    await input.onBoundary?.("before_manifest");
-    const prePublicationSnapshot = await assertLegacyTreeRedactionSafe(input.runRoot);
-    await ensureCompleteBackup(backupInput, prePublicationSnapshot);
-    await assertMigratedInventoryCurrent(artifactStore, migratedInventory);
-    return await persistCurrentRunStorageManifest(input.runRoot, input.runId, storage.version);
+    await ensureCompleteBackup(backupInput, sourceSnapshot, lease, input.onBackupCheckpoint);
+    if (input.onBoundary)
+      await migrationStep(lease, async () => await input.onBoundary("after_backup"));
+    const artifactStore = new RunArtifactStore(
+      input.runRoot,
+      input.runId,
+      DEFAULT_ARTIFACT_POLICY,
+      void 0,
+      lease.signal
+    );
+    const migratedInventory = await migrationStep(
+      lease,
+      async () => await artifactStore.migrateLegacy()
+    );
+    await assertMigratedInventoryCurrent(artifactStore, migratedInventory, lease);
+    await migrationStep(
+      lease,
+      async () => await hardenPrivateTree(input.runRoot, input.graphcraftRoot)
+    );
+    if (input.onBoundary)
+      await migrationStep(lease, async () => await input.onBoundary("after_inventory"));
+    await assertMigratedInventoryCurrent(artifactStore, migratedInventory, lease);
+    if (input.onBoundary)
+      await migrationStep(lease, async () => await input.onBoundary("before_manifest"));
+    const prePublicationSnapshot = await assertLegacyTreeRedactionSafe(input.runRoot, lease);
+    await ensureCompleteBackup(
+      backupInput,
+      prePublicationSnapshot,
+      lease,
+      input.onBackupCheckpoint
+    );
+    await assertMigratedInventoryCurrent(artifactStore, migratedInventory, lease);
+    return await persistCurrentRunStorageManifest(
+      input.runRoot,
+      input.runId,
+      storage.version,
+      lease
+    );
+  } catch (error51) {
+    bodyFailureWasThrown = true;
+    throw lease.recordFailure(error51);
   } finally {
-    try {
-      if (runLock) await runLock.release();
-    } finally {
-      await migrationLock.release();
+    for (const lock of [runLock, migrationLock]) {
+      if (!lock) continue;
+      try {
+        await lock.release();
+      } catch (error51) {
+        lease.recordFailure(error51);
+      }
     }
+    const causalFailure = lease.failure();
+    lease.dispose();
+    if (!bodyFailureWasThrown && causalFailure) throw causalFailure.error;
   }
 }
 
