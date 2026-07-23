@@ -16,7 +16,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { HostCapabilities } from "@graphcraft/core";
@@ -944,8 +944,7 @@ describe.each(["codex", "claude"] as const)("%s installation lifecycle", (host) 
     temporaryRoots.push(root);
     const graphcraftHome = join(root, "home");
     const source = join(root, "mcp.mjs");
-    const expectedRuntime = join(graphcraftHome, "runtime", GRAPHCRAFT_VERSION, "mcp.mjs");
-    const relativeRuntime = relative(process.cwd(), expectedRuntime);
+    const relativeRuntime = join("relative-registration", GRAPHCRAFT_VERSION, "mcp.mjs");
     const fake = fakeHostRunner();
     fake.registrations.set(host, { command: "node", args: [relativeRuntime] });
     await writeFile(source, "#!/usr/bin/env node\n");

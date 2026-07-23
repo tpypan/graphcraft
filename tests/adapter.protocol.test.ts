@@ -260,7 +260,7 @@ describe("native host continuation protocol", () => {
     ).toBe("completed");
   });
 
-  it("terminates children gracefully and escalates an unresponsive child", async () => {
+  it("records first-stage termination and escalates an unresponsive child", async () => {
     const terminate = async (script: string, graceMs: number) => {
       const child = spawn(process.execPath, ["-e", script], { stdio: "ignore" });
       await once(child, "spawn");
@@ -275,12 +275,20 @@ describe("native host continuation protocol", () => {
       return controller.finish(exit.code, exit.signal);
     };
 
-    const graceful = await terminate("setInterval(() => {}, 1000)", 500);
-    expect(graceful).toMatchObject({
-      cause: "user_pause",
-      outcome: "graceful",
-      requestedSignal: "SIGTERM",
-    });
+    const firstStage = await terminate("setInterval(() => {}, 1000)", 500);
+    expect(firstStage).toMatchObject(
+      process.platform === "win32"
+        ? {
+            cause: "user_pause",
+            outcome: "forced",
+            requestedSignal: "SIGTERM",
+          }
+        : {
+            cause: "user_pause",
+            outcome: "graceful",
+            requestedSignal: "SIGTERM",
+          },
+    );
 
     const forced = await terminate(
       "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)",
@@ -290,7 +298,7 @@ describe("native host continuation protocol", () => {
       process.platform === "win32"
         ? {
             cause: "user_pause",
-            outcome: "graceful",
+            outcome: "forced",
             requestedSignal: "SIGTERM",
           }
         : {

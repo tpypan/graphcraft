@@ -454,6 +454,23 @@ describe("release artifact and registry verification", () => {
     expect(child.kill).toHaveBeenCalledWith("SIGKILL");
   });
 
+  it("forces the Windows smoke tree during the first termination stage", () => {
+    const killer = Object.assign(new EventEmitter(), { unref: vi.fn() });
+    const child = {
+      pid: 42,
+      kill: vi.fn((_signal?: NodeJS.Signals | number) => true),
+    };
+    const crossSpawn = vi.fn(() => killer);
+
+    terminateSmokeProcessTree(crossSpawn, child, "SIGTERM", { SystemRoot: "C:\\Windows" }, "win32");
+
+    expect(crossSpawn).toHaveBeenCalledWith(
+      "C:\\Windows\\System32\\taskkill.exe",
+      ["/pid", "42", "/t", "/f"],
+      expect.objectContaining({ shell: false, windowsHide: true }),
+    );
+  });
+
   it("compares package bytes rather than filenames", async () => {
     const root = await temporaryDirectory("graphcraft-release-artifacts-");
     const left = join(root, "left.tgz");

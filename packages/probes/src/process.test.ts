@@ -130,7 +130,7 @@ describe("bounded subprocess output capture", () => {
     });
     vi.spyOn(crossSpawn, "spawn").mockReturnValue(child as never);
 
-    const result = runProcess("fixture-host", [], {
+    const result = runProcess(process.execPath, [], {
       cwd: process.cwd(),
       timeoutMs: 10,
     });

@@ -14,7 +14,9 @@ const temporaryRoots: string[] = [];
 afterEach(async () => {
   vi.unstubAllEnvs();
   await Promise.all(
-    temporaryRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })),
+    temporaryRoots
+      .splice(0)
+      .map((path) => rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })),
   );
 });
 
@@ -28,8 +30,8 @@ async function windowsShimFixture(): Promise<{
   temporaryRoots.push(root);
   const bin = join(root, "PATH 工具 & fixtures");
   const recordPath = join(root, "exact argv.jsonl");
-  const recorderPath = join(root, "record host argv.mjs");
   await mkdir(bin, { recursive: true });
+  const recorderPath = join(bin, "record-host-argv.mjs");
   await writeFile(
     recorderPath,
     `import { appendFileSync, writeFileSync } from "node:fs";
@@ -56,7 +58,7 @@ else if (host === "tree-host") {
   for (const host of ["fixture-host", "codex", "claude", "tree-host"]) {
     await writeFile(
       join(bin, `${host}.cmd`),
-      `@echo off\r\n"${process.execPath}" "${recorderPath}" "${host}" %*\r\n`,
+      `@echo off\r\n"%GRAPHCRAFT_WINDOWS_FIXTURE_NODE%" "%~dp0record-host-argv.mjs" "${host}" %*\r\n`,
       "utf8",
     );
   }
@@ -65,11 +67,13 @@ else if (host === "tree-host") {
   const path = `${bin}${delimiter}${inheritedPath}`;
   vi.stubEnv("PATH", path);
   vi.stubEnv("GRAPHCRAFT_WINDOWS_ARGV_RECORD", recordPath);
+  vi.stubEnv("GRAPHCRAFT_WINDOWS_FIXTURE_NODE", process.execPath);
   const environment = Object.fromEntries(
     Object.entries(process.env).filter(([name]) => name.toLowerCase() !== "path"),
   );
   environment.PATH = path;
   environment.GRAPHCRAFT_WINDOWS_ARGV_RECORD = recordPath;
+  environment.GRAPHCRAFT_WINDOWS_FIXTURE_NODE = process.execPath;
   return { bin, environment, recordPath, root };
 }
 

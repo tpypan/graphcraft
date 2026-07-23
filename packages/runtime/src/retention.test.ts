@@ -595,7 +595,7 @@ describe("run-state retention", () => {
       await git(repository, "show-ref", "--verify", `refs/heads/${workspace.branch}`),
     ).not.toBe("");
     expect(await git(repository, "worktree", "list", "--porcelain")).toContain(
-      `worktree ${await realpath(workspace.path)}`,
+      `worktree ${(await realpath(workspace.path)).replaceAll("\\", "/")}`,
     );
   });
 

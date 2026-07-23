@@ -1,10 +1,14 @@
 import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const spawnMock = vi.hoisted(() => vi.fn());
+let trustedCommandDirectory: string | undefined;
 
 vi.mock("cross-spawn", () => ({
   default: Object.assign(spawnMock, { spawn: spawnMock, sync: vi.fn() }),
@@ -36,6 +40,7 @@ import {
   HOST_CAPABILITY_PROBE_TIMEOUT_MS,
   HOST_TERMINATION_GRACE_MS,
   HOST_TERMINATION_SETTLE_GRACE_MS,
+  ChildTerminationController,
   terminateChildProcessTree,
 } from "../packages/core/src/index.ts";
 
@@ -159,8 +164,30 @@ function adapters(): AdapterFixture[] {
 }
 
 describe("bounded adapter streams", () => {
+  beforeAll(async () => {
+    if (process.platform !== "win32") return;
+    trustedCommandDirectory = await mkdtemp(join(tmpdir(), "graphcraft-adapter-path-"));
+    await Promise.all(
+      ["codex.cmd", "claude.cmd"].map((name) =>
+        writeFile(join(trustedCommandDirectory!, name), "@exit /b 0\r\n", "utf8"),
+      ),
+    );
+    const inheritedPath = process.env.PATH ?? process.env.Path ?? "";
+    vi.stubEnv("PATH", `${trustedCommandDirectory}${delimiter}${inheritedPath}`);
+  });
   beforeEach(() => spawnMock.mockReset());
   afterEach(() => vi.useRealTimers());
+  afterAll(async () => {
+    vi.unstubAllEnvs();
+    if (trustedCommandDirectory) {
+      await rm(trustedCommandDirectory, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 100,
+      });
+    }
+  });
 
   it("retains no oversized protocol line and continues draining later lines", async () => {
     expect(CODEX_PROTOCOL_LINE_LIMIT_BYTES).toBe(CLAUDE_PROTOCOL_LINE_LIMIT_BYTES);
@@ -349,6 +376,7 @@ describe("bounded adapter streams", () => {
         name: "HostTerminationError",
         termination: expect.objectContaining({
           cause: "user_pause",
+          outcome: process.platform === "win32" ? "forced" : "graceful",
           requestedSignal: "SIGTERM",
         }),
       });
@@ -411,6 +439,52 @@ describe("bounded adapter streams", () => {
     );
     expect(child.kill).toHaveBeenCalledOnce();
     expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+  });
+
+  it("forces the full Windows tree when SIGTERM is requested", () => {
+    const killer = Object.assign(new EventEmitter(), { unref: vi.fn() });
+    const child = {
+      pid: 42,
+      kill: vi.fn((_signal?: NodeJS.Signals | number) => true),
+    } as unknown as ChildProcess;
+    const spawnProcess = vi.fn(() => killer as never);
+
+    expect(
+      terminateChildProcessTree(child, "SIGTERM", {
+        platform: "win32",
+        environment: { SystemRoot: "C:\\Windows" },
+        spawnProcess: spawnProcess as never,
+      }),
+    ).toBe(true);
+
+    expect(spawnProcess).toHaveBeenCalledWith(
+      "C:\\Windows\\System32\\taskkill.exe",
+      ["/pid", "42", "/t", "/f"],
+      expect.objectContaining({ shell: false, windowsHide: true }),
+    );
+  });
+
+  it("records the first Windows termination request as forced", () => {
+    const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    try {
+      const child = new FakeChild();
+      const abort = new AbortController();
+      const controller = new ChildTerminationController(
+        child as unknown as ChildProcess,
+        abort.signal,
+      );
+
+      abort.abort({ cause: "user_pause", reason: "Windows termination receipt" });
+
+      expect(controller.finish(null, null)).toMatchObject({
+        cause: "user_pause",
+        outcome: "forced",
+        requestedSignal: "SIGTERM",
+      });
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    } finally {
+      platform.mockRestore();
+    }
   });
 
   it("still accepts exact small structured worker results", async () => {

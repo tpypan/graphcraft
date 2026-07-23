@@ -118,9 +118,7 @@ describe("cross-process run control", () => {
     expect(pausedState.status).toBe("paused");
     expect(
       (await pausedRun.store.loadEvents()).find(
-        ({ type, data }) =>
-          type === "control.applied" &&
-          data.outcome === (process.platform === "win32" ? "graceful" : "forced"),
+        ({ type, data }) => type === "control.applied" && data.outcome === "forced",
       ),
     ).toBeDefined();
 

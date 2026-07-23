@@ -29,7 +29,9 @@ afterEach(async () => {
   vi.restoreAllMocks();
   vi.useRealTimers();
   await Promise.all(
-    temporaryRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })),
+    temporaryRoots
+      .splice(0)
+      .map((path) => rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })),
   );
 });
 

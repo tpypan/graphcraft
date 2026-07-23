@@ -952,11 +952,14 @@ export function terminateSmokeProcessTree(
     systemRoot && win32.isAbsolute(systemRoot)
       ? win32.join(systemRoot, "System32", "taskkill.exe")
       : "taskkill.exe";
-  const killer = crossSpawn(
-    taskkill,
-    ["/pid", String(child.pid), "/t", ...(signal === "SIGKILL" ? ["/f"] : [])],
-    { env: environment, shell: false, stdio: "ignore", windowsHide: true },
-  );
+  // A non-forced taskkill can let cmd.exe exit before its descendants, losing
+  // the process-tree linkage needed by the later escalation attempt.
+  const killer = crossSpawn(taskkill, ["/pid", String(child.pid), "/t", "/f"], {
+    env: environment,
+    shell: false,
+    stdio: "ignore",
+    windowsHide: true,
+  });
   let fallbackAttempted = false;
   const fallback = () => {
     if (fallbackAttempted) return;

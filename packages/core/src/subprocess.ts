@@ -144,9 +144,11 @@ export function terminateChildProcessTree(
   }
 
   const spawnProcess = options.spawnProcess ?? spawn;
+  // Windows has no tree-wide graceful signal. Without /f, cmd.exe can exit
+  // before taskkill reaches a stubborn descendant and erase the tree linkage.
   const killer = spawnProcess(
     windowsTaskkillExecutable(options.environment ?? process.env),
-    ["/pid", String(child.pid), "/t", ...(signal === "SIGKILL" ? ["/f"] : [])],
+    ["/pid", String(child.pid), "/t", "/f"],
     {
       shell: false,
       stdio: "ignore",
@@ -175,6 +177,7 @@ export class ChildTerminationController {
   private requested = false;
   private delivered = false;
   private forced = false;
+  private requestedSignal: "SIGTERM" | "SIGKILL" = "SIGTERM";
   private timer?: NodeJS.Timeout;
   private settlementTimer?: NodeJS.Timeout;
   private readonly boundedExit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
@@ -187,14 +190,18 @@ export class ChildTerminationController {
     this.requested = true;
     try {
       this.delivered = terminateChildProcessTree(this.child, "SIGTERM");
+      // Node's Windows signal delivery is forceful, and the tree helper uses
+      // taskkill /f so the durable receipt must not call this graceful.
+      this.forced = process.platform === "win32" && this.delivered;
     } catch {
       this.delivered = false;
     }
     this.timer = setTimeout(() => {
+      this.requestedSignal = "SIGKILL";
       try {
-        this.forced = terminateChildProcessTree(this.child, "SIGKILL");
+        this.forced = terminateChildProcessTree(this.child, "SIGKILL") || this.forced;
       } catch {
-        this.forced = false;
+        // Preserve evidence of an earlier forceful Windows tree request.
       }
       this.settlementTimer = setTimeout(() => {
         try {
@@ -238,7 +245,7 @@ export class ChildTerminationController {
     return {
       cause: reason.cause,
       outcome: this.forced ? "forced" : this.delivered ? "graceful" : "already_exited",
-      requestedSignal: this.forced ? "SIGKILL" : "SIGTERM",
+      requestedSignal: this.requestedSignal,
       exitCode,
       exitSignal,
     };
