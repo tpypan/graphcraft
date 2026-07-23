@@ -78,19 +78,40 @@ export class RunControlChannel {
     }
   }
 
-  watch(onRequest: (request: RunControlRequest) => void, intervalMs = 100): () => Promise<void> {
+  watch(
+    onRequest: (request: RunControlRequest) => void,
+    intervalMs = 100,
+    onFailure?: (error: unknown) => void,
+  ): () => Promise<void> {
     let stopped = false;
     let lastRequestId: string | undefined;
+    let failed = false;
+    let failure: unknown;
     let inFlight = Promise.resolve();
     const poll = (): void => {
       if (stopped) return;
-      inFlight = inFlight.then(async () => {
-        const request = await this.read();
-        if (request && request.requestId !== lastRequestId) {
-          lastRequestId = request.requestId;
-          onRequest(request);
-        }
-      });
+      inFlight = inFlight
+        .then(async () => {
+          if (stopped) return;
+          const request = await this.read();
+          if (request && request.requestId !== lastRequestId) {
+            lastRequestId = request.requestId;
+            onRequest(request);
+          }
+        })
+        .catch((error: unknown) => {
+          stopped = true;
+          clearInterval(timer);
+          if (!failed) {
+            failed = true;
+            failure = error;
+            try {
+              onFailure?.(error);
+            } catch {
+              // Failure notification must not replace the originating watcher failure.
+            }
+          }
+        });
     };
     const timer = setInterval(poll, intervalMs);
     timer.unref();
@@ -99,6 +120,7 @@ export class RunControlChannel {
       stopped = true;
       clearInterval(timer);
       await inFlight;
+      if (failed) throw failure;
     };
   }
 

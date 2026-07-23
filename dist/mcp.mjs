@@ -2992,7 +2992,7 @@ var require_compile = __commonJS({
       const schOrFunc = root.refs[ref];
       if (schOrFunc)
         return schOrFunc;
-      let _sch = resolve13.call(this, root, ref);
+      let _sch = resolve14.call(this, root, ref);
       if (_sch === void 0) {
         const schema = (_a3 = root.localRefs) === null || _a3 === void 0 ? void 0 : _a3[ref];
         const { schemaId } = this.opts;
@@ -3019,7 +3019,7 @@ var require_compile = __commonJS({
     function sameSchemaEnv(s1, s2) {
       return s1.schema === s2.schema && s1.root === s2.root && s1.baseId === s2.baseId;
     }
-    function resolve13(root, ref) {
+    function resolve14(root, ref) {
       let sch;
       while (typeof (sch = this.refs[ref]) == "string")
         ref = sch;
@@ -3650,55 +3650,55 @@ var require_fast_uri = __commonJS({
       }
       return uri;
     }
-    function resolve13(baseURI, relativeURI, options) {
+    function resolve14(baseURI, relativeURI, options) {
       const schemelessOptions = options ? Object.assign({ scheme: "null" }, options) : { scheme: "null" };
       const resolved = resolveComponent(parse3(baseURI, schemelessOptions), parse3(relativeURI, schemelessOptions), schemelessOptions, true);
       schemelessOptions.skipEscape = true;
       return serialize(resolved, schemelessOptions);
     }
-    function resolveComponent(base, relative8, options, skipNormalization) {
+    function resolveComponent(base, relative9, options, skipNormalization) {
       const target = {};
       if (!skipNormalization) {
         base = parse3(serialize(base, options), options);
-        relative8 = parse3(serialize(relative8, options), options);
+        relative9 = parse3(serialize(relative9, options), options);
       }
       options = options || {};
-      if (!options.tolerant && relative8.scheme) {
-        target.scheme = relative8.scheme;
-        target.userinfo = relative8.userinfo;
-        target.host = relative8.host;
-        target.port = relative8.port;
-        target.path = removeDotSegments(relative8.path || "");
-        target.query = relative8.query;
+      if (!options.tolerant && relative9.scheme) {
+        target.scheme = relative9.scheme;
+        target.userinfo = relative9.userinfo;
+        target.host = relative9.host;
+        target.port = relative9.port;
+        target.path = removeDotSegments(relative9.path || "");
+        target.query = relative9.query;
       } else {
-        if (relative8.userinfo !== void 0 || relative8.host !== void 0 || relative8.port !== void 0) {
-          target.userinfo = relative8.userinfo;
-          target.host = relative8.host;
-          target.port = relative8.port;
-          target.path = removeDotSegments(relative8.path || "");
-          target.query = relative8.query;
+        if (relative9.userinfo !== void 0 || relative9.host !== void 0 || relative9.port !== void 0) {
+          target.userinfo = relative9.userinfo;
+          target.host = relative9.host;
+          target.port = relative9.port;
+          target.path = removeDotSegments(relative9.path || "");
+          target.query = relative9.query;
         } else {
-          if (!relative8.path) {
+          if (!relative9.path) {
             target.path = base.path;
-            if (relative8.query !== void 0) {
-              target.query = relative8.query;
+            if (relative9.query !== void 0) {
+              target.query = relative9.query;
             } else {
               target.query = base.query;
             }
           } else {
-            if (relative8.path[0] === "/") {
-              target.path = removeDotSegments(relative8.path);
+            if (relative9.path[0] === "/") {
+              target.path = removeDotSegments(relative9.path);
             } else {
               if ((base.userinfo !== void 0 || base.host !== void 0 || base.port !== void 0) && !base.path) {
-                target.path = "/" + relative8.path;
+                target.path = "/" + relative9.path;
               } else if (!base.path) {
-                target.path = relative8.path;
+                target.path = relative9.path;
               } else {
-                target.path = base.path.slice(0, base.path.lastIndexOf("/") + 1) + relative8.path;
+                target.path = base.path.slice(0, base.path.lastIndexOf("/") + 1) + relative9.path;
               }
               target.path = removeDotSegments(target.path);
             }
-            target.query = relative8.query;
+            target.query = relative9.query;
           }
           target.userinfo = base.userinfo;
           target.host = base.host;
@@ -3706,7 +3706,7 @@ var require_fast_uri = __commonJS({
         }
         target.scheme = base.scheme;
       }
-      target.fragment = relative8.fragment;
+      target.fragment = relative9.fragment;
       return target;
     }
     function equal(uriA, uriB, options) {
@@ -3914,7 +3914,7 @@ var require_fast_uri = __commonJS({
     var fastUri = {
       SCHEMES,
       normalize,
-      resolve: resolve13,
+      resolve: resolve14,
       resolveComponent,
       equal,
       serialize,
@@ -6926,15 +6926,15 @@ var require_windows = __commonJS({
       }
       return false;
     }
-    function checkStat(stat6, path, options) {
-      if (!stat6.isSymbolicLink() && !stat6.isFile()) {
+    function checkStat(stat5, path, options) {
+      if (!stat5.isSymbolicLink() && !stat5.isFile()) {
         return false;
       }
       return checkPathExt(path, options);
     }
     function isexe(path, options, cb) {
-      fs.stat(path, function(er, stat6) {
-        cb(er, er ? false : checkStat(stat6, path, options));
+      fs.stat(path, function(er, stat5) {
+        cb(er, er ? false : checkStat(stat5, path, options));
       });
     }
     function sync(path, options) {
@@ -6950,20 +6950,20 @@ var require_mode = __commonJS({
     isexe.sync = sync;
     var fs = __require("fs");
     function isexe(path, options, cb) {
-      fs.stat(path, function(er, stat6) {
-        cb(er, er ? false : checkStat(stat6, options));
+      fs.stat(path, function(er, stat5) {
+        cb(er, er ? false : checkStat(stat5, options));
       });
     }
     function sync(path, options) {
       return checkStat(fs.statSync(path), options);
     }
-    function checkStat(stat6, options) {
-      return stat6.isFile() && checkMode(stat6, options);
+    function checkStat(stat5, options) {
+      return stat5.isFile() && checkMode(stat5, options);
     }
-    function checkMode(stat6, options) {
-      var mod = stat6.mode;
-      var uid = stat6.uid;
-      var gid = stat6.gid;
+    function checkMode(stat5, options) {
+      var mod = stat5.mode;
+      var uid = stat5.uid;
+      var gid = stat5.gid;
       var myUid = options.uid !== void 0 ? options.uid : process.getuid && process.getuid();
       var myGid = options.gid !== void 0 ? options.gid : process.getgid && process.getgid();
       var u = parseInt("100", 8);
@@ -6997,12 +6997,12 @@ var require_isexe = __commonJS({
         if (typeof Promise !== "function") {
           throw new TypeError("callback not provided");
         }
-        return new Promise(function(resolve13, reject) {
+        return new Promise(function(resolve14, reject) {
           isexe(path, options || {}, function(er, is) {
             if (er) {
               reject(er);
             } else {
-              resolve13(is);
+              resolve14(is);
             }
           });
         });
@@ -7068,27 +7068,27 @@ var require_which = __commonJS({
         opt = {};
       const { pathEnv, pathExt, pathExtExe } = getPathInfo(cmd, opt);
       const found = [];
-      const step = (i) => new Promise((resolve13, reject) => {
+      const step = (i) => new Promise((resolve14, reject) => {
         if (i === pathEnv.length)
-          return opt.all && found.length ? resolve13(found) : reject(getNotFoundError(cmd));
+          return opt.all && found.length ? resolve14(found) : reject(getNotFoundError(cmd));
         const ppRaw = pathEnv[i];
         const pathPart = /^".*"$/.test(ppRaw) ? ppRaw.slice(1, -1) : ppRaw;
         const pCmd = path.join(pathPart, cmd);
         const p = !pathPart && /^\.[\\\/]/.test(cmd) ? cmd.slice(0, 2) + pCmd : pCmd;
-        resolve13(subStep(p, i, 0));
+        resolve14(subStep(p, i, 0));
       });
-      const subStep = (p, i, ii) => new Promise((resolve13, reject) => {
+      const subStep = (p, i, ii) => new Promise((resolve14, reject) => {
         if (ii === pathExt.length)
-          return resolve13(step(i + 1));
+          return resolve14(step(i + 1));
         const ext = pathExt[ii];
         isexe(p + ext, { pathExt: pathExtExe }, (er, is) => {
           if (!er && is) {
             if (opt.all)
               found.push(p + ext);
             else
-              return resolve13(p + ext);
+              return resolve14(p + ext);
           }
-          return resolve13(subStep(p, i, ii + 1));
+          return resolve14(subStep(p, i, ii + 1));
         });
       });
       return cb ? step(0).then((res) => cb(null, res), cb) : step(0);
@@ -23526,12 +23526,12 @@ var StdioServerTransport = class {
     this.onclose?.();
   }
   send(message) {
-    return new Promise((resolve13) => {
+    return new Promise((resolve14) => {
       const json2 = serializeMessage(message);
       if (this._stdout.write(json2)) {
-        resolve13();
+        resolve14();
       } else {
-        this._stdout.once("drain", resolve13);
+        this._stdout.once("drain", resolve14);
       }
     });
   }
@@ -29434,7 +29434,7 @@ var Protocol = class {
           return;
         }
         const pollInterval = task2.pollInterval ?? this._options?.defaultTaskPollInterval ?? 1e3;
-        await new Promise((resolve13) => setTimeout(resolve13, pollInterval));
+        await new Promise((resolve14) => setTimeout(resolve14, pollInterval));
         options?.signal?.throwIfAborted();
       }
     } catch (error51) {
@@ -29451,7 +29451,7 @@ var Protocol = class {
    */
   request(request, resultSchema, options) {
     const { relatedRequestId, resumptionToken, onresumptiontoken, task, relatedTask } = options ?? {};
-    return new Promise((resolve13, reject) => {
+    return new Promise((resolve14, reject) => {
       const earlyReject = (error51) => {
         reject(error51);
       };
@@ -29529,7 +29529,7 @@ var Protocol = class {
           if (!parseResult2.success) {
             reject(parseResult2.error);
           } else {
-            resolve13(parseResult2.data);
+            resolve14(parseResult2.data);
           }
         } catch (error51) {
           reject(error51);
@@ -29790,12 +29790,12 @@ var Protocol = class {
       }
     } catch {
     }
-    return new Promise((resolve13, reject) => {
+    return new Promise((resolve14, reject) => {
       if (signal.aborted) {
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
         return;
       }
-      const timeoutId = setTimeout(resolve13, interval);
+      const timeoutId = setTimeout(resolve14, interval);
       signal.addEventListener("abort", () => {
         clearTimeout(timeoutId);
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
@@ -30895,7 +30895,7 @@ var McpServer = class {
     let task = createTaskResult.task;
     const pollInterval = task.pollInterval ?? 5e3;
     while (task.status !== "completed" && task.status !== "failed" && task.status !== "cancelled") {
-      await new Promise((resolve13) => setTimeout(resolve13, pollInterval));
+      await new Promise((resolve14) => setTimeout(resolve14, pollInterval));
       const updatedTask = await extra.taskStore.getTask(taskId);
       if (!updatedTask) {
         throw new McpError(ErrorCode.InternalError, `Task ${taskId} not found during polling`);
@@ -31469,7 +31469,7 @@ import { createHash as createHash6, randomUUID as randomUUID9 } from "node:crypt
 import {
   access as access2,
   chmod as chmod2,
-  lstat as lstat8,
+  lstat as lstat9,
   mkdir as mkdir5,
   mkdtemp as mkdtemp2,
   open as open8,
@@ -31480,7 +31480,7 @@ import {
 } from "node:fs/promises";
 import { homedir, platform, tmpdir as tmpdir2 } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname as dirname9, isAbsolute as isAbsolute9, join as join14, resolve as resolve12 } from "node:path";
+import { dirname as dirname9, isAbsolute as isAbsolute9, join as join14, resolve as resolve13 } from "node:path";
 var import_cross_spawn5 = __toESM(require_cross_spawn(), 1);
 
 // package.json
@@ -35049,7 +35049,7 @@ var ChildTerminationController = class {
       this.delivered = false;
     }
     this.timer = setTimeout(() => {
-      this.requestedSignal = "SIGKILL";
+      if (process.platform !== "win32") this.requestedSignal = "SIGKILL";
       try {
         this.forced = terminateChildProcessTree(this.child, "SIGKILL") || this.forced;
       } catch {
@@ -35264,7 +35264,7 @@ async function runCapabilityProbe(command, args, captureErrorOutput = false) {
   } catch {
     return { code: null, output: "", overflowed: false, terminated: false };
   }
-  return await new Promise((resolve13) => {
+  return await new Promise((resolve14) => {
     const child = spawn2(executable, args, { stdio: ["ignore", "pipe", "pipe"] });
     const output = new BoundedTextCapture(ADAPTER_STDERR_LIMIT_BYTES);
     const timeoutAbort = new AbortController();
@@ -35278,7 +35278,7 @@ async function runCapabilityProbe(command, args, captureErrorOutput = false) {
       if (timeout) clearTimeout(timeout);
       if (settlement) clearTimeout(settlement);
       const termination = terminationController.finish(code, signal);
-      resolve13({
+      resolve14({
         code,
         output: output.text(),
         overflowed: output.overflowed,
@@ -35347,7 +35347,7 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve13) => child.once("close", (code, closeSignal) => resolve13({ code, signal: closeSignal }))
+      (resolve14) => child.once("close", (code, closeSignal) => resolve14({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderPlannerPrompt(request));
@@ -35410,7 +35410,7 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve13) => child.once("close", (code, closeSignal) => resolve13({ code, signal: closeSignal }))
+      (resolve14) => child.once("close", (code, closeSignal) => resolve14({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderSemanticVerifierPrompt(request.context, request.authorityBoundary));
@@ -35474,7 +35474,7 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve13) => child.once("close", (code, closeSignal) => resolve13({ code, signal: closeSignal }))
+      (resolve14) => child.once("close", (code, closeSignal) => resolve14({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderWorkerPrompt(request.capsule, request.authorityBoundary));
@@ -35800,7 +35800,7 @@ async function runCapabilityProbe2(args) {
   } catch {
     return { code: null, output: "", overflowed: false, terminated: false };
   }
-  return await new Promise((resolve13) => {
+  return await new Promise((resolve14) => {
     const child = spawn3(executable, args, { stdio: ["ignore", "pipe", "ignore"] });
     const output = new BoundedTextCapture2(ADAPTER_STDERR_LIMIT_BYTES2);
     const timeoutAbort = new AbortController();
@@ -35814,7 +35814,7 @@ async function runCapabilityProbe2(args) {
       if (timeout) clearTimeout(timeout);
       if (settlement) clearTimeout(settlement);
       const termination = terminationController.finish(code, signal);
-      resolve13({
+      resolve14({
         code,
         output: output.text(),
         overflowed: output.overflowed,
@@ -35882,7 +35882,7 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve13) => child.once("close", (code, closeSignal) => resolve13({ code, signal: closeSignal }))
+      (resolve14) => child.once("close", (code, closeSignal) => resolve14({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     let protocolExceededLimit = false;
@@ -35938,7 +35938,7 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve13) => child.once("close", (code, closeSignal) => resolve13({ code, signal: closeSignal }))
+      (resolve14) => child.once("close", (code, closeSignal) => resolve14({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     let protocolExceededLimit = false;
@@ -35995,7 +35995,7 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve13) => child.once("close", (code, closeSignal) => resolve13({ code, signal: closeSignal }))
+      (resolve14) => child.once("close", (code, closeSignal) => resolve14({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     let protocolExceededLimit = false;
@@ -36326,7 +36326,7 @@ async function runCommand(options, args) {
     untrustedCwd: options.cwd
   });
   const commandArgs = [...options.commandArgs ?? [], ...args];
-  return await new Promise((resolve13, reject) => {
+  return await new Promise((resolve14, reject) => {
     const child = import_cross_spawn3.default.spawn(command, commandArgs, {
       cwd: options.cwd,
       env: options.env ?? process.env,
@@ -36366,7 +36366,7 @@ async function runCommand(options, args) {
         return;
       }
       const code = exitCode ?? 1;
-      if (code === 0) resolve13({ stdout, stderr });
+      if (code === 0) resolve14({ stdout, stderr });
       else
         reject(
           new GitHubCommandError(
@@ -37551,8 +37551,15 @@ import { join as join4 } from "node:path";
 // packages/runtime/src/lock.ts
 import { hostname as hostname3 } from "node:os";
 import { randomUUID as randomUUID3 } from "node:crypto";
-import { open as open3, stat as stat2, unlink } from "node:fs/promises";
-import { basename, dirname as dirname3 } from "node:path";
+import { constants as fsConstants2 } from "node:fs";
+import { lstat as lstat2, open as open3, unlink } from "node:fs/promises";
+import { basename, dirname as dirname3, resolve as resolve3 } from "node:path";
+
+// packages/runtime/src/secure-fs.ts
+import { spawn as spawn4 } from "node:child_process";
+import { constants as fsConstants } from "node:fs";
+import { chmod, lstat, mkdir as mkdir2, open as open2, readdir } from "node:fs/promises";
+import { dirname as dirname2, isAbsolute as isAbsolute3, join as join3, relative as relative2, resolve as resolve2, sep as sep2, win32 as win322 } from "node:path";
 
 // packages/runtime/src/json.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
@@ -37802,14 +37809,25 @@ async function writeJsonAtomic(path, value) {
   const temporaryPath = `${path}.${process.pid}.${randomUUID2()}.tmp`;
   try {
     const handle = await open(temporaryPath, "wx", 384);
+    let publication;
     try {
       await handle.writeFile(`${JSON.stringify(redactValue(value), null, 2)}
 `, "utf8");
       await handle.sync();
+      const status3 = await handle.stat({ bigint: true });
+      if (!status3.isFile() || status3.nlink !== 1n)
+        throw new Error(`Atomic JSON temporary path is not a private regular file: ${path}`);
+      publication = {
+        path,
+        device: status3.dev,
+        inode: status3.ino,
+        birthtimeNs: status3.birthtimeNs
+      };
     } finally {
       await handle.close();
     }
     await replacePathAtomic(temporaryPath, path);
+    return publication;
   } catch (error51) {
     await rm2(temporaryPath, { force: true }).catch(() => void 0);
     throw error51;
@@ -37835,7 +37853,7 @@ async function replacePathAtomic(temporaryPath, path) {
     } catch (error51) {
       if (!retryable.has(error51.code ?? "") || Date.now() >= deadline)
         throw error51;
-      await new Promise((resolve13) => setTimeout(resolve13, delayMs));
+      await new Promise((resolve14) => setTimeout(resolve14, delayMs));
       delayMs = Math.min(100, delayMs * 2);
     }
   }
@@ -37846,15 +37864,12 @@ async function replacePathAtomic(temporaryPath, path) {
 }
 
 // packages/runtime/src/secure-fs.ts
-import { spawn as spawn4 } from "node:child_process";
-import { constants as fsConstants } from "node:fs";
-import { chmod, lstat, mkdir as mkdir2, open as open2, readdir } from "node:fs/promises";
-import { dirname as dirname2, isAbsolute as isAbsolute3, join as join3, relative as relative2, resolve as resolve2, sep as sep2, win32 as win322 } from "node:path";
 var PRIVATE_DIRECTORY_MODE = 448;
 var PRIVATE_FILE_MODE = 384;
 var WINDOWS_ACL_TIMEOUT_MS = 12e4;
 var WINDOWS_ACL_OUTPUT_LIMIT_BYTES = 64 * 1024;
 var WINDOWS_ACL_CACHE_LIMIT = 4096;
+var WINDOWS_ACL_VERIFICATION_ATTEMPTS = 3;
 var DARWIN_ACL_TIMEOUT_MS = 3e4;
 var DARWIN_ACL_BATCH_MAX_ENTRIES = 256;
 var DARWIN_ACL_BATCH_MAX_ARGUMENT_BYTES = 64 * 1024;
@@ -37862,6 +37877,8 @@ var DARWIN_ACL_CACHE_LIMIT = 4096;
 var supportsPosixModes = process.platform !== "win32";
 var hardenedWindowsIdentities = /* @__PURE__ */ new Map();
 var hardenedDarwinEntries = /* @__PURE__ */ new Map();
+var privatePathMutationTails = /* @__PURE__ */ new Map();
+var windowsAclWorkTail = Promise.resolve();
 var WINDOWS_OWNER_ONLY_ACL_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3.0
@@ -37898,7 +37915,9 @@ try {
   }
   if ($targets.Count -eq 0) { throw 'No Graphcraft ACL targets were supplied' }
 
+  $targetIndex = 0
   foreach ($target in $targets) {
+    $targetIndex += 1
     $attributes = [System.IO.File]::GetAttributes($target.Path)
     if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
       throw 'Graphcraft ACL target became a reparse point'
@@ -37941,14 +37960,22 @@ try {
       $true,
       [System.Security.Principal.SecurityIdentifier]
     ))
-    if (-not $verified.AreAccessRulesProtected -or $owner.Value -ne $sid.Value -or
-        $rules.Count -ne 1 -or $rules[0].IsInherited -or
-        $rules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
-        $rules[0].FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl -or
-        $rules[0].InheritanceFlags -ne $inheritance -or
-        $rules[0].PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None -or
-        $rules[0].IdentityReference.Value -ne $sid.Value) {
-      throw 'Graphcraft owner-only ACL verification failed'
+    $failures = [System.Collections.Generic.List[string]]::new()
+    if (-not $verified.AreAccessRulesProtected) { [void]$failures.Add('protection') }
+    if ($owner.Value -ne $sid.Value) { [void]$failures.Add('owner') }
+    if ($rules.Count -ne 1) {
+      [void]$failures.Add('rule_count')
+    } else {
+      if ($rules[0].IsInherited) { [void]$failures.Add('inherited') }
+      if ($rules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { [void]$failures.Add('type') }
+      if ($rules[0].FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl) { [void]$failures.Add('rights') }
+      if ($rules[0].InheritanceFlags -ne $inheritance) { [void]$failures.Add('inheritance') }
+      if ($rules[0].PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None) { [void]$failures.Add('propagation') }
+      if ($rules[0].IdentityReference.Value -ne $sid.Value) { [void]$failures.Add('identity') }
+    }
+    if ($failures.Count -gt 0) {
+      $kind = if ($isDirectory) { 'D' } else { 'F' }
+      throw "Graphcraft owner-only ACL verification failed for target $targetIndex ($kind): $($failures -join ',')"
     }
   }
   [Console]::Out.WriteLine("GRAPHCRAFT_ACL_OK:$($targets.Count)")
@@ -38044,7 +38071,7 @@ async function collectPrivateTree(root) {
   await visit(root);
   return entries;
 }
-async function runWindowsAclBatch(entries) {
+async function runWindowsAclBatchOnce(entries) {
   if (entries.length === 0) return;
   const payload = `${entries.map(
     ({ kind, path }) => `${kind === "directory" ? "D" : "F"}	${Buffer.from(path, "utf8").toString("base64")}`
@@ -38123,8 +38150,50 @@ async function runWindowsAclBatch(entries) {
     child.stdin.end(payload, "utf8");
   });
 }
-async function hardenWindowsEntries(entries, force = false) {
-  if (supportsPosixModes || entries.length === 0) return;
+async function runWindowsAclBatch(entries) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await runWindowsAclBatchOnce(entries);
+      return;
+    } catch (error51) {
+      if (attempt >= WINDOWS_ACL_VERIFICATION_ATTEMPTS || !(error51 instanceof Error) || !error51.message.includes("owner-only ACL verification failed"))
+        throw error51;
+      await new Promise((resolveRetry) => setTimeout(resolveRetry, attempt * 25));
+    }
+  }
+}
+async function serializeWindowsAclWork(work) {
+  if (supportsPosixModes) return await work();
+  const previous = windowsAclWorkTail;
+  let release;
+  windowsAclWorkTail = new Promise((resolveTurn) => {
+    release = resolveTurn;
+  });
+  await previous;
+  try {
+    return await work();
+  } finally {
+    release();
+  }
+}
+async function serializePrivatePathMutation(path, work) {
+  const absolute = resolve2(path);
+  const previous = privatePathMutationTails.get(absolute);
+  let release;
+  const turn = new Promise((resolveTurn) => {
+    release = resolveTurn;
+  });
+  privatePathMutationTails.set(absolute, turn);
+  if (previous) await previous;
+  try {
+    return await work();
+  } finally {
+    release();
+    if (privatePathMutationTails.get(absolute) === turn) privatePathMutationTails.delete(absolute);
+  }
+}
+async function hardenWindowsEntriesLocked(entries, force = false) {
+  if (entries.length === 0) return;
   const pending = [];
   for (const entry of entries) {
     const inspected = await inspectPrivateEntry(entry.path);
@@ -38145,6 +38214,10 @@ async function hardenWindowsEntries(entries, force = false) {
     if (inspected.identityFingerprint === identityFingerprint)
       rememberWindowsIdentity(identityFingerprint, inspected.metadataFingerprint);
   }
+}
+async function hardenWindowsEntries(entries, force = false) {
+  if (supportsPosixModes || entries.length === 0) return;
+  await serializeWindowsAclWork(async () => hardenWindowsEntriesLocked(entries, force));
 }
 async function runDarwinAclBatch(paths) {
   if (paths.length === 0) return;
@@ -38361,6 +38434,158 @@ async function ensurePrivateDirectory(path, ownedRoot = path) {
     await syncDirectory(dirname2(directory));
   }
 }
+var activePrivateDirectoryMutations = /* @__PURE__ */ new WeakSet();
+async function preparePrivateDirectoryMutation(path, ownedRoot = path) {
+  const absolute = resolve2(path);
+  await ensurePrivateDirectory(absolute, ownedRoot);
+  const inspected = await inspectPrivateEntry(absolute);
+  if (inspected.entry.kind !== "directory")
+    throw new Error(`Private mutation parent is not a directory: ${absolute}`);
+  const checkpoint = {
+    path: absolute,
+    identityFingerprint: inspected.identityFingerprint,
+    metadataFingerprint: inspected.metadataFingerprint
+  };
+  activePrivateDirectoryMutations.add(checkpoint);
+  return checkpoint;
+}
+async function finalizePrivateDirectoryMutation(checkpoint, ownedRoot = checkpoint.path) {
+  if (!activePrivateDirectoryMutations.delete(checkpoint)) {
+    await ensurePrivateDirectory(checkpoint.path, ownedRoot);
+    return;
+  }
+  if (supportsPosixModes) {
+    if (process.platform !== "darwin") return;
+    await validatePrivatePath(ownedRoot, relative2(resolve2(ownedRoot), resolve2(checkpoint.path)));
+    const inspected = await inspectPrivateEntry(checkpoint.path);
+    if (inspected.entry.kind === "directory" && checkpoint.identityFingerprint !== void 0 && inspected.identityFingerprint === checkpoint.identityFingerprint && hardenedDarwinEntries.get(checkpoint.path) === checkpoint.metadataFingerprint) {
+      rememberDarwinEntry(checkpoint.path, inspected.metadataFingerprint);
+      return;
+    }
+    if (inspected.entry.kind !== "directory")
+      throw new Error(`Private mutation parent is not a directory: ${checkpoint.path}`);
+    await hardenPosixEntries([inspected.entry]);
+    return;
+  }
+  await serializeWindowsAclWork(async () => {
+    await validatePrivatePath(ownedRoot, relative2(resolve2(ownedRoot), resolve2(checkpoint.path)));
+    const inspected = await inspectPrivateEntry(checkpoint.path);
+    if (inspected.entry.kind === "directory" && checkpoint.identityFingerprint !== void 0 && inspected.identityFingerprint === checkpoint.identityFingerprint && hardenedWindowsIdentities.get(checkpoint.identityFingerprint) === checkpoint.metadataFingerprint) {
+      rememberWindowsIdentity(inspected.identityFingerprint, inspected.metadataFingerprint);
+      return;
+    }
+    if (inspected.entry.kind !== "directory")
+      throw new Error(`Private mutation parent is not a directory: ${checkpoint.path}`);
+    await hardenWindowsEntriesLocked([inspected.entry]);
+  });
+}
+async function publishPrivateFileAtomic(input) {
+  const absolute = resolve2(input.path);
+  const root = resolve2(input.ownedRoot);
+  const sourceDirectory = resolve2(input.sourceDirectory);
+  const targetDirectory = dirname2(absolute);
+  const relativePath = relative2(root, absolute);
+  await validatePrivatePath(root, relativePath);
+  const parentPaths = [.../* @__PURE__ */ new Set([sourceDirectory, targetDirectory])];
+  for (const parent of parentPaths) await validatePrivatePath(root, relative2(root, parent));
+  if (supportsPosixModes) {
+    await serializePrivatePathMutation(absolute, async () => {
+      const publication = await input.publish();
+      await validatePrivatePath(root, relativePath);
+      const fileAfter = await inspectPrivateEntry(absolute);
+      const publicationIdentity = privateEntryIdentityFingerprint({
+        dev: publication.device,
+        ino: publication.inode,
+        birthtimeNs: publication.birthtimeNs
+      });
+      if (resolve2(publication.path) !== absolute || fileAfter.entry.kind !== "file")
+        throw new Error(`Published private file changed filesystem identity: ${absolute}`);
+      const superseded = publicationIdentity !== void 0 && fileAfter.identityFingerprint !== void 0 && fileAfter.identityFingerprint !== publicationIdentity;
+      if (superseded && input.supersessionPolicy !== "reconstructable_projection")
+        throw new Error(`Published private file changed filesystem identity: ${absolute}`);
+      if (superseded || input.hardenOnPosix) await hardenPrivateFile(absolute, root);
+    });
+    return;
+  }
+  for (const parent of parentPaths) await ensurePrivateDirectory(parent, root);
+  await serializePrivatePathMutation(absolute, async () => {
+    await serializeWindowsAclWork(async () => {
+      await validatePrivatePath(root, relativePath);
+      try {
+        const existing = await inspectPrivateEntry(absolute);
+        if (existing.entry.kind !== "file")
+          throw new Error(`Private publication path is not a regular file: ${absolute}`);
+      } catch (error51) {
+        if (!isMissing(error51)) throw error51;
+      }
+      await hardenWindowsEntriesLocked(
+        parentPaths.map((parent) => ({ kind: "directory", path: parent }))
+      );
+      const parentsBefore = await Promise.all(parentPaths.map(inspectPrivateEntry));
+      for (const parentBefore of parentsBefore) {
+        if (parentBefore.entry.kind !== "directory")
+          throw new Error(
+            `Private publication parent is not a directory: ${parentBefore.entry.path}`
+          );
+        if (parentBefore.identityFingerprint !== void 0 && (parentBefore.metadataFingerprint === void 0 || hardenedWindowsIdentities.get(parentBefore.identityFingerprint) !== parentBefore.metadataFingerprint))
+          throw new Error(
+            `Unable to verify owner-only publication parent identity: ${parentBefore.entry.path}`
+          );
+      }
+      const publication = await input.publish();
+      await validatePrivatePath(root, relativePath);
+      const [parentsAfter, fileAfter] = await Promise.all([
+        Promise.all(parentPaths.map(inspectPrivateEntry)),
+        inspectPrivateEntry(absolute)
+      ]);
+      let requiresFallbackHardening = false;
+      for (const [index, parentAfter] of parentsAfter.entries()) {
+        const parentBefore = parentsBefore[index];
+        if (parentAfter.entry.kind !== "directory")
+          throw new Error(
+            `Private publication parent changed filesystem identity: ${parentAfter.entry.path}`
+          );
+        if (parentBefore.identityFingerprint !== void 0 && parentAfter.identityFingerprint !== void 0 && parentAfter.identityFingerprint !== parentBefore.identityFingerprint)
+          throw new Error(
+            `Private publication parent changed filesystem identity: ${parentAfter.entry.path}`
+          );
+        requiresFallbackHardening ||= parentBefore.identityFingerprint === void 0 || parentAfter.identityFingerprint === void 0;
+      }
+      if (fileAfter.entry.kind !== "file")
+        throw new Error(`Published private path is not a regular file: ${absolute}`);
+      const publicationIdentity = privateEntryIdentityFingerprint({
+        dev: publication.device,
+        ino: publication.inode,
+        birthtimeNs: publication.birthtimeNs
+      });
+      if (resolve2(publication.path) !== absolute)
+        throw new Error(`Published private file changed filesystem identity: ${absolute}`);
+      const superseded = publicationIdentity !== void 0 && fileAfter.identityFingerprint !== void 0 && fileAfter.identityFingerprint !== publicationIdentity;
+      if (superseded && input.supersessionPolicy !== "reconstructable_projection")
+        throw new Error(`Published private file changed filesystem identity: ${absolute}`);
+      requiresFallbackHardening ||= superseded || publicationIdentity === void 0 || fileAfter.identityFingerprint === void 0;
+      if (requiresFallbackHardening)
+        await hardenWindowsEntriesLocked(
+          [...parentsAfter.map(({ entry }) => entry), fileAfter.entry],
+          true
+        );
+      else
+        for (const parentAfter of parentsAfter)
+          rememberWindowsIdentity(parentAfter.identityFingerprint, parentAfter.metadataFingerprint);
+    });
+  });
+}
+async function writePrivateJsonAtomic(path, value, ownedRoot, options = {}) {
+  const absolute = resolve2(path);
+  await publishPrivateFileAtomic({
+    path: absolute,
+    ownedRoot,
+    sourceDirectory: dirname2(absolute),
+    hardenOnPosix: false,
+    supersessionPolicy: options.supersessionPolicy ?? "strict",
+    publish: async () => await writeJsonAtomic(absolute, value)
+  });
+}
 async function hardenPrivateFile(path, ownedRoot) {
   const absolute = resolve2(path);
   if (ownedRoot !== void 0)
@@ -38447,6 +38672,54 @@ async function hardenPrivateTree(root, ownedRoot = root) {
 
 // packages/runtime/src/lock.ts
 var LOCK_RECORD_MAX_BYTES = 64 * 1024;
+var LOCK_PUBLICATION_CONTENTION_ATTEMPTS = 16;
+var RunLockPublicationContentionError = class extends Error {
+};
+function isPublicationContention(error51, path, descriptorOpened) {
+  if (!descriptorOpened) return false;
+  if (error51 instanceof RunLockPublicationContentionError) return true;
+  if (error51.code === "ENOENT") return true;
+  return error51 instanceof Error && (error51.message === `Published private file changed filesystem identity: ${path}` || error51.message === `Private ACL target changed filesystem identity: ${path}`);
+}
+async function yieldLockContention() {
+  await new Promise((resolveYield) => setImmediate(resolveYield));
+}
+function parseLockRecord(value) {
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return void 0;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return void 0;
+  const candidate = parsed;
+  if (typeof candidate.token !== "string" || candidate.token.length === 0 || !Number.isSafeInteger(candidate.pid) || (candidate.pid ?? 0) <= 0 || typeof candidate.hostname !== "string" || candidate.hostname.length === 0 || typeof candidate.acquiredAt !== "string" || !Number.isFinite(Date.parse(candidate.acquiredAt)) || typeof candidate.heartbeatAt !== "string" || !Number.isFinite(Date.parse(candidate.heartbeatAt)))
+    return void 0;
+  return candidate;
+}
+function isPrivateLockFile(status3) {
+  return status3.isFile() && status3.nlink === 1n;
+}
+function sameLockSnapshot(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.birthtimeNs === right.birthtimeNs && left.size === right.size && left.mtimeNs === right.mtimeNs && left.nlink === right.nlink;
+}
+async function readLockRecordFromHandle(handle) {
+  const before = await handle.stat({ bigint: true });
+  if (!isPrivateLockFile(before)) return void 0;
+  if (before.size > BigInt(LOCK_RECORD_MAX_BYTES))
+    throw new Error(`Private file exceeds its ${LOCK_RECORD_MAX_BYTES}-byte bounded read limit`);
+  const bytes = Buffer.alloc(Number(before.size));
+  let offset = 0;
+  while (offset < bytes.length) {
+    const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
+    if (bytesRead === 0) break;
+    offset += bytesRead;
+  }
+  const after = await handle.stat({ bigint: true });
+  if (offset !== bytes.length || !sameLockSnapshot(before, after)) return void 0;
+  const record2 = parseLockRecord(bytes.toString("utf8"));
+  return record2 ? { record: record2, status: after } : void 0;
+}
 function processExists(pid) {
   try {
     process.kill(pid, 0);
@@ -38467,98 +38740,250 @@ function lockOwnedRoot(path) {
 async function readLockRecord(path, ownedRoot) {
   return (await readPrivateFileBounded(path, LOCK_RECORD_MAX_BYTES, ownedRoot)).toString("utf8");
 }
+async function pathNamesLockDescriptor(path, ownedRoot, descriptorStatus, token) {
+  let pathStatus;
+  try {
+    pathStatus = await lstat2(path, { bigint: true });
+  } catch (error51) {
+    if (error51.code === "ENOENT") return false;
+    throw error51;
+  }
+  if (!isPrivateLockFile(pathStatus)) return false;
+  const descriptorIdentity = privateEntryIdentityFingerprint(descriptorStatus);
+  const pathIdentity = privateEntryIdentityFingerprint(pathStatus);
+  if (descriptorIdentity !== void 0 || pathIdentity !== void 0)
+    return descriptorIdentity !== void 0 && descriptorIdentity === pathIdentity;
+  const current = parseLockRecord(await readLockRecord(path, ownedRoot).catch(() => ""));
+  return current?.token === token;
+}
 var RunLock = class {
   path;
   ownedRoot;
   token = randomUUID3();
   heartbeat;
   heartbeatWrite = Promise.resolve();
+  heartbeatFailure;
+  loss = new AbortController();
+  acquired = false;
   constructor(path) {
-    this.path = path;
-    this.ownedRoot = lockOwnedRoot(path);
+    this.path = resolve3(path);
+    this.ownedRoot = lockOwnedRoot(this.path);
+  }
+  get signal() {
+    return this.loss.signal;
   }
   async acquire(staleAfterMs = 3e4) {
-    await ensurePrivateDirectory(this.ownedRoot);
-    await ensurePrivateDirectory(dirname3(this.path), this.ownedRoot);
-    await hardenPrivateFile(this.path, this.ownedRoot);
-    try {
-      const handle = await open3(this.path, "wx", 384);
-      const acquiredAt = (/* @__PURE__ */ new Date()).toISOString();
-      try {
-        await handle.writeFile(
-          `${JSON.stringify({
-            token: this.token,
-            pid: process.pid,
-            hostname: hostname3(),
-            acquiredAt,
-            heartbeatAt: acquiredAt
-          })}
-`,
-          "utf8"
-        );
-      } finally {
-        await handle.close();
-      }
+    let contentionAttempts = 0;
+    while (true) {
+      await ensurePrivateDirectory(this.ownedRoot);
+      await ensurePrivateDirectory(dirname3(this.path), this.ownedRoot);
       await hardenPrivateFile(this.path, this.ownedRoot);
-    } catch (error51) {
-      if (error51.code !== "EEXIST") throw error51;
-      let record2;
-      let observed = "";
+      let descriptorOpened = false;
       try {
-        observed = await readLockRecord(this.path, this.ownedRoot);
-        record2 = JSON.parse(observed);
-      } catch {
-      }
-      const heartbeatAge = record2 ? Math.max(0, Date.now() - Date.parse(record2.heartbeatAt)) : await stat2(this.path).then(({ mtimeMs }) => Math.max(0, Date.now() - mtimeMs)).catch(() => Number.POSITIVE_INFINITY);
-      const sameHost = record2 !== void 0 && record2.hostname === hostname3();
-      const liveLocalProcess = record2 !== void 0 && sameHost && processExists(record2.pid);
-      if (liveLocalProcess || !sameHost && heartbeatAge < staleAfterMs)
-        throw new Error("Graphcraft run is already active");
-      const current = await readLockRecord(this.path, this.ownedRoot).catch(
-        (readError) => {
-          if (readError.code === "ENOENT") return void 0;
-          throw readError;
+        await publishPrivateFileAtomic({
+          path: this.path,
+          ownedRoot: this.ownedRoot,
+          sourceDirectory: dirname3(this.path),
+          hardenOnPosix: true,
+          publish: async () => {
+            const handle = await open3(this.path, "wx", 384);
+            descriptorOpened = true;
+            const acquiredAt = (/* @__PURE__ */ new Date()).toISOString();
+            let publication;
+            try {
+              await handle.writeFile(
+                `${JSON.stringify({
+                  token: this.token,
+                  pid: process.pid,
+                  hostname: hostname3(),
+                  acquiredAt,
+                  heartbeatAt: acquiredAt
+                })}
+`,
+                "utf8"
+              );
+              await handle.sync();
+              const status3 = await handle.stat({ bigint: true });
+              if (!status3.isFile() || status3.nlink > 1n)
+                throw new Error(`Run lock is not a private regular file: ${this.path}`);
+              if (status3.nlink === 0n)
+                throw new RunLockPublicationContentionError(
+                  `Run lock was unlinked during publication: ${this.path}`
+                );
+              publication = {
+                path: this.path,
+                device: status3.dev,
+                inode: status3.ino,
+                birthtimeNs: status3.birthtimeNs
+              };
+            } finally {
+              await handle.close();
+            }
+            return publication;
+          }
+        });
+        const published = parseLockRecord(await readLockRecord(this.path, this.ownedRoot));
+        if (published?.token !== this.token)
+          throw new RunLockPublicationContentionError(
+            `Run lock was superseded during publication: ${this.path}`
+          );
+        this.acquired = true;
+        break;
+      } catch (error51) {
+        if (isPublicationContention(error51, this.path, descriptorOpened)) {
+          contentionAttempts += 1;
+          if (contentionAttempts >= LOCK_PUBLICATION_CONTENTION_ATTEMPTS)
+            throw new Error("Graphcraft run lock remained contended during publication", {
+              cause: error51
+            });
+          await yieldLockContention();
+          continue;
         }
-      );
-      if (current !== void 0 && current !== observed) return await this.acquire(staleAfterMs);
-      await unlink(this.path).catch((unlinkError) => {
-        if (unlinkError.code !== "ENOENT") throw unlinkError;
-      });
-      return await this.acquire(staleAfterMs);
+        if (descriptorOpened || error51.code !== "EEXIST") throw error51;
+        let record2;
+        let observed = "";
+        let observedStatus;
+        try {
+          observed = await readLockRecord(this.path, this.ownedRoot);
+          record2 = parseLockRecord(observed);
+          observedStatus = await lstat2(this.path, { bigint: true });
+        } catch {
+        }
+        const heartbeatAge = observedStatus ? Math.max(0, Date.now() - Number(observedStatus.mtimeMs)) : Number.POSITIVE_INFINITY;
+        const sameHost = record2 !== void 0 && record2.hostname === hostname3();
+        const liveLocalProcess = record2 !== void 0 && sameHost && processExists(record2.pid);
+        if (liveLocalProcess || !sameHost && heartbeatAge < staleAfterMs)
+          throw new Error("Graphcraft run is already active");
+        const removedObservedLock = await this.mutateLockDirectory(async () => {
+          const current = await readLockRecord(this.path, this.ownedRoot).catch(
+            (readError) => {
+              if (readError.code === "ENOENT") return void 0;
+              throw readError;
+            }
+          );
+          const currentStatus = await lstat2(this.path, { bigint: true }).catch(
+            (statusError) => {
+              if (statusError.code === "ENOENT") return void 0;
+              throw statusError;
+            }
+          );
+          if (current === void 0 && currentStatus === void 0) return true;
+          if (current !== observed || observedStatus === void 0 || currentStatus === void 0 || !sameLockSnapshot(observedStatus, currentStatus))
+            return false;
+          await unlink(this.path).catch((unlinkError) => {
+            if (unlinkError.code !== "ENOENT") throw unlinkError;
+          });
+          return true;
+        });
+        if (!removedObservedLock) await yieldLockContention();
+      }
     }
     this.heartbeat = setInterval(() => {
-      this.heartbeatWrite = this.heartbeatWrite.then(() => this.writeRecord((/* @__PURE__ */ new Date()).toISOString())).catch(() => void 0);
+      this.heartbeatWrite = this.heartbeatWrite.then(async () => await this.heartbeatTick()).catch((error51) => this.failHeartbeat(error51, false));
     }, 5e3);
     this.heartbeat.unref();
   }
   async release() {
     if (this.heartbeat) clearInterval(this.heartbeat);
     await this.heartbeatWrite.catch(() => void 0);
-    await hardenPrivateFile(this.path, this.ownedRoot);
+    if (this.acquired) {
+      const released = await this.mutateLockDirectory(async () => {
+        let observed;
+        try {
+          observed = await readLockRecord(this.path, this.ownedRoot);
+        } catch (error51) {
+          if (error51.code === "ENOENT") return false;
+          throw error51;
+        }
+        const current = parseLockRecord(observed);
+        if (!current)
+          throw new Error(`Graphcraft run lock record is malformed or ambiguous: ${this.path}`);
+        if (current.token !== this.token) return false;
+        try {
+          await unlink(this.path);
+        } catch (error51) {
+          if (error51.code === "ENOENT") return false;
+          throw error51;
+        }
+        return true;
+      });
+      if (released) this.acquired = false;
+      else
+        this.failHeartbeat(new Error(`Graphcraft run lock ownership was lost: ${this.path}`), true);
+    }
+    delete this.heartbeat;
+    if (this.heartbeatFailure) throw this.heartbeatFailure;
+  }
+  async mutateLockDirectory(operation) {
+    return await serializePrivatePathMutation(this.path, async () => {
+      const mutation = await preparePrivateDirectoryMutation(dirname3(this.path), this.ownedRoot);
+      try {
+        return await operation();
+      } finally {
+        await finalizePrivateDirectoryMutation(mutation, this.ownedRoot);
+      }
+    });
+  }
+  failHeartbeat(error51, ownershipLost) {
+    if (this.heartbeatFailure) return;
+    if (ownershipLost) this.acquired = false;
+    if (this.heartbeat) clearInterval(this.heartbeat);
+    delete this.heartbeat;
+    this.heartbeatFailure = error51 instanceof Error ? error51 : new Error(`Graphcraft run lock heartbeat failed: ${this.path}`, { cause: error51 });
+    this.loss.abort(this.heartbeatFailure);
+  }
+  async heartbeatTick() {
     try {
-      const current = JSON.parse(await readLockRecord(this.path, this.ownedRoot));
-      if (current.token === this.token) await unlink(this.path);
-    } catch {
+      if (!this.acquired || await this.refreshHeartbeat()) return;
+      this.failHeartbeat(new Error(`Graphcraft run lock ownership was lost: ${this.path}`), true);
+    } catch (error51) {
+      this.failHeartbeat(error51, false);
     }
   }
-  async writeRecord(heartbeatAt) {
-    await ensurePrivateDirectory(this.ownedRoot);
-    await ensurePrivateDirectory(dirname3(this.path), this.ownedRoot);
-    await hardenPrivateFile(this.path, this.ownedRoot);
-    const record2 = {
-      token: this.token,
-      pid: process.pid,
-      hostname: hostname3(),
-      acquiredAt: heartbeatAt,
-      heartbeatAt
-    };
+  async refreshHeartbeat() {
     try {
-      const current = JSON.parse(await readLockRecord(this.path, this.ownedRoot));
-      record2.acquiredAt = current.token === this.token ? current.acquiredAt : heartbeatAt;
-    } catch {
+      return await serializePrivatePathMutation(this.path, async () => {
+        const mutation = await preparePrivateFileMutation(this.path, this.ownedRoot);
+        try {
+          const noFollow = process.platform === "win32" ? 0 : fsConstants2.O_NOFOLLOW;
+          let handle;
+          try {
+            handle = await open3(this.path, fsConstants2.O_RDWR | noFollow);
+          } catch (error51) {
+            if (error51.code === "ENOENT") return false;
+            throw error51;
+          }
+          try {
+            const observed = await readLockRecordFromHandle(handle);
+            if (!observed || observed.record.token !== this.token) return false;
+            if (!await pathNamesLockDescriptor(
+              this.path,
+              this.ownedRoot,
+              observed.status,
+              this.token
+            ))
+              return false;
+            const now2 = /* @__PURE__ */ new Date();
+            await handle.utimes(now2, now2);
+            await handle.sync();
+            const after = await handle.stat({ bigint: true });
+            if (!isPrivateLockFile(after)) return false;
+            const beforeIdentity = privateEntryIdentityFingerprint(observed.status);
+            const afterIdentity = privateEntryIdentityFingerprint(after);
+            if ((beforeIdentity !== void 0 || afterIdentity !== void 0) && beforeIdentity !== afterIdentity)
+              return false;
+            return await pathNamesLockDescriptor(this.path, this.ownedRoot, after, this.token);
+          } finally {
+            await handle.close();
+          }
+        } finally {
+          await finalizePrivateFileMutation(mutation, this.ownedRoot);
+        }
+      });
+    } catch (error51) {
+      if (error51.code === "ENOENT") return false;
+      throw error51;
     }
-    await writeJsonAtomic(this.path, record2);
-    await hardenPrivateFile(this.path, this.ownedRoot);
   }
 };
 
@@ -38662,9 +39087,9 @@ async function amendRunGraph(store, input, actor = "runtime") {
 
 // packages/runtime/src/artifact-policy.ts
 import { createHash as createHash2, randomUUID as randomUUID4 } from "node:crypto";
-import { constants as fsConstants2 } from "node:fs";
-import { lstat as lstat2, open as open4, readdir as readdir2, rmdir, unlink as unlink2 } from "node:fs/promises";
-import { basename as basename2, dirname as dirname4, isAbsolute as isAbsolute4, join as join5, posix, resolve as resolve3, win32 as win323 } from "node:path";
+import { constants as fsConstants3 } from "node:fs";
+import { lstat as lstat3, open as open4, readdir as readdir2, rmdir, unlink as unlink2 } from "node:fs/promises";
+import { basename as basename2, dirname as dirname4, isAbsolute as isAbsolute4, join as join5, posix, relative as relative3, resolve as resolve4, win32 as win323 } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 var MIB3 = 1024 * 1024;
 var ATOMIC_STAGING_DIRECTORY = ".artifact-staging";
@@ -38737,7 +39162,7 @@ function isMissing2(error51) {
 }
 async function targetStatus(path) {
   try {
-    return await lstat2(path);
+    return await lstat3(path);
   } catch (error51) {
     if (isMissing2(error51)) return void 0;
     throw error51;
@@ -38747,13 +39172,13 @@ function sameFileSnapshot2(left, right) {
   return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
 }
 async function readBoundedArtifactInventory(path) {
-  const observed = await lstat2(path, { bigint: true });
+  const observed = await lstat3(path, { bigint: true });
   assertRegularPrivateTarget(path, observed);
   if (observed.size > BigInt(MAX_ARTIFACT_INVENTORY_BYTES))
     throw new Error(
       `Artifact inventory exceeds its ${MAX_ARTIFACT_INVENTORY_BYTES}-byte read limit`
     );
-  const handle = await open4(path, fsConstants2.O_RDONLY | fsConstants2.O_NOFOLLOW);
+  const handle = await open4(path, fsConstants3.O_RDONLY | fsConstants3.O_NOFOLLOW);
   try {
     const before = await handle.stat({ bigint: true });
     assertRegularPrivateTarget(path, before);
@@ -38808,17 +39233,35 @@ async function atomicWrite(root, relativePath, bytes) {
   await ensurePrivateDirectory(stagingRoot, root);
   const temporaryPath = join5(stagingRoot, `${randomUUID4()}.tmp`);
   try {
-    const handle = await open4(temporaryPath, "wx", 384);
-    try {
-      await handle.writeFile(bytes);
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    await hardenPrivateFile(temporaryPath, root);
-    await resolvePrivatePath(root, relativePath, true);
-    await replacePathAtomic(temporaryPath, path);
-    await hardenPrivateFile(path, root);
+    await publishPrivateFileAtomic({
+      path,
+      ownedRoot: root,
+      sourceDirectory: stagingRoot,
+      hardenOnPosix: true,
+      publish: async () => {
+        const handle = await open4(temporaryPath, "wx", 384);
+        let publication;
+        try {
+          await handle.writeFile(bytes);
+          await handle.sync();
+          const status3 = await handle.stat({ bigint: true });
+          assertRegularPrivateTarget(temporaryPath, status3);
+          publication = {
+            path,
+            device: status3.dev,
+            inode: status3.ino,
+            birthtimeNs: status3.birthtimeNs
+          };
+        } finally {
+          await handle.close();
+        }
+        await validatePrivatePath(root, relative3(root, path));
+        const existing = await targetStatus(path);
+        if (existing) assertRegularPrivateTarget(path, existing);
+        await replacePathAtomic(temporaryPath, path);
+        return publication;
+      }
+    });
     return path;
   } catch (error51) {
     const removed = await unlink2(temporaryPath).then(
@@ -38846,25 +39289,36 @@ async function cleanupAtomicStaging(root) {
     const path = join5(stagingRoot, item.name);
     if (!item.isFile() || item.isSymbolicLink())
       throw new Error(`Unsupported entry in artifact staging directory: ${path}`);
-    assertRegularPrivateTarget(path, await lstat2(path));
-    const removed = await unlink2(path).then(
+    assertRegularPrivateTarget(path, await lstat3(path));
+    const mutation2 = await preparePrivateDirectoryMutation(stagingRoot, root);
+    try {
+      const removed = await unlink2(path).then(
+        () => true,
+        (error51) => {
+          if (isMissing2(error51)) return false;
+          throw error51;
+        }
+      );
+      removedEntry ||= removed;
+    } finally {
+      await finalizePrivateDirectoryMutation(mutation2, root);
+    }
+  }
+  if (removedEntry) await syncDirectory(stagingRoot);
+  const parent = dirname4(stagingRoot);
+  const mutation = await preparePrivateDirectoryMutation(parent, root);
+  try {
+    const removedDirectory = await rmdir(stagingRoot).then(
       () => true,
       (error51) => {
         if (isMissing2(error51)) return false;
         throw error51;
       }
     );
-    removedEntry ||= removed;
+    if (removedDirectory) await syncDirectory(parent);
+  } finally {
+    await finalizePrivateDirectoryMutation(mutation, root);
   }
-  if (removedEntry) await syncDirectory(stagingRoot);
-  const removedDirectory = await rmdir(stagingRoot).then(
-    () => true,
-    (error51) => {
-      if (isMissing2(error51)) return false;
-      throw error51;
-    }
-  );
-  if (removedDirectory) await syncDirectory(dirname4(stagingRoot));
 }
 async function removePrivateFile(root, relativePath) {
   const path = await resolvePrivatePath(root, relativePath, false).catch((error51) => {
@@ -38872,14 +39326,20 @@ async function removePrivateFile(root, relativePath) {
     throw error51;
   });
   if (path) {
-    const removed = await unlink2(path).then(
-      () => true,
-      (error51) => {
-        if (isMissing2(error51)) return false;
-        throw error51;
-      }
-    );
-    if (removed) await syncDirectory(dirname4(path));
+    const parent = dirname4(path);
+    const mutation = await preparePrivateDirectoryMutation(parent, root);
+    try {
+      const removed = await unlink2(path).then(
+        () => true,
+        (error51) => {
+          if (isMissing2(error51)) return false;
+          throw error51;
+        }
+      );
+      if (removed) await syncDirectory(parent);
+    } finally {
+      await finalizePrivateDirectoryMutation(mutation, root);
+    }
   }
 }
 function utf8Prefix(bytes, limit) {
@@ -39194,7 +39654,7 @@ var RunArtifactStore = class {
       throw new Error("Run artifact reserve must be smaller than the run quota");
     if (policy.runReservedBytes < policy.invocationReservedBytes)
       throw new Error("Run artifact reserve must cover the invocation recovery reserve");
-    const runParent = dirname4(resolve3(runRoot));
+    const runParent = dirname4(resolve4(runRoot));
     const lockRoot = basename2(runParent) === "runs" ? dirname4(runParent) : runParent;
     this.mutationLockPath = join5(lockRoot, "locks", `${runId}.artifacts.lock`);
   }
@@ -39438,7 +39898,7 @@ var RunArtifactStore = class {
       if (!entry || !expected)
         throw new Error("Artifact preview is not represented by stored inventory bytes");
       const path = await resolvePrivatePath(this.runRoot, relativePath, false);
-      const handle = await open4(path, fsConstants2.O_RDONLY | fsConstants2.O_NOFOLLOW);
+      const handle = await open4(path, fsConstants3.O_RDONLY | fsConstants3.O_NOFOLLOW);
       try {
         const before = await handle.stat();
         if (!before.isFile() || before.nlink > 1)
@@ -39506,7 +39966,7 @@ var RunArtifactStore = class {
           continue;
         }
         if (!item.isFile()) throw new Error(`Unsupported entry in artifact tree: ${absolute}`);
-        const metadata = await lstat2(absolute);
+        const metadata = await lstat3(absolute);
         assertRegularPrivateTarget(absolute, metadata);
         files.push({
           path: relativePath,
@@ -40015,9 +40475,9 @@ var RunArtifactStore = class {
 };
 
 // packages/probes/src/index.ts
-import { access, readFile, stat as stat4 } from "node:fs/promises";
+import { access, readFile, stat as stat3 } from "node:fs/promises";
 import { constants } from "node:fs";
-import { dirname as dirname5, join as join6, resolve as resolve4, sep as sep3 } from "node:path";
+import { dirname as dirname5, join as join6, resolve as resolve5, sep as sep3 } from "node:path";
 
 // packages/probes/src/process.ts
 var import_cross_spawn4 = __toESM(require_cross_spawn(), 1);
@@ -40108,7 +40568,7 @@ async function runProcess(command, args, options) {
     environment,
     untrustedCwd: options.cwd
   });
-  return await new Promise((resolve13, reject) => {
+  return await new Promise((resolve14, reject) => {
     const child = import_cross_spawn4.default.spawn(executable, args, {
       cwd: options.cwd,
       env: environment,
@@ -40188,8 +40648,8 @@ async function runProcess(command, args, options) {
         reject(new ProcessOutputLimitError(overflowStream, captureMetadata));
         return;
       }
-      resolve13({
-        exitCode: code ?? (timedOut ? 124 : 1),
+      resolve14({
+        exitCode: timedOut ? 124 : code ?? 1,
         stdout: stdout.text,
         stderr: stderr.text,
         durationMs: Math.round(performance.now() - started),
@@ -40224,7 +40684,7 @@ async function runProbe(spec, repositoryPath, signal) {
     throw new Error(`Held-out probe ${spec.id} must be resolved by the runtime`);
   if (spec.kind === "command") {
     const processResult = await runProcess(spec.command, spec.args, {
-      cwd: spec.cwd ? resolve4(repositoryPath, spec.cwd) : repositoryPath,
+      cwd: spec.cwd ? resolve5(repositoryPath, spec.cwd) : repositoryPath,
       timeoutMs: spec.timeoutMs,
       maxOutputBytesPerStream: DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM,
       outputOverflow: "truncate",
@@ -40250,7 +40710,7 @@ async function runProbe(spec, repositoryPath, signal) {
     };
   }
   if (spec.kind === "file") {
-    const path = resolve4(repositoryPath, spec.path);
+    const path = resolve5(repositoryPath, spec.path);
     let exists = true;
     try {
       await access(path, constants.F_OK);
@@ -40451,8 +40911,8 @@ function selectPackageCandidates(candidates) {
   );
 }
 function withinRepository(repositoryPath, candidate) {
-  const root = resolve4(repositoryPath);
-  const path = resolve4(repositoryPath, candidate);
+  const root = resolve5(repositoryPath);
+  const path = resolve5(repositoryPath, candidate);
   return path === root || path.startsWith(`${root}${sep3}`);
 }
 async function validateProbePlan(input, repositoryPath) {
@@ -40476,7 +40936,7 @@ async function validateProbePlan(input, repositoryPath) {
       const cwd = item.probe.cwd ?? ".";
       if (!withinRepository(repositoryPath, cwd))
         throw new Error(`Probe ${item.probe.id} escapes the repository working directory`);
-      const directory = await stat4(resolve4(repositoryPath, cwd)).catch(() => void 0);
+      const directory = await stat3(resolve5(repositoryPath, cwd)).catch(() => void 0);
       if (!directory?.isDirectory())
         throw new Error(`Probe ${item.probe.id} uses missing working directory ${cwd}`);
     }
@@ -40662,17 +41122,31 @@ var RunControlChannel = class {
       return void 0;
     }
   }
-  watch(onRequest, intervalMs = 100) {
+  watch(onRequest, intervalMs = 100, onFailure) {
     let stopped = false;
     let lastRequestId;
+    let failed = false;
+    let failure;
     let inFlight = Promise.resolve();
     const poll = () => {
       if (stopped) return;
       inFlight = inFlight.then(async () => {
+        if (stopped) return;
         const request = await this.read();
         if (request && request.requestId !== lastRequestId) {
           lastRequestId = request.requestId;
           onRequest(request);
+        }
+      }).catch((error51) => {
+        stopped = true;
+        clearInterval(timer);
+        if (!failed) {
+          failed = true;
+          failure = error51;
+          try {
+            onFailure?.(error51);
+          } catch {
+          }
         }
       });
     };
@@ -40683,6 +41157,7 @@ var RunControlChannel = class {
       stopped = true;
       clearInterval(timer);
       await inFlight;
+      if (failed) throw failure;
     };
   }
   async clear(requestId) {
@@ -40733,7 +41208,7 @@ async function requestRunControl(store, action, reason = action === "pause" ? "P
       if (!(error51 instanceof Error) || error51.message !== "Graphcraft run is already active")
         throw error51;
     }
-    await new Promise((resolve13) => setTimeout(resolve13, 50));
+    await new Promise((resolve14) => setTimeout(resolve14, 50));
   }
   throw new Error(
     `The active Graphcraft process did not acknowledge ${action} within ${waitMs}ms; the durable request remains pending`
@@ -41429,8 +41904,8 @@ async function decideRunControl(store, input) {
 }
 
 // packages/runtime/src/repository.ts
-import { appendFile, lstat as lstat3, mkdir as mkdir3, readFile as readFile2, readlink } from "node:fs/promises";
-import { basename as basename3, dirname as dirname7, isAbsolute as isAbsolute5, join as join9, resolve as resolve5 } from "node:path";
+import { appendFile, lstat as lstat4, mkdir as mkdir3, readFile as readFile2, readlink } from "node:fs/promises";
+import { basename as basename3, dirname as dirname7, isAbsolute as isAbsolute5, join as join9, resolve as resolve6 } from "node:path";
 
 // packages/runtime/src/side-effect.ts
 var SideEffectBoundaryInterruption = class extends Error {
@@ -41740,7 +42215,7 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
 }
 async function ensureGraphcraftIgnored(repositoryRoot) {
   const rawExcludePath = await git(repositoryRoot, ["rev-parse", "--git-path", "info/exclude"]);
-  const excludePath = isAbsolute5(rawExcludePath) ? rawExcludePath : resolve5(repositoryRoot, rawExcludePath);
+  const excludePath = isAbsolute5(rawExcludePath) ? rawExcludePath : resolve6(repositoryRoot, rawExcludePath);
   let content = "";
   try {
     content = await readFile2(excludePath, "utf8");
@@ -41788,7 +42263,7 @@ async function commitContentDigest(repositoryPath) {
   const changes = await Promise.all(
     paths.map(async (path) => {
       const absolutePath = join9(repositoryPath, path);
-      const stats = await lstat3(absolutePath).catch(() => void 0);
+      const stats = await lstat4(absolutePath).catch(() => void 0);
       if (!stats) return { path, kind: "absent" };
       if (stats.isSymbolicLink())
         return { path, kind: "symlink", target: await readlink(absolutePath) };
@@ -42013,16 +42488,16 @@ async function reconcileAtomicPush(workspace, claim) {
 }
 
 // packages/runtime/src/store.ts
-import { constants as fsConstants4 } from "node:fs";
-import { lstat as lstat5, open as open6, readdir as readdir4 } from "node:fs/promises";
-import { join as join11, relative as relative4, resolve as resolve7 } from "node:path";
+import { constants as fsConstants5 } from "node:fs";
+import { lstat as lstat6, open as open6, readdir as readdir4 } from "node:fs/promises";
+import { join as join11, relative as relative5, resolve as resolve8 } from "node:path";
 import { TextDecoder as TextDecoder2 } from "node:util";
 
 // packages/runtime/src/migration.ts
 import { createHash as createHash4 } from "node:crypto";
-import { constants as fsConstants3 } from "node:fs";
-import { lstat as lstat4, mkdir as mkdir4, open as open5, readdir as readdir3, rename as rename2, rm as rm3 } from "node:fs/promises";
-import { join as join10, relative as relative3, resolve as resolve6 } from "node:path";
+import { constants as fsConstants4 } from "node:fs";
+import { lstat as lstat5, mkdir as mkdir4, open as open5, readdir as readdir3, rename as rename2, rm as rm3 } from "node:fs/promises";
+import { join as join10, relative as relative4, resolve as resolve7 } from "node:path";
 import { isDeepStrictEqual as isDeepStrictEqual2 } from "node:util";
 var CURRENT_RUN_STORAGE_VERSION = 2;
 var BACKUP_COMPLETION_FILE = ".backup-complete.json";
@@ -42072,9 +42547,9 @@ function runStorageManifestPath(runRoot) {
   return join10(runRoot, "storage.json");
 }
 async function validateRunStorageRoot(input) {
-  const graphcraftRoot2 = resolve6(input.graphcraftRoot);
-  const runRoot = resolve6(input.runRoot);
-  const validated = await validatePrivatePath(graphcraftRoot2, relative3(graphcraftRoot2, runRoot));
+  const graphcraftRoot2 = resolve7(input.graphcraftRoot);
+  const runRoot = resolve7(input.runRoot);
+  const validated = await validatePrivatePath(graphcraftRoot2, relative4(graphcraftRoot2, runRoot));
   if (validated !== runRoot)
     throw new Error(`Run storage path escaped the Graphcraft state directory: ${input.runRoot}`);
 }
@@ -42162,7 +42637,7 @@ async function acquireMigrationLock(input) {
     } catch (error51) {
       if (!isActiveLockError(error51)) throw error51;
     }
-    await new Promise((resolve13) => setTimeout(resolve13, 25));
+    await new Promise((resolve14) => setTimeout(resolve14, 25));
   }
 }
 async function acquireActiveAwareLock(path) {
@@ -42174,12 +42649,12 @@ async function acquireActiveAwareLock(path) {
     } catch (error51) {
       if (!isActiveLockError(error51)) throw error51;
     }
-    await new Promise((resolve13) => setTimeout(resolve13, 25));
+    await new Promise((resolve14) => setTimeout(resolve14, 25));
   }
 }
 async function status2(path) {
   try {
-    return await lstat4(path);
+    return await lstat5(path);
   } catch (error51) {
     if (error51.code === "ENOENT") return void 0;
     throw error51;
@@ -42305,7 +42780,7 @@ function legacyTreeDigest(entries, ignoredRootName) {
   return createHash4("sha256").update(JSON.stringify(values)).digest("hex");
 }
 async function scanLegacyTreeMetadata(root, options) {
-  const rootMetadata = await lstat4(root, { bigint: true });
+  const rootMetadata = await lstat5(root, { bigint: true });
   if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory())
     throw new Error("Storage migration cannot scan an unsafe legacy run root");
   let entryCount = 0;
@@ -42326,7 +42801,7 @@ async function scanLegacyTreeMetadata(root, options) {
         throw new Error(
           `Legacy run contains more than the ${LEGACY_MIGRATION_RESOURCE_LIMITS.maximumEntryCount}-entry safe migration limit; prune legacy run state before retrying`
         );
-      const metadata = await lstat4(path, { bigint: true });
+      const metadata = await lstat5(path, { bigint: true });
       if (metadata.isSymbolicLink())
         throw new Error("Storage migration cannot scan a symbolic link; no backup was created");
       if (metadata.isDirectory()) {
@@ -42438,12 +42913,12 @@ function advanceLegacyEventLineLength(chunk, previousLength) {
 }
 async function readLegacySnapshotFile(expected, options) {
   assertLegacyFileMetadata(
-    await lstat4(expected.path, { bigint: true }),
+    await lstat5(expected.path, { bigint: true }),
     expected,
     "before opening"
   );
-  const noFollow = process.platform === "win32" ? 0 : fsConstants3.O_NOFOLLOW;
-  const handle = await open5(expected.path, fsConstants3.O_RDONLY | noFollow);
+  const noFollow = process.platform === "win32" ? 0 : fsConstants4.O_NOFOLLOW;
+  const handle = await open5(expected.path, fsConstants4.O_RDONLY | noFollow);
   const hash2 = createHash4("sha256");
   const redactionChunks = options.scanRedaction ? [] : void 0;
   const buffer = Buffer.alloc(Math.min(MIGRATION_COPY_CHUNK_BYTES, Math.max(1, expected.bytes)));
@@ -42472,7 +42947,7 @@ async function readLegacySnapshotFile(expected, options) {
       );
     assertLegacyFileMetadata(await handle.stat({ bigint: true }), expected, "while being read");
     assertLegacyFileMetadata(
-      await lstat4(expected.path, { bigint: true }),
+      await lstat5(expected.path, { bigint: true }),
       expected,
       "after reading"
     );
@@ -42620,15 +43095,15 @@ async function syncBackupFile(path, observed) {
   if (observed.isSymbolicLink() || !observed.isFile() || observed.nlink > 1)
     throw new Error(`Storage migration backup payload is unsafe: ${path}`);
   const expected = backupEntryFingerprint(observed);
-  const noFollow = process.platform === "win32" ? 0 : fsConstants3.O_NOFOLLOW;
-  const handle = await open5(path, fsConstants3.O_RDWR | noFollow);
+  const noFollow = process.platform === "win32" ? 0 : fsConstants4.O_NOFOLLOW;
+  const handle = await open5(path, fsConstants4.O_RDWR | noFollow);
   try {
     const before = await handle.stat();
     if (before.isSymbolicLink() || !before.isFile() || before.nlink > 1 || backupEntryFingerprint(before) !== expected)
       throw new Error(`Storage migration backup payload changed before fsync: ${path}`);
     await handle.sync();
     const after = await handle.stat();
-    const current = await lstat4(path);
+    const current = await lstat5(path);
     if (backupEntryFingerprint(after) !== expected || backupEntryFingerprint(current) !== expected)
       throw new Error(`Storage migration backup payload changed during fsync: ${path}`);
   } finally {
@@ -42637,7 +43112,7 @@ async function syncBackupFile(path, observed) {
 }
 async function syncBackupTree(root) {
   const visit = async (directory) => {
-    const observed = await lstat4(directory);
+    const observed = await lstat5(directory);
     if (observed.isSymbolicLink() || !observed.isDirectory())
       throw new Error(`Storage migration backup directory is unsafe: ${directory}`);
     const expected = backupEntryFingerprint(observed);
@@ -42645,11 +43120,11 @@ async function syncBackupTree(root) {
       (left, right) => left.localeCompare(right)
     )) {
       const path = join10(directory, name);
-      const metadata = await lstat4(path);
+      const metadata = await lstat5(path);
       if (metadata.isDirectory() && !metadata.isSymbolicLink()) await visit(path);
       else await syncBackupFile(path, metadata);
     }
-    if (backupEntryFingerprint(await lstat4(directory)) !== expected)
+    if (backupEntryFingerprint(await lstat5(directory)) !== expected)
       throw new Error(`Storage migration backup directory changed during fsync: ${directory}`);
     await syncDirectory(directory);
   };
@@ -42666,12 +43141,12 @@ async function writeAll(handle, chunk, position) {
 }
 async function copyLegacySnapshotFile(source, destinationPath) {
   assertLegacyFileMetadata(
-    await lstat4(source.path, { bigint: true }),
+    await lstat5(source.path, { bigint: true }),
     source,
     "before backup copy"
   );
-  const noFollow = process.platform === "win32" ? 0 : fsConstants3.O_NOFOLLOW;
-  const sourceHandle = await open5(source.path, fsConstants3.O_RDONLY | noFollow);
+  const noFollow = process.platform === "win32" ? 0 : fsConstants4.O_NOFOLLOW;
+  const sourceHandle = await open5(source.path, fsConstants4.O_RDONLY | noFollow);
   let destinationHandle;
   try {
     assertLegacyFileMetadata(
@@ -42681,7 +43156,7 @@ async function copyLegacySnapshotFile(source, destinationPath) {
     );
     destinationHandle = await open5(
       destinationPath,
-      fsConstants3.O_WRONLY | fsConstants3.O_CREAT | fsConstants3.O_EXCL | noFollow,
+      fsConstants4.O_WRONLY | fsConstants4.O_CREAT | fsConstants4.O_EXCL | noFollow,
       384
     );
     const hash2 = createHash4("sha256");
@@ -42710,7 +43185,7 @@ async function copyLegacySnapshotFile(source, destinationPath) {
       "during backup copy"
     );
     assertLegacyFileMetadata(
-      await lstat4(source.path, { bigint: true }),
+      await lstat5(source.path, { bigint: true }),
       source,
       "after backup copy"
     );
@@ -42720,7 +43195,7 @@ async function copyLegacySnapshotFile(source, destinationPath) {
       );
     await destinationHandle.sync();
     const destination = await destinationHandle.stat({ bigint: true });
-    const destinationPathMetadata = await lstat4(destinationPath, { bigint: true });
+    const destinationPathMetadata = await lstat5(destinationPath, { bigint: true });
     if (destination.isSymbolicLink() || !destination.isFile() || destination.nlink > 1n || destination.size !== BigInt(source.bytes) || legacyMetadataFingerprint(destination) !== legacyMetadataFingerprint(destinationPathMetadata))
       throw new Error(
         `Storage migration backup destination changed while copying ${source.relativePath}`
@@ -42735,7 +43210,7 @@ async function copyLegacySnapshot(sourceRoot, temporaryRoot, snapshot) {
   for (const entry of snapshot.entries) {
     if (entry.kind !== "directory") continue;
     assertLegacyDirectoryMetadata(
-      await lstat4(entry.path, { bigint: true }),
+      await lstat5(entry.path, { bigint: true }),
       entry,
       "before backup copy"
     );
@@ -42761,7 +43236,7 @@ async function ensureCompleteBackup(input, sourceSnapshot) {
   if (!isDeepStrictEqual2(legacySnapshotView(verifiedSource), legacySnapshotView(sourceSnapshot)))
     throw new Error("Legacy run tree changed after migration preflight; no backup was created");
   await ensurePrivateDirectory(input.graphcraftRoot);
-  await validatePrivatePath(input.graphcraftRoot, relative3(input.graphcraftRoot, input.runRoot));
+  await validatePrivatePath(input.graphcraftRoot, relative4(input.graphcraftRoot, input.runRoot));
   const backupBase = join10(input.graphcraftRoot, "migration-backups");
   const backupParent = join10(backupBase, input.runId);
   await ensurePrivateDirectory(backupBase, input.graphcraftRoot);
@@ -42816,7 +43291,7 @@ async function ensureCompleteBackup(input, sourceSnapshot) {
     const completionPath = join10(temporaryRoot, BACKUP_COMPLETION_FILE);
     await writeJsonAtomic(completionPath, completion);
     await hardenPrivateFile(completionPath, temporaryRoot);
-    await syncBackupFile(completionPath, await lstat4(completionPath));
+    await syncBackupFile(completionPath, await lstat5(completionPath));
     await syncDirectory(temporaryRoot);
     await rename2(temporaryRoot, backupRoot);
     await syncDirectory(backupParent);
@@ -42832,7 +43307,7 @@ async function validateLegacyRun(runRoot, runId) {
       `Legacy run ${runId} cannot migrate because events.jsonl is unsafe: ${error51 instanceof Error ? error51.message : String(error51)}`
     );
   });
-  await lstat4(join10(runRoot, "events.jsonl")).catch((error51) => {
+  await lstat5(join10(runRoot, "events.jsonl")).catch((error51) => {
     throw new Error(
       `Legacy run ${runId} cannot migrate because events.jsonl is unavailable: ${error51 instanceof Error ? error51.message : String(error51)}`
     );
@@ -43004,9 +43479,9 @@ var RunStore = class _RunStore {
       throw new Error("RunStore blocked-event reserve cannot fit its durable blocked event");
   }
   async validateStorageRoot() {
-    const graphcraftRoot2 = resolve7(this.graphcraftRoot);
-    const runRoot = resolve7(this.runRoot);
-    const validated = await validatePrivatePath(graphcraftRoot2, relative4(graphcraftRoot2, runRoot));
+    const graphcraftRoot2 = resolve8(this.graphcraftRoot);
+    const runRoot = resolve8(this.runRoot);
+    const validated = await validatePrivatePath(graphcraftRoot2, relative5(graphcraftRoot2, runRoot));
     if (validated !== runRoot)
       throw new Error(`Run storage path escaped the Graphcraft state directory: ${this.runRoot}`);
   }
@@ -43034,10 +43509,12 @@ var RunStore = class _RunStore {
     if (bytes > maximumBytes)
       throw new Error(`${label} requires ${bytes} serialized bytes, exceeding ${maximumBytes}`);
   }
-  async writeBoundedJson(relativePath, value, maximumBytes, label) {
+  async writeBoundedJson(relativePath, value, maximumBytes, label, supersessionPolicy = "strict") {
     const persisted = redactValue(value);
     this.assertJsonProjectionFits(persisted, maximumBytes, label);
-    await writeJsonAtomic(join11(this.runRoot, relativePath), persisted);
+    await writePrivateJsonAtomic(join11(this.runRoot, relativePath), persisted, this.runRoot, {
+      supersessionPolicy
+    });
   }
   async readBoundedJson(relativePath, maximumBytes) {
     const bytes = await readPrivateFileBounded(
@@ -43178,22 +43655,22 @@ var RunStore = class _RunStore {
     let created = false;
     let observed;
     let handle;
-    const noFollow = process.platform === "win32" ? 0 : fsConstants4.O_NOFOLLOW;
+    const noFollow = process.platform === "win32" ? 0 : fsConstants5.O_NOFOLLOW;
     try {
       handle = await open6(
         this.eventsPath(),
-        fsConstants4.O_WRONLY | fsConstants4.O_APPEND | fsConstants4.O_CREAT | fsConstants4.O_EXCL | noFollow,
+        fsConstants5.O_WRONLY | fsConstants5.O_APPEND | fsConstants5.O_CREAT | fsConstants5.O_EXCL | noFollow,
         384
       );
       created = true;
     } catch (error51) {
       if (error51.code !== "EEXIST") throw error51;
       await validatePrivatePath(this.runRoot, "events.jsonl");
-      observed = await lstat5(this.eventsPath(), { bigint: true });
+      observed = await lstat6(this.eventsPath(), { bigint: true });
       assertEventLogFile(this.eventsPath(), observed);
       handle = await open6(
         this.eventsPath(),
-        fsConstants4.O_WRONLY | fsConstants4.O_APPEND | noFollow,
+        fsConstants5.O_WRONLY | fsConstants5.O_APPEND | noFollow,
         384
       );
     }
@@ -43202,7 +43679,7 @@ var RunStore = class _RunStore {
       assertEventLogFile(this.eventsPath(), before);
       if (observed && !sameFileIdentity(observed, before))
         throw new Error("Run event log changed before its append descriptor was opened");
-      const pathBefore = await lstat5(this.eventsPath(), { bigint: true });
+      const pathBefore = await lstat6(this.eventsPath(), { bigint: true });
       assertEventLogFile(this.eventsPath(), pathBefore);
       if (!sameFileIdentity(before, pathBefore))
         throw new Error("Run event log path changed before append");
@@ -43211,7 +43688,7 @@ var RunStore = class _RunStore {
       await handle.writeFile(line, "utf8");
       await handle.sync();
       const after = await handle.stat({ bigint: true });
-      const pathAfter = await lstat5(this.eventsPath(), { bigint: true });
+      const pathAfter = await lstat6(this.eventsPath(), { bigint: true });
       assertEventLogFile(this.eventsPath(), after);
       assertEventLogFile(this.eventsPath(), pathAfter);
       if (!sameFileIdentity(after, pathAfter))
@@ -43248,7 +43725,8 @@ var RunStore = class _RunStore {
       "graph.json",
       GraphSchema.parse(redactValue(graph)),
       RUN_METADATA_MAX_BYTES,
-      "Run graph"
+      "Run graph",
+      "reconstructable_projection"
     );
   }
   async loadGraph() {
@@ -43275,7 +43753,8 @@ var RunStore = class _RunStore {
       "probe-plan.json",
       ProbePlanSchema.parse(probePlan),
       RUN_METADATA_MAX_BYTES,
-      "Probe plan"
+      "Probe plan",
+      "reconstructable_projection"
     );
   }
   async loadProbePlan() {
@@ -43306,7 +43785,8 @@ var RunStore = class _RunStore {
       "held-out-probes.json",
       validateHeldOutProbePlan(heldOutProbePlan),
       RUN_METADATA_MAX_BYTES,
-      "Held-out probe plan"
+      "Held-out probe plan",
+      "reconstructable_projection"
     );
   }
   async loadHeldOutProbePlan() {
@@ -43628,7 +44108,9 @@ var RunStore = class _RunStore {
     const bytes = serializedStateBytes(state);
     if (bytes > this.limits.maxStateBytes)
       throw new RunStoreLimitError("state", bytes, this.limits.maxStateBytes);
-    await writeJsonAtomic(join11(this.runRoot, "state.json"), state);
+    await writePrivateJsonAtomic(join11(this.runRoot, "state.json"), state, this.runRoot, {
+      supersessionPolicy: "reconstructable_projection"
+    });
   }
 };
 async function listRunIds(repositoryRoot) {
@@ -43663,8 +44145,8 @@ async function resolveRunId(repositoryRoot, reference) {
 // packages/runtime/src/scope.ts
 import { createHash as createHash5 } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { lstat as lstat6, readlink as readlink2 } from "node:fs/promises";
-import { isAbsolute as isAbsolute6, matchesGlob, relative as relative5, resolve as resolve8, sep as sep4 } from "node:path";
+import { lstat as lstat7, readlink as readlink2 } from "node:fs/promises";
+import { isAbsolute as isAbsolute6, matchesGlob, relative as relative6, resolve as resolve9, sep as sep4 } from "node:path";
 var maximumChangedPaths = 1e4;
 async function gitOutput(repositoryPath, args) {
   const result = await runProcess("git", args, { cwd: repositoryPath, timeoutMs: 12e4 });
@@ -43677,8 +44159,8 @@ function nulPaths(value) {
 }
 function confinedPath(repositoryPath, path) {
   if (isAbsolute6(path)) throw new Error(`Git reported an absolute workspace path: ${path}`);
-  const absolute = resolve8(repositoryPath, path);
-  const confined = relative5(repositoryPath, absolute);
+  const absolute = resolve9(repositoryPath, path);
+  const confined = relative6(repositoryPath, absolute);
   if (confined === ".." || confined.startsWith(`..${sep4}`) || isAbsolute6(confined))
     throw new Error(`Git reported a path outside the workspace: ${path}`);
   return absolute;
@@ -43692,7 +44174,7 @@ async function pathSignature(repositoryPath, path) {
   const absolute = confinedPath(repositoryPath, path);
   let status3;
   try {
-    status3 = await lstat6(absolute);
+    status3 = await lstat7(absolute);
   } catch (error51) {
     if (error51.code === "ENOENT") return "missing";
     throw error51;
@@ -43995,20 +44477,20 @@ async function prepareWorkerContext(input) {
 }
 
 // packages/runtime/src/wait.ts
-import { lstat as lstat7, readFile as readFile3, readlink as readlink3 } from "node:fs/promises";
+import { lstat as lstat8, readFile as readFile3, readlink as readlink3 } from "node:fs/promises";
 import { setTimeout as waitForTimeout } from "node:timers/promises";
-import { isAbsolute as isAbsolute7, resolve as resolve9, sep as sep5 } from "node:path";
+import { isAbsolute as isAbsolute7, resolve as resolve10, sep as sep5 } from "node:path";
 function waitPath(root, path) {
   if (isAbsolute7(path) || path.split(/[\\/]/).includes(".."))
     throw new Error(`Wait condition path is unsafe: ${path}`);
-  const absolute = resolve9(root, path);
+  const absolute = resolve10(root, path);
   if (absolute !== root && !absolute.startsWith(`${root}${sep5}`))
     throw new Error(`Wait condition path escapes the workspace: ${path}`);
   return absolute;
 }
 async function fileSignature(root, path) {
   const absolute = waitPath(root, path);
-  const stats = await lstat7(absolute).catch(() => void 0);
+  const stats = await lstat8(absolute).catch(() => void 0);
   if (!stats) return contentHash({ kind: "absent", path });
   if (stats.isSymbolicLink())
     return contentHash({ kind: "symlink", path, target: await readlink3(absolute) });
@@ -44159,21 +44641,21 @@ async function sleepUntilWake(nextWakeAt2, signal) {
 
 // packages/runtime/src/held-out.ts
 import { execFile } from "node:child_process";
-import { readFile as readFile4, stat as stat5 } from "node:fs/promises";
-import { isAbsolute as isAbsolute8, relative as relative6, resolve as resolve10, sep as sep6 } from "node:path";
+import { readFile as readFile4, stat as stat4 } from "node:fs/promises";
+import { isAbsolute as isAbsolute8, relative as relative7, resolve as resolve11, sep as sep6 } from "node:path";
 import { promisify } from "node:util";
 var execFileAsync = promisify(execFile);
 function relativeRepositoryPath(repositoryRoot, candidate) {
-  const root = resolve10(repositoryRoot);
-  const path = resolve10(repositoryRoot, candidate);
+  const root = resolve11(repositoryRoot);
+  const path = resolve11(repositoryRoot, candidate);
   if (path !== root && !path.startsWith(`${root}${sep6}`)) return void 0;
-  const result = relative6(root, path);
+  const result = relative7(root, path);
   return result && !isAbsolute8(result) ? result.split(sep6).join("/") : void 0;
 }
 async function gitObjectValueHash(repositoryRoot, path) {
   const { stdout } = await execFileAsync(
     "git",
-    ["hash-object", `--path=${path.replaceAll("\\", "/")}`, resolve10(repositoryRoot, path)],
+    ["hash-object", `--path=${path.replaceAll("\\", "/")}`, resolve11(repositoryRoot, path)],
     { cwd: repositoryRoot, encoding: "utf8", maxBuffer: 1024 * 1024 }
   );
   const objectHash = stdout.trim();
@@ -44183,10 +44665,10 @@ async function gitObjectValueHash(repositoryRoot, path) {
 }
 async function fileValueHash(repositoryRoot, path, algorithm) {
   if (algorithm === "git_hash_object") {
-    const details = await stat5(resolve10(repositoryRoot, path)).catch(() => void 0);
+    const details = await stat4(resolve11(repositoryRoot, path)).catch(() => void 0);
     return details?.isFile() ? await gitObjectValueHash(repositoryRoot, path) : contentHash({ missing: true, path, algorithm });
   }
-  const contents = await readFile4(resolve10(repositoryRoot, path)).catch(() => void 0);
+  const contents = await readFile4(resolve11(repositoryRoot, path)).catch(() => void 0);
   return contents ? contentHash({ path, contents: contents.toString("base64") }) : contentHash({ missing: true, path });
 }
 function possibleFileArguments(values) {
@@ -44197,9 +44679,9 @@ function possibleFileArguments(values) {
 async function fileIntegrity(repositoryRoot, cwd, values) {
   const result = [];
   for (const value of possibleFileArguments(values)) {
-    const path = relativeRepositoryPath(repositoryRoot, resolve10(repositoryRoot, cwd ?? ".", value));
+    const path = relativeRepositoryPath(repositoryRoot, resolve11(repositoryRoot, cwd ?? ".", value));
     if (!path) continue;
-    const details = await stat5(resolve10(repositoryRoot, path)).catch(() => void 0);
+    const details = await stat4(resolve11(repositoryRoot, path)).catch(() => void 0);
     if (!details?.isFile()) continue;
     result.push({
       kind: "file",
@@ -44230,7 +44712,7 @@ async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot) {
     const script = match[2];
     const manifestPath = relativeRepositoryPath(repositoryRoot, path);
     if (!manifestPath) throw new Error(`Completion script ${script} escapes the repository`);
-    const manifest2 = JSON.parse(await readFile4(resolve10(repositoryRoot, manifestPath), "utf8"));
+    const manifest2 = JSON.parse(await readFile4(resolve11(repositoryRoot, manifestPath), "utf8"));
     const value = manifest2.scripts?.[script];
     if (!value) throw new Error(`Completion script ${script} is missing from ${manifestPath}`);
     protectedValues.push({
@@ -44261,7 +44743,7 @@ async function heldOutIntegrityFailures(plan, repositoryPath) {
     for (const integrity of entry.integrity) {
       let actualHash;
       if (integrity.kind === "package_script") {
-        const manifest2 = await readFile4(resolve10(repositoryPath, integrity.path), "utf8").then(
+        const manifest2 = await readFile4(resolve11(repositoryPath, integrity.path), "utf8").then(
           (value2) => JSON.parse(value2)
         ).catch(() => void 0);
         const value = manifest2?.scripts?.[integrity.script];
@@ -48023,15 +48505,47 @@ async function executeRun(input) {
   let graph = await input.store.loadGraph();
   const lock = new RunLock(join12(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
   await lock.acquire();
+  const lockSignal = lock.signal;
+  const ownedStore = new Proxy(input.store, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (typeof value !== "function") return value;
+      return (...args) => {
+        if (lockSignal.aborted) throw lockSignal.reason;
+        return Reflect.apply(value, target, args);
+      };
+    }
+  });
+  input = { ...input, store: ownedStore };
   const controlChannel = new RunControlChannel(input.store.graphcraftRoot, contract.runId);
   const controlAbort = new AbortController();
+  let causalFailure;
+  let infrastructureFailure;
+  let bodyFailureWasThrown = false;
+  const rememberFailure = (error51) => causalFailure ??= { error: error51 };
+  const rememberInfrastructureFailure = (error51) => {
+    infrastructureFailure ??= { error: error51 };
+    rememberFailure(error51);
+  };
+  const recordLockLoss = () => {
+    rememberInfrastructureFailure(lockSignal.reason);
+  };
+  if (lockSignal.aborted) recordLockLoss();
+  else lockSignal.addEventListener("abort", recordLockLoss, { once: true });
   let controlRequest;
-  const stopWatching = controlChannel.watch((request) => {
-    if (!controlRequest || request.action === "stop") controlRequest = request;
-    if (!controlAbort.signal.aborted)
-      controlAbort.abort({ cause: request.cause, reason: request.reason });
-  });
-  const signal = AbortSignal.any([externalSignal, controlAbort.signal]);
+  const stopWatching = controlChannel.watch(
+    (request) => {
+      if (!controlRequest || request.action === "stop") controlRequest = request;
+      if (!controlAbort.signal.aborted)
+        controlAbort.abort({ cause: request.cause, reason: request.reason });
+    },
+    100,
+    (error51) => {
+      rememberInfrastructureFailure(error51);
+      if (!controlAbort.signal.aborted) controlAbort.abort(error51);
+    }
+  );
+  const signal = AbortSignal.any([externalSignal, controlAbort.signal, lockSignal]);
   try {
     let state = await input.store.loadState();
     if (state.status === "awaiting_approval") {
@@ -48113,8 +48627,8 @@ async function executeRun(input) {
       }
     const finishInterruption = async (nodeIds, termination, artifact) => {
       const activeNodeIds = nodeIds ? Array.isArray(nodeIds) ? nodeIds : [nodeIds] : [];
-      const request = controlRequest;
-      const reason = request ? { cause: request.cause, reason: request.reason } : interruptionReason(externalSignal.reason, "runtime_shutdown");
+      const request = infrastructureFailure ? void 0 : signal.reason === controlAbort.signal.reason ? controlRequest : void 0;
+      const reason = infrastructureFailure ? interruptionReason(infrastructureFailure.error, "runtime_shutdown") : request ? { cause: request.cause, reason: request.reason } : interruptionReason(signal.reason, "runtime_shutdown");
       const action = request?.action ?? "pause";
       const currentState = await input.store.loadState();
       if (action === "stop") {
@@ -49304,16 +49818,27 @@ async function executeRun(input) {
   } catch (error51) {
     if (error51 instanceof RunStoreLimitError && error51.blockerPersisted)
       return await input.store.loadState();
-    throw error51;
+    bodyFailureWasThrown = true;
+    throw rememberFailure(error51).error;
   } finally {
-    await stopWatching();
-    await lock.release();
+    try {
+      await stopWatching();
+    } catch (error51) {
+      rememberInfrastructureFailure(error51);
+    }
+    try {
+      await lock.release();
+    } catch (error51) {
+      rememberInfrastructureFailure(error51);
+    }
+    lockSignal.removeEventListener("abort", recordLockLoss);
+    if (!bodyFailureWasThrown && causalFailure) throw causalFailure.error;
   }
 }
 
 // packages/runtime/src/supervisor.ts
 import { open as open7, readdir as readdir5 } from "node:fs/promises";
-import { dirname as dirname8, join as join13, relative as relative7, resolve as resolve11 } from "node:path";
+import { dirname as dirname8, join as join13, relative as relative8, resolve as resolve12 } from "node:path";
 var KIB3 = 1024;
 var SUPERVISOR_LOG_MAX_BYTES = 64 * KIB3;
 var SUPERVISOR_LOG_RETAIN_BYTES = 32 * KIB3;
@@ -49346,7 +49871,7 @@ async function listSupervisorRecords(repositoryRoot, runId) {
   const ownedRoot = graphcraftRoot(repositoryRoot);
   let entries;
   try {
-    await validatePrivatePath(ownedRoot, relative7(ownedRoot, root));
+    await validatePrivatePath(ownedRoot, relative8(ownedRoot, root));
     entries = await readdir5(root, { withFileTypes: true });
   } catch (error51) {
     if (error51.code === "ENOENT") return [];
@@ -49355,7 +49880,7 @@ async function listSupervisorRecords(repositoryRoot, runId) {
   const records = await Promise.all(
     entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json")).map(async (entry) => {
       const path = join13(root, entry.name);
-      await validatePrivatePath(ownedRoot, relative7(ownedRoot, path));
+      await validatePrivatePath(ownedRoot, relative8(ownedRoot, path));
       return await readSupervisorRecord(path, ownedRoot);
     })
   );
@@ -49624,7 +50149,7 @@ async function runtimePairHasExactEntries(runtimeDirectory, bundled) {
 }
 async function runtimeDirectoryKind(path) {
   try {
-    const metadata = await lstat8(path);
+    const metadata = await lstat9(path);
     return metadata.isDirectory() && !metadata.isSymbolicLink() ? "directory" : "other";
   } catch (error51) {
     if (error51.code === "ENOENT") return "missing";
@@ -49636,7 +50161,7 @@ function modeMatches(mode, expectedMode) {
 }
 async function managedDirectoryMatches(path, expectedMode) {
   try {
-    const metadata = await lstat8(path);
+    const metadata = await lstat9(path);
     return metadata.isDirectory() && !metadata.isSymbolicLink() && modeMatches(metadata.mode, expectedMode);
   } catch {
     return false;
@@ -49660,7 +50185,7 @@ async function readRegularFile(path, expectedMode, maximumBytes = MANAGED_RUNTIM
   if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0) return void 0;
   let pathMetadata;
   try {
-    pathMetadata = await lstat8(path);
+    pathMetadata = await lstat9(path);
   } catch {
     return void 0;
   }
@@ -49668,7 +50193,7 @@ async function readRegularFile(path, expectedMode, maximumBytes = MANAGED_RUNTIM
     return void 0;
   try {
     const source = await readPrivateFileBounded(path, maximumBytes, ownedRoot);
-    const finalPathMetadata = await lstat8(path);
+    const finalPathMetadata = await lstat9(path);
     return finalPathMetadata.isFile() && !finalPathMetadata.isSymbolicLink() && modeMatches(finalPathMetadata.mode, expectedMode) && finalPathMetadata.dev === pathMetadata.dev && finalPathMetadata.ino === pathMetadata.ino && finalPathMetadata.size === source.byteLength ? source : void 0;
   } catch {
     return void 0;
@@ -49678,8 +50203,8 @@ async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
   const moduleDirectory = dirname9(fileURLToPath(moduleUrl));
   const candidates = [
     join14(moduleDirectory, "mcp.mjs"),
-    resolve12(moduleDirectory, "../../../dist/mcp.mjs"),
-    resolve12(process.cwd(), "dist/mcp.mjs")
+    resolve13(moduleDirectory, "../../../dist/mcp.mjs"),
+    resolve13(process.cwd(), "dist/mcp.mjs")
   ];
   for (const candidate of candidates) {
     try {
@@ -49691,7 +50216,7 @@ async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
   throw new Error("dist/mcp.mjs is missing; run pnpm build before installing Graphcraft");
 }
 function resolveGraphcraftHome(configuredHome = process.env.GRAPHCRAFT_HOME) {
-  return configuredHome?.trim() ? resolve12(configuredHome) : join14(homedir(), ".graphcraft");
+  return configuredHome?.trim() ? resolve13(configuredHome) : join14(homedir(), ".graphcraft");
 }
 async function ensureGraphcraftHomeIfPresent(graphcraftHome) {
   if (await runtimeDirectoryKind(graphcraftHome) === "missing") return false;
@@ -49718,8 +50243,8 @@ async function withPrivateHostCommandCwd(operation, createdBoundary) {
 }
 function sameRuntimePath(left, right) {
   if (!isAbsolute9(left) || !isAbsolute9(right)) return false;
-  const normalizedLeft = resolve12(left);
-  const normalizedRight = resolve12(right);
+  const normalizedLeft = resolve13(left);
+  const normalizedRight = resolve13(right);
   return platform() === "win32" ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase() : normalizedLeft === normalizedRight;
 }
 async function inspectHostRegistration(host, expected, runner, cwd, knownSingleArguments = []) {
@@ -49815,7 +50340,7 @@ async function readRegistrationReceiptBytes(graphcraftHome, host) {
   const source = await readRegularFile(path, 384, REGISTRATION_RECEIPT_MAX_BYTES, graphcraftHome);
   if (source) return source;
   try {
-    await lstat8(path);
+    await lstat9(path);
   } catch (error51) {
     if (error51.code === "ENOENT") return void 0;
     throw error51;

@@ -9,6 +9,7 @@ import {
   rm,
   stat,
   symlink,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -17,13 +18,18 @@ import { afterEach, describe, expect, it } from "vitest";
 import { compileGraph, compileRunContract } from "@graphcraft/core";
 import {
   ensurePrivateDirectory,
+  finalizePrivateDirectoryMutation,
   hardenPrivateFile,
   hardenPrivateTree,
+  preparePrivateDirectoryMutation,
   privateEntryIdentityFingerprint,
+  publishPrivateFileAtomic,
   readPrivateFileBounded,
   readRegularFileBounded,
   validatePrivatePath,
+  writePrivateJsonAtomic,
 } from "./secure-fs.ts";
+import { writeJsonAtomic } from "./json.ts";
 import { RunStore } from "./store.ts";
 
 const temporaryRoots: string[] = [];
@@ -140,6 +146,31 @@ if (-not $acl.AreAccessRulesProtected -or $owner.Value -ne $sid.Value -or
     $rules[0].PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None -or
     $rules[0].IdentityReference.Value -ne $sid.Value) {
   throw 'Owner-only ACL assertion failed'
+}
+`,
+  );
+}
+
+async function expectWindowsOwnerExclusive(path: string): Promise<void> {
+  await runWindowsPowerShell(
+    path,
+    String.raw`
+$ErrorActionPreference = 'Stop'
+$path = [Environment]::GetEnvironmentVariable('GRAPHCRAFT_ACL_TEST_PATH')
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$item = [System.IO.FileInfo]::new($path)
+$sections = ([System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner)
+$acl = $item.GetAccessControl($sections)
+$owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier])
+$rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+if ($acl.AreAccessRulesProtected -or $owner.Value -ne $sid.Value -or
+    $rules.Count -ne 1 -or -not $rules[0].IsInherited -or
+    $rules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+    $rules[0].FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl -or
+    $rules[0].InheritanceFlags -ne [System.Security.AccessControl.InheritanceFlags]::None -or
+    $rules[0].PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None -or
+    $rules[0].IdentityReference.Value -ne $sid.Value) {
+  throw 'Owner-exclusive ACL assertion failed'
 }
 `,
   );
@@ -406,6 +437,83 @@ describe("secure filesystem permissions", () => {
     else await expectWindowsOwnerOnly(file);
   });
 
+  it("serializes concurrent private JSON replacements without poisoning later writes", async () => {
+    const root = await temporaryRoot();
+    const ownedRoot = join(root, "concurrent private projections");
+    const path = join(ownedRoot, "state.json");
+    await ensurePrivateDirectory(ownedRoot);
+
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    await expect(writePrivateJsonAtomic(path, cyclic, ownedRoot)).rejects.toThrow(
+      "safe redaction depth",
+    );
+
+    for (let wave = 0; wave < 2; wave += 1) {
+      await Promise.all(
+        Array.from({ length: 32 }, (_, sequence) =>
+          writePrivateJsonAtomic(path, { sequence: wave * 32 + sequence }, ownedRoot),
+        ),
+      );
+      const persisted = JSON.parse(
+        (await readPrivateFileBounded(path, 1024, ownedRoot)).toString("utf8"),
+      ) as { sequence: number };
+      expect(persisted.sequence).toBeGreaterThanOrEqual(wave * 32);
+      expect(persisted.sequence).toBeLessThan((wave + 1) * 32);
+    }
+
+    if (process.platform !== "win32") await expectMode(path, 0o600);
+    else await expectWindowsOwnerExclusive(path);
+  });
+
+  it("keeps strict publication identity by default but accepts a private projection supersession", async () => {
+    const root = await temporaryRoot();
+    const ownedRoot = join(root, "superseded private projections");
+    await ensurePrivateDirectory(ownedRoot);
+    const publishThenSupersede = async (path: string) => {
+      const publication = await writeJsonAtomic(path, { writer: "original" });
+      await writeJsonAtomic(path, { writer: "external" });
+      return publication;
+    };
+    const strictPath = join(ownedRoot, "strict.json");
+
+    await expect(
+      publishPrivateFileAtomic({
+        path: strictPath,
+        ownedRoot,
+        sourceDirectory: ownedRoot,
+        hardenOnPosix: false,
+        publish: async () => await publishThenSupersede(strictPath),
+      }),
+    ).rejects.toThrow("changed filesystem identity");
+    expect(
+      JSON.parse((await readPrivateFileBounded(strictPath, 1024, ownedRoot)).toString("utf8")),
+    ).toEqual({ writer: "external" });
+
+    const projectionPath = join(ownedRoot, "projection.json");
+    await expect(
+      publishPrivateFileAtomic({
+        path: projectionPath,
+        ownedRoot,
+        sourceDirectory: ownedRoot,
+        hardenOnPosix: false,
+        supersessionPolicy: "reconstructable_projection",
+        publish: async () => await publishThenSupersede(projectionPath),
+      }),
+    ).resolves.toBeUndefined();
+    expect(
+      JSON.parse((await readPrivateFileBounded(projectionPath, 1024, ownedRoot)).toString("utf8")),
+    ).toEqual({ writer: "external" });
+
+    if (process.platform !== "win32") {
+      await expectMode(strictPath, 0o600);
+      await expectMode(projectionPath, 0o600);
+    } else {
+      await expectWindowsOwnerExclusive(strictPath);
+      await expectWindowsOwnerOnly(projectionPath);
+    }
+  });
+
   it.skipIf(process.platform !== "win32")(
     "removes inherited and explicit non-owner Windows access rules",
     async () => {
@@ -439,6 +547,88 @@ describe("secure filesystem permissions", () => {
       await hardenPrivateFile(file, directory);
 
       for (const path of [directory, file]) await expectWindowsOwnerOnly(path);
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "serializes concurrent owner-only hardening of the same Windows directory",
+    async () => {
+      const root = await temporaryRoot();
+      const directory = join(root, "concurrent ACL target");
+      await mkdir(directory);
+      await grantWindowsEveryone(directory);
+
+      await Promise.all(Array.from({ length: 16 }, () => ensurePrivateDirectory(directory)));
+
+      await expectWindowsOwnerOnly(directory);
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "advances the Windows ACL cache across a controlled child unlink",
+    async () => {
+      const root = await temporaryRoot();
+      const directory = join(root, "directory mutation");
+      const file = join(directory, "removed.txt");
+      await ensurePrivateDirectory(directory);
+      await writeFile(file, "removed\n");
+      const mutation = await preparePrivateDirectoryMutation(directory);
+
+      await unlink(file);
+      await finalizePrivateDirectoryMutation(mutation);
+      await ensurePrivateDirectory(directory);
+
+      await expectWindowsOwnerOnly(directory);
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "publishes concurrent JSON replacements under owner-exclusive inherited ACLs",
+    async () => {
+      const root = await temporaryRoot();
+      const ownedRoot = join(root, "private projections");
+      const path = join(ownedRoot, "state.json");
+      await ensurePrivateDirectory(ownedRoot);
+      await writePrivateJsonAtomic(path, { sequence: 0 }, ownedRoot);
+      await expectWindowsOwnerExclusive(path);
+
+      await grantWindowsEveryone(path);
+      await Promise.all(
+        Array.from({ length: 16 }, (_, sequence) =>
+          writePrivateJsonAtomic(path, { sequence: sequence + 1 }, ownedRoot),
+        ),
+      );
+
+      expect(
+        JSON.parse((await readPrivateFileBounded(path, 1024, ownedRoot)).toString("utf8")),
+      ).toMatchObject({ sequence: expect.any(Number) });
+      await expectWindowsOwnerOnly(ownedRoot);
+      await expectWindowsOwnerExclusive(path);
+      await hardenPrivateFile(path, ownedRoot);
+      await expectWindowsOwnerOnly(path);
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "publishes artifacts across verified Windows staging and target parents",
+    async () => {
+      const root = await temporaryRoot();
+      const contract = compileRunContract(
+        "Exercise Windows artifact ACL publication",
+        { root, baseRef: "main", baseSha: "a".repeat(40) },
+        { finishLine: "local_verified" },
+      );
+      const graph = compileGraph(contract, [
+        { id: "verification-file", kind: "file", path: "verified.txt", shouldExist: true },
+      ]);
+      const store = await RunStore.create(root, contract, graph);
+      const path = join(store.runRoot, "artifacts", "nested", "result.txt");
+
+      await store.writeArtifact("nested/result.txt", "owner-exclusive artifact\n");
+
+      await expectWindowsOwnerExclusive(path);
+      await hardenPrivateFile(path, store.runRoot);
+      await expectWindowsOwnerOnly(path);
     },
   );
 

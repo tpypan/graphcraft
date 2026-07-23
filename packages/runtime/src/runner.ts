@@ -3037,15 +3037,47 @@ export async function executeRun(input: {
   let graph = await input.store.loadGraph();
   const lock = new RunLock(join(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
   await lock.acquire();
+  const lockSignal = lock.signal;
+  const ownedStore = new Proxy(input.store, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target) as unknown;
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        if (lockSignal.aborted) throw lockSignal.reason;
+        return Reflect.apply(value, target, args);
+      };
+    },
+  });
+  input = { ...input, store: ownedStore };
   const controlChannel = new RunControlChannel(input.store.graphcraftRoot, contract.runId);
   const controlAbort = new AbortController();
+  let causalFailure: { error: unknown } | undefined;
+  let infrastructureFailure: { error: unknown } | undefined;
+  let bodyFailureWasThrown = false;
+  const rememberFailure = (error: unknown): { error: unknown } => (causalFailure ??= { error });
+  const rememberInfrastructureFailure = (error: unknown): void => {
+    infrastructureFailure ??= { error };
+    rememberFailure(error);
+  };
+  const recordLockLoss = (): void => {
+    rememberInfrastructureFailure(lockSignal.reason);
+  };
+  if (lockSignal.aborted) recordLockLoss();
+  else lockSignal.addEventListener("abort", recordLockLoss, { once: true });
   let controlRequest: RunControlRequest | undefined;
-  const stopWatching = controlChannel.watch((request) => {
-    if (!controlRequest || request.action === "stop") controlRequest = request;
-    if (!controlAbort.signal.aborted)
-      controlAbort.abort({ cause: request.cause, reason: request.reason });
-  });
-  const signal = AbortSignal.any([externalSignal, controlAbort.signal]);
+  const stopWatching = controlChannel.watch(
+    (request) => {
+      if (!controlRequest || request.action === "stop") controlRequest = request;
+      if (!controlAbort.signal.aborted)
+        controlAbort.abort({ cause: request.cause, reason: request.reason });
+    },
+    100,
+    (error) => {
+      rememberInfrastructureFailure(error);
+      if (!controlAbort.signal.aborted) controlAbort.abort(error);
+    },
+  );
+  const signal = AbortSignal.any([externalSignal, controlAbort.signal, lockSignal]);
   try {
     let state = await input.store.loadState();
     if (state.status === "awaiting_approval") {
@@ -3151,10 +3183,16 @@ export async function executeRun(input: {
       artifact?: string,
     ): Promise<RunState> => {
       const activeNodeIds = nodeIds ? (Array.isArray(nodeIds) ? nodeIds : [nodeIds]) : [];
-      const request = controlRequest;
-      const reason = request
-        ? { cause: request.cause, reason: request.reason }
-        : interruptionReason(externalSignal.reason, "runtime_shutdown");
+      const request = infrastructureFailure
+        ? undefined
+        : signal.reason === controlAbort.signal.reason
+          ? controlRequest
+          : undefined;
+      const reason = infrastructureFailure
+        ? interruptionReason(infrastructureFailure.error, "runtime_shutdown")
+        : request
+          ? { cause: request.cause, reason: request.reason }
+          : interruptionReason(signal.reason, "runtime_shutdown");
       const action = request?.action ?? "pause";
       const currentState = await input.store.loadState();
       if (action === "stop")
@@ -4469,10 +4507,21 @@ export async function executeRun(input: {
   } catch (error) {
     if (error instanceof RunStoreLimitError && error.blockerPersisted)
       return await input.store.loadState();
-    throw error;
+    bodyFailureWasThrown = true;
+    throw rememberFailure(error).error;
   } finally {
-    await stopWatching();
-    await lock.release();
+    try {
+      await stopWatching();
+    } catch (error) {
+      rememberInfrastructureFailure(error);
+    }
+    try {
+      await lock.release();
+    } catch (error) {
+      rememberInfrastructureFailure(error);
+    }
+    lockSignal.removeEventListener("abort", recordLockLoss);
+    if (!bodyFailureWasThrown && causalFailure) throw causalFailure.error;
   }
 }
 

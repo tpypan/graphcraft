@@ -399,7 +399,7 @@ describe("bounded adapter streams", () => {
         termination: expect.objectContaining({
           cause: "user_pause",
           outcome: "forced",
-          requestedSignal: "SIGKILL",
+          requestedSignal: process.platform === "win32" ? "SIGTERM" : "SIGKILL",
         }),
       });
       vi.useFakeTimers();
@@ -464,17 +464,20 @@ describe("bounded adapter streams", () => {
     );
   });
 
-  it("records the first Windows termination request as forced", () => {
+  it("keeps the logical Windows termination request stable through escalation", async () => {
     const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    vi.useFakeTimers();
     try {
       const child = new FakeChild();
       const abort = new AbortController();
       const controller = new ChildTerminationController(
         child as unknown as ChildProcess,
         abort.signal,
+        10,
       );
 
       abort.abort({ cause: "user_pause", reason: "Windows termination receipt" });
+      await vi.advanceTimersByTimeAsync(10);
 
       expect(controller.finish(null, null)).toMatchObject({
         cause: "user_pause",
@@ -482,7 +485,9 @@ describe("bounded adapter streams", () => {
         requestedSignal: "SIGTERM",
       });
       expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+      expect(child.kill).toHaveBeenCalledWith("SIGKILL");
     } finally {
+      vi.useRealTimers();
       platform.mockRestore();
     }
   });

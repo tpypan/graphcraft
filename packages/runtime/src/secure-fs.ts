@@ -2,13 +2,14 @@ import { spawn } from "node:child_process";
 import { constants as fsConstants, type BigIntStats } from "node:fs";
 import { chmod, lstat, mkdir, open, readdir } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep, win32 } from "node:path";
-import { syncDirectory } from "./json.ts";
+import { syncDirectory, writeJsonAtomic, type AtomicFilePublication } from "./json.ts";
 
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const WINDOWS_ACL_TIMEOUT_MS = 120_000;
 const WINDOWS_ACL_OUTPUT_LIMIT_BYTES = 64 * 1024;
 const WINDOWS_ACL_CACHE_LIMIT = 4_096;
+const WINDOWS_ACL_VERIFICATION_ATTEMPTS = 3;
 const DARWIN_ACL_TIMEOUT_MS = 30_000;
 const DARWIN_ACL_BATCH_MAX_ENTRIES = 256;
 const DARWIN_ACL_BATCH_MAX_ARGUMENT_BYTES = 64 * 1024;
@@ -22,6 +23,8 @@ interface PrivateEntry {
 
 const hardenedWindowsIdentities = new Map<string, string>();
 const hardenedDarwinEntries = new Map<string, string>();
+const privatePathMutationTails = new Map<string, Promise<void>>();
+let windowsAclWorkTail = Promise.resolve();
 
 /*
  * Paths are base64-encoded on stdin rather than interpolated into this script.
@@ -65,7 +68,9 @@ try {
   }
   if ($targets.Count -eq 0) { throw 'No Graphcraft ACL targets were supplied' }
 
+  $targetIndex = 0
   foreach ($target in $targets) {
+    $targetIndex += 1
     $attributes = [System.IO.File]::GetAttributes($target.Path)
     if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
       throw 'Graphcraft ACL target became a reparse point'
@@ -108,14 +113,22 @@ try {
       $true,
       [System.Security.Principal.SecurityIdentifier]
     ))
-    if (-not $verified.AreAccessRulesProtected -or $owner.Value -ne $sid.Value -or
-        $rules.Count -ne 1 -or $rules[0].IsInherited -or
-        $rules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
-        $rules[0].FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl -or
-        $rules[0].InheritanceFlags -ne $inheritance -or
-        $rules[0].PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None -or
-        $rules[0].IdentityReference.Value -ne $sid.Value) {
-      throw 'Graphcraft owner-only ACL verification failed'
+    $failures = [System.Collections.Generic.List[string]]::new()
+    if (-not $verified.AreAccessRulesProtected) { [void]$failures.Add('protection') }
+    if ($owner.Value -ne $sid.Value) { [void]$failures.Add('owner') }
+    if ($rules.Count -ne 1) {
+      [void]$failures.Add('rule_count')
+    } else {
+      if ($rules[0].IsInherited) { [void]$failures.Add('inherited') }
+      if ($rules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { [void]$failures.Add('type') }
+      if ($rules[0].FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl) { [void]$failures.Add('rights') }
+      if ($rules[0].InheritanceFlags -ne $inheritance) { [void]$failures.Add('inheritance') }
+      if ($rules[0].PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None) { [void]$failures.Add('propagation') }
+      if ($rules[0].IdentityReference.Value -ne $sid.Value) { [void]$failures.Add('identity') }
+    }
+    if ($failures.Count -gt 0) {
+      $kind = if ($isDirectory) { 'D' } else { 'F' }
+      throw "Graphcraft owner-only ACL verification failed for target $targetIndex ($kind): $($failures -join ',')"
     }
   }
   [Console]::Out.WriteLine("GRAPHCRAFT_ACL_OK:$($targets.Count)")
@@ -263,7 +276,7 @@ async function collectPrivateTree(root: string): Promise<PrivateEntry[]> {
   return entries;
 }
 
-async function runWindowsAclBatch(entries: PrivateEntry[]): Promise<void> {
+async function runWindowsAclBatchOnce(entries: PrivateEntry[]): Promise<void> {
   if (entries.length === 0) return;
   const payload = `${entries
     .map(
@@ -350,8 +363,64 @@ async function runWindowsAclBatch(entries: PrivateEntry[]): Promise<void> {
   });
 }
 
-async function hardenWindowsEntries(entries: PrivateEntry[], force = false): Promise<void> {
-  if (supportsPosixModes || entries.length === 0) return;
+async function runWindowsAclBatch(entries: PrivateEntry[]): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await runWindowsAclBatchOnce(entries);
+      return;
+    } catch (error) {
+      if (
+        attempt >= WINDOWS_ACL_VERIFICATION_ATTEMPTS ||
+        !(error instanceof Error) ||
+        !error.message.includes("owner-only ACL verification failed")
+      )
+        throw error;
+      await new Promise<void>((resolveRetry) => setTimeout(resolveRetry, attempt * 25));
+    }
+  }
+}
+
+async function serializeWindowsAclWork<T>(work: () => Promise<T>): Promise<T> {
+  if (supportsPosixModes) return await work();
+  const previous = windowsAclWorkTail;
+  let release!: () => void;
+  windowsAclWorkTail = new Promise<void>((resolveTurn) => {
+    release = resolveTurn;
+  });
+  await previous;
+  try {
+    return await work();
+  } finally {
+    release();
+  }
+}
+
+/** Serialize one private path-entry mutation without coupling it to ACL work. @internal */
+export async function serializePrivatePathMutation<T>(
+  path: string,
+  work: () => Promise<T>,
+): Promise<T> {
+  const absolute = resolve(path);
+  const previous = privatePathMutationTails.get(absolute);
+  let release!: () => void;
+  const turn = new Promise<void>((resolveTurn) => {
+    release = resolveTurn;
+  });
+  privatePathMutationTails.set(absolute, turn);
+  if (previous) await previous;
+  try {
+    return await work();
+  } finally {
+    release();
+    // Retain only paths with queued or active mutations. Each gate resolves
+    // independently of work success, so a failed operation cannot poison a
+    // later mutation for the same target.
+    if (privatePathMutationTails.get(absolute) === turn) privatePathMutationTails.delete(absolute);
+  }
+}
+
+async function hardenWindowsEntriesLocked(entries: PrivateEntry[], force = false): Promise<void> {
+  if (entries.length === 0) return;
   const pending: Array<{
     entry: PrivateEntry;
     identityFingerprint: string | undefined;
@@ -379,6 +448,11 @@ async function hardenWindowsEntries(entries: PrivateEntry[], force = false): Pro
     if (inspected.identityFingerprint === identityFingerprint)
       rememberWindowsIdentity(identityFingerprint, inspected.metadataFingerprint);
   }
+}
+
+async function hardenWindowsEntries(entries: PrivateEntry[], force = false): Promise<void> {
+  if (supportsPosixModes || entries.length === 0) return;
+  await serializeWindowsAclWork(async () => hardenWindowsEntriesLocked(entries, force));
 }
 
 async function runDarwinAclBatch(paths: string[]): Promise<void> {
@@ -656,6 +730,240 @@ export async function ensurePrivateDirectory(path: string, ownedRoot = path): Pr
     await syncDirectory(directory);
     await syncDirectory(dirname(directory));
   }
+}
+
+export interface PrivateDirectoryMutationCheckpoint {
+  readonly path: string;
+  readonly identityFingerprint: string | undefined;
+  readonly metadataFingerprint: string | undefined;
+}
+
+const activePrivateDirectoryMutations = new WeakSet<PrivateDirectoryMutationCheckpoint>();
+
+/** Begin one narrow child create, rename, or unlink beneath a private directory. @internal */
+export async function preparePrivateDirectoryMutation(
+  path: string,
+  ownedRoot = path,
+): Promise<PrivateDirectoryMutationCheckpoint> {
+  const absolute = resolve(path);
+  await ensurePrivateDirectory(absolute, ownedRoot);
+  const inspected = await inspectPrivateEntry(absolute);
+  if (inspected.entry.kind !== "directory")
+    throw new Error(`Private mutation parent is not a directory: ${absolute}`);
+  const checkpoint = {
+    path: absolute,
+    identityFingerprint: inspected.identityFingerprint,
+    metadataFingerprint: inspected.metadataFingerprint,
+  };
+  activePrivateDirectoryMutations.add(checkpoint);
+  return checkpoint;
+}
+
+/** Finish a directory-entry mutation begun by preparePrivateDirectoryMutation. @internal */
+export async function finalizePrivateDirectoryMutation(
+  checkpoint: PrivateDirectoryMutationCheckpoint,
+  ownedRoot = checkpoint.path,
+): Promise<void> {
+  if (!activePrivateDirectoryMutations.delete(checkpoint)) {
+    await ensurePrivateDirectory(checkpoint.path, ownedRoot);
+    return;
+  }
+  if (supportsPosixModes) {
+    if (process.platform !== "darwin") return;
+    await validatePrivatePath(ownedRoot, relative(resolve(ownedRoot), resolve(checkpoint.path)));
+    const inspected = await inspectPrivateEntry(checkpoint.path);
+    if (
+      inspected.entry.kind === "directory" &&
+      checkpoint.identityFingerprint !== undefined &&
+      inspected.identityFingerprint === checkpoint.identityFingerprint &&
+      hardenedDarwinEntries.get(checkpoint.path) === checkpoint.metadataFingerprint
+    ) {
+      rememberDarwinEntry(checkpoint.path, inspected.metadataFingerprint);
+      return;
+    }
+    if (inspected.entry.kind !== "directory")
+      throw new Error(`Private mutation parent is not a directory: ${checkpoint.path}`);
+    await hardenPosixEntries([inspected.entry]);
+    return;
+  }
+  await serializeWindowsAclWork(async () => {
+    await validatePrivatePath(ownedRoot, relative(resolve(ownedRoot), resolve(checkpoint.path)));
+    const inspected = await inspectPrivateEntry(checkpoint.path);
+    if (
+      inspected.entry.kind === "directory" &&
+      checkpoint.identityFingerprint !== undefined &&
+      inspected.identityFingerprint === checkpoint.identityFingerprint &&
+      hardenedWindowsIdentities.get(checkpoint.identityFingerprint) ===
+        checkpoint.metadataFingerprint
+    ) {
+      rememberWindowsIdentity(inspected.identityFingerprint, inspected.metadataFingerprint);
+      return;
+    }
+    if (inspected.entry.kind !== "directory")
+      throw new Error(`Private mutation parent is not a directory: ${checkpoint.path}`);
+    await hardenWindowsEntriesLocked([inspected.entry]);
+  });
+}
+
+/** Publish one descriptor-identified file beneath verified owner-only parents. @internal */
+export async function publishPrivateFileAtomic(input: {
+  path: string;
+  ownedRoot: string;
+  sourceDirectory: string;
+  hardenOnPosix: boolean;
+  supersessionPolicy?: "strict" | "reconstructable_projection";
+  publish: () => Promise<AtomicFilePublication>;
+}): Promise<void> {
+  const absolute = resolve(input.path);
+  const root = resolve(input.ownedRoot);
+  const sourceDirectory = resolve(input.sourceDirectory);
+  const targetDirectory = dirname(absolute);
+  const relativePath = relative(root, absolute);
+  await validatePrivatePath(root, relativePath);
+  const parentPaths = [...new Set([sourceDirectory, targetDirectory])];
+  for (const parent of parentPaths) await validatePrivatePath(root, relative(root, parent));
+
+  if (supportsPosixModes) {
+    await serializePrivatePathMutation(absolute, async () => {
+      const publication = await input.publish();
+      await validatePrivatePath(root, relativePath);
+      const fileAfter = await inspectPrivateEntry(absolute);
+      const publicationIdentity = privateEntryIdentityFingerprint({
+        dev: publication.device,
+        ino: publication.inode,
+        birthtimeNs: publication.birthtimeNs,
+      });
+      if (resolve(publication.path) !== absolute || fileAfter.entry.kind !== "file")
+        throw new Error(`Published private file changed filesystem identity: ${absolute}`);
+      const superseded =
+        publicationIdentity !== undefined &&
+        fileAfter.identityFingerprint !== undefined &&
+        fileAfter.identityFingerprint !== publicationIdentity;
+      if (superseded && input.supersessionPolicy !== "reconstructable_projection")
+        throw new Error(`Published private file changed filesystem identity: ${absolute}`);
+      // Event-reconstructable projections may be rewritten by another runtime
+      // process after this writer's atomic rename. Canonicalize that later
+      // regular, singly-linked file before accepting the benign supersession.
+      if (superseded || input.hardenOnPosix) await hardenPrivateFile(absolute, root);
+    });
+    return;
+  }
+
+  for (const parent of parentPaths) await ensurePrivateDirectory(parent, root);
+  await serializePrivatePathMutation(absolute, async () => {
+    await serializeWindowsAclWork(async () => {
+      await validatePrivatePath(root, relativePath);
+      try {
+        const existing = await inspectPrivateEntry(absolute);
+        if (existing.entry.kind !== "file")
+          throw new Error(`Private publication path is not a regular file: ${absolute}`);
+      } catch (error) {
+        if (!isMissing(error)) throw error;
+      }
+      await hardenWindowsEntriesLocked(
+        parentPaths.map((parent) => ({ kind: "directory", path: parent })),
+      );
+
+      const parentsBefore = await Promise.all(parentPaths.map(inspectPrivateEntry));
+      for (const parentBefore of parentsBefore) {
+        if (parentBefore.entry.kind !== "directory")
+          throw new Error(
+            `Private publication parent is not a directory: ${parentBefore.entry.path}`,
+          );
+        if (
+          parentBefore.identityFingerprint !== undefined &&
+          (parentBefore.metadataFingerprint === undefined ||
+            hardenedWindowsIdentities.get(parentBefore.identityFingerprint) !==
+              parentBefore.metadataFingerprint)
+        )
+          throw new Error(
+            `Unable to verify owner-only publication parent identity: ${parentBefore.entry.path}`,
+          );
+      }
+
+      const publication = await input.publish();
+      await validatePrivatePath(root, relativePath);
+      const [parentsAfter, fileAfter] = await Promise.all([
+        Promise.all(parentPaths.map(inspectPrivateEntry)),
+        inspectPrivateEntry(absolute),
+      ]);
+      let requiresFallbackHardening = false;
+      for (const [index, parentAfter] of parentsAfter.entries()) {
+        const parentBefore = parentsBefore[index]!;
+        if (parentAfter.entry.kind !== "directory")
+          throw new Error(
+            `Private publication parent changed filesystem identity: ${parentAfter.entry.path}`,
+          );
+        if (
+          parentBefore.identityFingerprint !== undefined &&
+          parentAfter.identityFingerprint !== undefined &&
+          parentAfter.identityFingerprint !== parentBefore.identityFingerprint
+        )
+          throw new Error(
+            `Private publication parent changed filesystem identity: ${parentAfter.entry.path}`,
+          );
+        requiresFallbackHardening ||=
+          parentBefore.identityFingerprint === undefined ||
+          parentAfter.identityFingerprint === undefined;
+      }
+      if (fileAfter.entry.kind !== "file")
+        throw new Error(`Published private path is not a regular file: ${absolute}`);
+
+      const publicationIdentity = privateEntryIdentityFingerprint({
+        dev: publication.device,
+        ino: publication.inode,
+        birthtimeNs: publication.birthtimeNs,
+      });
+      if (resolve(publication.path) !== absolute)
+        throw new Error(`Published private file changed filesystem identity: ${absolute}`);
+      const superseded =
+        publicationIdentity !== undefined &&
+        fileAfter.identityFingerprint !== undefined &&
+        fileAfter.identityFingerprint !== publicationIdentity;
+      if (superseded && input.supersessionPolicy !== "reconstructable_projection")
+        throw new Error(`Published private file changed filesystem identity: ${absolute}`);
+      requiresFallbackHardening ||=
+        superseded ||
+        publicationIdentity === undefined ||
+        fileAfter.identityFingerprint === undefined;
+      if (requiresFallbackHardening)
+        await hardenWindowsEntriesLocked(
+          [...parentsAfter.map(({ entry }) => entry), fileAfter.entry],
+          true,
+        );
+      else
+        for (const parentAfter of parentsAfter)
+          rememberWindowsIdentity(parentAfter.identityFingerprint, parentAfter.metadataFingerprint);
+    });
+  });
+}
+
+/**
+ * Atomically replace JSON beneath an owner-only directory. Windows inherits
+ * the verified parent ACL, while the descriptor receipt proves that the final
+ * path is the file Graphcraft created. The inherited file is deliberately not
+ * entered in the strict ACL cache, so an explicit hardenPrivateFile call still
+ * canonicalizes it to a protected, non-inherited owner-only ACL.
+ *
+ * @internal
+ */
+export async function writePrivateJsonAtomic(
+  path: string,
+  value: unknown,
+  ownedRoot: string,
+  options: {
+    supersessionPolicy?: "strict" | "reconstructable_projection";
+  } = {},
+): Promise<void> {
+  const absolute = resolve(path);
+  await publishPrivateFileAtomic({
+    path: absolute,
+    ownedRoot,
+    sourceDirectory: dirname(absolute),
+    hardenOnPosix: false,
+    supersessionPolicy: options.supersessionPolicy ?? "strict",
+    publish: async () => await writeJsonAtomic(absolute, value),
+  });
 }
 
 /** Harden a file when it exists. Missing files are intentionally ignored. */

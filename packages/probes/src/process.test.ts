@@ -120,6 +120,27 @@ describe("bounded subprocess output capture", () => {
     });
   });
 
+  it("normalizes a child close code after the timeout boundary", async () => {
+    vi.useFakeTimers();
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill: vi.fn(() => true),
+      unref: vi.fn(),
+    });
+    vi.spyOn(crossSpawn, "spawn").mockReturnValue(child as never);
+
+    const result = runProcess(process.execPath, [], {
+      cwd: process.cwd(),
+      timeoutMs: 10,
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    child.emit("close", 1, null);
+
+    await expect(result).resolves.toMatchObject({ exitCode: 124, timedOut: true });
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+  });
+
   it("settles after escalation when a timed-out child never emits close", async () => {
     vi.useFakeTimers();
     const child = Object.assign(new EventEmitter(), {

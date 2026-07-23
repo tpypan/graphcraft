@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { RunControlChannel } from "./control.ts";
 
 const temporaryRoots: string[] = [];
@@ -35,5 +35,32 @@ describe("run control persistence", () => {
     await truncate(channel.path, 64 * 1024 + 1);
 
     await expect(channel.read()).rejects.toThrow(/65536-byte bounded read limit/);
+  });
+
+  it("stops polling after the first read failure and reports it during shutdown", async () => {
+    const channel = await createChannel();
+    const graphcraftRoot = dirname(dirname(channel.path));
+    await channel.read();
+    await rm(graphcraftRoot, { recursive: true });
+    const read = vi.spyOn(channel, "read");
+    const callbackFailure = new Error("failure callback failed");
+    let reportFailure!: (error: unknown) => void;
+    const reportedFailure = new Promise<unknown>((resolve) => {
+      reportFailure = resolve;
+    });
+    const stopWatching = channel.watch(
+      () => undefined,
+      1,
+      (error) => {
+        reportFailure(error);
+        throw callbackFailure;
+      },
+    );
+
+    const watcherFailure = await reportedFailure;
+    expect(watcherFailure).toMatchObject({ code: "ENOENT" });
+
+    expect(read).toHaveBeenCalledTimes(1);
+    await expect(stopWatching()).rejects.toBe(watcherFailure);
   });
 });

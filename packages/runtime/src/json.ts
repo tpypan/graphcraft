@@ -3,18 +3,39 @@ import { mkdir, open, rename, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 import { redactValue } from "./redaction.ts";
 
-export async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
+export interface AtomicFilePublication {
+  readonly path: string;
+  readonly device: bigint;
+  readonly inode: bigint;
+  readonly birthtimeNs: bigint;
+}
+
+export async function writeJsonAtomic(
+  path: string,
+  value: unknown,
+): Promise<AtomicFilePublication> {
   await mkdir(dirname(path), { recursive: true });
   const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
   try {
     const handle = await open(temporaryPath, "wx", 0o600);
+    let publication: AtomicFilePublication;
     try {
       await handle.writeFile(`${JSON.stringify(redactValue(value), null, 2)}\n`, "utf8");
       await handle.sync();
+      const status = await handle.stat({ bigint: true });
+      if (!status.isFile() || status.nlink !== 1n)
+        throw new Error(`Atomic JSON temporary path is not a private regular file: ${path}`);
+      publication = {
+        path,
+        device: status.dev,
+        inode: status.ino,
+        birthtimeNs: status.birthtimeNs,
+      };
     } finally {
       await handle.close();
     }
     await replacePathAtomic(temporaryPath, path);
+    return publication;
   } catch (error) {
     await rm(temporaryPath, { force: true }).catch(() => undefined);
     throw error;

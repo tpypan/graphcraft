@@ -197,7 +197,10 @@ export class ChildTerminationController {
       this.delivered = false;
     }
     this.timer = setTimeout(() => {
-      this.requestedSignal = "SIGKILL";
+      // Windows already uses forceful taskkill /t /f for the logical SIGTERM
+      // stage. Retrying that same operation must not make durable receipts
+      // depend on whether asynchronous taskkill closes before this timer.
+      if (process.platform !== "win32") this.requestedSignal = "SIGKILL";
       try {
         this.forced = terminateChildProcessTree(this.child, "SIGKILL") || this.forced;
       } catch {

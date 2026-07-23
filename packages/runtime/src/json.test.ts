@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -18,13 +18,20 @@ describe("atomic JSON replacement", () => {
     temporaryRoots.push(root);
     const path = join(root, "state.json");
 
-    await Promise.all(
+    const publications = await Promise.all(
       Array.from({ length: 100 }, (_, sequence) =>
         writeJsonAtomic(path, { schemaVersion: 1, sequence, payload: "x".repeat(1024) }),
       ),
     );
 
+    const status = await lstat(path, { bigint: true });
     expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ schemaVersion: 1 });
+    expect(publications).toContainEqual({
+      path,
+      device: status.dev,
+      inode: status.ino,
+      birthtimeNs: status.birthtimeNs,
+    });
     expect((await readdir(root)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
   });
 });

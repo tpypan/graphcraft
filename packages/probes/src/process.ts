@@ -236,7 +236,7 @@ export async function runProcess(
         return;
       }
       resolve({
-        exitCode: code ?? (timedOut ? 124 : 1),
+        exitCode: timedOut ? 124 : (code ?? 1),
         stdout: stdout.text,
         stderr: stderr.text,
         durationMs: Math.round(performance.now() - started),

@@ -29,7 +29,7 @@ import {
   type RunEvent,
   type RunState,
 } from "@graphcraft/core";
-import { syncDirectory, writeJsonAtomic } from "./json.ts";
+import { syncDirectory } from "./json.ts";
 import { ensureCurrentRunStorage, writeCurrentRunStorageManifest } from "./migration.ts";
 import { assertPersistenceSafe, redactTextBytes, redactValue } from "./redaction.ts";
 import { RunArtifactStore, type ArtifactPreview } from "./artifact-policy.ts";
@@ -39,6 +39,7 @@ import {
   preparePrivateFileMutation,
   readPrivateFileBounded,
   validatePrivatePath,
+  writePrivateJsonAtomic,
 } from "./secure-fs.ts";
 
 const MEBIBYTE = 1024 * 1024;
@@ -223,10 +224,13 @@ export class RunStore {
     value: unknown,
     maximumBytes: number,
     label: string,
+    supersessionPolicy: "strict" | "reconstructable_projection" = "strict",
   ): Promise<void> {
     const persisted = redactValue(value);
     this.assertJsonProjectionFits(persisted, maximumBytes, label);
-    await writeJsonAtomic(join(this.runRoot, relativePath), persisted);
+    await writePrivateJsonAtomic(join(this.runRoot, relativePath), persisted, this.runRoot, {
+      supersessionPolicy,
+    });
   }
 
   private async readBoundedJson(relativePath: string, maximumBytes: number): Promise<unknown> {
@@ -471,6 +475,7 @@ export class RunStore {
       GraphSchema.parse(redactValue(graph)),
       RUN_METADATA_MAX_BYTES,
       "Run graph",
+      "reconstructable_projection",
     );
   }
 
@@ -501,6 +506,7 @@ export class RunStore {
       ProbePlanSchema.parse(probePlan),
       RUN_METADATA_MAX_BYTES,
       "Probe plan",
+      "reconstructable_projection",
     );
   }
 
@@ -537,6 +543,7 @@ export class RunStore {
       validateHeldOutProbePlan(heldOutProbePlan),
       RUN_METADATA_MAX_BYTES,
       "Held-out probe plan",
+      "reconstructable_projection",
     );
   }
 
@@ -927,7 +934,9 @@ export class RunStore {
     const bytes = serializedStateBytes(state);
     if (bytes > this.limits.maxStateBytes)
       throw new RunStoreLimitError("state", bytes, this.limits.maxStateBytes);
-    await writeJsonAtomic(join(this.runRoot, "state.json"), state);
+    await writePrivateJsonAtomic(join(this.runRoot, "state.json"), state, this.runRoot, {
+      supersessionPolicy: "reconstructable_projection",
+    });
   }
 }
 

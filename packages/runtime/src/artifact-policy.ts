@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, type BigIntStats } from "node:fs";
 import { lstat, open, readdir, rmdir, stat, unlink } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, posix, resolve, win32 } from "node:path";
+import { basename, dirname, isAbsolute, join, posix, relative, resolve, win32 } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
   ArtifactInventorySchema,
@@ -21,13 +21,16 @@ import {
   type HostEvent,
 } from "@graphcraft/core";
 import { redactTextBytes, redactValue } from "./redaction.ts";
-import { replacePathAtomic, syncDirectory } from "./json.ts";
+import { replacePathAtomic, syncDirectory, type AtomicFilePublication } from "./json.ts";
 import { RunLock } from "./lock.ts";
 import {
   ensurePrivateDirectory,
-  hardenPrivateFile,
+  finalizePrivateDirectoryMutation,
   hardenPrivateTree,
+  preparePrivateDirectoryMutation,
+  publishPrivateFileAtomic,
   readPrivateFileBounded,
+  validatePrivatePath,
 } from "./secure-fs.ts";
 
 const MIB = 1024 * 1024;
@@ -253,17 +256,35 @@ async function atomicWrite(root: string, relativePath: string, bytes: Uint8Array
   await ensurePrivateDirectory(stagingRoot, root);
   const temporaryPath = join(stagingRoot, `${randomUUID()}.tmp`);
   try {
-    const handle = await open(temporaryPath, "wx", 0o600);
-    try {
-      await handle.writeFile(bytes);
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    await hardenPrivateFile(temporaryPath, root);
-    await resolvePrivatePath(root, relativePath, true);
-    await replacePathAtomic(temporaryPath, path);
-    await hardenPrivateFile(path, root);
+    await publishPrivateFileAtomic({
+      path,
+      ownedRoot: root,
+      sourceDirectory: stagingRoot,
+      hardenOnPosix: true,
+      publish: async () => {
+        const handle = await open(temporaryPath, "wx", 0o600);
+        let publication: AtomicFilePublication;
+        try {
+          await handle.writeFile(bytes);
+          await handle.sync();
+          const status = await handle.stat({ bigint: true });
+          assertRegularPrivateTarget(temporaryPath, status);
+          publication = {
+            path,
+            device: status.dev,
+            inode: status.ino,
+            birthtimeNs: status.birthtimeNs,
+          };
+        } finally {
+          await handle.close();
+        }
+        await validatePrivatePath(root, relative(root, path));
+        const existing = await targetStatus(path);
+        if (existing) assertRegularPrivateTarget(path, existing);
+        await replacePathAtomic(temporaryPath, path);
+        return publication;
+      },
+    });
     return path;
   } catch (error) {
     const removed = await unlink(temporaryPath).then(
@@ -293,24 +314,35 @@ async function cleanupAtomicStaging(root: string): Promise<void> {
     if (!item.isFile() || item.isSymbolicLink())
       throw new Error(`Unsupported entry in artifact staging directory: ${path}`);
     assertRegularPrivateTarget(path, await lstat(path));
-    const removed = await unlink(path).then(
+    const mutation = await preparePrivateDirectoryMutation(stagingRoot, root);
+    try {
+      const removed = await unlink(path).then(
+        () => true,
+        (error) => {
+          if (isMissing(error)) return false;
+          throw error;
+        },
+      );
+      removedEntry ||= removed;
+    } finally {
+      await finalizePrivateDirectoryMutation(mutation, root);
+    }
+  }
+  if (removedEntry) await syncDirectory(stagingRoot);
+  const parent = dirname(stagingRoot);
+  const mutation = await preparePrivateDirectoryMutation(parent, root);
+  try {
+    const removedDirectory = await rmdir(stagingRoot).then(
       () => true,
       (error) => {
         if (isMissing(error)) return false;
         throw error;
       },
     );
-    removedEntry ||= removed;
+    if (removedDirectory) await syncDirectory(parent);
+  } finally {
+    await finalizePrivateDirectoryMutation(mutation, root);
   }
-  if (removedEntry) await syncDirectory(stagingRoot);
-  const removedDirectory = await rmdir(stagingRoot).then(
-    () => true,
-    (error) => {
-      if (isMissing(error)) return false;
-      throw error;
-    },
-  );
-  if (removedDirectory) await syncDirectory(dirname(stagingRoot));
 }
 
 async function removePrivateFile(root: string, relativePath: string): Promise<void> {
@@ -319,14 +351,20 @@ async function removePrivateFile(root: string, relativePath: string): Promise<vo
     throw error;
   });
   if (path) {
-    const removed = await unlink(path).then(
-      () => true,
-      (error) => {
-        if (isMissing(error)) return false;
-        throw error;
-      },
-    );
-    if (removed) await syncDirectory(dirname(path));
+    const parent = dirname(path);
+    const mutation = await preparePrivateDirectoryMutation(parent, root);
+    try {
+      const removed = await unlink(path).then(
+        () => true,
+        (error) => {
+          if (isMissing(error)) return false;
+          throw error;
+        },
+      );
+      if (removed) await syncDirectory(parent);
+    } finally {
+      await finalizePrivateDirectoryMutation(mutation, root);
+    }
   }
 }
 

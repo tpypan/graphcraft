@@ -45,7 +45,7 @@ import type {
 } from "@graphcraft/core";
 import { configureRunProbes, createRun, executeRun } from "./runner.ts";
 import { runProbes } from "@graphcraft/probes";
-import { requestRunControl } from "./control.ts";
+import { requestRunControl, RunControlChannel } from "./control.ts";
 import {
   decideRunControl,
   evaluateControlAcceptance,
@@ -8889,6 +8889,122 @@ process.stdin.on("end", () => {
       capsule: true,
       repositoryInventory: true,
     });
+  });
+
+  it("aborts active work and releases the run lock when the control watcher fails", async () => {
+    const repository = await createRepository();
+    let childAborted = false;
+    const adapter = new FakeAdapter(async (_request, _call, signal) => {
+      await waitForAbort(signal);
+      childAborted = true;
+    });
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    const watcherFailure = new Error("control watcher read failed");
+    let failRead!: (error: Error) => void;
+    const pendingRead = new Promise<undefined>((_resolve, reject) => {
+      failRead = reject;
+    });
+    const read = vi.spyOn(RunControlChannel.prototype, "read").mockReturnValueOnce(pendingRead);
+
+    try {
+      const execution = executeRun({ store: created.store, adapter, approve: true });
+      await waitFor(() => adapter.calls.length === 1);
+      failRead(watcherFailure);
+
+      await expect(execution).rejects.toBe(watcherFailure);
+      expect(childAborted).toBe(true);
+      expect(
+        (await created.store.loadEvents()).findLast(({ type }) => type === "control.applied")?.data,
+      ).toMatchObject({
+        request: null,
+        cause: "runtime_shutdown",
+        reason: watcherFailure.message,
+      });
+
+      const lock = new RunLock(
+        join(created.store.graphcraftRoot, "locks", `${created.contract.runId}.lock`),
+      );
+      await lock.acquire();
+      await lock.release();
+    } finally {
+      read.mockRestore();
+    }
+  });
+
+  it("aborts active work with the exact lock-loss failure without writing after loss", async () => {
+    const repository = await createRepository();
+    let childAborted = false;
+    const adapter = new FakeAdapter(async (_request, _call, signal) => {
+      await waitForAbort(signal);
+      childAborted = true;
+    });
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    const lockFailure = new Error("Graphcraft run lock ownership was lost by test");
+    const lockLoss = new AbortController();
+    const signal = vi.spyOn(RunLock.prototype, "signal", "get").mockReturnValue(lockLoss.signal);
+    const durableRunFiles = async (): Promise<Record<string, string>> =>
+      Object.fromEntries(
+        Object.entries(await snapshotFiles(created.store.runRoot)).filter(
+          ([path]) => !path.endsWith(".tmp"),
+        ),
+      );
+
+    try {
+      const execution = executeRun({ store: created.store, adapter, approve: true });
+      await waitFor(async () => {
+        const events = await created.store.loadEvents();
+        if (!events.some(({ type }) => type === "invocation.session")) return false;
+        return (await created.store.loadState()).lastEventSequence === events.at(-1)?.sequence;
+      });
+      const eventsBeforeLoss = await created.store.loadEvents();
+      const filesBeforeLoss = await durableRunFiles();
+      lockLoss.abort(lockFailure);
+
+      await expect(execution).rejects.toBe(lockFailure);
+      expect(childAborted).toBe(true);
+      expect(await created.store.loadEvents()).toEqual(eventsBeforeLoss);
+      expect(await durableRunFiles()).toEqual(filesBeforeLoss);
+    } finally {
+      signal.mockRestore();
+    }
+
+    const lock = new RunLock(
+      join(created.store.graphcraftRoot, "locks", `${created.contract.runId}.lock`),
+    );
+    await lock.acquire();
+    await lock.release();
+  });
+
+  it("preserves the watcher failure when lock release also fails", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async () => undefined);
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    const watcherFailure = new Error("control watcher shutdown failed");
+    const releaseFailure = new Error("run lock release failed");
+    const releaseLock = RunLock.prototype.release;
+    const watch = vi.spyOn(RunControlChannel.prototype, "watch").mockReturnValueOnce(async () => {
+      throw watcherFailure;
+    });
+    const release = vi.spyOn(RunLock.prototype, "release").mockImplementationOnce(async function (
+      this: RunLock,
+    ) {
+      await releaseLock.call(this);
+      throw releaseFailure;
+    });
+
+    try {
+      await expect(executeRun({ store: created.store, adapter })).rejects.toBe(watcherFailure);
+      expect(release).toHaveBeenCalledTimes(1);
+    } finally {
+      watch.mockRestore();
+      release.mockRestore();
+    }
   });
 
   it("coordinates an active stop and leaves no running node state", async () => {
