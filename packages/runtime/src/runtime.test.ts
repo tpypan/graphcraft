@@ -44,9 +44,11 @@ import type {
   WorkerRequest,
 } from "@graphcraft/core";
 import { configureRunProbes, createRun, executeRun } from "./runner.ts";
+import { runProbes } from "@graphcraft/probes";
 import { requestRunControl } from "./control.ts";
 import {
   decideRunControl,
+  evaluateControlAcceptance,
   recordRunApprovalDecisions,
   recordRuntimeControlDecision,
 } from "./governance.ts";
@@ -1072,6 +1074,331 @@ class FaultInjectingRunStore extends RunStore {
   }
 }
 
+type VerificationTailCheckpoint =
+  | "held_out.checked"
+  | "semantic.started"
+  | "semantic.missing_tokens"
+  | "semantic.verdict"
+  | "semantic.tokens"
+  | "control.decision"
+  | "control.observed"
+  | "control.resolved"
+  | "node.progress"
+  | "node.accepted"
+  | "run.completed";
+
+class VerificationCheckpointFaultStore extends RunStore {
+  private armed = true;
+
+  constructor(
+    store: RunStore,
+    private readonly checkpoint: VerificationTailCheckpoint,
+    private readonly phase: "before" | "after",
+  ) {
+    super(store.repositoryRoot, store.runId);
+  }
+
+  get injected(): boolean {
+    return !this.armed;
+  }
+
+  override async append(
+    actor: RunEvent["actor"],
+    type: RunEvent["type"],
+    data: Record<string, unknown>,
+    causationId = this.runId,
+  ): Promise<RunEvent> {
+    const decision =
+      type === "control.decision" && typeof data.decision === "object" && data.decision !== null
+        ? (data.decision as { sourceId?: unknown; targetId?: unknown })
+        : undefined;
+    const targetsVerification =
+      type === "run.completed" ||
+      data.nodeId === "verify" ||
+      data.targetId === "verify" ||
+      (decision?.sourceId === "runtime-verifier" && decision.targetId === "verify");
+    const semanticReceipt =
+      type === "tokens.recorded" &&
+      data.phase === "semantic_verification" &&
+      data.nodeId === "verify";
+    const matches =
+      (this.checkpoint === "semantic.missing_tokens"
+        ? semanticReceipt && data.missing === true
+        : this.checkpoint === "semantic.tokens"
+          ? semanticReceipt && data.missing !== true
+          : type === this.checkpoint && targetsVerification) &&
+      (type !== "semantic.verdict" || data.phase === "completion");
+    if (this.armed && matches && this.phase === "before") this.inject();
+    const event = await super.append(actor, type, data, causationId);
+    if (this.armed && matches && this.phase === "after") this.inject();
+    return event;
+  }
+
+  private inject(): never {
+    this.armed = false;
+    throw new Error(`Injected process termination ${this.phase} ${this.checkpoint}`);
+  }
+}
+
+type SchedulingTailCheckpoint = "control.override" | "control.resolved";
+
+class SchedulingCheckpointFaultStore extends RunStore {
+  private armed = true;
+
+  constructor(
+    store: RunStore,
+    private readonly checkpoint: SchedulingTailCheckpoint,
+    private readonly phase: "before" | "after",
+  ) {
+    super(store.repositoryRoot, store.runId);
+  }
+
+  get injected(): boolean {
+    return !this.armed;
+  }
+
+  override async append(
+    actor: RunEvent["actor"],
+    type: RunEvent["type"],
+    data: Record<string, unknown>,
+    causationId = this.runId,
+  ): Promise<RunEvent> {
+    const matches = type === this.checkpoint && data.targetId === "verify";
+    if (this.armed && matches && this.phase === "before") this.inject();
+    const event = await super.append(actor, type, data, causationId);
+    if (this.armed && matches && this.phase === "after") this.inject();
+    return event;
+  }
+
+  private inject(): never {
+    this.armed = false;
+    throw new Error(`Injected process termination ${this.phase} scheduling ${this.checkpoint}`);
+  }
+}
+
+class SemanticPreCallScopeFaultStore extends RunStore {
+  private armed = false;
+
+  constructor(store: RunStore) {
+    super(store.repositoryRoot, store.runId);
+  }
+
+  override async append(
+    actor: RunEvent["actor"],
+    type: RunEvent["type"],
+    data: Record<string, unknown>,
+    causationId = this.runId,
+  ): Promise<RunEvent> {
+    const event = await super.append(actor, type, data, causationId);
+    if (type === "scope.checked" && data.nodeId === "investigate") this.armed = true;
+    return event;
+  }
+
+  override async loadGraphHistory() {
+    const history = await super.loadGraphHistory();
+    if (this.armed) {
+      this.armed = false;
+      const workspace = await this.loadWorkspace<{ path: string }>();
+      await rm(join(workspace.path, ".git"), { recursive: true, force: true });
+    }
+    return history;
+  }
+}
+
+class SemanticStartFaultStore extends RunStore {
+  private armed = true;
+
+  constructor(store: RunStore) {
+    super(store.repositoryRoot, store.runId);
+  }
+
+  override async append(
+    actor: RunEvent["actor"],
+    type: RunEvent["type"],
+    data: Record<string, unknown>,
+    causationId = this.runId,
+  ): Promise<RunEvent> {
+    const event = await super.append(actor, type, data, causationId);
+    if (
+      this.armed &&
+      type === "semantic.started" &&
+      data.nodeId === "investigate" &&
+      data.phase === "progress"
+    ) {
+      this.armed = false;
+      throw new Error("Injected process termination after progress semantic.started");
+    }
+    return event;
+  }
+}
+
+class ProgressControlDecisionFaultStore extends RunStore {
+  private armed = true;
+
+  constructor(store: RunStore) {
+    super(store.repositoryRoot, store.runId);
+  }
+
+  override async append(
+    actor: RunEvent["actor"],
+    type: RunEvent["type"],
+    data: Record<string, unknown>,
+    causationId = this.runId,
+  ): Promise<RunEvent> {
+    const event = await super.append(actor, type, data, causationId);
+    const decision =
+      typeof data.decision === "object" && data.decision !== null
+        ? (data.decision as { sourceId?: unknown; targetId?: unknown })
+        : undefined;
+    if (
+      this.armed &&
+      type === "control.decision" &&
+      decision?.sourceId === "runtime-verifier" &&
+      decision.targetId === "investigate"
+    ) {
+      this.armed = false;
+      throw new Error("Injected process termination after progress control.decision");
+    }
+    return event;
+  }
+}
+
+class NodeFailureFaultStore extends RunStore {
+  private armed = true;
+
+  constructor(store: RunStore) {
+    super(store.repositoryRoot, store.runId);
+  }
+
+  override async append(
+    actor: RunEvent["actor"],
+    type: RunEvent["type"],
+    data: Record<string, unknown>,
+    causationId = this.runId,
+  ): Promise<RunEvent> {
+    const event = await super.append(actor, type, data, causationId);
+    if (this.armed && type === "node.failed" && data.nodeId === "investigate") {
+      this.armed = false;
+      throw new Error("Injected process termination after progress node.failed");
+    }
+    return event;
+  }
+}
+
+class ProgressScopeCheckFaultStore extends RunStore {
+  private armed = true;
+
+  constructor(
+    store: RunStore,
+    private readonly stage: "progress_baseline" | "progress_current",
+  ) {
+    super(store.repositoryRoot, store.runId);
+  }
+
+  override async append(
+    actor: RunEvent["actor"],
+    type: RunEvent["type"],
+    data: Record<string, unknown>,
+    causationId = this.runId,
+  ): Promise<RunEvent> {
+    const event = await super.append(actor, type, data, causationId);
+    const audit =
+      typeof data.audit === "object" && data.audit !== null
+        ? (data.audit as { allowed?: unknown })
+        : undefined;
+    if (
+      this.armed &&
+      type === "scope.checked" &&
+      data.stage === this.stage &&
+      audit?.allowed === false
+    ) {
+      this.armed = false;
+      throw new Error(`Injected process termination after failing ${this.stage} scope.checked`);
+    }
+    return event;
+  }
+}
+
+type ProgressScopeProtocolFault =
+  "baseline_digest" | "policy_linkage" | "malformed_check" | "duplicate_check";
+
+class ProgressScopeProtocolFaultStore extends RunStore {
+  private armed = true;
+
+  constructor(
+    store: RunStore,
+    private readonly fault: ProgressScopeProtocolFault,
+  ) {
+    super(store.repositoryRoot, store.runId);
+  }
+
+  override async append(
+    actor: RunEvent["actor"],
+    type: RunEvent["type"],
+    data: Record<string, unknown>,
+    causationId = this.runId,
+  ): Promise<RunEvent> {
+    const targetsBaseline =
+      this.armed &&
+      type === "scope.started" &&
+      data.nodeId === "implement" &&
+      data.stage === "progress_baseline";
+    if (!targetsBaseline) return await super.append(actor, type, data, causationId);
+
+    const baseline = data.baseline as Record<string, unknown>;
+    const persistedData =
+      this.fault === "baseline_digest"
+        ? { ...data, baseline: { ...baseline, digest: "0".repeat(64) } }
+        : this.fault === "policy_linkage"
+          ? { ...data, policyHash: "0".repeat(64) }
+          : data;
+    const event = await super.append(actor, type, persistedData, causationId);
+    if (this.fault === "malformed_check" || this.fault === "duplicate_check") {
+      const check = {
+        nodeId: data.nodeId,
+        stage: data.stage,
+        checkpointId: data.checkpointId,
+        enforced: true,
+        audit: { schemaVersion: 1, nodeId: "wrong-node", allowed: true },
+        current: baseline,
+      };
+      await super.append("runtime", "scope.checked", check, causationId);
+      if (this.fault === "duplicate_check")
+        await super.append("runtime", "scope.checked", check, causationId);
+    }
+    this.armed = false;
+    throw new Error(`Injected process termination after ${this.fault} progress scope protocol`);
+  }
+}
+
+class ActionableCiFailureFaultStore extends RunStore {
+  private armed = true;
+
+  constructor(store: RunStore) {
+    super(store.repositoryRoot, store.runId);
+  }
+
+  override async append(
+    actor: RunEvent["actor"],
+    type: RunEvent["type"],
+    data: Record<string, unknown>,
+    causationId = this.runId,
+  ): Promise<RunEvent> {
+    const event = await super.append(actor, type, data, causationId);
+    if (
+      this.armed &&
+      type === "node.failed" &&
+      data.nodeId === "pr-green" &&
+      typeof data.reason === "string" &&
+      data.reason.includes("same actionable CI failure")
+    ) {
+      this.armed = false;
+      throw new Error("Injected process termination after actionable CI node.failed");
+    }
+    return event;
+  }
+}
+
 function splitParallelBranches(graph: Graph): GraphAmendment {
   const investigation = graph.nodes.find(({ id }) => id === "investigate")!;
   const implementation = graph.nodes.find(({ id }) => id === "implement")!;
@@ -1977,6 +2304,247 @@ process.stdin.on("end", () => {
     );
   });
 
+  it("runs a fresh verifier when resuming from a successful legacy semantic verdict", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+    });
+    const created = await createRun("Implement a substantial legacy recovery feature", {
+      cwd: repository,
+      planner: adapter,
+    });
+    const legacyInvocationId = randomUUID();
+    await created.store.append("user", "run.approved", { approved: true });
+    await created.store.append("runtime", "node.started", { nodeId: "investigate" });
+    await created.store.append(
+      "host",
+      "semantic.verdict",
+      {
+        invocationId: legacyInvocationId,
+        nodeId: "investigate",
+        phase: "progress",
+        host: adapter.id,
+        verdict: {
+          verdict: "supported",
+          evidence: ["Legacy repository evidence supported progress"],
+          rationale: "Legacy verifier completed before semantic checkpoints existed",
+          uncertainty: 0.1,
+        },
+        usage: null,
+        artifact: "artifacts/semantic/legacy.json",
+        policyViolation: false,
+      },
+      legacyInvocationId,
+    );
+    await created.store.append("host", "node.failed", {
+      nodeId: "investigate",
+      reason: "Legacy runtime stopped after persisting its semantic verdict",
+    });
+    await created.store.append("runtime", "run.blocked", {
+      reason: "Legacy runtime stopped after persisting its semantic verdict",
+    });
+
+    const completed = await executeRun({ store: created.store, adapter });
+    const events = await created.store.loadEvents();
+
+    expect(completed.status).toBe("completed");
+    expect(adapter.semanticRequests).toHaveLength(1);
+    expect(adapter.semanticRequests[0]?.context).toMatchObject({
+      nodeId: "investigate",
+      phase: "progress",
+    });
+    expect(
+      events.filter(
+        ({ type, data }) =>
+          type === "semantic.verdict" && data.nodeId === "investigate" && data.phase === "progress",
+      ),
+    ).toHaveLength(2);
+    expect(
+      events.filter(
+        ({ type, data }) =>
+          type === "semantic.started" && data.nodeId === "investigate" && data.phase === "progress",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("does not recover an unlinked semantic checkpoint verdict", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+    });
+    const created = await createRun("Implement a substantial checkpoint-linkage feature", {
+      cwd: repository,
+      planner: adapter,
+    });
+    const faultStore = new SemanticStartFaultStore(created.store);
+    await expect(executeRun({ store: faultStore, adapter, approve: true })).rejects.toThrow(
+      "Injected process termination after progress semantic.started",
+    );
+    const started = (await created.store.loadEvents()).find(
+      ({ type }) => type === "semantic.started",
+    );
+    const invocationId = started?.data.invocationId;
+    const host = started?.data.host;
+    const checkpointId = started?.data.checkpointId;
+    const contextHash = started?.data.contextHash;
+    const baselineDigest = started?.data.beforeDigest;
+    if (
+      !started ||
+      typeof invocationId !== "string" ||
+      typeof host !== "string" ||
+      typeof checkpointId !== "string" ||
+      typeof contextHash !== "string" ||
+      typeof baselineDigest !== "string"
+    )
+      throw new Error("Missing semantic start linkage fixture");
+    await created.store.append(
+      "user",
+      "semantic.verdict",
+      {
+        invocationId,
+        nodeId: "investigate",
+        phase: "progress",
+        host,
+        checkpointId,
+        contextHash,
+        beforeDigest: baselineDigest,
+        afterDigest: baselineDigest,
+        verdict: {
+          verdict: "supported",
+          evidence: ["unlinked checkpoint fixture"],
+          rationale: "A user-authored event cannot resolve a runtime verifier invocation",
+          uncertainty: 0,
+        },
+        usage: null,
+        artifact: "artifacts/semantic/unlinked-checkpoint.json",
+        policyViolation: false,
+      },
+      "unlinked-causation",
+    );
+
+    const completed = await executeRun({
+      store: new RunStore(repository, created.contract.runId),
+      adapter,
+    });
+    const progressRequests = adapter.semanticRequests.filter(
+      ({ context }) => context.nodeId === "investigate" && context.phase === "progress",
+    );
+
+    expect(completed.status).toBe("completed");
+    expect(progressRequests).toHaveLength(1);
+  });
+
+  it("replays durable semantic progress evidence without duplicating control", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+    });
+    const created = await createRun("Implement a substantial progress-tail recovery feature", {
+      cwd: repository,
+      planner: adapter,
+    });
+    const faultStore = new ProgressControlDecisionFaultStore(created.store);
+
+    await expect(executeRun({ store: faultStore, adapter, approve: true })).rejects.toThrow(
+      "Injected process termination after progress control.decision",
+    );
+    const completed = await executeRun({
+      store: new RunStore(repository, created.contract.runId),
+      adapter,
+    });
+    const events = await created.store.loadEvents();
+    const progress = events.find(
+      ({ type, data }) => type === "node.progress" && data.nodeId === "investigate",
+    );
+    const attemptId =
+      typeof progress?.data.trajectory === "object" && progress.data.trajectory !== null
+        ? (progress.data.trajectory as { attemptId?: unknown }).attemptId
+        : undefined;
+    const verifierDecisions = events.filter(
+      ({ type, data }) =>
+        type === "control.decision" &&
+        typeof data.decision === "object" &&
+        data.decision !== null &&
+        (data.decision as { sourceId?: unknown; targetId?: unknown }).sourceId ===
+          "runtime-verifier" &&
+        (data.decision as { sourceId?: unknown; targetId?: unknown }).targetId === "investigate",
+    );
+    const controlTail = events.filter(
+      ({ type, data }) =>
+        (type === "control.observed" || type === "control.resolved") &&
+        data.targetId === "investigate",
+    );
+    const progressRequests = adapter.semanticRequests.filter(
+      ({ context }) => context.nodeId === "investigate" && context.phase === "progress",
+    );
+
+    expect(completed.status).toBe("completed");
+    expect(attemptId).toEqual(expect.any(String));
+    expect(progressRequests).toHaveLength(1);
+    expect(verifierDecisions).toHaveLength(1);
+    expect(verifierDecisions[0]?.data).toMatchObject({
+      checkpointId: attemptId,
+      decision: { evidence: progress?.data.evidence },
+    });
+    expect(controlTail.filter(({ type }) => type === "control.observed")).toHaveLength(1);
+    expect(controlTail.filter(({ type }) => type === "control.resolved")).toHaveLength(1);
+    expect(controlTail.every(({ data }) => data.checkpointId === attemptId)).toBe(true);
+    expect(
+      events.filter(({ type, data }) => type === "node.accepted" && data.nodeId === "investigate"),
+    ).toHaveLength(1);
+  });
+
+  it("recovers the exact blocker after a durable progress node failure", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(
+      async () => undefined,
+      true,
+      undefined,
+      async () => ({
+        verdict: {
+          verdict: "unsupported",
+          evidence: ["The claimed progress is absent from the selected repository evidence"],
+          rationale: "The worker evidence could not be corroborated",
+          uncertainty: 0.05,
+        },
+      }),
+    );
+    const created = await createRun("Implement a substantial blocker-recovery feature", {
+      cwd: repository,
+      planner: adapter,
+    });
+    const faultStore = new NodeFailureFaultStore(created.store);
+
+    await expect(executeRun({ store: faultStore, adapter, approve: true })).rejects.toThrow(
+      "Injected process termination after progress node.failed",
+    );
+    const failure = (await created.store.loadEvents()).findLast(
+      ({ type, data }) => type === "node.failed" && data.nodeId === "investigate",
+    );
+    const recovered = await executeRun({
+      store: new RunStore(repository, created.contract.runId),
+      adapter,
+    });
+    const blocker = (await created.store.loadEvents()).findLast(
+      ({ type }) => type === "run.blocked",
+    );
+
+    expect(failure?.data.progressDecision).toEqual(expect.any(Object));
+    expect(recovered.status).toBe("blocked");
+    expect(recovered.stopReason).toBe(failure?.data.reason);
+    expect(recovered.progressDecision).toEqual(failure?.data.progressDecision);
+    expect(blocker?.data).toMatchObject({
+      reason: failure?.data.reason,
+      progressDecision: failure?.data.progressDecision,
+      recoveredFromNodeFailure: true,
+    });
+    expect(adapter.calls).toEqual(["investigate"]);
+    expect(adapter.semanticRequests).toHaveLength(1);
+  });
+
   it("blocks if a semantic verifier mutates its read-only workspace", async () => {
     const repository = await createRepository();
     const adapter = new FakeAdapter(
@@ -2001,12 +2569,123 @@ process.stdin.on("end", () => {
     });
 
     const state = await executeRun({ store: created.store, adapter, approve: true });
+    const started = (await created.store.loadEvents()).find(
+      ({ type }) => type === "semantic.started",
+    );
+    const invocationId = started?.data.invocationId;
+    const baselineDigest = started?.data.beforeDigest;
+    if (!started || typeof invocationId !== "string" || typeof baselineDigest !== "string")
+      throw new Error("Missing semantic start fixture");
+    await created.store.append(
+      "host",
+      "semantic.verdict",
+      {
+        invocationId,
+        nodeId: "investigate",
+        phase: "progress",
+        host: "mismatched-host",
+        checkpointId: started.data.checkpointId,
+        contextHash: started.data.contextHash,
+        beforeDigest: baselineDigest,
+        afterDigest: baselineDigest,
+        verdict: {
+          verdict: "supported",
+          evidence: ["malformed recovery fixture"],
+          rationale: "A verdict from another host cannot resolve this semantic start",
+          uncertainty: 0,
+        },
+        usage: null,
+        artifact: "artifacts/semantic/malformed-recovery.json",
+        policyViolation: false,
+      },
+      invocationId,
+    );
+    const resumed = await executeRun({ store: created.store, adapter });
+    const events = await created.store.loadEvents();
 
     expect(state.status).toBe("blocked");
     expect(state.stopReason).toMatch(/read-only semantic verifier changed/);
+    expect(resumed.status).toBe("blocked");
+    expect(resumed.stopReason).toMatch(/approved pre-call baseline/);
+    expect(adapter.semanticRequests).toHaveLength(1);
+    expect(events.find(({ type }) => type === "semantic.verdict")).toMatchObject({
+      data: { policyViolation: true },
+    });
+    expect(events.find(({ type }) => type === "semantic.started")).toMatchObject({
+      data: {
+        beforeDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+        scopeBaseline: {
+          digest: expect.stringMatching(/^[a-f0-9]{64}$/),
+        },
+      },
+    });
+  });
+
+  it("blocks if post-verifier workspace scope inspection fails", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(
+      async () => undefined,
+      true,
+      undefined,
+      async (request) => {
+        await rm(join(request.repositoryPath, ".git"), { recursive: true, force: true });
+        return {
+          verdict: {
+            verdict: "supported",
+            evidence: ["unreachable"],
+            rationale: "scope inspection should fail before this verdict is accepted",
+            uncertainty: 0,
+          },
+        };
+      },
+    );
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+      planner: adapter,
+    });
+
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+    const events = await created.store.loadEvents();
+
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toMatch(/Semantic progress verification failed/);
+    expect(events.find(({ type }) => type === "semantic.verdict")).toMatchObject({
+      data: {
+        checkpointId: expect.stringMatching(/^[a-f0-9]{64}$/),
+        beforeDigest: expect.any(String),
+        error: expect.any(String),
+      },
+    });
     expect(
-      (await created.store.loadEvents()).find(({ type }) => type === "semantic.verdict"),
-    ).toMatchObject({ data: { policyViolation: true } });
+      events.find(({ type, data }) => type === "semantic.verdict" && data.verdict !== undefined),
+    ).toBeUndefined();
+  });
+
+  it("durably blocks if pre-verifier workspace scope inspection fails", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async () => undefined);
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+      planner: adapter,
+    });
+    const store = new SemanticPreCallScopeFaultStore(created.store);
+
+    const state = await executeRun({ store, adapter, approve: true });
+    const events = await created.store.loadEvents();
+
+    expect(state.status).toBe("blocked");
+    expect(state.nodes.investigate?.status).toBe("failed");
+    expect(state.stopReason).toMatch(/Semantic progress verification failed/);
+    expect(adapter.semanticRequests).toHaveLength(0);
+    expect(
+      events.find(
+        ({ type, data }) =>
+          type === "node.failed" &&
+          data.nodeId === "investigate" &&
+          String(data.reason).includes("Semantic progress verification failed"),
+      ),
+    ).toBeDefined();
+    expect(events.find(({ type }) => type === "run.blocked")).toBeDefined();
   });
 
   it("redacts task secrets before planning, worker context, and persistence", async () => {
@@ -2211,6 +2890,423 @@ process.stdin.on("end", () => {
     });
   });
 
+  it("rejects repository mutation by a progress probe before worker execution", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        throw new Error("the worker must not run after a mutating progress probe");
+    });
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+      planner: adapter,
+    });
+    const focusedProgress = created.probePlan.items.find(
+      ({ phase, purpose }) => phase === "progress" && purpose === "focused",
+    )!;
+    await configureRunProbes(created.store, {
+      ...created.probePlan,
+      items: created.probePlan.items.map((item) =>
+        item === focusedProgress
+          ? {
+              ...item,
+              source: "Adversarial mutating progress probe",
+              probe: {
+                id: "mutating-progress-probe",
+                kind: "command" as const,
+                command: process.execPath,
+                args: [
+                  "-e",
+                  "require('node:fs').writeFileSync('progress-probe-output.txt', 'mutation\\n')",
+                ],
+                expectedExitCode: 0,
+                timeoutMs: 30_000,
+                platforms: [process.platform] as Array<"darwin" | "linux" | "win32">,
+              },
+            }
+          : item,
+      ),
+    });
+
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+    const scopeEvent = (await created.store.loadEvents()).findLast(
+      ({ type, data }) => type === "scope.checked" && data.stage === "progress_baseline",
+    );
+
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toMatch(/progress probe execution changed repository state/i);
+    expect(adapter.calls).toEqual(["investigate"]);
+    expect(scopeEvent).toMatchObject({
+      data: {
+        audit: {
+          allowed: false,
+          violations: expect.arrayContaining([
+            expect.objectContaining({
+              kind: "read_only_write",
+              path: "progress-probe-output.txt",
+            }),
+          ]),
+        },
+      },
+    });
+  });
+
+  it("audits a mutating progress probe even when cancellation arrives after its write", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async () => undefined);
+    const created = await createRun("Implement a substantial cancellation-safe feature", {
+      cwd: repository,
+      planner: adapter,
+    });
+    const focusedProgress = created.probePlan.items.find(
+      ({ phase, purpose }) => phase === "progress" && purpose === "focused",
+    )!;
+    await configureRunProbes(created.store, {
+      ...created.probePlan,
+      items: created.probePlan.items.map((item) =>
+        item === focusedProgress
+          ? {
+              ...item,
+              source: "Cancellation-racing mutating progress probe",
+              probe: {
+                id: "cancellation-racing-progress-probe",
+                kind: "command" as const,
+                command: process.execPath,
+                args: [
+                  "-e",
+                  "require('node:fs').writeFileSync('progress-probe-output.txt', 'mutation\\n'); setInterval(() => {}, 1_000)",
+                ],
+                expectedExitCode: 0,
+                timeoutMs: 30_000,
+                platforms: [process.platform] as Array<"darwin" | "linux" | "win32">,
+              },
+            }
+          : item,
+      ),
+    });
+    const interruption = new AbortController();
+    const executing = executeRun({
+      store: created.store,
+      adapter,
+      approve: true,
+      signal: interruption.signal,
+    });
+    let workspacePath: string | undefined;
+    await waitFor(async () => {
+      try {
+        workspacePath = (await created.store.loadWorkspace<{ path: string }>()).path;
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    await waitFor(async () =>
+      stat(join(workspacePath!, "progress-probe-output.txt")).then(
+        () => true,
+        () => false,
+      ),
+    );
+
+    interruption.abort({ cause: "cancellation", reason: "Cancel after the probe mutation" });
+    const state = await executing;
+    const events = await created.store.loadEvents();
+    const started = events.findLast(
+      ({ type, data }) =>
+        type === "scope.started" &&
+        data.nodeId === "implement" &&
+        data.stage === "progress_baseline",
+    );
+    const checked = events.findLast(
+      ({ type, data }) =>
+        type === "scope.checked" &&
+        data.nodeId === "implement" &&
+        data.stage === "progress_baseline",
+    );
+    const failure = events.findLast(
+      ({ type, data }) => type === "node.failed" && data.nodeId === "implement",
+    );
+    const blocker = events.findLast(({ type }) => type === "run.blocked");
+
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toMatch(/progress probe execution changed repository state/i);
+    expect(adapter.calls).toEqual(["investigate"]);
+    expect(started?.data.checkpointId).toEqual(expect.any(String));
+    expect(checked).toMatchObject({
+      causationId: started?.data.checkpointId,
+      data: {
+        checkpointId: started?.data.checkpointId,
+        audit: {
+          allowed: false,
+          violations: expect.arrayContaining([
+            expect.objectContaining({
+              kind: "read_only_write",
+              path: "progress-probe-output.txt",
+            }),
+          ]),
+        },
+      },
+    });
+    expect(failure?.data).toMatchObject({
+      progressProbeStage: "progress_baseline",
+      scopeCheckpointId: started?.data.checkpointId,
+      runBlocker: {
+        reason: state.stopReason,
+        progressProbeStage: "progress_baseline",
+        scopeCheckpointId: started?.data.checkpointId,
+      },
+    });
+    expect(blocker?.data).toMatchObject({
+      reason: state.stopReason,
+      progressProbeStage: "progress_baseline",
+      scopeCheckpointId: started?.data.checkpointId,
+      scopeAudit: checked?.data.audit,
+      evidence: expect.arrayContaining([expect.stringContaining("progress-probe-output.txt")]),
+    });
+  }, 30_000);
+
+  it("recovers progress-probe scope blockers after the failing audit checkpoint", async () => {
+    for (const stage of ["progress_baseline", "progress_current"] as const) {
+      const repository = await createRepository();
+      const adapter = new FakeAdapter(async (request) => {
+        if (request.capsule.nodeId === "implement")
+          await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+      });
+      const created = await createRun(`Implement a substantial ${stage} recovery feature`, {
+        cwd: repository,
+        planner: adapter,
+      });
+      const focusedProgress = created.probePlan.items.find(
+        ({ phase, purpose }) => phase === "progress" && purpose === "focused",
+      )!;
+      const mutation =
+        stage === "progress_baseline"
+          ? "require('node:fs').writeFileSync('progress-probe-output.txt', 'mutation\\n')"
+          : "const fs = require('node:fs'); if (fs.existsSync('feature.txt')) fs.writeFileSync('progress-probe-output.txt', 'mutation\\n')";
+      await configureRunProbes(created.store, {
+        ...created.probePlan,
+        items: created.probePlan.items.map((item) =>
+          item === focusedProgress
+            ? {
+                ...item,
+                source: `Fault-injected ${stage} mutating progress probe`,
+                probe: {
+                  id: `${stage}-mutating-progress-probe`,
+                  kind: "command" as const,
+                  command: process.execPath,
+                  args: ["-e", mutation],
+                  expectedExitCode: 0,
+                  timeoutMs: 30_000,
+                  platforms: [process.platform] as Array<"darwin" | "linux" | "win32">,
+                },
+              }
+            : item,
+        ),
+      });
+      const faultStore = new ProgressScopeCheckFaultStore(created.store, stage);
+
+      await expect(executeRun({ store: faultStore, adapter, approve: true })).rejects.toThrow(
+        `Injected process termination after failing ${stage} scope.checked`,
+      );
+      const eventsAtCrash = await created.store.loadEvents();
+      const started = eventsAtCrash.findLast(
+        ({ type, data }) =>
+          type === "scope.started" && data.nodeId === "implement" && data.stage === stage,
+      );
+      const checked = eventsAtCrash.findLast(
+        ({ type, data }) =>
+          type === "scope.checked" && data.nodeId === "implement" && data.stage === stage,
+      );
+      const failure = eventsAtCrash.findLast(
+        ({ type, data }) => type === "node.failed" && data.nodeId === "implement",
+      );
+      const callsAtCrash = [...adapter.calls];
+
+      expect(started?.data.checkpointId, stage).toEqual(expect.any(String));
+      expect(checked?.data, stage).toMatchObject({
+        checkpointId: started?.data.checkpointId,
+        audit: { allowed: false },
+      });
+      expect(failure?.sequence, stage).toBeLessThan(checked?.sequence ?? 0);
+      expect(failure?.data, stage).toMatchObject({
+        reason: expect.stringMatching(/progress probe execution changed repository state/i),
+        progressProbeStage: stage,
+        scopeCheckpointId: started?.data.checkpointId,
+        scopeAudit: { allowed: false },
+        runBlocker: {
+          progressProbeStage: stage,
+          scopeCheckpointId: started?.data.checkpointId,
+          scopeAudit: { allowed: false },
+        },
+      });
+      expect(
+        eventsAtCrash.some(({ type }) => type === "run.blocked"),
+        stage,
+      ).toBe(false);
+
+      const recovered = await executeRun({
+        store: new RunStore(repository, created.contract.runId),
+        adapter,
+      });
+      const recoveredEvents = await created.store.loadEvents();
+      const blocker = recoveredEvents.findLast(({ type }) => type === "run.blocked");
+
+      expect(recovered.status, stage).toBe("blocked");
+      expect(recovered.stopReason, stage).toBe(failure?.data.reason);
+      expect(adapter.calls, stage).toEqual(callsAtCrash);
+      expect(
+        recoveredEvents.filter(
+          ({ type, data }) =>
+            type === "scope.started" && data.nodeId === "implement" && data.stage === stage,
+        ),
+        stage,
+      ).toHaveLength(1);
+      expect(
+        recoveredEvents.filter(
+          ({ type, data }) => type === "node.failed" && data.nodeId === "implement",
+        ),
+        stage,
+      ).toHaveLength(1);
+      expect(blocker?.data, stage).toMatchObject({
+        ...(failure?.data.runBlocker as Record<string, unknown>),
+        recoveredFromNodeFailure: true,
+      });
+    }
+  }, 60_000);
+
+  it("fails closed when a durable progress scope start has corrupt baseline or policy linkage", async () => {
+    for (const fault of ["baseline_digest", "policy_linkage"] as const) {
+      const repository = await createRepository();
+      const adapter = new FakeAdapter(async () => undefined);
+      const created = await createRun(`Implement a substantial ${fault} recovery feature`, {
+        cwd: repository,
+        planner: adapter,
+      });
+      const faultStore = new ProgressScopeProtocolFaultStore(created.store, fault);
+
+      await expect(
+        executeRun({ store: faultStore, adapter, approve: true }),
+        fault,
+      ).rejects.toThrow(`Injected process termination after ${fault} progress scope protocol`);
+      const crashEvents = await created.store.loadEvents();
+      const started = crashEvents.findLast(
+        ({ type, data }) =>
+          type === "scope.started" &&
+          data.nodeId === "implement" &&
+          data.stage === "progress_baseline",
+      );
+      const callsAtCrash = [...adapter.calls];
+      const requestsAtCrash = adapter.requests.length;
+
+      expect(started?.data.checkpointId, fault).toEqual(expect.any(String));
+      expect(callsAtCrash, fault).toEqual(["investigate"]);
+
+      const recovered = await executeRun({
+        store: new RunStore(repository, created.contract.runId),
+        adapter,
+      });
+      const events = await created.store.loadEvents();
+      const checkpointId = started?.data.checkpointId;
+      const failures = events.filter(
+        ({ type, data }) =>
+          type === "node.failed" &&
+          data.nodeId === "implement" &&
+          data.scopeCheckpointId === checkpointId,
+      );
+      const blockers = events.filter(
+        ({ type, data }) => type === "run.blocked" && data.scopeCheckpointId === checkpointId,
+      );
+
+      expect(recovered.status, fault).toBe("blocked");
+      expect(recovered.stopReason, fault).toContain(
+        `cannot validate progress-probe scope checkpoint ${checkpointId}`,
+      );
+      expect(adapter.calls, fault).toEqual(callsAtCrash);
+      expect(adapter.requests, fault).toHaveLength(requestsAtCrash);
+      expect(failures, fault).toHaveLength(1);
+      expect(blockers, fault).toHaveLength(1);
+      expect(failures[0]?.data, fault).toMatchObject({
+        reason: recovered.stopReason,
+        progressProbeStage: "progress_baseline",
+        scopeCheckpointId: checkpointId,
+        runBlocker: {
+          reason: recovered.stopReason,
+          progressProbeStage: "progress_baseline",
+          scopeCheckpointId: checkpointId,
+        },
+      });
+      expect(blockers[0]?.data, fault).toMatchObject({
+        reason: recovered.stopReason,
+        progressProbeStage: "progress_baseline",
+        scopeCheckpointId: checkpointId,
+      });
+    }
+  }, 60_000);
+
+  it("fails closed on malformed or duplicate matching durable progress scope checks", async () => {
+    for (const fault of ["malformed_check", "duplicate_check"] as const) {
+      const repository = await createRepository();
+      const adapter = new FakeAdapter(async () => undefined);
+      const created = await createRun(`Implement a substantial ${fault} recovery feature`, {
+        cwd: repository,
+        planner: adapter,
+      });
+      const faultStore = new ProgressScopeProtocolFaultStore(created.store, fault);
+
+      await expect(
+        executeRun({ store: faultStore, adapter, approve: true }),
+        fault,
+      ).rejects.toThrow(`Injected process termination after ${fault} progress scope protocol`);
+      const crashEvents = await created.store.loadEvents();
+      const started = crashEvents.findLast(
+        ({ type, data }) =>
+          type === "scope.started" &&
+          data.nodeId === "implement" &&
+          data.stage === "progress_baseline",
+      );
+      const callsAtCrash = [...adapter.calls];
+      const requestsAtCrash = adapter.requests.length;
+
+      expect(started?.data.checkpointId, fault).toEqual(expect.any(String));
+      expect(callsAtCrash, fault).toEqual(["investigate"]);
+
+      const recovered = await executeRun({
+        store: new RunStore(repository, created.contract.runId),
+        adapter,
+      });
+      const events = await created.store.loadEvents();
+      const checkpointId = started?.data.checkpointId;
+      const failures = events.filter(
+        ({ type, data }) =>
+          type === "node.failed" &&
+          data.nodeId === "implement" &&
+          data.scopeCheckpointId === checkpointId,
+      );
+      const blockers = events.filter(
+        ({ type, data }) => type === "run.blocked" && data.scopeCheckpointId === checkpointId,
+      );
+
+      expect(recovered.status, fault).toBe("blocked");
+      expect(recovered.stopReason, fault).toContain(
+        fault === "duplicate_check"
+          ? `duplicate progress-probe scope checks for checkpoint ${checkpointId}`
+          : `cannot validate the durable progress-probe scope check for checkpoint ${checkpointId}`,
+      );
+      expect(adapter.calls, fault).toEqual(callsAtCrash);
+      expect(adapter.requests, fault).toHaveLength(requestsAtCrash);
+      expect(failures, fault).toHaveLength(1);
+      expect(blockers, fault).toHaveLength(1);
+      expect(failures[0]?.data, fault).toMatchObject({
+        reason: recovered.stopReason,
+        progressProbeStage: "progress_baseline",
+        scopeCheckpointId: checkpointId,
+      });
+      expect(blockers[0]?.data, fault).toMatchObject({
+        reason: recovered.stopReason,
+        progressProbeStage: "progress_baseline",
+        scopeCheckpointId: checkpointId,
+      });
+    }
+  }, 60_000);
+
   it("completes a local run in an isolated worktree and records tokens", async () => {
     const repository = await createRepository();
     const adapter = new FakeAdapter(async (request) => {
@@ -2335,6 +3431,377 @@ process.stdin.on("end", () => {
       replaces: veto.decisionId,
     });
     expect((await executeRun({ store: created.store, adapter })).status).toBe("completed");
+  });
+
+  it(
+    "replays scheduling controls once across every before-and-after checkpoint",
+    async () => {
+      for (const checkpoint of ["control.override", "control.resolved"] as const) {
+        for (const phase of ["before", "after"] as const) {
+          const repository = await createRepository();
+          const adapter = new FakeAdapter(async (request) => {
+            if (request.capsule.nodeId === "implement")
+              await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+          });
+          const created = await createRun(
+            "Implement a substantial restart-safe scheduling checkpoint feature",
+            { cwd: repository },
+          );
+          await created.store.append("user", "run.approved", { approved: true });
+          await recordRunApprovalDecisions(created.store, created.graph);
+          const approval = (await created.store.loadState()).controlDecisions.find(
+            ({ sourceId, targetId }) => sourceId === "user-outcome" && targetId === "verify",
+          );
+          if (!approval) throw new Error("Missing terminal owner approval fixture");
+          await decideRunControl(created.store, {
+            sourceId: "user-outcome",
+            targetId: "verify",
+            verdict: "veto",
+            rationale: "Require the explicit scheduling arbitrator",
+            replaces: approval.decisionId,
+          });
+          await decideRunControl(created.store, {
+            sourceId: "user-arbitrator",
+            targetId: "verify",
+            verdict: "approve",
+            rationale: "Approve this exact scheduling generation",
+            evidence: ["scheduling checkpoint fixture"],
+          });
+
+          const faultStore = new SchedulingCheckpointFaultStore(created.store, checkpoint, phase);
+          await expect(
+            executeRun({ store: faultStore, adapter }),
+            `${phase}:${checkpoint}`,
+          ).rejects.toThrow(`Injected process termination ${phase} scheduling ${checkpoint}`);
+          expect(faultStore.injected, `${phase}:${checkpoint}`).toBe(true);
+
+          const completed = await executeRun({
+            store: new RunStore(repository, created.contract.runId),
+            adapter,
+          });
+          const events = await created.store.loadEvents();
+          const verifyStart = events.find(
+            ({ type, data }) => type === "node.started" && data.nodeId === "verify",
+          );
+          if (!verifyStart) throw new Error("Missing verification start fixture");
+          const schedulingControls = events.filter(
+            ({ sequence, type, data }) =>
+              sequence < verifyStart.sequence &&
+              (type === "control.override" || type === "control.resolved") &&
+              data.targetId === "verify",
+          );
+          const override = schedulingControls.filter(({ type }) => type === "control.override");
+          const resolution = schedulingControls.filter(({ type }) => type === "control.resolved");
+
+          expect(completed.status, `${phase}:${checkpoint}`).toBe("completed");
+          expect(override, `${phase}:${checkpoint}`).toHaveLength(1);
+          expect(resolution, `${phase}:${checkpoint}`).toHaveLength(1);
+          expect(override[0]?.data.checkpointId, `${phase}:${checkpoint}`).toEqual(
+            resolution[0]?.data.checkpointId,
+          );
+          expect(override[0]?.data.controlGenerationId, `${phase}:${checkpoint}`).toEqual(
+            resolution[0]?.data.controlGenerationId,
+          );
+          expect(override[0]?.data.operationId, `${phase}:${checkpoint}`).toEqual(
+            expect.stringMatching(/^[a-f0-9]{64}$/),
+          );
+          expect(resolution[0]?.data.operationId, `${phase}:${checkpoint}`).toEqual(
+            expect.stringMatching(/^[a-f0-9]{64}$/),
+          );
+          expect(
+            events.filter(({ type, data }) => type === "node.started" && data.nodeId === "verify"),
+            `${phase}:${checkpoint}`,
+          ).toHaveLength(1);
+          expect(
+            adapter.calls.filter((nodeId) => nodeId === "implement"),
+            `${phase}:${checkpoint}`,
+          ).toHaveLength(1);
+        }
+      }
+    },
+    process.platform === "darwin" ? 90_000 : 60_000,
+  );
+
+  it("scopes checkpoint decision replay to the current decision generation", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    const checkpointId = "a".repeat(64);
+    const decisionA = {
+      store: created.store,
+      graph: created.graph,
+      sourceId: "runtime-verifier",
+      targetId: "verify",
+      verdict: "approve" as const,
+      rationale: "Verification checkpoint supports acceptance",
+      evidence: ["checkpoint:A"],
+      actor: "verifier" as const,
+      checkpointId,
+    };
+    const firstA = await recordRuntimeControlDecision(decisionA);
+    const decisionB = await recordRuntimeControlDecision({
+      ...decisionA,
+      verdict: "veto",
+      rationale: "A later lifetime decision vetoes acceptance",
+      evidence: ["checkpoint:B"],
+    });
+    const secondA = await recordRuntimeControlDecision(decisionA);
+    const replayedA = await recordRuntimeControlDecision(decisionA);
+    const checkpointedEvents = (await created.store.loadEvents()).filter(
+      ({ type, data }) => type === "control.decision" && data.checkpointId === checkpointId,
+    );
+    const current = (await created.store.loadState()).controlDecisions.find(
+      ({ sourceId, targetId }) => sourceId === "runtime-verifier" && targetId === "verify",
+    );
+
+    expect(firstA.decisionId).not.toBe(decisionB.decisionId);
+    expect(secondA.decisionId).not.toBe(firstA.decisionId);
+    expect(replayedA.decisionId).toBe(secondA.decisionId);
+    expect(current?.decisionId).toBe(secondA.decisionId);
+    expect(checkpointedEvents).toHaveLength(3);
+    expect(new Set(checkpointedEvents.map(({ data }) => data.operationId)).size).toBe(3);
+
+    const uncheckpointed = {
+      store: created.store,
+      graph: created.graph,
+      sourceId: "runtime-verifier",
+      targetId: "verify",
+      verdict: "approve" as const,
+      rationale: "Non-checkpointed decisions retain append semantics",
+      evidence: ["direct-call"],
+      actor: "verifier" as const,
+    };
+    const firstDirect = await recordRuntimeControlDecision(uncheckpointed);
+    const secondDirect = await recordRuntimeControlDecision(uncheckpointed);
+
+    expect(secondDirect.decisionId).not.toBe(firstDirect.decisionId);
+  });
+
+  it("reapplies recurring checkpoint conflicts and resolutions in new control generations", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    const checkpointId = "b".repeat(64);
+    const graph: Graph = {
+      ...created.graph,
+      controlEdges: [
+        ...created.graph.controlEdges.filter(({ to }) => to !== "verify"),
+        { from: "repository-policy", to: "verify", relation: "owns_target" },
+        { from: "runtime-verifier", to: "verify", relation: "observes" },
+        { from: "runtime-verifier", to: "verify", relation: "vetoes" },
+      ],
+    };
+    await recordRuntimeControlDecision({
+      store: created.store,
+      graph,
+      sourceId: "repository-policy",
+      targetId: "verify",
+      verdict: "approve",
+      rationale: "Repository policy approves the stable evidence",
+      evidence: ["stable-control-evidence"],
+      actor: "runtime",
+      checkpointId,
+    });
+    const verifierDecision = async (verdict: "approve" | "veto", cycle: number) =>
+      await recordRuntimeControlDecision({
+        store: created.store,
+        graph,
+        sourceId: "runtime-verifier",
+        targetId: "verify",
+        verdict,
+        rationale: `Verifier cycle ${cycle} is ${verdict}`,
+        evidence: [`verifier:${verdict}`],
+        actor: "verifier",
+        checkpointId,
+      });
+    const evaluate = async () =>
+      await evaluateControlAcceptance(
+        created.store,
+        graph,
+        await created.store.loadState(),
+        "verify",
+        ["stable-control-evidence"],
+        checkpointId,
+      );
+
+    await verifierDecision("veto", 1);
+    const firstConflict = await evaluate();
+    expect(firstConflict.allowed).toBe(false);
+    expect((await created.store.loadState()).pendingDecision?.packetId).toBe(
+      firstConflict.packet?.packetId,
+    );
+    expect((await evaluate()).packet?.packetId).toBe(firstConflict.packet?.packetId);
+
+    await verifierDecision("approve", 2);
+    expect((await evaluate()).allowed).toBe(true);
+    expect((await created.store.loadState()).pendingDecision).toBeUndefined();
+    expect((await evaluate()).allowed).toBe(true);
+
+    await verifierDecision("veto", 3);
+    const secondConflict = await evaluate();
+    expect(secondConflict.allowed).toBe(false);
+    expect(secondConflict.packet?.packetId).not.toBe(firstConflict.packet?.packetId);
+    expect((await created.store.loadState()).pendingDecision?.packetId).toBe(
+      secondConflict.packet?.packetId,
+    );
+
+    await verifierDecision("approve", 4);
+    expect((await evaluate()).allowed).toBe(true);
+    expect((await created.store.loadState()).pendingDecision).toBeUndefined();
+
+    const events = await created.store.loadEvents();
+    const observations = events.filter(
+      ({ type, data }) => type === "control.observed" && data.targetId === "verify",
+    );
+    const conflicts = events.filter(
+      ({ type, data }) => type === "control.decision_required" && data.packet !== undefined,
+    );
+    const resolutions = events.filter(
+      ({ type, data }) => type === "control.resolved" && data.targetId === "verify",
+    );
+
+    expect(observations).toHaveLength(4);
+    expect(conflicts).toHaveLength(2);
+    expect(resolutions).toHaveLength(2);
+    expect(new Set(observations.map(({ data }) => data.controlGenerationId)).size).toBe(4);
+    expect(new Set(conflicts.map(({ data }) => data.operationId)).size).toBe(2);
+    expect(new Set(resolutions.map(({ data }) => data.operationId)).size).toBe(2);
+    expect(
+      new Set(
+        resolutions.map(({ data }) =>
+          JSON.stringify({ outcome: data.outcome, owners: data.owners, evidence: data.evidence }),
+        ),
+      ).size,
+    ).toBe(1);
+  });
+
+  it("replaces an unresolved conflict packet when its control generation changes", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    const checkpointId = "d".repeat(64);
+    const graph: Graph = {
+      ...created.graph,
+      controlEdges: [
+        ...created.graph.controlEdges.filter(({ to }) => to !== "verify"),
+        { from: "repository-policy", to: "verify", relation: "arbitrates" },
+        { from: "runtime-verifier", to: "verify", relation: "arbitrates" },
+      ],
+    };
+    const decide = async (
+      sourceId: "repository-policy" | "runtime-verifier",
+      verdict: "approve" | "veto",
+      cycle: number,
+    ) =>
+      await recordRuntimeControlDecision({
+        store: created.store,
+        graph,
+        sourceId,
+        targetId: "verify",
+        verdict,
+        rationale: `${sourceId} cycle ${cycle} is ${verdict}`,
+        evidence: [`${sourceId}:${cycle}:${verdict}`],
+        actor: sourceId === "runtime-verifier" ? "verifier" : "runtime",
+        checkpointId,
+      });
+    const evaluate = async () =>
+      await evaluateControlAcceptance(
+        created.store,
+        graph,
+        await created.store.loadState(),
+        "verify",
+        ["stable-control-evidence"],
+        checkpointId,
+      );
+
+    await decide("repository-policy", "approve", 1);
+    await decide("runtime-verifier", "veto", 1);
+    const first = await evaluate();
+    expect((await evaluate()).packet?.packetId).toBe(first.packet?.packetId);
+
+    await decide("repository-policy", "veto", 2);
+    await decide("runtime-verifier", "approve", 2);
+    const second = await evaluate();
+    expect((await evaluate()).packet?.packetId).toBe(second.packet?.packetId);
+
+    expect(second.packet?.packetId).not.toBe(first.packet?.packetId);
+    expect(second.packet?.evidence).not.toEqual(first.packet?.evidence);
+    const conflicts = (await created.store.loadEvents()).filter(
+      ({ type, data }) => type === "control.decision_required" && data.packet !== undefined,
+    );
+    expect(conflicts).toHaveLength(2);
+    expect(new Set(conflicts.map(({ data }) => data.controlGenerationId)).size).toBe(2);
+  });
+
+  it("deduplicates node-derived controls and advances their lifecycle generation", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    const checkpointId = "c".repeat(64);
+    const graph: Graph = {
+      ...created.graph,
+      controlEdges: [
+        ...created.graph.controlEdges.filter(({ to }) => to !== "verify"),
+        { from: "implement", to: "verify", relation: "owns_target" },
+      ],
+    };
+    const evaluate = async () =>
+      await evaluateControlAcceptance(
+        created.store,
+        graph,
+        await created.store.loadState(),
+        "verify",
+        ["stable-control-evidence"],
+        checkpointId,
+      );
+
+    await created.store.append("user", "run.approved", { approved: true });
+    await created.store.append("runtime", "node.started", { nodeId: "implement" });
+    await created.store.append("host", "node.failed", {
+      nodeId: "implement",
+      reason: "The first control-source generation vetoed acceptance",
+    });
+
+    expect((await evaluate()).allowed).toBe(false);
+    expect((await evaluate()).allowed).toBe(false);
+
+    await created.store.append("runtime", "node.reset", {
+      nodeId: "implement",
+      reason: "Retry the control-source node",
+    });
+    const pending = await evaluate();
+    expect(pending.allowed).toBe(false);
+    expect((await evaluate()).packet?.packetId).toBe(pending.packet?.packetId);
+
+    await created.store.append("runtime", "node.started", { nodeId: "implement" });
+    await created.store.append("probe", "node.accepted", { nodeId: "implement" });
+    expect((await evaluate()).allowed).toBe(true);
+    expect((await evaluate()).allowed).toBe(true);
+
+    const events = await created.store.loadEvents();
+    const resolutions = events.filter(
+      ({ type, data }) => type === "control.resolved" && data.targetId === "verify",
+    );
+    const conflicts = events.filter(
+      ({ type, data }) => type === "control.decision_required" && data.packet !== undefined,
+    );
+
+    expect(resolutions).toHaveLength(2);
+    expect(resolutions.map(({ data }) => data.outcome)).toEqual(["vetoed", "approved"]);
+    expect(new Set(resolutions.map(({ data }) => data.controlGenerationId)).size).toBe(2);
+    expect(
+      new Set(
+        resolutions.flatMap(({ data }) =>
+          Array.isArray(data.ownerDecisionIds) ? data.ownerDecisionIds : [],
+        ),
+      ).size,
+    ).toBe(2);
+    expect(conflicts).toHaveLength(1);
+    expect((await created.store.loadState()).pendingDecision).toBeUndefined();
   });
 
   it("emits a durable conflict packet and honors an explicit verifier-veto override", async () => {
@@ -2498,7 +3965,7 @@ process.stdin.on("end", () => {
     expect(blocked.status).toBe("blocked");
     expect(blocked.stopReason).toMatch(/Arbitrator vetoed verify: user-arbitrator/);
     expect(blocked.pendingDecision).toBeUndefined();
-    expect(adapter.semanticRequests).toHaveLength(2);
+    expect(adapter.semanticRequests).toHaveLength(1);
   });
 
   it("turns a work-dependency ownership cycle into a resolvable user decision", async () => {
@@ -2599,6 +4066,247 @@ process.stdin.on("end", () => {
       context: { phase: "completion", nodeId: "verify" },
     });
   });
+
+  it("deduplicates checkpoint control events from their persisted redacted representation", async () => {
+    const repository = await createRepository();
+    const secret = "ghp_abcdefghijklmnopqrstuvwxyz";
+    const adapter = new FakeAdapter(
+      async (request) => {
+        if (request.capsule.nodeId === "implement")
+          await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+      },
+      true,
+      undefined,
+      async () => ({
+        verdict: {
+          verdict: "supported",
+          evidence: [`Semantic evidence carried ${secret}`],
+          rationale: `The completion token=${secret} was supported`,
+          uncertainty: 0,
+        },
+      }),
+    );
+    const created = await createRun(
+      "Implement a substantial feature with secret-safe checkpoint replay",
+      { cwd: repository },
+    );
+    const inventory = created.probePlan.items.find(
+      ({ phase, purpose }) => phase === "progress" && purpose === "inventory",
+    );
+    if (!inventory) throw new Error("Missing repository-inventory fixture probe");
+    await configureRunProbes(created.store, {
+      ...created.probePlan,
+      items: [
+        ...created.probePlan.items.filter(({ phase }) => phase === "progress"),
+        { ...inventory, phase: "completion" },
+      ],
+    });
+
+    const faultStore = new VerificationCheckpointFaultStore(
+      created.store,
+      "node.progress",
+      "after",
+    );
+    await expect(executeRun({ store: faultStore, adapter, approve: true })).rejects.toThrow(
+      "Injected process termination after node.progress",
+    );
+    const completed = await executeRun({
+      store: new RunStore(repository, created.contract.runId),
+      adapter,
+    });
+    const events = await created.store.loadEvents();
+    const completionRequests = adapter.semanticRequests.filter(
+      ({ context }) => context.nodeId === "verify" && context.phase === "completion",
+    );
+    const controlEvents = events.filter(
+      ({ type, data }) =>
+        (type === "control.observed" || type === "control.resolved") && data.targetId === "verify",
+    );
+    const verifierDecisions = events.filter(
+      ({ type, data }) =>
+        type === "control.decision" &&
+        typeof data.decision === "object" &&
+        data.decision !== null &&
+        (data.decision as { sourceId?: unknown; targetId?: unknown }).sourceId ===
+          "runtime-verifier" &&
+        (data.decision as { sourceId?: unknown; targetId?: unknown }).targetId === "verify",
+    );
+
+    expect(completed.status).toBe("completed");
+    expect(completionRequests).toHaveLength(1);
+    expect(verifierDecisions).toHaveLength(1);
+    expect(controlEvents.filter(({ type }) => type === "control.observed")).toHaveLength(1);
+    expect(controlEvents.filter(({ type }) => type === "control.resolved")).toHaveLength(1);
+    expect(JSON.stringify(events)).not.toContain(secret);
+  });
+
+  it(
+    "recovers the verification tail across every before-and-after semantic checkpoint",
+    async () => {
+      const checkpoints: VerificationTailCheckpoint[] = [
+        "held_out.checked",
+        "semantic.started",
+        "semantic.missing_tokens",
+        "semantic.verdict",
+        "semantic.tokens",
+        "control.decision",
+        "control.observed",
+        "control.resolved",
+        "node.progress",
+        "node.accepted",
+        "run.completed",
+      ];
+
+      for (const checkpoint of checkpoints) {
+        for (const phase of ["before", "after"] as const) {
+          const repository = await createRepository();
+          const adapter = new FakeAdapter(async (request) => {
+            if (request.capsule.nodeId === "implement")
+              await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+          });
+          const created = await createRun(
+            "Implement a substantial feature with a restart-safe semantic completion proof",
+            { cwd: repository },
+          );
+          const inventory = created.probePlan.items.find(
+            ({ phase: itemPhase, purpose }) => itemPhase === "progress" && purpose === "inventory",
+          );
+          if (!inventory) throw new Error("Missing repository-inventory fixture probe");
+          await configureRunProbes(created.store, {
+            ...created.probePlan,
+            items: [
+              ...created.probePlan.items.filter(({ phase: itemPhase }) => itemPhase === "progress"),
+              { ...inventory, phase: "completion" },
+            ],
+          });
+
+          const faultStore = new VerificationCheckpointFaultStore(created.store, checkpoint, phase);
+          await expect(
+            executeRun({ store: faultStore, adapter, approve: true }),
+            `${phase}:${checkpoint}`,
+          ).rejects.toThrow(`Injected process termination ${phase} ${checkpoint}`);
+          expect(faultStore.injected, `${phase}:${checkpoint}`).toBe(true);
+
+          const completed = await executeRun({
+            store: new RunStore(repository, created.contract.runId),
+            adapter,
+          });
+          const events = await created.store.loadEvents();
+          const completionSemanticRequests = adapter.semanticRequests.filter(
+            ({ context }) => context.nodeId === "verify" && context.phase === "completion",
+          );
+          const completionVerdicts = events.filter(
+            ({ type, data }) =>
+              type === "semantic.verdict" &&
+              data.nodeId === "verify" &&
+              data.phase === "completion" &&
+              data.verdict !== undefined,
+          );
+          const completionStarts = events.filter(
+            ({ type, data }) =>
+              type === "semantic.started" &&
+              data.nodeId === "verify" &&
+              data.phase === "completion",
+          );
+          const completionUsage = events.filter(
+            ({ type, data }) =>
+              type === "tokens.recorded" &&
+              data.nodeId === "verify" &&
+              data.phase === "semantic_verification",
+          );
+          const heldOutChecks = events.filter(
+            ({ type, data }) => type === "held_out.checked" && data.nodeId === "verify",
+          );
+          const verifierDecisions = events.filter(
+            ({ type, data }) =>
+              type === "control.decision" &&
+              typeof data.decision === "object" &&
+              data.decision !== null &&
+              (data.decision as { sourceId?: unknown; targetId?: unknown }).sourceId ===
+                "runtime-verifier" &&
+              (data.decision as { sourceId?: unknown; targetId?: unknown }).targetId === "verify",
+          );
+          const controlObservations = events.filter(
+            ({ type, data }) =>
+              type === "control.observed" &&
+              data.observer === "runtime-verifier" &&
+              data.targetId === "verify",
+          );
+          const controlResolutions = events.filter(
+            ({ type, data }) => type === "control.resolved" && data.targetId === "verify",
+          );
+
+          expect(completed.status, `${phase}:${checkpoint}`).toBe("completed");
+          expect(completionSemanticRequests, `${phase}:${checkpoint}`).toHaveLength(
+            checkpoint === "semantic.verdict" && phase === "before" ? 2 : 1,
+          );
+          expect(completionVerdicts, `${phase}:${checkpoint}`).toHaveLength(1);
+          expect(completionVerdicts[0]?.data, `${phase}:${checkpoint}`).toMatchObject({
+            checkpointId: expect.stringMatching(/^[a-f0-9]{64}$/),
+            contextHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+            beforeDigest: expect.any(String),
+            afterDigest: expect.any(String),
+            policyViolation: false,
+          });
+          expect(completionVerdicts[0]?.data.beforeDigest, `${phase}:${checkpoint}`).toBe(
+            completionVerdicts[0]?.data.afterDigest,
+          );
+          const repeatedStart =
+            (checkpoint === "semantic.started" && phase === "after") ||
+            checkpoint === "semantic.missing_tokens" ||
+            (checkpoint === "semantic.verdict" && phase === "before");
+          expect(completionStarts, `${phase}:${checkpoint}`).toHaveLength(repeatedStart ? 2 : 1);
+          const repeatedMissingReceipt =
+            (checkpoint === "semantic.missing_tokens" && phase === "after") ||
+            (checkpoint === "semantic.verdict" && phase === "before");
+          expect(
+            completionUsage.filter(({ data }) => data.missing === true),
+            `${phase}:${checkpoint}`,
+          ).toHaveLength(repeatedMissingReceipt ? 2 : 1);
+          expect(
+            completionUsage.filter(({ data }) => data.missing !== true),
+            `${phase}:${checkpoint}`,
+          ).toHaveLength(1);
+          expect(
+            completed.tokenLedger.filter(
+              ({ nodeId, phase: tokenPhase }) =>
+                nodeId === "verify" && tokenPhase === "semantic_verification",
+            ),
+            `${phase}:${checkpoint}`,
+          ).toHaveLength(repeatedMissingReceipt ? 2 : 1);
+          expect(heldOutChecks, `${phase}:${checkpoint}`).toHaveLength(1);
+          const verificationCheckpointId = heldOutChecks[0]?.data.checkpointId;
+          expect(verificationCheckpointId, `${phase}:${checkpoint}`).toEqual(
+            expect.stringMatching(/^[a-f0-9]{64}$/),
+          );
+          for (const controlEvents of [
+            verifierDecisions,
+            controlObservations,
+            controlResolutions,
+          ]) {
+            expect(controlEvents, `${phase}:${checkpoint}`).toHaveLength(1);
+            expect(controlEvents[0]?.data, `${phase}:${checkpoint}`).toMatchObject({
+              checkpointId: verificationCheckpointId,
+              operationId: expect.stringMatching(/^[a-f0-9]{64}$/),
+            });
+          }
+          expect(
+            events.filter(({ type, data }) => type === "node.progress" && data.nodeId === "verify"),
+            `${phase}:${checkpoint}`,
+          ).toHaveLength(1);
+          expect(
+            events.filter(({ type, data }) => type === "node.accepted" && data.nodeId === "verify"),
+            `${phase}:${checkpoint}`,
+          ).toHaveLength(1);
+          expect(
+            events.filter(({ type }) => type === "run.completed"),
+            `${phase}:${checkpoint}`,
+          ).toHaveLength(1);
+        }
+      }
+    },
+    process.platform === "darwin" ? 180_000 : 120_000,
+  );
 
   it("amends the graph once and repairs a deterministic failure", async () => {
     const repository = await createRepository("repair.txt");
@@ -3045,6 +4753,79 @@ process.stdin.on("end", () => {
     ).toBe(true);
   });
 
+  it("recovers deterministic parallel-batch blocker metadata from durable node failures", async () => {
+    const scenarios = [
+      {
+        name: "multiple failures",
+        settleSibling: "failed" as const,
+        acceptedSiblingIds: [],
+        quarantinedSiblingIds: [],
+      },
+      {
+        name: "accepted sibling",
+        settleSibling: "accepted" as const,
+        acceptedSiblingIds: ["inspect-b"],
+        quarantinedSiblingIds: [],
+      },
+      {
+        name: "unfinished sibling",
+        settleSibling: "running" as const,
+        acceptedSiblingIds: [],
+        quarantinedSiblingIds: ["inspect-b"],
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const repository = await createRepository();
+      const adapter = new FakeAdapter(async () => undefined);
+      const created = await createRun(
+        `Implement a substantial ${scenario.name} batch-recovery feature`,
+        { cwd: repository, planner: adapter },
+      );
+      await created.store.append("user", "run.approved", { approved: true });
+      await amendRunGraph(created.store, splitParallelBranches(created.graph), "runtime");
+      const batchId = randomUUID();
+      for (const nodeId of ["inspect-a", "inspect-b"])
+        await created.store.append("runtime", "node.started", {
+          nodeId,
+          batchId,
+          batchSize: 2,
+          maxWorkers: 2,
+        });
+      const firstReason = `${scenario.name}: inspect-a failed first in batch order`;
+      await created.store.append("runtime", "node.failed", {
+        nodeId: "inspect-a",
+        reason: firstReason,
+      });
+      if (scenario.settleSibling === "failed")
+        await created.store.append("runtime", "node.failed", {
+          nodeId: "inspect-b",
+          reason: `${scenario.name}: inspect-b failed later in event order`,
+        });
+      if (scenario.settleSibling === "accepted")
+        await created.store.append("runtime", "node.accepted", {
+          nodeId: "inspect-b",
+          summary: "Accepted before the sibling failure was materialized",
+        });
+
+      const recovered = await executeRun({ store: created.store, adapter, maxWorkers: 2 });
+      const blocker = (await created.store.loadEvents()).findLast(
+        ({ type }) => type === "run.blocked",
+      );
+
+      expect(recovered.status, scenario.name).toBe("blocked");
+      expect(recovered.stopReason, scenario.name).toBe(firstReason);
+      expect(blocker?.data, scenario.name).toMatchObject({
+        reason: firstReason,
+        batchId,
+        acceptedSiblingIds: scenario.acceptedSiblingIds,
+        quarantinedSiblingIds: scenario.quarantinedSiblingIds,
+        recoveredFromNodeFailure: true,
+      });
+      expect(adapter.calls, scenario.name).toEqual([]);
+    }
+  });
+
   it("reuses a durable host context only for tightly dependent equivalent reasoning", async () => {
     const repository = await createRepository();
     const adapter = new FakeAdapter(async (request) => {
@@ -3155,6 +4936,107 @@ process.stdin.on("end", () => {
     expect(adapter.calls).not.toContain("write-a");
     expect(adapter.calls).not.toContain("write-b");
   });
+
+  it("preserves progress-probe scope evidence for a blocked parallel batch", async () => {
+    const repository = await createRepository();
+    const siblingReady = join(repository, "..", "inspect-b-ready");
+    const adapter = new FakeAdapter(async (request, _call, signal) => {
+      if (request.capsule.nodeId === "inspect-a")
+        throw new Error("the worker must not run after a mutating progress probe");
+      if (request.capsule.nodeId === "inspect-b") {
+        await writeFile(siblingReady, "ready\n");
+        await waitForAbort(signal);
+      }
+    });
+    const created = await createRun("Implement a scope-safe parallel fixture feature", {
+      cwd: repository,
+      planner: adapter,
+    });
+    const inventoryProgress = created.probePlan.items.find(
+      ({ phase, purpose }) => phase === "progress" && purpose === "inventory",
+    )!;
+    const configured = await configureRunProbes(created.store, {
+      ...created.probePlan,
+      items: created.probePlan.items.map((item) =>
+        item === inventoryProgress
+          ? {
+              ...item,
+              source: "Parallel mutating progress probe",
+              probe: {
+                id: "parallel-mutating-progress-probe",
+                kind: "command" as const,
+                command: process.execPath,
+                args: [
+                  "-e",
+                  "const fs = require('node:fs'); const marker = process.argv[1]; const deadline = Date.now() + 5000; while (!fs.existsSync(marker)) { if (Date.now() > deadline) throw new Error('timed out waiting for sibling'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); } fs.writeFileSync('parallel-progress-probe-output.txt', 'mutation\\n');",
+                  siblingReady,
+                ],
+                expectedExitCode: 0,
+                timeoutMs: 30_000,
+                platforms: [process.platform] as Array<"darwin" | "linux" | "win32">,
+              },
+            }
+          : item,
+      ),
+    });
+    await created.store.append("user", "run.approved", { approved: true });
+    const baseAmendment = splitParallelBranches(configured.graph);
+    const amendment: GraphAmendment = {
+      ...baseAmendment,
+      operations: baseAmendment.operations.map((operation) =>
+        operation.operation === "split" && operation.targetId === "investigate"
+          ? {
+              ...operation,
+              replacements: operation.replacements.map((replacement) =>
+                replacement.id === "inspect-b"
+                  ? { ...replacement, progressProbes: [] }
+                  : replacement,
+              ),
+            }
+          : operation,
+      ),
+    };
+    await amendRunGraph(created.store, amendment, "runtime");
+
+    const state = await executeRun({ store: created.store, adapter, maxWorkers: 2 });
+    const events = await created.store.loadEvents();
+    const batchStart = events.find(
+      ({ type, data }) => type === "node.started" && data.nodeId === "inspect-a",
+    );
+    const scopeStart = events.find(
+      ({ type, data }) =>
+        type === "scope.started" &&
+        data.nodeId === "inspect-a" &&
+        data.stage === "progress_baseline",
+    );
+    const scopeCheck = events.find(
+      ({ type, data }) =>
+        type === "scope.checked" &&
+        data.nodeId === "inspect-a" &&
+        data.stage === "progress_baseline",
+    );
+    const blocker = events.findLast(({ type }) => type === "run.blocked");
+
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toMatch(/progress probe execution changed repository state/i);
+    expect(state.nodes["inspect-a"]?.status).toBe("failed");
+    expect(state.nodes["inspect-b"]?.status).toBe("running");
+    expect(batchStart?.data.batchId).toEqual(expect.any(String));
+    expect(scopeStart?.data.checkpointId).toEqual(expect.any(String));
+    expect(scopeCheck?.data.audit).toMatchObject({ allowed: false });
+    expect(blocker?.data).toMatchObject({
+      reason: state.stopReason,
+      progressProbeStage: "progress_baseline",
+      scopeCheckpointId: scopeStart?.data.checkpointId,
+      scopeAudit: scopeCheck?.data.audit,
+      evidence: expect.arrayContaining([
+        expect.stringContaining("parallel-progress-probe-output.txt"),
+      ]),
+      batchId: batchStart?.data.batchId,
+      acceptedSiblingIds: [],
+      quarantinedSiblingIds: ["inspect-b"],
+    });
+  }, 30_000);
 
   it("resumes only the unfinished branch after a parallel interruption", async () => {
     const repository = await createRepository();
@@ -5955,17 +7837,51 @@ process.stdin.on("end", () => {
       cwd: repository,
       finishLine: "pr_green",
     });
+    const faultStore = new ActionableCiFailureFaultStore(created.store);
+
+    await expect(
+      executeRun({
+        store: faultStore,
+        adapter,
+        approve: true,
+        github,
+      }),
+    ).rejects.toThrow("Injected process termination after actionable CI node.failed");
+    const crashEvents = await created.store.loadEvents();
+    const failure = crashEvents.findLast(
+      ({ type, data }) =>
+        type === "node.failed" &&
+        data.nodeId === "pr-green" &&
+        typeof data.reason === "string" &&
+        data.reason.includes("same actionable CI failure"),
+    );
+    const runBlocker = failure?.data.runBlocker;
+
+    expect(crashEvents.some(({ type }) => type === "run.blocked")).toBe(false);
+    expect(runBlocker).toMatchObject({
+      reason: failure?.data.reason,
+      githubLifecycleStatus: "actionable_failure",
+      ciFailureSignature: expect.any(String),
+      actionableCheckIds: ["tests-check"],
+      evidence: expect.arrayContaining([expect.any(String)]),
+    });
 
     const state = await executeRun({
-      store: created.store,
+      store: new RunStore(repository, created.contract.runId),
       adapter,
-      approve: true,
       github,
     });
     const graph = await created.store.loadGraph();
+    const blocker = (await created.store.loadEvents()).findLast(
+      ({ type }) => type === "run.blocked",
+    );
 
     expect(state.status).toBe("blocked");
-    expect(state.stopReason).toContain("same actionable CI failure");
+    expect(state.stopReason).toBe(failure?.data.reason);
+    expect(blocker?.data).toEqual({
+      ...(runBlocker as Record<string, unknown>),
+      recoveredFromNodeFailure: true,
+    });
     expect(adapter.calls).toEqual(["implement", "repair-ci-1"]);
     expect(graph.nodes.map(({ id }) => id)).toContain("repair-ci-1");
     expect(graph.nodes.map(({ id }) => id)).not.toContain("repair-ci-2");
@@ -6708,6 +8624,103 @@ process.stdin.on("end", () => {
       ),
     ).toBeDefined();
   });
+
+  it("normalizes a recovered legacy progress baseline to its durable scope snapshot", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async () => {
+      throw new Error("the completed invocation must not execute again");
+    });
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    await created.store.append("user", "run.approved", { approved: true });
+    const workspace = await createRunWorkspace(created.contract);
+    await created.store.writeWorkspace(workspace);
+    await created.store.append("runtime", "node.started", { nodeId: "implement" });
+    const graph = await created.store.loadGraph();
+    const implement = graph.nodes.find(({ id }) => id === "implement")!;
+    const baselineProbeResults = (await runProbes(implement.progressProbes, workspace.path)).map(
+      ({ result }) => result,
+    );
+    const scopeBaseline = await captureWorkspaceScopeSnapshot(workspace.path);
+    const invocationId = randomUUID();
+    await created.store.append("runtime", "invocation.started", {
+      invocationId,
+      nodeId: "implement",
+      adapter: "test",
+      capsuleHash: "persisted-capsule",
+      baseline: evidenceSnapshot("legacy-workspace-digest", baselineProbeResults, graph.family),
+      scopeBaseline,
+    });
+    await created.store.appendInvocationEvent(invocationId, {
+      type: "result",
+      result: {
+        status: "completed",
+        summary: "Reported completion without changing the repository",
+        changedPaths: [],
+        evidence: [],
+      },
+    });
+    await created.store.append(
+      "runtime",
+      "invocation.finished",
+      { invocationId, nodeId: "implement", success: true },
+      invocationId,
+    );
+
+    const state = await executeRun({ store: created.store, adapter });
+    const trajectory = state.progressTrajectory.findLast(({ nodeId }) => nodeId === "implement");
+
+    expect(state.status).toBe("blocked");
+    expect(adapter.calls).toEqual([]);
+    expect(trajectory).toMatchObject({
+      classification: "stalled",
+      baseline: { workspaceDigest: scopeBaseline.digest },
+      current: { workspaceDigest: scopeBaseline.digest },
+    });
+  });
+
+  it("refuses a stale work progress checkpoint after allowed evidence drift", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+    });
+    const created = await createRun("Implement a substantial restart-safe feature", {
+      cwd: repository,
+      planner: adapter,
+    });
+    const faultStore = new FaultInjectingRunStore(created.store, "node.progress");
+
+    await expect(executeRun({ store: faultStore, adapter, approve: true })).rejects.toThrow(
+      "Injected process termination after node.progress",
+    );
+    const workspace = await created.store.loadWorkspace<{ path: string }>();
+    const requestsAtCrash = adapter.requests.length;
+    await writeFile(join(workspace.path, "feature.txt"), "reformatted\n");
+
+    const resumed = await executeRun({
+      store: new RunStore(repository, created.contract.runId),
+      adapter,
+    });
+    const events = await created.store.loadEvents();
+    const failure = events.findLast(
+      ({ type, data }) => type === "node.failed" && data.nodeId === "implement",
+    );
+
+    expect(resumed.status).toBe("blocked");
+    expect(resumed.stopReason).toMatch(/current repository evidence changed after that checkpoint/);
+    expect(adapter.requests).toHaveLength(requestsAtCrash);
+    expect(
+      events.filter(({ type, data }) => type === "node.accepted" && data.nodeId === "implement"),
+    ).toHaveLength(0);
+    expect(failure?.data).toMatchObject({
+      attemptId: expect.any(String),
+      recordedEvidenceDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+      currentEvidenceDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    expect(failure?.data.recordedEvidenceDigest).not.toBe(failure?.data.currentEvidenceDigest);
+  }, 30_000);
 
   it(
     "recovers across the complete durable invocation fault matrix on both host identities",

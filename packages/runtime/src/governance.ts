@@ -3,12 +3,15 @@ import { join } from "node:path";
 import {
   ControlDecisionPacketSchema,
   ControlDecisionSchema,
+  contentHash,
   type ControlDecision,
   type ControlDecisionPacket,
   type Graph,
+  type RunEvent,
   type RunState,
 } from "@graphcraft/core";
 import { RunLock } from "./lock.ts";
+import { redactValue } from "./redaction.ts";
 import type { RunStore } from "./store.ts";
 
 export interface UserControlDecisionInput {
@@ -38,9 +41,23 @@ function decisionFor(
   const sourceState = state.nodes[sourceId];
   if (!sourceState || !["accepted", "failed", "blocked", "stopped"].includes(sourceState.status))
     return undefined;
+  const identity = {
+    schemaVersion: 1,
+    kind: "node_control_decision",
+    sourceId,
+    targetId,
+    state: {
+      status: sourceState.status,
+      attempts: sourceState.attempts,
+      lastSummary: sourceState.lastSummary ?? null,
+      lastProgress: sourceState.lastProgress ?? null,
+      acceptedAt: sourceState.acceptedAt ?? null,
+    },
+  };
+  const hash = contentHash(identity);
   return ControlDecisionSchema.parse({
     schemaVersion: 1,
-    decisionId: randomUUID(),
+    decisionId: `${hash.slice(0, 8)}-${hash.slice(8, 12)}-5${hash.slice(13, 16)}-8${hash.slice(17, 20)}-${hash.slice(20, 32)}`,
     sourceId,
     targetId,
     verdict: sourceState.status === "accepted" ? "approve" : "veto",
@@ -52,13 +69,150 @@ function decisionFor(
   });
 }
 
-async function appendDecision(store: RunStore, decision: ControlDecision): Promise<void> {
-  await store.append(
-    decision.actor === "user" ? "user" : decision.actor === "verifier" ? "host" : "runtime",
-    "control.decision",
-    { decision },
-    decision.decisionId,
+function controlSourceGenerationIdentity(
+  state: RunState,
+  sourceId: string,
+  targetId: string,
+): Record<string, unknown> {
+  const explicit = state.controlDecisions.findLast(
+    (decision) => decision.sourceId === sourceId && decision.targetId === targetId,
   );
+  if (explicit)
+    return {
+      sourceId,
+      targetId,
+      kind: "explicit",
+      decisionId: explicit.decisionId,
+    };
+  const sourceState = state.nodes[sourceId];
+  const projected = decisionFor(state, sourceId, targetId);
+  return projected
+    ? {
+        sourceId,
+        targetId,
+        kind: "node",
+        decisionId: projected.decisionId,
+      }
+    : {
+        sourceId,
+        targetId,
+        kind: "unresolved",
+        state: sourceState
+          ? {
+              status: sourceState.status,
+              attempts: sourceState.attempts,
+              lastSummary: sourceState.lastSummary ?? null,
+              lastProgress: sourceState.lastProgress ?? null,
+              acceptedAt: sourceState.acceptedAt ?? null,
+            }
+          : null,
+      };
+}
+
+type CheckpointedControlEventType =
+  | "control.decision"
+  | "control.observed"
+  | "control.override"
+  | "control.decision_required"
+  | "control.resolved";
+
+async function appendCheckpointedControlEvent(input: {
+  store: RunStore;
+  actor: RunEvent["actor"];
+  type: CheckpointedControlEventType;
+  data: Record<string, unknown>;
+  checkpointId?: string;
+  controlGenerationId?: string;
+  identity?: unknown;
+  causationId?: string;
+}): Promise<RunEvent> {
+  if (!input.checkpointId)
+    return await input.store.append(input.actor, input.type, input.data, input.causationId);
+  const operationId = contentHash({
+    schemaVersion: 1,
+    kind: input.type,
+    checkpointId: input.checkpointId,
+    controlGenerationId: input.controlGenerationId ?? null,
+    identity: redactValue(input.identity ?? input.data),
+  });
+  const existing = (await input.store.loadEvents()).find(
+    ({ type, data }) => type === input.type && data.operationId === operationId,
+  );
+  if (existing) return existing;
+  return await input.store.append(
+    input.actor,
+    input.type,
+    {
+      ...input.data,
+      checkpointId: input.checkpointId,
+      ...(input.controlGenerationId ? { controlGenerationId: input.controlGenerationId } : {}),
+      operationId,
+    },
+    operationId,
+  );
+}
+
+async function appendDecision(
+  store: RunStore,
+  decision: ControlDecision,
+  checkpointId?: string,
+): Promise<ControlDecision> {
+  if (!checkpointId) {
+    await appendCheckpointedControlEvent({
+      store,
+      actor:
+        decision.actor === "user" ? "user" : decision.actor === "verifier" ? "host" : "runtime",
+      type: "control.decision",
+      data: { decision },
+      causationId: decision.decisionId,
+    });
+    return decision;
+  }
+  const durableDecision = ControlDecisionSchema.parse(redactValue(decision));
+  const [state, events] = await Promise.all([store.loadState(), store.loadEvents()]);
+  const current = state.controlDecisions.findLast(
+    ({ sourceId, targetId }) =>
+      sourceId === durableDecision.sourceId && targetId === durableDecision.targetId,
+  );
+  const currentMatches =
+    current?.verdict === durableDecision.verdict &&
+    current.rationale === durableDecision.rationale &&
+    JSON.stringify(current.evidence) === JSON.stringify(durableDecision.evidence) &&
+    current.actor === durableDecision.actor &&
+    current.sticky === durableDecision.sticky &&
+    current.replaces === durableDecision.replaces;
+  const currentBelongsToCheckpoint =
+    currentMatches &&
+    events.some(({ type, data }) => {
+      if (type !== "control.decision" || data.checkpointId !== checkpointId) return false;
+      const persisted = ControlDecisionSchema.safeParse(data.decision);
+      return persisted.success && persisted.data.decisionId === current?.decisionId;
+    });
+  if (currentMatches && currentBelongsToCheckpoint) return current;
+  const event = await appendCheckpointedControlEvent({
+    store,
+    actor:
+      durableDecision.actor === "user"
+        ? "user"
+        : durableDecision.actor === "verifier"
+          ? "host"
+          : "runtime",
+    type: "control.decision",
+    data: { decision: durableDecision },
+    checkpointId,
+    causationId: durableDecision.decisionId,
+    identity: {
+      sourceId: durableDecision.sourceId,
+      targetId: durableDecision.targetId,
+      verdict: durableDecision.verdict,
+      rationale: durableDecision.rationale,
+      evidence: durableDecision.evidence,
+      actor: durableDecision.actor,
+      sticky: durableDecision.sticky,
+      predecessorDecisionId: current?.decisionId ?? null,
+    },
+  });
+  return ControlDecisionSchema.parse(event.data.decision);
 }
 
 function authorityEdge(graph: Graph, sourceId: string, targetId: string): boolean {
@@ -79,6 +233,7 @@ export async function recordRuntimeControlDecision(input: {
   rationale: string;
   evidence: string[];
   actor: "runtime" | "verifier";
+  checkpointId?: string;
 }): Promise<ControlDecision> {
   if (!authorityEdge(input.graph, input.sourceId, input.targetId))
     throw new Error(`Control source ${input.sourceId} has no authority over ${input.targetId}`);
@@ -99,8 +254,7 @@ export async function recordRuntimeControlDecision(input: {
     sticky: false,
     decidedAt: new Date().toISOString(),
   });
-  await appendDecision(input.store, decision);
-  return decision;
+  return await appendDecision(input.store, decision, input.checkpointId);
 }
 
 export async function recordRunApprovalDecisions(store: RunStore, graph: Graph): Promise<void> {
@@ -151,6 +305,8 @@ async function requireDecision(
   conflict: string,
   evidence: string[],
   requiredSources: string[],
+  checkpointId?: string,
+  controlGenerationId?: string,
 ): Promise<ControlEvaluation> {
   const required = [...new Set(requiredSources)];
   const existing = (await store.loadState()).pendingDecision;
@@ -159,11 +315,36 @@ async function requireDecision(
     existing.conflict === conflict &&
     JSON.stringify([...existing.requiredSources].sort()) === JSON.stringify([...required].sort())
   ) {
-    return { allowed: false, reason: conflict, packet: existing };
+    if (!checkpointId) return { allowed: false, reason: conflict, packet: existing };
+    const existingEvent = (await store.loadEvents()).findLast(
+      ({ type, data }) =>
+        type === "control.decision_required" &&
+        typeof data.packet === "object" &&
+        data.packet !== null &&
+        (data.packet as { packetId?: unknown }).packetId === existing.packetId,
+    );
+    if (
+      existingEvent?.data.checkpointId === checkpointId &&
+      existingEvent.data.controlGenerationId === controlGenerationId
+    )
+      return { allowed: false, reason: conflict, packet: existing };
   }
   const value = packet({ targetId, conflict, evidence, requiredSources });
-  await store.append("runtime", "control.decision_required", { packet: value }, value.packetId);
-  return { allowed: false, reason: conflict, packet: value };
+  const event = await appendCheckpointedControlEvent({
+    store,
+    actor: "runtime",
+    type: "control.decision_required",
+    data: { packet: value },
+    ...(checkpointId ? { checkpointId } : {}),
+    ...(controlGenerationId ? { controlGenerationId } : {}),
+    causationId: value.packetId,
+    identity: { targetId, conflict, evidence, requiredSources: required },
+  });
+  return {
+    allowed: false,
+    reason: conflict,
+    packet: ControlDecisionPacketSchema.parse(event.data.packet),
+  };
 }
 
 function decisionsFor(
@@ -188,8 +369,10 @@ async function recordOverride(
   arbitrator: ControlDecision,
   overridden: ControlDecision[],
   missingSources: string[] = [],
+  checkpointId?: string,
+  controlGenerationId?: string,
 ): Promise<void> {
-  await store.append(arbitrator.actor === "user" ? "user" : "runtime", "control.override", {
+  const data = {
     targetId,
     arbitrator: arbitrator.sourceId,
     arbitratorDecisionId: arbitrator.decisionId,
@@ -198,6 +381,14 @@ async function recordOverride(
     overriddenDecisionIds: overridden.map(({ decisionId }) => decisionId),
     missingSources,
     evidence: arbitrator.evidence,
+  };
+  await appendCheckpointedControlEvent({
+    store,
+    actor: arbitrator.actor === "user" ? "user" : "runtime",
+    type: "control.override",
+    data,
+    ...(checkpointId ? { checkpointId } : {}),
+    ...(controlGenerationId ? { controlGenerationId } : {}),
   });
 }
 
@@ -207,13 +398,22 @@ async function recordResolution(
   outcome: "approved" | "vetoed",
   owners: ControlDecision[],
   evidence: string[],
+  checkpointId?: string,
+  controlGenerationId?: string,
 ): Promise<void> {
-  await store.append("runtime", "control.resolved", {
-    targetId,
-    outcome,
-    owners: owners.map(({ sourceId }) => sourceId),
-    ownerDecisionIds: owners.map(({ decisionId }) => decisionId),
-    evidence,
+  await appendCheckpointedControlEvent({
+    store,
+    actor: "runtime",
+    type: "control.resolved",
+    data: {
+      targetId,
+      outcome,
+      owners: owners.map(({ sourceId }) => sourceId),
+      ownerDecisionIds: owners.map(({ decisionId }) => decisionId),
+      evidence,
+    },
+    ...(checkpointId ? { checkpointId } : {}),
+    ...(controlGenerationId ? { controlGenerationId } : {}),
   });
 }
 
@@ -222,11 +422,24 @@ export async function evaluateControlScheduling(
   graph: Graph,
   state: RunState,
   targetId: string,
+  checkpointId?: string,
 ): Promise<ControlEvaluation> {
+  const incoming = graph.controlEdges.filter((edge) => edge.to === targetId);
   const owners = graph.controlEdges.filter(
     (edge) => edge.to === targetId && edge.relation === "owns_target",
   );
   if (owners.length === 0) return { allowed: true };
+  const controlGenerationId = checkpointId
+    ? contentHash({
+        schemaVersion: 1,
+        kind: "control_scheduling_generation",
+        checkpointId,
+        targetId,
+        sources: [...new Set(incoming.map(({ from }) => from))]
+          .sort()
+          .map((sourceId) => controlSourceGenerationIdentity(state, sourceId, targetId)),
+      })
+    : undefined;
   const ownerDecisions = decisionsFor(state, owners, targetId);
   const ownerApprovals = ownerDecisions.filter(({ verdict }) => verdict === "approve");
   const ownerVetoes = ownerDecisions.filter(({ verdict }) => verdict === "veto");
@@ -246,6 +459,8 @@ export async function evaluateControlScheduling(
       `Arbitrators disagree about scheduling ${targetId}`,
       arbitrators.flatMap(({ evidence }) => evidence),
       arbitratorEdges.map(({ from }) => from),
+      checkpointId,
+      controlGenerationId,
     );
   }
 
@@ -257,12 +472,30 @@ export async function evaluateControlScheduling(
         arbitrator,
         ownerVetoes,
         missing.map(({ from }) => from),
+        checkpointId,
+        controlGenerationId,
       );
-      await recordResolution(store, targetId, "approved", ownerApprovals, arbitrator.evidence);
+      await recordResolution(
+        store,
+        targetId,
+        "approved",
+        ownerApprovals,
+        arbitrator.evidence,
+        checkpointId,
+        controlGenerationId,
+      );
       return { allowed: true };
     }
     if (arbitrator?.verdict === "veto") {
-      await recordResolution(store, targetId, "vetoed", ownerDecisions, arbitrator.evidence);
+      await recordResolution(
+        store,
+        targetId,
+        "vetoed",
+        ownerDecisions,
+        arbitrator.evidence,
+        checkpointId,
+        controlGenerationId,
+      );
       return {
         allowed: false,
         reason: `Arbitrator vetoed scheduling ${targetId}: ${arbitrator.sourceId}`,
@@ -276,17 +509,43 @@ export async function evaluateControlScheduling(
       arbitratorEdges.length > 0
         ? arbitratorEdges.map(({ from }) => from)
         : missing.map(({ from }) => from),
+      checkpointId,
+      controlGenerationId,
     );
   }
 
   if (ownerApprovals.length > 0 && ownerVetoes.length > 0) {
     if (arbitrator?.verdict === "approve") {
-      await recordOverride(store, targetId, arbitrator, ownerVetoes);
-      await recordResolution(store, targetId, "approved", ownerApprovals, arbitrator.evidence);
+      await recordOverride(
+        store,
+        targetId,
+        arbitrator,
+        ownerVetoes,
+        [],
+        checkpointId,
+        controlGenerationId,
+      );
+      await recordResolution(
+        store,
+        targetId,
+        "approved",
+        ownerApprovals,
+        arbitrator.evidence,
+        checkpointId,
+        controlGenerationId,
+      );
       return { allowed: true };
     }
     if (arbitrator?.verdict === "veto") {
-      await recordResolution(store, targetId, "vetoed", ownerDecisions, arbitrator.evidence);
+      await recordResolution(
+        store,
+        targetId,
+        "vetoed",
+        ownerDecisions,
+        arbitrator.evidence,
+        checkpointId,
+        controlGenerationId,
+      );
       return {
         allowed: false,
         reason: `Arbitrator vetoed scheduling ${targetId}: ${arbitrator.sourceId}`,
@@ -300,13 +559,31 @@ export async function evaluateControlScheduling(
       arbitratorEdges.length > 0
         ? arbitratorEdges.map(({ from }) => from)
         : owners.map(({ from }) => from),
+      checkpointId,
+      controlGenerationId,
     );
   }
 
   if (ownerVetoes.length > 0) {
     if (arbitrator?.verdict === "approve") {
-      await recordOverride(store, targetId, arbitrator, ownerVetoes);
-      await recordResolution(store, targetId, "approved", [], arbitrator.evidence);
+      await recordOverride(
+        store,
+        targetId,
+        arbitrator,
+        ownerVetoes,
+        [],
+        checkpointId,
+        controlGenerationId,
+      );
+      await recordResolution(
+        store,
+        targetId,
+        "approved",
+        [],
+        arbitrator.evidence,
+        checkpointId,
+        controlGenerationId,
+      );
       return { allowed: true };
     }
     const reason = `Control owner vetoed ${targetId}: ${ownerVetoes
@@ -318,6 +595,8 @@ export async function evaluateControlScheduling(
       "vetoed",
       ownerVetoes,
       ownerVetoes.flatMap(({ evidence }) => evidence),
+      checkpointId,
+      controlGenerationId,
     );
     return { allowed: false, reason };
   }
@@ -330,13 +609,28 @@ export async function evaluateControlAcceptance(
   state: RunState,
   targetId: string,
   evidence: string[],
+  checkpointId?: string,
 ): Promise<ControlEvaluation> {
   const incoming = graph.controlEdges.filter((edge) => edge.to === targetId);
+  const controlGenerationId = checkpointId
+    ? contentHash({
+        schemaVersion: 1,
+        kind: "control_acceptance_generation",
+        checkpointId,
+        targetId,
+        sources: [...new Set(incoming.map(({ from }) => from))]
+          .sort()
+          .map((sourceId) => controlSourceGenerationIdentity(state, sourceId, targetId)),
+      })
+    : undefined;
   for (const edge of incoming.filter(({ relation }) => relation === "observes")) {
-    await store.append("runtime", "control.observed", {
-      observer: edge.from,
-      targetId,
-      evidence,
+    await appendCheckpointedControlEvent({
+      store,
+      actor: "runtime",
+      type: "control.observed",
+      data: { observer: edge.from, targetId, evidence },
+      ...(checkpointId ? { checkpointId } : {}),
+      ...(controlGenerationId ? { controlGenerationId } : {}),
     });
   }
 
@@ -358,6 +652,8 @@ export async function evaluateControlAcceptance(
       `Arbitrators disagree about ${targetId}`,
       [...evidence, ...arbitrators.flatMap(({ evidence: value }) => value)],
       arbitratorEdges.map(({ from }) => from),
+      checkpointId,
+      controlGenerationId,
     );
   }
 
@@ -369,10 +665,20 @@ export async function evaluateControlAcceptance(
         arbitrator,
         ownerVetoes,
         missingOwners.map(({ from }) => from),
+        checkpointId,
+        controlGenerationId,
       );
       ownerVetoes = [];
     } else if (arbitrator?.verdict === "veto") {
-      await recordResolution(store, targetId, "vetoed", ownerDecisions, arbitrator.evidence);
+      await recordResolution(
+        store,
+        targetId,
+        "vetoed",
+        ownerDecisions,
+        arbitrator.evidence,
+        checkpointId,
+        controlGenerationId,
+      );
       return { allowed: false, reason: `Arbitrator vetoed ${targetId}: ${arbitrator.sourceId}` };
     } else {
       return await requireDecision(
@@ -383,6 +689,8 @@ export async function evaluateControlAcceptance(
         arbitratorEdges.length > 0
           ? arbitratorEdges.map(({ from }) => from)
           : missingOwners.map(({ from }) => from),
+        checkpointId,
+        controlGenerationId,
       );
     }
   }
@@ -397,28 +705,70 @@ export async function evaluateControlAcceptance(
         arbitratorEdges.length > 0
           ? arbitratorEdges.map(({ from }) => from)
           : owners.map(({ from }) => from),
+        checkpointId,
+        controlGenerationId,
       );
     if (arbitrator.verdict === "approve") {
-      await recordOverride(store, targetId, arbitrator, ownerVetoes);
+      await recordOverride(
+        store,
+        targetId,
+        arbitrator,
+        ownerVetoes,
+        [],
+        checkpointId,
+        controlGenerationId,
+      );
       ownerVetoes = [];
     } else {
-      await recordResolution(store, targetId, "vetoed", ownerDecisions, arbitrator.evidence);
+      await recordResolution(
+        store,
+        targetId,
+        "vetoed",
+        ownerDecisions,
+        arbitrator.evidence,
+        checkpointId,
+        controlGenerationId,
+      );
       return { allowed: false, reason: `Arbitrator vetoed ${targetId}: ${arbitrator.sourceId}` };
     }
   }
   if (ownerVetoes.length > 0) {
     if (arbitrator?.verdict === "approve") {
-      await recordOverride(store, targetId, arbitrator, ownerVetoes);
+      await recordOverride(
+        store,
+        targetId,
+        arbitrator,
+        ownerVetoes,
+        [],
+        checkpointId,
+        controlGenerationId,
+      );
       ownerVetoes = [];
       ownerApprovals = [];
     } else if (arbitrator?.verdict === "veto") {
-      await recordResolution(store, targetId, "vetoed", ownerVetoes, arbitrator.evidence);
+      await recordResolution(
+        store,
+        targetId,
+        "vetoed",
+        ownerVetoes,
+        arbitrator.evidence,
+        checkpointId,
+        controlGenerationId,
+      );
       return { allowed: false, reason: `Arbitrator vetoed ${targetId}: ${arbitrator.sourceId}` };
     }
   }
   if (ownerVetoes.length > 0) {
     const reason = `Control owner vetoed ${targetId}: ${ownerVetoes.map(({ sourceId }) => sourceId).join(", ")}`;
-    await recordResolution(store, targetId, "vetoed", ownerVetoes, evidence);
+    await recordResolution(
+      store,
+      targetId,
+      "vetoed",
+      ownerVetoes,
+      evidence,
+      checkpointId,
+      controlGenerationId,
+    );
     return { allowed: false, reason };
   }
 
@@ -428,13 +778,26 @@ export async function evaluateControlAcceptance(
     .filter((decision): decision is ControlDecision => decision?.verdict === "veto");
   if (vetoes.length > 0) {
     if (arbitrator?.verdict === "approve") {
-      await recordOverride(store, targetId, arbitrator, vetoes);
+      await recordOverride(
+        store,
+        targetId,
+        arbitrator,
+        vetoes,
+        [],
+        checkpointId,
+        controlGenerationId,
+      );
     } else if (arbitrator?.verdict === "veto") {
       const reason = `Arbitrator vetoed ${targetId}: ${arbitrator.sourceId}`;
-      await recordResolution(store, targetId, "vetoed", ownerApprovals, [
-        ...evidence,
-        ...arbitrator.evidence,
-      ]);
+      await recordResolution(
+        store,
+        targetId,
+        "vetoed",
+        ownerApprovals,
+        [...evidence, ...arbitrator.evidence],
+        checkpointId,
+        controlGenerationId,
+      );
       return { allowed: false, reason };
     } else if (ownerApprovals.length > 0) {
       return await requireDecision(
@@ -445,6 +808,8 @@ export async function evaluateControlAcceptance(
         arbitratorEdges.length > 0
           ? arbitratorEdges.map(({ from }) => from)
           : owners.map(({ from }) => from),
+        checkpointId,
+        controlGenerationId,
       );
     } else {
       const reason = `Control vetoed ${targetId}: ${vetoes
@@ -456,12 +821,22 @@ export async function evaluateControlAcceptance(
         "vetoed",
         [],
         [...evidence, ...vetoes.flatMap(({ evidence: value }) => value)],
+        checkpointId,
+        controlGenerationId,
       );
       return { allowed: false, reason };
     }
   }
 
-  await recordResolution(store, targetId, "approved", ownerApprovals, evidence);
+  await recordResolution(
+    store,
+    targetId,
+    "approved",
+    ownerApprovals,
+    evidence,
+    checkpointId,
+    controlGenerationId,
+  );
   return { allowed: true };
 }
 

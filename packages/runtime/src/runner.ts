@@ -4,7 +4,11 @@ import {
   HostTerminationError,
   HostEventSchema,
   OptimizationDecisionSchema,
+  ProgressDecisionPacketSchema,
+  ProgressTrajectoryEntrySchema,
+  SemanticVerdictSchema,
   SemanticVerifierContextSchema,
+  TokenUsageSchema,
   WorkerResultSchema,
   applyProbePlan,
   classifyProgress,
@@ -39,7 +43,10 @@ import {
   type ProgressTrajectoryEntry,
   type RunContract,
   type RunControlRequest,
+  type RunEvent,
   type RunState,
+  type SemanticVerificationResult,
+  type SemanticVerifierContext,
   type SideEffectClaim,
   type TokenUsage,
   type UntrustedInputSource,
@@ -52,7 +59,6 @@ import {
   runProcess,
   runProbes,
   validateProbePlan,
-  workspaceDigest,
   type ExecutedProbe,
 } from "@graphcraft/probes";
 import { GitHubLifecycleConsistencyError } from "@graphcraft/github";
@@ -91,6 +97,7 @@ import {
   captureWorkspaceScopeSnapshot,
   parseWorkspaceScopeSnapshot,
   scopeViolationReason,
+  type WorkspaceScopeAudit,
   type WorkspaceScopeSnapshot,
 } from "./scope.ts";
 import { groundedRelevantPaths, prepareWorkerContext } from "./context.ts";
@@ -738,6 +745,230 @@ async function captureProbes(
   return executed;
 }
 
+class SemanticVerificationFailure extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "SemanticVerificationFailure";
+  }
+}
+
+function semanticEventMatches(
+  event: RunEvent,
+  nodeId: string,
+  phase: "progress" | "completion",
+): boolean {
+  return event.data.nodeId === nodeId && event.data.phase === phase;
+}
+
+function safeSemanticVerdict(event: RunEvent, baselineDigest: string): boolean {
+  return (
+    event.type === "semantic.verdict" &&
+    event.data.policyViolation === false &&
+    event.data.beforeDigest === baselineDigest &&
+    event.data.afterDigest === baselineDigest
+  );
+}
+
+function semanticVerdictResolvesStart(
+  start: RunEvent,
+  verdict: RunEvent,
+  baselineDigest: string,
+): boolean {
+  return (
+    start.actor === "runtime" &&
+    verdict.actor === "host" &&
+    verdict.sequence > start.sequence &&
+    start.causationId === start.data.invocationId &&
+    verdict.causationId === start.data.invocationId &&
+    verdict.data.invocationId === start.data.invocationId &&
+    verdict.data.host === start.data.host &&
+    verdict.data.checkpointId === start.data.checkpointId &&
+    verdict.data.contextHash === start.data.contextHash &&
+    safeSemanticVerdict(verdict, baselineDigest)
+  );
+}
+
+function successfulLegacySemanticVerdict(event: RunEvent): boolean {
+  const usage = event.data.usage;
+  return (
+    event.type === "semantic.verdict" &&
+    event.data.policyViolation === false &&
+    typeof event.data.invocationId === "string" &&
+    typeof event.data.host === "string" &&
+    typeof event.data.artifact === "string" &&
+    event.data.error === undefined &&
+    event.data.checkpointId === undefined &&
+    event.data.contextHash === undefined &&
+    event.data.beforeDigest === undefined &&
+    event.data.afterDigest === undefined &&
+    SemanticVerdictSchema.safeParse(event.data.verdict).success &&
+    (usage === null || TokenUsageSchema.safeParse(usage).success)
+  );
+}
+
+function assertSemanticWorkspaceRecovery(input: {
+  events: RunEvent[];
+  node: GraphNode;
+  phase: "progress" | "completion";
+  current: WorkspaceScopeSnapshot;
+}): void {
+  const latestStart = input.events.findLast(
+    (event) =>
+      event.type === "semantic.started" && semanticEventMatches(event, input.node.id, input.phase),
+  );
+  if (latestStart) {
+    const invocationId = latestStart.data.invocationId;
+    const baseline = parseWorkspaceScopeSnapshot(latestStart.data.scopeBaseline);
+    if (
+      typeof invocationId !== "string" ||
+      typeof latestStart.data.host !== "string" ||
+      typeof latestStart.data.checkpointId !== "string" ||
+      typeof latestStart.data.contextHash !== "string" ||
+      latestStart.actor !== "runtime" ||
+      latestStart.causationId !== invocationId ||
+      !baseline ||
+      latestStart.data.beforeDigest !== baseline.digest
+    )
+      throw new SemanticVerificationFailure(
+        "Graphcraft cannot validate the semantic verifier's approved pre-call workspace baseline",
+      );
+    const verdict = input.events.findLast(
+      (event) =>
+        event.type === "semantic.verdict" &&
+        event.data.invocationId === invocationId &&
+        semanticEventMatches(event, input.node.id, input.phase),
+    );
+    if (verdict && semanticVerdictResolvesStart(latestStart, verdict, baseline.digest)) return;
+    if (input.current.digest !== baseline.digest)
+      throw new SemanticVerificationFailure(
+        "The repository workspace still differs from the semantic verifier's approved pre-call baseline",
+      );
+    return;
+  }
+
+  const legacyVerdict = input.events.findLast(
+    (event) =>
+      event.type === "semantic.verdict" && semanticEventMatches(event, input.node.id, input.phase),
+  );
+  if (!legacyVerdict) return;
+  const baselineDigest = legacyVerdict.data.beforeDigest;
+  if (typeof baselineDigest === "string" && safeSemanticVerdict(legacyVerdict, baselineDigest))
+    return;
+  if (typeof baselineDigest !== "string") {
+    if (successfulLegacySemanticVerdict(legacyVerdict)) return;
+    throw new SemanticVerificationFailure(
+      "Graphcraft cannot validate the semantic verifier's approved pre-call workspace baseline",
+    );
+  }
+  if (input.current.digest !== baselineDigest)
+    throw new SemanticVerificationFailure(
+      "The repository workspace still differs from the semantic verifier's approved pre-call baseline",
+    );
+}
+
+async function ensureSemanticUsageReceipt(input: {
+  store: RunStore;
+  invocationId: string;
+  node: GraphNode;
+  host: string;
+  checkpointId: string;
+  usage: unknown;
+  recovered?: boolean;
+}): Promise<void> {
+  const receipts = (await input.store.loadEvents()).filter(
+    ({ type, causationId, data }) =>
+      type === "tokens.recorded" &&
+      causationId === input.invocationId &&
+      data.phase === "semantic_verification",
+  );
+  const usage = TokenUsageSchema.safeParse(input.usage);
+  if (usage.success) {
+    if (receipts.some(({ data }) => data.missing !== true)) return;
+    await input.store.append(
+      "host",
+      "tokens.recorded",
+      {
+        usage: usage.data,
+        phase: "semantic_verification",
+        nodeId: input.node.id,
+        host: input.host,
+        ...(input.recovered ? { recovered: true } : {}),
+        semanticCheckpointId: input.checkpointId,
+      },
+      input.invocationId,
+    );
+    return;
+  }
+  if (receipts.length > 0) return;
+  await input.store.append(
+    "host",
+    "tokens.recorded",
+    {
+      usage: unavailableTokenUsage(),
+      phase: "semantic_verification",
+      nodeId: input.node.id,
+      host: input.host,
+      missing: true,
+      ...(input.recovered ? { recovered: true } : {}),
+      semanticCheckpointId: input.checkpointId,
+    },
+    input.invocationId,
+  );
+}
+
+async function recoverSemanticVerification(input: {
+  store: RunStore;
+  node: GraphNode;
+  host: string;
+  phase: "progress" | "completion";
+  checkpointId: string;
+  scope: WorkspaceScopeSnapshot;
+}): Promise<SemanticVerdict | undefined> {
+  const events = await input.store.loadEvents();
+  assertSemanticWorkspaceRecovery({
+    events,
+    node: input.node,
+    phase: input.phase,
+    current: input.scope,
+  });
+  const checkpoint = events.findLast((event) => {
+    if (
+      event.type !== "semantic.verdict" ||
+      event.data.checkpointId !== input.checkpointId ||
+      event.data.nodeId !== input.node.id ||
+      event.data.host !== input.host ||
+      event.data.phase !== input.phase ||
+      event.data.policyViolation !== false ||
+      event.data.beforeDigest !== input.scope.digest ||
+      event.data.afterDigest !== input.scope.digest
+    )
+      return false;
+    const start = events.findLast(
+      (candidate) =>
+        candidate.sequence < event.sequence &&
+        candidate.type === "semantic.started" &&
+        candidate.data.invocationId === event.data.invocationId &&
+        semanticEventMatches(candidate, input.node.id, input.phase),
+    );
+    return start !== undefined && semanticVerdictResolvesStart(start, event, input.scope.digest);
+  });
+  if (!checkpoint) return undefined;
+  const invocationId = checkpoint.data.invocationId;
+  const verdict = SemanticVerdictSchema.safeParse(checkpoint.data.verdict);
+  if (typeof invocationId !== "string" || !verdict.success) return undefined;
+
+  await ensureSemanticUsageReceipt({
+    store: input.store,
+    invocationId,
+    node: input.node,
+    host: input.host,
+    checkpointId: input.checkpointId,
+    usage: checkpoint.data.usage,
+    recovered: true,
+  });
+  return verdict.data;
+}
+
 function needsSemanticVerification(
   phase: "progress" | "completion",
   probes: GraphNode["progressProbes"],
@@ -747,6 +978,15 @@ function needsSemanticVerification(
   if (!lacksCommandProof) return false;
   if (phase === "completion") return true;
   return classification === "stalled" || classification === "done";
+}
+
+function stableSemanticProbeEvidence(results: ProbeResult[]): ProbeResult[] {
+  return results
+    .map(({ artifact: _artifact, durationMs: _durationMs, ...result }) => ({
+      ...result,
+      durationMs: 0,
+    }))
+    .sort((left, right) => left.probeId.localeCompare(right.probeId));
 }
 
 async function runSemanticVerification(input: {
@@ -763,26 +1003,50 @@ async function runSemanticVerification(input: {
   signal: AbortSignal;
 }): Promise<SemanticVerdict> {
   const invocationId = randomUUID();
-  const context = SemanticVerifierContextSchema.parse(
-    redactValue({
-      schemaVersion: 1,
-      phase: input.phase,
-      runId: input.contract.runId,
-      nodeId: input.node.id,
-      objective: input.node.objective,
-      finishLine: input.contract.finishLine,
-      acceptanceAnchors: input.contract.acceptanceAnchors,
-      relevantPaths: input.node.contextSelector.relevantPaths,
-      workerSummary: input.workerSummary,
-      workerEvidence: input.workerEvidence,
-      baselineProbeEvidence: input.baselineProbeEvidence,
-      currentProbeEvidence: input.currentProbeEvidence,
-    }),
-  );
-  const beforeScope = await captureWorkspaceScopeSnapshot(
-    input.workspace.path,
-    input.contract.scope.exclude,
-  );
+  let context: SemanticVerifierContext;
+  let beforeScope: WorkspaceScopeSnapshot;
+  try {
+    context = SemanticVerifierContextSchema.parse(
+      redactValue({
+        schemaVersion: 1,
+        phase: input.phase,
+        runId: input.contract.runId,
+        nodeId: input.node.id,
+        objective: input.node.objective,
+        finishLine: input.contract.finishLine,
+        acceptanceAnchors: input.contract.acceptanceAnchors,
+        relevantPaths: input.node.contextSelector.relevantPaths,
+        workerSummary: input.workerSummary,
+        workerEvidence: input.workerEvidence,
+        baselineProbeEvidence: stableSemanticProbeEvidence(input.baselineProbeEvidence),
+        currentProbeEvidence: stableSemanticProbeEvidence(input.currentProbeEvidence),
+      }),
+    );
+    beforeScope = await captureWorkspaceScopeSnapshot(
+      input.workspace.path,
+      input.contract.scope.exclude,
+    );
+  } catch (error) {
+    const failure = error instanceof Error ? error : new Error(String(error));
+    throw new SemanticVerificationFailure(failure.message, { cause: error });
+  }
+  const contextHash = contentHash(context);
+  const checkpointId = contentHash({
+    schemaVersion: 1,
+    kind: "semantic_verification",
+    host: input.adapter.id,
+    contextHash,
+    scopeDigest: beforeScope.digest,
+  });
+  const recovered = await recoverSemanticVerification({
+    store: input.store,
+    node: input.node,
+    host: input.adapter.id,
+    phase: input.phase,
+    checkpointId,
+    scope: beforeScope,
+  });
+  if (recovered) return recovered;
   const semanticAuthorityInputs: Array<{ source: UntrustedInputSource; location: string }> = [
     {
       source: "task_or_issue_text",
@@ -808,9 +1072,62 @@ async function runSemanticVerification(input: {
     });
   if (input.node.id.startsWith("repair-review-") || input.node.id.startsWith("repair-ci-"))
     semanticAuthorityInputs.push({ source: "external_event", location: "context.objective" });
-  let verdictPersisted = false;
+  await input.store.append(
+    "runtime",
+    "semantic.started",
+    {
+      invocationId,
+      nodeId: input.node.id,
+      phase: input.phase,
+      host: input.adapter.id,
+      checkpointId,
+      contextHash,
+      beforeDigest: beforeScope.digest,
+      scopeBaseline: beforeScope,
+    },
+    invocationId,
+  );
+  await input.store.append(
+    "host",
+    "tokens.recorded",
+    {
+      usage: unavailableTokenUsage(),
+      phase: "semantic_verification",
+      nodeId: input.node.id,
+      host: input.adapter.id,
+      missing: true,
+      provisional: true,
+      semanticCheckpointId: checkpointId,
+    },
+    invocationId,
+  );
+  const failVerification = async (error: unknown): Promise<never> => {
+    const failure = error instanceof Error ? error : new Error(String(error));
+    const artifact = await input.store.writeArtifact(
+      `semantic/${invocationId}-error.json`,
+      `${JSON.stringify({ schemaVersion: 1, host: input.adapter.id, context, error: failure.message }, null, 2)}\n`,
+    );
+    await input.store.append(
+      "host",
+      "semantic.verdict",
+      {
+        invocationId,
+        nodeId: input.node.id,
+        phase: input.phase,
+        host: input.adapter.id,
+        checkpointId,
+        contextHash,
+        beforeDigest: beforeScope.digest,
+        error: failure.message,
+        artifact,
+      },
+      invocationId,
+    );
+    throw new SemanticVerificationFailure(failure.message, { cause: error });
+  };
+  let result: SemanticVerificationResult;
   try {
-    const result = await input.adapter.verify(
+    result = await input.adapter.verify(
       {
         invocationId,
         repositoryPath: input.workspace.path,
@@ -819,70 +1136,59 @@ async function runSemanticVerification(input: {
       },
       input.signal,
     );
-    const afterScope = await captureWorkspaceScopeSnapshot(
+  } catch (error) {
+    if (error instanceof HostTerminationError) throw error;
+    return failVerification(error);
+  }
+
+  let afterScope: WorkspaceScopeSnapshot;
+  try {
+    afterScope = await captureWorkspaceScopeSnapshot(
       input.workspace.path,
       input.contract.scope.exclude,
     );
-    const beforeDigest = beforeScope.digest;
-    const afterDigest = afterScope.digest;
-    const policyViolation = beforeDigest !== afterDigest;
-    const artifact = await input.store.writeArtifact(
-      `semantic/${invocationId}.json`,
-      `${JSON.stringify({ schemaVersion: 1, host: input.adapter.id, context, result, beforeDigest, afterDigest }, null, 2)}\n`,
-    );
-    await input.store.append(
-      "host",
-      "semantic.verdict",
-      {
-        invocationId,
-        nodeId: input.node.id,
-        phase: input.phase,
-        host: input.adapter.id,
-        verdict: result.verdict,
-        usage: result.usage ?? null,
-        artifact,
-        policyViolation,
-      },
-      invocationId,
-    );
-    verdictPersisted = true;
-    await input.store.append(
-      "host",
-      "tokens.recorded",
-      {
-        usage: result.usage ?? unavailableTokenUsage(),
-        phase: "semantic_verification",
-        nodeId: input.node.id,
-        host: input.adapter.id,
-        missing: !result.usage,
-      },
-      invocationId,
-    );
-    if (policyViolation)
-      throw new Error("The read-only semantic verifier changed the repository workspace");
-    return result.verdict;
   } catch (error) {
-    if (error instanceof HostTerminationError) throw error;
-    if (verdictPersisted) throw error;
-    const artifact = await input.store.writeArtifact(
-      `semantic/${invocationId}-error.json`,
-      `${JSON.stringify({ schemaVersion: 1, host: input.adapter.id, context, error: (error as Error).message }, null, 2)}\n`,
-    );
-    await input.store.append(
-      "host",
-      "semantic.verdict",
-      {
-        invocationId,
-        nodeId: input.node.id,
-        phase: input.phase,
-        host: input.adapter.id,
-        error: (error as Error).message,
-        artifact,
-      },
-      invocationId,
-    );
-    throw error;
+    return failVerification(error);
   }
+  const beforeDigest = beforeScope.digest;
+  const afterDigest = afterScope.digest;
+  const policyViolation = beforeDigest !== afterDigest;
+  const artifact = await input.store.writeArtifact(
+    `semantic/${invocationId}.json`,
+    `${JSON.stringify({ schemaVersion: 1, host: input.adapter.id, context, result, beforeDigest, afterDigest }, null, 2)}\n`,
+  );
+  await input.store.append(
+    "host",
+    "semantic.verdict",
+    {
+      invocationId,
+      nodeId: input.node.id,
+      phase: input.phase,
+      host: input.adapter.id,
+      checkpointId,
+      contextHash,
+      beforeDigest,
+      afterDigest,
+      verdict: result.verdict,
+      usage: result.usage ?? null,
+      artifact,
+      policyViolation,
+    },
+    invocationId,
+  );
+  await ensureSemanticUsageReceipt({
+    store: input.store,
+    invocationId,
+    node: input.node,
+    host: input.adapter.id,
+    checkpointId,
+    usage: result.usage,
+  });
+  if (policyViolation)
+    throw new SemanticVerificationFailure(
+      "The read-only semantic verifier changed the repository workspace",
+    );
+  return result.verdict;
 }
 
 function acceptedNodeIds(state: RunState): Set<string> {
@@ -1434,6 +1740,7 @@ async function recordVerifierControl(input: {
   verdict: "approve" | "veto";
   rationale: string;
   evidence: string[];
+  checkpointId?: string;
 }): Promise<void> {
   if (!runtimeVerifierControls(input.graph, input.targetId)) return;
   await recordRuntimeControlDecision({
@@ -1449,6 +1756,7 @@ async function evaluateSuccessfulControl(input: {
   node: GraphNode;
   rationale: string;
   evidence: string[];
+  checkpointId?: string;
 }): Promise<ControlEvaluation> {
   await recordVerifierControl({
     store: input.store,
@@ -1457,6 +1765,7 @@ async function evaluateSuccessfulControl(input: {
     verdict: "approve",
     rationale: input.rationale,
     evidence: input.evidence,
+    ...(input.checkpointId ? { checkpointId: input.checkpointId } : {}),
   });
   return await evaluateControlAcceptance(
     input.store,
@@ -1464,6 +1773,7 @@ async function evaluateSuccessfulControl(input: {
     await input.store.loadState(),
     input.node.id,
     input.evidence,
+    input.checkpointId,
   );
 }
 
@@ -1480,6 +1790,7 @@ async function appendProgressTrajectory(input: {
   alreadyRecorded: boolean;
   summary: string;
   evidence: string[];
+  semanticStopReason?: string;
 }): Promise<void> {
   if (input.alreadyRecorded) return;
   await input.store.append(
@@ -1491,9 +1802,52 @@ async function appendProgressTrajectory(input: {
       summary: input.summary,
       evidence: input.evidence,
       trajectory: input.trajectory,
+      ...(input.semanticStopReason ? { semanticStopReason: input.semanticStopReason } : {}),
     },
     input.trajectory.attemptId,
   );
+}
+
+function persistedProgressCheckpoint(
+  events: RunEvent[],
+  nodeId: string,
+  attemptId: string,
+):
+  | {
+      trajectory: ProgressTrajectoryEntry;
+      summary: string;
+      evidence: string[];
+      semanticStopReason?: string;
+    }
+  | undefined {
+  const event = events.findLast(
+    ({ actor, type, causationId, data }) =>
+      actor === "probe" &&
+      type === "node.progress" &&
+      causationId === attemptId &&
+      data.nodeId === nodeId,
+  );
+  if (!event || typeof event.data.summary !== "string" || !Array.isArray(event.data.evidence))
+    return undefined;
+  const trajectory = ProgressTrajectoryEntrySchema.safeParse(event.data.trajectory);
+  if (
+    !trajectory.success ||
+    trajectory.data.attemptId !== attemptId ||
+    trajectory.data.nodeId !== nodeId ||
+    event.data.classification !== trajectory.data.classification ||
+    event.data.evidence.some((value) => typeof value !== "string") ||
+    (event.data.semanticStopReason !== undefined &&
+      typeof event.data.semanticStopReason !== "string")
+  )
+    return undefined;
+  return {
+    trajectory: trajectory.data,
+    summary: event.data.summary,
+    evidence: event.data.evidence as string[],
+    ...(typeof event.data.semanticStopReason === "string"
+      ? { semanticStopReason: event.data.semanticStopReason }
+      : {}),
+  };
 }
 
 async function progressPacket(input: {
@@ -1514,6 +1868,41 @@ async function progressPacket(input: {
   });
 }
 
+type RunBlockerEnvelope = { reason: string } & Record<string, unknown>;
+
+async function appendDurableNodeFailureBlocker(input: {
+  store: RunStore;
+  actor: RunEvent["actor"];
+  nodeId: string;
+  blocker: RunBlockerEnvelope;
+}): Promise<void> {
+  if (input.blocker.reason.length === 0) throw new Error("Run blocker reason must not be empty");
+  await input.store.append(input.actor, "node.failed", {
+    nodeId: input.nodeId,
+    reason: input.blocker.reason,
+    runBlocker: input.blocker,
+  });
+  await input.store.append("runtime", "run.blocked", input.blocker);
+}
+
+function durableRunBlocker(failure: RunEvent): RunBlockerEnvelope | undefined {
+  const value = failure.data.runBlocker;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const blocker = value as Record<string, unknown>;
+  if (
+    typeof blocker.reason !== "string" ||
+    blocker.reason.length === 0 ||
+    blocker.reason !== failure.data.reason
+  )
+    return undefined;
+  if (
+    "progressDecision" in blocker &&
+    !ProgressDecisionPacketSchema.safeParse(blocker.progressDecision).success
+  )
+    return undefined;
+  return blocker as RunBlockerEnvelope;
+}
+
 type WorkNodeOutcome =
   | { status: "accepted"; nodeId: string }
   | {
@@ -1523,6 +1912,7 @@ type WorkNodeOutcome =
       cause?: "host_crash" | "timeout";
       packet?: ControlEvaluation["packet"];
       progressDecision?: ProgressDecisionPacket;
+      blocker?: RunBlockerEnvelope;
     }
   | {
       status: "interrupted";
@@ -1530,6 +1920,641 @@ type WorkNodeOutcome =
       termination?: HostTermination;
       artifact: string;
     };
+
+type ProgressProbeStage = "progress_baseline" | "progress_current";
+
+function progressProbeStage(value: unknown): ProgressProbeStage | undefined {
+  return value === "progress_baseline" || value === "progress_current" ? value : undefined;
+}
+
+function workspaceScopeSnapshotDigestIsValid(snapshot: WorkspaceScopeSnapshot): boolean {
+  return (
+    snapshot.digest ===
+    contentHash({
+      headSha: snapshot.headSha,
+      branch: snapshot.branch,
+      indexDigest: snapshot.indexDigest,
+      changed: snapshot.changed,
+    })
+  );
+}
+
+function progressProbeScopePolicyHash(input: {
+  contract: RunContract;
+  graph: Graph;
+  node: GraphNode;
+}): string {
+  return contentHash({
+    schemaVersion: 1,
+    kind: "progress_probe_scope_policy",
+    runId: input.contract.runId,
+    graphRevision: input.graph.revision,
+    contractScope: input.contract.scope,
+    nodeId: input.node.id,
+    nodeScope: input.node.scope,
+    probeIds: input.node.progressProbes.map(({ id }) => id),
+  });
+}
+
+function progressProbeScopeAudit(input: {
+  contract: RunContract;
+  graph: Graph;
+  state: RunState;
+  node: GraphNode;
+  baseline: WorkspaceScopeSnapshot;
+  current: WorkspaceScopeSnapshot;
+}): WorkspaceScopeAudit {
+  return auditWorkspaceScope({
+    contract: input.contract,
+    graph: input.graph,
+    state: input.state,
+    node: { ...input.node, sideEffectClass: "none" },
+    baseline: input.baseline,
+    current: input.current,
+  });
+}
+
+function progressProbeScopeBlocker(input: {
+  audit: WorkspaceScopeAudit;
+  workspace: RunWorkspace;
+  stage: ProgressProbeStage;
+  checkpointId: string;
+}): RunBlockerEnvelope | undefined {
+  if (input.audit.allowed) return undefined;
+  const reason = `Progress probe execution changed repository state: ${scopeViolationReason(
+    input.audit,
+    input.workspace.path,
+  )}`;
+  return {
+    reason,
+    progressProbeStage: input.stage,
+    scopeCheckpointId: input.checkpointId,
+    scopeAudit: input.audit,
+    evidence: input.audit.violations.map(({ detail }) => detail),
+  };
+}
+
+async function ensureProgressProbeNodeFailure(input: {
+  store: RunStore;
+  nodeId: string;
+  blocker: RunBlockerEnvelope;
+}): Promise<void> {
+  const stage = progressProbeStage(input.blocker.progressProbeStage);
+  const checkpointId = input.blocker.scopeCheckpointId;
+  if (typeof checkpointId !== "string" || checkpointId.length === 0)
+    throw new Error("Progress-probe blocker checkpoint is incomplete");
+  const events = await input.store.loadEvents();
+  if (
+    events.some(
+      ({ type, data }) =>
+        type === "node.failed" &&
+        data.nodeId === input.nodeId &&
+        data.scopeCheckpointId === checkpointId,
+    )
+  )
+    return;
+  await input.store.append("runtime", "node.failed", {
+    nodeId: input.nodeId,
+    reason: input.blocker.reason,
+    ...(stage ? { progressProbeStage: stage } : {}),
+    scopeCheckpointId: checkpointId,
+    ...(input.blocker.scopeAudit ? { scopeAudit: input.blocker.scopeAudit } : {}),
+    runBlocker: input.blocker,
+  });
+}
+
+async function ensureProgressProbeRunBlocker(input: {
+  store: RunStore;
+  blocker: RunBlockerEnvelope;
+}): Promise<void> {
+  const checkpointId = input.blocker.scopeCheckpointId;
+  if (typeof checkpointId !== "string" || checkpointId.length === 0)
+    throw new Error("Progress-probe blocker checkpoint is incomplete");
+  const events = await input.store.loadEvents();
+  if (
+    events.some(
+      ({ type, data }) => type === "run.blocked" && data.scopeCheckpointId === checkpointId,
+    )
+  )
+    return;
+  await input.store.append("runtime", "run.blocked", input.blocker);
+}
+
+async function persistProgressProbeScopeCheck(input: {
+  store: RunStore;
+  contract: RunContract;
+  graph: Graph;
+  state: RunState;
+  node: GraphNode;
+  workspace: RunWorkspace;
+  baseline: WorkspaceScopeSnapshot;
+  current: WorkspaceScopeSnapshot;
+  stage: ProgressProbeStage;
+  checkpointId: string;
+  recovered?: boolean;
+}): Promise<{ audit: WorkspaceScopeAudit; reason?: string; blocker?: RunBlockerEnvelope }> {
+  const audit = progressProbeScopeAudit(input);
+  const blocker = progressProbeScopeBlocker({
+    audit,
+    workspace: input.workspace,
+    stage: input.stage,
+    checkpointId: input.checkpointId,
+  });
+  const reason = blocker?.reason;
+  if (blocker)
+    await ensureProgressProbeNodeFailure({
+      store: input.store,
+      nodeId: input.node.id,
+      blocker,
+    });
+  await input.store.append(
+    "runtime",
+    "scope.checked",
+    {
+      nodeId: input.node.id,
+      stage: input.stage,
+      checkpointId: input.checkpointId,
+      enforced: true,
+      audit,
+      current: input.current,
+      ...(input.recovered ? { recovered: true } : {}),
+    },
+    input.checkpointId,
+  );
+  if (reason && blocker) return { audit, reason, blocker };
+  return { audit };
+}
+
+type ProgressProbeExecution =
+  | { status: "completed"; probes: ExecutedProbe[]; scope: WorkspaceScopeSnapshot }
+  | { status: "interrupted" }
+  | {
+      status: "failed";
+      reason: string;
+      failurePersisted: boolean;
+      blocker?: RunBlockerEnvelope;
+    };
+
+async function executeReadOnlyProgressProbes(input: {
+  store: RunStore;
+  contract: RunContract;
+  graph: Graph;
+  state: RunState;
+  node: GraphNode;
+  workspace: RunWorkspace;
+  signal: AbortSignal;
+  stage: ProgressProbeStage;
+  baseline?: WorkspaceScopeSnapshot;
+  execute: () => Promise<ExecutedProbe[]>;
+}): Promise<ProgressProbeExecution> {
+  let baseline = input.baseline;
+  if (!baseline)
+    try {
+      baseline = await captureWorkspaceScopeSnapshot(
+        input.workspace.path,
+        input.contract.scope.exclude,
+      );
+    } catch (error) {
+      return {
+        status: "failed",
+        reason: `Workspace scope inspection failed before progress probes for node ${input.node.id}: ${(error as Error).message}`,
+        failurePersisted: false,
+      };
+    }
+  const checkpointId = contentHash({
+    schemaVersion: 1,
+    kind: "progress_probe_scope",
+    runId: input.contract.runId,
+    nodeId: input.node.id,
+    stage: input.stage,
+    baselineDigest: baseline.digest,
+    nonce: randomUUID(),
+  });
+  await input.store.append(
+    "runtime",
+    "scope.started",
+    {
+      nodeId: input.node.id,
+      stage: input.stage,
+      checkpointId,
+      baseline,
+      graphRevision: input.graph.revision,
+      policyHash: progressProbeScopePolicyHash(input),
+      probeIds: input.node.progressProbes.map(({ id }) => id),
+    },
+    checkpointId,
+  );
+  let probes: ExecutedProbe[] = [];
+  let executionError: unknown;
+  if (!input.signal.aborted)
+    try {
+      probes = await input.execute();
+    } catch (error) {
+      executionError = error;
+    }
+  let current: WorkspaceScopeSnapshot;
+  try {
+    current = await captureWorkspaceScopeSnapshot(
+      input.workspace.path,
+      input.contract.scope.exclude,
+    );
+  } catch (error) {
+    return {
+      status: "failed",
+      reason: `Workspace scope inspection failed after progress probes for node ${input.node.id}: ${(error as Error).message}`,
+      failurePersisted: false,
+    };
+  }
+  const check = await persistProgressProbeScopeCheck({
+    store: input.store,
+    contract: input.contract,
+    graph: input.graph,
+    state: input.state,
+    node: input.node,
+    workspace: input.workspace,
+    baseline,
+    current,
+    stage: input.stage,
+    checkpointId,
+  });
+  if (check.reason)
+    return {
+      status: "failed",
+      reason: check.reason,
+      failurePersisted: true,
+      ...(check.blocker ? { blocker: check.blocker } : {}),
+    };
+  if (input.signal.aborted) return { status: "interrupted" };
+  if (executionError)
+    return {
+      status: "failed",
+      reason: `Progress probe execution failed for node ${input.node.id}: ${executionError instanceof Error ? executionError.message : String(executionError)}`,
+      failurePersisted: false,
+    };
+  return { status: "completed", probes, scope: current };
+}
+
+interface ProgressProbeScopeCheckpoint {
+  start: RunEvent;
+  node: GraphNode;
+  stage: ProgressProbeStage;
+  checkpointId: string;
+  baseline: WorkspaceScopeSnapshot;
+}
+
+function validatedProgressProbeScopeCheck(input: {
+  event: RunEvent;
+  checkpoint: ProgressProbeScopeCheckpoint;
+  contract: RunContract;
+  graph: Graph;
+  state: RunState;
+}): { audit: WorkspaceScopeAudit; current: WorkspaceScopeSnapshot } | undefined {
+  const { event, checkpoint } = input;
+  if (
+    event.type !== "scope.checked" ||
+    event.actor !== "runtime" ||
+    event.sequence <= checkpoint.start.sequence ||
+    event.causationId !== checkpoint.checkpointId ||
+    event.data.checkpointId !== checkpoint.checkpointId ||
+    event.data.nodeId !== checkpoint.node.id ||
+    event.data.stage !== checkpoint.stage ||
+    event.data.enforced !== true ||
+    typeof event.data.audit !== "object" ||
+    event.data.audit === null ||
+    Array.isArray(event.data.audit)
+  )
+    return undefined;
+  const current = parseWorkspaceScopeSnapshot(event.data.current);
+  if (!current || !workspaceScopeSnapshotDigestIsValid(current)) return undefined;
+  const audit = progressProbeScopeAudit({
+    contract: input.contract,
+    graph: input.graph,
+    state: input.state,
+    node: checkpoint.node,
+    baseline: checkpoint.baseline,
+    current,
+  });
+  if (contentHash(event.data.audit) !== contentHash(audit)) return undefined;
+  return { audit, current };
+}
+
+function progressProbeRecoveryBlocker(input: {
+  reason: string;
+  checkpointId: string;
+  stage?: ProgressProbeStage;
+  audit?: WorkspaceScopeAudit;
+}): RunBlockerEnvelope {
+  return {
+    reason: input.reason,
+    scopeCheckpointId: input.checkpointId,
+    ...(input.stage ? { progressProbeStage: input.stage } : {}),
+    ...(input.audit ? { scopeAudit: input.audit } : {}),
+    evidence: input.audit ? input.audit.violations.map(({ detail }) => detail) : [input.reason],
+  };
+}
+
+async function blockProgressProbeRecovery(input: {
+  store: RunStore;
+  nodeId?: string;
+  blocker: RunBlockerEnvelope;
+}): Promise<RunState> {
+  if (input.nodeId)
+    await ensureProgressProbeNodeFailure({
+      store: input.store,
+      nodeId: input.nodeId,
+      blocker: input.blocker,
+    });
+  await ensureProgressProbeRunBlocker({ store: input.store, blocker: input.blocker });
+  return await input.store.loadState();
+}
+
+function activeProgressProbeScopeStarts(
+  events: RunEvent[],
+  graph: Graph,
+  state: RunState,
+): RunEvent[] {
+  const activeNodes = new Map(
+    graph.nodes
+      .filter(({ id }) => ["running", "failed"].includes(state.nodes[id]?.status ?? ""))
+      .map((node) => {
+        const started = events.findLast(
+          ({ type, data }) => type === "node.started" && data.nodeId === node.id,
+        );
+        return [node.id, started] as const;
+      })
+      .filter((entry): entry is readonly [string, RunEvent] => entry[1] !== undefined),
+  );
+  const knownNodeIds = new Set(graph.nodes.map(({ id }) => id));
+  const earliestActiveStart = Math.min(
+    ...[...activeNodes.values()].map(({ sequence }) => sequence),
+  );
+  return events.filter(({ sequence, type, data }) => {
+    if (type !== "scope.started") return false;
+    if (typeof data.nodeId === "string") {
+      const nodeStart = activeNodes.get(data.nodeId);
+      if (nodeStart) return sequence > nodeStart.sequence;
+      if (knownNodeIds.has(data.nodeId)) return false;
+    }
+    return Number.isFinite(earliestActiveStart) && sequence > earliestActiveStart;
+  });
+}
+
+async function reconcileProgressProbeScopeCheckpoints(input: {
+  store: RunStore;
+  contract: RunContract;
+  graph: Graph;
+  state: RunState;
+  workspace: RunWorkspace;
+}): Promise<RunState | undefined> {
+  const events = await input.store.loadEvents();
+  const activeNodes = new Map(
+    input.graph.nodes
+      .filter(({ id }) => ["running", "failed"].includes(input.state.nodes[id]?.status ?? ""))
+      .map((node) => {
+        const started = events.findLast(
+          ({ type, data }) => type === "node.started" && data.nodeId === node.id,
+        );
+        return [node.id, { node, started }] as const;
+      })
+      .filter(
+        (entry): entry is readonly [string, { node: GraphNode; started: RunEvent }] =>
+          entry[1].started !== undefined,
+      ),
+  );
+  const starts = activeProgressProbeScopeStarts(events, input.graph, input.state);
+
+  const duplicateStart = starts.find((start, index) => {
+    const checkpointId = start.data.checkpointId;
+    return (
+      typeof checkpointId === "string" &&
+      starts.findIndex((candidate) => candidate.data.checkpointId === checkpointId) !== index
+    );
+  });
+  if (duplicateStart) {
+    const checkpointId = String(duplicateStart.data.checkpointId);
+    const nodeId =
+      typeof duplicateStart.data.nodeId === "string" && activeNodes.has(duplicateStart.data.nodeId)
+        ? duplicateStart.data.nodeId
+        : undefined;
+    const reason = `Graphcraft found duplicate progress-probe scope starts for checkpoint ${checkpointId}`;
+    return await blockProgressProbeRecovery({
+      store: input.store,
+      ...(nodeId ? { nodeId } : {}),
+      blocker: progressProbeRecoveryBlocker({
+        reason,
+        checkpointId,
+        ...(progressProbeStage(duplicateStart.data.stage)
+          ? { stage: progressProbeStage(duplicateStart.data.stage)! }
+          : {}),
+      }),
+    });
+  }
+  const unresolvedByNode = new Map<string, RunEvent[]>();
+  for (const start of starts) {
+    if (typeof start.data.nodeId !== "string") continue;
+    const checkpointId = start.data.checkpointId;
+    const resolved =
+      typeof checkpointId === "string" &&
+      events.some(
+        ({ sequence, type, causationId, data }) =>
+          sequence > start.sequence &&
+          type === "scope.checked" &&
+          (causationId === checkpointId || data.checkpointId === checkpointId),
+      );
+    if (!resolved)
+      unresolvedByNode.set(start.data.nodeId, [
+        ...(unresolvedByNode.get(start.data.nodeId) ?? []),
+        start,
+      ]);
+  }
+  const conflictingUnresolved = [...unresolvedByNode.entries()].find(
+    ([, nodeStarts]) => nodeStarts.length > 1,
+  );
+  if (conflictingUnresolved) {
+    const [nodeId, nodeStarts] = conflictingUnresolved;
+    const checkpointId =
+      typeof nodeStarts[0]?.data.checkpointId === "string"
+        ? nodeStarts[0].data.checkpointId
+        : nodeStarts[0]!.hash;
+    const reason = `Graphcraft found multiple unresolved progress-probe scope starts for node ${nodeId}`;
+    return await blockProgressProbeRecovery({
+      store: input.store,
+      ...(activeNodes.has(nodeId) ? { nodeId } : {}),
+      blocker: progressProbeRecoveryBlocker({
+        reason,
+        checkpointId,
+        ...(progressProbeStage(nodeStarts[0]?.data.stage)
+          ? { stage: progressProbeStage(nodeStarts[0]?.data.stage)! }
+          : {}),
+      }),
+    });
+  }
+
+  for (const start of starts) {
+    const declaredNodeId = typeof start.data.nodeId === "string" ? start.data.nodeId : undefined;
+    const active = declaredNodeId ? activeNodes.get(declaredNodeId) : undefined;
+    const stage = progressProbeStage(start.data.stage);
+    const checkpointId =
+      typeof start.data.checkpointId === "string" && start.data.checkpointId.length > 0
+        ? start.data.checkpointId
+        : start.hash;
+    const baseline = parseWorkspaceScopeSnapshot(start.data.baseline);
+    const expectedProbeIds = active?.node.progressProbes.map(({ id }) => id);
+    const probeIds = start.data.probeIds;
+    const validProbeIds =
+      Array.isArray(probeIds) &&
+      probeIds.every((value): value is string => typeof value === "string") &&
+      new Set(probeIds).size === probeIds.length &&
+      expectedProbeIds !== undefined &&
+      probeIds.length === expectedProbeIds.length &&
+      probeIds.every((value, index) => value === expectedProbeIds[index]);
+    const valid =
+      active !== undefined &&
+      stage !== undefined &&
+      start.actor === "runtime" &&
+      start.causationId === checkpointId &&
+      start.data.checkpointId === checkpointId &&
+      start.data.graphRevision === input.graph.revision &&
+      start.data.policyHash ===
+        progressProbeScopePolicyHash({
+          contract: input.contract,
+          graph: input.graph,
+          node: active.node,
+        }) &&
+      baseline !== undefined &&
+      workspaceScopeSnapshotDigestIsValid(baseline) &&
+      validProbeIds;
+    if (!valid) {
+      const reason = `Graphcraft cannot validate progress-probe scope checkpoint ${checkpointId}`;
+      return await blockProgressProbeRecovery({
+        store: input.store,
+        ...(declaredNodeId && active ? { nodeId: declaredNodeId } : {}),
+        blocker: progressProbeRecoveryBlocker({
+          reason,
+          checkpointId,
+          ...(stage ? { stage } : {}),
+        }),
+      });
+    }
+
+    const checkpoint: ProgressProbeScopeCheckpoint = {
+      start,
+      node: active.node,
+      stage,
+      checkpointId,
+      baseline,
+    };
+    const rawChecks = events.filter(
+      ({ sequence, type, causationId, data }) =>
+        sequence > start.sequence &&
+        type === "scope.checked" &&
+        (causationId === checkpointId || data.checkpointId === checkpointId),
+    );
+    if (rawChecks.length > 1) {
+      const reason = `Graphcraft found duplicate progress-probe scope checks for checkpoint ${checkpointId}`;
+      return await blockProgressProbeRecovery({
+        store: input.store,
+        nodeId: active.node.id,
+        blocker: progressProbeRecoveryBlocker({ reason, checkpointId, stage }),
+      });
+    }
+    const checked = rawChecks[0]
+      ? validatedProgressProbeScopeCheck({
+          event: rawChecks[0],
+          checkpoint,
+          contract: input.contract,
+          graph: input.graph,
+          state: input.state,
+        })
+      : undefined;
+    if (rawChecks.length === 1 && !checked) {
+      const reason = `Graphcraft cannot validate the durable progress-probe scope check for checkpoint ${checkpointId}`;
+      return await blockProgressProbeRecovery({
+        store: input.store,
+        nodeId: active.node.id,
+        blocker: progressProbeRecoveryBlocker({ reason, checkpointId, stage }),
+      });
+    }
+    if (checked?.audit.allowed) continue;
+    if (checked) {
+      const blocker = progressProbeScopeBlocker({
+        audit: checked.audit,
+        workspace: input.workspace,
+        stage,
+        checkpointId,
+      })!;
+      const failureExists = events.some(
+        ({ type, data }) =>
+          type === "node.failed" &&
+          data.nodeId === active.node.id &&
+          data.scopeCheckpointId === checkpointId,
+      );
+      if (!failureExists)
+        return await blockProgressProbeRecovery({
+          store: input.store,
+          nodeId: active.node.id,
+          blocker,
+        });
+      let current: WorkspaceScopeSnapshot;
+      try {
+        current = await captureWorkspaceScopeSnapshot(
+          input.workspace.path,
+          input.contract.scope.exclude,
+        );
+      } catch {
+        await ensureProgressProbeRunBlocker({ store: input.store, blocker });
+        return await input.store.loadState();
+      }
+      const currentAudit = progressProbeScopeAudit({
+        contract: input.contract,
+        graph: input.graph,
+        state: input.state,
+        node: active.node,
+        baseline,
+        current,
+      });
+      if (!currentAudit.allowed) {
+        if (input.state.status === "running") continue;
+        await ensureProgressProbeRunBlocker({ store: input.store, blocker });
+        return await input.store.loadState();
+      }
+      continue;
+    }
+
+    let current: WorkspaceScopeSnapshot;
+    try {
+      current = await captureWorkspaceScopeSnapshot(
+        input.workspace.path,
+        input.contract.scope.exclude,
+      );
+    } catch (error) {
+      const reason = `Workspace scope inspection failed while recovering progress probes for node ${active.node.id}: ${(error as Error).message}`;
+      return await blockProgressProbeRecovery({
+        store: input.store,
+        nodeId: active.node.id,
+        blocker: progressProbeRecoveryBlocker({ reason, checkpointId, stage }),
+      });
+    }
+    const recovered = await persistProgressProbeScopeCheck({
+      store: input.store,
+      contract: input.contract,
+      graph: input.graph,
+      state: input.state,
+      node: active.node,
+      workspace: input.workspace,
+      baseline,
+      current,
+      stage,
+      checkpointId,
+      recovered: true,
+    });
+    if (recovered.blocker) {
+      await ensureProgressProbeRunBlocker({ store: input.store, blocker: recovered.blocker });
+      return await input.store.loadState();
+    }
+  }
+  return undefined;
+}
 
 async function executeWorkNode(input: {
   store: RunStore;
@@ -1545,21 +2570,52 @@ async function executeWorkNode(input: {
   recoveryScopeBaseline?: WorkspaceScopeSnapshot;
   reuseSession?: { hostSessionId: string; sourceNodeId: string };
 }): Promise<WorkNodeOutcome> {
-  let baseline: EvidenceSnapshot;
+  let baseline = input.recovery?.baseline;
   let baselineProbeResults: ProbeResult[];
-  if (input.recovery?.baseline) {
-    baseline = input.recovery.baseline;
+  let observedBaselineScope: WorkspaceScopeSnapshot | undefined;
+  if (baseline) {
+    if (!input.recoveryScopeBaseline) {
+      const reason = `Graphcraft cannot recover the approved pre-invocation workspace baseline for node ${input.node.id}`;
+      await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason });
+      return { status: "failed", nodeId: input.node.id, reason };
+    }
     baselineProbeResults = baseline.probeResults;
-  } else {
-    const baselineProbes = await runProbes(
-      input.node.progressProbes,
-      input.workspace.path,
-      input.signal,
-    );
-    if (input.signal.aborted) return { status: "interrupted", nodeId: input.node.id, artifact: "" };
-    baselineProbeResults = baselineProbes.map(({ result }) => result);
     baseline = evidenceSnapshot(
-      await workspaceDigest(input.workspace.path),
+      input.recoveryScopeBaseline.digest,
+      baselineProbeResults,
+      input.graph.family,
+    );
+  } else {
+    const baselineExecution = await executeReadOnlyProgressProbes({
+      store: input.store,
+      contract: input.contract,
+      graph: input.graph,
+      state: input.state,
+      node: input.node,
+      workspace: input.workspace,
+      signal: input.signal,
+      stage: "progress_baseline",
+      execute: () => runProbes(input.node.progressProbes, input.workspace.path, input.signal),
+    });
+    if (baselineExecution.status === "interrupted")
+      return { status: "interrupted", nodeId: input.node.id, artifact: "" };
+    if (baselineExecution.status === "failed") {
+      if (!baselineExecution.failurePersisted)
+        await input.store.append("runtime", "node.failed", {
+          nodeId: input.node.id,
+          reason: baselineExecution.reason,
+        });
+      return {
+        status: "failed",
+        nodeId: input.node.id,
+        reason: baselineExecution.reason,
+        ...(baselineExecution.blocker ? { blocker: baselineExecution.blocker } : {}),
+      };
+    }
+    baselineProbeResults = baselineExecution.probes.map(({ result }) => result);
+    observedBaselineScope = baselineExecution.scope;
+    baseline = evidenceSnapshot(
+      observedBaselineScope.digest,
       baselineProbeResults,
       input.graph.family,
     );
@@ -1568,6 +2624,7 @@ async function executeWorkNode(input: {
   try {
     scopeBaseline =
       input.recoveryScopeBaseline ??
+      observedBaselineScope ??
       (await captureWorkspaceScopeSnapshot(input.workspace.path, input.contract.scope.exclude));
   } catch (error) {
     const reason = `Workspace scope inspection failed before node ${input.node.id}: ${(error as Error).message}`;
@@ -1592,8 +2649,9 @@ async function executeWorkNode(input: {
     ...(input.recovery ? { resume: input.recovery } : {}),
     ...(input.reuseSession ? { reuseSession: input.reuseSession } : {}),
   });
+  let currentScope: WorkspaceScopeSnapshot;
   try {
-    const currentScope = await captureWorkspaceScopeSnapshot(
+    currentScope = await captureWorkspaceScopeSnapshot(
       input.workspace.path,
       input.contract.scope.exclude,
     );
@@ -1647,22 +2705,49 @@ async function executeWorkNode(input: {
     return { status: "failed", nodeId: input.node.id, reason, cause };
   }
 
-  const afterProbes = await captureProbes(
-    input.store,
-    input.node.progressProbes,
-    input.workspace,
-    input.observer,
-    input.signal,
-  );
-  if (input.signal.aborted)
+  const progressExecution = await executeReadOnlyProgressProbes({
+    store: input.store,
+    contract: input.contract,
+    graph: input.graph,
+    state: input.state,
+    node: input.node,
+    workspace: input.workspace,
+    signal: input.signal,
+    stage: "progress_current",
+    baseline: currentScope,
+    execute: () =>
+      captureProbes(
+        input.store,
+        input.node.progressProbes,
+        input.workspace,
+        input.observer,
+        input.signal,
+      ),
+  });
+  if (progressExecution.status === "interrupted")
     return {
       status: "interrupted",
       nodeId: input.node.id,
       ...(worker.termination ? { termination: worker.termination } : {}),
       artifact: worker.artifact,
     };
+  if (progressExecution.status === "failed") {
+    if (!progressExecution.failurePersisted)
+      await input.store.append("runtime", "node.failed", {
+        nodeId: input.node.id,
+        reason: progressExecution.reason,
+      });
+    return {
+      status: "failed",
+      nodeId: input.node.id,
+      reason: progressExecution.reason,
+      ...(progressExecution.blocker ? { blocker: progressExecution.blocker } : {}),
+    };
+  }
+  const afterProbes = progressExecution.probes;
+  const progressScope = progressExecution.scope;
   const currentEvidence = evidenceSnapshot(
-    await workspaceDigest(input.workspace.path),
+    progressScope.digest,
     afterProbes.map(({ result }) => result),
     input.graph.family,
   );
@@ -1676,9 +2761,40 @@ async function executeWorkNode(input: {
     current: currentEvidence,
   });
   const measuredClassification = assessed.trajectory.classification;
+  let trajectory = assessed.trajectory;
   let classification = measuredClassification;
   let semanticEvidence: string[] = [];
   let semanticStopReason: string | undefined;
+  let progressSummary = worker.result.summary;
+  let progressEvidence: string[] | undefined;
+  if (assessed.alreadyRecorded) {
+    const recorded = persistedProgressCheckpoint(
+      await input.store.loadEvents(),
+      input.node.id,
+      worker.invocationId,
+    );
+    if (!recorded || contentHash(recorded.trajectory) !== contentHash(assessed.trajectory)) {
+      const reason = `Graphcraft cannot recover the durable progress checkpoint for node ${input.node.id} attempt ${worker.invocationId}`;
+      await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason });
+      return { status: "failed", nodeId: input.node.id, reason };
+    }
+    if (recorded.trajectory.current.digest !== currentEvidence.digest) {
+      const reason = `Graphcraft refused to reuse the durable progress checkpoint for node ${input.node.id} attempt ${worker.invocationId} because the current repository evidence changed after that checkpoint`;
+      await input.store.append("runtime", "node.failed", {
+        nodeId: input.node.id,
+        reason,
+        attemptId: worker.invocationId,
+        recordedEvidenceDigest: recorded.trajectory.current.digest,
+        currentEvidenceDigest: currentEvidence.digest,
+      });
+      return { status: "failed", nodeId: input.node.id, reason };
+    }
+    trajectory = recorded.trajectory;
+    classification = recorded.trajectory.classification;
+    progressSummary = recorded.summary;
+    progressEvidence = recorded.evidence;
+    semanticStopReason = recorded.semanticStopReason;
+  }
   if (
     !assessed.alreadyRecorded &&
     input.node.sideEffectClass === "none" &&
@@ -1712,6 +2828,7 @@ async function executeWorkNode(input: {
               : {}),
           artifact: worker.artifact,
         };
+      if (!(error instanceof SemanticVerificationFailure)) throw error;
       const reason = `Semantic progress verification failed: ${(error as Error).message}`;
       await input.store.append("host", "node.failed", { nodeId: input.node.id, reason });
       return { status: "failed", nodeId: input.node.id, reason };
@@ -1723,22 +2840,21 @@ async function executeWorkNode(input: {
       semanticStopReason = `Semantic progress verdict was ${semanticVerdict.verdict}: ${semanticVerdict.rationale}`;
     }
   }
-  const progressEvidence = [
+  progressEvidence ??= [
     ...worker.result.evidence,
     ...afterProbes.map(({ result }) => result.summary),
     ...semanticEvidence,
   ];
-  const trajectory: ProgressTrajectoryEntry = {
-    ...assessed.trajectory,
-    classification,
-  };
+  trajectory = { ...trajectory, classification };
   await appendProgressTrajectory({
     store: input.store,
     trajectory,
     alreadyRecorded: assessed.alreadyRecorded,
-    summary: worker.result.summary,
+    summary: progressSummary,
     evidence: progressEvidence,
+    ...(semanticStopReason ? { semanticStopReason } : {}),
   });
+  const progressCheckpointId = trajectory.attemptId;
   if (["done", "advanced", "learning"].includes(classification)) {
     const control = await evaluateSuccessfulControl({
       store: input.store,
@@ -1746,10 +2862,15 @@ async function executeWorkNode(input: {
       node: input.node,
       rationale: `Progress was classified as ${classification}`,
       evidence: progressEvidence,
+      checkpointId: progressCheckpointId,
     });
     if (!control.allowed) {
       const reason = control.reason ?? `Control graph blocked acceptance of ${input.node.id}`;
-      await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason });
+      await input.store.append("runtime", "node.failed", {
+        nodeId: input.node.id,
+        reason,
+        ...(control.packet ? { decisionPacket: control.packet } : {}),
+      });
       return {
         status: "failed",
         nodeId: input.node.id,
@@ -1759,7 +2880,7 @@ async function executeWorkNode(input: {
     }
     await input.store.append("runtime", "node.accepted", {
       nodeId: input.node.id,
-      summary: worker.result.summary,
+      summary: progressSummary,
     });
     return { status: "accepted", nodeId: input.node.id };
   }
@@ -1771,6 +2892,7 @@ async function executeWorkNode(input: {
     verdict: "veto",
     rationale: semanticStopReason ?? `Progress classified as ${classification}`,
     evidence: progressEvidence,
+    checkpointId: progressCheckpointId,
   });
   const control = await evaluateControlAcceptance(
     input.store,
@@ -1778,23 +2900,29 @@ async function executeWorkNode(input: {
     await input.store.loadState(),
     input.node.id,
     progressEvidence,
+    progressCheckpointId,
   );
   const reason =
     control.reason ?? semanticStopReason ?? `Stopped safely because progress was ${classification}`;
   if (control.allowed) {
     await input.store.append("runtime", "node.accepted", {
       nodeId: input.node.id,
-      summary: worker.result.summary,
+      summary: progressSummary,
       controlOverride: true,
     });
     return { status: "accepted", nodeId: input.node.id };
   }
-  await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason });
   const progressDecision = await progressPacket({
     store: input.store,
     trajectory,
     blocker: reason,
     evidence: progressEvidence,
+  });
+  await input.store.append("runtime", "node.failed", {
+    nodeId: input.node.id,
+    reason,
+    ...(control.packet ? { decisionPacket: control.packet } : {}),
+    progressDecision,
   });
   return {
     status: "failed",
@@ -1803,6 +2931,94 @@ async function executeWorkNode(input: {
     ...(control.packet ? { packet: control.packet } : {}),
     progressDecision,
   };
+}
+
+async function recoverDurableNodeFailureBlocker(
+  store: RunStore,
+  state: RunState,
+): Promise<RunState | undefined> {
+  if (state.status !== "running") return undefined;
+  const failedNodeIds = new Set(
+    Object.entries(state.nodes)
+      .filter(([, nodeState]) => nodeState.status === "failed")
+      .map(([nodeId]) => nodeId),
+  );
+  if (failedNodeIds.size === 0) return undefined;
+  const events = await store.loadEvents();
+  let failure = events.findLast(
+    ({ type, data }) =>
+      type === "node.failed" &&
+      typeof data.nodeId === "string" &&
+      failedNodeIds.has(data.nodeId) &&
+      typeof data.reason === "string",
+  );
+  if (!failure) return undefined;
+  let batchContext:
+    | {
+        batchId: string;
+        acceptedSiblingIds: string[];
+        quarantinedSiblingIds: string[];
+      }
+    | undefined;
+  const latestFailedStarts = [...failedNodeIds]
+    .map((nodeId) =>
+      events.findLast(({ type, data }) => type === "node.started" && data.nodeId === nodeId),
+    )
+    .filter(
+      (event): event is RunEvent =>
+        event !== undefined &&
+        typeof event.data.batchId === "string" &&
+        typeof event.data.batchSize === "number" &&
+        event.data.batchSize > 1,
+    )
+    .sort((left, right) => right.sequence - left.sequence);
+  const latestBatchStart = latestFailedStarts[0];
+  if (latestBatchStart && typeof latestBatchStart.data.batchId === "string") {
+    const batchId = latestBatchStart.data.batchId;
+    const batchStarts = events.filter(
+      ({ type, data }) => type === "node.started" && data.batchId === batchId,
+    );
+    const batchNodeIds = batchStarts
+      .map(({ data }) => data.nodeId)
+      .filter((nodeId): nodeId is string => typeof nodeId === "string");
+    const firstFailedNodeId = batchNodeIds.find((nodeId) => failedNodeIds.has(nodeId));
+    const firstFailedStart = batchStarts.find(({ data }) => data.nodeId === firstFailedNodeId);
+    const deterministicFailure = firstFailedNodeId
+      ? events.findLast(
+          ({ sequence, type, data }) =>
+            sequence > (firstFailedStart?.sequence ?? 0) &&
+            type === "node.failed" &&
+            data.nodeId === firstFailedNodeId &&
+            typeof data.reason === "string",
+        )
+      : undefined;
+    if (deterministicFailure) failure = deterministicFailure;
+    batchContext = {
+      batchId,
+      acceptedSiblingIds: batchNodeIds.filter(
+        (nodeId) => state.nodes[nodeId]?.status === "accepted",
+      ),
+      quarantinedSiblingIds: batchNodeIds.filter(
+        (nodeId) => state.nodes[nodeId]?.status === "running",
+      ),
+    };
+  }
+  const runBlocker = durableRunBlocker(failure);
+  const progressDecision = ProgressDecisionPacketSchema.safeParse(failure.data.progressDecision);
+  const legacyBlocker: RunBlockerEnvelope = {
+    reason: failure.data.reason as string,
+    ...(typeof failure.data.cause === "string" ? { cause: failure.data.cause } : {}),
+    ...(typeof failure.data.decisionPacket === "object" && failure.data.decisionPacket !== null
+      ? { decisionPacket: failure.data.decisionPacket }
+      : {}),
+    ...(progressDecision.success ? { progressDecision: progressDecision.data } : {}),
+  };
+  await store.append("runtime", "run.blocked", {
+    ...(runBlocker ?? legacyBlocker),
+    ...(batchContext ?? {}),
+    recoveredFromNodeFailure: true,
+  });
+  return await store.loadState();
 }
 
 export async function executeRun(input: {
@@ -1840,6 +3056,51 @@ export async function executeRun(input: {
     if (["completed", "stopped"].includes(state.status)) return state;
     await recordRunApprovalDecisions(input.store, graph);
     state = await input.store.loadState();
+
+    let workspace: RunWorkspace | undefined;
+    const pendingScopeStarts = activeProgressProbeScopeStarts(
+      await input.store.loadEvents(),
+      graph,
+      state,
+    );
+    if (pendingScopeStarts.length > 0) {
+      try {
+        workspace = await input.store.loadWorkspace<RunWorkspace>();
+      } catch (error) {
+        const pendingScopeStart = pendingScopeStarts[0]!;
+        const nodeId =
+          typeof pendingScopeStart.data.nodeId === "string"
+            ? pendingScopeStart.data.nodeId
+            : undefined;
+        const stage = progressProbeStage(pendingScopeStart.data.stage);
+        const checkpointId =
+          typeof pendingScopeStart.data.checkpointId === "string" &&
+          pendingScopeStart.data.checkpointId.length > 0
+            ? pendingScopeStart.data.checkpointId
+            : pendingScopeStart.hash;
+        const reason = `Graphcraft cannot recover progress-probe scope checkpoint ${checkpointId} because its durable workspace is unavailable: ${(error as Error).message}`;
+        return await blockProgressProbeRecovery({
+          store: input.store,
+          ...(nodeId && state.nodes[nodeId] ? { nodeId } : {}),
+          blocker: progressProbeRecoveryBlocker({
+            reason,
+            checkpointId,
+            ...(stage ? { stage } : {}),
+          }),
+        });
+      }
+      const scopeRecovery = await reconcileProgressProbeScopeCheckpoints({
+        store: input.store,
+        contract,
+        graph,
+        state,
+        workspace,
+      });
+      if (scopeRecovery) return scopeRecovery;
+    }
+
+    const recoveredFailureBlocker = await recoverDurableNodeFailureBlocker(input.store, state);
+    if (recoveredFailureBlocker) return recoveredFailureBlocker;
     const interruptedNodeIds = Object.entries(state.nodes)
       .filter(([, nodeState]) => nodeState.status === "running")
       .map(([nodeId]) => nodeId);
@@ -1877,14 +3138,13 @@ export async function executeRun(input: {
       !(await ensureAdapterReady())
     )
       return await input.store.loadState();
-
-    let workspace: RunWorkspace;
-    try {
-      workspace = await input.store.loadWorkspace<RunWorkspace>();
-    } catch {
-      workspace = await createRunWorkspace(contract);
-      await input.store.writeWorkspace(workspace);
-    }
+    if (!workspace)
+      try {
+        workspace = await input.store.loadWorkspace<RunWorkspace>();
+      } catch {
+        workspace = await createRunWorkspace(contract);
+        await input.store.writeWorkspace(workspace);
+      }
     const finishInterruption = async (
       nodeIds?: string | string[],
       termination?: HostTermination,
@@ -1989,6 +3249,7 @@ export async function executeRun(input: {
           : "Recovered from repository evidence; accepted nodes remain immutable",
       });
     }
+    state = await input.store.loadState();
     if (signal.aborted) return await finishInterruption(interruptedNodeIds);
     if (state.status !== "running")
       await input.store.append("runtime", "run.started", { workspace });
@@ -2054,7 +3315,21 @@ export async function executeRun(input: {
         );
 
       for (const candidate of batch) {
-        const scheduling = await evaluateControlScheduling(input.store, graph, state, candidate.id);
+        const schedulingCheckpointId = contentHash({
+          schemaVersion: 1,
+          kind: "control_scheduling_checkpoint",
+          runId: contract.runId,
+          graphRevision: graph.revision,
+          targetId: candidate.id,
+          nextAttempt: (state.nodes[candidate.id]?.attempts ?? 0) + 1,
+        });
+        const scheduling = await evaluateControlScheduling(
+          input.store,
+          graph,
+          state,
+          candidate.id,
+          schedulingCheckpointId,
+        );
         if (!scheduling.allowed) {
           await input.store.append("runtime", "run.blocked", {
             reason: scheduling.reason ?? `Control authority blocked ${candidate.id}`,
@@ -2164,6 +3439,7 @@ export async function executeRun(input: {
             )
             .map(({ nodeId }) => nodeId);
           await input.store.append("runtime", "run.blocked", {
+            ...(failed.blocker ?? {}),
             reason: failed.reason,
             ...(failed.cause ? { cause: failed.cause } : {}),
             ...(failed.packet ? { decisionPacket: failed.packet } : {}),
@@ -2209,10 +3485,14 @@ export async function executeRun(input: {
               });
             } catch (error) {
               const reason = error instanceof Error ? error.message : String(error);
-              await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
-              await input.store.append("runtime", "run.blocked", {
-                reason,
-                evidence: ["GitHub lifecycle evaluation failed without a safe deferred wake"],
+              await appendDurableNodeFailureBlocker({
+                store: input.store,
+                actor: "runtime",
+                nodeId: current.id,
+                blocker: {
+                  reason,
+                  evidence: ["GitHub lifecycle evaluation failed without a safe deferred wake"],
+                },
               });
               return await input.store.loadState();
             }
@@ -2249,10 +3529,14 @@ export async function executeRun(input: {
                 continue;
               }
               const reason = error instanceof Error ? error.message : String(error);
-              await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
-              await input.store.append("runtime", "run.blocked", {
-                reason,
-                evidence: ["Pending GitHub mutation could not be reconciled"],
+              await appendDurableNodeFailureBlocker({
+                store: input.store,
+                actor: "runtime",
+                nodeId: current.id,
+                blocker: {
+                  reason,
+                  evidence: ["Pending GitHub mutation could not be reconciled"],
+                },
               });
               return await input.store.loadState();
             }
@@ -2266,10 +3550,14 @@ export async function executeRun(input: {
               });
             } catch (error) {
               const reason = error instanceof Error ? error.message : String(error);
-              await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
-              await input.store.append("runtime", "run.blocked", {
-                reason,
-                evidence: ["GitHub lifecycle evaluation failed without a safe deferred wake"],
+              await appendDurableNodeFailureBlocker({
+                store: input.store,
+                actor: "runtime",
+                nodeId: current.id,
+                blocker: {
+                  reason,
+                  evidence: ["GitHub lifecycle evaluation failed without a safe deferred wake"],
+                },
               });
               return await input.store.loadState();
             }
@@ -2291,10 +3579,14 @@ export async function executeRun(input: {
           });
           if (!control.allowed) {
             const reason = control.reason ?? `Control graph blocked wait node ${current.id}`;
-            await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
-            await input.store.append("runtime", "run.blocked", {
-              reason,
-              ...(control.packet ? { decisionPacket: control.packet } : {}),
+            await appendDurableNodeFailureBlocker({
+              store: input.store,
+              actor: "runtime",
+              nodeId: current.id,
+              blocker: {
+                reason,
+                ...(control.packet ? { decisionPacket: control.packet } : {}),
+              },
             });
             return await input.store.loadState();
           }
@@ -2356,14 +3648,15 @@ export async function executeRun(input: {
               } catch (error) {
                 if (error instanceof SideEffectBoundaryInterruption) throw error;
                 const reason = error instanceof Error ? error.message : String(error);
-                await input.store.append("runtime", "node.failed", {
+                await appendDurableNodeFailureBlocker({
+                  store: input.store,
+                  actor: "runtime",
                   nodeId: current.id,
-                  reason,
-                });
-                await input.store.append("runtime", "run.blocked", {
-                  reason,
-                  githubLifecycleStatus: lifecycleStatus,
-                  evidence: outcome.evidence,
+                  blocker: {
+                    reason,
+                    githubLifecycleStatus: lifecycleStatus,
+                    evidence: outcome.evidence,
+                  },
                 });
                 return await input.store.loadState();
               }
@@ -2378,13 +3671,17 @@ export async function executeRun(input: {
                 evidence: outcome.evidence,
                 probeResults: [outcome.lifecycle.result],
               });
-              await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
-              await input.store.append("runtime", "run.blocked", {
-                reason,
-                githubLifecycleStatus: lifecycleStatus,
-                reviewFeedbackSignature: outcome.lifecycle.reviewFeedbackSignature,
-                unresolvedThreadIds: outcome.lifecycle.classification.unresolvedThreadIds,
-                evidence: outcome.evidence,
+              await appendDurableNodeFailureBlocker({
+                store: input.store,
+                actor: "runtime",
+                nodeId: current.id,
+                blocker: {
+                  reason,
+                  githubLifecycleStatus: lifecycleStatus,
+                  reviewFeedbackSignature: outcome.lifecycle.reviewFeedbackSignature,
+                  unresolvedThreadIds: outcome.lifecycle.classification.unresolvedThreadIds,
+                  evidence: outcome.evidence,
+                },
               });
               return await input.store.loadState();
             }
@@ -2407,11 +3704,15 @@ export async function executeRun(input: {
                 evidence: outcome.evidence,
                 probeResults: [outcome.lifecycle.result],
               });
-              await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
-              await input.store.append("runtime", "run.blocked", {
-                reason,
-                githubLifecycleStatus: "human_decision",
-                evidence: outcome.evidence,
+              await appendDurableNodeFailureBlocker({
+                store: input.store,
+                actor: "runtime",
+                nodeId: current.id,
+                blocker: {
+                  reason,
+                  githubLifecycleStatus: "human_decision",
+                  evidence: outcome.evidence,
+                },
               });
               return await input.store.loadState();
             }
@@ -2436,13 +3737,17 @@ export async function executeRun(input: {
                 evidence: outcome.evidence,
                 probeResults: [outcome.lifecycle.result],
               });
-              await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
-              await input.store.append("runtime", "run.blocked", {
-                reason,
-                githubLifecycleStatus: lifecycleStatus,
-                ciFailureSignature: outcome.lifecycle.ciFailureSignature,
-                actionableCheckIds: outcome.lifecycle.classification.checkIds.actionable,
-                evidence: outcome.evidence,
+              await appendDurableNodeFailureBlocker({
+                store: input.store,
+                actor: "runtime",
+                nodeId: current.id,
+                blocker: {
+                  reason,
+                  githubLifecycleStatus: lifecycleStatus,
+                  ciFailureSignature: outcome.lifecycle.ciFailureSignature,
+                  actionableCheckIds: outcome.lifecycle.classification.checkIds.actionable,
+                  evidence: outcome.evidence,
+                },
               });
               return await input.store.loadState();
             }
@@ -2487,15 +3792,19 @@ export async function executeRun(input: {
                 evidence: outcome.evidence,
                 probeResults: [outcome.lifecycle.result],
               });
-              await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
-              await input.store.append("runtime", "run.blocked", {
-                reason,
-                githubLifecycleStatus: lifecycleStatus,
-                checkIds:
-                  lifecycleStatus === "infrastructure_failure"
-                    ? outcome.lifecycle.classification.checkIds.infrastructure
-                    : outcome.lifecycle.classification.checkIds.cancelled,
-                evidence: outcome.evidence,
+              await appendDurableNodeFailureBlocker({
+                store: input.store,
+                actor: "runtime",
+                nodeId: current.id,
+                blocker: {
+                  reason,
+                  githubLifecycleStatus: lifecycleStatus,
+                  checkIds:
+                    lifecycleStatus === "infrastructure_failure"
+                      ? outcome.lifecycle.classification.checkIds.infrastructure
+                      : outcome.lifecycle.classification.checkIds.cancelled,
+                  evidence: outcome.evidence,
+                },
               });
               return await input.store.loadState();
             }
@@ -2508,11 +3817,15 @@ export async function executeRun(input: {
             evidence: outcome.evidence,
             probeResults: [outcome.lifecycle.result],
           });
-          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
-          await input.store.append("runtime", "run.blocked", {
-            reason,
-            githubLifecycleStatus: lifecycleStatus,
-            evidence: outcome.evidence,
+          await appendDurableNodeFailureBlocker({
+            store: input.store,
+            actor: "runtime",
+            nodeId: current.id,
+            blocker: {
+              reason,
+              githubLifecycleStatus: lifecycleStatus,
+              evidence: outcome.evidence,
+            },
           });
           return await input.store.loadState();
         }
@@ -2545,13 +3858,13 @@ export async function executeRun(input: {
           return await input.store.loadState();
         }
         if (completionProbes.length === 0) {
-          await input.store.append("probe", "node.failed", {
+          const reason =
+            "Graphcraft cannot prove local_verified because no deterministic verification commands were discovered";
+          await appendDurableNodeFailureBlocker({
+            store: input.store,
+            actor: "probe",
             nodeId: current.id,
-            reason: "No deterministic verification commands were discovered",
-          });
-          await input.store.append("runtime", "run.blocked", {
-            reason:
-              "Graphcraft cannot prove local_verified because no deterministic verification commands were discovered",
+            blocker: { reason },
           });
           return await input.store.loadState();
         }
@@ -2571,8 +3884,9 @@ export async function executeRun(input: {
         const executed = integrityFailures.length
           ? []
           : await captureProbes(input.store, completionProbes, workspace, input.observer, signal);
+        let verificationScopeCurrent: WorkspaceScopeSnapshot;
         try {
-          const verificationScopeCurrent = await captureWorkspaceScopeSnapshot(
+          verificationScopeCurrent = await captureWorkspaceScopeSnapshot(
             workspace.path,
             contract.scope.exclude,
           );
@@ -2612,23 +3926,51 @@ export async function executeRun(input: {
         const results = integrityFailures.length
           ? integrityFailures
           : executed.map(({ result }) => result);
-        await input.store.append("probe", "held_out.checked", {
+        const verificationEvidence = evidenceSnapshot(
+          verificationScopeCurrent.digest,
+          results,
+          graph.family,
+        );
+        const verificationCheckpointId = contentHash({
+          schemaVersion: 1,
+          kind: "held_out_verification",
+          runId: contract.runId,
+          graphRevision: graph.revision,
           nodeId: current.id,
           planDigest: heldOutProbePlan.digest,
-          results: results.map(({ probeId, passed, signature, artifact }) => ({
-            probeId,
-            passed,
-            signature,
-            artifact: artifact ?? null,
-          })),
+          workspaceDigest: verificationEvidence.workspaceDigest,
+          evidenceVector: verificationEvidence.vector,
         });
+        const heldOutAlreadyChecked = (await input.store.loadEvents()).some(
+          ({ type, data }) =>
+            type === "held_out.checked" &&
+            data.nodeId === current.id &&
+            data.checkpointId === verificationCheckpointId,
+        );
+        if (!heldOutAlreadyChecked)
+          await input.store.append(
+            "probe",
+            "held_out.checked",
+            {
+              nodeId: current.id,
+              checkpointId: verificationCheckpointId,
+              planDigest: heldOutProbePlan.digest,
+              results: results.map(({ probeId, passed, signature, artifact }) => ({
+                probeId,
+                passed,
+                signature,
+                artifact: artifact ?? null,
+              })),
+            },
+            verificationCheckpointId,
+          );
         const verificationAssessment = await assessRunProgress({
           store: input.store,
-          attemptId: batchId,
+          attemptId: verificationCheckpointId,
           nodeId: current.id,
           family: graph.family,
           strategy: await strategyForNode(input.store, current),
-          current: evidenceSnapshot(await workspaceDigest(workspace.path), results, graph.family),
+          current: verificationEvidence,
           firstObservation: results.every(({ passed }) => passed) ? "done" : "learning",
         });
         if (results.every(({ passed }) => passed)) {
@@ -2659,6 +4001,7 @@ export async function executeRun(input: {
                   current.id,
                   error instanceof HostTerminationError ? error.termination : undefined,
                 );
+              if (!(error instanceof SemanticVerificationFailure)) throw error;
               const reason = `Semantic completion verification failed: ${(error as Error).message}`;
               await input.store.append("host", "node.failed", { nodeId: current.id, reason });
               await input.store.append("runtime", "run.blocked", { reason });
@@ -2673,6 +4016,7 @@ export async function executeRun(input: {
                 verdict: "veto",
                 rationale: semanticVerdict.rationale,
                 evidence: semanticVerdict.evidence,
+                checkpointId: verificationCheckpointId,
               });
               const control = await evaluateControlAcceptance(
                 input.store,
@@ -2680,15 +4024,20 @@ export async function executeRun(input: {
                 await input.store.loadState(),
                 current.id,
                 semanticVerdict.evidence,
+                verificationCheckpointId,
               );
               if (!control.allowed) {
                 const reason =
                   control.reason ??
                   `Semantic completion verdict was ${semanticVerdict.verdict}: ${semanticVerdict.rationale}`;
-                await input.store.append("host", "node.failed", { nodeId: current.id, reason });
-                await input.store.append("runtime", "run.blocked", {
-                  reason,
-                  ...(control.packet ? { decisionPacket: control.packet } : {}),
+                await appendDurableNodeFailureBlocker({
+                  store: input.store,
+                  actor: "host",
+                  nodeId: current.id,
+                  blocker: {
+                    reason,
+                    ...(control.packet ? { decisionPacket: control.packet } : {}),
+                  },
                 });
                 return await input.store.loadState();
               }
@@ -2707,13 +4056,18 @@ export async function executeRun(input: {
               node: current,
               rationale: "Completion probes and any required semantic verification passed",
               evidence: completionEvidence,
+              checkpointId: verificationCheckpointId,
             }));
           if (!control.allowed) {
             const reason = control.reason ?? `Control graph blocked acceptance of ${current.id}`;
-            await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
-            await input.store.append("runtime", "run.blocked", {
-              reason,
-              ...(control.packet ? { decisionPacket: control.packet } : {}),
+            await appendDurableNodeFailureBlocker({
+              store: input.store,
+              actor: "runtime",
+              nodeId: current.id,
+              blocker: {
+                reason,
+                ...(control.packet ? { decisionPacket: control.packet } : {}),
+              },
             });
             return await input.store.loadState();
           }
@@ -2743,10 +4097,6 @@ export async function executeRun(input: {
           alreadyRecorded: verificationAssessment.alreadyRecorded,
           summary: "Completion probes failed",
           evidence: failureEvidence,
-        });
-        await input.store.append("probe", "node.failed", {
-          nodeId: current.id,
-          reason: failureEvidence.join("\n"),
         });
         const previousRepair = (await input.store.loadGraphHistory())
           .filter(
@@ -2780,6 +4130,7 @@ export async function executeRun(input: {
             verdict: "veto",
             rationale,
             evidence: failureEvidence,
+            checkpointId: verificationCheckpointId,
           });
           const control = await evaluateControlAcceptance(
             input.store,
@@ -2787,6 +4138,7 @@ export async function executeRun(input: {
             await input.store.loadState(),
             current.id,
             failureEvidence,
+            verificationCheckpointId,
           );
           const reason = control.reason ?? rationale;
           const progressDecision = await progressPacket({
@@ -2801,14 +4153,23 @@ export async function executeRun(input: {
                 }
               : {}),
           });
-          await input.store.append("runtime", "run.blocked", {
-            reason,
-            failures,
-            ...(control.packet ? { decisionPacket: control.packet } : {}),
-            progressDecision,
+          await appendDurableNodeFailureBlocker({
+            store: input.store,
+            actor: "probe",
+            nodeId: current.id,
+            blocker: {
+              reason,
+              failures,
+              ...(control.packet ? { decisionPacket: control.packet } : {}),
+              progressDecision,
+            },
           });
           return await input.store.loadState();
         }
+        await input.store.append("probe", "node.failed", {
+          nodeId: current.id,
+          reason: failureEvidence.join("\n"),
+        });
         const applied = await applyRunGraphAmendmentLocked(
           input.store,
           repairAmendment(graph, current, failures),
@@ -2832,10 +4193,14 @@ export async function executeRun(input: {
         });
         if (!control.allowed) {
           const reason = control.reason ?? `Control graph blocked commit node ${current.id}`;
-          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
-          await input.store.append("runtime", "run.blocked", {
-            reason,
-            ...(control.packet ? { decisionPacket: control.packet } : {}),
+          await appendDurableNodeFailureBlocker({
+            store: input.store,
+            actor: "runtime",
+            nodeId: current.id,
+            blocker: {
+              reason,
+              ...(control.packet ? { decisionPacket: control.packet } : {}),
+            },
           });
           return await input.store.loadState();
         }
@@ -2881,10 +4246,14 @@ export async function executeRun(input: {
         });
         if (!control.allowed) {
           const reason = control.reason ?? `Control graph blocked push node ${current.id}`;
-          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
-          await input.store.append("runtime", "run.blocked", {
-            reason,
-            ...(control.packet ? { decisionPacket: control.packet } : {}),
+          await appendDurableNodeFailureBlocker({
+            store: input.store,
+            actor: "runtime",
+            nodeId: current.id,
+            blocker: {
+              reason,
+              ...(control.packet ? { decisionPacket: control.packet } : {}),
+            },
           });
           return await input.store.loadState();
         }
@@ -2929,10 +4298,14 @@ export async function executeRun(input: {
         });
         if (!control.allowed) {
           const reason = control.reason ?? `Control graph blocked pull-request node ${current.id}`;
-          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
-          await input.store.append("runtime", "run.blocked", {
-            reason,
-            ...(control.packet ? { decisionPacket: control.packet } : {}),
+          await appendDurableNodeFailureBlocker({
+            store: input.store,
+            actor: "runtime",
+            nodeId: current.id,
+            blocker: {
+              reason,
+              ...(control.packet ? { decisionPacket: control.packet } : {}),
+            },
           });
           return await input.store.loadState();
         }
@@ -3007,10 +4380,14 @@ export async function executeRun(input: {
             if (!acceptance.allowed) {
               const reason =
                 acceptance.reason ?? `Control graph blocked pull-request node ${current.id}`;
-              await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
-              await input.store.append("runtime", "run.blocked", {
-                reason,
-                ...(acceptance.packet ? { decisionPacket: acceptance.packet } : {}),
+              await appendDurableNodeFailureBlocker({
+                store: input.store,
+                actor: "runtime",
+                nodeId: current.id,
+                blocker: {
+                  reason,
+                  ...(acceptance.packet ? { decisionPacket: acceptance.packet } : {}),
+                },
               });
               return await input.store.loadState();
             }
@@ -3073,6 +4450,7 @@ export async function executeRun(input: {
         return await finishInterruption(current.id, outcome.termination, outcome.artifact);
       if (outcome.status === "failed") {
         await input.store.append("runtime", "run.blocked", {
+          ...(outcome.blocker ?? {}),
           reason: outcome.reason,
           ...(outcome.cause ? { cause: outcome.cause } : {}),
           ...(outcome.packet ? { decisionPacket: outcome.packet } : {}),

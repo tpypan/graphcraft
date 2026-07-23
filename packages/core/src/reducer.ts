@@ -388,7 +388,10 @@ export function reduceEvents(events: RunEvent[]): RunState {
       case "control.applied":
       case "context.selected":
       case "held_out.checked":
+      case "semantic.started":
       case "semantic.verdict":
+      case "scope.started":
+      case "scope.checked":
       case "control.observed":
       case "control.override":
         break;
