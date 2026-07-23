@@ -29,6 +29,7 @@ import {
   installationDiagnostics,
   isLegacyGraphcraftRuntimeSha256,
   isManagedLegacyGraphcraftRuntime,
+  stageBundledMcp,
   uninstallHost,
   updateHost,
   validateLocalViewerUrl,
@@ -299,6 +300,54 @@ it("accepts a hard-linked package runtime source while staging a private copy", 
   await expect(readFile(installed.runtimePath, "utf8")).resolves.toBe("#!/usr/bin/env node\n");
   expect(fake.calls.length).toBeGreaterThan(0);
 });
+
+it.skipIf(process.platform !== "win32")(
+  "publishes the bundled runtime through a staging path longer than 300 characters",
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-long-staging-"));
+    temporaryRoots.push(root);
+    const source = join(root, "mcp.mjs");
+    const bundledSource = Buffer.from(
+      "#!/usr/bin/env node\nconsole.log('windows long-path runtime');\n",
+    );
+    const fake = fakeHostRunner();
+    let graphcraftHome = join(root, "home");
+    let segment = 0;
+    const stagingName = `.${GRAPHCRAFT_VERSION}.staged-${"0".repeat(12)}`;
+    while (join(graphcraftHome, "runtime", stagingName).length <= 300) {
+      graphcraftHome = join(
+        graphcraftHome,
+        `segment-${String(segment).padStart(3, "0")}-${"x".repeat(24)}`,
+      );
+      segment += 1;
+    }
+    let preparedPath: string | undefined;
+    let preparedRuntime: Buffer | undefined;
+    await writeFile(source, bundledSource);
+
+    const installed = await installHost("codex", source, {
+      graphcraftHome,
+      runner: fake.runner,
+      async runtimePublicationBoundary(point) {
+        if (point !== "after_prepare") return;
+        const runtimeRoot = join(graphcraftHome, "runtime");
+        const preparedName = (await readdir(runtimeRoot)).find((name) => name.includes(".staged-"));
+        if (!preparedName) throw new Error("Prepared runtime staging directory was not found");
+        preparedPath = join(runtimeRoot, preparedName);
+        preparedRuntime = await readFile(join(preparedPath, "mcp.mjs"));
+      },
+    });
+
+    expect(preparedPath).toBeDefined();
+    expect(preparedPath!.length).toBeGreaterThan(300);
+    expect(preparedRuntime).toEqual(bundledSource);
+    expect(installed.runtimePath).toBe(
+      join(graphcraftHome, "runtime", GRAPHCRAFT_VERSION, "mcp.mjs"),
+    );
+    expect(installed.runtimeSha256).toBe(digest(bundledSource));
+    await expect(readFile(installed.runtimePath)).resolves.toEqual(bundledSource);
+  },
+);
 
 it.skipIf(process.platform !== "darwin")(
   "removes inherited ACLs from the temporary host-command working directory",
@@ -1097,6 +1146,201 @@ it("leaves a concurrent immutable runtime winner unchanged when bytes differ", a
   expect(fake.registrations.has("codex")).toBe(true);
   expect(fake.registrations.has("claude")).toBe(false);
   expect((await readdir(join(graphcraftHome, "runtime"))).sort()).toEqual([GRAPHCRAFT_VERSION]);
+});
+
+it("does not publish a prepared runtime whose staging directory is path-swapped", async () => {
+  const { root, graphcraftHome, source } = await cleanLongPathFixture();
+  const externalDirectory = join(root, "external-runtime");
+  const externalMarker = join(externalDirectory, "marker.txt");
+  const fake = fakeHostRunner();
+  let replacementLink: string | undefined;
+  await mkdir(externalDirectory);
+  await writeFile(externalMarker, "unchanged\n");
+  await writeFile(source, "#!/usr/bin/env node\nconsole.log('prepared');\n");
+
+  await expect(
+    installHost("codex", source, {
+      graphcraftHome,
+      runner: fake.runner,
+      async runtimePublicationBoundary(point) {
+        if (point !== "after_prepare") return;
+        const runtimeRoot = join(graphcraftHome, "runtime");
+        const stagedName = (await readdir(runtimeRoot)).find((name) => name.includes(".staged-"));
+        if (!stagedName) throw new Error("Prepared runtime staging directory was not found");
+        const stagedDirectory = join(runtimeRoot, stagedName);
+        replacementLink = stagedDirectory;
+        await rm(stagedDirectory, { recursive: true });
+        await symlink(
+          externalDirectory,
+          stagedDirectory,
+          process.platform === "win32" ? "junction" : "dir",
+        );
+      },
+    }),
+  ).rejects.toThrow(/prepared Graphcraft MCP runtime changed before publication/i);
+
+  await expect(readFile(externalMarker, "utf8")).resolves.toBe("unchanged\n");
+  await expect(
+    access(join(graphcraftHome, "runtime", GRAPHCRAFT_VERSION, "mcp.mjs")),
+  ).rejects.toThrow();
+  expect(replacementLink).toBeDefined();
+  await expect(access(replacementLink!)).resolves.toBeUndefined();
+  await expect(readdir(join(graphcraftHome, "runtime"))).resolves.toHaveLength(1);
+  expect(fake.calls.filter(({ args }) => ["remove", "add"].includes(args[1]!))).toHaveLength(0);
+});
+
+it("refuses runtime publication when the staging directory has no stable identity", async () => {
+  const { graphcraftHome, source } = await cleanLongPathFixture();
+  const fake = fakeHostRunner();
+  await writeFile(source, "#!/usr/bin/env node\nconsole.log('prepared');\n");
+
+  await expect(
+    installHost("codex", source, {
+      graphcraftHome,
+      runner: fake.runner,
+      runtimeStagingIdentityUnavailableForTest: true,
+    }),
+  ).rejects.toThrow(/no stable filesystem identity.*publication was refused/i);
+
+  await expect(
+    access(join(graphcraftHome, "runtime", GRAPHCRAFT_VERSION, "mcp.mjs")),
+  ).rejects.toThrow();
+  await expect(readdir(join(graphcraftHome, "runtime"))).resolves.toEqual([]);
+  expect(fake.calls.filter(({ args }) => ["remove", "add"].includes(args[1]!))).toHaveLength(0);
+});
+
+it("removes an empty reservation when staging identity inspection fails", async () => {
+  const { graphcraftHome, source } = await cleanLongPathFixture();
+  const fake = fakeHostRunner();
+  await writeFile(source, "#!/usr/bin/env node\nconsole.log('prepared');\n");
+
+  await expect(
+    installHost("codex", source, {
+      graphcraftHome,
+      runner: fake.runner,
+      runtimeStagingIdentityInspectionFailureForTest: true,
+    }),
+  ).rejects.toThrow(/staging identity inspection failure/i);
+
+  await expect(
+    access(join(graphcraftHome, "runtime", GRAPHCRAFT_VERSION, "mcp.mjs")),
+  ).rejects.toThrow();
+  await expect(readdir(join(graphcraftHome, "runtime"))).resolves.toEqual([]);
+  expect(fake.calls.filter(({ args }) => ["remove", "add"].includes(args[1]!))).toHaveLength(0);
+});
+
+it("rejects a byte-identical real-directory replacement by staging identity", async () => {
+  const { graphcraftHome, source } = await cleanLongPathFixture();
+  const fake = fakeHostRunner();
+  let replacementDirectory: string | undefined;
+  await writeFile(source, "#!/usr/bin/env node\nconsole.log('prepared');\n");
+
+  await expect(
+    installHost("codex", source, {
+      graphcraftHome,
+      runner: fake.runner,
+      async runtimePublicationBoundary(point) {
+        if (point !== "after_prepare") return;
+        const runtimeRoot = join(graphcraftHome, "runtime");
+        const stagedName = (await readdir(runtimeRoot)).find((name) => name.includes(".staged-"));
+        if (!stagedName) throw new Error("Prepared runtime staging directory was not found");
+        replacementDirectory = join(runtimeRoot, stagedName);
+        const runtime = await readFile(join(replacementDirectory, "mcp.mjs"));
+        const manifest = await readFile(join(replacementDirectory, "runtime.json"));
+        await rm(replacementDirectory, { recursive: true });
+        await mkdir(replacementDirectory, { mode: 0o700 });
+        await writeFile(join(replacementDirectory, "mcp.mjs"), runtime, { mode: 0o600 });
+        await writeFile(join(replacementDirectory, "runtime.json"), manifest, { mode: 0o600 });
+      },
+    }),
+  ).rejects.toThrow(/prepared Graphcraft MCP runtime changed before publication/i);
+
+  expect(replacementDirectory).toBeDefined();
+  await expect(readdir(replacementDirectory!).then((entries) => entries.sort())).resolves.toEqual([
+    "mcp.mjs",
+    "runtime.json",
+  ]);
+  await expect(
+    access(join(graphcraftHome, "runtime", GRAPHCRAFT_VERSION, "mcp.mjs")),
+  ).rejects.toThrow();
+  expect(fake.calls.filter(({ args }) => ["remove", "add"].includes(args[1]!))).toHaveLength(0);
+});
+
+it("rejects extra entries in an immutable published runtime", async () => {
+  const { graphcraftHome, source } = await cleanLongPathFixture();
+  await writeFile(source, "#!/usr/bin/env node\nconsole.log('prepared');\n");
+  await stageBundledMcp(source, graphcraftHome);
+  await writeFile(
+    join(graphcraftHome, "runtime", GRAPHCRAFT_VERSION, "unexpected.txt"),
+    "not part of the immutable runtime\n",
+  );
+
+  await expect(stageBundledMcp(source, graphcraftHome)).rejects.toThrow(
+    /already exists with different or unsafe contents.*immutable/i,
+  );
+});
+
+it("does not publish a prepared runtime with extra directory entries", async () => {
+  const { graphcraftHome, source } = await cleanLongPathFixture();
+  const fake = fakeHostRunner();
+  await writeFile(source, "#!/usr/bin/env node\nconsole.log('prepared');\n");
+
+  await expect(
+    installHost("codex", source, {
+      graphcraftHome,
+      runner: fake.runner,
+      async runtimePublicationBoundary(point) {
+        if (point !== "after_prepare") return;
+        const runtimeRoot = join(graphcraftHome, "runtime");
+        const stagedName = (await readdir(runtimeRoot)).find((name) => name.includes(".staged-"));
+        if (!stagedName) throw new Error("Prepared runtime staging directory was not found");
+        await writeFile(join(runtimeRoot, stagedName, "unexpected.txt"), "not publishable\n");
+      },
+    }),
+  ).rejects.toThrow(/prepared Graphcraft MCP runtime changed before publication/i);
+
+  await expect(
+    access(join(graphcraftHome, "runtime", GRAPHCRAFT_VERSION, "mcp.mjs")),
+  ).rejects.toThrow();
+  expect(fake.calls.filter(({ args }) => ["remove", "add"].includes(args[1]!))).toHaveLength(0);
+});
+
+it("does not delete a real directory that replaces the prepared runtime staging path", async () => {
+  const { root, graphcraftHome, source } = await cleanLongPathFixture();
+  const replacementMarker = "replacement-directory-marker.txt";
+  const fake = fakeHostRunner();
+  let replacementDirectory: string | undefined;
+  await writeFile(source, "#!/usr/bin/env node\nconsole.log('prepared');\n");
+
+  await expect(
+    installHost("codex", source, {
+      graphcraftHome,
+      runner: fake.runner,
+      async runtimePublicationBoundary(point) {
+        if (point !== "after_prepare") return;
+        const runtimeRoot = join(graphcraftHome, "runtime");
+        const stagedName = (await readdir(runtimeRoot)).find((name) => name.includes(".staged-"));
+        if (!stagedName) throw new Error("Prepared runtime staging directory was not found");
+        replacementDirectory = join(runtimeRoot, stagedName);
+        const runtime = await readFile(join(replacementDirectory, "mcp.mjs"));
+        const manifest = await readFile(join(replacementDirectory, "runtime.json"));
+        await rm(replacementDirectory, { recursive: true });
+        await mkdir(replacementDirectory, { mode: 0o700 });
+        await writeFile(join(replacementDirectory, "mcp.mjs"), runtime, { mode: 0o600 });
+        await writeFile(join(replacementDirectory, "runtime.json"), manifest, { mode: 0o600 });
+        await writeFile(join(replacementDirectory, replacementMarker), "preserve me\n");
+      },
+    }),
+  ).rejects.toThrow(/prepared Graphcraft MCP runtime changed before publication/i);
+
+  expect(replacementDirectory).toBeDefined();
+  await expect(readFile(join(replacementDirectory!, replacementMarker), "utf8")).resolves.toBe(
+    "preserve me\n",
+  );
+  await expect(
+    access(join(graphcraftHome, "runtime", GRAPHCRAFT_VERSION, "mcp.mjs")),
+  ).rejects.toThrow();
+  expect(fake.calls.filter(({ args }) => ["remove", "add"].includes(args[1]!))).toHaveLength(0);
 });
 
 it("leaves a Codex registration with inherited environment authority unchanged", async () => {

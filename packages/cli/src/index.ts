@@ -11,6 +11,7 @@ import {
   readdir,
   rename,
   rm,
+  rmdir,
 } from "node:fs/promises";
 import { homedir, platform, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -69,6 +70,7 @@ const RUNTIME_MANIFEST = "runtime.json";
 const REGISTRATION_RECEIPT_MAX_BYTES = 16 * 1024;
 const RUNTIME_MANIFEST_MAX_BYTES = 16 * 1024;
 const MANAGED_RUNTIME_MAX_BYTES = 32 * 1024 * 1024;
+const RUNTIME_STAGING_RESERVATION_ATTEMPTS = 8;
 const HOST_MINIMUM_VERSIONS: Record<HostName, string> = {
   codex: "0.144.6",
   claude: "2.1.212",
@@ -346,6 +348,7 @@ async function runtimePairMatches(
   const runtimeRoot = dirname(runtimeDirectory);
   if ((await runtimeDirectoryKind(runtimeDirectory)) !== "directory") return false;
   if (!(await managedDirectoryMatches(runtimeDirectory, 0o700))) return false;
+  if (!(await runtimePairHasExactEntries(runtimeDirectory, bundled))) return false;
   try {
     await ensurePrivateDirectory(runtimeDirectory, runtimeRoot);
   } catch {
@@ -374,10 +377,43 @@ async function runtimePairMatches(
       runtimeRoot,
     ),
   ]);
-  return sameRuntimeManifest(hardenedManifest, bundled.manifest) &&
+  return (await runtimePairHasExactEntries(runtimeDirectory, bundled)) &&
+    sameRuntimeManifest(hardenedManifest, bundled.manifest) &&
     hardenedRuntime?.equals(bundled.source)
     ? true
     : false;
+}
+
+async function runtimePairHasExactEntries(
+  runtimeDirectory: string,
+  bundled: BundledMcpRuntime,
+): Promise<boolean> {
+  try {
+    const actual = (await readdir(runtimeDirectory)).sort();
+    const expected = [RUNTIME_MANIFEST, bundled.manifest.runtimeFile].sort();
+    return JSON.stringify(actual) === JSON.stringify(expected);
+  } catch {
+    return false;
+  }
+}
+
+async function runtimePairContentsMatch(
+  runtimeDirectory: string,
+  bundled: BundledMcpRuntime,
+): Promise<boolean> {
+  const runtimeRoot = dirname(runtimeDirectory);
+  if ((await runtimeDirectoryKind(runtimeDirectory)) !== "directory") return false;
+  if (!(await managedDirectoryMatches(runtimeDirectory, 0o700))) return false;
+  if (!(await runtimePairHasExactEntries(runtimeDirectory, bundled))) return false;
+  const manifest = await readRuntimeManifest(join(runtimeDirectory, RUNTIME_MANIFEST));
+  if (!sameRuntimeManifest(manifest, bundled.manifest)) return false;
+  const runtime = await readRegularFile(
+    join(runtimeDirectory, bundled.manifest.runtimeFile),
+    0o600,
+    bundled.manifest.bytes,
+    runtimeRoot,
+  );
+  return runtime?.equals(bundled.source) === true;
 }
 
 type RuntimeDirectoryKind = "missing" | "directory" | "other";
@@ -475,10 +511,101 @@ function runtimePublicationPaths(graphcraftHome: string): {
   };
 }
 
+interface RuntimeStagingReservation {
+  path: string;
+  identity: string | undefined;
+}
+
+async function runtimeStagingDirectoryIdentity(path: string): Promise<string | undefined> {
+  const metadata = await lstat(path, { bigint: true });
+  if (!metadata.isDirectory() || metadata.isSymbolicLink() || metadata.ino === 0n) return undefined;
+  return `${metadata.dev}:${metadata.ino}:${metadata.birthtimeNs}`;
+}
+
+async function reserveRuntimeStagingDirectory(
+  runtimeRoot: string,
+  forceIdentityUnavailable = false,
+  forceIdentityInspectionFailure = false,
+): Promise<RuntimeStagingReservation> {
+  // fs.mkdtemp can report ENOENT once a valid Windows runtime path exceeds
+  // MAX_PATH. An exclusive mkdir preserves collision safety on those paths.
+  for (let attempt = 0; attempt < RUNTIME_STAGING_RESERVATION_ATTEMPTS; attempt += 1) {
+    const candidate = join(
+      runtimeRoot,
+      `.${GRAPHCRAFT_VERSION}.staged-${randomUUID().replaceAll("-", "").slice(0, 12)}`,
+    );
+    try {
+      await mkdir(candidate, { mode: 0o700 });
+      try {
+        if (forceIdentityInspectionFailure)
+          throw new Error("Injected runtime staging identity inspection failure");
+        return {
+          path: candidate,
+          identity: forceIdentityUnavailable
+            ? undefined
+            : await runtimeStagingDirectoryIdentity(candidate),
+        };
+      } catch (error) {
+        // Identity was never established, so only attempt a non-recursive
+        // removal of the still-empty reservation. Preserve replacements or
+        // populated paths and surface the original inspection failure.
+        await rmdir(candidate).catch(() => undefined);
+        throw error;
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
+  throw new Error("Unable to reserve a private Graphcraft runtime staging directory");
+}
+
+async function cleanupRuntimeStagingDirectory(
+  reservation: RuntimeStagingReservation,
+): Promise<void> {
+  let metadata;
+  try {
+    metadata = await lstat(reservation.path, { bigint: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+
+  // Replacement entries are left untouched. Recursive cleanup is permitted
+  // only while the path still names the exact directory this process created.
+  // When the filesystem cannot provide a stable identity, publication stops
+  // before writing any entries, so only remove the reservation if it is still
+  // an empty real directory. Never recurse through an unidentified path.
+  if (reservation.identity === undefined) {
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) return;
+    try {
+      await rmdir(reservation.path);
+    } catch (error) {
+      if (["ENOENT", "ENOTEMPTY", "EEXIST"].includes((error as NodeJS.ErrnoException).code ?? ""))
+        return;
+      throw error;
+    }
+    return;
+  }
+  if (
+    !metadata.isDirectory() ||
+    metadata.isSymbolicLink() ||
+    (await runtimeStagingDirectoryIdentity(reservation.path)) !== reservation.identity
+  )
+    return;
+  await rm(reservation.path, {
+    recursive: true,
+    force: true,
+    maxRetries: 3,
+    retryDelay: 25,
+  });
+}
+
 async function stageBundledMcpRuntime(
   bundled: BundledMcpRuntime,
   graphcraftHome: string,
   boundary?: (point: RuntimePublicationBoundary) => void | Promise<void>,
+  forceIdentityUnavailable = false,
+  forceIdentityInspectionFailure = false,
 ): Promise<{ path: string; manifest: RuntimeManifest }> {
   const paths = runtimePublicationPaths(graphcraftHome);
   await ensurePrivateDirectory(graphcraftHome);
@@ -496,10 +623,20 @@ async function stageBundledMcpRuntime(
   if (previousKind === "other") {
     throw new Error("The managed Graphcraft runtime path is not a directory");
   }
-  const stagedDirectory = await mkdtemp(join(paths.runtimeRoot, `.${GRAPHCRAFT_VERSION}.staged-`));
-  await ensurePrivateDirectory(stagedDirectory, paths.runtimeRoot);
+  const stagingReservation = await reserveRuntimeStagingDirectory(
+    paths.runtimeRoot,
+    forceIdentityUnavailable,
+    forceIdentityInspectionFailure,
+  );
+  const stagedDirectory = stagingReservation.path;
   let published = false;
   try {
+    if (stagingReservation.identity === undefined) {
+      throw new Error(
+        "The Graphcraft runtime staging directory has no stable filesystem identity; publication was refused.",
+      );
+    }
+    await ensurePrivateDirectory(stagedDirectory, paths.runtimeRoot);
     await writeAtomic(join(stagedDirectory, bundled.manifest.runtimeFile), bundled.source, 0o600);
     await writeAtomic(
       join(stagedDirectory, RUNTIME_MANIFEST),
@@ -511,6 +648,12 @@ async function stageBundledMcpRuntime(
     }
     await syncDirectory(stagedDirectory);
     await boundary?.("after_prepare");
+    if (
+      !(await runtimePairContentsMatch(stagedDirectory, bundled)) ||
+      (await runtimeStagingDirectoryIdentity(stagedDirectory)) !== stagingReservation.identity
+    ) {
+      throw new Error("The prepared Graphcraft MCP runtime changed before publication");
+    }
     try {
       await rename(stagedDirectory, paths.runtimeDirectory);
       published = true;
@@ -538,7 +681,7 @@ async function stageBundledMcpRuntime(
     }
     return { path: runtimePath, manifest: bundled.manifest };
   } finally {
-    if (!published) await rm(stagedDirectory, { recursive: true, force: true });
+    if (!published) await cleanupRuntimeStagingDirectory(stagingReservation);
   }
 }
 
@@ -1064,6 +1207,10 @@ export interface HostLifecycleOptions {
   runner?: HostCommandRunner;
   /** @internal Fault boundary used by the installer transaction tests. */
   runtimePublicationBoundary?: (point: RuntimePublicationBoundary) => void | Promise<void>;
+  /** @internal Simulates unavailable filesystem identity in installer fault tests. */
+  runtimeStagingIdentityUnavailableForTest?: boolean;
+  /** @internal Simulates a post-reservation identity inspection failure. */
+  runtimeStagingIdentityInspectionFailureForTest?: boolean;
   /** @internal Fault boundary used to simulate pre-hardening host-cwd injection. */
   hostCommandCwdCreatedBoundary?: (cwd: string) => void | Promise<void>;
 }
@@ -1133,6 +1280,8 @@ async function configureHost(
       bundledRuntime,
       graphcraftHome,
       options.runtimePublicationBoundary,
+      options.runtimeStagingIdentityUnavailableForTest === true,
+      options.runtimeStagingIdentityInspectionFailureForTest === true,
     );
     if (previous.status === "current") {
       const current = await inspectHostRegistration(host, expectedRegistration, runner, cwd, [
