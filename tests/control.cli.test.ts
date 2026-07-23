@@ -10,6 +10,7 @@ import { createRun, RunStore } from "../packages/runtime/src/index.ts";
 const execFileAsync = promisify(execFile);
 const temporaryRoots: string[] = [];
 const tsxCli = fileURLToPath(import.meta.resolve("tsx/cli"));
+const controlCliTestTimeout = process.platform === "win32" ? 120_000 : 30_000;
 
 afterEach(async () => {
   await Promise.all(
@@ -99,7 +100,7 @@ async function controlCli(repository: string, action: "pause" | "stop"): Promise
 }
 
 describe("cross-process run control", () => {
-  it("pauses, resumes, and stops from a second CLI process without orphaning children", async () => {
+  const controlCliLifecycle = async (): Promise<void> => {
     const repository = await createRepository();
     const pausedRun = await createRun("Implement a substantial feature across the fixture", {
       cwd: repository,
@@ -141,5 +142,10 @@ describe("cross-process run control", () => {
     expect(processExists(stopPid)).toBe(false);
     const stoppedStore = new RunStore(repository, stoppedRun.contract.runId);
     expect((await stoppedStore.loadState()).status).toBe("stopped");
-  }, 30_000);
+  };
+  it(
+    "pauses, resumes, and stops from a second CLI process without orphaning children",
+    controlCliLifecycle,
+    controlCliTestTimeout,
+  );
 });

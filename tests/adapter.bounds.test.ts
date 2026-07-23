@@ -74,8 +74,12 @@ function queueChild(output: FakeChildOutput): FakeChild {
   return child;
 }
 
-function queueTerminatingChild(): FakeChild {
+function queueTerminatingChild(): { child: FakeChild; spawned: Promise<void> } {
   const child = new FakeChild();
+  let markSpawned!: () => void;
+  const spawned = new Promise<void>((resolve) => {
+    markSpawned = resolve;
+  });
   child.kill.mockImplementation((signal?: NodeJS.Signals | number) => {
     queueMicrotask(() => {
       child.stdout.end();
@@ -84,14 +88,24 @@ function queueTerminatingChild(): FakeChild {
     });
     return true;
   });
-  spawnMock.mockImplementationOnce(() => child as unknown as ChildProcess);
-  return child;
+  spawnMock.mockImplementationOnce(() => {
+    markSpawned();
+    return child as unknown as ChildProcess;
+  });
+  return { child, spawned };
 }
 
-function queueNeverClosingChild(): FakeChild {
+function queueNeverClosingChild(): { child: FakeChild; spawned: Promise<void> } {
   const child = new FakeChild();
-  spawnMock.mockImplementationOnce(() => child as unknown as ChildProcess);
-  return child;
+  let markSpawned!: () => void;
+  const spawned = new Promise<void>((resolve) => {
+    markSpawned = resolve;
+  });
+  spawnMock.mockImplementationOnce(() => {
+    markSpawned();
+    return child as unknown as ChildProcess;
+  });
+  return { child, spawned };
 }
 
 async function collectEvents(iterable: AsyncIterable<HostEvent>): Promise<HostEvent[]> {
@@ -333,8 +347,9 @@ describe("bounded adapter streams", () => {
   it("bounds hanging capability probes and terminates their process tree", async () => {
     vi.useFakeTimers();
     for (const { adapter } of adapters()) {
-      const child = queueTerminatingChild();
+      const { child, spawned } = queueTerminatingChild();
       const probing = adapter.probe();
+      await spawned;
       await vi.advanceTimersByTimeAsync(HOST_CAPABILITY_PROBE_TIMEOUT_MS);
       await expect(probing).resolves.toMatchObject({
         installed: false,
@@ -348,8 +363,9 @@ describe("bounded adapter streams", () => {
   it("settles capability probes even when a child never emits close", async () => {
     vi.useFakeTimers();
     for (const { adapter } of adapters()) {
-      const child = queueNeverClosingChild();
+      const { child, spawned } = queueNeverClosingChild();
       const probing = adapter.probe();
+      await spawned;
       await vi.advanceTimersByTimeAsync(
         HOST_CAPABILITY_PROBE_TIMEOUT_MS + HOST_CAPABILITY_PROBE_SETTLE_GRACE_MS,
       );
@@ -366,12 +382,10 @@ describe("bounded adapter streams", () => {
 
   it("terminates planner process trees through the shared cancellation controller", async () => {
     for (const { adapter } of adapters()) {
-      const child = queueTerminatingChild();
+      const { child, spawned } = queueTerminatingChild();
       const abort = new AbortController();
       const planning = adapter.plan(planningRequest(), abort.signal);
-      while (spawnMock.mock.results.at(-1)?.value !== child) {
-        await new Promise<void>((resolve) => setImmediate(resolve));
-      }
+      await spawned;
       const rejected = expect(planning).rejects.toMatchObject({
         name: "HostTerminationError",
         termination: expect.objectContaining({
@@ -388,12 +402,10 @@ describe("bounded adapter streams", () => {
 
   it("settles operational adapter cancellation when a child never emits close", async () => {
     for (const { adapter } of adapters()) {
-      const child = queueNeverClosingChild();
+      const { child, spawned } = queueNeverClosingChild();
       const abort = new AbortController();
       const planning = adapter.plan(planningRequest(), abort.signal);
-      while (spawnMock.mock.results.at(-1)?.value !== child) {
-        await new Promise<void>((resolve) => setImmediate(resolve));
-      }
+      await spawned;
       const rejected = expect(planning).rejects.toMatchObject({
         name: "HostTerminationError",
         termination: expect.objectContaining({

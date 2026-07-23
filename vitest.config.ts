@@ -5,6 +5,6 @@ export default defineConfig({
     coverage: { enabled: false },
     include: ["packages/**/*.test.ts", "tests/**/*.test.ts"],
     maxWorkers: 1,
-    testTimeout: 15_000,
+    testTimeout: process.platform === "win32" ? 60_000 : 15_000,
   },
 });

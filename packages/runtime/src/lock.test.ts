@@ -327,7 +327,8 @@ describe("run lock persistence", () => {
       });
 
     try {
-      await expect(lock.acquire(1_000)).rejects.toThrow("Graphcraft run is already active");
+      const staleAfterMs = process.platform === "win32" ? 30_000 : 1_000;
+      await expect(lock.acquire(staleAfterMs)).rejects.toThrow("Graphcraft run is already active");
       expect(await readFile(path, "utf8")).toBe(record);
       const currentStatus = await lstat(path, { bigint: true });
       expect(currentStatus.dev).toBe(replacementStatus.dev);

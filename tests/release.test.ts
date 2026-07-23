@@ -271,7 +271,14 @@ describe("release metadata", () => {
       }
     }
 
+    const ci = await readFile(join(workflowDirectory, "ci.yml"), "utf8");
+    const platformCheckTimeout =
+      "timeout-minutes: ${{ matrix.os == 'windows-latest' && 180 || 45 }}";
+    expect(ci).toContain(platformCheckTimeout);
+    expect(ci.match(/\n    timeout-minutes: 10\n/gu)).toHaveLength(2);
+
     const release = await readFile(join(workflowDirectory, "release.yml"), "utf8");
+    expect(release).toContain(platformCheckTimeout);
     expect(release).toContain("group: graphcraft-stable-release");
     expect(release).not.toContain("group: release-${{ github.ref }}");
     expect(release).toContain("needs: [preflight, ci, dependency-audit, secret-scan]");

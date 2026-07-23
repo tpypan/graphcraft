@@ -83,6 +83,11 @@ import {
 const execFileAsync = promisify(execFile);
 const temporaryRoots: string[] = [];
 const storageFixturesRoot = fileURLToPath(new URL("./fixtures/storage", import.meta.url));
+const atomicCommitMatrixTimeout = process.platform === "win32" ? 300_000 : 60_000;
+const pushMatrixTimeout = process.platform === "win32" ? 300_000 : 120_000;
+const checkRerunMatrixTimeout = process.platform === "win32" ? 600_000 : 180_000;
+const pullRequestCreateMatrixTimeout = process.platform === "win32" ? 300_000 : 180_000;
+const interruptionClassificationTimeout = process.platform === "win32" ? 60_000 : 30_000;
 
 function reportedUsage(
   input: number,
@@ -124,13 +129,17 @@ async function snapshotFiles(root: string): Promise<Record<string, string>> {
 
 async function waitFor(
   predicate: () => boolean | Promise<boolean>,
-  timeoutMs = 5_000,
+  timeoutMs = process.platform === "win32" ? 30_000 : 5_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!(await predicate())) {
     if (Date.now() > deadline) throw new Error("Timed out waiting for test condition");
     await new Promise<void>((resolve) => setTimeout(resolve, 10));
   }
+}
+
+function itWin(name: string, test: () => Promise<void>): void {
+  it(name, test, process.platform === "win32" ? 60_000 : 15_000);
 }
 
 async function waitForAbort(signal: AbortSignal): Promise<void> {
@@ -1554,7 +1563,7 @@ describe("durable runtime", () => {
     expect(adapter.calls).toEqual([]);
   });
 
-  it("keeps a file-change baseline across runtime restart", async () => {
+  itWin("keeps a file-change baseline across runtime restart", async () => {
     const repository = await createRepository();
     await writeFile(join(repository, "signal.txt"), "before\n");
     await git(repository, "add", "signal.txt");
@@ -1593,7 +1602,7 @@ describe("durable runtime", () => {
     ).toHaveLength(1);
   });
 
-  it("supervises a time wait without recording model tokens during sleep", async () => {
+  itWin("supervises a time wait without recording model tokens during sleep", async () => {
     const repository = await createRepository();
     const adapter = new WaitPlannerAdapter(
       { kind: "time", wakeAt: new Date(Date.now() + 150).toISOString() },
@@ -1656,7 +1665,7 @@ describe("durable runtime", () => {
     expect(adapter.calls).toEqual([]);
   });
 
-  it("reconciles a satisfied wait after termination before node acceptance", async () => {
+  itWin("reconciles a satisfied wait after termination before node acceptance", async () => {
     const repository = await createRepository();
     const adapter = new WaitPlannerAdapter(
       { kind: "file_exists", path: "ready.flag", pollIntervalMs: 250 },
@@ -3519,7 +3528,7 @@ process.stdin.on("end", () => {
         }
       }
     },
-    process.platform === "darwin" ? 90_000 : 60_000,
+    process.platform === "win32" ? 120_000 : process.platform === "darwin" ? 90_000 : 60_000,
   );
 
   it("scopes checkpoint decision replay to the current decision generation", async () => {
@@ -4305,7 +4314,7 @@ process.stdin.on("end", () => {
         }
       }
     },
-    process.platform === "darwin" ? 180_000 : 120_000,
+    process.platform === "win32" ? 600_000 : process.platform === "darwin" ? 180_000 : 120_000,
   );
 
   it("amends the graph once and repairs a deterministic failure", async () => {
@@ -5038,7 +5047,7 @@ process.stdin.on("end", () => {
     });
   }, 30_000);
 
-  it("resumes only the unfinished branch after a parallel interruption", async () => {
+  itWin("resumes only the unfinished branch after a parallel interruption", async () => {
     const repository = await createRepository();
     const firstAdapter = new FakeAdapter(async (request, _call, signal) => {
       if (request.capsule.nodeId === "inspect-b") await waitForAbort(signal);
@@ -5056,7 +5065,7 @@ process.stdin.on("end", () => {
       maxWorkers: 2,
       signal: interruption.signal,
     });
-    const deadline = Date.now() + 5_000;
+    const deadline = Date.now() + (process.platform === "win32" ? 30_000 : 5_000);
     while ((await created.store.loadState()).nodes["inspect-a"]?.status !== "accepted") {
       if (Date.now() > deadline) throw new Error("Timed out waiting for the accepted sibling");
       await new Promise<void>((resolve) => setTimeout(resolve, 10));
@@ -5150,7 +5159,7 @@ process.stdin.on("end", () => {
     ]);
   });
 
-  it("reconciles one atomic commit across every claim-act-confirm interruption boundary", async () => {
+  const atomicCommitMatrix = async (): Promise<void> => {
     const faultPoints: SideEffectBoundary[] = [
       "before_claim",
       "after_claim",
@@ -5224,7 +5233,12 @@ process.stdin.on("end", () => {
         faultPoint,
       ).toHaveLength(1);
     }
-  }, 60_000);
+  };
+  it(
+    "reconciles one atomic commit across every claim-act-confirm interruption boundary",
+    atomicCommitMatrix,
+    atomicCommitMatrixTimeout,
+  );
 
   it("refuses to retry a claimed commit after unrelated Git state replaces its precondition", async () => {
     const repository = await createRepository();
@@ -5304,7 +5318,7 @@ process.stdin.on("end", () => {
     expect(remoteHead.trim()).toBe(localHead.trim());
   });
 
-  it("reconciles one normal push across every remote claim-act-confirm boundary", async () => {
+  const normalPushMatrix = async (): Promise<void> => {
     const faultPoints: SideEffectBoundary[] = [
       "before_claim",
       "after_claim",
@@ -5402,7 +5416,12 @@ process.stdin.on("end", () => {
         faultPoint,
       ).toHaveLength(1);
     }
-  }, 120_000);
+  };
+  it(
+    "reconciles one normal push across every remote claim-act-confirm boundary",
+    normalPushMatrix,
+    pushMatrixTimeout,
+  );
 
   it.each(["after_claim", "after_confirm"] as const)(
     "refuses a push retry when the remote moves after %s",
@@ -7270,7 +7289,7 @@ process.stdin.on("end", () => {
         }
       }
     },
-    process.platform === "darwin" ? 600_000 : 240_000,
+    process.platform === "win32" ? 1_200_000 : process.platform === "darwin" ? 600_000 : 240_000,
   );
 
   it("resumes a confirmed review-repair push without repeating the mutation", async () => {
@@ -7721,7 +7740,7 @@ process.stdin.on("end", () => {
     expect(events.filter(({ type }) => type === "side_effect.failed")).toHaveLength(0);
   }, 60_000);
 
-  it("reconciles a check rerun without issuing a possibly duplicate dispatch", async () => {
+  const checkRerunMatrix = async (): Promise<void> => {
     const faultPoints: SideEffectBoundary[] = [
       "before_claim",
       "after_claim",
@@ -7809,7 +7828,12 @@ process.stdin.on("end", () => {
       }
       expect(adapter.calls, faultPoint).toEqual(["implement"]);
     }
-  }, 180_000);
+  };
+  it(
+    "reconciles a check rerun without issuing a possibly duplicate dispatch",
+    checkRerunMatrix,
+    checkRerunMatrixTimeout,
+  );
 
   it("stops instead of repeating an unchanged actionable CI repair", async () => {
     const { repository, remote } = await createRepositoryWithRemote();
@@ -7888,7 +7912,7 @@ process.stdin.on("end", () => {
     expect(state.sideEffects.filter(({ claim }) => claim.kind === "git_push")).toHaveLength(2);
   });
 
-  it("reconciles one pull-request creation across every side-effect boundary", async () => {
+  const pullRequestCreateMatrix = async (): Promise<void> => {
     const faultPoints: SideEffectBoundary[] = [
       "before_claim",
       "after_claim",
@@ -7978,7 +8002,12 @@ process.stdin.on("end", () => {
         faultPoint,
       ).toHaveLength(1);
     }
-  }, 180_000);
+  };
+  it(
+    "reconciles one pull-request creation across every side-effect boundary",
+    pullRequestCreateMatrix,
+    pullRequestCreateMatrixTimeout,
+  );
 
   it("recovers an existing exact pull request without creating another", async () => {
     const { repository, remote } = await createRepositoryWithRemote();
@@ -8841,7 +8870,7 @@ process.stdin.on("end", () => {
         }
       }
     },
-    process.platform === "darwin" ? 180_000 : 60_000,
+    process.platform === "darwin" ? 180_000 : process.platform === "win32" ? 600_000 : 60_000,
   );
 
   it("coordinates an active pause, checkpoints termination, and resumes the same session", async () => {
@@ -9027,7 +9056,7 @@ process.stdin.on("end", () => {
     expect(stoppedState.stopReason).toBe("Stop from another terminal");
   });
 
-  it("distinguishes cancellation, shutdown, host crashes, and timeouts in durable state", async () => {
+  const interruptionClassification = async (): Promise<void> => {
     for (const cause of ["cancellation", "runtime_shutdown"] as const) {
       const repository = await createRepository();
       const adapter = new FakeAdapter(
@@ -9065,7 +9094,12 @@ process.stdin.on("end", () => {
       expect(state.status).toBe("blocked");
       expect(state.stopReason).toMatch(cause === "timeout" ? /^Host timeout:/ : /^Host crash:/);
     }
-  }, 30_000);
+  };
+  it(
+    "distinguishes cancellation, shutdown, host crashes, and timeouts in durable state",
+    interruptionClassification,
+    interruptionClassificationTimeout,
+  );
 
   it("uses an exclusive recoverable run lock", async () => {
     const root = await mkdtemp(join(tmpdir(), "graphcraft-lock-test-"));

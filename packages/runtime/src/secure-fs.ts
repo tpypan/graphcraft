@@ -128,7 +128,17 @@ try {
     }
     if ($failures.Count -gt 0) {
       $kind = if ($isDirectory) { 'D' } else { 'F' }
-      throw "Graphcraft owner-only ACL verification failed for target $targetIndex ($kind): $($failures -join ',')"
+      $ownerClass = if ($owner.Value -eq $sid.Value) { 'current' } else { 'other' }
+      $protection = if ($verified.AreAccessRulesProtected) { 'protected' } else { 'unprotected' }
+      $aceDiagnostics = [System.Collections.Generic.List[string]]::new()
+      foreach ($rule in $rules) {
+        $identityClass = if ($rule.IdentityReference.Value -eq $sid.Value) { 'current' } else { 'other' }
+        $inherited = $rule.IsInherited.ToString().ToLowerInvariant()
+        [void]$aceDiagnostics.Add(
+          "identity=$identityClass,type=$([int]($rule.AccessControlType)),rights=$([int]($rule.FileSystemRights)),inherited=$inherited,inheritance=$([int]($rule.InheritanceFlags)),propagation=$([int]($rule.PropagationFlags))"
+        )
+      }
+      throw "Graphcraft owner-only ACL verification failed for target $targetIndex ($kind): $($failures -join ','); protection=$protection;owner=$ownerClass;aces=[$($aceDiagnostics -join '|')]"
     }
   }
   [Console]::Out.WriteLine("GRAPHCRAFT_ACL_OK:$($targets.Count)")
@@ -946,6 +956,11 @@ export async function publishPrivateFileAtomic(input: {
         superseded ||
         publicationIdentity === undefined ||
         fileAfter.publicationIdentityFingerprint === undefined;
+      // A descriptor-identified file created beneath a canonically verified
+      // source parent has demonstrably owner-exclusive inherited access. If
+      // either parent or file identity cannot establish that provenance, or a
+      // reconstructable projection superseded this publication, canonicalize
+      // the final file through the existing protected owner-only hardener.
       if (requiresFallbackHardening)
         await hardenWindowsEntriesLocked(
           [...parentsAfter.map(({ entry }) => entry), fileAfter.entry],

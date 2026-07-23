@@ -51,10 +51,10 @@ async function expectMode(path: string, mode: number): Promise<void> {
   expect((await stat(path)).mode & 0o777).toBe(mode);
 }
 
-async function runWindowsPowerShell(path: string, script: string): Promise<void> {
+async function runWindowsPowerShell(path: string, script: string): Promise<string> {
   const systemRoot = process.env.SystemRoot;
   if (!systemRoot) throw new Error("Windows test requires SystemRoot");
-  await new Promise<void>((resolve, reject) => {
+  return await new Promise<string>((resolve, reject) => {
     execFile(
       win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
       [
@@ -65,10 +65,11 @@ async function runWindowsPowerShell(path: string, script: string): Promise<void>
         Buffer.from(script, "utf16le").toString("base64"),
       ],
       {
+        encoding: "utf8",
         windowsHide: true,
         env: { ...process.env, GRAPHCRAFT_ACL_TEST_PATH: path },
       },
-      (error) => (error ? reject(error) : resolve()),
+      (error, stdout) => (error ? reject(error) : resolve(stdout)),
     );
   });
 }
@@ -116,6 +117,67 @@ async function darwinAclListing(path: string): Promise<string> {
   return await runDarwinTool("/bin/ls", ["-lde", path]);
 }
 
+interface WindowsAclEvidence {
+  readonly protected: boolean;
+  readonly ownerIsCurrent: boolean;
+  readonly aces: readonly {
+    readonly identityIsCurrent: boolean;
+    readonly accessControlType: number;
+    readonly rights: number;
+    readonly isInherited: boolean;
+    readonly inheritanceFlags: number;
+    readonly propagationFlags: number;
+  }[];
+}
+
+function windowsAclIsOwnerExclusive(evidence: WindowsAclEvidence): boolean {
+  if (
+    !evidence.ownerIsCurrent ||
+    evidence.aces.length === 0 ||
+    evidence.aces.some((ace) => !ace.identityIsCurrent || ace.accessControlType !== 0)
+  )
+    return false;
+  const grantedRights = evidence.aces.reduce((rights, ace) => rights | ace.rights, 0);
+  return (grantedRights & 0x1f01ff) === 0x1f01ff;
+}
+
+function windowsAclDiagnostic(evidence: WindowsAclEvidence): string {
+  const aces = evidence.aces
+    .map(
+      (ace) =>
+        `identity=${ace.identityIsCurrent ? "current" : "other"},type=${ace.accessControlType},rights=${ace.rights},inherited=${ace.isInherited},inheritance=${ace.inheritanceFlags},propagation=${ace.propagationFlags}`,
+    )
+    .join("|");
+  return `protection=${evidence.protected ? "protected" : "unprotected"};owner=${evidence.ownerIsCurrent ? "current" : "other"};aces=[${aces}]`;
+}
+
+function parseWindowsAclEvidence(output: string): WindowsAclEvidence {
+  const parsed = JSON.parse(output) as {
+    Protected: boolean;
+    OwnerIsCurrent: boolean;
+    Aces: Array<{
+      IdentityIsCurrent: boolean;
+      AccessControlType: number;
+      Rights: number;
+      IsInherited: boolean;
+      InheritanceFlags: number;
+      PropagationFlags: number;
+    }>;
+  };
+  return {
+    protected: parsed.Protected,
+    ownerIsCurrent: parsed.OwnerIsCurrent,
+    aces: parsed.Aces.map((ace) => ({
+      identityIsCurrent: ace.IdentityIsCurrent,
+      accessControlType: ace.AccessControlType,
+      rights: ace.Rights,
+      isInherited: ace.IsInherited,
+      inheritanceFlags: ace.InheritanceFlags,
+      propagationFlags: ace.PropagationFlags,
+    })),
+  };
+}
+
 async function expectWindowsOwnerOnly(path: string): Promise<void> {
   await runWindowsPowerShell(
     path,
@@ -153,10 +215,12 @@ if (-not $acl.AreAccessRulesProtected -or $owner.Value -ne $sid.Value -or
 }
 
 async function expectWindowsOwnerExclusive(path: string): Promise<void> {
-  await runWindowsPowerShell(
-    path,
-    String.raw`
+  const evidence = parseWindowsAclEvidence(
+    await runWindowsPowerShell(
+      path,
+      String.raw`
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $path = [Environment]::GetEnvironmentVariable('GRAPHCRAFT_ACL_TEST_PATH')
 $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
 $item = [System.IO.FileInfo]::new($path)
@@ -164,17 +228,27 @@ $sections = ([System.Security.AccessControl.AccessControlSections]::Access -bor 
 $acl = $item.GetAccessControl($sections)
 $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier])
 $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
-if ($acl.AreAccessRulesProtected -or $owner.Value -ne $sid.Value -or
-    $rules.Count -ne 1 -or -not $rules[0].IsInherited -or
-    $rules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
-    $rules[0].FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl -or
-    $rules[0].InheritanceFlags -ne [System.Security.AccessControl.InheritanceFlags]::None -or
-    $rules[0].PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None -or
-    $rules[0].IdentityReference.Value -ne $sid.Value) {
-  throw 'Owner-exclusive ACL assertion failed'
+$aces = [System.Collections.Generic.List[object]]::new()
+foreach ($rule in $rules) {
+  [void]$aces.Add([pscustomobject]@{
+    IdentityIsCurrent = ($rule.IdentityReference.Value -eq $sid.Value)
+    AccessControlType = [int]($rule.AccessControlType)
+    Rights = [int]($rule.FileSystemRights)
+    IsInherited = $rule.IsInherited
+    InheritanceFlags = [int]($rule.InheritanceFlags)
+    PropagationFlags = [int]($rule.PropagationFlags)
+  })
 }
+[pscustomobject]@{
+  Protected = $acl.AreAccessRulesProtected
+  OwnerIsCurrent = ($owner.Value -eq $sid.Value)
+  Aces = $aces.ToArray()
+} | ConvertTo-Json -Compress -Depth 4
 `,
+    ),
   );
+  if (!windowsAclIsOwnerExclusive(evidence))
+    throw new Error(`Owner-exclusive ACL assertion failed: ${windowsAclDiagnostic(evidence)}`);
 }
 
 describe("secure filesystem permissions", () => {
@@ -211,6 +285,85 @@ describe("secure filesystem permissions", () => {
     expect(privatePublicationIdentityFingerprint({ ...before, dev: 12n })).not.toBe(fingerprint);
     expect(privatePublicationIdentityFingerprint({ ...before, ino: 23n })).not.toBe(fingerprint);
     expect(privatePublicationIdentityFingerprint({ ...before, ino: 0n })).toBeUndefined();
+  });
+
+  it("accepts only demonstrably owner-exclusive Windows file ACL observations", () => {
+    const inheritedFullControl = {
+      identityIsCurrent: true,
+      accessControlType: 0,
+      rights: 0x1f01ff,
+      isInherited: true,
+      inheritanceFlags: 0,
+      propagationFlags: 0,
+    };
+    const inherited = {
+      protected: false,
+      ownerIsCurrent: true,
+      aces: [inheritedFullControl],
+    };
+
+    expect(windowsAclIsOwnerExclusive(inherited)).toBe(true);
+    expect(
+      windowsAclIsOwnerExclusive({
+        ...inherited,
+        protected: true,
+        aces: [
+          { ...inheritedFullControl, rights: 0x1f0000, isInherited: false },
+          { ...inheritedFullControl, rights: 0x01ff, isInherited: false },
+        ],
+      }),
+    ).toBe(true);
+    expect(windowsAclIsOwnerExclusive({ ...inherited, ownerIsCurrent: false })).toBe(false);
+    expect(
+      windowsAclIsOwnerExclusive({
+        ...inherited,
+        aces: [{ ...inheritedFullControl, identityIsCurrent: false }],
+      }),
+    ).toBe(false);
+    expect(
+      windowsAclIsOwnerExclusive({
+        ...inherited,
+        aces: [{ ...inheritedFullControl, accessControlType: 1 }],
+      }),
+    ).toBe(false);
+    expect(
+      windowsAclIsOwnerExclusive({
+        ...inherited,
+        aces: [{ ...inheritedFullControl, rights: 0x120089 }],
+      }),
+    ).toBe(false);
+    expect(windowsAclIsOwnerExclusive({ ...inherited, aces: [] })).toBe(false);
+  });
+
+  it("renders complete path-safe Windows ACL diagnostics", () => {
+    const diagnostic = windowsAclDiagnostic({
+      protected: false,
+      ownerIsCurrent: true,
+      aces: [
+        {
+          identityIsCurrent: true,
+          accessControlType: 0,
+          rights: 0x1f01ff,
+          isInherited: true,
+          inheritanceFlags: 0,
+          propagationFlags: 0,
+        },
+        {
+          identityIsCurrent: false,
+          accessControlType: 1,
+          rights: 1,
+          isInherited: false,
+          inheritanceFlags: 2,
+          propagationFlags: 1,
+        },
+      ],
+    });
+
+    expect(diagnostic).toBe(
+      "protection=unprotected;owner=current;aces=[identity=current,type=0,rights=2032127,inherited=true,inheritance=0,propagation=0|identity=other,type=1,rights=1,inherited=false,inheritance=2,propagation=1]",
+    );
+    expect(diagnostic).not.toContain("S-1-");
+    expect(diagnostic).not.toContain("\\");
   });
 
   it("reads a validated private file within its explicit byte limit", async () => {
@@ -597,7 +750,7 @@ describe("secure filesystem permissions", () => {
   );
 
   it.skipIf(process.platform !== "win32")(
-    "publishes concurrent JSON replacements under owner-exclusive inherited ACLs",
+    "publishes concurrent JSON replacements with owner-exclusive final ACLs",
     async () => {
       const root = await temporaryRoot();
       const ownedRoot = join(root, "private projections");
