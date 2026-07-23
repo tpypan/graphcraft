@@ -1,8 +1,18 @@
 import { createHash, randomUUID } from "node:crypto";
-import { link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  link,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   HostEventSchema,
   MAX_ARTIFACT_INVENTORY_BYTES,
@@ -11,11 +21,17 @@ import {
   type ArtifactInventory,
 } from "@graphcraft/core";
 import { redactTextBytes } from "./redaction.ts";
-import { RunArtifactStore, type ArtifactPolicy } from "./artifact-policy.ts";
+import {
+  RunArtifactStore,
+  type ArtifactPolicy,
+  type ArtifactPublicationBoundary,
+} from "./artifact-policy.ts";
+import { RunLock } from "./lock.ts";
 
 const temporaryRoots: string[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(
     temporaryRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })),
   );
@@ -67,6 +83,48 @@ async function readIfPresent(path: string): Promise<Buffer | undefined> {
     if (error.code === "ENOENT") return undefined;
     throw error;
   });
+}
+
+interface ArtifactMutationSnapshot {
+  inventory?: Buffer;
+  payload?: Buffer;
+  journal?: Buffer;
+  target?: Buffer;
+  staging?: string[];
+}
+
+async function artifactMutationSnapshot(
+  runRoot: string,
+  targetRelativePath: string,
+): Promise<ArtifactMutationSnapshot> {
+  const staging = await readdir(join(runRoot, ".artifact-staging"))
+    .then((entries) => entries.sort())
+    .catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return undefined;
+      throw error;
+    });
+  return {
+    ...((await readIfPresent(join(runRoot, "artifact-inventory.json")))
+      ? { inventory: await readFile(join(runRoot, "artifact-inventory.json")) }
+      : {}),
+    ...((await readIfPresent(join(runRoot, "artifact-mutation.payload")))
+      ? { payload: await readFile(join(runRoot, "artifact-mutation.payload")) }
+      : {}),
+    ...((await readIfPresent(join(runRoot, "artifact-mutation.json")))
+      ? { journal: await readFile(join(runRoot, "artifact-mutation.json")) }
+      : {}),
+    ...((await readIfPresent(join(runRoot, ...targetRelativePath.split("/"))))
+      ? { target: await readFile(join(runRoot, ...targetRelativePath.split("/"))) }
+      : {}),
+    ...(staging ? { staging } : {}),
+  };
+}
+
+interface ArtifactStoreInternal {
+  persistInventory(
+    inventory: ArtifactInventory,
+    lease: { assertHeld(): void },
+  ): Promise<ArtifactInventory>;
 }
 
 describe("artifact lifecycle policy", () => {
@@ -829,6 +887,395 @@ describe("artifact lifecycle policy", () => {
     },
   );
 
+  it.each(["after_payload", "after_journal", "after_target", "after_inventory"] as const)(
+    "does not start another artifact publication step after lease loss at %s",
+    async (faultPoint) => {
+      const { runRoot, store } = await temporaryStore();
+      const controller = new AbortController();
+      const leaseFailure = new Error(`Artifact publication lease lost at ${faultPoint}`);
+      let snapshotAtLoss: ArtifactMutationSnapshot | undefined;
+      const signal = vi
+        .spyOn(RunLock.prototype, "signal", "get")
+        .mockReturnValueOnce(controller.signal);
+      const release = vi.spyOn(RunLock.prototype, "release");
+
+      try {
+        const faultStore = new RunArtifactStore(
+          runRoot,
+          store.runId,
+          store.policy,
+          async ({ phase, boundary, path }) => {
+            if (
+              phase !== "publication" ||
+              boundary !== faultPoint ||
+              path !== "artifacts/lease-publication.txt"
+            )
+              return;
+            controller.abort(leaseFailure);
+            snapshotAtLoss = await artifactMutationSnapshot(
+              runRoot,
+              "artifacts/lease-publication.txt",
+            );
+          },
+        );
+
+        await expect(
+          faultStore.writeArtifact("lease-publication.txt", "recoverable\n"),
+        ).rejects.toBe(leaseFailure);
+        expect(release).toHaveBeenCalledTimes(1);
+      } finally {
+        signal.mockRestore();
+        release.mockRestore();
+      }
+
+      if (!snapshotAtLoss) throw new Error("Expected an artifact lease-loss snapshot");
+      expect(await artifactMutationSnapshot(runRoot, "artifacts/lease-publication.txt")).toEqual(
+        snapshotAtLoss,
+      );
+
+      const reopened = new RunArtifactStore(runRoot, store.runId, store.policy);
+      const inventory = await reopened.inventory();
+      const entry = inventory.entries.find(
+        ({ path }) => path === "artifacts/lease-publication.txt",
+      );
+      if (faultPoint === "after_payload") {
+        expect(entry).toBeUndefined();
+        await expect(
+          stat(join(runRoot, "artifacts", "lease-publication.txt")),
+        ).rejects.toMatchObject({ code: "ENOENT" });
+      } else {
+        expect(entry).toMatchObject({ disposition: "stored", storedBytes: 12 });
+        await expect(
+          readFile(join(runRoot, "artifacts", "lease-publication.txt"), "utf8"),
+        ).resolves.toBe("recoverable\n");
+      }
+      const recovered = await artifactMutationSnapshot(runRoot, "artifacts/lease-publication.txt");
+      expect(recovered.payload).toBeUndefined();
+      expect(recovered.journal).toBeUndefined();
+      expect(recovered.staging).toBeUndefined();
+    },
+  );
+
+  it.each(["after_journal", "after_target", "after_inventory"] as const)(
+    "does not start another artifact recovery step after lease loss at %s",
+    async (faultPoint) => {
+      const { runRoot, store } = await temporaryStore();
+      const seedStore = new RunArtifactStore(
+        runRoot,
+        store.runId,
+        store.policy,
+        ({ phase, boundary, path }) => {
+          if (
+            phase === "publication" &&
+            boundary === "after_journal" &&
+            path === "artifacts/lease-recovery.txt"
+          )
+            throw new Error("Seed an after-journal recovery");
+        },
+      );
+      await expect(seedStore.writeArtifact("lease-recovery.txt", "recoverable\n")).rejects.toThrow(
+        "Seed an after-journal recovery",
+      );
+
+      const controller = new AbortController();
+      const leaseFailure = new Error(`Artifact recovery lease lost at ${faultPoint}`);
+      let snapshotAtLoss: ArtifactMutationSnapshot | undefined;
+      const signal = vi
+        .spyOn(RunLock.prototype, "signal", "get")
+        .mockReturnValueOnce(controller.signal);
+      const release = vi.spyOn(RunLock.prototype, "release");
+
+      try {
+        const recoveryStore = new RunArtifactStore(
+          runRoot,
+          store.runId,
+          store.policy,
+          async ({ phase, boundary, path }) => {
+            if (
+              phase !== "recovery" ||
+              boundary !== faultPoint ||
+              path !== "artifacts/lease-recovery.txt"
+            )
+              return;
+            controller.abort(leaseFailure);
+            snapshotAtLoss = await artifactMutationSnapshot(
+              runRoot,
+              "artifacts/lease-recovery.txt",
+            );
+          },
+        );
+
+        await expect(recoveryStore.inventory()).rejects.toBe(leaseFailure);
+        expect(release).toHaveBeenCalledTimes(1);
+      } finally {
+        signal.mockRestore();
+        release.mockRestore();
+      }
+
+      if (!snapshotAtLoss?.inventory || !snapshotAtLoss.journal || !snapshotAtLoss.payload)
+        throw new Error("Expected preserved artifact recovery evidence");
+      expect(await artifactMutationSnapshot(runRoot, "artifacts/lease-recovery.txt")).toEqual(
+        snapshotAtLoss,
+      );
+      const inventoryAtLoss = JSON.parse(
+        snapshotAtLoss.inventory.toString("utf8"),
+      ) as ArtifactInventory;
+      const journalAtLoss = JSON.parse(snapshotAtLoss.journal.toString("utf8")) as {
+        previousInventoryHash: string;
+        nextInventoryHash: string;
+      };
+      expect(contentHash(inventoryAtLoss)).toBe(
+        faultPoint === "after_inventory"
+          ? journalAtLoss.nextInventoryHash
+          : journalAtLoss.previousInventoryHash,
+      );
+      if (faultPoint === "after_journal") expect(snapshotAtLoss.target).toBeUndefined();
+      else expect(snapshotAtLoss.target?.toString("utf8")).toBe("recoverable\n");
+
+      const recoveredInventory = await new RunArtifactStore(
+        runRoot,
+        store.runId,
+        store.policy,
+      ).inventory();
+      expect(recoveredInventory.entries).toContainEqual(
+        expect.objectContaining({
+          path: "artifacts/lease-recovery.txt",
+          disposition: "stored",
+          storedBytes: 12,
+        }),
+      );
+      await expect(
+        readFile(join(runRoot, "artifacts", "lease-recovery.txt"), "utf8"),
+      ).resolves.toBe("recoverable\n");
+      const recovered = await artifactMutationSnapshot(runRoot, "artifacts/lease-recovery.txt");
+      expect(recovered.payload).toBeUndefined();
+      expect(recovered.journal).toBeUndefined();
+      expect(recovered.staging).toBeUndefined();
+    },
+  );
+
+  it.each(["body", "lease"] as const)(
+    "preserves the original artifact %s failure over cleanup and release failures",
+    async (failureKind) => {
+      const { root, runRoot, store } = await temporaryStore();
+      const controller = new AbortController();
+      const causalFailure = new Error(`Original artifact ${failureKind} failure`);
+      const releaseFailure = new Error("Artifact lock release failed");
+      const cleanupCandidatePath = join(runRoot, ".artifact-staging", "00-cleanup.tmp");
+      const unsupportedStagingPath = join(runRoot, ".artifact-staging", "99-unsupported");
+      const signal = vi
+        .spyOn(RunLock.prototype, "signal", "get")
+        .mockReturnValueOnce(controller.signal);
+      const realRelease = RunLock.prototype.release;
+      const release = vi.spyOn(RunLock.prototype, "release").mockImplementationOnce(async function (
+        this: RunLock,
+      ) {
+        await realRelease.call(this);
+        throw releaseFailure;
+      });
+
+      try {
+        const faultStore = new RunArtifactStore(
+          runRoot,
+          store.runId,
+          store.policy,
+          async ({ phase, boundary, path }) => {
+            if (
+              phase !== "publication" ||
+              boundary !== "after_journal" ||
+              path !== "artifacts/causal-failure.txt"
+            )
+              return;
+            await writeFile(cleanupCandidatePath, "cleanup\n");
+            await mkdir(unsupportedStagingPath);
+            if (failureKind === "body") throw causalFailure;
+            controller.abort(causalFailure);
+          },
+        );
+
+        await expect(faultStore.writeArtifact("causal-failure.txt", "recoverable\n")).rejects.toBe(
+          causalFailure,
+        );
+        expect(release).toHaveBeenCalledTimes(1);
+      } finally {
+        signal.mockRestore();
+        release.mockRestore();
+      }
+
+      const evidence = await artifactMutationSnapshot(runRoot, "artifacts/causal-failure.txt");
+      expect(evidence.payload?.toString("utf8")).toBe("recoverable\n");
+      expect(evidence.journal).toBeDefined();
+      expect(evidence.staging).toEqual(
+        failureKind === "body" ? ["99-unsupported"] : ["00-cleanup.tmp", "99-unsupported"],
+      );
+      if (failureKind === "body")
+        await expect(stat(cleanupCandidatePath)).rejects.toMatchObject({ code: "ENOENT" });
+      else await expect(stat(cleanupCandidatePath)).resolves.toBeDefined();
+      await expect(stat(unsupportedStagingPath)).resolves.toMatchObject({
+        mode: expect.any(Number),
+      });
+
+      const lock = new RunLock(join(root, "locks", `${store.runId}.artifacts.lock`));
+      await lock.acquire();
+      await lock.release();
+    },
+  );
+
+  it("preserves a settled artifact hook failure over later lease loss", async () => {
+    const { runRoot, store } = await temporaryStore();
+    const controller = new AbortController();
+    const bodyFailure = new Error("Artifact hook failed first");
+    const leaseFailure = new Error("Artifact lease failed second");
+    let reachHook!: () => void;
+    let rejectHook!: (error: unknown) => void;
+    const hookReached = new Promise<void>((resolve) => {
+      reachHook = resolve;
+    });
+    const hookResult = new Promise<void>((_resolve, reject) => {
+      rejectHook = reject;
+    });
+    const signal = vi
+      .spyOn(RunLock.prototype, "signal", "get")
+      .mockReturnValueOnce(controller.signal);
+
+    try {
+      const faultStore = new RunArtifactStore(
+        runRoot,
+        store.runId,
+        store.policy,
+        ({ phase, boundary }) => {
+          if (phase !== "publication" || boundary !== "after_journal") return;
+          reachHook();
+          return hookResult;
+        },
+      );
+      const pending = faultStore.writeArtifact("settlement-order.txt", "value\n");
+      await hookReached;
+      rejectHook(bodyFailure);
+      queueMicrotask(() => controller.abort(leaseFailure));
+      await expect(pending).rejects.toBe(bodyFailure);
+    } finally {
+      signal.mockRestore();
+    }
+  });
+
+  it("preserves a settled artifact persistence failure over later lease loss", async () => {
+    const { store } = await temporaryStore();
+    const internal = store as unknown as ArtifactStoreInternal;
+    const controller = new AbortController();
+    const bodyFailure = new Error("Artifact persistence failed first");
+    const leaseFailure = new Error("Artifact lease failed second");
+    let reachPersistence!: () => void;
+    let rejectPersistence!: (error: unknown) => void;
+    const persistenceReached = new Promise<void>((resolve) => {
+      reachPersistence = resolve;
+    });
+    const persistenceResult = new Promise<ArtifactInventory>((_resolve, reject) => {
+      rejectPersistence = reject;
+    });
+    const signal = vi
+      .spyOn(RunLock.prototype, "signal", "get")
+      .mockReturnValueOnce(controller.signal);
+    const persistInventory = vi.spyOn(internal, "persistInventory").mockImplementationOnce(() => {
+      reachPersistence();
+      return persistenceResult;
+    });
+
+    try {
+      const pending = store.initialize();
+      await persistenceReached;
+      rejectPersistence(bodyFailure);
+      queueMicrotask(() => controller.abort(leaseFailure));
+      await expect(pending).rejects.toBe(bodyFailure);
+    } finally {
+      persistInventory.mockRestore();
+      signal.mockRestore();
+    }
+  });
+
+  it("does not publish an initial artifact inventory after its lease is lost", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-artifact-initialize-lease-test-"));
+    temporaryRoots.push(root);
+    const runRoot = join(root, "run");
+    const store = new RunArtifactStore(runRoot, randomUUID());
+    const internal = store as unknown as ArtifactStoreInternal;
+    const originalPersistInventory = internal.persistInventory;
+    const controller = new AbortController();
+    const leaseFailure = new Error("Artifact initialization lease lost");
+    const signal = vi
+      .spyOn(RunLock.prototype, "signal", "get")
+      .mockReturnValueOnce(controller.signal);
+    const release = vi.spyOn(RunLock.prototype, "release");
+    const persistInventory = vi
+      .spyOn(internal, "persistInventory")
+      .mockImplementationOnce(async (inventory, lease) => {
+        controller.abort(leaseFailure);
+        return await originalPersistInventory.call(internal, inventory, lease);
+      });
+
+    try {
+      await expect(store.initialize()).rejects.toBe(leaseFailure);
+      expect(release).toHaveBeenCalledTimes(1);
+      await expect(stat(join(runRoot, store.inventoryRelativePath))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      persistInventory.mockRestore();
+      signal.mockRestore();
+      release.mockRestore();
+    }
+
+    const initialized = await new RunArtifactStore(runRoot, store.runId, store.policy).initialize();
+    expect(initialized).toMatchObject({ runId: store.runId, entries: [] });
+    await expect(stat(join(runRoot, store.inventoryRelativePath))).resolves.toBeDefined();
+  });
+
+  it("does not publish a migrated artifact inventory after its lease is lost", async () => {
+    const { runRoot, store } = await temporaryStore();
+    const inventoryPath = join(runRoot, store.inventoryRelativePath);
+    const legacyPath = join(runRoot, "artifacts", "legacy.txt");
+    await mkdir(join(runRoot, "artifacts"), { recursive: true });
+    await writeFile(legacyPath, "legacy\n");
+    const inventoryBefore = await readFile(inventoryPath);
+    const legacyBefore = await readFile(legacyPath);
+    const internal = store as unknown as ArtifactStoreInternal;
+    const originalPersistInventory = internal.persistInventory;
+    const controller = new AbortController();
+    const leaseFailure = new Error("Artifact migration lease lost");
+    const signal = vi
+      .spyOn(RunLock.prototype, "signal", "get")
+      .mockReturnValueOnce(controller.signal);
+    const release = vi.spyOn(RunLock.prototype, "release");
+    const persistInventory = vi
+      .spyOn(internal, "persistInventory")
+      .mockImplementationOnce(async (inventory, lease) => {
+        controller.abort(leaseFailure);
+        return await originalPersistInventory.call(internal, inventory, lease);
+      });
+
+    try {
+      await expect(store.migrateLegacy()).rejects.toBe(leaseFailure);
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(await readFile(inventoryPath)).toEqual(inventoryBefore);
+      expect(await readFile(legacyPath)).toEqual(legacyBefore);
+    } finally {
+      persistInventory.mockRestore();
+      signal.mockRestore();
+      release.mockRestore();
+    }
+
+    const migrated = await new RunArtifactStore(runRoot, store.runId, store.policy).migrateLegacy();
+    expect(migrated.entries).toContainEqual(
+      expect.objectContaining({
+        path: "artifacts/legacy.txt",
+        disposition: "legacy",
+        legacy: true,
+        storedBytes: 7,
+      }),
+    );
+    await expect(readFile(legacyPath)).resolves.toEqual(legacyBefore);
+  });
+
   it.each(["after_target", "after_inventory"] as const)(
     "retains recoverable mutation evidence when the target changes at %s",
     async (faultPoint) => {
@@ -856,12 +1303,14 @@ describe("artifact lifecycle policy", () => {
       expect(await readFile(targetPath, "utf8")).toBe("tampered\n");
       const journalBefore = await readFile(journalPath);
       const payloadBefore = await readFile(payloadPath);
+      const recoveryHook = vi.fn();
 
       await expect(
-        new RunArtifactStore(runRoot, store.runId, store.policy).inventory(),
+        new RunArtifactStore(runRoot, store.runId, store.policy, recoveryHook).inventory(),
       ).rejects.toThrow(
         /does not match its completed mutation|changed after its mutation was journaled/,
       );
+      expect(recoveryHook).not.toHaveBeenCalled();
       expect(await readFile(journalPath)).toEqual(journalBefore);
       expect(await readFile(payloadPath)).toEqual(payloadBefore);
 

@@ -72,6 +72,7 @@ export type ArtifactPublicationBoundary =
   "after_payload" | "after_journal" | "after_target" | "after_inventory";
 
 export interface ArtifactPublicationCheckpoint {
+  phase: "publication" | "recovery";
   boundary: ArtifactPublicationBoundary;
   mutationId: string;
   path: string;
@@ -81,6 +82,12 @@ export interface ArtifactPublicationCheckpoint {
 export type ArtifactPublicationHook = (
   checkpoint: ArtifactPublicationCheckpoint,
 ) => void | Promise<void>;
+
+interface ArtifactLeaseContext {
+  assertHeld(): void;
+  recordFailure(error: unknown): unknown;
+  observe<T>(operation: () => T | PromiseLike<T>): Promise<T>;
+}
 
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -226,36 +233,53 @@ async function resolvePrivatePath(
   root: string,
   relativePath: string,
   createParents: boolean,
+  lease: ArtifactLeaseContext,
 ): Promise<string> {
   const parts = validatePortableRelativePath(relativePath);
+  lease.assertHeld();
   await ensurePrivateDirectory(root);
+  lease.assertHeld();
   let directory = root;
   for (const part of parts.slice(0, -1)) {
     directory = join(directory, part);
     const existing = await targetStatus(directory);
+    lease.assertHeld();
     if (!existing) {
       if (!createParents) throw new Error(`Artifact parent does not exist: ${directory}`);
+      lease.assertHeld();
       await ensurePrivateDirectory(directory);
+      lease.assertHeld();
       continue;
     }
     if (existing.isSymbolicLink())
       throw new Error(`Refusing symbolic-link artifact parent: ${directory}`);
     if (!existing.isDirectory())
       throw new Error(`Artifact parent is not a directory: ${directory}`);
+    lease.assertHeld();
     await ensurePrivateDirectory(directory);
+    lease.assertHeld();
   }
   const target = join(root, ...parts);
   const existing = await targetStatus(target);
+  lease.assertHeld();
   if (existing) assertRegularPrivateTarget(target, existing);
   return target;
 }
 
-async function atomicWrite(root: string, relativePath: string, bytes: Uint8Array): Promise<string> {
-  const path = await resolvePrivatePath(root, relativePath, true);
+async function atomicWrite(
+  root: string,
+  relativePath: string,
+  bytes: Uint8Array,
+  lease: ArtifactLeaseContext,
+): Promise<string> {
+  const path = await resolvePrivatePath(root, relativePath, true, lease);
   const stagingRoot = join(root, ATOMIC_STAGING_DIRECTORY);
+  lease.assertHeld();
   await ensurePrivateDirectory(stagingRoot, root);
+  lease.assertHeld();
   const temporaryPath = join(stagingRoot, `${randomUUID()}.tmp`);
   try {
+    lease.assertHeld();
     await publishPrivateFileAtomic({
       path,
       ownedRoot: root,
@@ -285,37 +309,54 @@ async function atomicWrite(root: string, relativePath: string, bytes: Uint8Array
         return publication;
       },
     });
+    lease.assertHeld();
     return path;
   } catch (error) {
-    const removed = await unlink(temporaryPath).then(
-      () => true,
-      (unlinkError) => {
-        if (isMissing(unlinkError)) return false;
-        throw unlinkError;
-      },
-    );
-    if (removed) await syncDirectory(stagingRoot);
-    throw error;
+    const causalError = lease.recordFailure(error);
+    try {
+      lease.assertHeld();
+      const removed = await unlink(temporaryPath).then(
+        () => true,
+        (unlinkError) => {
+          if (isMissing(unlinkError)) return false;
+          throw unlinkError;
+        },
+      );
+      lease.assertHeld();
+      if (removed) await syncDirectory(stagingRoot);
+    } catch {
+      // The publication or lease failure remains causal; a fresh holder cleans staging.
+    }
+    throw causalError;
   }
 }
 
-async function cleanupAtomicStaging(root: string): Promise<void> {
+async function cleanupAtomicStaging(root: string, lease: ArtifactLeaseContext): Promise<void> {
   const stagingRoot = join(root, ATOMIC_STAGING_DIRECTORY);
   const existing = await targetStatus(stagingRoot);
+  lease.assertHeld();
   if (!existing) return;
   if (existing.isSymbolicLink())
     throw new Error(`Refusing symbolic-link artifact staging directory: ${stagingRoot}`);
   if (!existing.isDirectory())
     throw new Error(`Artifact staging path is not a directory: ${stagingRoot}`);
+  lease.assertHeld();
   await ensurePrivateDirectory(stagingRoot, root);
+  lease.assertHeld();
   let removedEntry = false;
-  for (const item of await readdir(stagingRoot, { withFileTypes: true })) {
+  const items = await readdir(stagingRoot, { withFileTypes: true });
+  items.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+  for (const item of items) {
+    lease.assertHeld();
     const path = join(stagingRoot, item.name);
     if (!item.isFile() || item.isSymbolicLink())
       throw new Error(`Unsupported entry in artifact staging directory: ${path}`);
     assertRegularPrivateTarget(path, await lstat(path));
+    lease.assertHeld();
     const mutation = await preparePrivateDirectoryMutation(stagingRoot, root);
+    let bodyFailureWasThrown = false;
     try {
+      lease.assertHeld();
       const removed = await unlink(path).then(
         () => true,
         (error) => {
@@ -323,15 +364,30 @@ async function cleanupAtomicStaging(root: string): Promise<void> {
           throw error;
         },
       );
+      lease.assertHeld();
       removedEntry ||= removed;
+    } catch (error) {
+      bodyFailureWasThrown = true;
+      throw lease.recordFailure(error);
     } finally {
-      await finalizePrivateDirectoryMutation(mutation, root);
+      try {
+        await finalizePrivateDirectoryMutation(mutation, root);
+      } catch (error) {
+        if (!bodyFailureWasThrown) throw lease.recordFailure(error);
+      }
     }
   }
-  if (removedEntry) await syncDirectory(stagingRoot);
+  lease.assertHeld();
+  if (removedEntry) {
+    await syncDirectory(stagingRoot);
+    lease.assertHeld();
+  }
   const parent = dirname(stagingRoot);
+  lease.assertHeld();
   const mutation = await preparePrivateDirectoryMutation(parent, root);
+  let bodyFailureWasThrown = false;
   try {
+    lease.assertHeld();
     const removedDirectory = await rmdir(stagingRoot).then(
       () => true,
       (error) => {
@@ -339,21 +395,40 @@ async function cleanupAtomicStaging(root: string): Promise<void> {
         throw error;
       },
     );
-    if (removedDirectory) await syncDirectory(parent);
+    lease.assertHeld();
+    if (removedDirectory) {
+      await syncDirectory(parent);
+      lease.assertHeld();
+    }
+  } catch (error) {
+    bodyFailureWasThrown = true;
+    throw lease.recordFailure(error);
   } finally {
-    await finalizePrivateDirectoryMutation(mutation, root);
+    try {
+      await finalizePrivateDirectoryMutation(mutation, root);
+    } catch (error) {
+      if (!bodyFailureWasThrown) throw lease.recordFailure(error);
+    }
   }
 }
 
-async function removePrivateFile(root: string, relativePath: string): Promise<void> {
-  const path = await resolvePrivatePath(root, relativePath, false).catch((error) => {
+async function removePrivateFile(
+  root: string,
+  relativePath: string,
+  lease: ArtifactLeaseContext,
+): Promise<void> {
+  const path = await resolvePrivatePath(root, relativePath, false, lease).catch((error) => {
     if (isMissing(error)) return undefined;
     throw error;
   });
+  lease.assertHeld();
   if (path) {
     const parent = dirname(path);
+    lease.assertHeld();
     const mutation = await preparePrivateDirectoryMutation(parent, root);
+    let bodyFailureWasThrown = false;
     try {
+      lease.assertHeld();
       const removed = await unlink(path).then(
         () => true,
         (error) => {
@@ -361,9 +436,20 @@ async function removePrivateFile(root: string, relativePath: string): Promise<vo
           throw error;
         },
       );
-      if (removed) await syncDirectory(parent);
+      lease.assertHeld();
+      if (removed) {
+        await syncDirectory(parent);
+        lease.assertHeld();
+      }
+    } catch (error) {
+      bodyFailureWasThrown = true;
+      throw lease.recordFailure(error);
     } finally {
-      await finalizePrivateDirectoryMutation(mutation, root);
+      try {
+        await finalizePrivateDirectoryMutation(mutation, root);
+      } catch (error) {
+        if (!bodyFailureWasThrown) throw lease.recordFailure(error);
+      }
     }
   }
 }
@@ -759,19 +845,72 @@ export class RunArtifactStore {
     }
   }
 
-  private serializeMutation<T>(operation: () => Promise<T>): Promise<T> {
+  private serializeMutation<T>(operation: (lease: ArtifactLeaseContext) => Promise<T>): Promise<T> {
     const current = this.tail.then(async () => {
       const lock = await this.acquireMutationLock();
+      const signal = lock.signal;
+      let causalFailure: { error: unknown } | undefined;
+      let leaseFailure: { error: unknown } | undefined;
+      let cleanupFailure: { error: unknown } | undefined;
+      let bodyFailureWasThrown = false;
+      let operationStarted = false;
+      const rememberCausalFailure = (error: unknown): { error: unknown } =>
+        (causalFailure ??= { error });
+      const recordLeaseLoss = (): void => {
+        leaseFailure ??= { error: signal.reason };
+        rememberCausalFailure(leaseFailure.error);
+      };
+      const lease: ArtifactLeaseContext = {
+        assertHeld: () => {
+          if (signal.aborted) recordLeaseLoss();
+          if (leaseFailure) throw leaseFailure.error;
+        },
+        recordFailure: (error) => rememberCausalFailure(error).error,
+        observe: <T>(operation: () => T | PromiseLike<T>): Promise<T> => {
+          try {
+            return Promise.resolve(operation()).catch((error) => {
+              throw rememberCausalFailure(error).error;
+            });
+          } catch (error) {
+            return Promise.reject(rememberCausalFailure(error).error);
+          }
+        },
+      };
+      if (signal.aborted) recordLeaseLoss();
+      else signal.addEventListener("abort", recordLeaseLoss, { once: true });
       try {
-        await cleanupAtomicStaging(this.runRoot);
-        await this.recoverPendingMutation();
-        try {
-          return await operation();
-        } finally {
-          await cleanupAtomicStaging(this.runRoot);
-        }
+        lease.assertHeld();
+        await cleanupAtomicStaging(this.runRoot, lease);
+        lease.assertHeld();
+        await this.recoverPendingMutation(lease);
+        lease.assertHeld();
+        operationStarted = true;
+        const result = await operation(lease);
+        lease.assertHeld();
+        return result;
+      } catch (error) {
+        bodyFailureWasThrown = true;
+        throw rememberCausalFailure(error).error;
       } finally {
-        await lock.release();
+        if (operationStarted) {
+          try {
+            lease.assertHeld();
+            await cleanupAtomicStaging(this.runRoot, lease);
+            lease.assertHeld();
+          } catch (error) {
+            cleanupFailure ??= { error };
+          }
+        }
+        try {
+          await lock.release();
+        } catch (error) {
+          cleanupFailure ??= { error };
+        }
+        signal.removeEventListener("abort", recordLeaseLoss);
+        if (!bodyFailureWasThrown) {
+          if (causalFailure) throw causalFailure.error;
+          if (cleanupFailure) throw cleanupFailure.error;
+        }
       }
     });
     this.tail = current.then(
@@ -781,24 +920,33 @@ export class RunArtifactStore {
     return current;
   }
 
-  private async persistInventory(inventory: ArtifactInventory): Promise<ArtifactInventory> {
+  private async persistInventory(
+    inventory: ArtifactInventory,
+    lease: ArtifactLeaseContext,
+  ): Promise<ArtifactInventory> {
     const value = validateArtifactInventory(inventory);
     if (value.runId !== this.runId)
       throw new Error(`Artifact inventory belongs to ${value.runId}, not ${this.runId}`);
     if (artifactInventorySerializedBytes(value) > MAX_ARTIFACT_INVENTORY_BYTES)
       throw new Error("Serialized artifact inventory exceeds its byte limit");
     const bytes = Buffer.from(`${JSON.stringify(value, null, 2)}\n`);
-    await atomicWrite(this.runRoot, this.inventoryRelativePath, bytes);
+    lease.assertHeld();
+    await atomicWrite(this.runRoot, this.inventoryRelativePath, bytes, lease);
+    lease.assertHeld();
     return value;
   }
 
-  private async rawInventory(): Promise<ArtifactInventory> {
-    const path = await resolvePrivatePath(this.runRoot, this.inventoryRelativePath, false).catch(
-      (error) => {
-        if (isMissing(error) || String(error).includes("does not exist")) return undefined;
-        throw error;
-      },
-    );
+  private async rawInventory(lease: ArtifactLeaseContext): Promise<ArtifactInventory> {
+    const path = await resolvePrivatePath(
+      this.runRoot,
+      this.inventoryRelativePath,
+      false,
+      lease,
+    ).catch((error) => {
+      if (isMissing(error) || String(error).includes("does not exist")) return undefined;
+      throw error;
+    });
+    lease.assertHeld();
     if (!path) return emptyInventory(this.runId, this.policy);
     const parsed = await readBoundedArtifactInventory(path).catch((error) => {
       if (isMissing(error)) return undefined;
@@ -810,13 +958,16 @@ export class RunArtifactStore {
     return parsed;
   }
 
-  private async readMutationJournal(): Promise<ArtifactMutationJournal | undefined> {
-    const path = await resolvePrivatePath(this.runRoot, MUTATION_JOURNAL_PATH, false).catch(
+  private async readMutationJournal(
+    lease: ArtifactLeaseContext,
+  ): Promise<ArtifactMutationJournal | undefined> {
+    const path = await resolvePrivatePath(this.runRoot, MUTATION_JOURNAL_PATH, false, lease).catch(
       (error) => {
         if (isMissing(error) || String(error).includes("does not exist")) return undefined;
         throw error;
       },
     );
+    lease.assertHeld();
     if (!path) return undefined;
     const source = await readPrivateFileBounded(path, 128 * 1024, this.runRoot).catch((error) => {
       if (isMissing(error)) return undefined;
@@ -858,11 +1009,15 @@ export class RunArtifactStore {
   private async readTarget(
     relativePath: string,
     expectedSizes: ReadonlySet<number>,
+    lease: ArtifactLeaseContext,
   ): Promise<{ bytes: number; hash?: string } | undefined> {
-    const path = await resolvePrivatePath(this.runRoot, relativePath, false).catch((error) => {
-      if (isMissing(error) || String(error).includes("does not exist")) return undefined;
-      throw error;
-    });
+    const path = await resolvePrivatePath(this.runRoot, relativePath, false, lease).catch(
+      (error) => {
+        if (isMissing(error) || String(error).includes("does not exist")) return undefined;
+        throw error;
+      },
+    );
+    lease.assertHeld();
     if (!path) return undefined;
     const maximumBytes = Math.max(0, ...expectedSizes);
     const contents = await readPrivateFileBounded(path, maximumBytes, this.runRoot).catch(
@@ -891,24 +1046,49 @@ export class RunArtifactStore {
     entry: ArtifactInventoryEntry | undefined,
     expectedSizes: ReadonlySet<number>,
     message: string,
+    lease: ArtifactLeaseContext,
   ): Promise<void> {
-    const target = await this.readTarget(relativePath, expectedSizes);
+    const target = await this.readTarget(relativePath, expectedSizes, lease);
     if (!this.targetMatches(target, entry)) throw new Error(message);
   }
 
-  private async cleanupMutationFiles(): Promise<void> {
-    await removePrivateFile(this.runRoot, MUTATION_JOURNAL_PATH);
-    await removePrivateFile(this.runRoot, MUTATION_PAYLOAD_PATH);
+  private async cleanupMutationFiles(lease: ArtifactLeaseContext): Promise<void> {
+    lease.assertHeld();
+    await removePrivateFile(this.runRoot, MUTATION_JOURNAL_PATH, lease);
+    lease.assertHeld();
+    await removePrivateFile(this.runRoot, MUTATION_PAYLOAD_PATH, lease);
+    lease.assertHeld();
   }
 
-  private async recoverPendingMutation(): Promise<void> {
-    const journal = await this.readMutationJournal();
+  private async checkpointMutation(
+    journal: ArtifactMutationJournal,
+    phase: ArtifactPublicationCheckpoint["phase"],
+    boundary: ArtifactPublicationBoundary,
+    lease: ArtifactLeaseContext,
+  ): Promise<void> {
+    lease.assertHeld();
+    await lease.observe(() =>
+      this.publicationHook?.({
+        phase,
+        boundary,
+        mutationId: journal.mutationId,
+        path: journal.path,
+        action: journal.action,
+      }),
+    );
+    lease.assertHeld();
+  }
+
+  private async recoverPendingMutation(lease: ArtifactLeaseContext): Promise<void> {
+    const journal = await this.readMutationJournal(lease);
+    lease.assertHeld();
     if (!journal) {
-      await removePrivateFile(this.runRoot, MUTATION_PAYLOAD_PATH);
+      await removePrivateFile(this.runRoot, MUTATION_PAYLOAD_PATH, lease);
       return;
     }
     this.assertMutationAction(journal);
-    const inventory = await this.rawInventory();
+    const inventory = await this.rawInventory(lease);
+    lease.assertHeld();
     const inventoryHash = contentHash(inventory);
     const currentEntry = inventory.entries.find(({ path }) => path === journal.path);
     const currentIsPrevious =
@@ -926,13 +1106,17 @@ export class RunArtifactStore {
         .filter((value): value is { bytes: number; hash: string } => value !== undefined)
         .map(({ bytes }) => bytes),
     );
-    const target = await this.readTarget(journal.path, expectedSizes);
+    const target = await this.readTarget(journal.path, expectedSizes, lease);
+    lease.assertHeld();
     if (currentIsNext) {
       if (!this.targetMatches(target, journal.nextEntry))
         throw new Error(
           `Artifact ${journal.path} does not match its completed mutation; recovery stopped without changing files`,
         );
-      await this.cleanupMutationFiles();
+      await this.checkpointMutation(journal, "recovery", "after_journal", lease);
+      await this.checkpointMutation(journal, "recovery", "after_target", lease);
+      await this.checkpointMutation(journal, "recovery", "after_inventory", lease);
+      await this.cleanupMutationFiles(lease);
       return;
     }
     const targetIsPrevious = this.targetMatches(target, journal.previousEntry);
@@ -947,20 +1131,29 @@ export class RunArtifactStore {
       throw new Error(
         `Artifact mutation ${journal.mutationId} does not reproduce its next inventory snapshot; recovery stopped without changing files`,
       );
+    await this.checkpointMutation(journal, "recovery", "after_journal", lease);
     if (journal.action === "write" && !targetIsNext) {
-      const payloadPath = await resolvePrivatePath(this.runRoot, MUTATION_PAYLOAD_PATH, false);
+      const payloadPath = await resolvePrivatePath(
+        this.runRoot,
+        MUTATION_PAYLOAD_PATH,
+        false,
+        lease,
+      );
       const expected = this.expectedTarget(journal.nextEntry);
       if (!expected) throw new Error("Artifact mutation payload has no journaled target bytes");
       const payload = await readPrivateFileBounded(payloadPath, expected.bytes, this.runRoot);
+      lease.assertHeld();
       if (payload.length !== expected.bytes)
         throw new Error("Artifact mutation payload size does not match its journal");
       if (bytesHash(payload) !== expected.hash)
         throw new Error("Artifact mutation payload hash does not match its journal");
-      await atomicWrite(this.runRoot, journal.path, payload);
+      await atomicWrite(this.runRoot, journal.path, payload, lease);
     } else if (journal.action === "delete" && !targetIsNext) {
-      await removePrivateFile(this.runRoot, journal.path);
+      await removePrivateFile(this.runRoot, journal.path, lease);
     }
-    if (contentHash(await this.rawInventory()) !== journal.previousInventoryHash)
+    lease.assertHeld();
+    await this.checkpointMutation(journal, "recovery", "after_target", lease);
+    if (contentHash(await this.rawInventory(lease)) !== journal.previousInventoryHash)
       throw new Error(
         `Artifact mutation ${journal.mutationId} inventory changed during recovery; recovery stopped without changing inventory metadata`,
       );
@@ -969,9 +1162,10 @@ export class RunArtifactStore {
       journal.nextEntry,
       expectedSizes,
       `Artifact ${journal.path} changed before its inventory was recovered; recovery stopped without cleaning mutation evidence`,
+      lease,
     );
-    await this.persistInventory(nextInventory);
-    if (contentHash(await this.rawInventory()) !== journal.nextInventoryHash)
+    await lease.observe(() => this.persistInventory(nextInventory, lease));
+    if (contentHash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
       throw new Error(
         `Artifact mutation ${journal.mutationId} inventory changed while it was recovered; recovery stopped without cleaning mutation evidence`,
       );
@@ -980,42 +1174,47 @@ export class RunArtifactStore {
       journal.nextEntry,
       expectedSizes,
       `Artifact ${journal.path} changed while its inventory was recovered; recovery stopped without cleaning mutation evidence`,
+      lease,
     );
-    if (contentHash(await this.rawInventory()) !== journal.nextInventoryHash)
+    if (contentHash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
       throw new Error(
         `Artifact mutation ${journal.mutationId} inventory changed after it was recovered; recovery stopped without cleaning mutation evidence`,
       );
-    await this.cleanupMutationFiles();
+    await this.checkpointMutation(journal, "recovery", "after_inventory", lease);
+    await this.cleanupMutationFiles(lease);
   }
 
   async initialize(): Promise<ArtifactInventory> {
-    return await this.serializeMutation(async () => {
+    return await this.serializeMutation(async (lease) => {
+      lease.assertHeld();
       await ensurePrivateDirectory(this.runRoot);
-      const inventory = await this.rawInventory();
-      return await this.persistInventory(inventory);
+      lease.assertHeld();
+      const inventory = await this.rawInventory(lease);
+      lease.assertHeld();
+      return await lease.observe(() => this.persistInventory(inventory, lease));
     });
   }
 
   async inventory(): Promise<ArtifactInventory> {
     return await this.serializeMutation(
-      async () => await this.reconcile(await this.rawInventory()),
+      async (lease) => await this.reconcile(await this.rawInventory(lease)),
     );
   }
 
   async readArtifactPreview(relativePath: string, maxBytes: number): Promise<ArtifactPreview> {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > MIB)
       throw new Error(`Artifact preview limit must be an integer from 0 through ${MIB}`);
-    return await this.serializeMutation(async () => {
+    return await this.serializeMutation(async (lease) => {
       const parts = validatePortableRelativePath(relativePath);
       if (parts[0] !== "artifacts" || parts.length < 2)
         throw new Error("Artifact preview path is not artifact-owned");
-      const inventory = await this.rawInventory();
+      const inventory = await this.rawInventory(lease);
       const entry = inventory.entries.find(({ path }) => path === relativePath);
       const expected = this.expectedTarget(entry);
       if (!entry || !expected)
         throw new Error("Artifact preview is not represented by stored inventory bytes");
 
-      const path = await resolvePrivatePath(this.runRoot, relativePath, false);
+      const path = await resolvePrivatePath(this.runRoot, relativePath, false, lease);
       const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
       try {
         const before = await handle.stat();
@@ -1069,10 +1268,12 @@ export class RunArtifactStore {
   }
 
   async migrateLegacy(): Promise<ArtifactInventory> {
-    return await this.serializeMutation(async () => {
-      const inventory = await this.scanLegacy(emptyInventory(this.runId, this.policy));
+    return await this.serializeMutation(async (lease) => {
+      const inventory = await this.scanLegacy(emptyInventory(this.runId, this.policy), lease);
+      lease.assertHeld();
       await hardenPrivateTree(this.runRoot);
-      return await this.persistInventory(inventory);
+      lease.assertHeld();
+      return await lease.observe(() => this.persistInventory(inventory, lease));
     });
   }
 
@@ -1123,7 +1324,10 @@ export class RunArtifactStore {
     return files;
   }
 
-  private async scanLegacy(inventory: ArtifactInventory): Promise<ArtifactInventory> {
+  private async scanLegacy(
+    inventory: ArtifactInventory,
+    lease: ArtifactLeaseContext,
+  ): Promise<ArtifactInventory> {
     const files = [...(await this.scanFiles("artifacts")), ...(await this.scanFiles("capsules"))];
     const legacyLimit = inventory.policy.runArtifactBytes - inventory.policy.runReservedBytes;
     const legacyBytes = files.reduce((total, file) => total + file.bytes, 0);
@@ -1133,9 +1337,11 @@ export class RunArtifactStore {
       );
     const byPath = new Map(inventory.entries.map((entry) => [entry.path, entry]));
     for (const file of files) {
+      lease.assertHeld();
       validateNewArtifactPath(file.path);
-      const absolute = await resolvePrivatePath(this.runRoot, file.path, false);
+      const absolute = await resolvePrivatePath(this.runRoot, file.path, false, lease);
       const contents = await readPrivateFileBounded(absolute, file.bytes, this.runRoot);
+      lease.assertHeld();
       if (contents.length !== file.bytes)
         throw new Error(`Artifact ${file.path} changed while its legacy metadata was scanned`);
       const storedHash = bytesHash(contents);
@@ -1262,12 +1468,15 @@ export class RunArtifactStore {
     );
   }
 
-  private async publishEntryMutation(input: {
-    inventory: ArtifactInventory;
-    entry: ArtifactInventoryEntry;
-    action: ArtifactMutationJournal["action"];
-    bytes?: Buffer;
-  }): Promise<ArtifactInventory> {
+  private async publishEntryMutation(
+    input: {
+      inventory: ArtifactInventory;
+      entry: ArtifactInventoryEntry;
+      action: ArtifactMutationJournal["action"];
+      bytes?: Buffer;
+    },
+    lease: ArtifactLeaseContext,
+  ): Promise<ArtifactInventory> {
     assertNoArtifactPathAlias(input.inventory, input.entry.path);
     const previousEntry = input.inventory.entries.find(({ path }) => path === input.entry.path);
     const mutationTimestamp = now();
@@ -1291,29 +1500,20 @@ export class RunArtifactStore {
         throw new Error("Artifact mutation bytes do not match the inventory entry size");
       if (bytesHash(input.bytes) !== expected.hash)
         throw new Error("Artifact mutation bytes do not match the inventory entry hash");
-      await atomicWrite(this.runRoot, MUTATION_PAYLOAD_PATH, input.bytes);
+      await atomicWrite(this.runRoot, MUTATION_PAYLOAD_PATH, input.bytes, lease);
     } else if (input.bytes) {
       throw new Error("Artifact mutation bytes require a write action");
     }
-    await this.publicationHook?.({
-      boundary: "after_payload",
-      mutationId: journal.mutationId,
-      path: journal.path,
-      action: journal.action,
-    });
+    await this.checkpointMutation(journal, "publication", "after_payload", lease);
     await atomicWrite(
       this.runRoot,
       MUTATION_JOURNAL_PATH,
       Buffer.from(`${JSON.stringify(journal, null, 2)}\n`),
+      lease,
     );
-    await this.publicationHook?.({
-      boundary: "after_journal",
-      mutationId: journal.mutationId,
-      path: journal.path,
-      action: journal.action,
-    });
+    await this.checkpointMutation(journal, "publication", "after_journal", lease);
 
-    if (contentHash(await this.rawInventory()) !== journal.previousInventoryHash)
+    if (contentHash(await this.rawInventory(lease)) !== journal.previousInventoryHash)
       throw new Error(
         `Artifact ${input.entry.path} inventory changed while its mutation was being published; recovery stopped without changing files`,
       );
@@ -1323,20 +1523,17 @@ export class RunArtifactStore {
         .filter((value): value is { bytes: number; hash: string } => value !== undefined)
         .map(({ bytes }) => bytes),
     );
-    const target = await this.readTarget(input.entry.path, expectedSizes);
+    const target = await this.readTarget(input.entry.path, expectedSizes, lease);
     if (!this.targetMatches(target, previousEntry))
       throw new Error(
         `Artifact ${input.entry.path} changed while its mutation was being published; recovery stopped without changing files`,
       );
-    if (input.action === "write") await atomicWrite(this.runRoot, input.entry.path, input.bytes!);
-    else if (input.action === "delete") await removePrivateFile(this.runRoot, input.entry.path);
-    await this.publicationHook?.({
-      boundary: "after_target",
-      mutationId: journal.mutationId,
-      path: journal.path,
-      action: journal.action,
-    });
-    if (contentHash(await this.rawInventory()) !== journal.previousInventoryHash)
+    if (input.action === "write")
+      await atomicWrite(this.runRoot, input.entry.path, input.bytes!, lease);
+    else if (input.action === "delete")
+      await removePrivateFile(this.runRoot, input.entry.path, lease);
+    await this.checkpointMutation(journal, "publication", "after_target", lease);
+    if (contentHash(await this.rawInventory(lease)) !== journal.previousInventoryHash)
       throw new Error(
         `Artifact ${input.entry.path} inventory changed before its mutation inventory was published; recovery stopped without changing files`,
       );
@@ -1345,9 +1542,10 @@ export class RunArtifactStore {
       input.entry,
       expectedSizes,
       `Artifact ${input.entry.path} changed before its mutation inventory was published; recovery stopped without cleaning mutation evidence`,
+      lease,
     );
-    const persisted = await this.persistInventory(nextInventory);
-    if (contentHash(await this.rawInventory()) !== journal.nextInventoryHash)
+    const persisted = await lease.observe(() => this.persistInventory(nextInventory, lease));
+    if (contentHash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
       throw new Error(
         `Artifact mutation ${journal.mutationId} inventory changed while it was published; recovery stopped without cleaning mutation evidence`,
       );
@@ -1356,14 +1554,10 @@ export class RunArtifactStore {
       input.entry,
       expectedSizes,
       `Artifact ${input.entry.path} changed while its mutation inventory was published; recovery stopped without cleaning mutation evidence`,
+      lease,
     );
-    await this.publicationHook?.({
-      boundary: "after_inventory",
-      mutationId: journal.mutationId,
-      path: journal.path,
-      action: journal.action,
-    });
-    if (contentHash(await this.rawInventory()) !== journal.nextInventoryHash)
+    await this.checkpointMutation(journal, "publication", "after_inventory", lease);
+    if (contentHash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
       throw new Error(
         `Artifact mutation ${journal.mutationId} inventory changed after it was published; recovery stopped without cleaning mutation evidence`,
       );
@@ -1372,12 +1566,13 @@ export class RunArtifactStore {
       input.entry,
       expectedSizes,
       `Artifact ${input.entry.path} changed after its mutation inventory was published; recovery stopped without cleaning mutation evidence`,
+      lease,
     );
-    if (contentHash(await this.rawInventory()) !== journal.nextInventoryHash)
+    if (contentHash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
       throw new Error(
         `Artifact mutation ${journal.mutationId} inventory changed before mutation evidence cleanup; recovery stopped without cleaning mutation evidence`,
       );
-    await this.cleanupMutationFiles();
+    await this.cleanupMutationFiles(lease);
     return persisted;
   }
 
@@ -1385,11 +1580,11 @@ export class RunArtifactStore {
     relativePath: string,
     value: string | Uint8Array,
   ): Promise<ArtifactWriteResult> {
-    return await this.serializeMutation(async () => {
+    return await this.serializeMutation(async (lease) => {
       validateNewRelativePath(relativePath);
       const inventoryPath = `artifacts/${relativePath}`;
       validateNewArtifactPath(inventoryPath);
-      const inventory = await this.reconcile(await this.rawInventory());
+      const inventory = await this.reconcile(await this.rawInventory(lease));
       assertNoArtifactPathAlias(inventory, inventoryPath);
       const previous = inventory.entries.find(({ path }) => path === inventoryPath);
       const source = redactTextBytes(value);
@@ -1408,13 +1603,22 @@ export class RunArtifactStore {
             ? "run_quota"
             : "artifact_limit";
       const entry = entryFor(inventoryPath, "artifact", format, source, stored, previous, reason);
-      await this.publishEntryMutation({
-        inventory,
-        entry,
-        action:
-          stored !== undefined ? "write" : this.expectedTarget(previous) ? "delete" : "unchanged",
-        ...(stored !== undefined ? { bytes: stored } : {}),
-      });
+      await lease.observe(() =>
+        this.publishEntryMutation(
+          {
+            inventory,
+            entry,
+            action:
+              stored !== undefined
+                ? "write"
+                : this.expectedTarget(previous)
+                  ? "delete"
+                  : "unchanged",
+            ...(stored !== undefined ? { bytes: stored } : {}),
+          },
+          lease,
+        ),
+      );
       return {
         path: join(this.runRoot, ...validatePortableRelativePath(inventoryPath)),
         stored: entry.storedBytes > 0,
@@ -1430,9 +1634,9 @@ export class RunArtifactStore {
     value: string | Uint8Array;
     kind: "content_addressed" | "capsule";
   }): Promise<IdentityArtifactWriteResult> {
-    return await this.serializeMutation(async () => {
+    return await this.serializeMutation(async (lease) => {
       validateNewArtifactPath(input.relativePath);
-      const inventory = await this.reconcile(await this.rawInventory());
+      const inventory = await this.reconcile(await this.rawInventory(lease));
       assertNoArtifactPathAlias(inventory, input.relativePath);
       const previous = inventory.entries.find(({ path }) => path === input.relativePath);
       const source = redactTextBytes(input.value);
@@ -1465,10 +1669,12 @@ export class RunArtifactStore {
           reason,
           "rejected",
         );
-        await this.publishEntryMutation({ inventory, entry: rejected, action: "unchanged" });
+        await lease.observe(() =>
+          this.publishEntryMutation({ inventory, entry: rejected, action: "unchanged" }, lease),
+        );
         throw new Error(message);
       }
-      const path = await resolvePrivatePath(this.runRoot, input.relativePath, true);
+      const path = await resolvePrivatePath(this.runRoot, input.relativePath, true, lease);
       const existing = await readPrivateFileBounded(path, perFileLimit, this.runRoot).catch(
         (error) => {
           if (isMissing(error)) return undefined;
@@ -1487,12 +1693,17 @@ export class RunArtifactStore {
         source,
         previous,
       );
-      await this.publishEntryMutation({
-        inventory,
-        entry,
-        action: existing ? "unchanged" : "write",
-        ...(!existing ? { bytes: source } : {}),
-      });
+      await lease.observe(() =>
+        this.publishEntryMutation(
+          {
+            inventory,
+            entry,
+            action: existing ? "unchanged" : "write",
+            ...(!existing ? { bytes: source } : {}),
+          },
+          lease,
+        ),
+      );
       return {
         path,
         reused: Boolean(existing),
@@ -1512,20 +1723,25 @@ export class RunArtifactStore {
       throw new Error(`Invalid invocation ID: ${invocationId}`);
     const persistedEvent = HostEventSchema.parse(redactValue(event));
     assertInvocationEventIdentity(persistedEvent, invocationId);
-    return await this.serializeMutation(async () => {
+    return await this.serializeMutation(async (lease) => {
       const sourceLine = Buffer.from(`${JSON.stringify(persistedEvent)}\n`);
       const relativePath = `artifacts/invocations/${invocationId}.jsonl`;
       validateNewArtifactPath(relativePath);
       const recovery = ["session", "result", "usage", "error", "terminated"].includes(
         persistedEvent.type,
       );
-      let inventory = await this.reconcile(await this.rawInventory());
+      let inventory = await this.reconcile(await this.rawInventory(lease));
       const policy = inventory.policy;
       if (recovery) {
         const checkpointPath = `artifacts/invocations/${invocationId}.recovery.json`;
         validateNewArtifactPath(checkpointPath);
         const previousEntry = inventory.entries.find(({ path }) => path === checkpointPath);
-        const checkpointAbsolute = await resolvePrivatePath(this.runRoot, checkpointPath, true);
+        const checkpointAbsolute = await resolvePrivatePath(
+          this.runRoot,
+          checkpointPath,
+          true,
+          lease,
+        );
         const previousCheckpoint = await readPrivateFileBounded(
           checkpointAbsolute,
           policy.invocationReservedBytes,
@@ -1556,15 +1772,20 @@ export class RunArtifactStore {
           previousEntry,
           bounded.source.length > bounded.stored.length ? "artifact_limit" : undefined,
         );
-        inventory = await this.publishEntryMutation({
-          inventory,
-          entry: checkpointEntry,
-          action: "write",
-          bytes: bounded.stored,
-        });
+        inventory = await lease.observe(() =>
+          this.publishEntryMutation(
+            {
+              inventory,
+              entry: checkpointEntry,
+              action: "write",
+              bytes: bounded.stored,
+            },
+            lease,
+          ),
+        );
       }
       const previous = inventory.entries.find(({ path }) => path === relativePath);
-      const path = await resolvePrivatePath(this.runRoot, relativePath, true);
+      const path = await resolvePrivatePath(this.runRoot, relativePath, true, lease);
       const existing = await readPrivateFileBounded(
         path,
         policy.invocationTranscriptBytes,
@@ -1615,12 +1836,17 @@ export class RunArtifactStore {
         createdAt: previous?.createdAt ?? timestamp,
         updatedAt: timestamp,
       };
-      await this.publishEntryMutation({
-        inventory,
-        entry,
-        action: storedLine ? "write" : "unchanged",
-        ...(storedLine ? { bytes: stored } : {}),
-      });
+      await lease.observe(() =>
+        this.publishEntryMutation(
+          {
+            inventory,
+            entry,
+            action: storedLine ? "write" : "unchanged",
+            ...(storedLine ? { bytes: stored } : {}),
+          },
+          lease,
+        ),
+      );
       return {
         path,
         stored: storedLine !== undefined,
@@ -1634,11 +1860,11 @@ export class RunArtifactStore {
   async loadInvocationEvents(invocationId: string): Promise<HostEvent[]> {
     if (!/^[a-z0-9][a-z0-9._-]{0,127}$/i.test(invocationId))
       throw new Error(`Invalid invocation ID: ${invocationId}`);
-    return await this.serializeMutation(async () => {
-      const inventory = await this.reconcile(await this.rawInventory());
+    return await this.serializeMutation(async (lease) => {
+      const inventory = await this.reconcile(await this.rawInventory(lease));
       const transcriptPath = `artifacts/invocations/${invocationId}.jsonl`;
       const checkpointPath = `artifacts/invocations/${invocationId}.recovery.json`;
-      const transcript = await resolvePrivatePath(this.runRoot, transcriptPath, false)
+      const transcript = await resolvePrivatePath(this.runRoot, transcriptPath, false, lease)
         .then(async (path) =>
           (
             await readPrivateFileBounded(
@@ -1663,7 +1889,7 @@ export class RunArtifactStore {
             return [] as HostEvent[];
           throw error;
         });
-      const checkpoint = await resolvePrivatePath(this.runRoot, checkpointPath, false)
+      const checkpoint = await resolvePrivatePath(this.runRoot, checkpointPath, false, lease)
         .then(async (path) =>
           parseRecoveryCheckpoint(
             JSON.parse(
