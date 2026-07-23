@@ -13,45 +13,68 @@ const tsxLoader = pathToFileURL(resolve("node_modules/tsx/dist/loader.mjs")).hre
 const runnerPath = resolve("tests/fixtures/crash-restart-runner.ts");
 
 type HostId = "codex" | "claude";
-type FaultBoundary = "session" | "usage" | "result" | "progress_scope";
-type ProgressProbeStage = "progress_baseline" | "progress_current";
+type FaultBoundary =
+  "session" | "usage" | "result" | "probe_scope" | "probe_scope_forged" | "probe_cleanup";
+type ProbeScopeStage = "progress_baseline" | "progress_current" | "verification";
 
-interface ProgressScopeMarker {
-  boundary: "progress_scope";
+interface ProbeScopeMarker {
+  boundary: "probe_scope";
+  brokerPid: number;
+  descendantPid: number;
   mutated: boolean;
   probePid: number;
-  runnerPid: number;
-  stage: ProgressProbeStage;
+  stage: ProbeScopeStage;
+  startedAt: string;
 }
 
-const progressScopeProbe = `
-const { existsSync, writeFileSync } = require("node:fs");
+interface ProbeLaunch {
+  brokerPid: number;
+  probePid: number;
+  stage: ProbeScopeStage;
+  startedAt: string;
+  target: boolean;
+}
+
+const probeScopeProbe = `
+const { appendFileSync, existsSync, writeFileSync } = require("node:fs");
 const { join } = require("node:path");
+const { spawn } = require("node:child_process");
 const markerPath = process.argv[1];
 const mutated = process.argv[2] === "mutate";
 const stage = process.argv[3];
-if (existsSync(markerPath)) process.exit(0);
 const attemptPath = markerPath + ".attempt";
-if (stage === "progress_current" && !existsSync(attemptPath)) {
+const target = stage !== "progress_current" || existsSync(attemptPath);
+const startedAt = new Date().toISOString();
+appendFileSync(markerPath + ".launches.jsonl", JSON.stringify({
+  brokerPid: process.ppid,
+  probePid: process.pid,
+  stage,
+  startedAt,
+  target,
+}) + "\\n");
+if (existsSync(markerPath)) process.exit(0);
+if (!target) {
   writeFileSync(attemptPath, "progress_baseline completed\\n");
   process.exit(0);
 }
 if (mutated) writeFileSync(join(process.cwd(), "feature.txt"), "probe mutation before crash\\n");
-const runnerPid = process.ppid;
+const descendant = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], {
+  stdio: "ignore",
+});
 writeFileSync(markerPath, JSON.stringify({
-  boundary: "progress_scope",
+  boundary: "probe_scope",
+  brokerPid: process.ppid,
+  descendantPid: descendant.pid,
   mutated,
   probePid: process.pid,
-  runnerPid,
   stage,
+  startedAt,
 }) + "\\n");
+process.on("SIGTERM", () => {});
 setInterval(() => {
-  try {
-    process.kill(runnerPid, 0);
-  } catch {
-    process.exit(0);
-  }
-}, 25);
+  process.stdout.write("probe stdout after runtime loss\\n");
+  process.stderr.write("probe stderr after runtime loss\\n");
+}, 10);
 `;
 
 interface RunnerRequest {
@@ -108,6 +131,7 @@ function runnerArguments(
   boundary: FaultBoundary,
   markerPath: string,
   requestLogPath: string,
+  forgedBrokerPid?: number,
 ): string[] {
   return [
     "--import",
@@ -119,6 +143,7 @@ function runnerArguments(
     boundary,
     markerPath,
     requestLogPath,
+    forgedBrokerPid === undefined ? "" : String(forgedBrokerPid),
   ];
 }
 
@@ -128,6 +153,7 @@ function spawnCrashRunner(
   boundary: FaultBoundary,
   markerPath: string,
   requestLogPath: string,
+  forgedBrokerPid?: number,
 ): {
   child: ChildProcess;
   closed: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
@@ -135,7 +161,15 @@ function spawnCrashRunner(
 } {
   const child = spawn(
     process.execPath,
-    runnerArguments(repository, host, "crash", boundary, markerPath, requestLogPath),
+    runnerArguments(
+      repository,
+      host,
+      "crash",
+      boundary,
+      markerPath,
+      requestLogPath,
+      forgedBrokerPid,
+    ),
     { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] },
   );
   let stdout = "";
@@ -180,16 +214,16 @@ async function waitForMarker(
   }
 }
 
-async function waitForProgressScopeMarker(
+async function waitForProbeScopeMarker(
   markerPath: string,
   child: ChildProcess,
   diagnostics: () => string,
   timeoutMs = 15_000,
-): Promise<ProgressScopeMarker> {
+): Promise<ProbeScopeMarker> {
   const deadline = Date.now() + timeoutMs;
   while (true) {
     try {
-      return JSON.parse(await readFile(markerPath, "utf8")) as ProgressScopeMarker;
+      return JSON.parse(await readFile(markerPath, "utf8")) as ProbeScopeMarker;
     } catch (error) {
       if (child.exitCode !== null || child.signalCode !== null)
         throw new Error(
@@ -202,51 +236,99 @@ async function waitForProgressScopeMarker(
   }
 }
 
-async function killProbe(pid: number): Promise<void> {
+function isProcessAlive(pid: number): boolean {
   try {
-    process.kill(pid, "SIGKILL");
+    process.kill(pid, 0);
+    return true;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
     throw error;
   }
-  const deadline = Date.now() + 2_000;
-  while (true) {
-    try {
-      process.kill(pid, 0);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
-      throw error;
-    }
-    if (Date.now() > deadline) throw new Error(`Probe process ${pid} did not exit after SIGKILL`);
+}
+
+async function waitForProcessExit(pid: number, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (isProcessAlive(pid)) {
+    if (Date.now() > deadline) throw new Error(`Process ${pid} did not settle after runtime loss`);
     await new Promise<void>((done) => setTimeout(done, 20));
   }
 }
 
-async function configureProgressScopeCrash(
+async function killProcessForCleanup(pid: number): Promise<void> {
+  if (!isProcessAlive(pid)) return;
+  process.kill(pid, "SIGKILL");
+  await waitForProcessExit(pid, 2_000);
+}
+
+async function probeLaunches(markerPath: string): Promise<ProbeLaunch[]> {
+  return (await readFile(`${markerPath}.launches.jsonl`, "utf8"))
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as ProbeLaunch);
+}
+
+async function configureProbeScopeCrash(
   created: Awaited<ReturnType<typeof createRun>>,
   markerPath: string,
   mutate: boolean,
-  stage: ProgressProbeStage,
+  stage: ProbeScopeStage,
 ): Promise<void> {
+  const target =
+    stage === "verification"
+      ? created.probePlan.items.find(({ phase }) => phase === "completion")
+      : created.probePlan.items.find(
+          ({ phase, purpose }) => phase === "progress" && purpose === "focused",
+        );
+  if (!target) throw new Error(`Missing ${stage} probe fixture`);
   await configureRunProbes(created.store, {
-    schemaVersion: 1,
-    family: created.probePlan.family,
-    items: [
-      {
-        phase: "progress",
-        purpose: "focused",
-        source: "Crash-restart scope checkpoint fixture",
-        probe: {
-          id: "crash-after-progress-scope-start",
-          kind: "command",
-          command: process.execPath,
-          args: ["-e", progressScopeProbe, markerPath, mutate ? "mutate" : "observe", stage],
-          expectedExitCode: 0,
-          timeoutMs: 30_000,
-        },
-      },
-      ...created.probePlan.items.filter(({ phase }) => phase === "completion"),
-    ],
+    ...created.probePlan,
+    items: created.probePlan.items.map((item) =>
+      item === target
+        ? {
+            ...item,
+            source: `Crash-restart ${stage} scope checkpoint fixture`,
+            probe: {
+              id: `crash-after-${stage}-scope-start`,
+              kind: "command" as const,
+              command: process.execPath,
+              args: ["-e", probeScopeProbe, markerPath, mutate ? "mutate" : "observe", stage],
+              expectedExitCode: 0,
+              timeoutMs: 30_000,
+              platforms: [process.platform] as Array<"darwin" | "linux" | "win32">,
+            },
+          }
+        : item,
+    ),
+  });
+}
+
+async function configureProbeCleanupCrash(
+  created: Awaited<ReturnType<typeof createRun>>,
+): Promise<void> {
+  const target = created.probePlan.items.find(
+    ({ phase, purpose }) => phase === "progress" && purpose === "focused",
+  );
+  if (!target) throw new Error("Missing progress probe cleanup fixture");
+  await configureRunProbes(created.store, {
+    ...created.probePlan,
+    items: created.probePlan.items.map((item) =>
+      item === target
+        ? {
+            ...item,
+            source: "Crash-restart probe journal cleanup fixture",
+            probe: {
+              id: "crash-after-probe-process-finished",
+              kind: "command" as const,
+              command: process.execPath,
+              args: ["-e", "process.exit(0)"],
+              expectedExitCode: 0,
+              timeoutMs: 10_000,
+              platforms: [process.platform] as Array<"darwin" | "linux" | "win32">,
+            },
+          }
+        : item,
+    ),
   });
 }
 
@@ -256,10 +338,19 @@ async function runResume(
   boundary: FaultBoundary,
   markerPath: string,
   requestLogPath: string,
+  forgedBrokerPid?: number,
 ): Promise<void> {
   await execFileAsync(
     process.execPath,
-    runnerArguments(repository, host, "resume", boundary, markerPath, requestLogPath),
+    runnerArguments(
+      repository,
+      host,
+      "resume",
+      boundary,
+      markerPath,
+      requestLogPath,
+      forgedBrokerPid,
+    ),
     { cwd: process.cwd(), timeout: 30_000 },
   );
 }
@@ -394,17 +485,18 @@ describe("cold runtime restart fault recovery", () => {
     45_000,
   );
 
-  const progressScopeCases = (["progress_baseline", "progress_current"] as const).flatMap(
-    (stage) => [
-      { mutate: false, label: "unchanged", stage },
-      { mutate: true, label: "changed", stage },
-    ],
-  );
+  const probeScopeCases = (
+    ["progress_baseline", "progress_current", "verification"] as const
+  ).flatMap((stage) => [
+    { mutate: false, label: "unchanged", stage },
+    { mutate: true, label: "changed", stage },
+  ]);
 
-  it.each(progressScopeCases)(
+  it.each(probeScopeCases)(
     "reconciles an unresolved $stage scope checkpoint when the workspace is $label",
     async ({ mutate, stage }) => {
       const { repository, root } = await createRepository();
+      const nodeId = stage === "verification" ? "verify" : "implement";
       const created = await createRun("Implement a substantial scope-recovery feature", {
         cwd: repository,
       });
@@ -413,32 +505,37 @@ describe("cold runtime restart fault recovery", () => {
         root,
         `${stage}-${mutate ? "changed" : "unchanged"}.requests.jsonl`,
       );
-      await configureProgressScopeCrash(created, markerPath, mutate, stage);
+      await configureProbeScopeCrash(created, markerPath, mutate, stage);
       await created.store.append("user", "run.approved", { approved: true });
       const crash = spawnCrashRunner(
         repository,
         "codex",
-        "progress_scope",
+        "probe_scope",
         markerPath,
         requestLogPath,
       );
-      let probePid: number | undefined;
+      const cleanupPids = new Set<number>();
 
       try {
-        const marker = await waitForProgressScopeMarker(markerPath, crash.child, crash.diagnostics);
-        probePid = marker.probePid;
+        const marker = await waitForProbeScopeMarker(markerPath, crash.child, crash.diagnostics);
+        cleanupPids.add(marker.probePid);
+        cleanupPids.add(marker.descendantPid);
+        cleanupPids.add(marker.brokerPid);
         expect(marker).toMatchObject({
-          boundary: "progress_scope",
+          boundary: "probe_scope",
           mutated: mutate,
-          runnerPid: crash.child.pid,
           stage,
         });
+        expect(marker.brokerPid).not.toBe(crash.child.pid);
+        expect(
+          [marker.brokerPid, marker.probePid, marker.descendantPid].every(isProcessAlive),
+        ).toBe(true);
 
         const crashedStore = new RunStore(repository, created.contract.runId);
         const beforeRestart = await crashedStore.loadEvents();
         const scopeStart = beforeRestart.findLast(
           ({ type, data }) =>
-            type === "scope.started" && data.nodeId === "implement" && data.stage === stage,
+            type === "scope.started" && data.nodeId === nodeId && data.stage === stage,
         );
         expect(scopeStart).toBeDefined();
         expect(
@@ -450,38 +547,117 @@ describe("cold runtime restart fault recovery", () => {
         const invocationsBeforeRestart = beforeRestart.filter(
           ({ type, data }) => type === "invocation.started" && data.nodeId === "implement",
         );
-        expect(invocationsBeforeRestart).toHaveLength(stage === "progress_current" ? 1 : 0);
+        expect(invocationsBeforeRestart).toHaveLength(stage === "progress_baseline" ? 0 : 1);
+        const processStart = beforeRestart.findLast(
+          ({ type, data }) =>
+            type === "probe.process.started" &&
+            data.nodeId === nodeId &&
+            data.stage === stage &&
+            data.checkpointId === scopeStart?.data.checkpointId,
+        );
+        expect(processStart).toMatchObject({
+          actor: "probe",
+          causationId: scopeStart?.data.checkpointId,
+          data: {
+            ready: { brokerPid: marker.brokerPid },
+          },
+        });
+        const executionId = (processStart?.data.definition as { executionId?: string })
+          ?.executionId;
+        expect(executionId).toEqual(expect.any(String));
+        const journalPath = join(
+          crashedStore.graphcraftRoot,
+          String(processStart?.data.journalPath),
+        );
+        await expect(stat(journalPath)).resolves.toBeDefined();
 
         expect(crash.child.kill("SIGKILL")).toBe(true);
         const exit = await crash.closed;
         expect(exit.signal !== null || exit.code !== 0).toBe(true);
-        await killProbe(marker.probePid);
-        probePid = undefined;
-
-        await runResume(repository, "codex", "progress_scope", markerPath, requestLogPath);
+        const resumed = runResume(repository, "codex", "probe_scope", markerPath, requestLogPath);
+        await Promise.all(
+          [marker.probePid, marker.descendantPid, marker.brokerPid].map((pid) =>
+            waitForProcessExit(pid),
+          ),
+        );
+        cleanupPids.clear();
+        await resumed;
         const recoveredStore = new RunStore(repository, created.contract.runId);
         const recovered = await recoveredStore.loadState();
         const events = await recoveredStore.loadEvents();
+        const reconciliation = events.find(
+          ({ type, data }) =>
+            type === "probe.process.reconciled" && data.executionId === executionId,
+        );
+        expect(reconciliation).toMatchObject({
+          actor: "runtime",
+          causationId: executionId,
+          data: {
+            nodeId,
+            stage,
+            checkpointId: scopeStart?.data.checkpointId,
+            started: true,
+            settlement: {
+              outcome: "terminated",
+              confirmed: true,
+              brokerPid: marker.brokerPid,
+              childPid: marker.probePid,
+            },
+          },
+        });
         const recoveredScopeCheck = events.find(
           ({ sequence, causationId, type, data }) =>
             sequence > scopeStart!.sequence &&
             type === "scope.checked" &&
             causationId === scopeStart?.data.checkpointId &&
             data.checkpointId === scopeStart?.data.checkpointId &&
-            data.nodeId === "implement" &&
+            data.nodeId === nodeId &&
             data.stage === stage,
         );
         expect(recoveredScopeCheck?.data).toMatchObject({
-          nodeId: "implement",
+          nodeId,
           stage,
           recovered: true,
         });
         expect(recoveredScopeCheck?.data.audit).toMatchObject({ allowed: !mutate });
+        const launches = await probeLaunches(markerPath);
+        const interruptedLaunchIndex = launches.findIndex(
+          ({ probePid }) => probePid === marker.probePid,
+        );
+        expect(interruptedLaunchIndex).toBeGreaterThanOrEqual(0);
+        const laterLaunches = launches.slice(interruptedLaunchIndex + 1);
+        const settledAt = String(
+          (reconciliation?.data.settlement as { settledAt?: unknown })?.settledAt,
+        );
+        if (mutate) expect(laterLaunches).toHaveLength(0);
+        else {
+          expect(laterLaunches.length).toBeGreaterThan(0);
+          expect(
+            laterLaunches.every(({ startedAt }) => Date.parse(startedAt) >= Date.parse(settledAt)),
+          ).toBe(true);
+          expect(
+            events
+              .filter(
+                ({ sequence, type, data }) =>
+                  type === "probe.process.started" &&
+                  sequence > scopeStart!.sequence &&
+                  data.checkpointId !== scopeStart?.data.checkpointId,
+              )
+              .every(
+                ({ sequence }) => sequence > (reconciliation?.sequence ?? Number.MAX_SAFE_INTEGER),
+              ),
+          ).toBe(true);
+        }
+        await expect(
+          stat(
+            join(recoveredStore.graphcraftRoot, "locks", "probe-processes", created.contract.runId),
+          ),
+        ).rejects.toMatchObject({ code: "ENOENT" });
 
         const workspace = await recoveredStore.loadWorkspace<{ path: string }>();
         if (mutate) {
           expect(recovered.status).toBe("blocked");
-          expect(recovered.nodes.implement?.status).toBe("failed");
+          expect(recovered.nodes[nodeId]?.status).toBe("failed");
           await expect(readFile(join(workspace.path, "feature.txt"), "utf8")).resolves.toBe(
             "probe mutation before crash\n",
           );
@@ -494,7 +670,7 @@ describe("cold runtime restart fault recovery", () => {
             ({ sequence, type, data }) =>
               sequence > scopeStart!.sequence &&
               type === "node.failed" &&
-              data.nodeId === "implement" &&
+              data.nodeId === nodeId &&
               data.scopeCheckpointId === scopeStart?.data.checkpointId,
           );
           expect(checkpointFailures).toHaveLength(1);
@@ -504,7 +680,9 @@ describe("cold runtime restart fault recovery", () => {
             scopeCheckpointId: scopeStart?.data.checkpointId,
           });
           expect(failure?.data.reason).toMatch(
-            /progress probe execution changed repository state/i,
+            stage === "verification"
+              ? /completion probe execution changed repository state/i
+              : /progress probe execution changed repository state/i,
           );
           expect(failure?.data.runBlocker).toMatchObject({
             reason: failure?.data.reason,
@@ -524,7 +702,7 @@ describe("cold runtime restart fault recovery", () => {
             scopeCheckpointId: scopeStart?.data.checkpointId,
           });
 
-          await runResume(repository, "codex", "progress_scope", markerPath, requestLogPath);
+          await runResume(repository, "codex", "probe_scope", markerPath, requestLogPath);
           const idempotentState = await recoveredStore.loadState();
           const idempotentEvents = await recoveredStore.loadEvents();
           expect(idempotentState.status).toBe("blocked");
@@ -532,7 +710,7 @@ describe("cold runtime restart fault recovery", () => {
             idempotentEvents.filter(
               ({ type, data }) =>
                 type === "node.failed" &&
-                data.nodeId === "implement" &&
+                data.nodeId === nodeId &&
                 data.scopeCheckpointId === scopeStart?.data.checkpointId,
             ),
           ).toHaveLength(1);
@@ -552,7 +730,7 @@ describe("cold runtime restart fault recovery", () => {
           );
         } else {
           expect(recovered.status).toBe("completed");
-          expect(recovered.nodes.implement?.status).toBe("accepted");
+          expect(recovered.nodes[nodeId]?.status).toBe("accepted");
           expect(
             events.filter(
               ({ type, data }) => type === "invocation.started" && data.nodeId === "implement",
@@ -561,15 +739,257 @@ describe("cold runtime restart fault recovery", () => {
           await expect(readFile(join(workspace.path, "feature.txt"), "utf8")).resolves.toBe(
             "completed after cold restart\n",
           );
+          expect(
+            events.filter(({ type, data }) => type === "node.accepted" && data.nodeId === nodeId),
+          ).toHaveLength(1);
+          expect(events.filter(({ type }) => type === "run.completed")).toHaveLength(1);
+          if (stage === "verification")
+            expect(
+              events.filter(
+                ({ type, data }) => type === "held_out.checked" && data.nodeId === "verify",
+              ),
+            ).toHaveLength(1);
+
+          const launchesBeforeIdempotentResume = launches.length;
+          await runResume(repository, "codex", "probe_scope", markerPath, requestLogPath);
+          expect(await probeLaunches(markerPath)).toHaveLength(launchesBeforeIdempotentResume);
+          const idempotentEvents = await recoveredStore.loadEvents();
+          expect(
+            idempotentEvents.filter(
+              ({ type, data }) => type === "node.accepted" && data.nodeId === nodeId,
+            ),
+          ).toHaveLength(1);
+          expect(idempotentEvents.filter(({ type }) => type === "run.completed")).toHaveLength(1);
+          if (stage === "verification")
+            expect(
+              idempotentEvents.filter(
+                ({ type, data }) => type === "held_out.checked" && data.nodeId === "verify",
+              ),
+            ).toHaveLength(1);
         }
       } finally {
         if (crash.child.exitCode === null && crash.child.signalCode === null) {
           crash.child.kill("SIGKILL");
           await crash.closed;
         }
-        if (probePid !== undefined) await killProbe(probePid);
+        await Promise.all([...cleanupPids].map((pid) => killProcessForCleanup(pid)));
       }
     },
-    45_000,
+    60_000,
   );
+
+  it.each(["forged", "missing"] as const)(
+    "blocks on $fault probe ownership evidence without signaling an ambiguous PID",
+    async (fault) => {
+      const { repository, root } = await createRepository();
+      const created = await createRun("Implement a probe-ownership recovery feature", {
+        cwd: repository,
+      });
+      const markerPath = join(root, `${fault}-ownership.json`);
+      const requestLogPath = join(root, `${fault}-ownership.requests.jsonl`);
+      await configureProbeScopeCrash(created, markerPath, false, "progress_baseline");
+      await created.store.append("user", "run.approved", { approved: true });
+      const sentinel = spawn(
+        process.execPath,
+        ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
+        { stdio: "ignore" },
+      );
+      const sentinelClosed = new Promise<void>((resolveClosed) =>
+        sentinel.once("close", () => resolveClosed()),
+      );
+      const boundary = fault === "forged" ? "probe_scope_forged" : "probe_scope";
+      const crash = spawnCrashRunner(
+        repository,
+        "codex",
+        boundary,
+        markerPath,
+        requestLogPath,
+        fault === "forged" ? sentinel.pid : undefined,
+      );
+      const cleanupPids = new Set<number>();
+
+      try {
+        const marker = await waitForProbeScopeMarker(markerPath, crash.child, crash.diagnostics);
+        cleanupPids.add(marker.probePid);
+        cleanupPids.add(marker.descendantPid);
+        cleanupPids.add(marker.brokerPid);
+        const crashedStore = new RunStore(repository, created.contract.runId);
+        const beforeRestart = await crashedStore.loadEvents();
+        const scopeStart = beforeRestart.findLast(
+          ({ type, data }) =>
+            type === "scope.started" &&
+            data.nodeId === "implement" &&
+            data.stage === "progress_baseline",
+        );
+        const processStart = beforeRestart.findLast(
+          ({ type, data }) =>
+            type === "probe.process.started" && data.checkpointId === scopeStart?.data.checkpointId,
+        );
+        expect(scopeStart).toBeDefined();
+        expect(processStart).toBeDefined();
+        if (fault === "forged") {
+          expect(processStart?.data.ready).toMatchObject({ brokerPid: sentinel.pid });
+          expect(marker.brokerPid).not.toBe(sentinel.pid);
+        }
+        const journalPath = join(
+          crashedStore.graphcraftRoot,
+          String(processStart?.data.journalPath),
+        );
+
+        expect(crash.child.kill("SIGKILL")).toBe(true);
+        await crash.closed;
+        await Promise.all(
+          [marker.probePid, marker.descendantPid, marker.brokerPid].map((pid) =>
+            waitForProcessExit(pid),
+          ),
+        );
+        cleanupPids.clear();
+        if (fault === "missing") await rm(journalPath, { force: true });
+
+        await runResume(repository, "codex", boundary, markerPath, requestLogPath);
+        const recoveredStore = new RunStore(repository, created.contract.runId);
+        const recovered = await recoveredStore.loadState();
+        const events = await recoveredStore.loadEvents();
+        const checkpointId = scopeStart?.data.checkpointId;
+        const failures = events.filter(
+          ({ type, data }) =>
+            type === "node.failed" &&
+            data.nodeId === "implement" &&
+            data.scopeCheckpointId === checkpointId,
+        );
+        const blockers = events.filter(
+          ({ type, data }) => type === "run.blocked" && data.scopeCheckpointId === checkpointId,
+        );
+        expect(recovered.status).toBe("blocked");
+        expect(recovered.stopReason).toMatch(
+          fault === "forged"
+            ? /broker identity is ambiguous/i
+            : /cannot find the ownership journal/i,
+        );
+        expect(failures).toHaveLength(1);
+        expect(blockers).toHaveLength(1);
+        expect(isProcessAlive(sentinel.pid!)).toBe(true);
+        expect(events.filter(({ type }) => type === "probe.process.reconciled")).toHaveLength(0);
+        const launches = await probeLaunches(markerPath);
+        const interrupted = launches.findIndex(({ probePid }) => probePid === marker.probePid);
+        expect(launches.slice(interrupted + 1)).toHaveLength(0);
+
+        await runResume(repository, "codex", boundary, markerPath, requestLogPath);
+        const idempotentEvents = await recoveredStore.loadEvents();
+        expect(
+          idempotentEvents.filter(
+            ({ type, data }) =>
+              type === "node.failed" &&
+              data.nodeId === "implement" &&
+              data.scopeCheckpointId === checkpointId,
+          ),
+        ).toHaveLength(1);
+        expect(
+          idempotentEvents.filter(
+            ({ type, data }) => type === "run.blocked" && data.scopeCheckpointId === checkpointId,
+          ),
+        ).toHaveLength(1);
+        expect(isProcessAlive(sentinel.pid!)).toBe(true);
+      } finally {
+        if (crash.child.exitCode === null && crash.child.signalCode === null) {
+          crash.child.kill("SIGKILL");
+          await crash.closed;
+        }
+        await Promise.all([...cleanupPids].map((pid) => killProcessForCleanup(pid)));
+        if (sentinel.pid && isProcessAlive(sentinel.pid)) sentinel.kill("SIGKILL");
+        await sentinelClosed;
+      }
+    },
+    60_000,
+  );
+
+  it("persists a precise blocker when a settled probe journal cannot be removed during recovery", async () => {
+    const { repository, root } = await createRepository();
+    const created = await createRun("Implement durable probe journal cleanup recovery", {
+      cwd: repository,
+    });
+    const markerPath = join(root, "probe-cleanup.marker.json");
+    const requestLogPath = join(root, "probe-cleanup.requests.jsonl");
+    await configureProbeCleanupCrash(created);
+    await created.store.append("user", "run.approved", { approved: true });
+    const crash = spawnCrashRunner(
+      repository,
+      "codex",
+      "probe_cleanup",
+      markerPath,
+      requestLogPath,
+    );
+
+    try {
+      const marker = await waitForMarker(markerPath, crash.child, crash.diagnostics);
+      const crashedStore = new RunStore(repository, created.contract.runId);
+      const beforeRestart = await crashedStore.loadEvents();
+      const processFinish = beforeRestart.find(
+        ({ type, data }) =>
+          type === "probe.process.finished" && data.executionId === marker.invocationId,
+      );
+      const processStart = beforeRestart.find(
+        ({ type, data }) =>
+          type === "probe.process.started" &&
+          typeof data.definition === "object" &&
+          data.definition !== null &&
+          (data.definition as { executionId?: unknown }).executionId === marker.invocationId,
+      );
+      const checkpointId = processStart?.data.checkpointId;
+      const journalPath = join(crashedStore.graphcraftRoot, String(processStart?.data.journalPath));
+      expect(processFinish).toBeDefined();
+      expect(checkpointId).toEqual(expect.any(String));
+      await expect(stat(journalPath)).resolves.toBeDefined();
+
+      expect(crash.child.kill("SIGKILL")).toBe(true);
+      await crash.closed;
+      await rm(journalPath);
+      await mkdir(journalPath);
+
+      await runResume(repository, "codex", "probe_cleanup", markerPath, requestLogPath);
+      const recovered = await crashedStore.loadState();
+      const events = await crashedStore.loadEvents();
+      const failures = events.filter(
+        ({ type, data }) =>
+          type === "node.failed" &&
+          data.nodeId === "implement" &&
+          data.scopeCheckpointId === checkpointId,
+      );
+      const blockers = events.filter(
+        ({ type, data }) => type === "run.blocked" && data.scopeCheckpointId === checkpointId,
+      );
+      expect(recovered.status).toBe("blocked");
+      expect(recovered.stopReason).toMatch(
+        /cannot clean up the settled ownership journal for probe process/i,
+      );
+      expect(failures).toHaveLength(1);
+      expect(failures[0]?.data).toMatchObject({
+        progressProbeStage: "progress_baseline",
+        scopeCheckpointId: checkpointId,
+      });
+      expect(blockers).toHaveLength(1);
+      expect((await stat(journalPath)).isDirectory()).toBe(true);
+
+      await runResume(repository, "codex", "probe_cleanup", markerPath, requestLogPath);
+      const idempotentEvents = await crashedStore.loadEvents();
+      expect(
+        idempotentEvents.filter(
+          ({ type, data }) =>
+            type === "node.failed" &&
+            data.nodeId === "implement" &&
+            data.scopeCheckpointId === checkpointId,
+        ),
+      ).toHaveLength(1);
+      expect(
+        idempotentEvents.filter(
+          ({ type, data }) => type === "run.blocked" && data.scopeCheckpointId === checkpointId,
+        ),
+      ).toHaveLength(1);
+    } finally {
+      if (crash.child.exitCode === null && crash.child.signalCode === null) {
+        crash.child.kill("SIGKILL");
+        await crash.closed;
+      }
+    }
+  }, 45_000);
 });

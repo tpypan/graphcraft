@@ -533,6 +533,27 @@ async function assertNoLiveSupervisor(repositoryRoot: string, runId: string): Pr
   }
 }
 
+async function assertNoProbeProcessState(repositoryRoot: string, runId: string): Promise<void> {
+  const graphcraftRoot = join(repositoryRoot, ".graphcraft");
+  const path = join(graphcraftRoot, "locks", "probe-processes", runId);
+  try {
+    await validatePrivatePath(graphcraftRoot, relative(graphcraftRoot, path));
+    const stats = await lstat(path);
+    if (stats.isSymbolicLink() || !stats.isDirectory())
+      throw new Error("probe-process state is not an ordinary directory");
+  } catch (error) {
+    if (isMissing(error)) return;
+    throw refusal(
+      runId,
+      `probe-process ownership evidence is ambiguous (${error instanceof Error ? error.message : String(error)})`,
+    );
+  }
+  throw refusal(
+    runId,
+    "probe-process ownership evidence remains; resume the run so Graphcraft can reconcile it before deletion",
+  );
+}
+
 async function inspectDeletableRun(
   repositoryRoot: string,
   runId: string,
@@ -542,6 +563,7 @@ async function inspectDeletableRun(
     throw refusal(runId, `state ${state.status} is active or has an ambiguous terminal outcome`);
   const preservedWorkspace = await readPreservedWorkspace(repositoryRoot, runId);
   await assertNoLiveSupervisor(repositoryRoot, runId);
+  await assertNoProbeProcessState(repositoryRoot, runId);
   return {
     schemaVersion: 1,
     action: "delete_run_state",
@@ -773,6 +795,7 @@ async function applyRetention(
       const current = planFromJournal(repositoryRoot, journal);
       validateEligibility?.(current);
       await assertNoLiveSupervisor(repositoryRoot, plan.runId);
+      await assertNoProbeProcessState(repositoryRoot, plan.runId);
       await validateTargets(graphcraftRoot, targets, true);
     } else {
       const resolvedRunId = await resolveRunId(repositoryRoot, plan.runId);

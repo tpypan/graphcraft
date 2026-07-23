@@ -62,7 +62,6 @@ import {
   discoverProbePlan,
   runProbe,
   runProcess,
-  runProbes,
   validateProbePlan,
   type ExecutedProbe,
 } from "@graphcraft/probes";
@@ -113,6 +112,19 @@ import {
   heldOutIntegrityFailures,
 } from "./held-out.ts";
 import { assessRunProgress, createProgressDecisionPacket } from "./trajectory.ts";
+import {
+  closeProbeProcessLease,
+  createProbeProcessLease,
+  inspectProbeProcessJournal,
+  parseProbeProcessDefinitions,
+  probeProcessEventSettlement,
+  probeProcessDefinitions,
+  probeProcessLifecycleExecutionId,
+  removeProbeProcessJournal,
+  waitForProbeProcessSettlement,
+  type ProbeProcessDefinition,
+  type ProbeScopeStage,
+} from "./probe-process.ts";
 import {
   capturePullRequestLifecycleProbe,
   createPullRequestClaim,
@@ -823,6 +835,12 @@ async function captureProbes(
     result: Record<string, unknown>;
     options?: GitHubExecutionOptions;
   },
+  processScope?: {
+    nodeId: string;
+    stage: ProbeScopeStage;
+    checkpointId: string;
+    definitions: ProbeProcessDefinition[];
+  },
 ): Promise<ExecutedProbe[]> {
   const executed: ExecutedProbe[] = [];
   for (const spec of specs) {
@@ -839,6 +857,71 @@ async function captureProbes(
           githubLifecycle.options,
         ),
       );
+    } else if (spec.kind === "command" && processScope) {
+      const definition = processScope.definitions.find(({ probeId }) => probeId === spec.id);
+      if (!definition)
+        throw new Error(`Managed probe process definition is missing for ${spec.id}`);
+      const lease = await createProbeProcessLease({
+        graphcraftRoot: store.graphcraftRoot,
+        runId: store.runId,
+        checkpointId: processScope.checkpointId,
+        nodeId: processScope.nodeId,
+        stage: processScope.stage,
+        definition,
+      });
+      let completed = false;
+      try {
+        executed.push(
+          await runProbe(
+            spec,
+            workspace.path,
+            signal,
+            lease.lifecycle({
+              onReady: async (ready) => {
+                await store.append(
+                  "probe",
+                  "probe.process.started",
+                  {
+                    schemaVersion: 1,
+                    nodeId: processScope.nodeId,
+                    stage: processScope.stage,
+                    checkpointId: processScope.checkpointId,
+                    definition,
+                    ownerTokenHash: lease.ownerTokenHash,
+                    journalPath: lease.journalRelativePath,
+                    ready,
+                  },
+                  processScope.checkpointId,
+                );
+              },
+              onSettled: async (settlement) => {
+                await store.append(
+                  "probe",
+                  "probe.process.finished",
+                  {
+                    schemaVersion: 1,
+                    nodeId: processScope.nodeId,
+                    stage: processScope.stage,
+                    checkpointId: processScope.checkpointId,
+                    executionId: definition.executionId,
+                    settlement,
+                  },
+                  definition.executionId,
+                );
+              },
+            }),
+          ),
+        );
+        completed = true;
+      } finally {
+        await closeProbeProcessLease(lease);
+        if (completed)
+          await removeProbeProcessJournal({
+            graphcraftRoot: store.graphcraftRoot,
+            runId: store.runId,
+            executionId: definition.executionId,
+          });
+      }
     } else {
       executed.push(await runProbe(spec, workspace.path, signal));
     }
@@ -2073,10 +2156,12 @@ type WorkNodeOutcome =
       artifact: string;
     };
 
-type ProgressProbeStage = "progress_baseline" | "progress_current";
+type ProgressProbeStage = ProbeScopeStage;
 
 function progressProbeStage(value: unknown): ProgressProbeStage | undefined {
-  return value === "progress_baseline" || value === "progress_current" ? value : undefined;
+  return value === "progress_baseline" || value === "progress_current" || value === "verification"
+    ? value
+    : undefined;
 }
 
 function workspaceScopeSnapshotDigestIsValid(snapshot: WorkspaceScopeSnapshot): boolean {
@@ -2095,16 +2180,19 @@ function progressProbeScopePolicyHash(input: {
   contract: RunContract;
   graph: Graph;
   node: GraphNode;
+  stage: ProgressProbeStage;
+  probeIds: string[];
 }): string {
   return contentHash({
     schemaVersion: 1,
-    kind: "progress_probe_scope_policy",
+    kind: "probe_scope_policy",
     runId: input.contract.runId,
     graphRevision: input.graph.revision,
     contractScope: input.contract.scope,
     nodeId: input.node.id,
     nodeScope: input.node.scope,
-    probeIds: input.node.progressProbes.map(({ id }) => id),
+    stage: input.stage,
+    probeIds: input.probeIds,
   });
 }
 
@@ -2133,7 +2221,8 @@ function progressProbeScopeBlocker(input: {
   checkpointId: string;
 }): RunBlockerEnvelope | undefined {
   if (input.audit.allowed) return undefined;
-  const reason = `Progress probe execution changed repository state: ${scopeViolationReason(
+  const label = input.stage === "verification" ? "Completion probe" : "Progress probe";
+  const reason = `${label} execution changed repository state: ${scopeViolationReason(
     input.audit,
     input.workspace.path,
   )}`;
@@ -2256,8 +2345,9 @@ async function executeReadOnlyProgressProbes(input: {
   workspace: RunWorkspace;
   signal: AbortSignal;
   stage: ProgressProbeStage;
+  specs: GraphNode["completionProbes"];
+  observer?: RunObserver;
   baseline?: WorkspaceScopeSnapshot;
-  execute: () => Promise<ExecutedProbe[]>;
 }): Promise<ProgressProbeExecution> {
   let baseline = input.baseline;
   if (!baseline)
@@ -2282,6 +2372,7 @@ async function executeReadOnlyProgressProbes(input: {
     baselineDigest: baseline.digest,
     nonce: randomUUID(),
   });
+  const processDefinitions = probeProcessDefinitions(checkpointId, input.specs);
   await input.store.append(
     "runtime",
     "scope.started",
@@ -2291,8 +2382,15 @@ async function executeReadOnlyProgressProbes(input: {
       checkpointId,
       baseline,
       graphRevision: input.graph.revision,
-      policyHash: progressProbeScopePolicyHash(input),
-      probeIds: input.node.progressProbes.map(({ id }) => id),
+      policyHash: progressProbeScopePolicyHash({
+        contract: input.contract,
+        graph: input.graph,
+        node: input.node,
+        stage: input.stage,
+        probeIds: input.specs.map(({ id }) => id),
+      }),
+      probeIds: input.specs.map(({ id }) => id),
+      processDefinitions,
     },
     checkpointId,
   );
@@ -2300,7 +2398,20 @@ async function executeReadOnlyProgressProbes(input: {
   let executionError: unknown;
   if (!input.signal.aborted)
     try {
-      probes = await input.execute();
+      probes = await captureProbes(
+        input.store,
+        input.specs,
+        input.workspace,
+        input.observer,
+        input.signal,
+        undefined,
+        {
+          nodeId: input.node.id,
+          stage: input.stage,
+          checkpointId,
+          definitions: processDefinitions,
+        },
+      );
     } catch (error) {
       executionError = error;
     }
@@ -2420,6 +2531,35 @@ async function blockProgressProbeRecovery(input: {
   return await input.store.loadState();
 }
 
+async function cleanupRecoveredProbeProcessJournal(input: {
+  store: RunStore;
+  nodeId: string;
+  stage: ProgressProbeStage;
+  checkpointId: string;
+  executionId: string;
+}): Promise<RunState | undefined> {
+  try {
+    await removeProbeProcessJournal({
+      graphcraftRoot: input.store.graphcraftRoot,
+      runId: input.store.runId,
+      executionId: input.executionId,
+    });
+    return undefined;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    const reason = `Graphcraft cannot clean up the settled ownership journal for probe process ${input.executionId} in scope checkpoint ${input.checkpointId}: ${detail}`;
+    return await blockProgressProbeRecovery({
+      store: input.store,
+      nodeId: input.nodeId,
+      blocker: progressProbeRecoveryBlocker({
+        reason,
+        checkpointId: input.checkpointId,
+        stage: input.stage,
+      }),
+    });
+  }
+}
+
 function activeProgressProbeScopeStarts(
   events: RunEvent[],
   graph: Graph,
@@ -2449,6 +2589,350 @@ function activeProgressProbeScopeStarts(
     }
     return Number.isFinite(earliestActiveStart) && sequence > earliestActiveStart;
   });
+}
+
+async function reconcileProbeProcessesForScope(input: {
+  store: RunStore;
+  start: RunEvent;
+  node: GraphNode;
+  stage: ProgressProbeStage;
+  checkpointId: string;
+}): Promise<RunState | undefined> {
+  const definitions = parseProbeProcessDefinitions(input.start.data.processDefinitions);
+  let expectedSpecs: GraphNode["completionProbes"];
+  try {
+    expectedSpecs =
+      input.stage === "verification"
+        ? resolveHeldOutProbes(
+            input.node.completionProbes,
+            await input.store.loadHeldOutProbePlan(),
+          )
+        : input.node.progressProbes;
+  } catch (error) {
+    const reason = `Graphcraft cannot resolve probe-process definitions for scope checkpoint ${input.checkpointId}: ${(error as Error).message}`;
+    return await blockProgressProbeRecovery({
+      store: input.store,
+      nodeId: input.node.id,
+      blocker: progressProbeRecoveryBlocker({
+        reason,
+        checkpointId: input.checkpointId,
+        stage: input.stage,
+      }),
+    });
+  }
+  const expectedDefinitions = probeProcessDefinitions(input.checkpointId, expectedSpecs);
+  if (!definitions || contentHash(definitions) !== contentHash(expectedDefinitions)) {
+    const reason = `Graphcraft cannot validate probe-process definitions for scope checkpoint ${input.checkpointId}`;
+    return await blockProgressProbeRecovery({
+      store: input.store,
+      nodeId: input.node.id,
+      blocker: progressProbeRecoveryBlocker({
+        reason,
+        checkpointId: input.checkpointId,
+        stage: input.stage,
+      }),
+    });
+  }
+  const events = await input.store.loadEvents();
+  const declaredExecutionIds = new Set(definitions.map(({ executionId }) => executionId));
+  const lifecycleEvents = events.filter((event) => {
+    if (
+      event.sequence <= input.start.sequence ||
+      !["probe.process.started", "probe.process.finished", "probe.process.reconciled"].includes(
+        event.type,
+      )
+    )
+      return false;
+    const executionId = probeProcessLifecycleExecutionId(event);
+    return (
+      event.data.checkpointId === input.checkpointId ||
+      (executionId !== undefined && declaredExecutionIds.has(executionId))
+    );
+  });
+  const unknown = lifecycleEvents.find((event) => {
+    const executionId = probeProcessLifecycleExecutionId(event);
+    return executionId === undefined || !declaredExecutionIds.has(executionId);
+  });
+  if (unknown) {
+    const reason = `Graphcraft found an undeclared probe process in scope checkpoint ${input.checkpointId}`;
+    return await blockProgressProbeRecovery({
+      store: input.store,
+      nodeId: input.node.id,
+      blocker: progressProbeRecoveryBlocker({
+        reason,
+        checkpointId: input.checkpointId,
+        stage: input.stage,
+      }),
+    });
+  }
+
+  for (const definition of definitions) {
+    const starts = lifecycleEvents.filter(
+      ({ type, data }) =>
+        type === "probe.process.started" &&
+        typeof data.definition === "object" &&
+        data.definition !== null &&
+        (data.definition as { executionId?: unknown }).executionId === definition.executionId,
+    );
+    const finishes = lifecycleEvents.filter(
+      ({ type, data }) =>
+        type === "probe.process.finished" && data.executionId === definition.executionId,
+    );
+    const reconciliations = lifecycleEvents.filter(
+      ({ type, data }) =>
+        type === "probe.process.reconciled" && data.executionId === definition.executionId,
+    );
+    if (
+      starts.length > 1 ||
+      finishes.length > 1 ||
+      reconciliations.length > 1 ||
+      finishes.length + reconciliations.length > 1
+    ) {
+      const reason = `Graphcraft found duplicate lifecycle evidence for probe process ${definition.executionId}`;
+      return await blockProgressProbeRecovery({
+        store: input.store,
+        nodeId: input.node.id,
+        blocker: progressProbeRecoveryBlocker({
+          reason,
+          checkpointId: input.checkpointId,
+          stage: input.stage,
+        }),
+      });
+    }
+    const start = starts[0];
+    const ready =
+      start?.data.ready !== null &&
+      typeof start?.data.ready === "object" &&
+      !Array.isArray(start.data.ready)
+        ? (start.data.ready as Record<string, unknown>)
+        : undefined;
+    const brokerPid = ready?.brokerPid;
+    const expectedJournalPath = `locks/probe-processes/${input.store.runId}/${definition.executionId}.jsonl`;
+    const validStart =
+      start === undefined ||
+      (start.actor === "probe" &&
+        start.causationId === input.checkpointId &&
+        start.data.schemaVersion === 1 &&
+        start.data.nodeId === input.node.id &&
+        start.data.stage === input.stage &&
+        start.data.checkpointId === input.checkpointId &&
+        contentHash(start.data.definition) === contentHash(definition) &&
+        typeof start.data.ownerTokenHash === "string" &&
+        /^[a-f0-9]{64}$/.test(start.data.ownerTokenHash) &&
+        start.data.journalPath === expectedJournalPath &&
+        ready?.type === "ready" &&
+        ready?.schemaVersion === 1 &&
+        ready.executionId === definition.executionId &&
+        Number.isSafeInteger(brokerPid) &&
+        Number(brokerPid) > 0 &&
+        (ready.processGroupId === null ||
+          (Number.isSafeInteger(ready.processGroupId) && Number(ready.processGroupId) > 0)) &&
+        [
+          "aix",
+          "android",
+          "darwin",
+          "freebsd",
+          "haiku",
+          "linux",
+          "openbsd",
+          "sunos",
+          "win32",
+          "cygwin",
+          "netbsd",
+        ].includes(String(ready.platform)) &&
+        typeof ready.readyAt === "string" &&
+        Number.isFinite(Date.parse(ready.readyAt)));
+    if (!validStart) {
+      const reason = `Graphcraft cannot validate ownership of probe process ${definition.executionId}`;
+      return await blockProgressProbeRecovery({
+        store: input.store,
+        nodeId: input.node.id,
+        blocker: progressProbeRecoveryBlocker({
+          reason,
+          checkpointId: input.checkpointId,
+          stage: input.stage,
+        }),
+      });
+    }
+    if (reconciliations.length === 1) {
+      if (start && reconciliations[0]!.sequence <= start.sequence) {
+        const reason = `Graphcraft cannot confirm settlement of probe process ${definition.executionId}`;
+        return await blockProgressProbeRecovery({
+          store: input.store,
+          nodeId: input.node.id,
+          blocker: progressProbeRecoveryBlocker({
+            reason,
+            checkpointId: input.checkpointId,
+            stage: input.stage,
+          }),
+        });
+      }
+      const settlement = probeProcessEventSettlement({
+        event: reconciliations[0]!,
+        type: "probe.process.reconciled",
+        actor: "runtime",
+        executionId: definition.executionId,
+        nodeId: input.node.id,
+        stage: input.stage,
+        checkpointId: input.checkpointId,
+        ...(start ? { brokerPid: Number(brokerPid) } : {}),
+        started: Boolean(start),
+      });
+      if (!settlement?.confirmed || (!start && settlement.outcome !== "cancelled_before_start")) {
+        const reason = `Graphcraft cannot confirm settlement of probe process ${definition.executionId}`;
+        return await blockProgressProbeRecovery({
+          store: input.store,
+          nodeId: input.node.id,
+          blocker: progressProbeRecoveryBlocker({
+            reason,
+            checkpointId: input.checkpointId,
+            stage: input.stage,
+          }),
+        });
+      }
+      const cleanupRecovery = await cleanupRecoveredProbeProcessJournal({
+        store: input.store,
+        nodeId: input.node.id,
+        stage: input.stage,
+        checkpointId: input.checkpointId,
+        executionId: definition.executionId,
+      });
+      if (cleanupRecovery) return cleanupRecovery;
+      continue;
+    }
+
+    if (finishes.length === 1) {
+      if (!start || finishes[0]!.sequence <= start.sequence) {
+        const reason = `Graphcraft cannot confirm settlement of probe process ${definition.executionId}`;
+        return await blockProgressProbeRecovery({
+          store: input.store,
+          nodeId: input.node.id,
+          blocker: progressProbeRecoveryBlocker({
+            reason,
+            checkpointId: input.checkpointId,
+            stage: input.stage,
+          }),
+        });
+      }
+      const settlement = probeProcessEventSettlement({
+        event: finishes[0]!,
+        type: "probe.process.finished",
+        actor: "probe",
+        executionId: definition.executionId,
+        nodeId: input.node.id,
+        stage: input.stage,
+        checkpointId: input.checkpointId,
+        brokerPid: Number(brokerPid),
+      });
+      if (!settlement?.confirmed) {
+        const reason = `Graphcraft cannot confirm settlement of probe process ${definition.executionId}`;
+        return await blockProgressProbeRecovery({
+          store: input.store,
+          nodeId: input.node.id,
+          blocker: progressProbeRecoveryBlocker({
+            reason,
+            checkpointId: input.checkpointId,
+            stage: input.stage,
+          }),
+        });
+      }
+      const cleanupRecovery = await cleanupRecoveredProbeProcessJournal({
+        store: input.store,
+        nodeId: input.node.id,
+        stage: input.stage,
+        checkpointId: input.checkpointId,
+        executionId: definition.executionId,
+      });
+      if (cleanupRecovery) return cleanupRecovery;
+      continue;
+    }
+
+    let journal;
+    try {
+      journal = await waitForProbeProcessSettlement({
+        graphcraftRoot: input.store.graphcraftRoot,
+        runId: input.store.runId,
+        definition,
+        checkpointId: input.checkpointId,
+        nodeId: input.node.id,
+        stage: input.stage,
+        ...(start ? { ownerTokenHash: start.data.ownerTokenHash as string } : {}),
+        ...(start ? { expectedBrokerPid: Number(brokerPid) } : {}),
+      });
+    } catch (error) {
+      const reason = `Graphcraft cannot validate probe process ${definition.executionId}: ${(error as Error).message}`;
+      return await blockProgressProbeRecovery({
+        store: input.store,
+        nodeId: input.node.id,
+        blocker: progressProbeRecoveryBlocker({
+          reason,
+          checkpointId: input.checkpointId,
+          stage: input.stage,
+        }),
+      });
+    }
+    if (start && !journal) {
+      const reason = `Graphcraft cannot find the ownership journal for probe process ${definition.executionId}`;
+      return await blockProgressProbeRecovery({
+        store: input.store,
+        nodeId: input.node.id,
+        blocker: progressProbeRecoveryBlocker({
+          reason,
+          checkpointId: input.checkpointId,
+          stage: input.stage,
+        }),
+      });
+    }
+    if (journal && (!journal.settlement || !journal.settlement.confirmed)) {
+      const reason = `Graphcraft cannot confirm that probe process ${definition.executionId} and its child tree settled after runtime interruption`;
+      return await blockProgressProbeRecovery({
+        store: input.store,
+        nodeId: input.node.id,
+        blocker: progressProbeRecoveryBlocker({
+          reason,
+          checkpointId: input.checkpointId,
+          stage: input.stage,
+        }),
+      });
+    }
+    if (journal?.settlement && !start && journal.settlement.outcome !== "cancelled_before_start") {
+      const reason = `Graphcraft cannot validate authorization of probe process ${definition.executionId}`;
+      return await blockProgressProbeRecovery({
+        store: input.store,
+        nodeId: input.node.id,
+        blocker: progressProbeRecoveryBlocker({
+          reason,
+          checkpointId: input.checkpointId,
+          stage: input.stage,
+        }),
+      });
+    }
+    if (journal?.settlement) {
+      await input.store.append(
+        "runtime",
+        "probe.process.reconciled",
+        {
+          schemaVersion: 1,
+          nodeId: input.node.id,
+          stage: input.stage,
+          checkpointId: input.checkpointId,
+          executionId: definition.executionId,
+          started: Boolean(start),
+          settlement: journal.settlement,
+        },
+        definition.executionId,
+      );
+      const cleanupRecovery = await cleanupRecoveredProbeProcessJournal({
+        store: input.store,
+        nodeId: input.node.id,
+        stage: input.stage,
+        checkpointId: input.checkpointId,
+        executionId: definition.executionId,
+      });
+      if (cleanupRecovery) return cleanupRecovery;
+    }
+  }
+  return undefined;
 }
 
 async function reconcileProgressProbeScopeCheckpoints(input: {
@@ -2551,7 +3035,11 @@ async function reconcileProgressProbeScopeCheckpoints(input: {
         ? start.data.checkpointId
         : start.hash;
     const baseline = parseWorkspaceScopeSnapshot(start.data.baseline);
-    const expectedProbeIds = active?.node.progressProbes.map(({ id }) => id);
+    const expectedProbeIds = active
+      ? (stage === "verification" ? active.node.completionProbes : active.node.progressProbes).map(
+          ({ id }) => id,
+        )
+      : undefined;
     const probeIds = start.data.probeIds;
     const validProbeIds =
       Array.isArray(probeIds) &&
@@ -2572,6 +3060,8 @@ async function reconcileProgressProbeScopeCheckpoints(input: {
           contract: input.contract,
           graph: input.graph,
           node: active.node,
+          stage,
+          probeIds: expectedProbeIds!,
         }) &&
       baseline !== undefined &&
       workspaceScopeSnapshotDigestIsValid(baseline) &&
@@ -2596,6 +3086,14 @@ async function reconcileProgressProbeScopeCheckpoints(input: {
       checkpointId,
       baseline,
     };
+    const processRecovery = await reconcileProbeProcessesForScope({
+      store: input.store,
+      start,
+      node: active.node,
+      stage,
+      checkpointId,
+    });
+    if (processRecovery) return processRecovery;
     const rawChecks = events.filter(
       ({ sequence, type, causationId, data }) =>
         sequence > start.sequence &&
@@ -2747,7 +3245,8 @@ async function executeWorkNode(input: {
       workspace: input.workspace,
       signal: input.signal,
       stage: "progress_baseline",
-      execute: () => runProbes(input.node.progressProbes, input.workspace.path, input.signal),
+      specs: input.node.progressProbes,
+      ...(input.observer ? { observer: input.observer } : {}),
     });
     if (baselineExecution.status === "interrupted")
       return { status: "interrupted", nodeId: input.node.id, artifact: "" };
@@ -2875,15 +3374,9 @@ async function executeWorkNode(input: {
     workspace: input.workspace,
     signal: input.signal,
     stage: "progress_current",
+    specs: input.node.progressProbes,
+    ...(input.observer ? { observer: input.observer } : {}),
     baseline: currentScope,
-    execute: () =>
-      captureProbes(
-        input.store,
-        input.node.progressProbes,
-        input.workspace,
-        input.observer,
-        input.signal,
-      ),
   });
   if (progressExecution.status === "interrupted")
     return {
@@ -4078,61 +4571,56 @@ export async function executeRun(input: {
           });
           return await input.store.loadState();
         }
-        let verificationScopeBaseline: WorkspaceScopeSnapshot;
-        try {
-          verificationScopeBaseline = await captureWorkspaceScopeSnapshot(
-            workspace.path,
-            contract.scope.exclude,
-          );
-        } catch (error) {
-          const reason = `Workspace scope inspection failed before verification node ${current.id}: ${(error as Error).message}`;
-          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
-          await input.store.append("runtime", "run.blocked", { reason });
-          return await input.store.loadState();
-        }
         const integrityFailures = await heldOutIntegrityFailures(heldOutProbePlan, workspace.path);
-        const executed = integrityFailures.length
-          ? []
-          : await captureProbes(input.store, completionProbes, workspace, input.observer, signal);
+        let executed: ExecutedProbe[] = [];
         let verificationScopeCurrent: WorkspaceScopeSnapshot;
-        try {
-          verificationScopeCurrent = await captureWorkspaceScopeSnapshot(
-            workspace.path,
-            contract.scope.exclude,
-          );
-          const scopeAudit = auditWorkspaceScope({
+        if (integrityFailures.length === 0) {
+          const verificationExecution = await executeReadOnlyProgressProbes({
+            store: input.store,
             contract,
             graph,
             state,
             node: current,
-            baseline: verificationScopeBaseline,
-            current: verificationScopeCurrent,
+            workspace,
+            signal,
+            stage: "verification",
+            specs: completionProbes,
+            ...(input.observer ? { observer: input.observer } : {}),
           });
-          await input.store.append(
-            "runtime",
-            "scope.checked",
-            {
-              nodeId: current.id,
-              stage: "verification",
-              enforced: !signal.aborted,
-              audit: scopeAudit,
-              current: verificationScopeCurrent,
-            },
-            batchId,
-          );
-          if (!scopeAudit.allowed && !signal.aborted) {
-            const reason = scopeViolationReason(scopeAudit, workspace.path);
+          if (verificationExecution.status === "interrupted")
+            return await finishInterruption(current.id);
+          if (verificationExecution.status === "failed") {
+            if (!verificationExecution.failurePersisted)
+              await input.store.append("runtime", "node.failed", {
+                nodeId: current.id,
+                reason: verificationExecution.reason,
+              });
+            if (verificationExecution.blocker)
+              await ensureProgressProbeRunBlocker({
+                store: input.store,
+                blocker: verificationExecution.blocker,
+              });
+            else
+              await input.store.append("runtime", "run.blocked", {
+                reason: verificationExecution.reason,
+              });
+            return await input.store.loadState();
+          }
+          executed = verificationExecution.probes;
+          verificationScopeCurrent = verificationExecution.scope;
+        } else {
+          try {
+            verificationScopeCurrent = await captureWorkspaceScopeSnapshot(
+              workspace.path,
+              contract.scope.exclude,
+            );
+          } catch (error) {
+            const reason = `Workspace scope inspection failed after held-out integrity verification for node ${current.id}: ${(error as Error).message}`;
             await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
             await input.store.append("runtime", "run.blocked", { reason });
             return await input.store.loadState();
           }
-        } catch (error) {
-          const reason = `Workspace scope inspection failed after verification node ${current.id}: ${(error as Error).message}`;
-          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
-          await input.store.append("runtime", "run.blocked", { reason });
-          return await input.store.loadState();
         }
-        if (signal.aborted) return await finishInterruption(current.id);
         const results = integrityFailures.length
           ? integrityFailures
           : executed.map(({ result }) => result);

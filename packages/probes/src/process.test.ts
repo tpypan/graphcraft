@@ -1,5 +1,8 @@
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { mkdtemp, open, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import crossSpawn from "cross-spawn";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -14,7 +17,98 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+async function waitFor(check: () => boolean | Promise<boolean>, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await check())) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for managed process evidence");
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 describe("bounded subprocess output capture", () => {
+  it("does not start a managed command until its ownership checkpoint is durable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-managed-process-"));
+    const marker = join(root, "started.txt");
+    const journal = await open(join(root, "journal.jsonl"), "a+", 0o600);
+    let release!: () => void;
+    const durable = new Promise<void>((resolve) => (release = resolve));
+    let ready = false;
+    const settlements: unknown[] = [];
+    try {
+      const result = runProcess(
+        process.execPath,
+        ["-e", `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "started\\n")`],
+        {
+          cwd: root,
+          lifecycle: {
+            executionId: "managed-gate",
+            ownerToken: "managed-gate-token",
+            journalFd: journal.fd,
+            onReady: async () => {
+              ready = true;
+              await durable;
+            },
+            onSettled: async (settlement) => {
+              settlements.push(settlement);
+            },
+          },
+        },
+      );
+      await waitFor(() => ready);
+      await expect(stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+      release();
+
+      await expect(result).resolves.toMatchObject({ exitCode: 0, timedOut: false });
+      await expect(readFile(marker, "utf8")).resolves.toBe("started\n");
+      expect(settlements).toEqual([
+        expect.objectContaining({
+          executionId: "managed-gate",
+          outcome: "exited",
+          confirmed: true,
+          exitCode: 0,
+        }),
+      ]);
+      expect(await readFile(join(root, "journal.jsonl"), "utf8")).toContain('"status":"settled"');
+    } finally {
+      release();
+      await journal.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails before launch when a managed ownership checkpoint cannot be persisted", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-managed-process-failure-"));
+    const marker = join(root, "must-not-start.txt");
+    const journal = await open(join(root, "journal.jsonl"), "a+", 0o600);
+    try {
+      await expect(
+        runProcess(
+          process.execPath,
+          ["-e", `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "unsafe\\n")`],
+          {
+            cwd: root,
+            lifecycle: {
+              executionId: "managed-refusal",
+              ownerToken: "managed-refusal-token",
+              journalFd: journal.fd,
+              onReady: async () => {
+                throw new Error("ownership checkpoint refused");
+              },
+              onSettled: async () => undefined,
+            },
+          },
+        ),
+      ).rejects.toThrow("ownership checkpoint refused");
+      await expect(stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(join(root, "journal.jsonl"), "utf8")).toContain(
+        '"outcome":"cancelled_before_start"',
+      );
+    } finally {
+      await journal.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("rejects empty or NUL-bearing invocations before spawning", async () => {
     await expect(runProcess("", [], { cwd: process.cwd() })).rejects.toThrow(
       "Subprocess command must not be empty",

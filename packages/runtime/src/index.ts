@@ -7,6 +7,7 @@ export * from "./governance.ts";
 export * from "./held-out.ts";
 export * from "./lock.ts";
 export * from "./migration.ts";
+export * from "./probe-process.ts";
 export * from "./repository.ts";
 export * from "./redaction.ts";
 export * from "./retention.ts";

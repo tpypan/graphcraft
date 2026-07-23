@@ -24,7 +24,8 @@ import {
 } from "../../packages/runtime/src/index.ts";
 
 type HostId = "codex" | "claude";
-type FaultBoundary = "session" | "usage" | "result" | "progress_scope";
+type FaultBoundary =
+  "session" | "usage" | "result" | "probe_scope" | "probe_scope_forged" | "probe_cleanup";
 type RunnerMode = "crash" | "resume";
 
 function usage(input: number, cachedInput: number, output: number): TokenUsage {
@@ -54,6 +55,7 @@ class ColdRestartFaultStore extends RunStore {
     runId: string,
     private readonly boundary: FaultBoundary,
     private readonly markerPath: string,
+    private readonly forgedBrokerPid?: number,
   ) {
     super(repositoryRoot, runId);
   }
@@ -64,7 +66,37 @@ class ColdRestartFaultStore extends RunStore {
     data: Record<string, unknown>,
     causationId = this.runId,
   ): Promise<RunEvent> {
-    const event = await super.append(actor, type, data, causationId);
+    const persistedData =
+      this.boundary === "probe_scope_forged" &&
+      type === "probe.process.started" &&
+      this.forgedBrokerPid !== undefined &&
+      data.ready !== null &&
+      typeof data.ready === "object" &&
+      !Array.isArray(data.ready)
+        ? {
+            ...data,
+            ready: { ...(data.ready as Record<string, unknown>), brokerPid: this.forgedBrokerPid },
+          }
+        : data;
+    const event = await super.append(actor, type, persistedData, causationId);
+    if (
+      this.boundary === "probe_cleanup" &&
+      type === "probe.process.finished" &&
+      typeof data.executionId === "string"
+    ) {
+      await writeFile(
+        this.markerPath,
+        `${JSON.stringify({
+          boundary: this.boundary,
+          invocationId: data.executionId,
+          pid: process.pid,
+        })}\n`,
+        "utf8",
+      );
+      await new Promise<never>(() => {
+        setInterval(() => undefined, 1_000);
+      });
+    }
     if (
       type === "invocation.started" &&
       data.nodeId === "implement" &&
@@ -77,7 +109,8 @@ class ColdRestartFaultStore extends RunStore {
   override async appendInvocationEvent(invocationId: string, event: HostEvent): Promise<string> {
     const artifact = await super.appendInvocationEvent(invocationId, event);
     if (
-      this.boundary !== "progress_scope" &&
+      this.boundary !== "probe_scope" &&
+      this.boundary !== "probe_scope_forged" &&
       invocationId === this.targetInvocationId &&
       event.type === this.boundary
     ) {
@@ -184,7 +217,9 @@ class ColdRestartAdapter implements HostAdapter {
   }
 }
 
-const [repositoryPath, host, mode, boundary, markerPath, requestLogPath] = process.argv.slice(2);
+const [repositoryPath, host, mode, boundary, markerPath, requestLogPath, forgedBrokerPidSource] =
+  process.argv.slice(2);
+const forgedBrokerPid = forgedBrokerPidSource ? Number(forgedBrokerPidSource) : undefined;
 if (
   !repositoryPath ||
   (host !== "codex" && host !== "claude") ||
@@ -192,19 +227,24 @@ if (
   (boundary !== "session" &&
     boundary !== "usage" &&
     boundary !== "result" &&
-    boundary !== "progress_scope") ||
+    boundary !== "probe_scope" &&
+    boundary !== "probe_scope_forged" &&
+    boundary !== "probe_cleanup") ||
   !markerPath ||
-  !requestLogPath
+  !requestLogPath ||
+  (mode === "crash" &&
+    boundary === "probe_scope_forged" &&
+    (!Number.isSafeInteger(forgedBrokerPid) || Number(forgedBrokerPid) <= 0))
 )
   throw new Error(
-    "usage: crash-restart-runner <repository> <codex|claude> <crash|resume> <session|usage|result|progress_scope> <marker> <request-log>",
+    "usage: crash-restart-runner <repository> <codex|claude> <crash|resume> <session|usage|result|probe_scope|probe_scope_forged|probe_cleanup> <marker> <request-log> [forged-broker-pid]",
   );
 
 const repository = await discoverRepository(repositoryPath);
 const runId = await resolveRunId(repository.root);
 const store =
   mode === "crash"
-    ? new ColdRestartFaultStore(repository.root, runId, boundary, markerPath)
+    ? new ColdRestartFaultStore(repository.root, runId, boundary, markerPath, forgedBrokerPid)
     : new RunStore(repository.root, runId);
 const state = await executeRun({
   store,

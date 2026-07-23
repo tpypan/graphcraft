@@ -392,6 +392,9 @@ export function reduceEvents(events: RunEvent[]): RunState {
       case "semantic.verdict":
       case "scope.started":
       case "scope.checked":
+      case "probe.process.started":
+      case "probe.process.finished":
+      case "probe.process.reconciled":
       case "control.observed":
       case "control.override":
         break;

@@ -195,6 +195,10 @@ function journalPath(repository: string, runId: string): string {
   return join(repository, ".graphcraft", "retention", `${runId}.json`);
 }
 
+function probeProcessStatePath(repository: string, runId: string): string {
+  return join(repository, ".graphcraft", "locks", "probe-processes", runId);
+}
+
 async function seedAuxiliaryState(
   repository: string,
   runId: string,
@@ -633,6 +637,85 @@ describe("run-state retention", () => {
       expect(await pathExists(store.runRoot)).toBe(false);
       expect(await readFile(join(workspace.path, "preserved.txt"), "utf8")).toBe(
         `${store.runId}\n`,
+      );
+    },
+  );
+
+  it("refuses delete and prune plans while probe-process ownership evidence remains", async () => {
+    const { repository } = await createRepository();
+    const { store } = await createCompletedRun(repository);
+    await setStateUpdatedAt(store, "2026-01-01T00:00:00.000Z");
+    const processState = probeProcessStatePath(repository, store.runId);
+    const evidence = join(processState, `${"a".repeat(64)}.jsonl`);
+    await mkdir(processState, { recursive: true });
+    await writeFile(evidence, "ambiguous probe ownership evidence\n", { mode: 0o600 });
+
+    await expect(
+      planRunRetention({ repositoryRoot: repository, runReference: store.runId }),
+    ).rejects.toThrow(/probe-process ownership evidence remains/i);
+    await expect(
+      planCompletedRunPrune({
+        repositoryRoot: repository,
+        completedBefore: "2026-02-01T00:00:00.000Z",
+        keepNewest: 0,
+      }),
+    ).rejects.toThrow(/probe-process ownership evidence remains/i);
+    expect(await pathExists(store.runRoot)).toBe(true);
+    await expect(readFile(evidence, "utf8")).resolves.toBe("ambiguous probe ownership evidence\n");
+  });
+
+  it("rechecks probe-process ownership evidence under the run lock before applying deletion", async () => {
+    const { repository } = await createRepository();
+    const { store } = await createCompletedRun(repository);
+    const plan = await planRunRetention({
+      repositoryRoot: repository,
+      runReference: store.runId,
+    });
+    const processState = probeProcessStatePath(repository, store.runId);
+    const evidence = join(processState, `${"b".repeat(64)}.jsonl`);
+    await mkdir(processState, { recursive: true });
+    await writeFile(evidence, "appeared after planning\n", { mode: 0o600 });
+
+    await expect(applyRunRetention({ plan, confirmRunId: store.runId })).rejects.toThrow(
+      /probe-process ownership evidence remains/i,
+    );
+    expect(await pathExists(store.runRoot)).toBe(true);
+    expect(await pathExists(journalPath(repository, store.runId))).toBe(false);
+    await expect(readFile(evidence, "utf8")).resolves.toBe("appeared after planning\n");
+  });
+
+  it("preserves malformed probe-process ownership evidence", async () => {
+    const { repository } = await createRepository();
+    const { store } = await createCompletedRun(repository);
+    const processState = probeProcessStatePath(repository, store.runId);
+    await mkdir(dirname(processState), { recursive: true });
+    await writeFile(processState, "not a directory\n", { mode: 0o600 });
+
+    await expect(
+      planRunRetention({ repositoryRoot: repository, runReference: store.runId }),
+    ).rejects.toThrow(/probe-process ownership evidence is ambiguous/i);
+    expect(await pathExists(store.runRoot)).toBe(true);
+    await expect(readFile(processState, "utf8")).resolves.toBe("not a directory\n");
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "preserves symlinked probe-process ownership evidence",
+    async () => {
+      const { root, repository } = await createRepository();
+      const { store } = await createCompletedRun(repository);
+      const processState = probeProcessStatePath(repository, store.runId);
+      const outside = join(root, "outside-probe-state");
+      await mkdir(dirname(processState), { recursive: true });
+      await mkdir(outside);
+      await writeFile(join(outside, "must-survive.jsonl"), "outside evidence\n");
+      await symlink(outside, processState, "dir");
+
+      await expect(
+        planRunRetention({ repositoryRoot: repository, runReference: store.runId }),
+      ).rejects.toThrow(/probe-process ownership evidence is ambiguous/i);
+      expect(await pathExists(store.runRoot)).toBe(true);
+      await expect(readFile(join(outside, "must-survive.jsonl"), "utf8")).resolves.toBe(
+        "outside evidence\n",
       );
     },
   );

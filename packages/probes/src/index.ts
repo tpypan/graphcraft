@@ -13,7 +13,14 @@ import {
 import {
   DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM,
   runProcess,
+  type ManagedProcessLifecycle,
   type ProcessResult,
+} from "./process.ts";
+
+export type {
+  ManagedProcessLifecycle,
+  ManagedProcessReady,
+  ManagedProcessSettlement,
 } from "./process.ts";
 
 export interface ExecutedProbe {
@@ -40,6 +47,7 @@ export async function runProbe(
   spec: ProbeSpec,
   repositoryPath: string,
   signal?: AbortSignal,
+  lifecycle?: ManagedProcessLifecycle,
 ): Promise<ExecutedProbe> {
   const started = performance.now();
   if (spec.kind === "held_out")
@@ -51,6 +59,7 @@ export async function runProbe(
       maxOutputBytesPerStream: DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM,
       outputOverflow: "truncate",
       ...(signal ? { signal } : {}),
+      ...(lifecycle ? { lifecycle } : {}),
     });
     const output = [processResult.stdout, processResult.stderr].filter(Boolean).join("\n");
     const passed = !processResult.timedOut && processResult.exitCode === spec.expectedExitCode;
