@@ -24,9 +24,21 @@ import {
   type WorkerRequest,
 } from "@graphcraft/core";
 import { runProcess } from "@graphcraft/probes";
-import { runBenchmark } from "./benchmark.ts";
+import {
+  inspectBenchmarkSourceIdentity,
+  runBenchmark as runBenchmarkRuntime,
+} from "./benchmark.ts";
 
 const temporaryRoots: string[] = [];
+const cleanBenchmarkSource = {
+  commitSha: "a".repeat(40),
+  dirty: false,
+  dirtyStatusDigest: null,
+} as const;
+
+function runBenchmark(input: Parameters<typeof runBenchmarkRuntime>[0]) {
+  return runBenchmarkRuntime({ graphcraftSource: cleanBenchmarkSource, ...input });
+}
 
 afterEach(async () => {
   await Promise.all(
@@ -65,6 +77,9 @@ class BenchmarkAdapter implements HostAdapter {
       usageReceipt?: TokenUsage;
       weakenBaselineScorer?: boolean;
       makeBaselineAcceptancePathDirectory?: boolean;
+      binaryBaselineSecret?: string;
+      ignoredBaselineSecret?: string;
+      oversizedGraphcraftPatch?: boolean;
       capabilities?: Partial<HostCapabilities>;
       capabilitySequence?: HostCapabilities[];
       expectDeterministicLfFixture?: boolean;
@@ -195,11 +210,29 @@ class BenchmarkAdapter implements HostAdapter {
       };
       return;
     }
-    await writeFile(
-      join(request.repositoryPath, "source.js"),
-      "export const value = 'implemented';\n",
-      "utf8",
-    );
+    if (this.options.binaryBaselineSecret && request.capsule.nodeId.startsWith("baseline-")) {
+      await writeFile(
+        join(request.repositoryPath, "result.bin"),
+        Buffer.concat([
+          Buffer.from([0]),
+          Buffer.from(this.options.binaryBaselineSecret, "utf8"),
+          Buffer.from([0xff]),
+        ]),
+      );
+    }
+    if (this.options.ignoredBaselineSecret && request.capsule.nodeId.startsWith("baseline-")) {
+      await writeFile(join(request.repositoryPath, ".gitignore"), "ignored-result.txt\n", "utf8");
+      await writeFile(
+        join(request.repositoryPath, "ignored-result.txt"),
+        this.options.ignoredBaselineSecret,
+        "utf8",
+      );
+    }
+    const source =
+      this.options.oversizedGraphcraftPatch && !request.capsule.nodeId.startsWith("baseline-")
+        ? `export const value = 'implemented';\n/*${"x".repeat(140 * 1024)}*/\n`
+        : "export const value = 'implemented';\n";
+    await writeFile(join(request.repositoryPath, "source.js"), source, "utf8");
     yield { type: "usage", usage: this.usage(10, 4) };
     yield {
       type: "result",
@@ -240,6 +273,73 @@ describe("benchmark harness", () => {
     }
     throw new Error(`Could not construct a benchmark schedule starting with ${mode}`);
   }
+
+  it("binds source provenance to the exact commit and fails evidence closed when dirty", async () => {
+    const repository = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-source-identity-"));
+    temporaryRoots.push(repository);
+    await writeFile(join(repository, "source.js"), "export const value = 1;\n", "utf8");
+    expect((await runProcess("git", ["init", "-b", "main"], { cwd: repository })).exitCode).toBe(0);
+    expect((await runProcess("git", ["add", "."], { cwd: repository })).exitCode).toBe(0);
+    expect(
+      (
+        await runProcess(
+          "git",
+          [
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "user.name=Graphcraft Benchmark",
+            "-c",
+            "user.email=benchmark@graphcraft.local",
+            "commit",
+            "-m",
+            "source identity fixture",
+          ],
+          { cwd: repository },
+        )
+      ).exitCode,
+    ).toBe(0);
+
+    const clean = await inspectBenchmarkSourceIdentity(repository);
+    expect(clean).toMatchObject({ dirty: false, dirtyStatusDigest: null });
+    expect(clean.commitSha).toMatch(/^[0-9a-f]{40}$/);
+
+    await writeFile(join(repository, "untracked.txt"), "dirty\n", "utf8");
+    const dirty = await inspectBenchmarkSourceIdentity(repository);
+    expect(dirty).toMatchObject({ commitSha: clean.commitSha, dirty: true });
+    expect(dirty.dirtyStatusDigest).toMatch(/^[0-9a-f]{64}$/);
+
+    await expect(
+      runBenchmarkRuntime({
+        suite: BenchmarkSuiteSchema.parse({
+          schemaVersion: 2,
+          id: "dirty-source-suite",
+          version: 1,
+          description: "Dirty source rejection fixture",
+          tasks: [
+            {
+              id: "dirty-source-task",
+              family: "feature",
+              task: "Reject a dirty Graphcraft source identity",
+              initialFiles: { "score.mjs": "process.exit(0);\n" },
+              checks: [{ command: "node", scorerPath: "score.mjs" }],
+              acceptance: [{ kind: "exists", path: "score.mjs" }],
+              repetitions: 1,
+            },
+          ],
+        }),
+        hosts: ["codex"],
+        adapters: {},
+        policies: { codex: { model: "dirty-source-fixture", effort: "low" } },
+        graphcraftVersion: "0.1.2-dirty-source-fixture",
+        graphcraftSource: dirty,
+        seed: "dirty-source-seed",
+        repetitions: 1,
+        outputPath: join(repository, "report.json"),
+      }),
+    ).rejects.toThrow("require a clean Graphcraft source tree");
+    await expect(access(join(repository, "report.json"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
 
   it.each(REQUIRED_HOST_PROTOCOL_CAPABILITIES)(
     "rejects benchmark admission before fixture or report creation when %s is unavailable",
@@ -687,12 +787,34 @@ describe("benchmark harness", () => {
         ),
       ).toBe(true);
       expect(results.every(({ scorerVerified }) => scorerVerified === true)).toBe(true);
+      expect(
+        results.every(
+          ({ reviewPacket }) =>
+            typeof reviewPacket === "object" &&
+            reviewPacket !== null &&
+            (reviewPacket as { captureFailures?: unknown[] }).captureFailures?.length === 0,
+        ),
+      ).toBe(true);
+      expect(
+        persisted.results.every(({ reviewPacket }) =>
+          reviewPacket?.patch.text.includes("source.js"),
+        ),
+      ).toBe(true);
+      expect(
+        persisted.results.some(({ reviewPacket }) =>
+          reviewPacket?.transcript.text.includes("graphcraft_host_event"),
+        ),
+      ).toBe(true);
       expect(persisted.modelPolicy).toEqual({ codex: "gpt-benchmark-fixture" });
       expect(persisted.effortPolicy).toBe("high");
       expect(persisted.permissionPolicy).toEqual({
         codex: "codex_workspace_write_shell_external_not_graphcraft_enforced",
       });
       expect(persisted.environment.graphcraftVersion).toBe(graphcraftVersion);
+      expect(persisted.environment.graphcraftSource?.commitSha).toMatch(
+        /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/,
+      );
+      expect(persisted.reviewPolicy).toBe("bounded_redacted_patch_and_transcript_v1");
       expect(persisted.summary).toMatchObject({
         codex: {
           baseline: { trials: 1, accepted: 1 },
@@ -746,12 +868,68 @@ describe("benchmark harness", () => {
         expect(JSON.stringify(redacted.report)).not.toContain(configuredSecret);
         expect(reportText).not.toContain(configuredSecret);
         expect(reportText).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz");
+        expect(redacted.report.results.every(({ accepted }) => !accepted)).toBe(true);
+        expect(
+          redacted.report.results.every(({ reviewPacket }) => reviewPacket !== undefined),
+        ).toBe(true);
+        expect(
+          redacted.report.results.some(({ reviewPacket }) =>
+            reviewPacket?.transcript.text.includes("[REDACTED]"),
+          ),
+        ).toBe(true);
         if (process.platform !== "win32")
           expect((await stat(redactedOutputPath)).mode & 0o777).toBe(0o600);
       } finally {
         if (previousSecret === undefined) delete process.env.GRAPHCRAFT_BENCHMARK_API_KEY;
         else process.env.GRAPHCRAFT_BENCHMARK_API_KEY = previousSecret;
       }
+
+      const binarySecret = "binary-review-payload-must-not-be-published";
+      const ignoredSecret = "ignored-review-payload-must-not-be-published";
+      const boundedReview = await runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: {
+          codex: new BenchmarkAdapter({
+            binaryBaselineSecret: binarySecret,
+            ignoredBaselineSecret: ignoredSecret,
+            oversizedGraphcraftPatch: true,
+          }),
+        },
+        policies,
+        graphcraftVersion,
+        seed: "bounded-review-seed",
+        repetitions: 1,
+        outputPath: join(root, "bounded-review-report.json"),
+      });
+      const binaryBaseline = boundedReview.report.results.find(
+        ({ trial }) => trial.mode === "baseline",
+      )!;
+      expect(binaryBaseline).toMatchObject({ accepted: false });
+      expect(binaryBaseline.reviewPacket?.patch.truncated).toBe(false);
+      expect(binaryBaseline.reviewPacket?.captureFailures).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining("binary patch payload omitted"),
+          expect.stringContaining("ignored untracked payload omitted"),
+        ]),
+      );
+      expect(binaryBaseline.reviewPacket?.patch.text).toContain("Binary files");
+      expect(binaryBaseline.reviewPacket?.patch.text).not.toContain("GIT binary patch");
+      expect(binaryBaseline.reviewPacket?.patch.text).not.toContain(binarySecret);
+      expect(binaryBaseline.reviewPacket?.patch.text).not.toContain(ignoredSecret);
+      expect(JSON.stringify(boundedReview.report)).not.toContain(ignoredSecret);
+
+      const truncatedGraphcraft = boundedReview.report.results.find(
+        ({ trial }) => trial.mode === "graphcraft",
+      )!;
+      expect(truncatedGraphcraft).toMatchObject({ accepted: false });
+      expect(truncatedGraphcraft.reviewPacket?.patch.truncated).toBe(true);
+      expect(truncatedGraphcraft.reviewPacket?.captureFailures).toEqual(
+        expect.arrayContaining([expect.stringContaining("review is incomplete")]),
+      );
+      expect(truncatedGraphcraft.failureTrace).toEqual(
+        expect.arrayContaining([expect.stringContaining("patch review evidence exceeded")]),
+      );
 
       const providerLimited = usage(10, 4);
       providerLimited.availability.reasoning = "unavailable";
@@ -805,6 +983,8 @@ describe("benchmark harness", () => {
         weakenedBaseline.acceptanceScorerDigest,
       );
       expect(weakenedBaseline.acceptance[0]?.summary).toContain("changed from its fixture bytes");
+      expect(weakenedBaseline.reviewPacket?.patch.text).toContain("score.mjs");
+      expect(weakenedBaseline.reviewPacket?.transcript.text).toContain("baseline_host_event");
       expect(protectedGraphcraft).toMatchObject({ accepted: true, scorerVerified: true });
 
       const malformedAcceptance = await runBenchmark({
@@ -893,6 +1073,24 @@ describe("benchmark harness", () => {
           outputPath,
         }),
       ).rejects.toThrow("Graphcraft version identity does not match this execution");
+
+      await expect(
+        runBenchmark({
+          suite,
+          hosts: ["codex"],
+          adapters: {},
+          policies,
+          graphcraftVersion,
+          graphcraftSource: {
+            commitSha: "b".repeat(40),
+            dirty: false,
+            dirtyStatusDigest: null,
+          },
+          seed: "runtime-seed",
+          repetitions: 1,
+          outputPath,
+        }),
+      ).rejects.toThrow("Graphcraft source identity does not match this execution");
 
       persisted.results[0]!.acceptanceScorerDigest = "tampered-scorer";
       persisted.summary = summarizeBenchmark(persisted.results, persisted.schedule);

@@ -5,7 +5,11 @@ import { basename, dirname, extname, isAbsolute, join, resolve, sep } from "node
 import {
   BenchmarkSuiteSchema,
   BenchmarkReportSchema,
+  BenchmarkReviewPacketSchema,
+  BenchmarkSourceIdentitySchema,
   BenchmarkTrialResultSchema,
+  BENCHMARK_REVIEW_PATCH_LIMIT_BYTES,
+  BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES,
   ContextCapsuleSchema,
   HostCapabilityAdmissionError,
   RequiredHostCapabilityDiagnosticSchema,
@@ -18,6 +22,8 @@ import {
   type BenchmarkScheduleEntry,
   type BenchmarkReport,
   type BenchmarkPermissionPolicy,
+  type BenchmarkReviewPacket,
+  type BenchmarkSourceIdentity,
   type BenchmarkSuite,
   type BenchmarkTask,
   type BenchmarkTrialResult,
@@ -29,7 +35,7 @@ import {
 import { runProcess } from "@graphcraft/probes";
 import { createRun, executeRun } from "./runner.ts";
 import { writeJsonAtomic } from "./json.ts";
-import { redactValue } from "./redaction.ts";
+import { redactString, redactValue } from "./redaction.ts";
 
 const tokenDimensions = [
   "input",
@@ -40,9 +46,11 @@ const tokenDimensions = [
   "total",
 ] as const;
 const scorerPolicy = "fixture_bound_scorers_plus_suite_assertions" as const;
+const reviewPolicy = "bounded_redacted_patch_and_transcript_v1" as const;
+const PATCH_PROCESS_CAPTURE_LIMIT_BYTES = 2 * BENCHMARK_REVIEW_PATCH_LIMIT_BYTES;
 const reportLimitations = [
   "Stable efficiency claims require at least three jointly accepted reconciled baseline/Graphcraft pairs per task and host.",
-  "Blinded human defect review remains outside this deterministic harness slice.",
+  "Each trial retains a bounded redacted patch and transcript packet; blinded reviewer assignment and defect labels remain external.",
 ];
 
 function persistedCapabilityAdmissionError(
@@ -70,6 +78,243 @@ function safeFixturePath(root: string, path: string): string {
   if (resolved !== root && !resolved.startsWith(`${root}${sep}`))
     throw new Error(`Benchmark fixture path escapes its repository: ${path}`);
   return resolved;
+}
+
+function reviewEvidenceDigest(input: {
+  mediaType: "text/x-diff" | "application/x-ndjson";
+  text: string;
+  observedBytes: number;
+  omittedBytes: number;
+  truncated: boolean;
+}): string {
+  return contentHash(input);
+}
+
+function utf8Prefix(buffer: Buffer, maximumBytes: number): Buffer {
+  const candidate = buffer.subarray(0, Math.min(buffer.length, maximumBytes));
+  for (let trim = 0; trim <= Math.min(3, candidate.length); trim += 1) {
+    const end = candidate.length - trim;
+    try {
+      new TextDecoder("utf-8", { fatal: true }).decode(candidate.subarray(0, end));
+      return candidate.subarray(0, end);
+    } catch {
+      // A byte boundary can split one UTF-8 code point.
+    }
+  }
+  return candidate;
+}
+
+function utf8Suffix(buffer: Buffer, maximumBytes: number): Buffer {
+  const start = Math.max(0, buffer.length - maximumBytes);
+  const candidate = buffer.subarray(start);
+  for (let trim = 0; trim <= Math.min(3, candidate.length); trim += 1) {
+    try {
+      new TextDecoder("utf-8", { fatal: true }).decode(candidate.subarray(trim));
+      return candidate.subarray(trim);
+    } catch {
+      // A byte boundary can split one UTF-8 code point.
+    }
+  }
+  return candidate;
+}
+
+function boundedReviewEvidence(
+  mediaType: "text/x-diff" | "application/x-ndjson",
+  value: string,
+  capture: { observedBytes?: number; omittedBytes?: number } = {},
+) {
+  const redacted = redactString(value);
+  const source = Buffer.from(redacted, "utf8");
+  const limit =
+    mediaType === "text/x-diff"
+      ? BENCHMARK_REVIEW_PATCH_LIMIT_BYTES
+      : BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES;
+  const externallyOmitted = capture.omittedBytes ?? 0;
+  let text = redacted;
+  let locallyOmitted = 0;
+  if (source.length > limit) {
+    const marker = Buffer.from("\n[GRAPHCRAFT REVIEW EVIDENCE MIDDLE OMITTED]\n", "utf8");
+    const available = limit - marker.length;
+    const head = utf8Prefix(source, Math.floor(available / 2));
+    const tail = utf8Suffix(source, available - head.length);
+    locallyOmitted = Math.max(0, source.length - head.length - tail.length);
+    text = Buffer.concat([head, marker, tail]).toString("utf8");
+  }
+  const retainedBytes = Buffer.byteLength(text);
+  const omittedBytes = externallyOmitted + locallyOmitted;
+  const observedBytes = Math.max(capture.observedBytes ?? source.length, retainedBytes);
+  const truncated = omittedBytes > 0;
+  return {
+    mediaType,
+    text,
+    observedBytes,
+    retainedBytes,
+    omittedBytes,
+    truncated,
+    digest: reviewEvidenceDigest({ mediaType, text, observedBytes, omittedBytes, truncated }),
+  };
+}
+
+async function capturePatch(repository: string, baseSha: string) {
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-review-index-"));
+  const environment = { GIT_INDEX_FILE: join(temporaryRoot, "index") };
+  try {
+    const initialized = await runProcess("git", ["read-tree", baseSha], {
+      cwd: repository,
+      env: environment,
+    });
+    if (initialized.exitCode !== 0)
+      throw new Error(`temporary review index initialization exited ${initialized.exitCode}`);
+    const staged = await runProcess("git", ["add", "--all", "--", "."], {
+      cwd: repository,
+      env: environment,
+    });
+    if (staged.exitCode !== 0)
+      throw new Error(`temporary review index staging exited ${staged.exitCode}`);
+    const ignored = await runProcess(
+      "git",
+      [
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--directory",
+        "--no-empty-directory",
+        "-z",
+        "--",
+        ".",
+      ],
+      {
+        cwd: repository,
+        env: environment,
+        maxOutputBytesPerStream: PATCH_PROCESS_CAPTURE_LIMIT_BYTES,
+        outputOverflow: "truncate",
+      },
+    );
+    if (ignored.exitCode !== 0)
+      throw new Error(`ignored review inventory exited ${ignored.exitCode}`);
+    const ignoredEntries = ignored.stdout.split("\0").filter(Boolean).length;
+    const ignoredInventoryTruncated = ignored.capture.stdout.omittedBytes > 0;
+    const numstat = await runProcess(
+      "git",
+      ["diff", "--cached", "--numstat", "-z", "--no-ext-diff", "--no-textconv", baseSha, "--"],
+      {
+        cwd: repository,
+        env: environment,
+        maxOutputBytesPerStream: PATCH_PROCESS_CAPTURE_LIMIT_BYTES,
+        outputOverflow: "truncate",
+      },
+    );
+    if (numstat.exitCode !== 0) throw new Error(`review diff inventory exited ${numstat.exitCode}`);
+    if (numstat.capture.stdout.omittedBytes > 0)
+      throw new Error("review diff inventory exceeded its capture bound");
+    const binaryChanges = numstat.stdout
+      .split("\0")
+      .filter((entry) => entry.startsWith("-\t-\t")).length;
+    const diff = await runProcess(
+      "git",
+      ["diff", "--cached", "--full-index", "--no-ext-diff", "--no-textconv", baseSha, "--"],
+      {
+        cwd: repository,
+        env: environment,
+        maxOutputBytesPerStream: PATCH_PROCESS_CAPTURE_LIMIT_BYTES,
+        outputOverflow: "truncate",
+      },
+    );
+    if (diff.exitCode !== 0) throw new Error(`review diff exited ${diff.exitCode}`);
+    const evidence = boundedReviewEvidence("text/x-diff", diff.stdout, {
+      observedBytes: diff.capture.stdout.observedBytes,
+      omittedBytes: diff.capture.stdout.omittedBytes,
+    });
+    return {
+      evidence,
+      captureFailures: [
+        ...(ignoredEntries > 0 || ignoredInventoryTruncated
+          ? [
+              ignoredInventoryTruncated
+                ? "ignored untracked payloads were omitted and their inventory exceeded its capture bound; review is incomplete"
+                : `ignored untracked payload omitted for ${ignoredEntries} ${ignoredEntries === 1 ? "entry" : "entries"}; review is incomplete`,
+            ]
+          : []),
+        ...(binaryChanges > 0
+          ? [
+              `binary patch payload omitted for ${binaryChanges} changed ${binaryChanges === 1 ? "file" : "files"}; review is incomplete`,
+            ]
+          : []),
+        ...(evidence.truncated
+          ? ["patch review evidence exceeded its retained bound; review is incomplete"]
+          : []),
+      ],
+    };
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+}
+
+function transcriptText(entries: unknown[]): string {
+  return (
+    entries.map((entry) => JSON.stringify(redactValue(entry))).join("\n") +
+    (entries.length > 0 ? "\n" : "")
+  );
+}
+
+async function captureReviewPacket(input: {
+  repository: string;
+  baseSha: string;
+  transcript: unknown[];
+  captureFailures?: string[];
+}): Promise<BenchmarkReviewPacket> {
+  const captureFailures = [...(input.captureFailures ?? [])];
+  let patch;
+  try {
+    const captured = await capturePatch(input.repository, input.baseSha);
+    patch = captured.evidence;
+    captureFailures.push(...captured.captureFailures);
+  } catch (error) {
+    const failure = `patch capture failed: ${error instanceof Error ? error.message : String(error)}`;
+    captureFailures.push(failure);
+    patch = boundedReviewEvidence("text/x-diff", `[GRAPHCRAFT ${failure}]\n`);
+  }
+  return BenchmarkReviewPacketSchema.parse({
+    schemaVersion: 1,
+    patch,
+    transcript: boundedReviewEvidence("application/x-ndjson", transcriptText(input.transcript)),
+    captureFailures: captureFailures.map((failure) => redactString(failure)),
+  });
+}
+
+export async function inspectBenchmarkSourceIdentity(
+  repositoryPath: string,
+): Promise<BenchmarkSourceIdentity> {
+  const repository = resolve(repositoryPath);
+  const head = await runProcess("git", ["rev-parse", "--verify", "HEAD^{commit}"], {
+    cwd: repository,
+  });
+  const commitSha = head.stdout.trim().toLowerCase();
+  if (head.exitCode !== 0 || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(commitSha))
+    throw new Error("Unable to bind the benchmark to an exact Graphcraft source commit");
+  const status = await runProcess(
+    "git",
+    [
+      "status",
+      "--porcelain=v1",
+      "--untracked-files=all",
+      "--",
+      ".",
+      ":(exclude)dist/graphcraft.mjs",
+      ":(exclude)dist/graphcraft.mjs.map",
+      ":(exclude)dist/mcp.mjs",
+      ":(exclude)dist/mcp.mjs.map",
+    ],
+    { cwd: repository },
+  );
+  if (status.exitCode !== 0) throw new Error("Unable to inspect Graphcraft source dirty state");
+  const dirty = status.stdout.length > 0;
+  return BenchmarkSourceIdentitySchema.parse({
+    commitSha,
+    dirty,
+    dirtyStatusDigest: dirty ? contentHash(status.stdout) : null,
+  });
 }
 
 export async function loadBenchmarkSuite(path: string): Promise<BenchmarkSuite> {
@@ -334,6 +579,7 @@ async function runBaselineTrial(input: {
   const usages: TokenUsage[] = [];
   const failureTrace: string[] = [];
   const summaryEvidence: string[] = [];
+  const transcript: unknown[] = [];
   let resultStatus: "completed" | "blocked" | "failed" | "error" = "error";
   const capsule = ContextCapsuleSchema.parse({
     schemaVersion: 1,
@@ -369,6 +615,7 @@ async function runBaselineTrial(input: {
       },
       new AbortController().signal,
     )) {
+      transcript.push({ source: "baseline_host_event", event });
       if (event.type === "usage") usages.push(event.usage);
       if (event.type === "result") {
         resultStatus = event.result.status;
@@ -393,6 +640,16 @@ async function runBaselineTrial(input: {
     ...score.results.filter(({ passed }) => !passed).map(({ summary }) => `acceptance: ${summary}`),
   );
   const tokens = usageSummary(usages);
+  const reviewPacket = await captureReviewPacket({
+    repository: input.repository,
+    baseSha: input.baseSha,
+    transcript,
+  });
+  failureTrace.push(...reviewPacket.captureFailures.map((failure) => `review packet: ${failure}`));
+  const reviewLimitations = [
+    ...(reviewPacket.patch.truncated ? ["review_patch:truncated"] : []),
+    ...(reviewPacket.transcript.truncated ? ["review_transcript:truncated"] : []),
+  ];
   return BenchmarkTrialResultSchema.parse({
     trial: input.trial,
     hostVersion: input.hostVersion,
@@ -408,14 +665,16 @@ async function runBaselineTrial(input: {
     accepted:
       resultStatus === "completed" &&
       score.scorerVerified &&
-      score.results.every(({ passed }) => passed),
+      score.results.every(({ passed }) => passed) &&
+      reviewPacket.captureFailures.length === 0,
     acceptance: score.results,
     usage: tokens.usage,
     usageReconciled: tokens.reconciled,
-    limitations: tokens.limitations,
+    limitations: [...tokens.limitations, ...reviewLimitations],
     durationMs: Math.round(performance.now() - started),
     humanInterventions: 0,
     failureTrace,
+    reviewPacket,
   });
 }
 
@@ -435,12 +694,16 @@ async function runGraphcraftTrial(input: {
   let acceptanceRepository = input.repository;
   let summaryEvidence = "";
   let tokens = usageSummary([]);
+  let store: Awaited<ReturnType<typeof createRun>>["store"] | undefined;
+  const transcript: unknown[] = [];
+  const transcriptCaptureFailures: string[] = [];
   try {
     const created = await createRun(input.task.task, {
       cwd: input.repository,
       planner: input.adapter,
       finishLine: "local_verified",
     });
+    store = created.store;
     const state = await executeRun({ store: created.store, adapter: input.adapter, approve: true });
     const events = await created.store.loadEvents();
     const capabilityError = persistedCapabilityAdmissionError(events);
@@ -470,10 +733,64 @@ async function runGraphcraftTrial(input: {
     if (error instanceof HostCapabilityAdmissionError) throw error;
     failureTrace.push(error instanceof Error ? error.message : String(error));
   }
+  if (store) {
+    try {
+      const workspace = await store.loadWorkspace<{ path: string }>();
+      acceptanceRepository = workspace.path;
+    } catch (error) {
+      transcriptCaptureFailures.push(
+        `workspace receipt capture failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    try {
+      const events = await store.loadEvents();
+      transcript.push(...events.map((event) => ({ source: "graphcraft_run_event", event })));
+      const invocationIds = [
+        ...new Set(
+          events.flatMap(({ data }) =>
+            typeof data.invocationId === "string" ? [data.invocationId] : [],
+          ),
+        ),
+      ];
+      for (const invocationId of invocationIds) {
+        try {
+          const invocationEvents = await store.loadInvocationEvents(invocationId);
+          transcript.push(
+            ...invocationEvents.map((event) => ({
+              source: "graphcraft_host_event",
+              invocationId,
+              event,
+            })),
+          );
+        } catch (error) {
+          transcriptCaptureFailures.push(
+            `invocation transcript ${invocationId} capture failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+      }
+    } catch (error) {
+      transcriptCaptureFailures.push(
+        `run transcript capture failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
   const score = await scoreAcceptance(input.task, acceptanceRepository, summaryEvidence);
   failureTrace.push(
     ...score.results.filter(({ passed }) => !passed).map(({ summary }) => `acceptance: ${summary}`),
   );
+  const reviewPacket = await captureReviewPacket({
+    repository: acceptanceRepository,
+    baseSha: input.baseSha,
+    transcript,
+    captureFailures: transcriptCaptureFailures,
+  });
+  failureTrace.push(...reviewPacket.captureFailures.map((failure) => `review packet: ${failure}`));
+  const reviewLimitations = [
+    ...(reviewPacket.patch.truncated ? ["review_patch:truncated"] : []),
+    ...(reviewPacket.transcript.truncated ? ["review_transcript:truncated"] : []),
+  ];
   return BenchmarkTrialResultSchema.parse({
     trial: input.trial,
     hostVersion: input.hostVersion,
@@ -489,14 +806,16 @@ async function runGraphcraftTrial(input: {
     accepted:
       executionStatus === "completed" &&
       score.scorerVerified &&
-      score.results.every(({ passed }) => passed),
+      score.results.every(({ passed }) => passed) &&
+      reviewPacket.captureFailures.length === 0,
     acceptance: score.results,
     usage: tokens.usage,
     usageReconciled: tokens.reconciled,
-    limitations: tokens.limitations,
+    limitations: [...tokens.limitations, ...reviewLimitations],
     durationMs: Math.round(performance.now() - started),
     humanInterventions: 0,
     failureTrace,
+    reviewPacket,
   });
 }
 
@@ -506,6 +825,7 @@ export async function runBenchmark(input: {
   adapters: Partial<Record<"codex" | "claude", HostAdapter>>;
   policies: Partial<Record<"codex" | "claude", HostExecutionPolicy>>;
   graphcraftVersion: string;
+  graphcraftSource?: BenchmarkSourceIdentity;
   seed: string;
   repetitions?: number;
   outputPath: string;
@@ -514,6 +834,13 @@ export async function runBenchmark(input: {
   const suite = BenchmarkSuiteSchema.parse(input.suite);
   const graphcraftVersion = input.graphcraftVersion?.trim();
   if (!graphcraftVersion) throw new Error("A Graphcraft version identity is required");
+  const graphcraftSource = input.graphcraftSource
+    ? BenchmarkSourceIdentitySchema.parse(input.graphcraftSource)
+    : await inspectBenchmarkSourceIdentity(process.cwd());
+  if (graphcraftSource.dirty)
+    throw new Error(
+      "Evidence-backed benchmarks require a clean Graphcraft source tree; dirty source identity is not reproducible",
+    );
   const hosts = [...new Set(input.hosts)].sort() as Array<"codex" | "claude">;
   if (hosts.length === 0) throw new Error("A benchmark requires at least one host");
   const policies: Partial<Record<"codex" | "claude", HostExecutionPolicy>> = {};
@@ -545,6 +872,7 @@ export async function runBenchmark(input: {
     architecture: process.arch,
     nodeVersion: process.version,
     graphcraftVersion,
+    graphcraftSource,
   };
   const byTask = new Map(suite.tasks.map((task) => [task.id, task]));
   let startedAt = new Date().toISOString();
@@ -556,6 +884,9 @@ export async function runBenchmark(input: {
       throw new Error(
         "The existing benchmark report Graphcraft version identity does not match this execution",
       );
+    const { graphcraftSource: _existingSource, ...existingRuntimeEnvironment } =
+      existing.environment;
+    const { graphcraftSource: _currentSource, ...currentRuntimeEnvironment } = environment;
     if (
       existing.suite.id !== suite.id ||
       existing.suite.version !== suite.version ||
@@ -564,10 +895,15 @@ export async function runBenchmark(input: {
       JSON.stringify(existing.modelPolicy) !== JSON.stringify(modelPolicy) ||
       existing.effortPolicy !== effortPolicy ||
       JSON.stringify(existing.permissionPolicy) !== JSON.stringify(permissionPolicy) ||
-      JSON.stringify(existing.environment) !== JSON.stringify(environment) ||
+      existing.reviewPolicy !== reviewPolicy ||
+      JSON.stringify(existingRuntimeEnvironment) !== JSON.stringify(currentRuntimeEnvironment) ||
       JSON.stringify(existing.schedule) !== JSON.stringify(schedule)
     )
       throw new Error("The existing benchmark report does not match this suite and schedule");
+    if (contentHash(existing.environment.graphcraftSource) !== contentHash(graphcraftSource))
+      throw new Error(
+        "The existing benchmark report Graphcraft source identity does not match this execution",
+      );
     startedAt = existing.startedAt;
     results = existing.results;
     existingReport = existing;
@@ -600,7 +936,8 @@ export async function runBenchmark(input: {
         result.accepted !==
           (result.executionStatus === "completed" &&
             result.scorerVerified &&
-            result.acceptance.every(({ passed }) => passed)),
+            result.acceptance.every(({ passed }) => passed) &&
+            result.reviewPacket?.captureFailures.length === 0),
     )
   )
     throw new Error("The existing benchmark report contains mismatched trial controls");
@@ -628,6 +965,7 @@ export async function runBenchmark(input: {
         effortPolicy,
         permissionPolicy,
         scorerPolicy,
+        reviewPolicy,
         environment,
         limitations: reportLimitations,
         schedule,

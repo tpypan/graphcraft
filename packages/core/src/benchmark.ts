@@ -117,27 +117,130 @@ export const BenchmarkPermissionPoliciesSchema = z
     message: "At least one benchmark permission policy is required",
   });
 
-export const BenchmarkTrialResultSchema = z.strictObject({
-  trial: BenchmarkScheduleEntrySchema,
-  hostVersion: z.string().min(1),
-  modelPolicy: z.string().min(1),
-  effortPolicy: BenchmarkEffortPolicySchema,
-  permissionPolicy: BenchmarkPermissionPolicySchema,
-  acceptanceScorerDigest: z.string().min(1),
-  observedScorerDigest: z.string().min(1),
-  scorerVerified: z.boolean(),
-  repositoryDigest: z.string().min(1),
-  baseSha: z.string().min(1),
-  executionStatus: z.enum(["completed", "blocked", "failed", "error"]),
-  accepted: z.boolean(),
-  acceptance: z.array(BenchmarkAssertionResultSchema),
-  usage: TokenUsageSchema,
-  usageReconciled: z.boolean(),
-  limitations: z.array(z.string()),
-  durationMs: z.number().int().nonnegative(),
-  humanInterventions: z.number().int().nonnegative(),
-  failureTrace: z.array(z.string()),
+export const BenchmarkSourceIdentitySchema = z
+  .strictObject({
+    commitSha: z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
+    dirty: z.boolean(),
+    dirtyStatusDigest: z
+      .string()
+      .regex(/^[0-9a-f]{64}$/)
+      .nullable(),
+  })
+  .superRefine((identity, context) => {
+    if (identity.dirty !== (identity.dirtyStatusDigest !== null)) {
+      context.addIssue({
+        code: "custom",
+        path: ["dirtyStatusDigest"],
+        message: "Dirty benchmark source identity must include a status digest",
+      });
+    }
+  });
+
+export const BENCHMARK_REVIEW_PATCH_LIMIT_BYTES = 128 * 1024;
+export const BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES = 64 * 1024;
+
+const BenchmarkReviewEvidenceSchema = z
+  .strictObject({
+    mediaType: z.enum(["text/x-diff", "application/x-ndjson"]),
+    text: z.string(),
+    observedBytes: z.number().int().nonnegative(),
+    retainedBytes: z.number().int().nonnegative(),
+    omittedBytes: z.number().int().nonnegative(),
+    truncated: z.boolean(),
+    digest: z.string().regex(/^[0-9a-f]{64}$/),
+  })
+  .superRefine((evidence, context) => {
+    const retainedBytes = new TextEncoder().encode(evidence.text).byteLength;
+    const limit =
+      evidence.mediaType === "text/x-diff"
+        ? BENCHMARK_REVIEW_PATCH_LIMIT_BYTES
+        : BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES;
+    if (retainedBytes > limit) {
+      context.addIssue({
+        code: "custom",
+        path: ["retainedBytes"],
+        message: `Benchmark review evidence exceeds its ${limit}-byte retained limit`,
+      });
+    }
+    if (retainedBytes !== evidence.retainedBytes) {
+      context.addIssue({
+        code: "custom",
+        path: ["retainedBytes"],
+        message: "Benchmark review evidence retained-byte count does not match its text",
+      });
+    }
+    if (evidence.truncated !== evidence.omittedBytes > 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["truncated"],
+        message: "Benchmark review evidence truncation metadata is inconsistent",
+      });
+    }
+    if (
+      evidence.digest !==
+      contentHash({
+        mediaType: evidence.mediaType,
+        text: evidence.text,
+        observedBytes: evidence.observedBytes,
+        omittedBytes: evidence.omittedBytes,
+        truncated: evidence.truncated,
+      })
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["digest"],
+        message: "Benchmark review evidence digest does not match its retained content",
+      });
+    }
+  });
+
+export const BenchmarkReviewPacketSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  patch: BenchmarkReviewEvidenceSchema,
+  transcript: BenchmarkReviewEvidenceSchema,
+  captureFailures: z.array(z.string().min(1)),
 });
+
+export const BenchmarkTrialResultSchema = z
+  .strictObject({
+    trial: BenchmarkScheduleEntrySchema,
+    hostVersion: z.string().min(1),
+    modelPolicy: z.string().min(1),
+    effortPolicy: BenchmarkEffortPolicySchema,
+    permissionPolicy: BenchmarkPermissionPolicySchema,
+    acceptanceScorerDigest: z.string().min(1),
+    observedScorerDigest: z.string().min(1),
+    scorerVerified: z.boolean(),
+    repositoryDigest: z.string().min(1),
+    baseSha: z.string().min(1),
+    executionStatus: z.enum(["completed", "blocked", "failed", "error"]),
+    accepted: z.boolean(),
+    acceptance: z.array(BenchmarkAssertionResultSchema),
+    usage: TokenUsageSchema,
+    usageReconciled: z.boolean(),
+    limitations: z.array(z.string()),
+    durationMs: z.number().int().nonnegative(),
+    humanInterventions: z.number().int().nonnegative(),
+    failureTrace: z.array(z.string()),
+    reviewPacket: BenchmarkReviewPacketSchema.optional(),
+  })
+  .superRefine((result, context) => {
+    if (result.accepted && (result.reviewPacket?.captureFailures.length ?? 0) > 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["accepted"],
+        message:
+          "A trial with review-packet capture failures cannot be accepted as review-complete",
+      });
+    }
+    if (result.accepted && result.reviewPacket?.patch.truncated) {
+      context.addIssue({
+        code: "custom",
+        path: ["accepted"],
+        message: "A trial with truncated patch evidence cannot be accepted as review-complete",
+      });
+    }
+  });
 
 export const BenchmarkReportSchema = z
   .strictObject({
@@ -156,11 +259,13 @@ export const BenchmarkReportSchema = z
     effortPolicy: BenchmarkEffortPolicySchema,
     permissionPolicy: BenchmarkPermissionPoliciesSchema,
     scorerPolicy: z.literal("fixture_bound_scorers_plus_suite_assertions"),
+    reviewPolicy: z.literal("bounded_redacted_patch_and_transcript_v1").optional(),
     environment: z.strictObject({
       platform: z.string().min(1),
       architecture: z.string().min(1),
       nodeVersion: z.string().min(1),
       graphcraftVersion: z.string().trim().min(1),
+      graphcraftSource: BenchmarkSourceIdentitySchema.optional(),
     }),
     limitations: z.array(z.string()),
     schedule: z.array(BenchmarkScheduleEntrySchema).min(1),
@@ -168,6 +273,21 @@ export const BenchmarkReportSchema = z
     summary: z.record(z.string(), z.unknown()),
   })
   .superRefine((report, context) => {
+    if (report.reviewPolicy !== undefined && report.environment.graphcraftSource === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["environment", "graphcraftSource"],
+        message: "Evidence-backed benchmark reports must bind an exact Graphcraft source identity",
+      });
+    }
+    if (report.reviewPolicy !== undefined && report.environment.graphcraftSource?.dirty) {
+      context.addIssue({
+        code: "custom",
+        path: ["environment", "graphcraftSource", "dirty"],
+        message: "Evidence-backed benchmark reports require a clean Graphcraft source tree",
+      });
+    }
+
     const scheduleByTrialId = new Map<string, BenchmarkScheduleEntry>();
     for (const [index, trial] of report.schedule.entries()) {
       if (scheduleByTrialId.has(trial.trialId)) {
@@ -198,6 +318,13 @@ export const BenchmarkReportSchema = z
           code: "custom",
           path: ["results", index, "trial"],
           message: "Benchmark result trials must exactly match a scheduled trial",
+        });
+      }
+      if (report.reviewPolicy !== undefined && result.reviewPacket === undefined) {
+        context.addIssue({
+          code: "custom",
+          path: ["results", index, "reviewPacket"],
+          message: "Every evidence-backed benchmark result must retain a review packet",
         });
       }
     }
@@ -233,6 +360,8 @@ export type BenchmarkScheduleEntry = z.infer<typeof BenchmarkScheduleEntrySchema
 export type BenchmarkTrialResult = z.infer<typeof BenchmarkTrialResultSchema>;
 export type BenchmarkReport = z.infer<typeof BenchmarkReportSchema>;
 export type BenchmarkPermissionPolicy = z.infer<typeof BenchmarkPermissionPolicySchema>;
+export type BenchmarkSourceIdentity = z.infer<typeof BenchmarkSourceIdentitySchema>;
+export type BenchmarkReviewPacket = z.infer<typeof BenchmarkReviewPacketSchema>;
 
 function seededRandom(seed: string): () => number {
   let state = Number.parseInt(contentHash(seed).slice(0, 8), 16) >>> 0;

@@ -2,7 +2,8 @@
 import { Command, Option } from "commander";
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { dirname, join, parse, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import stableBenchmarkSuite from "../../../benchmarks/stable-v1.json" with { type: "json" };
 import {
   askForApproval,
@@ -38,6 +39,7 @@ import {
   inspectSupervisorRecord,
   listSupervisorRecords,
   loadBenchmarkSuite,
+  inspectBenchmarkSourceIdentity,
   planCompletedRunPrune,
   planRunRetention,
   redactString,
@@ -50,7 +52,9 @@ import {
 } from "@graphcraft/runtime";
 import {
   BenchmarkSuiteSchema,
+  BenchmarkSourceIdentitySchema,
   createBenchmarkSchedule,
+  type BenchmarkSourceIdentity,
   type GraphAmendment,
   type HostExecutionPolicy,
   type ProbePlan,
@@ -62,6 +66,43 @@ const program = new Command()
   .description("Progress-aware execution for durable coding agents")
   .version(GRAPHCRAFT_VERSION)
   .showSuggestionAfterError();
+
+declare const __GRAPHCRAFT_SOURCE_SHA__: string | undefined;
+declare const __GRAPHCRAFT_SOURCE_DIRTY__: boolean | undefined;
+declare const __GRAPHCRAFT_SOURCE_STATUS_DIGEST__: string | null | undefined;
+
+async function benchmarkSourceIdentity(): Promise<BenchmarkSourceIdentity> {
+  if (
+    typeof __GRAPHCRAFT_SOURCE_SHA__ === "string" &&
+    typeof __GRAPHCRAFT_SOURCE_DIRTY__ === "boolean"
+  ) {
+    return BenchmarkSourceIdentitySchema.parse({
+      commitSha: __GRAPHCRAFT_SOURCE_SHA__,
+      dirty: __GRAPHCRAFT_SOURCE_DIRTY__,
+      dirtyStatusDigest:
+        typeof __GRAPHCRAFT_SOURCE_STATUS_DIGEST__ === "string"
+          ? __GRAPHCRAFT_SOURCE_STATUS_DIGEST__
+          : null,
+    });
+  }
+
+  let candidate = dirname(fileURLToPath(import.meta.url));
+  while (true) {
+    try {
+      const metadata = JSON.parse(await readFile(join(candidate, "package.json"), "utf8")) as {
+        name?: unknown;
+      };
+      if (metadata.name === "@tpypan/graphcraft")
+        return await inspectBenchmarkSourceIdentity(candidate);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const parent = dirname(candidate);
+    if (candidate === parent || candidate === parse(candidate).root) break;
+    candidate = parent;
+  }
+  throw new Error("Unable to locate the Graphcraft source repository for benchmark provenance");
+}
 
 const hostOption = new Option("--host <host>", "coding-agent host")
   .choices(["codex", "claude"])
@@ -194,12 +235,14 @@ program
       const adapters = Object.fromEntries(
         hosts.map((host) => [host, createAdapter(host, policies[host])]),
       );
+      const graphcraftSource = await benchmarkSourceIdentity();
       const result = await runBenchmark({
         suite,
         hosts,
         adapters,
         policies,
         graphcraftVersion: GRAPHCRAFT_VERSION,
+        graphcraftSource,
         seed: options.seed,
         ...(repetitions ? { repetitions } : {}),
         outputPath,

@@ -8,6 +8,7 @@ import {
   BenchmarkReportSchema,
   BenchmarkSuiteSchema,
   BenchmarkTrialResultSchema,
+  contentHash,
   createBenchmarkSchedule,
   summarizeBenchmark,
   unavailableTokenUsage,
@@ -255,6 +256,157 @@ describe("matched benchmark protocol", () => {
     expect(() =>
       BenchmarkReportSchema.parse({ ...valid, environment: identitylessEnvironment }),
     ).toThrow(/graphcraftVersion/);
+  });
+
+  it("keeps legacy reports readable while enforcing source-bound review packets when declared", () => {
+    const schedule = createBenchmarkSchedule({
+      suite,
+      hosts: ["codex"],
+      seed: "report-schema-seed",
+    });
+    const legacy = reportValue(schedule, []);
+    expect(BenchmarkReportSchema.parse(legacy).reviewPolicy).toBeUndefined();
+
+    const evidence = (mediaType: "text/x-diff" | "application/x-ndjson", text: string) => ({
+      mediaType,
+      text,
+      observedBytes: Buffer.byteLength(text),
+      retainedBytes: Buffer.byteLength(text),
+      omittedBytes: 0,
+      truncated: false,
+      digest: contentHash({
+        mediaType,
+        text,
+        observedBytes: Buffer.byteLength(text),
+        omittedBytes: 0,
+        truncated: false,
+      }),
+    });
+    const result = {
+      ...reportedTrial(schedule[0]!, 100),
+      reviewPacket: {
+        schemaVersion: 1 as const,
+        patch: evidence("text/x-diff", "diff --git a/result.js b/result.js\n"),
+        transcript: evidence("application/x-ndjson", '{"type":"result"}\n'),
+        captureFailures: [],
+      },
+    };
+    const evidenceBacked = {
+      ...reportValue(schedule, [result]),
+      reviewPolicy: "bounded_redacted_patch_and_transcript_v1" as const,
+      environment: {
+        ...legacy.environment,
+        graphcraftSource: {
+          commitSha: "a".repeat(40),
+          dirty: false,
+          dirtyStatusDigest: null,
+        },
+      },
+      summary: summarizeBenchmark([result], schedule),
+    };
+    expect(BenchmarkReportSchema.parse(evidenceBacked)).toMatchObject({
+      reviewPolicy: "bounded_redacted_patch_and_transcript_v1",
+      environment: { graphcraftSource: { commitSha: "a".repeat(40), dirty: false } },
+    });
+    expect(() =>
+      BenchmarkReportSchema.parse({
+        ...evidenceBacked,
+        results: [reportedTrial(schedule[0]!, 100)],
+      }),
+    ).toThrow(/review packet/);
+    expect(() =>
+      BenchmarkReportSchema.parse({
+        ...evidenceBacked,
+        environment: legacy.environment,
+      }),
+    ).toThrow(/source identity/);
+    expect(() =>
+      BenchmarkReportSchema.parse({
+        ...evidenceBacked,
+        environment: {
+          ...evidenceBacked.environment,
+          graphcraftSource: {
+            commitSha: "a".repeat(40),
+            dirty: true,
+            dirtyStatusDigest: null,
+          },
+        },
+      }),
+    ).toThrow(/status digest/);
+    expect(() =>
+      BenchmarkReportSchema.parse({
+        ...evidenceBacked,
+        environment: {
+          ...evidenceBacked.environment,
+          graphcraftSource: {
+            commitSha: "a".repeat(40),
+            dirty: true,
+            dirtyStatusDigest: "b".repeat(64),
+          },
+        },
+      }),
+    ).toThrow(/clean Graphcraft source tree/);
+
+    const oversizedText = "x".repeat(64 * 1024 + 1);
+    const oversizedTranscript = {
+      mediaType: "application/x-ndjson" as const,
+      text: oversizedText,
+      observedBytes: Buffer.byteLength(oversizedText),
+      retainedBytes: Buffer.byteLength(oversizedText),
+      omittedBytes: 0,
+      truncated: false,
+      digest: contentHash({
+        mediaType: "application/x-ndjson",
+        text: oversizedText,
+        observedBytes: Buffer.byteLength(oversizedText),
+        omittedBytes: 0,
+        truncated: false,
+      }),
+    };
+    expect(() =>
+      BenchmarkReportSchema.parse({
+        ...evidenceBacked,
+        results: [
+          {
+            ...result,
+            reviewPacket: { ...result.reviewPacket, transcript: oversizedTranscript },
+          },
+        ],
+      }),
+    ).toThrow(/retained limit/);
+
+    expect(() =>
+      BenchmarkTrialResultSchema.parse({
+        ...result,
+        accepted: true,
+        reviewPacket: {
+          ...result.reviewPacket,
+          patch: {
+            ...result.reviewPacket.patch,
+            omittedBytes: 1,
+            truncated: true,
+            digest: contentHash({
+              mediaType: result.reviewPacket.patch.mediaType,
+              text: result.reviewPacket.patch.text,
+              observedBytes: result.reviewPacket.patch.observedBytes,
+              omittedBytes: 1,
+              truncated: true,
+            }),
+          },
+        },
+      }),
+    ).toThrow(/cannot be accepted as review-complete/);
+
+    expect(() =>
+      BenchmarkTrialResultSchema.parse({
+        ...result,
+        accepted: true,
+        reviewPacket: {
+          ...result.reviewPacket,
+          captureFailures: ["binary patch payload omitted; review is incomplete"],
+        },
+      }),
+    ).toThrow(/capture failures cannot be accepted as review-complete/);
   });
 
   it("keeps unsuccessful and unreconciled trials visible and refuses an incomplete gate", () => {
