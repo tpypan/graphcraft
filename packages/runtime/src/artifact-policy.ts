@@ -817,6 +817,7 @@ export class RunArtifactStore {
     readonly runId: string,
     readonly policy: ArtifactPolicy = DEFAULT_ARTIFACT_POLICY,
     private readonly publicationHook?: ArtifactPublicationHook,
+    private readonly parentSignal?: AbortSignal,
   ) {
     if (!RUN_ID_PATTERN.test(runId)) throw new Error(`Invalid Graphcraft run ID: ${runId}`);
     ArtifactPolicySchema.parse(policy);
@@ -833,22 +834,35 @@ export class RunArtifactStore {
 
   private async acquireMutationLock(): Promise<RunLock> {
     while (true) {
+      if (this.parentSignal?.aborted) throw this.parentSignal.reason;
       const lock = new RunLock(this.mutationLockPath);
       try {
         await lock.acquire();
+        if (this.parentSignal?.aborted) {
+          try {
+            await lock.release();
+          } catch {
+            // The already-observed parent lease loss remains causal.
+          }
+          throw this.parentSignal.reason;
+        }
         return lock;
       } catch (error) {
+        if (this.parentSignal?.aborted) throw this.parentSignal.reason;
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
         if (!(error instanceof Error) || !error.message.includes("already active")) throw error;
       }
       await new Promise<void>((resolveWait) => setTimeout(resolveWait, 10));
+      if (this.parentSignal?.aborted) throw this.parentSignal.reason;
     }
   }
 
   private serializeMutation<T>(operation: (lease: ArtifactLeaseContext) => Promise<T>): Promise<T> {
     const current = this.tail.then(async () => {
       const lock = await this.acquireMutationLock();
-      const signal = lock.signal;
+      const signal = this.parentSignal
+        ? AbortSignal.any([lock.signal, this.parentSignal])
+        : lock.signal;
       let causalFailure: { error: unknown } | undefined;
       let leaseFailure: { error: unknown } | undefined;
       let cleanupFailure: { error: unknown } | undefined;

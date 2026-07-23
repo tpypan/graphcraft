@@ -16,7 +16,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MAX_ARTIFACT_INVENTORY_BYTES, type ArtifactInventory } from "@graphcraft/core";
 import { RunLock } from "./lock.ts";
 import {
@@ -39,8 +39,10 @@ import {
 } from "./store.ts";
 
 const roots: string[] = [];
+const migrationFaultTestTimeout = process.platform === "win32" ? 300_000 : 15_000;
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true })));
 });
 
@@ -163,12 +165,79 @@ async function exists(path: string): Promise<boolean> {
     });
 }
 
-async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 2_000): Promise<void> {
+async function waitFor(
+  predicate: () => Promise<boolean>,
+  timeoutMs = process.platform === "win32" ? 30_000 : 2_000,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!(await predicate())) {
     if (Date.now() >= deadline) throw new Error("Timed out waiting for migration state");
     await new Promise<void>((resolve) => setTimeout(resolve, 10));
   }
+}
+
+function internalLockPath(lock: RunLock): string {
+  return (lock as unknown as { path: string }).path;
+}
+
+function outerLockPaths(fixture: LegacyFixture): { migration: string; run: string } {
+  return {
+    migration: join(fixture.graphcraftRoot, "locks", `${fixture.runId}.migration.lock`),
+    run: join(fixture.graphcraftRoot, "locks", `${fixture.runId}.lock`),
+  };
+}
+
+function spyOnOuterLockSignals(input: {
+  paths: { migration: string; run: string };
+  migration: AbortSignal;
+  run: AbortSignal;
+}): { observed: string[]; spy: ReturnType<typeof vi.spyOn> } {
+  const signalGetter = Object.getOwnPropertyDescriptor(RunLock.prototype, "signal")?.get as
+    ((this: RunLock) => AbortSignal) | undefined;
+  if (!signalGetter) throw new Error("Expected the RunLock signal getter");
+  const observed: string[] = [];
+  const spy = vi.spyOn(RunLock.prototype, "signal", "get").mockImplementation(function (
+    this: RunLock,
+  ): AbortSignal {
+    const path = internalLockPath(this);
+    observed.push(path);
+    if (path === input.paths.migration) return input.migration;
+    if (path === input.paths.run) return input.run;
+    return signalGetter.call(this);
+  });
+  return { observed, spy };
+}
+
+function spyOnLockReleases(): {
+  paths: string[];
+  spy: ReturnType<typeof vi.spyOn>;
+} {
+  const release = RunLock.prototype.release;
+  const paths: string[] = [];
+  const spy = vi.spyOn(RunLock.prototype, "release").mockImplementation(async function (
+    this: RunLock,
+  ): Promise<void> {
+    paths.push(internalLockPath(this));
+    await release.call(this);
+  });
+  return { paths, spy };
+}
+
+async function optionalTreeSnapshot(root: string): Promise<Record<string, string> | undefined> {
+  return (await exists(root)) ? await treeSnapshot(root) : undefined;
+}
+
+async function migrationDurableSnapshot(fixture: LegacyFixture): Promise<{
+  backup: Record<string, string> | undefined;
+  run: Record<string, string>;
+  temporary: Record<string, string> | undefined;
+}> {
+  const backupParent = join(fixture.graphcraftRoot, "migration-backups", fixture.runId);
+  return {
+    backup: await optionalTreeSnapshot(join(backupParent, "1-to-2")),
+    run: await treeSnapshot(fixture.runRoot),
+    temporary: await optionalTreeSnapshot(join(backupParent, ".1-to-2.tmp")),
+  };
 }
 
 function sampleLegacySnapshotRefreshEvidence(): LegacySnapshotRefreshEvidence {
@@ -845,6 +914,385 @@ describe("run storage schema v2 migration", () => {
     expect(await exists(runLockPath)).toBe(false);
     expect(await exists(migrationLockPath)).toBe(false);
   });
+
+  const outerLeaseFaultCases = [
+    ["migration", "after_preflight"],
+    ["migration", "after_backup"],
+    ["migration", "after_inventory"],
+    ["migration", "before_manifest"],
+    ["run", "after_preflight"],
+    ["run", "after_backup"],
+    ["run", "after_inventory"],
+    ["run", "before_manifest"],
+  ] as const;
+
+  it.each(outerLeaseFaultCases)(
+    "stops after observed %s lease loss at %s and recovers under fresh locks",
+    async (lostLock, faultBoundary) => {
+      const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000040", 1);
+      await writeFile(
+        join(fixture.runRoot, "artifacts", "logs", "large.log"),
+        "small matrix artifact\n",
+      );
+      const legacySnapshot = await fileSnapshot(fixture.runRoot);
+      const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "1-to-2");
+      const temporaryRoot = join(dirname(backupRoot), ".1-to-2.tmp");
+      const inventoryPath = join(fixture.runRoot, "artifact-inventory.json");
+      const paths = outerLockPaths(fixture);
+      const controllers = {
+        migration: new AbortController(),
+        run: new AbortController(),
+      };
+      const leaseFailure = new Error(`${lostLock} lease lost at ${faultBoundary}`);
+      const signal = spyOnOuterLockSignals({
+        paths,
+        migration: controllers.migration.signal,
+        run: controllers.run.signal,
+      });
+      const release = spyOnLockReleases();
+      let snapshotAtLoss: Awaited<ReturnType<typeof migrationDurableSnapshot>> | undefined;
+
+      await expect(
+        ensureCurrentRunStorage({
+          graphcraftRoot: fixture.graphcraftRoot,
+          runRoot: fixture.runRoot,
+          runId: fixture.runId,
+          onBoundary: async (boundary) => {
+            if (boundary !== faultBoundary) return;
+            controllers[lostLock].abort(leaseFailure);
+            snapshotAtLoss = await migrationDurableSnapshot(fixture);
+          },
+        }),
+      ).rejects.toBe(leaseFailure);
+
+      if (!snapshotAtLoss) throw new Error("Expected a durable migration snapshot at lease loss");
+      expect(await migrationDurableSnapshot(fixture)).toEqual(snapshotAtLoss);
+      expect(await exists(paths.run)).toBe(false);
+      expect(await exists(paths.migration)).toBe(false);
+      expect(await exists(temporaryRoot)).toBe(false);
+      expect(
+        JSON.parse(await readFile(join(fixture.runRoot, "storage.json"), "utf8")),
+      ).toMatchObject({ schemaVersion: 1 });
+
+      const backupExpected = faultBoundary !== "after_preflight";
+      const inventoryExpected =
+        faultBoundary === "after_inventory" || faultBoundary === "before_manifest";
+      expect(await exists(backupRoot)).toBe(backupExpected);
+      expect(await exists(inventoryPath)).toBe(inventoryExpected);
+      if (backupExpected) {
+        expect(await exists(join(backupRoot, ".backup-complete.json"))).toBe(true);
+        expect(await fileSnapshot(backupRoot)).toEqual(legacySnapshot);
+      }
+
+      const expectedReleaseCount = {
+        after_preflight: 2,
+        after_backup: 2,
+        after_inventory: 4,
+        before_manifest: 5,
+      }[faultBoundary];
+      const artifactLockPath = join(
+        fixture.graphcraftRoot,
+        "locks",
+        `${fixture.runId}.artifacts.lock`,
+      );
+      expect(release.paths).toHaveLength(expectedReleaseCount);
+      expect(release.paths.slice(0, -2)).toEqual(
+        Array.from({ length: expectedReleaseCount - 2 }, () => artifactLockPath),
+      );
+      expect(release.paths.slice(-2)).toEqual([paths.run, paths.migration]);
+
+      signal.spy.mockRestore();
+      release.spy.mockRestore();
+      await expect(
+        ensureCurrentRunStorage({
+          graphcraftRoot: fixture.graphcraftRoot,
+          runRoot: fixture.runRoot,
+          runId: fixture.runId,
+        }),
+      ).resolves.toMatchObject({ schemaVersion: 2, migratedFrom: 1 });
+      expect(await exists(temporaryRoot)).toBe(false);
+      expect(await fileSnapshot(backupRoot)).toEqual(legacySnapshot);
+      expect(await exists(join(backupRoot, "artifact-inventory.json"))).toBe(false);
+    },
+    migrationFaultTestTimeout,
+  );
+
+  it(
+    "stops waiting for the run lock when the migration lease is lost",
+    async () => {
+      const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000041", 1);
+      await writeFile(
+        join(fixture.runRoot, "artifacts", "logs", "large.log"),
+        "small waiting artifact\n",
+      );
+      const before = await treeSnapshot(fixture.runRoot);
+      const paths = outerLockPaths(fixture);
+      const writerLock = new RunLock(paths.run);
+      await writerLock.acquire();
+      const migrationLoss = new AbortController();
+      const runLease = new AbortController();
+      const leaseFailure = new Error("Migration lease lost while waiting for the run lock");
+      const signal = spyOnOuterLockSignals({
+        paths,
+        migration: migrationLoss.signal,
+        run: runLease.signal,
+      });
+      const release = spyOnLockReleases();
+      let settled = false;
+      const migrating = ensureCurrentRunStorage({
+        graphcraftRoot: fixture.graphcraftRoot,
+        runRoot: fixture.runRoot,
+        runId: fixture.runId,
+      });
+      const outcome = migrating.then(
+        () => {
+          settled = true;
+          return undefined;
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        },
+      );
+
+      try {
+        await waitFor(async () => signal.observed.includes(paths.migration));
+        migrationLoss.abort(leaseFailure);
+        await waitFor(async () => settled);
+        expect(await outcome).toBe(leaseFailure);
+        expect(release.paths).toEqual([paths.migration]);
+        expect(await exists(paths.migration)).toBe(false);
+        expect(await exists(paths.run)).toBe(true);
+        expect(await treeSnapshot(fixture.runRoot)).toEqual(before);
+        expect(await exists(join(fixture.graphcraftRoot, "migration-backups"))).toBe(false);
+        expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
+      } finally {
+        signal.spy.mockRestore();
+        release.spy.mockRestore();
+        await writerLock.release();
+        await outcome;
+      }
+
+      await expect(
+        ensureCurrentRunStorage({
+          graphcraftRoot: fixture.graphcraftRoot,
+          runRoot: fixture.runRoot,
+          runId: fixture.runId,
+        }),
+      ).resolves.toMatchObject({ schemaVersion: 2, migratedFrom: 1 });
+    },
+    migrationFaultTestTimeout,
+  );
+
+  it(
+    "preserves a first-chunk temporary backup after lease loss and rebuilds it fresh",
+    async () => {
+      const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000042", 1);
+      const sourcePath = join(fixture.runRoot, "artifacts", "logs", "large.log");
+      const firstChunk = fixture.largeArtifact.subarray(0, 64 * 1024);
+      const legacySnapshot = await fileSnapshot(fixture.runRoot);
+      const backupParent = join(fixture.graphcraftRoot, "migration-backups", fixture.runId);
+      const backupRoot = join(backupParent, "1-to-2");
+      const temporaryRoot = join(backupParent, ".1-to-2.tmp");
+      const temporaryArtifact = join(temporaryRoot, "artifacts", "logs", "large.log");
+      const paths = outerLockPaths(fixture);
+      const migrationLoss = new AbortController();
+      const runLease = new AbortController();
+      const leaseFailure = new Error("Migration lease lost after the first backup chunk");
+      const signal = spyOnOuterLockSignals({
+        paths,
+        migration: migrationLoss.signal,
+        run: runLease.signal,
+      });
+      const release = spyOnLockReleases();
+      let temporaryAtLoss: Record<string, string> | undefined;
+      let checkpointCount = 0;
+
+      await expect(
+        ensureCurrentRunStorage({
+          graphcraftRoot: fixture.graphcraftRoot,
+          runRoot: fixture.runRoot,
+          runId: fixture.runId,
+          onBackupCheckpoint: async (checkpoint) => {
+            if (
+              checkpoint.boundary !== "after_chunk" ||
+              checkpoint.relativePath !== "artifacts/logs/large.log" ||
+              checkpoint.copiedBytes !== 64 * 1024
+            )
+              return;
+            checkpointCount += 1;
+            migrationLoss.abort(leaseFailure);
+            expect(await readFile(temporaryArtifact)).toEqual(firstChunk);
+            temporaryAtLoss = await treeSnapshot(temporaryRoot);
+          },
+        }),
+      ).rejects.toBe(leaseFailure);
+
+      expect(checkpointCount).toBe(1);
+      if (!temporaryAtLoss) throw new Error("Expected the partial migration backup snapshot");
+      expect(await treeSnapshot(temporaryRoot)).toEqual(temporaryAtLoss);
+      expect(await fileSnapshot(temporaryRoot)).toEqual({
+        artifacts: "directory",
+        "artifacts/logs": "directory",
+        "artifacts/logs/large.log": `file:${firstChunk.length}:${digest(firstChunk)}`,
+        capsules: "directory",
+        reports: "directory",
+      });
+      expect(await readFile(temporaryArtifact)).toEqual(firstChunk);
+      expect(await exists(join(temporaryRoot, ".backup-complete.json"))).toBe(false);
+      expect(await exists(backupRoot)).toBe(false);
+      expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
+      expect(
+        JSON.parse(await readFile(join(fixture.runRoot, "storage.json"), "utf8")),
+      ).toMatchObject({ schemaVersion: 1 });
+      expect(release.paths).toEqual([paths.run, paths.migration]);
+      expect(await exists(paths.run)).toBe(false);
+      expect(await exists(paths.migration)).toBe(false);
+
+      signal.spy.mockRestore();
+      release.spy.mockRestore();
+      await expect(
+        ensureCurrentRunStorage({
+          graphcraftRoot: fixture.graphcraftRoot,
+          runRoot: fixture.runRoot,
+          runId: fixture.runId,
+        }),
+      ).resolves.toMatchObject({ schemaVersion: 2, migratedFrom: 1 });
+      expect(await exists(temporaryRoot)).toBe(false);
+      expect(await fileSnapshot(backupRoot)).toEqual(legacySnapshot);
+      expect(await readFile(join(backupRoot, relative(fixture.runRoot, sourcePath)))).toEqual(
+        fixture.largeArtifact,
+      );
+      expect(await exists(join(backupRoot, "artifact-inventory.json"))).toBe(false);
+    },
+    migrationFaultTestTimeout,
+  );
+
+  it.each(["body", "lease"] as const)(
+    "preserves the first migration %s failure when both outer releases fail",
+    async (failureKind) => {
+      const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000043", 1);
+      await writeFile(
+        join(fixture.runRoot, "artifacts", "logs", "large.log"),
+        "small causal artifact\n",
+      );
+      const before = await treeSnapshot(fixture.runRoot);
+      const paths = outerLockPaths(fixture);
+      const migrationLease = new AbortController();
+      const runLease = new AbortController();
+      const bodyFailure = new Error("Migration body failed first");
+      const leaseFailure = new Error("Migration run lease failed first");
+      const expectedFailure = failureKind === "body" ? bodyFailure : leaseFailure;
+      const runReleaseFailure = new Error("Run lock release failed second");
+      const migrationReleaseFailure = new Error("Migration lock release failed third");
+      const signal = spyOnOuterLockSignals({
+        paths,
+        migration: migrationLease.signal,
+        run: runLease.signal,
+      });
+      const realRelease = RunLock.prototype.release;
+      const releasePaths: string[] = [];
+      const release = vi.spyOn(RunLock.prototype, "release").mockImplementation(async function (
+        this: RunLock,
+      ): Promise<void> {
+        const path = internalLockPath(this);
+        releasePaths.push(path);
+        await realRelease.call(this);
+        if (path === paths.run) throw runReleaseFailure;
+        if (path === paths.migration) throw migrationReleaseFailure;
+      });
+
+      await expect(
+        ensureCurrentRunStorage({
+          graphcraftRoot: fixture.graphcraftRoot,
+          runRoot: fixture.runRoot,
+          runId: fixture.runId,
+          onBoundary: (boundary) => {
+            if (boundary !== "after_preflight") return;
+            if (failureKind === "body") throw bodyFailure;
+            runLease.abort(leaseFailure);
+          },
+        }),
+      ).rejects.toBe(expectedFailure);
+
+      expect(releasePaths).toEqual([paths.run, paths.migration]);
+      expect(await exists(paths.run)).toBe(false);
+      expect(await exists(paths.migration)).toBe(false);
+      expect(await treeSnapshot(fixture.runRoot)).toEqual(before);
+      expect(await exists(join(fixture.graphcraftRoot, "migration-backups"))).toBe(false);
+      expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
+
+      signal.spy.mockRestore();
+      release.mockRestore();
+      await expect(
+        ensureCurrentRunStorage({
+          graphcraftRoot: fixture.graphcraftRoot,
+          runRoot: fixture.runRoot,
+          runId: fixture.runId,
+        }),
+      ).resolves.toMatchObject({ schemaVersion: 2, migratedFrom: 1 });
+    },
+    migrationFaultTestTimeout,
+  );
+
+  it(
+    "preserves an earlier release error over later outer lease loss",
+    async () => {
+      const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000044", 1);
+      const paths = outerLockPaths(fixture);
+      const migrationLease = new AbortController();
+      const runLease = new AbortController();
+      const runReleaseFailure = new Error("Run lock release failed first");
+      const laterLeaseFailure = new Error("Migration lease failed later");
+      const signal = spyOnOuterLockSignals({
+        paths,
+        migration: migrationLease.signal,
+        run: runLease.signal,
+      });
+      const realRelease = RunLock.prototype.release;
+      const outerReleasePaths: string[] = [];
+      const release = vi.spyOn(RunLock.prototype, "release").mockImplementation(async function (
+        this: RunLock,
+      ): Promise<void> {
+        const path = internalLockPath(this);
+        if (path === paths.run || path === paths.migration) outerReleasePaths.push(path);
+        await realRelease.call(this);
+        if (path === paths.run) throw runReleaseFailure;
+        if (path === paths.migration) migrationLease.abort(laterLeaseFailure);
+      });
+
+      try {
+        await expect(
+          ensureCurrentRunStorage({
+            graphcraftRoot: fixture.graphcraftRoot,
+            runRoot: fixture.runRoot,
+            runId: fixture.runId,
+          }),
+        ).rejects.toBe(runReleaseFailure);
+      } finally {
+        signal.spy.mockRestore();
+        release.mockRestore();
+      }
+
+      expect(outerReleasePaths).toEqual([paths.run, paths.migration]);
+      expect(await exists(paths.run)).toBe(false);
+      expect(await exists(paths.migration)).toBe(false);
+      expect(
+        JSON.parse(await readFile(join(fixture.runRoot, "storage.json"), "utf8")),
+      ).toMatchObject({
+        schemaVersion: 2,
+        migratedFrom: 1,
+      });
+      await expect(
+        ensureCurrentRunStorage({
+          graphcraftRoot: fixture.graphcraftRoot,
+          runRoot: fixture.runRoot,
+          runId: fixture.runId,
+        }),
+      ).resolves.toMatchObject({ schemaVersion: 2, migratedFrom: 1 });
+    },
+    migrationFaultTestTimeout,
+  );
 
   it("publishes the v2 manifest last and safely retries an interrupted migration", async () => {
     const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000008", 1);

@@ -1276,6 +1276,51 @@ describe("artifact lifecycle policy", () => {
     await expect(readFile(legacyPath)).resolves.toEqual(legacyBefore);
   });
 
+  it("composes parent lease loss into legacy artifact migration", async () => {
+    const { runRoot, store } = await temporaryStore();
+    const inventoryPath = join(runRoot, store.inventoryRelativePath);
+    const legacyPath = join(runRoot, "artifacts", "parent-lease.txt");
+    await mkdir(join(runRoot, "artifacts"), { recursive: true });
+    await writeFile(legacyPath, "legacy\n");
+    const inventoryBefore = await readFile(inventoryPath);
+    const legacyBefore = await readFile(legacyPath);
+    const controller = new AbortController();
+    const leaseFailure = new Error("Parent migration lease lost");
+    const parentStore = new RunArtifactStore(
+      runRoot,
+      store.runId,
+      store.policy,
+      undefined,
+      controller.signal,
+    );
+    const internal = parentStore as unknown as ArtifactStoreInternal;
+    const originalPersistInventory = internal.persistInventory;
+    const persistInventory = vi
+      .spyOn(internal, "persistInventory")
+      .mockImplementationOnce(async (inventory, lease) => {
+        controller.abort(leaseFailure);
+        return await originalPersistInventory.call(internal, inventory, lease);
+      });
+
+    try {
+      await expect(parentStore.migrateLegacy()).rejects.toBe(leaseFailure);
+      expect(await readFile(inventoryPath)).toEqual(inventoryBefore);
+      expect(await readFile(legacyPath)).toEqual(legacyBefore);
+    } finally {
+      persistInventory.mockRestore();
+    }
+
+    await expect(
+      new RunArtifactStore(runRoot, store.runId, store.policy).migrateLegacy(),
+    ).resolves.toEqual(
+      expect.objectContaining({
+        entries: expect.arrayContaining([
+          expect.objectContaining({ path: "artifacts/parent-lease.txt", legacy: true }),
+        ]),
+      }),
+    );
+  });
+
   it.each(["after_target", "after_inventory"] as const)(
     "retains recoverable mutation evidence when the target changes at %s",
     async (faultPoint) => {
