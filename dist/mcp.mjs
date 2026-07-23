@@ -2251,8 +2251,8 @@ var require_resolve = __commonJS({
     }
     exports.getFullPath = getFullPath;
     function _getFullPath(resolver, p) {
-      const serialized = resolver.serialize(p);
-      return serialized.split("#")[0] + "#";
+      const serialized2 = resolver.serialize(p);
+      return serialized2.split("#")[0] + "#";
     }
     exports._getFullPath = _getFullPath;
     var TRAILING_SLASH_HASH = /#\/?$/;
@@ -3656,49 +3656,49 @@ var require_fast_uri = __commonJS({
       schemelessOptions.skipEscape = true;
       return serialize(resolved, schemelessOptions);
     }
-    function resolveComponent(base, relative9, options, skipNormalization) {
+    function resolveComponent(base, relative10, options, skipNormalization) {
       const target = {};
       if (!skipNormalization) {
         base = parse3(serialize(base, options), options);
-        relative9 = parse3(serialize(relative9, options), options);
+        relative10 = parse3(serialize(relative10, options), options);
       }
       options = options || {};
-      if (!options.tolerant && relative9.scheme) {
-        target.scheme = relative9.scheme;
-        target.userinfo = relative9.userinfo;
-        target.host = relative9.host;
-        target.port = relative9.port;
-        target.path = removeDotSegments(relative9.path || "");
-        target.query = relative9.query;
+      if (!options.tolerant && relative10.scheme) {
+        target.scheme = relative10.scheme;
+        target.userinfo = relative10.userinfo;
+        target.host = relative10.host;
+        target.port = relative10.port;
+        target.path = removeDotSegments(relative10.path || "");
+        target.query = relative10.query;
       } else {
-        if (relative9.userinfo !== void 0 || relative9.host !== void 0 || relative9.port !== void 0) {
-          target.userinfo = relative9.userinfo;
-          target.host = relative9.host;
-          target.port = relative9.port;
-          target.path = removeDotSegments(relative9.path || "");
-          target.query = relative9.query;
+        if (relative10.userinfo !== void 0 || relative10.host !== void 0 || relative10.port !== void 0) {
+          target.userinfo = relative10.userinfo;
+          target.host = relative10.host;
+          target.port = relative10.port;
+          target.path = removeDotSegments(relative10.path || "");
+          target.query = relative10.query;
         } else {
-          if (!relative9.path) {
+          if (!relative10.path) {
             target.path = base.path;
-            if (relative9.query !== void 0) {
-              target.query = relative9.query;
+            if (relative10.query !== void 0) {
+              target.query = relative10.query;
             } else {
               target.query = base.query;
             }
           } else {
-            if (relative9.path[0] === "/") {
-              target.path = removeDotSegments(relative9.path);
+            if (relative10.path[0] === "/") {
+              target.path = removeDotSegments(relative10.path);
             } else {
               if ((base.userinfo !== void 0 || base.host !== void 0 || base.port !== void 0) && !base.path) {
-                target.path = "/" + relative9.path;
+                target.path = "/" + relative10.path;
               } else if (!base.path) {
-                target.path = relative9.path;
+                target.path = relative10.path;
               } else {
-                target.path = base.path.slice(0, base.path.lastIndexOf("/") + 1) + relative9.path;
+                target.path = base.path.slice(0, base.path.lastIndexOf("/") + 1) + relative10.path;
               }
               target.path = removeDotSegments(target.path);
             }
-            target.query = relative9.query;
+            target.query = relative10.query;
           }
           target.userinfo = base.userinfo;
           target.host = base.host;
@@ -3706,7 +3706,7 @@ var require_fast_uri = __commonJS({
         }
         target.scheme = base.scheme;
       }
-      target.fragment = relative9.fragment;
+      target.fragment = relative10.fragment;
       return target;
     }
     function equal(uriA, uriB, options) {
@@ -31465,22 +31465,22 @@ var EMPTY_COMPLETION_RESULT = {
 
 // packages/cli/src/index.ts
 import { createInterface } from "node:readline/promises";
-import { createHash as createHash6, randomUUID as randomUUID9 } from "node:crypto";
+import { createHash as createHash6, randomUUID as randomUUID10 } from "node:crypto";
 import {
   access as access3,
   chmod as chmod2,
   lstat as lstat10,
   mkdir as mkdir5,
   mkdtemp as mkdtemp2,
-  open as open8,
+  open as open9,
   readdir as readdir6,
   rename as rename3,
   rm as rm4,
-  rmdir as rmdir2
+  rmdir as rmdir3
 } from "node:fs/promises";
 import { homedir, platform, tmpdir as tmpdir2 } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname as dirname10, isAbsolute as isAbsolute9, join as join14, resolve as resolve13 } from "node:path";
+import { dirname as dirname11, isAbsolute as isAbsolute9, join as join15, resolve as resolve13 } from "node:path";
 var import_cross_spawn5 = __toESM(require_cross_spawn(), 1);
 
 // package.json
@@ -32352,6 +32352,9 @@ var RunEventTypeSchema = external_exports.enum([
   "semantic.verdict",
   "scope.started",
   "scope.checked",
+  "probe.process.started",
+  "probe.process.finished",
+  "probe.process.reconciled",
   "tokens.recorded",
   "optimizer.decided",
   "side_effect.claimed",
@@ -32831,6 +32834,73 @@ var BenchmarkPermissionPoliciesSchema = external_exports.strictObject({
 }).refine((value) => value.codex !== void 0 || value.claude !== void 0, {
   message: "At least one benchmark permission policy is required"
 });
+var BenchmarkSourceIdentitySchema = external_exports.strictObject({
+  commitSha: external_exports.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
+  dirty: external_exports.boolean(),
+  dirtyStatusDigest: external_exports.string().regex(/^[0-9a-f]{64}$/).nullable()
+}).superRefine((identity, context) => {
+  if (identity.dirty !== (identity.dirtyStatusDigest !== null)) {
+    context.addIssue({
+      code: "custom",
+      path: ["dirtyStatusDigest"],
+      message: "Dirty benchmark source identity must include a status digest"
+    });
+  }
+});
+var BENCHMARK_REVIEW_PATCH_LIMIT_BYTES = 128 * 1024;
+var BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES = 64 * 1024;
+var BenchmarkReviewEvidenceSchema = external_exports.strictObject({
+  mediaType: external_exports.enum(["text/x-diff", "application/x-ndjson"]),
+  text: external_exports.string(),
+  observedBytes: external_exports.number().int().nonnegative(),
+  retainedBytes: external_exports.number().int().nonnegative(),
+  omittedBytes: external_exports.number().int().nonnegative(),
+  truncated: external_exports.boolean(),
+  digest: external_exports.string().regex(/^[0-9a-f]{64}$/)
+}).superRefine((evidence, context) => {
+  const retainedBytes = new TextEncoder().encode(evidence.text).byteLength;
+  const limit = evidence.mediaType === "text/x-diff" ? BENCHMARK_REVIEW_PATCH_LIMIT_BYTES : BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES;
+  if (retainedBytes > limit) {
+    context.addIssue({
+      code: "custom",
+      path: ["retainedBytes"],
+      message: `Benchmark review evidence exceeds its ${limit}-byte retained limit`
+    });
+  }
+  if (retainedBytes !== evidence.retainedBytes) {
+    context.addIssue({
+      code: "custom",
+      path: ["retainedBytes"],
+      message: "Benchmark review evidence retained-byte count does not match its text"
+    });
+  }
+  if (evidence.truncated !== evidence.omittedBytes > 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["truncated"],
+      message: "Benchmark review evidence truncation metadata is inconsistent"
+    });
+  }
+  if (evidence.digest !== contentHash({
+    mediaType: evidence.mediaType,
+    text: evidence.text,
+    observedBytes: evidence.observedBytes,
+    omittedBytes: evidence.omittedBytes,
+    truncated: evidence.truncated
+  })) {
+    context.addIssue({
+      code: "custom",
+      path: ["digest"],
+      message: "Benchmark review evidence digest does not match its retained content"
+    });
+  }
+});
+var BenchmarkReviewPacketSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  patch: BenchmarkReviewEvidenceSchema,
+  transcript: BenchmarkReviewEvidenceSchema,
+  captureFailures: external_exports.array(external_exports.string().min(1))
+});
 var BenchmarkTrialResultSchema = external_exports.strictObject({
   trial: BenchmarkScheduleEntrySchema,
   hostVersion: external_exports.string().min(1),
@@ -32850,7 +32920,30 @@ var BenchmarkTrialResultSchema = external_exports.strictObject({
   limitations: external_exports.array(external_exports.string()),
   durationMs: external_exports.number().int().nonnegative(),
   humanInterventions: external_exports.number().int().nonnegative(),
-  failureTrace: external_exports.array(external_exports.string())
+  failureTrace: external_exports.array(external_exports.string()),
+  reviewPacket: BenchmarkReviewPacketSchema.optional()
+}).superRefine((result, context) => {
+  if (result.accepted && (result.reviewPacket?.captureFailures.length ?? 0) > 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["accepted"],
+      message: "A trial with review-packet capture failures cannot be accepted as review-complete"
+    });
+  }
+  if (result.accepted && result.reviewPacket?.patch.truncated) {
+    context.addIssue({
+      code: "custom",
+      path: ["accepted"],
+      message: "A trial with truncated patch evidence cannot be accepted as review-complete"
+    });
+  }
+  if (result.accepted && result.reviewPacket?.transcript.truncated) {
+    context.addIssue({
+      code: "custom",
+      path: ["accepted"],
+      message: "A trial with truncated transcript evidence cannot be accepted as review-complete"
+    });
+  }
 });
 var BenchmarkReportSchema = external_exports.strictObject({
   schemaVersion: external_exports.literal(2),
@@ -32868,17 +32961,33 @@ var BenchmarkReportSchema = external_exports.strictObject({
   effortPolicy: BenchmarkEffortPolicySchema,
   permissionPolicy: BenchmarkPermissionPoliciesSchema,
   scorerPolicy: external_exports.literal("fixture_bound_scorers_plus_suite_assertions"),
+  reviewPolicy: external_exports.literal("bounded_redacted_patch_and_transcript_v1").optional(),
   environment: external_exports.strictObject({
     platform: external_exports.string().min(1),
     architecture: external_exports.string().min(1),
     nodeVersion: external_exports.string().min(1),
-    graphcraftVersion: external_exports.string().trim().min(1)
+    graphcraftVersion: external_exports.string().trim().min(1),
+    graphcraftSource: BenchmarkSourceIdentitySchema.optional()
   }),
   limitations: external_exports.array(external_exports.string()),
   schedule: external_exports.array(BenchmarkScheduleEntrySchema).min(1),
   results: external_exports.array(BenchmarkTrialResultSchema),
   summary: external_exports.record(external_exports.string(), external_exports.unknown())
 }).superRefine((report, context) => {
+  if (report.reviewPolicy !== void 0 && report.environment.graphcraftSource === void 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["environment", "graphcraftSource"],
+      message: "Evidence-backed benchmark reports must bind an exact Graphcraft source identity"
+    });
+  }
+  if (report.reviewPolicy !== void 0 && report.environment.graphcraftSource?.dirty) {
+    context.addIssue({
+      code: "custom",
+      path: ["environment", "graphcraftSource", "dirty"],
+      message: "Evidence-backed benchmark reports require a clean Graphcraft source tree"
+    });
+  }
   const scheduleByTrialId = /* @__PURE__ */ new Map();
   for (const [index, trial] of report.schedule.entries()) {
     if (scheduleByTrialId.has(trial.trialId)) {
@@ -32907,6 +33016,13 @@ var BenchmarkReportSchema = external_exports.strictObject({
         code: "custom",
         path: ["results", index, "trial"],
         message: "Benchmark result trials must exactly match a scheduled trial"
+      });
+    }
+    if (report.reviewPolicy !== void 0 && result.reviewPacket === void 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["results", index, "reviewPacket"],
+        message: "Every evidence-backed benchmark result must retain a review packet"
       });
     }
   }
@@ -35024,6 +35140,9 @@ function reduceEvents(events) {
       case "semantic.verdict":
       case "scope.started":
       case "scope.checked":
+      case "probe.process.started":
+      case "probe.process.finished":
+      case "probe.process.reconciled":
       case "control.observed":
       case "control.override":
         break;
@@ -35387,8 +35506,8 @@ function structuredOutputExceedsLimit(value) {
     return Buffer.byteLength(value) > ADAPTER_STRUCTURED_OUTPUT_LIMIT_BYTES;
   }
   try {
-    const serialized = JSON.stringify(value);
-    return typeof serialized === "string" && Buffer.byteLength(serialized) > ADAPTER_STRUCTURED_OUTPUT_LIMIT_BYTES;
+    const serialized2 = JSON.stringify(value);
+    return typeof serialized2 === "string" && Buffer.byteLength(serialized2) > ADAPTER_STRUCTURED_OUTPUT_LIMIT_BYTES;
   } catch {
     return false;
   }
@@ -36012,8 +36131,8 @@ function structuredOutputExceedsLimit2(value) {
     return Buffer.byteLength(value) > ADAPTER_STRUCTURED_OUTPUT_LIMIT_BYTES2;
   }
   try {
-    const serialized = JSON.stringify(value);
-    return typeof serialized === "string" && Buffer.byteLength(serialized) > ADAPTER_STRUCTURED_OUTPUT_LIMIT_BYTES2;
+    const serialized2 = JSON.stringify(value);
+    return typeof serialized2 === "string" && Buffer.byteLength(serialized2) > ADAPTER_STRUCTURED_OUTPUT_LIMIT_BYTES2;
   } catch {
     return false;
   }
@@ -38085,8 +38204,8 @@ function replaceJsonValue(source, value, configured) {
   const leading = body.match(/^[\t\n\r ]*/u)?.[0] ?? "";
   const trailing = body.match(/[\t\n\r ]*$/u)?.[0] ?? "";
   const tokenRedacted = redactJsonTokens(JSON.stringify(value), configured);
-  const serialized = redactString(tokenRedacted, configured) === tokenRedacted ? tokenRedacted : JSON.stringify("[REDACTED]");
-  return `${bom}${leading}${serialized}${trailing}`;
+  const serialized2 = redactString(tokenRedacted, configured) === tokenRedacted ? tokenRedacted : JSON.stringify("[REDACTED]");
+  return `${bom}${leading}${serialized2}${trailing}`;
 }
 function redactJsonDocument(source, configured) {
   const bom = source.startsWith("\uFEFF") ? source.slice(1) : source;
@@ -41045,6 +41164,7 @@ import { dirname as dirname6, join as join6, resolve as resolve5, sep as sep3 } 
 // packages/probes/src/process.ts
 var import_cross_spawn4 = __toESM(require_cross_spawn(), 1);
 import { createHash as createHash3 } from "node:crypto";
+import { constants as osConstants } from "node:os";
 var MIB4 = 1024 * 1024;
 var DEFAULT_PROCESS_OUTPUT_BYTES_PER_STREAM = 8 * MIB4;
 var DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM = MIB4;
@@ -41114,6 +41234,471 @@ var BoundedStreamCapture = class {
     };
   }
 };
+var MANAGED_PROCESS_BROKER_SOURCE = String.raw`
+const { spawn } = require("node:child_process");
+const { fsyncSync, writeSync } = require("node:fs");
+
+const executionId = process.argv[1];
+const ownerToken = process.argv[2];
+const journalFd = 4;
+const gracefulMs = 2000;
+const settlementMs = 2000;
+let target;
+let settled = false;
+let terminating = false;
+let targetClosed = false;
+let targetCode = null;
+let targetSignal = null;
+let settlementOutcome = "terminated";
+let forceTimer;
+let settlementTimer;
+let settlementPoll;
+let startTimer;
+
+function append(record) {
+  writeSync(journalFd, JSON.stringify({
+    schemaVersion: 1,
+    executionId,
+    ownerToken,
+    brokerPid: process.pid,
+    ...record,
+  }) + "\n");
+  fsyncSync(journalFd);
+}
+
+function send(message) {
+  if (process.connected) {
+    try { process.send(message); } catch {}
+  }
+}
+
+function finish(outcome, confirmed, code, signal) {
+  if (settled) return;
+  settled = true;
+  if (forceTimer) clearTimeout(forceTimer);
+  if (settlementTimer) clearTimeout(settlementTimer);
+  if (settlementPoll) clearInterval(settlementPoll);
+  if (startTimer) clearTimeout(startTimer);
+  const record = {
+    status: "settled",
+    outcome,
+    confirmed,
+    childPid: target && Number.isSafeInteger(target.pid) ? target.pid : null,
+    exitCode: code === undefined ? null : code,
+    exitSignal: signal === undefined ? null : signal,
+    settledAt: new Date().toISOString(),
+  };
+  try { append(record); } catch {
+    record.confirmed = false;
+    record.outcome = "unconfirmed";
+  }
+  const message = {
+    type: "settled",
+    schemaVersion: 1,
+    ...record,
+    executionId,
+    brokerPid: process.pid,
+  };
+  let exitScheduled = false;
+  let exitTimer;
+  const exitBroker = () => {
+    if (exitScheduled) return;
+    exitScheduled = true;
+    if (exitTimer) clearTimeout(exitTimer);
+    try { if (process.connected) process.disconnect(); } catch {}
+    setImmediate(() => process.exit(record.confirmed ? 0 : 1));
+  };
+  if (process.connected) {
+    try {
+      process.send(message, exitBroker);
+      exitTimer = setTimeout(exitBroker, 1000);
+    } catch {
+      exitBroker();
+    }
+  } else {
+    exitBroker();
+  }
+}
+
+function targetTreeAlive() {
+  if (!target || !Number.isSafeInteger(target.pid) || target.pid <= 0) return false;
+  if (process.platform === "win32") return !targetClosed;
+  try {
+    process.kill(-target.pid, 0);
+    return true;
+  } catch (error) {
+    return !error || error.code !== "ESRCH";
+  }
+}
+
+function settleIfTreeExited() {
+  if (targetClosed && !targetTreeAlive()) {
+    finish(settlementOutcome, true, targetCode, targetSignal);
+    return true;
+  }
+  return false;
+}
+
+function windowsTaskkill(pid) {
+  const root = process.env.SystemRoot;
+  const executable = root ? require("node:path").win32.join(root, "System32", "taskkill.exe") : "taskkill.exe";
+  const killer = spawn(executable, ["/pid", String(pid), "/t", "/f"], {
+    shell: false,
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  killer.once("error", () => { try { target.kill("SIGKILL"); } catch {} });
+  killer.unref();
+}
+
+function signalTarget(signal) {
+  if (!target || !Number.isSafeInteger(target.pid) || target.pid <= 0) return;
+  try {
+    if (process.platform === "win32") windowsTaskkill(target.pid);
+    else process.kill(-target.pid, signal);
+  } catch {
+    try { target.kill(signal); } catch {}
+  }
+}
+
+function terminate(outcome = "terminated") {
+  if (settled) return;
+  if (!terminating) {
+    terminating = true;
+    settlementOutcome = outcome;
+  }
+  if (!target) {
+    finish("cancelled_before_start", true, null, null);
+    return;
+  }
+  if (settleIfTreeExited()) return;
+  signalTarget("SIGTERM");
+  if (!forceTimer)
+    forceTimer = setTimeout(() => {
+      signalTarget("SIGKILL");
+      settleIfTreeExited();
+    }, gracefulMs);
+  if (!settlementPoll)
+    settlementPoll = setInterval(() => settleIfTreeExited(), 25);
+  if (!settlementTimer)
+    settlementTimer = setTimeout(() => {
+      if (!settleIfTreeExited()) finish("unconfirmed", false, targetCode, targetSignal);
+    }, gracefulMs + settlementMs);
+}
+
+function outputFailed() {
+  // A killed runtime closes the broker's inherited stdout/stderr pipes. Treat
+  // EPIPE (and any other output transport failure) as a termination request so
+  // the owned target tree is still reaped before the broker exits.
+  terminate();
+}
+
+process.stdout.on("error", outputFailed);
+process.stderr.on("error", outputFailed);
+
+process.on("message", (message) => {
+  if (!message || typeof message !== "object") return;
+  if (message.type === "terminate") {
+    terminate();
+    return;
+  }
+  if (message.type !== "start" || target || settled || terminating) return;
+  if (startTimer) clearTimeout(startTimer);
+  try {
+    append({ status: "starting", startingAt: new Date().toISOString() });
+    target = spawn(message.executable, message.args, {
+      cwd: message.cwd,
+      env: message.env,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+      windowsHide: true,
+    });
+    target.once("error", () => {
+      if (!Number.isSafeInteger(target && target.pid) || target.pid <= 0)
+        finish("failed_to_start", true, null, null);
+      else
+        terminate();
+    });
+    if (!Number.isSafeInteger(target.pid) || target.pid <= 0) return;
+    append({
+      status: "started",
+      childPid: target.pid,
+      startedAt: new Date().toISOString(),
+    });
+    target.stdout.on("error", outputFailed);
+    target.stderr.on("error", outputFailed);
+    target.stdout.pipe(process.stdout);
+    target.stderr.pipe(process.stderr);
+    target.once("close", (code, signal) => {
+      targetClosed = true;
+      targetCode = code;
+      targetSignal = signal;
+      if (terminating) {
+        settleIfTreeExited();
+        return;
+      }
+      if (targetTreeAlive()) terminate("exited");
+      else finish("exited", true, code, signal);
+    });
+  } catch {
+    if (target && Number.isSafeInteger(target.pid) && target.pid > 0) terminate();
+    else finish("failed_to_start", true, null, null);
+  }
+});
+
+process.once("disconnect", terminate);
+process.once("SIGTERM", terminate);
+process.once("SIGINT", terminate);
+startTimer = setTimeout(terminate, 30000);
+startTimer.unref();
+append({ status: "ready", readyAt: new Date().toISOString() });
+send({
+  type: "ready",
+  schemaVersion: 1,
+  executionId,
+  brokerPid: process.pid,
+  processGroupId: null,
+  platform: process.platform,
+  readyAt: new Date().toISOString(),
+});
+`;
+function exactMessageKeys(value, expected) {
+  const actual = Object.keys(value).sort();
+  const sortedExpected = [...expected].sort();
+  return actual.length === sortedExpected.length && actual.every((key, index) => key === sortedExpected[index]);
+}
+function validExitSignal(value) {
+  return value === null || typeof value === "string" && Object.prototype.hasOwnProperty.call(osConstants.signals, value);
+}
+function validManagedReady(value, lifecycle) {
+  if (!value || typeof value !== "object") return void 0;
+  const candidate = value;
+  if (!exactMessageKeys(value, [
+    "type",
+    "schemaVersion",
+    "executionId",
+    "brokerPid",
+    "processGroupId",
+    "platform",
+    "readyAt"
+  ]) || candidate.type !== "ready" || candidate.schemaVersion !== 1 || candidate.executionId !== lifecycle.executionId || !Number.isSafeInteger(candidate.brokerPid) || candidate.brokerPid <= 0 || candidate.processGroupId !== null && (!Number.isSafeInteger(candidate.processGroupId) || candidate.processGroupId <= 0) || ![
+    "aix",
+    "android",
+    "darwin",
+    "freebsd",
+    "haiku",
+    "linux",
+    "openbsd",
+    "sunos",
+    "win32",
+    "cygwin",
+    "netbsd"
+  ].includes(String(candidate.platform)) || typeof candidate.readyAt !== "string" || !Number.isFinite(Date.parse(candidate.readyAt)))
+    return void 0;
+  return candidate;
+}
+function validManagedSettlement(value, lifecycle) {
+  if (!value || typeof value !== "object") return void 0;
+  const candidate = value;
+  if (!exactMessageKeys(value, [
+    "type",
+    "schemaVersion",
+    "executionId",
+    "brokerPid",
+    "status",
+    "outcome",
+    "confirmed",
+    "childPid",
+    "exitCode",
+    "exitSignal",
+    "settledAt"
+  ]) || candidate.type !== "settled" || candidate.schemaVersion !== 1 || candidate.executionId !== lifecycle.executionId || !Number.isSafeInteger(candidate.brokerPid) || candidate.brokerPid <= 0 || candidate.childPid !== null && (!Number.isSafeInteger(candidate.childPid) || candidate.childPid <= 0) || !["exited", "terminated", "cancelled_before_start", "failed_to_start", "unconfirmed"].includes(
+    String(candidate.outcome)
+  ) || typeof candidate.confirmed !== "boolean" || candidate.exitCode !== null && !Number.isInteger(candidate.exitCode) || !validExitSignal(candidate.exitSignal) || typeof candidate.settledAt !== "string" || !Number.isFinite(Date.parse(candidate.settledAt)) || candidate.status !== "settled" || candidate.confirmed === true && candidate.outcome === "unconfirmed" || candidate.confirmed === false && candidate.outcome !== "unconfirmed" || ["exited", "terminated"].includes(String(candidate.outcome)) && (!Number.isSafeInteger(candidate.childPid) || candidate.childPid <= 0) || ["cancelled_before_start", "failed_to_start"].includes(String(candidate.outcome)) && (candidate.childPid !== null || candidate.exitCode !== null || candidate.exitSignal !== null))
+    return void 0;
+  return {
+    schemaVersion: 1,
+    executionId: candidate.executionId,
+    brokerPid: candidate.brokerPid,
+    childPid: candidate.childPid,
+    outcome: candidate.outcome,
+    confirmed: candidate.confirmed,
+    exitCode: candidate.exitCode,
+    exitSignal: candidate.exitSignal,
+    settledAt: candidate.settledAt
+  };
+}
+async function runManagedProcess(executable, args, environment, options, started, timeoutMs, maxOutputBytesPerStream, outputOverflow) {
+  const lifecycle = options.lifecycle;
+  return await new Promise((resolve14, reject) => {
+    const broker = import_cross_spawn4.default.spawn(
+      process.execPath,
+      ["-e", MANAGED_PROCESS_BROKER_SOURCE, lifecycle.executionId, lifecycle.ownerToken],
+      {
+        cwd: options.cwd,
+        env: environment,
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe", "ipc", lifecycle.journalFd],
+        detached: process.platform !== "win32",
+        windowsHide: true
+      }
+    );
+    const stdoutCapture = new BoundedStreamCapture(maxOutputBytesPerStream);
+    const stderrCapture = new BoundedStreamCapture(maxOutputBytesPerStream);
+    let timedOut = false;
+    let overflowStream;
+    let settled = false;
+    let terminationStarted = false;
+    let lifecycleError;
+    let targetSettlement;
+    let settlementPersisted;
+    let escalationTimer;
+    let settlementTimer;
+    let timer;
+    const requestTermination = () => {
+      if (terminationStarted || settled) return;
+      terminationStarted = true;
+      if (timer) clearTimeout(timer);
+      try {
+        if (broker.connected) broker.send({ type: "terminate" });
+      } catch {
+      }
+      escalationTimer = setTimeout(() => {
+        try {
+          if (broker.connected) broker.send({ type: "terminate", force: true });
+        } catch {
+        }
+        settlementTimer = setTimeout(() => {
+          try {
+            terminateChildProcessTree(broker, "SIGKILL");
+          } catch {
+          }
+        }, PROCESS_SETTLEMENT_GRACE_MS);
+        settlementTimer.unref();
+      }, PROCESS_TERMINATION_GRACE_MS);
+      escalationTimer.unref();
+    };
+    const capture = (stream, target, chunk) => {
+      const overflowed = target.append(chunk);
+      if (overflowed && outputOverflow === "reject" && !overflowStream) {
+        overflowStream = stream;
+        requestTermination();
+      }
+    };
+    broker.stdout.on("data", (chunk) => capture("stdout", stdoutCapture, chunk));
+    broker.stderr.on("data", (chunk) => capture("stderr", stderrCapture, chunk));
+    const abort = () => requestTermination();
+    options.signal?.addEventListener("abort", abort, { once: true });
+    timer = setTimeout(() => {
+      timedOut = true;
+      requestTermination();
+    }, timeoutMs);
+    timer.unref();
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      if (escalationTimer) clearTimeout(escalationTimer);
+      if (settlementTimer) clearTimeout(settlementTimer);
+      options.signal?.removeEventListener("abort", abort);
+    };
+    const complete = async (brokerCode, error51) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      try {
+        await settlementPersisted;
+      } catch (settlementError) {
+        lifecycleError ??= settlementError;
+      }
+      try {
+        broker.stdout.destroy();
+        broker.stderr.destroy();
+        broker.unref();
+      } catch {
+      }
+      const finalError = lifecycleError ?? error51;
+      if (finalError) {
+        reject(finalError);
+        return;
+      }
+      if (!targetSettlement?.confirmed) {
+        reject(
+          new Error(
+            `Managed subprocess ${lifecycle.executionId} exited without confirmed tree settlement (broker ${brokerCode ?? "unknown"})`
+          )
+        );
+        return;
+      }
+      const stdout = stdoutCapture.finish("stdout");
+      const stderr = stderrCapture.finish("stderr");
+      const captureMetadata = {
+        stdout: stdout.metadata,
+        stderr: stderr.metadata
+      };
+      if (overflowStream) {
+        reject(new ProcessOutputLimitError(overflowStream, captureMetadata));
+        return;
+      }
+      resolve14({
+        exitCode: timedOut ? 124 : targetSettlement.exitCode ?? 1,
+        stdout: stdout.text,
+        stderr: stderr.text,
+        durationMs: Math.round(performance.now() - started),
+        timedOut,
+        capture: captureMetadata
+      });
+    };
+    broker.on("message", (message) => {
+      const ready = validManagedReady(message, lifecycle);
+      if (ready) {
+        if (ready.brokerPid !== broker.pid) {
+          lifecycleError = new Error(
+            `Managed subprocess ${lifecycle.executionId} reported an ambiguous broker identity`
+          );
+          requestTermination();
+          return;
+        }
+        void lifecycle.onReady(ready).then(() => {
+          if (terminationStarted || options.signal?.aborted) {
+            requestTermination();
+            return;
+          }
+          if (!broker.connected) {
+            lifecycleError = new Error(
+              `Managed subprocess ${lifecycle.executionId} disconnected before authorization`
+            );
+            return;
+          }
+          broker.send({
+            type: "start",
+            executable,
+            args,
+            cwd: options.cwd,
+            env: environment
+          });
+        }).catch((error51) => {
+          lifecycleError = error51;
+          requestTermination();
+        });
+        return;
+      }
+      const settlement = validManagedSettlement(message, lifecycle);
+      if (!settlement) return;
+      if (settlement.brokerPid !== broker.pid) {
+        lifecycleError = new Error(
+          `Managed subprocess ${lifecycle.executionId} settled under an ambiguous broker identity`
+        );
+        requestTermination();
+        return;
+      }
+      targetSettlement = settlement;
+      settlementPersisted = lifecycle.onSettled(settlement);
+    });
+    broker.once("error", (error51) => void complete(null, error51));
+    broker.once("close", (code) => void complete(code));
+    if (options.signal?.aborted) requestTermination();
+  });
+}
 async function runProcess(command, args, options) {
   if (command.trim().length === 0) throw new Error("Subprocess command must not be empty");
   if (command.includes("\0")) throw new Error("Subprocess command must not contain NUL bytes");
@@ -41131,6 +41716,17 @@ async function runProcess(command, args, options) {
     environment,
     untrustedCwd: options.cwd
   });
+  if (options.lifecycle)
+    return await runManagedProcess(
+      executable,
+      args,
+      environment,
+      options,
+      started,
+      timeoutMs,
+      maxOutputBytesPerStream,
+      outputOverflow
+    );
   return await new Promise((resolve14, reject) => {
     const child = import_cross_spawn4.default.spawn(executable, args, {
       cwd: options.cwd,
@@ -41241,7 +41837,7 @@ function compactOutput(result) {
   return `${prefix}${value.length > available ? "\n\u2026" : ""}
 ${note}`;
 }
-async function runProbe(spec, repositoryPath, signal) {
+async function runProbe(spec, repositoryPath, signal, lifecycle) {
   const started = performance.now();
   if (spec.kind === "held_out")
     throw new Error(`Held-out probe ${spec.id} must be resolved by the runtime`);
@@ -41251,7 +41847,8 @@ async function runProbe(spec, repositoryPath, signal) {
       timeoutMs: spec.timeoutMs,
       maxOutputBytesPerStream: DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM,
       outputOverflow: "truncate",
-      ...signal ? { signal } : {}
+      ...signal ? { signal } : {},
+      ...lifecycle ? { lifecycle } : {}
     });
     const output2 = [processResult.stdout, processResult.stderr].filter(Boolean).join("\n");
     const passed2 = !processResult.timedOut && processResult.exitCode === spec.expectedExitCode;
@@ -41345,11 +41942,6 @@ async function runProbe(spec, repositoryPath, signal) {
     },
     output
   };
-}
-async function runProbes(specs, repositoryPath, signal) {
-  const results = [];
-  for (const spec of specs) results.push(await runProbe(spec, repositoryPath, signal));
-  return results;
 }
 var probeStopWords = /* @__PURE__ */ new Set([
   "across",
@@ -41627,8 +42219,8 @@ async function discoverProbePlan(repositoryPath, task, baseSha, options = {}) {
 }
 
 // packages/runtime/src/runner.ts
-import { randomUUID as randomUUID8 } from "node:crypto";
-import { join as join12 } from "node:path";
+import { randomUUID as randomUUID9 } from "node:crypto";
+import { join as join13 } from "node:path";
 
 // packages/runtime/src/control.ts
 import { randomUUID as randomUUID5 } from "node:crypto";
@@ -41684,9 +42276,9 @@ var RunControlChannel = class {
   async read() {
     await this.ensureStorage();
     await hardenPrivateFile(this.path, this.graphcraftRoot);
-    let serialized;
+    let serialized2;
     try {
-      serialized = await readPrivateFileBounded(
+      serialized2 = await readPrivateFileBounded(
         this.path,
         CONTROL_REQUEST_MAX_BYTES,
         this.graphcraftRoot
@@ -41696,7 +42288,7 @@ var RunControlChannel = class {
       throw error51;
     }
     try {
-      return RunControlRequestSchema.parse(JSON.parse(serialized.toString("utf8")));
+      return RunControlRequestSchema.parse(JSON.parse(serialized2.toString("utf8")));
     } catch {
       return void 0;
     }
@@ -45787,6 +46379,374 @@ function createProgressDecisionPacket(input) {
   });
 }
 
+// packages/runtime/src/probe-process.ts
+import { randomUUID as randomUUID8 } from "node:crypto";
+import { constants as fsConstants6 } from "node:fs";
+import { open as open7, rmdir as rmdir2, unlink as unlink4 } from "node:fs/promises";
+import { constants as osConstants2 } from "node:os";
+import { dirname as dirname9, join as join12, relative as relative8 } from "node:path";
+var PROBE_PROCESS_JOURNAL_MAX_BYTES = 64 * 1024;
+var PROBE_PROCESS_SETTLEMENT_WAIT_MS = 6e3;
+var PROBE_PROCESS_REMOVAL_RETRY_MS = 2e3;
+var WINDOWS_TRANSIENT_REMOVAL_ERRORS = /* @__PURE__ */ new Set(["EACCES", "EBUSY", "EPERM"]);
+var probeProcessRunMutationTails = /* @__PURE__ */ new Map();
+function commandHash(probe) {
+  return contentHash({
+    schemaVersion: 1,
+    command: probe.command,
+    args: probe.args,
+    cwd: probe.cwd ?? ".",
+    expectedExitCode: probe.expectedExitCode,
+    timeoutMs: probe.timeoutMs
+  });
+}
+function probeProcessDefinitions(checkpointId, probes) {
+  return probes.flatMap((probe, index) => {
+    if (probe.kind !== "command") return [];
+    const digest = commandHash(probe);
+    return [
+      {
+        schemaVersion: 1,
+        executionId: contentHash({
+          schemaVersion: 1,
+          kind: "probe_process",
+          checkpointId,
+          probeId: probe.id,
+          index,
+          commandHash: digest
+        }),
+        probeId: probe.id,
+        commandHash: digest
+      }
+    ];
+  });
+}
+function parseProbeProcessDefinitions(value) {
+  if (value === void 0) return [];
+  if (!Array.isArray(value)) return void 0;
+  const definitions = [];
+  for (const item of value) {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) return void 0;
+    const record2 = item;
+    const candidate = item;
+    if (!exactKeys(record2, ["schemaVersion", "executionId", "probeId", "commandHash"]) || candidate.schemaVersion !== 1 || typeof candidate.executionId !== "string" || !/^[a-f0-9]{64}$/.test(candidate.executionId) || typeof candidate.probeId !== "string" || candidate.probeId.length === 0 || typeof candidate.commandHash !== "string" || !/^[a-f0-9]{64}$/.test(candidate.commandHash))
+      return void 0;
+    definitions.push(candidate);
+  }
+  if (new Set(definitions.map(({ executionId }) => executionId)).size !== definitions.length || new Set(definitions.map(({ probeId }) => probeId)).size !== definitions.length)
+    return void 0;
+  return definitions;
+}
+function probeProcessLifecycleExecutionId(event) {
+  if (event.type === "probe.process.started") {
+    const definition = event.data.definition;
+    if (definition === null || typeof definition !== "object" || Array.isArray(definition))
+      return void 0;
+    const executionId = definition.executionId;
+    return typeof executionId === "string" ? executionId : void 0;
+  }
+  return typeof event.data.executionId === "string" ? event.data.executionId : void 0;
+}
+function probeProcessEventSettlement(input) {
+  if (input.event.type !== input.type || input.event.actor !== input.actor || input.event.causationId !== input.executionId || input.event.data.schemaVersion !== 1 || input.event.data.executionId !== input.executionId || input.event.data.nodeId !== input.nodeId || input.event.data.stage !== input.stage || input.event.data.checkpointId !== input.checkpointId || input.started !== void 0 && input.event.data.started !== input.started)
+    return void 0;
+  const settlement = input.event.data.settlement;
+  if (settlement === null || typeof settlement !== "object" || Array.isArray(settlement))
+    return void 0;
+  const candidate = settlement;
+  if (!exactKeys(candidate, [
+    "schemaVersion",
+    "executionId",
+    "brokerPid",
+    "childPid",
+    "outcome",
+    "confirmed",
+    "exitCode",
+    "exitSignal",
+    "settledAt"
+  ]) || candidate.schemaVersion !== 1 || candidate.executionId !== input.executionId || !Number.isSafeInteger(candidate.brokerPid) || Number(candidate.brokerPid) <= 0 || input.brokerPid !== void 0 && candidate.brokerPid !== input.brokerPid || candidate.childPid !== null && (!Number.isSafeInteger(candidate.childPid) || Number(candidate.childPid) <= 0) || typeof candidate.confirmed !== "boolean" || !["exited", "terminated", "cancelled_before_start", "failed_to_start", "unconfirmed"].includes(
+    String(candidate.outcome)
+  ) || candidate.exitCode !== null && !Number.isInteger(candidate.exitCode) || candidate.exitSignal !== null && (typeof candidate.exitSignal !== "string" || !Object.prototype.hasOwnProperty.call(osConstants2.signals, candidate.exitSignal)) || typeof candidate.settledAt !== "string" || !Number.isFinite(Date.parse(candidate.settledAt)) || candidate.confirmed === true && candidate.outcome === "unconfirmed" || candidate.confirmed === false && candidate.outcome !== "unconfirmed" || ["exited", "terminated"].includes(String(candidate.outcome)) && (!Number.isSafeInteger(candidate.childPid) || Number(candidate.childPid) <= 0) || ["cancelled_before_start", "failed_to_start"].includes(String(candidate.outcome)) && (candidate.childPid !== null || candidate.exitCode !== null || candidate.exitSignal !== null))
+    return void 0;
+  return {
+    confirmed: candidate.confirmed,
+    brokerPid: Number(candidate.brokerPid),
+    outcome: String(candidate.outcome)
+  };
+}
+function journalPath(graphcraftRoot2, runId, executionId) {
+  return join12(graphcraftRoot2, "locks", "probe-processes", runId, `${executionId}.jsonl`);
+}
+async function withProbeProcessRunMutation(runRoot, action) {
+  const previous = probeProcessRunMutationTails.get(runRoot) ?? Promise.resolve();
+  let release;
+  const gate = new Promise((resolve14) => release = resolve14);
+  const tail = previous.then(() => gate);
+  probeProcessRunMutationTails.set(runRoot, tail);
+  await previous;
+  try {
+    return await action();
+  } finally {
+    release();
+    if (probeProcessRunMutationTails.get(runRoot) === tail)
+      probeProcessRunMutationTails.delete(runRoot);
+  }
+}
+function serialized(value) {
+  return `${JSON.stringify(value)}
+`;
+}
+async function createProbeProcessLease(input) {
+  const root = join12(input.graphcraftRoot, "locks", "probe-processes", input.runId);
+  return await withProbeProcessRunMutation(root, async () => {
+    await ensurePrivateDirectory(root, input.graphcraftRoot);
+    const path = journalPath(input.graphcraftRoot, input.runId, input.definition.executionId);
+    await validatePrivatePath(input.graphcraftRoot, relative8(input.graphcraftRoot, path));
+    const directoryMutation = await preparePrivateDirectoryMutation(
+      dirname9(path),
+      input.graphcraftRoot
+    );
+    const noFollow = process.platform === "win32" ? 0 : fsConstants6.O_NOFOLLOW;
+    let handle;
+    try {
+      handle = await open7(
+        path,
+        fsConstants6.O_CREAT | fsConstants6.O_EXCL | fsConstants6.O_RDWR | fsConstants6.O_APPEND | noFollow,
+        384
+      );
+      const ownerToken = randomUUID8();
+      const prepared = {
+        schemaVersion: 1,
+        executionId: input.definition.executionId,
+        ownerToken,
+        status: "prepared",
+        checkpointId: input.checkpointId,
+        nodeId: input.nodeId,
+        stage: input.stage,
+        probeId: input.definition.probeId,
+        commandHash: input.definition.commandHash,
+        preparedAt: (/* @__PURE__ */ new Date()).toISOString()
+      };
+      await handle.write(serialized(prepared));
+      await handle.sync();
+      await hardenPrivateFile(path, input.graphcraftRoot);
+      await finalizePrivateDirectoryMutation(directoryMutation, input.graphcraftRoot);
+      return {
+        definition: input.definition,
+        ownerTokenHash: contentHash(ownerToken),
+        journalPath: path,
+        journalRelativePath: relative8(input.graphcraftRoot, path).replaceAll("\\", "/"),
+        handle,
+        lifecycle: ({ onReady, onSettled }) => ({
+          executionId: input.definition.executionId,
+          ownerToken,
+          journalFd: handle.fd,
+          onReady,
+          onSettled
+        })
+      };
+    } catch (error51) {
+      if (handle) await handle.close().catch(() => void 0);
+      await finalizePrivateDirectoryMutation(directoryMutation, input.graphcraftRoot).catch(
+        () => void 0
+      );
+      throw error51;
+    }
+  });
+}
+function strictObject2(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : void 0;
+}
+function positivePid(value) {
+  return Number.isSafeInteger(value) && Number(value) > 0;
+}
+function exactKeys(record2, expected) {
+  const actual = Object.keys(record2).sort();
+  const sortedExpected = [...expected].sort();
+  return actual.length === sortedExpected.length && actual.every((key, index) => key === sortedExpected[index]);
+}
+function validDate(value) {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+function parsePrepared(value) {
+  const record2 = strictObject2(value);
+  if (!record2 || !exactKeys(record2, [
+    "schemaVersion",
+    "executionId",
+    "ownerToken",
+    "status",
+    "checkpointId",
+    "nodeId",
+    "stage",
+    "probeId",
+    "commandHash",
+    "preparedAt"
+  ]) || record2.schemaVersion !== 1 || typeof record2.executionId !== "string" || !/^[a-f0-9]{64}$/.test(record2.executionId) || typeof record2.ownerToken !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    record2.ownerToken
+  ) || record2.status !== "prepared" || typeof record2.checkpointId !== "string" || record2.checkpointId.length === 0 || typeof record2.nodeId !== "string" || record2.nodeId.length === 0 || !["progress_baseline", "progress_current", "verification"].includes(String(record2.stage)) || typeof record2.probeId !== "string" || record2.probeId.length === 0 || typeof record2.commandHash !== "string" || !/^[a-f0-9]{64}$/.test(record2.commandHash) || typeof record2.preparedAt !== "string" || !Number.isFinite(Date.parse(record2.preparedAt)))
+    return void 0;
+  return record2;
+}
+function parseBroker(value) {
+  const record2 = strictObject2(value);
+  if (!record2 || record2.schemaVersion !== 1 || typeof record2.executionId !== "string" || !/^[a-f0-9]{64}$/.test(record2.executionId) || typeof record2.ownerToken !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    record2.ownerToken
+  ) || !positivePid(record2.brokerPid) || !["ready", "starting", "started", "settled"].includes(String(record2.status)))
+    return void 0;
+  if (record2.status === "ready" && (!exactKeys(record2, [
+    "schemaVersion",
+    "executionId",
+    "ownerToken",
+    "brokerPid",
+    "status",
+    "readyAt"
+  ]) || !validDate(record2.readyAt)) || record2.status === "starting" && (!exactKeys(record2, [
+    "schemaVersion",
+    "executionId",
+    "ownerToken",
+    "brokerPid",
+    "status",
+    "startingAt"
+  ]) || !validDate(record2.startingAt)) || record2.status === "started" && (!exactKeys(record2, [
+    "schemaVersion",
+    "executionId",
+    "ownerToken",
+    "brokerPid",
+    "status",
+    "childPid",
+    "startedAt"
+  ]) || !positivePid(record2.childPid) || !validDate(record2.startedAt)) || record2.status === "settled" && (!exactKeys(record2, [
+    "schemaVersion",
+    "executionId",
+    "ownerToken",
+    "brokerPid",
+    "status",
+    "outcome",
+    "confirmed",
+    "childPid",
+    "exitCode",
+    "exitSignal",
+    "settledAt"
+  ]) || record2.childPid !== null && !positivePid(record2.childPid) || ![
+    "exited",
+    "terminated",
+    "cancelled_before_start",
+    "failed_to_start",
+    "unconfirmed"
+  ].includes(String(record2.outcome)) || typeof record2.confirmed !== "boolean" || record2.exitCode !== null && !Number.isInteger(record2.exitCode) || record2.exitSignal !== null && (typeof record2.exitSignal !== "string" || !Object.prototype.hasOwnProperty.call(osConstants2.signals, record2.exitSignal)) || !validDate(record2.settledAt) || record2.confirmed === true && record2.outcome === "unconfirmed" || record2.confirmed === false && record2.outcome !== "unconfirmed" || ["exited", "terminated"].includes(String(record2.outcome)) && !positivePid(record2.childPid) || ["cancelled_before_start", "failed_to_start"].includes(String(record2.outcome)) && (record2.childPid !== null || record2.exitCode !== null || record2.exitSignal !== null)))
+    return void 0;
+  return record2;
+}
+async function inspectProbeProcessJournal(input) {
+  const path = journalPath(input.graphcraftRoot, input.runId, input.definition.executionId);
+  let source;
+  try {
+    source = await readPrivateFileBounded(
+      path,
+      PROBE_PROCESS_JOURNAL_MAX_BYTES,
+      input.graphcraftRoot
+    );
+  } catch (error51) {
+    if (error51.code === "ENOENT") return void 0;
+    throw error51;
+  }
+  const lines = source.toString("utf8").split("\n").filter((line) => line.length > 0);
+  if (lines.length === 0) throw new Error("Probe process journal is empty");
+  const prepared = parsePrepared(JSON.parse(lines[0]));
+  if (!prepared || prepared.executionId !== input.definition.executionId || prepared.checkpointId !== input.checkpointId || prepared.nodeId !== input.nodeId || prepared.stage !== input.stage || prepared.probeId !== input.definition.probeId || prepared.commandHash !== input.definition.commandHash || input.ownerTokenHash !== void 0 && contentHash(prepared.ownerToken) !== input.ownerTokenHash)
+    throw new Error(
+      `Probe process ${input.definition.executionId} has ambiguous ownership metadata`
+    );
+  let previous = "prepared";
+  let brokerPid;
+  let settlement;
+  for (const line of lines.slice(1)) {
+    const record2 = parseBroker(JSON.parse(line));
+    if (!record2 || record2.executionId !== prepared.executionId || record2.ownerToken !== prepared.ownerToken || brokerPid !== void 0 && record2.brokerPid !== brokerPid)
+      throw new Error(`Probe process ${input.definition.executionId} has an invalid journal chain`);
+    brokerPid ??= record2.brokerPid;
+    const allowed = previous === "prepared" && record2.status === "ready" || previous === "ready" && ["starting", "settled"].includes(record2.status) || previous === "starting" && ["started", "settled"].includes(record2.status) || previous === "started" && record2.status === "settled";
+    if (!allowed)
+      throw new Error(`Probe process ${input.definition.executionId} has an invalid journal order`);
+    previous = record2.status;
+    if (record2.status === "settled") {
+      settlement = {
+        schemaVersion: 1,
+        executionId: prepared.executionId,
+        brokerPid: record2.brokerPid,
+        childPid: positivePid(record2.childPid) ? record2.childPid : null,
+        outcome: record2.outcome,
+        confirmed: record2.confirmed,
+        exitCode: Number.isInteger(record2.exitCode) ? record2.exitCode : null,
+        exitSignal: typeof record2.exitSignal === "string" ? record2.exitSignal : null,
+        settledAt: record2.settledAt
+      };
+    }
+  }
+  if (input.expectedBrokerPid !== void 0 && brokerPid !== input.expectedBrokerPid)
+    throw new Error(`Probe process ${input.definition.executionId} broker identity is ambiguous`);
+  return { prepared, ...brokerPid ? { brokerPid } : {}, ...settlement ? { settlement } : {} };
+}
+async function waitForProbeProcessSettlement(input, timeoutMs = PROBE_PROCESS_SETTLEMENT_WAIT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    const inspected = await inspectProbeProcessJournal(input);
+    if (!inspected || inspected.settlement) return inspected;
+    if (Date.now() >= deadline) return inspected;
+    await new Promise((resolve14) => setTimeout(resolve14, 25));
+  }
+}
+async function closeProbeProcessLease(lease) {
+  await lease.handle.close();
+}
+async function retryWindowsRemoval(action, ignoredErrors) {
+  const deadline = Date.now() + PROBE_PROCESS_REMOVAL_RETRY_MS;
+  let delayMs = 5;
+  while (true) {
+    try {
+      await action();
+      return;
+    } catch (error51) {
+      const code = error51.code ?? "";
+      if (ignoredErrors.has(code)) return;
+      if (process.platform !== "win32" || !WINDOWS_TRANSIENT_REMOVAL_ERRORS.has(code) || Date.now() >= deadline)
+        throw error51;
+      await new Promise((resolve14) => setTimeout(resolve14, delayMs));
+      delayMs = Math.min(100, delayMs * 2);
+    }
+  }
+}
+async function removeProbeProcessJournal(input) {
+  const runRoot = join12(input.graphcraftRoot, "locks", "probe-processes", input.runId);
+  const path = journalPath(input.graphcraftRoot, input.runId, input.executionId);
+  await withProbeProcessRunMutation(runRoot, async () => {
+    const mutation = await preparePrivateDirectoryMutation(dirname9(path), input.graphcraftRoot);
+    try {
+      await retryWindowsRemoval(
+        async () => {
+          await validatePrivatePath(input.graphcraftRoot, relative8(input.graphcraftRoot, path));
+          await unlink4(path);
+        },
+        /* @__PURE__ */ new Set(["ENOENT"])
+      );
+    } finally {
+      await finalizePrivateDirectoryMutation(mutation, input.graphcraftRoot);
+    }
+    const parentMutation = await preparePrivateDirectoryMutation(
+      dirname9(runRoot),
+      input.graphcraftRoot
+    );
+    try {
+      await retryWindowsRemoval(
+        async () => await rmdir2(runRoot),
+        /* @__PURE__ */ new Set(["ENOENT", "ENOTEMPTY", "EEXIST"])
+      );
+    } finally {
+      await finalizePrivateDirectoryMutation(parentMutation, input.graphcraftRoot);
+    }
+  });
+}
+
 // packages/runtime/src/github.ts
 function commandOptions(workspace, options = {}) {
   return { cwd: workspace.path, ...options };
@@ -47495,7 +48455,7 @@ async function createRun(task, options) {
 }
 async function configureRunProbes(store, input) {
   await store.prepareStorage();
-  const lock = new RunLock(join12(store.graphcraftRoot, "locks", `${store.runId}.lock`));
+  const lock = new RunLock(join13(store.graphcraftRoot, "locks", `${store.runId}.lock`));
   await lock.acquire();
   try {
     const state = await store.loadState();
@@ -47534,13 +48494,13 @@ async function configureRunProbes(store, input) {
   }
 }
 async function executeWorker(input) {
-  let invocationId = input.resume?.invocationId ?? randomUUID8();
+  let invocationId = input.resume?.invocationId ?? randomUUID9();
   let resumeSessionId = input.reuseSession?.hostSessionId;
   if (input.resume) {
     await recordMissingUsage(input.store, input.resume, input.node, input.adapter.id);
     const reconciliation = await input.adapter.reconcile(input.resume);
     if (reconciliation.state === "completed" && reconciliation.result) {
-      const artifact2 = join12(
+      const artifact2 = join13(
         input.store.runRoot,
         "artifacts",
         "invocations",
@@ -47578,7 +48538,7 @@ async function executeWorker(input) {
         },
         invocationId
       );
-      invocationId = randomUUID8();
+      invocationId = randomUUID9();
     }
   }
   const { capsule, capsuleHash } = await prepareWorkerContext({
@@ -47633,7 +48593,7 @@ async function executeWorker(input) {
   let termination;
   let usageReceipts = 0;
   const tokenPhase = input.node.id.startsWith("repair-") ? "repair" : "worker";
-  let artifact = join12(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+  let artifact = join13(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
   let preInvocationDiagnostic;
   try {
     preInvocationDiagnostic = diagnoseRequiredHostCapabilities(
@@ -47807,7 +48767,7 @@ async function executeWorker(input) {
     artifact
   };
 }
-async function captureProbes(store, specs, workspace, observer, signal, githubLifecycle) {
+async function captureProbes(store, specs, workspace, observer, signal, githubLifecycle, processScope) {
   const executed = [];
   for (const spec of specs) {
     if (spec.kind === "github_snapshot") {
@@ -47823,6 +48783,71 @@ async function captureProbes(store, specs, workspace, observer, signal, githubLi
           githubLifecycle.options
         )
       );
+    } else if (spec.kind === "command" && processScope) {
+      const definition = processScope.definitions.find(({ probeId }) => probeId === spec.id);
+      if (!definition)
+        throw new Error(`Managed probe process definition is missing for ${spec.id}`);
+      const lease = await createProbeProcessLease({
+        graphcraftRoot: store.graphcraftRoot,
+        runId: store.runId,
+        checkpointId: processScope.checkpointId,
+        nodeId: processScope.nodeId,
+        stage: processScope.stage,
+        definition
+      });
+      let completed = false;
+      try {
+        executed.push(
+          await runProbe(
+            spec,
+            workspace.path,
+            signal,
+            lease.lifecycle({
+              onReady: async (ready) => {
+                await store.append(
+                  "probe",
+                  "probe.process.started",
+                  {
+                    schemaVersion: 1,
+                    nodeId: processScope.nodeId,
+                    stage: processScope.stage,
+                    checkpointId: processScope.checkpointId,
+                    definition,
+                    ownerTokenHash: lease.ownerTokenHash,
+                    journalPath: lease.journalRelativePath,
+                    ready
+                  },
+                  processScope.checkpointId
+                );
+              },
+              onSettled: async (settlement) => {
+                await store.append(
+                  "probe",
+                  "probe.process.finished",
+                  {
+                    schemaVersion: 1,
+                    nodeId: processScope.nodeId,
+                    stage: processScope.stage,
+                    checkpointId: processScope.checkpointId,
+                    executionId: definition.executionId,
+                    settlement
+                  },
+                  definition.executionId
+                );
+              }
+            })
+          )
+        );
+        completed = true;
+      } finally {
+        await closeProbeProcessLease(lease);
+        if (completed)
+          await removeProbeProcessJournal({
+            graphcraftRoot: store.graphcraftRoot,
+            runId: store.runId,
+            executionId: definition.executionId
+          });
+      }
     } else {
       executed.push(await runProbe(spec, workspace.path, signal));
     }
@@ -47982,7 +49007,7 @@ function stableSemanticProbeEvidence(results) {
   })).sort((left, right) => left.probeId.localeCompare(right.probeId));
 }
 async function runSemanticVerification(input) {
-  const invocationId = randomUUID8();
+  const invocationId = randomUUID9();
   let context;
   let beforeScope;
   try {
@@ -48245,7 +49270,7 @@ function concurrencyConflict(graph, left, right) {
 function runtimeOptimizationDecision(input) {
   return OptimizationDecisionSchema.parse({
     schemaVersion: 1,
-    decisionId: randomUUID8(),
+    decisionId: randomUUID9(),
     ...input
   });
 }
@@ -48399,7 +49424,7 @@ function repairAmendment(graph, verification, failures) {
   };
   return {
     schemaVersion: 1,
-    amendmentId: randomUUID8(),
+    amendmentId: randomUUID9(),
     operations: [
       { operation: "add", node: repair, authoritySourceIds: originalDependencies },
       {
@@ -48529,7 +49554,7 @@ function githubLifecycleRepairAmendment(input) {
   };
   return {
     schemaVersion: 1,
-    amendmentId: randomUUID8(),
+    amendmentId: randomUUID9(),
     operations: [
       { operation: "add", node: repair, authoritySourceIds: [previousBoundaryId] },
       { operation: "add", node: verification, authoritySourceIds: [repairId] },
@@ -48700,7 +49725,7 @@ function durableRunBlocker(failure) {
   return blocker;
 }
 function progressProbeStage(value) {
-  return value === "progress_baseline" || value === "progress_current" ? value : void 0;
+  return value === "progress_baseline" || value === "progress_current" || value === "verification" ? value : void 0;
 }
 function workspaceScopeSnapshotDigestIsValid(snapshot) {
   return snapshot.digest === contentHash({
@@ -48713,13 +49738,14 @@ function workspaceScopeSnapshotDigestIsValid(snapshot) {
 function progressProbeScopePolicyHash(input) {
   return contentHash({
     schemaVersion: 1,
-    kind: "progress_probe_scope_policy",
+    kind: "probe_scope_policy",
     runId: input.contract.runId,
     graphRevision: input.graph.revision,
     contractScope: input.contract.scope,
     nodeId: input.node.id,
     nodeScope: input.node.scope,
-    probeIds: input.node.progressProbes.map(({ id }) => id)
+    stage: input.stage,
+    probeIds: input.probeIds
   });
 }
 function progressProbeScopeAudit(input) {
@@ -48734,7 +49760,8 @@ function progressProbeScopeAudit(input) {
 }
 function progressProbeScopeBlocker(input) {
   if (input.audit.allowed) return void 0;
-  const reason = `Progress probe execution changed repository state: ${scopeViolationReason(
+  const label = input.stage === "verification" ? "Completion probe" : "Progress probe";
+  const reason = `${label} execution changed repository state: ${scopeViolationReason(
     input.audit,
     input.workspace.path
   )}`;
@@ -48830,8 +49857,9 @@ async function executeReadOnlyProgressProbes(input) {
     nodeId: input.node.id,
     stage: input.stage,
     baselineDigest: baseline.digest,
-    nonce: randomUUID8()
+    nonce: randomUUID9()
   });
+  const processDefinitions = probeProcessDefinitions(checkpointId, input.specs);
   await input.store.append(
     "runtime",
     "scope.started",
@@ -48841,8 +49869,15 @@ async function executeReadOnlyProgressProbes(input) {
       checkpointId,
       baseline,
       graphRevision: input.graph.revision,
-      policyHash: progressProbeScopePolicyHash(input),
-      probeIds: input.node.progressProbes.map(({ id }) => id)
+      policyHash: progressProbeScopePolicyHash({
+        contract: input.contract,
+        graph: input.graph,
+        node: input.node,
+        stage: input.stage,
+        probeIds: input.specs.map(({ id }) => id)
+      }),
+      probeIds: input.specs.map(({ id }) => id),
+      processDefinitions
     },
     checkpointId
   );
@@ -48850,7 +49885,20 @@ async function executeReadOnlyProgressProbes(input) {
   let executionError;
   if (!input.signal.aborted)
     try {
-      probes = await input.execute();
+      probes = await captureProbes(
+        input.store,
+        input.specs,
+        input.workspace,
+        input.observer,
+        input.signal,
+        void 0,
+        {
+          nodeId: input.node.id,
+          stage: input.stage,
+          checkpointId,
+          definitions: processDefinitions
+        }
+      );
     } catch (error51) {
       executionError = error51;
     }
@@ -48931,6 +49979,28 @@ async function blockProgressProbeRecovery(input) {
   await ensureProgressProbeRunBlocker({ store: input.store, blocker: input.blocker });
   return await input.store.loadState();
 }
+async function cleanupRecoveredProbeProcessJournal(input) {
+  try {
+    await removeProbeProcessJournal({
+      graphcraftRoot: input.store.graphcraftRoot,
+      runId: input.store.runId,
+      executionId: input.executionId
+    });
+    return void 0;
+  } catch (error51) {
+    const detail = error51 instanceof Error ? error51.message : String(error51);
+    const reason = `Graphcraft cannot clean up the settled ownership journal for probe process ${input.executionId} in scope checkpoint ${input.checkpointId}: ${detail}`;
+    return await blockProgressProbeRecovery({
+      store: input.store,
+      nodeId: input.nodeId,
+      blocker: progressProbeRecoveryBlocker({
+        reason,
+        checkpointId: input.checkpointId,
+        stage: input.stage
+      })
+    });
+  }
+}
 function activeProgressProbeScopeStarts(events, graph, state) {
   const activeNodes = new Map(
     graph.nodes.filter(({ id }) => ["running", "failed"].includes(state.nodes[id]?.status ?? "")).map((node2) => {
@@ -48953,6 +50023,294 @@ function activeProgressProbeScopeStarts(events, graph, state) {
     }
     return Number.isFinite(earliestActiveStart) && sequence > earliestActiveStart;
   });
+}
+async function reconcileProbeProcessesForScope(input) {
+  const definitions = parseProbeProcessDefinitions(input.start.data.processDefinitions);
+  let expectedSpecs;
+  try {
+    expectedSpecs = input.stage === "verification" ? resolveHeldOutProbes(
+      input.node.completionProbes,
+      await input.store.loadHeldOutProbePlan()
+    ) : input.node.progressProbes;
+  } catch (error51) {
+    const reason = `Graphcraft cannot resolve probe-process definitions for scope checkpoint ${input.checkpointId}: ${error51.message}`;
+    return await blockProgressProbeRecovery({
+      store: input.store,
+      nodeId: input.node.id,
+      blocker: progressProbeRecoveryBlocker({
+        reason,
+        checkpointId: input.checkpointId,
+        stage: input.stage
+      })
+    });
+  }
+  const expectedDefinitions = probeProcessDefinitions(input.checkpointId, expectedSpecs);
+  if (!definitions || contentHash(definitions) !== contentHash(expectedDefinitions)) {
+    const reason = `Graphcraft cannot validate probe-process definitions for scope checkpoint ${input.checkpointId}`;
+    return await blockProgressProbeRecovery({
+      store: input.store,
+      nodeId: input.node.id,
+      blocker: progressProbeRecoveryBlocker({
+        reason,
+        checkpointId: input.checkpointId,
+        stage: input.stage
+      })
+    });
+  }
+  const events = await input.store.loadEvents();
+  const declaredExecutionIds = new Set(definitions.map(({ executionId }) => executionId));
+  const lifecycleEvents = events.filter((event) => {
+    if (event.sequence <= input.start.sequence || !["probe.process.started", "probe.process.finished", "probe.process.reconciled"].includes(
+      event.type
+    ))
+      return false;
+    const executionId = probeProcessLifecycleExecutionId(event);
+    return event.data.checkpointId === input.checkpointId || executionId !== void 0 && declaredExecutionIds.has(executionId);
+  });
+  const unknown2 = lifecycleEvents.find((event) => {
+    const executionId = probeProcessLifecycleExecutionId(event);
+    return executionId === void 0 || !declaredExecutionIds.has(executionId);
+  });
+  if (unknown2) {
+    const reason = `Graphcraft found an undeclared probe process in scope checkpoint ${input.checkpointId}`;
+    return await blockProgressProbeRecovery({
+      store: input.store,
+      nodeId: input.node.id,
+      blocker: progressProbeRecoveryBlocker({
+        reason,
+        checkpointId: input.checkpointId,
+        stage: input.stage
+      })
+    });
+  }
+  for (const definition of definitions) {
+    const starts = lifecycleEvents.filter(
+      ({ type, data }) => type === "probe.process.started" && typeof data.definition === "object" && data.definition !== null && data.definition.executionId === definition.executionId
+    );
+    const finishes = lifecycleEvents.filter(
+      ({ type, data }) => type === "probe.process.finished" && data.executionId === definition.executionId
+    );
+    const reconciliations = lifecycleEvents.filter(
+      ({ type, data }) => type === "probe.process.reconciled" && data.executionId === definition.executionId
+    );
+    if (starts.length > 1 || finishes.length > 1 || reconciliations.length > 1 || finishes.length + reconciliations.length > 1) {
+      const reason = `Graphcraft found duplicate lifecycle evidence for probe process ${definition.executionId}`;
+      return await blockProgressProbeRecovery({
+        store: input.store,
+        nodeId: input.node.id,
+        blocker: progressProbeRecoveryBlocker({
+          reason,
+          checkpointId: input.checkpointId,
+          stage: input.stage
+        })
+      });
+    }
+    const start = starts[0];
+    const ready = start?.data.ready !== null && typeof start?.data.ready === "object" && !Array.isArray(start.data.ready) ? start.data.ready : void 0;
+    const brokerPid = ready?.brokerPid;
+    const expectedJournalPath = `locks/probe-processes/${input.store.runId}/${definition.executionId}.jsonl`;
+    const validStart = start === void 0 || start.actor === "probe" && start.causationId === input.checkpointId && start.data.schemaVersion === 1 && start.data.nodeId === input.node.id && start.data.stage === input.stage && start.data.checkpointId === input.checkpointId && contentHash(start.data.definition) === contentHash(definition) && typeof start.data.ownerTokenHash === "string" && /^[a-f0-9]{64}$/.test(start.data.ownerTokenHash) && start.data.journalPath === expectedJournalPath && ready?.type === "ready" && ready?.schemaVersion === 1 && ready.executionId === definition.executionId && Number.isSafeInteger(brokerPid) && Number(brokerPid) > 0 && (ready.processGroupId === null || Number.isSafeInteger(ready.processGroupId) && Number(ready.processGroupId) > 0) && [
+      "aix",
+      "android",
+      "darwin",
+      "freebsd",
+      "haiku",
+      "linux",
+      "openbsd",
+      "sunos",
+      "win32",
+      "cygwin",
+      "netbsd"
+    ].includes(String(ready.platform)) && typeof ready.readyAt === "string" && Number.isFinite(Date.parse(ready.readyAt));
+    if (!validStart) {
+      const reason = `Graphcraft cannot validate ownership of probe process ${definition.executionId}`;
+      return await blockProgressProbeRecovery({
+        store: input.store,
+        nodeId: input.node.id,
+        blocker: progressProbeRecoveryBlocker({
+          reason,
+          checkpointId: input.checkpointId,
+          stage: input.stage
+        })
+      });
+    }
+    if (reconciliations.length === 1) {
+      if (start && reconciliations[0].sequence <= start.sequence) {
+        const reason = `Graphcraft cannot confirm settlement of probe process ${definition.executionId}`;
+        return await blockProgressProbeRecovery({
+          store: input.store,
+          nodeId: input.node.id,
+          blocker: progressProbeRecoveryBlocker({
+            reason,
+            checkpointId: input.checkpointId,
+            stage: input.stage
+          })
+        });
+      }
+      const settlement = probeProcessEventSettlement({
+        event: reconciliations[0],
+        type: "probe.process.reconciled",
+        actor: "runtime",
+        executionId: definition.executionId,
+        nodeId: input.node.id,
+        stage: input.stage,
+        checkpointId: input.checkpointId,
+        ...start ? { brokerPid: Number(brokerPid) } : {},
+        started: Boolean(start)
+      });
+      if (!settlement?.confirmed || !start && settlement.outcome !== "cancelled_before_start") {
+        const reason = `Graphcraft cannot confirm settlement of probe process ${definition.executionId}`;
+        return await blockProgressProbeRecovery({
+          store: input.store,
+          nodeId: input.node.id,
+          blocker: progressProbeRecoveryBlocker({
+            reason,
+            checkpointId: input.checkpointId,
+            stage: input.stage
+          })
+        });
+      }
+      const cleanupRecovery = await cleanupRecoveredProbeProcessJournal({
+        store: input.store,
+        nodeId: input.node.id,
+        stage: input.stage,
+        checkpointId: input.checkpointId,
+        executionId: definition.executionId
+      });
+      if (cleanupRecovery) return cleanupRecovery;
+      continue;
+    }
+    if (finishes.length === 1) {
+      if (!start || finishes[0].sequence <= start.sequence) {
+        const reason = `Graphcraft cannot confirm settlement of probe process ${definition.executionId}`;
+        return await blockProgressProbeRecovery({
+          store: input.store,
+          nodeId: input.node.id,
+          blocker: progressProbeRecoveryBlocker({
+            reason,
+            checkpointId: input.checkpointId,
+            stage: input.stage
+          })
+        });
+      }
+      const settlement = probeProcessEventSettlement({
+        event: finishes[0],
+        type: "probe.process.finished",
+        actor: "probe",
+        executionId: definition.executionId,
+        nodeId: input.node.id,
+        stage: input.stage,
+        checkpointId: input.checkpointId,
+        brokerPid: Number(brokerPid)
+      });
+      if (!settlement?.confirmed) {
+        const reason = `Graphcraft cannot confirm settlement of probe process ${definition.executionId}`;
+        return await blockProgressProbeRecovery({
+          store: input.store,
+          nodeId: input.node.id,
+          blocker: progressProbeRecoveryBlocker({
+            reason,
+            checkpointId: input.checkpointId,
+            stage: input.stage
+          })
+        });
+      }
+      const cleanupRecovery = await cleanupRecoveredProbeProcessJournal({
+        store: input.store,
+        nodeId: input.node.id,
+        stage: input.stage,
+        checkpointId: input.checkpointId,
+        executionId: definition.executionId
+      });
+      if (cleanupRecovery) return cleanupRecovery;
+      continue;
+    }
+    let journal;
+    try {
+      journal = await waitForProbeProcessSettlement({
+        graphcraftRoot: input.store.graphcraftRoot,
+        runId: input.store.runId,
+        definition,
+        checkpointId: input.checkpointId,
+        nodeId: input.node.id,
+        stage: input.stage,
+        ...start ? { ownerTokenHash: start.data.ownerTokenHash } : {},
+        ...start ? { expectedBrokerPid: Number(brokerPid) } : {}
+      });
+    } catch (error51) {
+      const reason = `Graphcraft cannot validate probe process ${definition.executionId}: ${error51.message}`;
+      return await blockProgressProbeRecovery({
+        store: input.store,
+        nodeId: input.node.id,
+        blocker: progressProbeRecoveryBlocker({
+          reason,
+          checkpointId: input.checkpointId,
+          stage: input.stage
+        })
+      });
+    }
+    if (start && !journal) {
+      const reason = `Graphcraft cannot find the ownership journal for probe process ${definition.executionId}`;
+      return await blockProgressProbeRecovery({
+        store: input.store,
+        nodeId: input.node.id,
+        blocker: progressProbeRecoveryBlocker({
+          reason,
+          checkpointId: input.checkpointId,
+          stage: input.stage
+        })
+      });
+    }
+    if (journal && (!journal.settlement || !journal.settlement.confirmed)) {
+      const reason = `Graphcraft cannot confirm that probe process ${definition.executionId} and its child tree settled after runtime interruption`;
+      return await blockProgressProbeRecovery({
+        store: input.store,
+        nodeId: input.node.id,
+        blocker: progressProbeRecoveryBlocker({
+          reason,
+          checkpointId: input.checkpointId,
+          stage: input.stage
+        })
+      });
+    }
+    if (journal?.settlement && !start && journal.settlement.outcome !== "cancelled_before_start") {
+      const reason = `Graphcraft cannot validate authorization of probe process ${definition.executionId}`;
+      return await blockProgressProbeRecovery({
+        store: input.store,
+        nodeId: input.node.id,
+        blocker: progressProbeRecoveryBlocker({
+          reason,
+          checkpointId: input.checkpointId,
+          stage: input.stage
+        })
+      });
+    }
+    if (journal?.settlement) {
+      await input.store.append(
+        "runtime",
+        "probe.process.reconciled",
+        {
+          schemaVersion: 1,
+          nodeId: input.node.id,
+          stage: input.stage,
+          checkpointId: input.checkpointId,
+          executionId: definition.executionId,
+          started: Boolean(start),
+          settlement: journal.settlement
+        },
+        definition.executionId
+      );
+      const cleanupRecovery = await cleanupRecoveredProbeProcessJournal({
+        store: input.store,
+        nodeId: input.node.id,
+        stage: input.stage,
+        checkpointId: input.checkpointId,
+        executionId: definition.executionId
+      });
+      if (cleanupRecovery) return cleanupRecovery;
+    }
+  }
+  return void 0;
 }
 async function reconcileProgressProbeScopeCheckpoints(input) {
   const events = await input.store.loadEvents();
@@ -49021,13 +50379,17 @@ async function reconcileProgressProbeScopeCheckpoints(input) {
     const stage = progressProbeStage(start.data.stage);
     const checkpointId = typeof start.data.checkpointId === "string" && start.data.checkpointId.length > 0 ? start.data.checkpointId : start.hash;
     const baseline = parseWorkspaceScopeSnapshot(start.data.baseline);
-    const expectedProbeIds = active?.node.progressProbes.map(({ id }) => id);
+    const expectedProbeIds = active ? (stage === "verification" ? active.node.completionProbes : active.node.progressProbes).map(
+      ({ id }) => id
+    ) : void 0;
     const probeIds = start.data.probeIds;
     const validProbeIds = Array.isArray(probeIds) && probeIds.every((value) => typeof value === "string") && new Set(probeIds).size === probeIds.length && expectedProbeIds !== void 0 && probeIds.length === expectedProbeIds.length && probeIds.every((value, index) => value === expectedProbeIds[index]);
     const valid = active !== void 0 && stage !== void 0 && start.actor === "runtime" && start.causationId === checkpointId && start.data.checkpointId === checkpointId && start.data.graphRevision === input.graph.revision && start.data.policyHash === progressProbeScopePolicyHash({
       contract: input.contract,
       graph: input.graph,
-      node: active.node
+      node: active.node,
+      stage,
+      probeIds: expectedProbeIds
     }) && baseline !== void 0 && workspaceScopeSnapshotDigestIsValid(baseline) && validProbeIds;
     if (!valid) {
       const reason = `Graphcraft cannot validate progress-probe scope checkpoint ${checkpointId}`;
@@ -49048,6 +50410,14 @@ async function reconcileProgressProbeScopeCheckpoints(input) {
       checkpointId,
       baseline
     };
+    const processRecovery = await reconcileProbeProcessesForScope({
+      store: input.store,
+      start,
+      node: active.node,
+      stage,
+      checkpointId
+    });
+    if (processRecovery) return processRecovery;
     const rawChecks = events.filter(
       ({ sequence, type, causationId, data }) => sequence > start.sequence && type === "scope.checked" && (causationId === checkpointId || data.checkpointId === checkpointId)
     );
@@ -49176,7 +50546,8 @@ async function executeWorkNode(input) {
       workspace: input.workspace,
       signal: input.signal,
       stage: "progress_baseline",
-      execute: () => runProbes(input.node.progressProbes, input.workspace.path, input.signal)
+      specs: input.node.progressProbes,
+      ...input.observer ? { observer: input.observer } : {}
     });
     if (baselineExecution.status === "interrupted")
       return { status: "interrupted", nodeId: input.node.id, artifact: "" };
@@ -49300,14 +50671,9 @@ async function executeWorkNode(input) {
     workspace: input.workspace,
     signal: input.signal,
     stage: "progress_current",
-    baseline: currentScope,
-    execute: () => captureProbes(
-      input.store,
-      input.node.progressProbes,
-      input.workspace,
-      input.observer,
-      input.signal
-    )
+    specs: input.node.progressProbes,
+    ...input.observer ? { observer: input.observer } : {},
+    baseline: currentScope
   });
   if (progressExecution.status === "interrupted")
     return {
@@ -49565,7 +50931,7 @@ async function executeRun(input) {
   const externalSignal = input.signal ?? new AbortController().signal;
   const contract = await input.store.loadContract();
   let graph = await input.store.loadGraph();
-  const lock = new RunLock(join12(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
+  const lock = new RunLock(join13(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
   await lock.acquire();
   const lockSignal = lock.signal;
   const ownedStore = new Proxy(input.store, {
@@ -49883,7 +51249,7 @@ async function executeRun(input) {
         if (contextOptimization.reuseSession)
           reuseSessions.set(candidate.id, contextOptimization.reuseSession);
       }
-      const batchId = randomUUID8();
+      const batchId = randomUUID9();
       for (const candidate of batch) {
         input.observer?.({
           type: "status",
@@ -50340,59 +51706,56 @@ async function executeRun(input) {
           });
           return await input.store.loadState();
         }
-        let verificationScopeBaseline;
-        try {
-          verificationScopeBaseline = await captureWorkspaceScopeSnapshot(
-            workspace.path,
-            contract.scope.exclude
-          );
-        } catch (error51) {
-          const reason = `Workspace scope inspection failed before verification node ${current.id}: ${error51.message}`;
-          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
-          await input.store.append("runtime", "run.blocked", { reason });
-          return await input.store.loadState();
-        }
         const integrityFailures = await heldOutIntegrityFailures(heldOutProbePlan, workspace.path);
-        const executed = integrityFailures.length ? [] : await captureProbes(input.store, completionProbes, workspace, input.observer, signal);
+        let executed = [];
         let verificationScopeCurrent;
-        try {
-          verificationScopeCurrent = await captureWorkspaceScopeSnapshot(
-            workspace.path,
-            contract.scope.exclude
-          );
-          const scopeAudit = auditWorkspaceScope({
+        if (integrityFailures.length === 0) {
+          const verificationExecution = await executeReadOnlyProgressProbes({
+            store: input.store,
             contract,
             graph,
             state,
             node: current,
-            baseline: verificationScopeBaseline,
-            current: verificationScopeCurrent
+            workspace,
+            signal,
+            stage: "verification",
+            specs: completionProbes,
+            ...input.observer ? { observer: input.observer } : {}
           });
-          await input.store.append(
-            "runtime",
-            "scope.checked",
-            {
-              nodeId: current.id,
-              stage: "verification",
-              enforced: !signal.aborted,
-              audit: scopeAudit,
-              current: verificationScopeCurrent
-            },
-            batchId
-          );
-          if (!scopeAudit.allowed && !signal.aborted) {
-            const reason = scopeViolationReason(scopeAudit, workspace.path);
+          if (verificationExecution.status === "interrupted")
+            return await finishInterruption(current.id);
+          if (verificationExecution.status === "failed") {
+            if (!verificationExecution.failurePersisted)
+              await input.store.append("runtime", "node.failed", {
+                nodeId: current.id,
+                reason: verificationExecution.reason
+              });
+            if (verificationExecution.blocker)
+              await ensureProgressProbeRunBlocker({
+                store: input.store,
+                blocker: verificationExecution.blocker
+              });
+            else
+              await input.store.append("runtime", "run.blocked", {
+                reason: verificationExecution.reason
+              });
+            return await input.store.loadState();
+          }
+          executed = verificationExecution.probes;
+          verificationScopeCurrent = verificationExecution.scope;
+        } else {
+          try {
+            verificationScopeCurrent = await captureWorkspaceScopeSnapshot(
+              workspace.path,
+              contract.scope.exclude
+            );
+          } catch (error51) {
+            const reason = `Workspace scope inspection failed after held-out integrity verification for node ${current.id}: ${error51.message}`;
             await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
             await input.store.append("runtime", "run.blocked", { reason });
             return await input.store.loadState();
           }
-        } catch (error51) {
-          const reason = `Workspace scope inspection failed after verification node ${current.id}: ${error51.message}`;
-          await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
-          await input.store.append("runtime", "run.blocked", { reason });
-          return await input.store.loadState();
         }
-        if (signal.aborted) return await finishInterruption(current.id);
         const results = integrityFailures.length ? integrityFailures : executed.map(({ result }) => result);
         const verificationEvidence = evidenceSnapshot(
           verificationScopeCurrent.digest,
@@ -50908,9 +52271,16 @@ async function executeRun(input) {
   }
 }
 
+// packages/runtime/src/benchmark.ts
+var PATCH_PROCESS_CAPTURE_LIMIT_BYTES = 2 * BENCHMARK_REVIEW_PATCH_LIMIT_BYTES;
+var TRANSCRIPT_OMISSION_MARKER = Buffer.from(
+  "\n[GRAPHCRAFT REVIEW EVIDENCE MIDDLE OMITTED]\n",
+  "utf8"
+);
+
 // packages/runtime/src/supervisor.ts
-import { open as open7, readdir as readdir5 } from "node:fs/promises";
-import { dirname as dirname9, join as join13, relative as relative8, resolve as resolve12 } from "node:path";
+import { open as open8, readdir as readdir5 } from "node:fs/promises";
+import { dirname as dirname10, join as join14, relative as relative9, resolve as resolve12 } from "node:path";
 var KIB3 = 1024;
 var SUPERVISOR_LOG_MAX_BYTES = 64 * KIB3;
 var SUPERVISOR_LOG_RETAIN_BYTES = 32 * KIB3;
@@ -50921,10 +52291,10 @@ var SUPERVISOR_LOG_TRUNCATION_MARKER = Buffer.from(
 `
 );
 function graphcraftRoot(repositoryRoot) {
-  return join13(repositoryRoot, ".graphcraft");
+  return join14(repositoryRoot, ".graphcraft");
 }
 function supervisorRoot(repositoryRoot, runId) {
-  return join13(graphcraftRoot(repositoryRoot), "supervisors", runId);
+  return join14(graphcraftRoot(repositoryRoot), "supervisors", runId);
 }
 async function readSupervisorRecord(path, ownedRoot) {
   const source = await readPrivateFileBounded(path, SUPERVISOR_RECORD_MAX_BYTES, ownedRoot);
@@ -50943,7 +52313,7 @@ async function listSupervisorRecords(repositoryRoot, runId) {
   const ownedRoot = graphcraftRoot(repositoryRoot);
   let entries;
   try {
-    await validatePrivatePath(ownedRoot, relative8(ownedRoot, root));
+    await validatePrivatePath(ownedRoot, relative9(ownedRoot, root));
     entries = await readdir5(root, { withFileTypes: true });
   } catch (error51) {
     if (error51.code === "ENOENT") return [];
@@ -50951,8 +52321,8 @@ async function listSupervisorRecords(repositoryRoot, runId) {
   }
   const records = await Promise.all(
     entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json")).map(async (entry) => {
-      const path = join13(root, entry.name);
-      await validatePrivatePath(ownedRoot, relative8(ownedRoot, path));
+      const path = join14(root, entry.name);
+      await validatePrivatePath(ownedRoot, relative9(ownedRoot, path));
       return await readSupervisorRecord(path, ownedRoot);
     })
   );
@@ -51141,7 +52511,7 @@ async function readRuntimeManifest(path) {
       path,
       384,
       RUNTIME_MANIFEST_MAX_BYTES,
-      dirname10(dirname10(path))
+      dirname11(dirname11(path))
     );
     return source ? parseRuntimeManifest(JSON.parse(source.toString("utf8"))) : void 0;
   } catch {
@@ -51172,7 +52542,7 @@ async function loadBundledMcpRuntime(sourcePath) {
   };
 }
 async function runtimePairMatches(runtimeDirectory, bundled) {
-  const runtimeRoot = dirname10(runtimeDirectory);
+  const runtimeRoot = dirname11(runtimeDirectory);
   if (await runtimeDirectoryKind(runtimeDirectory) !== "directory") return false;
   if (!await managedDirectoryMatches(runtimeDirectory, 448)) return false;
   if (!await runtimePairHasExactEntries(runtimeDirectory, bundled)) return false;
@@ -51181,10 +52551,10 @@ async function runtimePairMatches(runtimeDirectory, bundled) {
   } catch {
     return false;
   }
-  const manifest2 = await readRuntimeManifest(join14(runtimeDirectory, RUNTIME_MANIFEST));
+  const manifest2 = await readRuntimeManifest(join15(runtimeDirectory, RUNTIME_MANIFEST));
   if (!sameRuntimeManifest(manifest2, bundled.manifest)) return false;
   const runtime = await readRegularFile(
-    join14(runtimeDirectory, bundled.manifest.runtimeFile),
+    join15(runtimeDirectory, bundled.manifest.runtimeFile),
     384,
     bundled.manifest.bytes,
     runtimeRoot
@@ -51196,9 +52566,9 @@ async function runtimePairMatches(runtimeDirectory, bundled) {
     return false;
   }
   const [hardenedManifest, hardenedRuntime] = await Promise.all([
-    readRuntimeManifest(join14(runtimeDirectory, RUNTIME_MANIFEST)),
+    readRuntimeManifest(join15(runtimeDirectory, RUNTIME_MANIFEST)),
     readRegularFile(
-      join14(runtimeDirectory, bundled.manifest.runtimeFile),
+      join15(runtimeDirectory, bundled.manifest.runtimeFile),
       384,
       bundled.manifest.bytes,
       runtimeRoot
@@ -51268,9 +52638,9 @@ async function readRegularFile(path, expectedMode, maximumBytes = MANAGED_RUNTIM
   }
 }
 async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
-  const moduleDirectory = dirname10(fileURLToPath(moduleUrl));
+  const moduleDirectory = dirname11(fileURLToPath(moduleUrl));
   const candidates = [
-    join14(moduleDirectory, "mcp.mjs"),
+    join15(moduleDirectory, "mcp.mjs"),
     resolve13(moduleDirectory, "../../../dist/mcp.mjs"),
     resolve13(process.cwd(), "dist/mcp.mjs")
   ];
@@ -51284,7 +52654,7 @@ async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
   throw new Error("dist/mcp.mjs is missing; run pnpm build before installing Graphcraft");
 }
 function resolveGraphcraftHome(configuredHome = process.env.GRAPHCRAFT_HOME) {
-  return configuredHome?.trim() ? resolve13(configuredHome) : join14(homedir(), ".graphcraft");
+  return configuredHome?.trim() ? resolve13(configuredHome) : join15(homedir(), ".graphcraft");
 }
 async function ensureGraphcraftHomeIfPresent(graphcraftHome) {
   if (await runtimeDirectoryKind(graphcraftHome) === "missing") return false;
@@ -51295,7 +52665,7 @@ function commandFor(host) {
   return host;
 }
 async function withPrivateHostCommandCwd(operation, createdBoundary) {
-  const cwd = await mkdtemp2(join14(tmpdir2(), "graphcraft-host-config-"));
+  const cwd = await mkdtemp2(join15(tmpdir2(), "graphcraft-host-config-"));
   try {
     await createdBoundary?.(cwd);
     await ensurePrivateDirectory(cwd);
@@ -51396,14 +52766,14 @@ async function inspectHostRegistration(host, expected, runner, cwd, knownSingleA
   };
 }
 async function readRegistrationReceiptBytes(graphcraftHome, host) {
-  const directory = join14(graphcraftHome, "registrations");
+  const directory = join15(graphcraftHome, "registrations");
   const directoryKind = await runtimeDirectoryKind(directory);
   if (directoryKind === "missing") return void 0;
   await ensurePrivateManagedDirectory(directory, "registration receipts", graphcraftHome);
   if (!await managedDirectoryMatches(directory, 448)) {
     throw new Error("The managed Graphcraft registration receipts directory is unsafe");
   }
-  const path = join14(directory, `${host}.json`);
+  const path = join15(directory, `${host}.json`);
   await hardenPrivateFile(path, graphcraftHome);
   const source = await readRegularFile(path, 384, REGISTRATION_RECEIPT_MAX_BYTES, graphcraftHome);
   if (source) return source;
@@ -51438,8 +52808,8 @@ async function verifiedReceiptRuntimePath(graphcraftHome, receipt) {
   return hardened && sha256(hardened) === receipt.runtimeSha256 ? expectedPath : void 0;
 }
 async function readManagedRuntimeFile(graphcraftHome, runtimePath, expectedMode) {
-  const runtimeRoot = join14(graphcraftHome, "runtime");
-  const runtimeDirectory = dirname10(runtimePath);
+  const runtimeRoot = join15(graphcraftHome, "runtime");
+  const runtimeDirectory = dirname11(runtimePath);
   if (await runtimeDirectoryKind(runtimeRoot) !== "directory" || await runtimeDirectoryKind(runtimeDirectory) !== "directory")
     return void 0;
   try {
@@ -51459,7 +52829,7 @@ async function readManagedRuntimeFile(graphcraftHome, runtimePath, expectedMode)
 }
 function receiptRuntimePath(graphcraftHome, receipt) {
   if (!receipt) return void 0;
-  const expectedPath = join14(graphcraftHome, "runtime", receipt.graphcraftVersion, "mcp.mjs");
+  const expectedPath = join15(graphcraftHome, "runtime", receipt.graphcraftVersion, "mcp.mjs");
   return sameRuntimePath(receipt.runtimePath, expectedPath) ? expectedPath : void 0;
 }
 function parseVersion(value) {
@@ -51516,12 +52886,12 @@ async function installationDiagnostics(options = {}) {
   const expectedSource = options.mcpPath ?? await resolveBundledMcpPath();
   const bundled = await loadBundledMcpRuntime(expectedSource);
   const expectedSha256 = bundled.manifest.sha256;
-  const runtimeRoot = join14(graphcraftHome, "runtime");
-  const runtimeDirectory = join14(runtimeRoot, GRAPHCRAFT_VERSION);
-  const runtimePath = join14(runtimeDirectory, "mcp.mjs");
+  const runtimeRoot = join15(graphcraftHome, "runtime");
+  const runtimeDirectory = join15(runtimeRoot, GRAPHCRAFT_VERSION);
+  const runtimePath = join15(runtimeDirectory, "mcp.mjs");
   const runtimeDirectoryState = await runtimeDirectoryKind(runtimeDirectory);
   const safeRuntimeDirectories = await managedDirectoryMatches(runtimeRoot, 448) && await managedDirectoryMatches(runtimeDirectory, 448);
-  const manifest2 = safeRuntimeDirectories ? await readRuntimeManifest(join14(runtimeDirectory, RUNTIME_MANIFEST)) : void 0;
+  const manifest2 = safeRuntimeDirectories ? await readRuntimeManifest(join15(runtimeDirectory, RUNTIME_MANIFEST)) : void 0;
   const actualRuntime = safeRuntimeDirectories ? await readRegularFile(runtimePath, 384, MANAGED_RUNTIME_MAX_BYTES, graphcraftHome) : void 0;
   const actualSha256 = actualRuntime ? sha256(actualRuntime) : void 0;
   const runtimeCurrent = safeRuntimeDirectories && await runtimePairMatches(runtimeDirectory, bundled);
