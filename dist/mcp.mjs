@@ -35068,12 +35068,14 @@ var HOST_CAPABILITY_PROBE_SETTLE_GRACE_MS = 2500;
 var HOST_TERMINATION_GRACE_MS = 2e3;
 var HOST_TERMINATION_SETTLE_GRACE_MS = 2500;
 var HostTerminationError = class extends Error {
-  constructor(termination) {
+  constructor(termination, beforeModelInvocation = false) {
     super(`Host child terminated after ${termination.cause}`);
     this.termination = termination;
+    this.beforeModelInvocation = beforeModelInvocation;
     this.name = "HostTerminationError";
   }
   termination;
+  beforeModelInvocation;
 };
 function interruptionReason(value, fallback = "cancellation") {
   if (typeof value === "object" && value !== null) {
@@ -35455,40 +35457,60 @@ async function codexUntrustedRoots(repositoryPath) {
   const discovered = await Promise.all(paths.map(discoverRepositoryTrustRoots));
   return [.../* @__PURE__ */ new Set([...paths, ...discovered.flat()])];
 }
-async function runCapabilityProbe(executable, args, captureErrorOutput = false) {
-  return await new Promise((resolve14) => {
+function abortedCapabilityProbeError(signal) {
+  const reason = interruptionReason(signal.reason);
+  return new HostTerminationError(
+    {
+      cause: reason.cause,
+      outcome: "already_exited",
+      requestedSignal: "SIGTERM",
+      exitCode: null,
+      exitSignal: null
+    },
+    true
+  );
+}
+async function runCapabilityProbe(executable, args, captureErrorOutput = false, signal) {
+  if (signal?.aborted) throw abortedCapabilityProbeError(signal);
+  return await new Promise((resolve14, reject) => {
     const child = spawn2(executable, args, { stdio: ["ignore", "pipe", "pipe"] });
     const output = new BoundedTextCapture(ADAPTER_STDERR_LIMIT_BYTES);
-    const timeoutAbort = new AbortController();
-    const terminationController = new ChildTerminationController(child, timeoutAbort.signal);
+    const probeAbort = new AbortController();
+    const terminationController = new ChildTerminationController(child, probeAbort.signal);
+    let abortSource;
     let settled = false;
     let settlement;
     let timeout;
-    const complete = (code, signal) => {
+    const requestAbort = (source, reason) => {
+      if (probeAbort.signal.aborted) return;
+      abortSource = source;
+      probeAbort.abort(reason);
+    };
+    const abortFromCaller = () => requestAbort("caller", signal?.reason);
+    const complete = (code, closeSignal) => {
       if (settled) return;
       settled = true;
       if (timeout) clearTimeout(timeout);
       if (settlement) clearTimeout(settlement);
-      const termination = terminationController.finish(code, signal);
-      resolve14({
+      probeAbort.signal.removeEventListener("abort", scheduleSettlement);
+      signal?.removeEventListener("abort", abortFromCaller);
+      const termination = terminationController.finish(code, closeSignal);
+      const result = {
         code,
         output: output.text(),
         overflowed: output.overflowed,
         terminated: termination !== void 0
-      });
+      };
+      if (abortSource === "caller" || abortSource === "timeout" && signal?.aborted) {
+        reject(
+          termination ? new HostTerminationError(termination, true) : abortedCapabilityProbeError(abortSource === "caller" ? signal : probeAbort.signal)
+        );
+        return;
+      }
+      resolve14(result);
     };
-    child.stdout.on("data", (chunk) => output.append(chunk));
-    if (captureErrorOutput) {
-      child.stderr.on("data", (chunk) => output.append(chunk));
-    }
-    child.once("error", () => complete(null, null));
-    child.once("close", complete);
-    timeout = setTimeout(() => {
-      timeoutAbort.abort({
-        cause: "timeout",
-        reason: `${executable} capability probe timed out`
-      });
-      if (settled) return;
+    const scheduleSettlement = () => {
+      if (settled || settlement) return;
       settlement = setTimeout(() => {
         child.stdout.destroy();
         child.stderr.destroy();
@@ -35496,21 +35518,39 @@ async function runCapabilityProbe(executable, args, captureErrorOutput = false) 
         complete(null, null);
       }, HOST_CAPABILITY_PROBE_SETTLE_GRACE_MS);
       settlement.unref();
+    };
+    child.stdout.on("data", (chunk) => output.append(chunk));
+    if (captureErrorOutput) {
+      child.stderr.on("data", (chunk) => output.append(chunk));
+    }
+    child.once("error", () => complete(null, null));
+    child.once("close", complete);
+    probeAbort.signal.addEventListener("abort", scheduleSettlement, { once: true });
+    timeout = setTimeout(() => {
+      requestAbort("timeout", {
+        cause: "timeout",
+        reason: `${executable} capability probe timed out`
+      });
     }, HOST_CAPABILITY_PROBE_TIMEOUT_MS);
     timeout.unref();
+    signal?.addEventListener("abort", abortFromCaller, { once: true });
+    if (signal?.aborted) abortFromCaller();
   });
 }
-async function codexVersion(executable) {
-  const result = await runCapabilityProbe(executable, ["--version"]);
+async function codexVersion(executable, signal) {
+  const result = await runCapabilityProbe(executable, ["--version"], false, signal);
   return result.code === 0 && !result.overflowed && !result.terminated ? { installed: true, version: stripSingleHostVersionLineEnding(result.output) } : { installed: false };
 }
-async function codexAuthenticated(executable) {
-  const result = await runCapabilityProbe(executable, ["login", "status"], true);
+async function codexAuthenticated(executable, signal) {
+  const result = await runCapabilityProbe(executable, ["login", "status"], true, signal);
   return result.code === 0 && !result.overflowed && !result.terminated && !/(?:^|\r?\n)Not logged in\.?($|\r?\n)/u.test(result.output) && /(?:^|\r?\n)Logged in(?: using [^\r\n]+)?\.?($|\r?\n)/u.test(result.output);
 }
-async function probeCodexExecutable(executable) {
-  const result = await codexVersion(executable);
-  const authenticated = result.installed && await codexAuthenticated(executable);
+async function probeCodexExecutable(executable, signal) {
+  if (signal?.aborted) throw abortedCapabilityProbeError(signal);
+  const result = await codexVersion(executable, signal);
+  if (signal?.aborted) throw abortedCapabilityProbeError(signal);
+  const authenticated = result.installed && await codexAuthenticated(executable, signal);
+  if (signal?.aborted) throw abortedCapabilityProbeError(signal);
   return hostCapabilitiesFromProtocolProfile("codex", {
     installed: result.installed,
     authenticated,
@@ -35523,13 +35563,15 @@ var CodexAdapter = class {
   }
   policy;
   id = "codex";
-  async resolveReadyExecutable(repositoryPath) {
+  async resolveReadyExecutable(repositoryPath, signal) {
+    if (signal?.aborted) throw abortedCapabilityProbeError(signal);
     let executable;
     try {
       executable = await resolveTrustedExecutable("codex", {
         untrustedRoots: await codexUntrustedRoots(repositoryPath)
       });
     } catch {
+      if (signal?.aborted) throw abortedCapabilityProbeError(signal);
       assertRequiredHostCapabilities(
         this.id,
         hostCapabilitiesFromProtocolProfile("codex", {
@@ -35539,28 +35581,38 @@ var CodexAdapter = class {
       );
       throw new Error("Unreachable Codex capability admission state");
     }
-    assertRequiredHostCapabilities(this.id, await probeCodexExecutable(executable));
+    if (signal?.aborted) throw abortedCapabilityProbeError(signal);
+    const capabilities = await probeCodexExecutable(executable, signal);
+    if (signal?.aborted) throw abortedCapabilityProbeError(signal);
+    assertRequiredHostCapabilities(this.id, capabilities);
     return executable;
   }
-  async probe() {
+  async probe(signal) {
+    if (signal?.aborted) throw abortedCapabilityProbeError(signal);
     let executable;
     try {
       executable = await resolveTrustedExecutable("codex", {
         untrustedRoots: await codexUntrustedRoots()
       });
     } catch {
+      if (signal?.aborted) throw abortedCapabilityProbeError(signal);
       return hostCapabilitiesFromProtocolProfile("codex", {
         installed: false,
         authenticated: false
       });
     }
-    return await probeCodexExecutable(executable);
+    if (signal?.aborted) throw abortedCapabilityProbeError(signal);
+    return await probeCodexExecutable(executable, signal);
   }
   async plan(request, signal) {
-    const executable = await this.resolveReadyExecutable(request.repositoryPath);
+    const executable = await this.resolveReadyExecutable(request.repositoryPath, signal);
     const schemaDirectory = await mkdtemp(join2(tmpdir(), "graphcraft-codex-plan-"));
     const schemaPath = join2(schemaDirectory, "graph-plan.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexGraphPlanJsonSchema), "utf8");
+    if (signal.aborted) {
+      await rm(schemaDirectory, { recursive: true, force: true });
+      throw abortedCapabilityProbeError(signal);
+    }
     const child = spawn2(executable, codexPlannerArgs(request, schemaPath, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -35618,10 +35670,14 @@ var CodexAdapter = class {
     }
   }
   async verify(request, signal) {
-    const executable = await this.resolveReadyExecutable(request.repositoryPath);
+    const executable = await this.resolveReadyExecutable(request.repositoryPath, signal);
     const schemaDirectory = await mkdtemp(join2(tmpdir(), "graphcraft-codex-verify-"));
     const schemaPath = join2(schemaDirectory, "semantic-verdict.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexSemanticVerdictJsonSchema), "utf8");
+    if (signal.aborted) {
+      await rm(schemaDirectory, { recursive: true, force: true });
+      throw abortedCapabilityProbeError(signal);
+    }
     const child = spawn2(executable, codexSemanticVerifierArgs(request, schemaPath, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -35679,11 +35735,15 @@ var CodexAdapter = class {
     }
   }
   async *execute(request, signal) {
-    const executable = await this.resolveReadyExecutable(request.repositoryPath);
+    const executable = await this.resolveReadyExecutable(request.repositoryPath, signal);
     const schemaDirectory = await mkdtemp(join2(tmpdir(), "graphcraft-codex-"));
     const schemaPath = join2(schemaDirectory, "worker-result.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexWorkerResultJsonSchema), "utf8");
     const args = codexWorkerArgs(request, schemaPath, this.policy);
+    if (signal.aborted) {
+      await rm(schemaDirectory, { recursive: true, force: true });
+      throw abortedCapabilityProbeError(signal);
+    }
     const child = spawn2(executable, args, {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -36015,53 +36075,88 @@ async function claudeUntrustedRoots(repositoryPath) {
   const discovered = await Promise.all(paths.map(discoverRepositoryTrustRoots));
   return [.../* @__PURE__ */ new Set([...paths, ...discovered.flat()])];
 }
-async function runCapabilityProbe2(executable, args) {
-  return await new Promise((resolve14) => {
+function abortedCapabilityProbeError2(signal) {
+  const reason = interruptionReason(signal.reason);
+  return new HostTerminationError(
+    {
+      cause: reason.cause,
+      outcome: "already_exited",
+      requestedSignal: "SIGTERM",
+      exitCode: null,
+      exitSignal: null
+    },
+    true
+  );
+}
+async function runCapabilityProbe2(executable, args, signal) {
+  if (signal?.aborted) throw abortedCapabilityProbeError2(signal);
+  return await new Promise((resolve14, reject) => {
     const child = spawn3(executable, args, { stdio: ["ignore", "pipe", "ignore"] });
     const output = new BoundedTextCapture2(ADAPTER_STDERR_LIMIT_BYTES2);
-    const timeoutAbort = new AbortController();
-    const terminationController = new ChildTerminationController(child, timeoutAbort.signal);
+    const probeAbort = new AbortController();
+    const terminationController = new ChildTerminationController(child, probeAbort.signal);
+    let abortSource;
     let settled = false;
     let settlement;
     let timeout;
-    const complete = (code, signal) => {
+    const requestAbort = (source, reason) => {
+      if (probeAbort.signal.aborted) return;
+      abortSource = source;
+      probeAbort.abort(reason);
+    };
+    const abortFromCaller = () => requestAbort("caller", signal?.reason);
+    const complete = (code, closeSignal) => {
       if (settled) return;
       settled = true;
       if (timeout) clearTimeout(timeout);
       if (settlement) clearTimeout(settlement);
-      const termination = terminationController.finish(code, signal);
-      resolve14({
+      probeAbort.signal.removeEventListener("abort", scheduleSettlement);
+      signal?.removeEventListener("abort", abortFromCaller);
+      const termination = terminationController.finish(code, closeSignal);
+      const result = {
         code,
         output: output.text(),
         overflowed: output.overflowed,
         terminated: termination !== void 0
-      });
+      };
+      if (abortSource === "caller" || abortSource === "timeout" && signal?.aborted) {
+        reject(
+          termination ? new HostTerminationError(termination, true) : abortedCapabilityProbeError2(abortSource === "caller" ? signal : probeAbort.signal)
+        );
+        return;
+      }
+      resolve14(result);
     };
-    child.stdout.on("data", (chunk) => output.append(chunk));
-    child.once("error", () => complete(null, null));
-    child.once("close", complete);
-    timeout = setTimeout(() => {
-      timeoutAbort.abort({
-        cause: "timeout",
-        reason: "claude capability probe timed out"
-      });
-      if (settled) return;
+    const scheduleSettlement = () => {
+      if (settled || settlement) return;
       settlement = setTimeout(() => {
         child.stdout.destroy();
         child.unref?.();
         complete(null, null);
       }, HOST_CAPABILITY_PROBE_SETTLE_GRACE_MS);
       settlement.unref();
+    };
+    child.stdout.on("data", (chunk) => output.append(chunk));
+    child.once("error", () => complete(null, null));
+    child.once("close", complete);
+    probeAbort.signal.addEventListener("abort", scheduleSettlement, { once: true });
+    timeout = setTimeout(() => {
+      requestAbort("timeout", {
+        cause: "timeout",
+        reason: "claude capability probe timed out"
+      });
     }, HOST_CAPABILITY_PROBE_TIMEOUT_MS);
     timeout.unref();
+    signal?.addEventListener("abort", abortFromCaller, { once: true });
+    if (signal?.aborted) abortFromCaller();
   });
 }
-async function claudeVersion(executable) {
-  const result = await runCapabilityProbe2(executable, ["--version"]);
+async function claudeVersion(executable, signal) {
+  const result = await runCapabilityProbe2(executable, ["--version"], signal);
   return result.code === 0 && !result.overflowed && !result.terminated ? { installed: true, version: stripSingleHostVersionLineEnding(result.output) } : { installed: false };
 }
-async function claudeAuthenticated(executable) {
-  const result = await runCapabilityProbe2(executable, ["auth", "status", "--json"]);
+async function claudeAuthenticated(executable, signal) {
+  const result = await runCapabilityProbe2(executable, ["auth", "status", "--json"], signal);
   if (result.code !== 0 || result.overflowed || result.terminated) return false;
   try {
     const status3 = JSON.parse(result.output);
@@ -36070,9 +36165,12 @@ async function claudeAuthenticated(executable) {
     return false;
   }
 }
-async function probeClaudeExecutable(executable) {
-  const result = await claudeVersion(executable);
-  const authenticated = result.installed && await claudeAuthenticated(executable);
+async function probeClaudeExecutable(executable, signal) {
+  if (signal?.aborted) throw abortedCapabilityProbeError2(signal);
+  const result = await claudeVersion(executable, signal);
+  if (signal?.aborted) throw abortedCapabilityProbeError2(signal);
+  const authenticated = result.installed && await claudeAuthenticated(executable, signal);
+  if (signal?.aborted) throw abortedCapabilityProbeError2(signal);
   return hostCapabilitiesFromProtocolProfile("claude", {
     installed: result.installed,
     authenticated,
@@ -36085,13 +36183,15 @@ var ClaudeAdapter = class {
   }
   policy;
   id = "claude";
-  async resolveReadyExecutable(repositoryPath) {
+  async resolveReadyExecutable(repositoryPath, signal) {
+    if (signal?.aborted) throw abortedCapabilityProbeError2(signal);
     let executable;
     try {
       executable = await resolveTrustedExecutable("claude", {
         untrustedRoots: await claudeUntrustedRoots(repositoryPath)
       });
     } catch {
+      if (signal?.aborted) throw abortedCapabilityProbeError2(signal);
       assertRequiredHostCapabilities(
         this.id,
         hostCapabilitiesFromProtocolProfile("claude", {
@@ -36101,25 +36201,32 @@ var ClaudeAdapter = class {
       );
       throw new Error("Unreachable Claude capability admission state");
     }
-    assertRequiredHostCapabilities(this.id, await probeClaudeExecutable(executable));
+    if (signal?.aborted) throw abortedCapabilityProbeError2(signal);
+    const capabilities = await probeClaudeExecutable(executable, signal);
+    if (signal?.aborted) throw abortedCapabilityProbeError2(signal);
+    assertRequiredHostCapabilities(this.id, capabilities);
     return executable;
   }
-  async probe() {
+  async probe(signal) {
+    if (signal?.aborted) throw abortedCapabilityProbeError2(signal);
     let executable;
     try {
       executable = await resolveTrustedExecutable("claude", {
         untrustedRoots: await claudeUntrustedRoots()
       });
     } catch {
+      if (signal?.aborted) throw abortedCapabilityProbeError2(signal);
       return hostCapabilitiesFromProtocolProfile("claude", {
         installed: false,
         authenticated: false
       });
     }
-    return await probeClaudeExecutable(executable);
+    if (signal?.aborted) throw abortedCapabilityProbeError2(signal);
+    return await probeClaudeExecutable(executable, signal);
   }
   async plan(request, signal) {
-    const executable = await this.resolveReadyExecutable(request.repositoryPath);
+    const executable = await this.resolveReadyExecutable(request.repositoryPath, signal);
+    if (signal.aborted) throw abortedCapabilityProbeError2(signal);
     const child = spawn3(executable, claudePlannerArgs(request, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -36173,7 +36280,8 @@ var ClaudeAdapter = class {
     }
   }
   async verify(request, signal) {
-    const executable = await this.resolveReadyExecutable(request.repositoryPath);
+    const executable = await this.resolveReadyExecutable(request.repositoryPath, signal);
+    if (signal.aborted) throw abortedCapabilityProbeError2(signal);
     const child = spawn3(executable, claudeSemanticVerifierArgs(request, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -36227,8 +36335,9 @@ var ClaudeAdapter = class {
     }
   }
   async *execute(request, signal) {
-    const executable = await this.resolveReadyExecutable(request.repositoryPath);
+    const executable = await this.resolveReadyExecutable(request.repositoryPath, signal);
     const args = claudeWorkerArgs(request, this.policy);
+    if (signal.aborted) throw abortedCapabilityProbeError2(signal);
     const child = spawn3(executable, args, {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -41313,14 +41422,27 @@ function familyScriptPurpose(family, name, terms) {
   if (["check", "test", "typecheck", "lint", "build"].includes(normalized)) return "regression";
   return void 0;
 }
-async function packageCandidates(repositoryPath, family, terms) {
-  const tracked = await runProcess("git", ["ls-files"], { cwd: repositoryPath });
+async function readUtf8File(path, signal) {
+  return await readFile(path, {
+    encoding: "utf8",
+    ...signal ? { signal } : {}
+  });
+}
+async function packageCandidates(repositoryPath, family, terms, signal) {
+  signal?.throwIfAborted();
+  const tracked = await runProcess("git", ["ls-files"], {
+    cwd: repositoryPath,
+    ...signal ? { signal } : {}
+  });
+  signal?.throwIfAborted();
   if (tracked.exitCode !== 0) return [];
   const manifests = tracked.stdout.split("\n").filter((path) => path === "package.json" || path.endsWith("/package.json")).slice(0, 100);
-  const rootManifest = manifests.includes("package.json") ? JSON.parse(await readFile(join6(repositoryPath, "package.json"), "utf8")) : void 0;
+  const rootManifest = manifests.includes("package.json") ? JSON.parse(await readUtf8File(join6(repositoryPath, "package.json"), signal)) : void 0;
+  signal?.throwIfAborted();
   const candidates = [];
   for (const manifestPath of manifests) {
-    const manifest2 = JSON.parse(await readFile(join6(repositoryPath, manifestPath), "utf8"));
+    signal?.throwIfAborted();
+    const manifest2 = JSON.parse(await readUtf8File(join6(repositoryPath, manifestPath), signal));
     const directory = dirname6(manifestPath) === "." ? void 0 : dirname6(manifestPath);
     const relevant = !directory || terms.some(
       (term) => directory.toLowerCase().includes(term) || manifest2.name?.toLowerCase().includes(term)
@@ -41404,6 +41526,7 @@ async function validateProbePlan(input, repositoryPath) {
   return plan;
 }
 async function discoverProbePlan(repositoryPath, task, baseSha, options = {}) {
+  options.signal?.throwIfAborted();
   const family = classifyTask(task);
   const terms = taskTerms(task);
   const inventoryTerms = terms.length ? terms : [family];
@@ -41448,8 +41571,9 @@ async function discoverProbePlan(repositoryPath, task, baseSha, options = {}) {
     });
   }
   const selected = selectPackageCandidates(
-    await packageCandidates(repositoryPath, family, inventoryTerms)
+    await packageCandidates(repositoryPath, family, inventoryTerms, options.signal)
   );
+  options.signal?.throwIfAborted();
   for (const completion of selected) {
     if (completion.purpose !== "regression") items.push({ ...completion, phase: "progress" });
     items.push(completion);
@@ -41498,6 +41622,7 @@ async function discoverProbePlan(repositoryPath, task, baseSha, options = {}) {
       probe: inventory
     });
   }
+  options.signal?.throwIfAborted();
   return await validateProbePlan({ schemaVersion: 1, family, items }, repositoryPath);
 }
 
@@ -42523,20 +42648,38 @@ async function executeSideEffect(input) {
 }
 
 // packages/runtime/src/repository.ts
-async function gitRaw(repositoryPath, args) {
-  const result = await runProcess("git", args, { cwd: repositoryPath, timeoutMs: 12e4 });
+async function gitRaw(repositoryPath, args, signal) {
+  signal?.throwIfAborted();
+  const result = await runProcess("git", args, {
+    cwd: repositoryPath,
+    timeoutMs: 12e4,
+    ...signal ? { signal } : {}
+  });
+  signal?.throwIfAborted();
   if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `git ${args[0]} failed`);
   return result.stdout;
 }
-async function git(repositoryPath, args) {
-  return (await gitRaw(repositoryPath, args)).trim();
+async function git(repositoryPath, args, signal) {
+  return (await gitRaw(repositoryPath, args, signal)).trim();
 }
-async function discoverRepository(cwd) {
-  const root = await git(cwd, ["rev-parse", "--show-toplevel"]);
-  const baseSha = await git(root, ["rev-parse", "HEAD"]);
-  const baseRef = await git(root, ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(() => "HEAD") || "HEAD";
-  const remote = await git(root, ["remote", "get-url", "origin"]).catch(() => void 0);
-  await ensureGraphcraftIgnored(root);
+async function readUtf8(path, signal) {
+  return await readFile2(path, {
+    encoding: "utf8",
+    ...signal ? { signal } : {}
+  });
+}
+async function discoverRepository(cwd, signal) {
+  const root = await git(cwd, ["rev-parse", "--show-toplevel"], signal);
+  const baseSha = await git(root, ["rev-parse", "HEAD"], signal);
+  const baseRef = await git(root, ["symbolic-ref", "--quiet", "--short", "HEAD"], signal).catch(() => {
+    signal?.throwIfAborted();
+    return "HEAD";
+  }) || "HEAD";
+  const remote = await git(root, ["remote", "get-url", "origin"], signal).catch(() => {
+    signal?.throwIfAborted();
+    return void 0;
+  });
+  await ensureGraphcraftIgnored(root, signal);
   return { root, baseRef, baseSha, ...remote ? { remote } : {} };
 }
 var planningEvidenceNames = /* @__PURE__ */ new Set([
@@ -42614,20 +42757,29 @@ function taskSnippet(content, terms, maximumCharacters) {
 ${lines.slice(start, end).join("\n")}`).join("\n\n");
   return snippet.slice(0, maximumCharacters);
 }
-async function discoverPlanningEvidence(repositoryRoot, task) {
-  const trackedPaths = (await git(repositoryRoot, ["ls-files"])).split("\n").filter(Boolean);
+async function discoverPlanningEvidence(repositoryRoot, task, signal) {
+  const trackedPaths = (await git(repositoryRoot, ["ls-files"], signal)).split("\n").filter(Boolean);
   const files = [];
   let remainingCharacters = 24e3;
   const searchTerms = planningSearchTerms(task);
   const searchPattern = searchTerms.join("|");
-  const matchedPaths = searchPattern ? (await git(repositoryRoot, ["grep", "-l", "-I", "-i", "-E", searchPattern, "--"]).catch(
-    () => ""
-  )).split("\n").filter(
+  const matchedPaths = searchPattern ? (await git(
+    repositoryRoot,
+    ["grep", "-l", "-I", "-i", "-E", searchPattern, "--"],
+    signal
+  ).catch(() => {
+    signal?.throwIfAborted();
+    return "";
+  })).split("\n").filter(
     (path) => path.length > 0 && !path.startsWith("dist/") && !path.endsWith(".map") && !path.endsWith(".lock")
   ) : [];
   const taskMatches = await Promise.all(
     matchedPaths.map(async (path) => {
-      const content = await readFile2(join9(repositoryRoot, path), "utf8").catch(() => "");
+      signal?.throwIfAborted();
+      const content = await readUtf8(join9(repositoryRoot, path), signal).catch(() => {
+        signal?.throwIfAborted();
+        return "";
+      });
       const normalized = content.toLowerCase();
       const score = searchTerms.filter((term) => normalized.includes(term)).length;
       const pathScore = searchTerms.filter((term) => path.toLowerCase().includes(term)).length;
@@ -42635,10 +42787,12 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
       return { path, content, score, pathScore, source };
     })
   );
+  signal?.throwIfAborted();
   taskMatches.sort(
     (left, right) => right.source - left.source || right.pathScore - left.pathScore || right.score - left.score || left.path.localeCompare(right.path)
   );
   for (const { path, content } of taskMatches.slice(0, 3)) {
+    signal?.throwIfAborted();
     const selected = taskSnippet(content, searchTerms, Math.min(3e3, remainingCharacters));
     if (!selected) continue;
     files.push({ path, content: selected, truncated: selected.length < content.length });
@@ -42650,9 +42804,13 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
     return leftDepth - rightDepth || left.localeCompare(right);
   });
   for (const path of baselinePaths) {
+    signal?.throwIfAborted();
     if (remainingCharacters <= 0 || files.length >= 7) break;
     if (files.some((file2) => file2.path === path)) continue;
-    const content = await readFile2(join9(repositoryRoot, path), "utf8").catch(() => "");
+    const content = await readUtf8(join9(repositoryRoot, path), signal).catch(() => {
+      signal?.throwIfAborted();
+      return "";
+    });
     const limit = Math.min(2e3, remainingCharacters);
     const selected = content.slice(0, limit);
     files.push({ path, content: selected, truncated: selected.length < content.length });
@@ -42667,15 +42825,21 @@ async function discoverPlanningEvidence(repositoryRoot, task) {
     files
   };
 }
-async function ensureGraphcraftIgnored(repositoryRoot) {
-  const rawExcludePath = await git(repositoryRoot, ["rev-parse", "--git-path", "info/exclude"]);
+async function ensureGraphcraftIgnored(repositoryRoot, signal) {
+  const rawExcludePath = await git(
+    repositoryRoot,
+    ["rev-parse", "--git-path", "info/exclude"],
+    signal
+  );
   const excludePath = isAbsolute5(rawExcludePath) ? rawExcludePath : resolve6(repositoryRoot, rawExcludePath);
   let content = "";
   try {
-    content = await readFile2(excludePath, "utf8");
+    content = await readUtf8(excludePath, signal);
   } catch {
+    signal?.throwIfAborted();
     await mkdir3(dirname8(excludePath), { recursive: true });
   }
+  signal?.throwIfAborted();
   if (!content.split("\n").includes(".graphcraft/"))
     await appendFile(excludePath, "\n.graphcraft/\n", "utf8");
 }
@@ -45368,23 +45532,46 @@ function relativeRepositoryPath(repositoryRoot, candidate) {
   const result = relative7(root, path);
   return result && !isAbsolute8(result) ? result.split(sep6).join("/") : void 0;
 }
-async function gitObjectValueHash(repositoryRoot, path) {
-  const { stdout } = await execFileAsync(
-    "git",
-    ["hash-object", `--path=${path.replaceAll("\\", "/")}`, resolve11(repositoryRoot, path)],
-    { cwd: repositoryRoot, encoding: "utf8", maxBuffer: 1024 * 1024 }
-  );
+async function gitObjectValueHash(repositoryRoot, path, signal) {
+  signal?.throwIfAborted();
+  const args = [
+    "hash-object",
+    `--path=${path.replaceAll("\\", "/")}`,
+    resolve11(repositoryRoot, path)
+  ];
+  const stdout = signal ? await runProcess("git", args, {
+    cwd: repositoryRoot,
+    signal,
+    timeoutMs: 12e4,
+    maxOutputBytesPerStream: 1024 * 1024
+  }).then((result) => {
+    signal.throwIfAborted();
+    if (result.exitCode !== 0)
+      throw new Error(result.stderr.trim() || `git hash-object failed for ${path}`);
+    return result.stdout;
+  }) : (await execFileAsync("git", args, {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024
+  })).stdout;
+  signal?.throwIfAborted();
   const objectHash = stdout.trim();
   if (!/^[a-f0-9]{40,64}$/.test(objectHash))
     throw new Error(`Unable to establish held-out integrity for ${path}`);
   return contentHash({ path, objectHash });
 }
-async function fileValueHash(repositoryRoot, path, algorithm) {
+async function fileValueHash(repositoryRoot, path, algorithm, signal) {
   if (algorithm === "git_hash_object") {
     const details = await stat4(resolve11(repositoryRoot, path)).catch(() => void 0);
-    return details?.isFile() ? await gitObjectValueHash(repositoryRoot, path) : contentHash({ missing: true, path, algorithm });
+    signal?.throwIfAborted();
+    return details?.isFile() ? await gitObjectValueHash(repositoryRoot, path, signal) : contentHash({ missing: true, path, algorithm });
   }
-  const contents = await readFile4(resolve11(repositoryRoot, path)).catch(() => void 0);
+  const contents = await readFile4(resolve11(repositoryRoot, path), {
+    ...signal ? { signal } : {}
+  }).catch(() => {
+    signal?.throwIfAborted();
+    return void 0;
+  });
   return contents ? contentHash({ path, contents: contents.toString("base64") }) : contentHash({ missing: true, path });
 }
 function possibleFileArguments(values) {
@@ -45392,31 +45579,34 @@ function possibleFileArguments(values) {
     (value) => !value.startsWith("-") && (value.startsWith(".") || value.includes("/") || /\.[a-z0-9]{1,8}$/i.test(value))
   );
 }
-async function fileIntegrity(repositoryRoot, cwd, values) {
+async function fileIntegrity(repositoryRoot, cwd, values, signal) {
   const result = [];
   for (const value of possibleFileArguments(values)) {
+    signal?.throwIfAborted();
     const path = relativeRepositoryPath(repositoryRoot, resolve11(repositoryRoot, cwd ?? ".", value));
     if (!path) continue;
     const details = await stat4(resolve11(repositoryRoot, path)).catch(() => void 0);
+    signal?.throwIfAborted();
     if (!details?.isFile()) continue;
     result.push({
       kind: "file",
       path,
       algorithm: "git_hash_object",
-      valueHash: await fileValueHash(repositoryRoot, path, "git_hash_object")
+      valueHash: await fileValueHash(repositoryRoot, path, "git_hash_object", signal)
     });
   }
   return result;
 }
-async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot) {
+async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot, signal) {
   const integrity = {};
   for (const item of probePlan.items.filter(({ phase }) => phase === "completion")) {
+    signal?.throwIfAborted();
     if (item.probe.kind === "held_out")
       throw new Error("An approved probe plan cannot contain held-out references");
     const protectedValues = [];
     if (item.probe.kind === "command") {
       protectedValues.push(
-        ...await fileIntegrity(repositoryRoot, item.probe.cwd, item.probe.args)
+        ...await fileIntegrity(repositoryRoot, item.probe.cwd, item.probe.args, signal)
       );
     }
     const match = /^(.*package\.json) script (.+)$/.exec(item.source);
@@ -45428,7 +45618,13 @@ async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot) {
     const script = match[2];
     const manifestPath = relativeRepositoryPath(repositoryRoot, path);
     if (!manifestPath) throw new Error(`Completion script ${script} escapes the repository`);
-    const manifest2 = JSON.parse(await readFile4(resolve11(repositoryRoot, manifestPath), "utf8"));
+    const manifest2 = JSON.parse(
+      await readFile4(resolve11(repositoryRoot, manifestPath), {
+        encoding: "utf8",
+        ...signal ? { signal } : {}
+      })
+    );
+    signal?.throwIfAborted();
     const value = manifest2.scripts?.[script];
     if (!value) throw new Error(`Completion script ${script} is missing from ${manifestPath}`);
     protectedValues.push({
@@ -45439,7 +45635,7 @@ async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot) {
     });
     const scriptDirectory = manifestPath.includes("/") ? manifestPath.slice(0, manifestPath.lastIndexOf("/")) : void 0;
     protectedValues.push(
-      ...await fileIntegrity(repositoryRoot, scriptDirectory, value.split(/\s+/))
+      ...await fileIntegrity(repositoryRoot, scriptDirectory, value.split(/\s+/), signal)
     );
     const unique2 = new Map(
       protectedValues.map((entry) => [
@@ -47058,6 +47254,26 @@ async function evaluateGitHubLifecycleWait(input) {
 }
 
 // packages/runtime/src/runner.ts
+function assertRunCreationActive(signal, durableRunId) {
+  if (!signal?.aborted) return;
+  const reason = interruptionReason(signal.reason);
+  const error51 = new Error(
+    durableRunId ? `${reason.reason}. Durable run ${durableRunId} was saved and can be inspected or resumed.` : reason.reason
+  );
+  error51.name = "RunCreationInterruptedError";
+  throw error51;
+}
+async function runCreationStep(signal, step) {
+  assertRunCreationActive(signal);
+  try {
+    const result = await step();
+    assertRunCreationActive(signal);
+    return result;
+  } catch (error51) {
+    assertRunCreationActive(signal);
+    throw error51;
+  }
+}
 function populateMissingGraphContext(graph, repositoryEvidence) {
   const evidencePaths = repositoryEvidence.files.map(({ path }) => path);
   return {
@@ -47156,17 +47372,20 @@ async function recordMissingUsage(store, invocation, node2, host) {
       invocation.invocationId
     );
 }
-async function validatePlannedContext(graph, repositoryPath) {
+async function validatePlannedContext(graph, repositoryPath, signal) {
   for (const node2 of graph.nodes) {
     if (node2.kind === "commit" || node2.kind === "push" || node2.kind === "pull_request" || node2.waitCondition?.kind === "github_pull_request")
       continue;
     if (node2.contextSelector.relevantPaths.length === 0)
       throw new Error(`Planned node ${node2.id} did not select repository evidence`);
     for (const relevantPath of node2.contextSelector.relevantPaths) {
+      assertRunCreationActive(signal);
       const result = await runProcess("git", ["ls-files", "--", relevantPath], {
         cwd: repositoryPath,
-        timeoutMs: 3e4
+        timeoutMs: 3e4,
+        ...signal ? { signal } : {}
       });
+      assertRunCreationActive(signal);
       if (result.exitCode !== 0 || result.stdout.trim().length === 0)
         throw new Error(
           `Planned node ${node2.id} selected nonexistent or untracked context path ${relevantPath}`
@@ -47175,23 +47394,29 @@ async function validatePlannedContext(graph, repositoryPath) {
   }
 }
 async function createRun(task, options) {
-  const repository = await discoverRepository(options.cwd);
+  const repository = await runCreationStep(
+    options.signal,
+    () => discoverRepository(options.cwd, options.signal)
+  );
   const persistedTask = redactString(task);
   const contract = compileRunContract(persistedTask, repository, {
     ...options.finishLine ? { finishLine: options.finishLine } : {},
     ...options.include ? { include: options.include } : {},
     ...options.exclude ? { exclude: options.exclude } : {}
   });
-  const [probePlan, repositoryEvidence] = await Promise.all([
-    discoverProbePlan(repository.root, persistedTask, repository.baseSha, {
-      ...contract.finishLine.kind === "pr_open" ? { finishLine: "pr_open" } : {}
-    }),
-    discoverPlanningEvidence(repository.root, persistedTask)
-  ]);
-  const heldOutProbePlan = await createRuntimeHeldOutProbePlan(
-    contract.runId,
-    probePlan,
-    repository.root
+  const [probePlan, repositoryEvidence] = await runCreationStep(
+    options.signal,
+    () => Promise.all([
+      discoverProbePlan(repository.root, persistedTask, repository.baseSha, {
+        ...contract.finishLine.kind === "pr_open" ? { finishLine: "pr_open" } : {},
+        ...options.signal ? { signal: options.signal } : {}
+      }),
+      discoverPlanningEvidence(repository.root, persistedTask, options.signal)
+    ])
+  );
+  const heldOutProbePlan = await runCreationStep(
+    options.signal,
+    () => createRuntimeHeldOutProbePlan(contract.runId, probePlan, repository.root, options.signal)
   );
   const graphProbePlan = workerVisibleProbePlan(probePlan, heldOutProbePlan);
   const completionProbes = graphProbePlan.items.filter(({ phase }) => phase === "completion").map(({ probe }) => probe);
@@ -47199,31 +47424,37 @@ async function createRun(task, options) {
   let graph;
   let planningUsage;
   if (options.planner) {
-    const capabilities = await options.planner.probe();
-    assertRequiredHostCapabilities(options.planner.id, capabilities);
-    const planned = await options.planner.plan(
-      {
-        contract,
-        repositoryPath: repository.root,
-        repositoryEvidence,
-        probePlan: graphProbePlan,
-        verificationProbes: completionProbes,
-        authorityBoundary: createModelAuthorityBoundary([
-          {
-            source: "task_or_issue_text",
-            location: "contract.task, contract.outcome, and task-derived anchor descriptions"
-          },
-          {
-            source: "repository_content",
-            location: "repositoryEvidence and repository reads"
-          },
-          { source: "command_output", location: "any read-only tool output" }
-        ])
-      },
-      options.signal ?? new AbortController().signal
+    const planner = options.planner;
+    const planningSignal = options.signal ?? new AbortController().signal;
+    const capabilities = await runCreationStep(options.signal, () => planner.probe(planningSignal));
+    assertRequiredHostCapabilities(planner.id, capabilities);
+    const planned = await runCreationStep(
+      options.signal,
+      () => planner.plan(
+        {
+          contract,
+          repositoryPath: repository.root,
+          repositoryEvidence,
+          probePlan: graphProbePlan,
+          verificationProbes: completionProbes,
+          authorityBoundary: createModelAuthorityBoundary([
+            {
+              source: "task_or_issue_text",
+              location: "contract.task, contract.outcome, and task-derived anchor descriptions"
+            },
+            {
+              source: "repository_content",
+              location: "repositoryEvidence and repository reads"
+            },
+            { source: "command_output", location: "any read-only tool output" }
+          ])
+        },
+        planningSignal
+      )
     );
     graph = compilePlannedGraph(contract, planned.plan, completionProbes, approvedProbes);
-    await validatePlannedContext(graph, repository.root);
+    await validatePlannedContext(graph, repository.root, options.signal);
+    assertRunCreationActive(options.signal);
     planningUsage = planned.usage;
   } else {
     graph = compileGraph(contract, completionProbes);
@@ -47237,7 +47468,8 @@ async function createRun(task, options) {
     approvedProbes
   });
   graph = optimized.graph;
-  await validatePlannedContext(graph, repository.root);
+  await validatePlannedContext(graph, repository.root, options.signal);
+  assertRunCreationActive(options.signal);
   const store = await RunStore.create(
     repository.root,
     contract,
@@ -47258,6 +47490,7 @@ async function createRun(task, options) {
       host: options.planner.id,
       missing: !planningUsage
     });
+  assertRunCreationActive(options.signal, contract.runId);
   return { contract, graph, store, probePlan };
 }
 async function configureRunProbes(store, input) {
@@ -47401,10 +47634,33 @@ async function executeWorker(input) {
   let usageReceipts = 0;
   const tokenPhase = input.node.id.startsWith("repair-") ? "repair" : "worker";
   let artifact = join12(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
-  const preInvocationDiagnostic = diagnoseRequiredHostCapabilities(
-    input.adapter.id,
-    await input.adapter.probe()
-  );
+  let preInvocationDiagnostic;
+  try {
+    preInvocationDiagnostic = diagnoseRequiredHostCapabilities(
+      input.adapter.id,
+      await input.adapter.probe(input.signal)
+    );
+  } catch (cause) {
+    if (!(cause instanceof HostTerminationError) || !input.signal.aborted) throw cause;
+    artifact = await input.store.appendInvocationEvent(invocationId, {
+      type: "terminated",
+      termination: cause.termination
+    });
+    await input.store.append(
+      "runtime",
+      "invocation.finished",
+      {
+        invocationId,
+        nodeId: input.node.id,
+        artifact,
+        success: false,
+        interrupted: true,
+        termination: cause.termination
+      },
+      invocationId
+    );
+    return { invocationId, termination: cause.termination, artifact };
+  }
   if (!preInvocationDiagnostic.ready) {
     artifact = await input.store.appendInvocationEvent(invocationId, {
       type: "error",
@@ -47442,11 +47698,20 @@ async function executeWorker(input) {
     input.signal
   );
   const iterator = execution[Symbol.asyncIterator]();
+  let hostStarted = false;
   while (true) {
     let next;
     try {
       next = await iterator.next();
     } catch (cause) {
+      if (cause instanceof HostTerminationError) {
+        termination = cause.termination;
+        artifact = await input.store.appendInvocationEvent(invocationId, {
+          type: "terminated",
+          termination
+        });
+        break;
+      }
       error51 = cause instanceof Error ? cause.message : String(cause);
       const capabilityError = cause instanceof HostCapabilityAdmissionError;
       if (!capabilityError) errorCause = "host_crash";
@@ -47471,6 +47736,7 @@ async function executeWorker(input) {
     }
     const event = parsedEvent.data;
     artifact = await input.store.appendInvocationEvent(invocationId, event);
+    if (event.type === "started") hostStarted = true;
     if (event.type === "session") {
       await input.store.append(
         "host",
@@ -47503,7 +47769,7 @@ async function executeWorker(input) {
       if (event.cause === "host_crash" || event.cause === "timeout") errorCause = event.cause;
     }
   }
-  if (usageReceipts === 0 && !capabilityDiagnostic)
+  if (hostStarted && usageReceipts === 0 && !capabilityDiagnostic)
     await input.store.append(
       "host",
       "tokens.recorded",
@@ -47786,35 +48052,6 @@ async function runSemanticVerification(input) {
     });
   if (input.node.id.startsWith("repair-review-") || input.node.id.startsWith("repair-ci-"))
     semanticAuthorityInputs.push({ source: "external_event", location: "context.objective" });
-  await input.store.append(
-    "runtime",
-    "semantic.started",
-    {
-      invocationId,
-      nodeId: input.node.id,
-      phase: input.phase,
-      host: input.adapter.id,
-      checkpointId,
-      contextHash,
-      beforeDigest: beforeScope.digest,
-      scopeBaseline: beforeScope
-    },
-    invocationId
-  );
-  await input.store.append(
-    "host",
-    "tokens.recorded",
-    {
-      usage: unavailableTokenUsage(),
-      phase: "semantic_verification",
-      nodeId: input.node.id,
-      host: input.adapter.id,
-      missing: true,
-      provisional: true,
-      semanticCheckpointId: checkpointId
-    },
-    invocationId
-  );
   const failVerification = async (error51) => {
     const failure = error51 instanceof Error ? error51 : new Error(String(error51));
     const capabilityDiagnostic = error51 instanceof HostCapabilityAdmissionError ? error51.diagnostic : void 0;
@@ -47852,9 +48089,58 @@ async function runSemanticVerification(input) {
     );
     throw new SemanticVerificationFailure(failure.message, { cause: error51 });
   };
+  try {
+    assertRequiredHostCapabilities(input.adapter.id, await input.adapter.probe(input.signal));
+  } catch (error51) {
+    if (error51 instanceof HostTerminationError) throw error51;
+    return failVerification(error51);
+  }
+  await input.store.append(
+    "runtime",
+    "semantic.started",
+    {
+      invocationId,
+      nodeId: input.node.id,
+      phase: input.phase,
+      host: input.adapter.id,
+      checkpointId,
+      contextHash,
+      beforeDigest: beforeScope.digest,
+      scopeBaseline: beforeScope
+    },
+    invocationId
+  );
+  await input.store.append(
+    "host",
+    "tokens.recorded",
+    {
+      usage: unavailableTokenUsage(),
+      phase: "semantic_verification",
+      nodeId: input.node.id,
+      host: input.adapter.id,
+      missing: true,
+      provisional: true,
+      semanticCheckpointId: checkpointId
+    },
+    invocationId
+  );
+  const recordNoModelUsage = async () => {
+    await input.store.append(
+      "host",
+      "tokens.recorded",
+      {
+        usage: deterministicTokenUsage(),
+        phase: "semantic_verification",
+        nodeId: input.node.id,
+        host: input.adapter.id,
+        beforeModelInvocation: true,
+        semanticCheckpointId: checkpointId
+      },
+      invocationId
+    );
+  };
   let result;
   try {
-    assertRequiredHostCapabilities(input.adapter.id, await input.adapter.probe());
     result = await input.adapter.verify(
       {
         invocationId,
@@ -47865,7 +48151,11 @@ async function runSemanticVerification(input) {
       input.signal
     );
   } catch (error51) {
-    if (error51 instanceof HostTerminationError) throw error51;
+    if (error51 instanceof HostTerminationError) {
+      if (error51.beforeModelInvocation) await recordNoModelUsage();
+      throw error51;
+    }
+    if (error51 instanceof HostCapabilityAdmissionError) await recordNoModelUsage();
     return failVerification(error51);
   }
   let afterScope;
@@ -49376,28 +49666,6 @@ async function executeRun(input) {
       }
       state = await input.store.loadState();
     }
-    let adapterReady = false;
-    const ensureAdapterReady = async () => {
-      if (adapterReady) return true;
-      const capabilities = await input.adapter.probe();
-      const diagnostic = diagnoseRequiredHostCapabilities(input.adapter.id, capabilities);
-      adapterReady = diagnostic.ready;
-      if (!adapterReady)
-        await input.store.append("runtime", "run.blocked", {
-          reason: diagnostic.detail
-        });
-      return adapterReady;
-    };
-    const initialBatch = readyBatch(graph, state, input.maxWorkers ?? 1).nodes;
-    if (initialBatch.some((candidate) => !["wait", "commit"].includes(candidate.kind)) && !await ensureAdapterReady())
-      return await input.store.loadState();
-    if (!workspace)
-      try {
-        workspace = await input.store.loadWorkspace();
-      } catch {
-        workspace = await createRunWorkspace(contract);
-        await input.store.writeWorkspace(workspace);
-      }
     const finishInterruption = async (nodeIds, termination, artifact) => {
       const activeNodeIds = nodeIds ? Array.isArray(nodeIds) ? nodeIds : [nodeIds] : [];
       const request = infrastructureFailure ? void 0 : signal.reason === controlAbort.signal.reason ? controlRequest : void 0;
@@ -49434,6 +49702,37 @@ async function executeRun(input) {
       if (request) await controlChannel.clear(request.requestId);
       return await input.store.loadState();
     };
+    let adapterReady = false;
+    let adapterProbeTermination;
+    const ensureAdapterReady = async () => {
+      if (adapterReady) return true;
+      let capabilities;
+      try {
+        capabilities = await input.adapter.probe(signal);
+      } catch (error51) {
+        if (!(error51 instanceof HostTerminationError) || !signal.aborted) throw error51;
+        adapterProbeTermination = error51.termination;
+        return false;
+      }
+      if (signal.aborted) return false;
+      const diagnostic = diagnoseRequiredHostCapabilities(input.adapter.id, capabilities);
+      adapterReady = diagnostic.ready;
+      if (!adapterReady)
+        await input.store.append("runtime", "run.blocked", {
+          reason: diagnostic.detail
+        });
+      return adapterReady;
+    };
+    const initialBatch = readyBatch(graph, state, input.maxWorkers ?? 1).nodes;
+    if (initialBatch.some((candidate) => !["wait", "commit"].includes(candidate.kind)) && !await ensureAdapterReady())
+      return signal.aborted ? await finishInterruption(void 0, adapterProbeTermination) : await input.store.loadState();
+    if (!workspace)
+      try {
+        workspace = await input.store.loadWorkspace();
+      } catch {
+        workspace = await createRunWorkspace(contract);
+        await input.store.writeWorkspace(workspace);
+      }
     const deferLifecycleConsistency = async (node2, error51) => {
       const deferred = await deferGitHubLifecycleConsistency({
         store: input.store,
@@ -49564,7 +49863,7 @@ async function executeRun(input) {
         }
       }
       if (batch.some((candidate) => !["wait", "commit"].includes(candidate.kind)) && !await ensureAdapterReady())
-        return await input.store.loadState();
+        return signal.aborted ? await finishInterruption(void 0, adapterProbeTermination) : await input.store.loadState();
       const reuseSessions = /* @__PURE__ */ new Map();
       for (const candidate of batch) {
         if (["verification", "commit", "push", "pull_request", "wait"].includes(candidate.kind) || recoveries.has(candidate.id))
