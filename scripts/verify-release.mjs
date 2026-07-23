@@ -1226,7 +1226,7 @@ if (host === "gh") {
 `;
 }
 
-async function installSmokeHostShims(environment) {
+export async function installSmokeHostShims(environment, platform = process.platform) {
   const binDirectory = environment.PNPM_HOME;
   const stateDirectory = join(dirname(binDirectory), "host-state");
   await Promise.all([
@@ -1234,15 +1234,16 @@ async function installSmokeHostShims(environment) {
     mkdir(stateDirectory, { recursive: true }),
   ]);
   environment.GRAPHCRAFT_SMOKE_HOST_STATE_DIR = stateDirectory;
+  environment.GRAPHCRAFT_SMOKE_NODE = process.execPath;
 
   for (const host of [...SMOKE_HOSTS, "gh"]) {
     const program = smokeHostProgram(host);
     const programPath = join(binDirectory, `${host}.mjs`);
     await writeFile(programPath, program, { mode: 0o700 });
-    if (process.platform === "win32") {
+    if (platform === "win32") {
       await writeFile(
         join(binDirectory, `${host}.cmd`),
-        `@echo off\r\n"${process.execPath}" "${programPath}" %*\r\n`,
+        `@echo off\r\n"%GRAPHCRAFT_SMOKE_NODE%" "%~dp0${host}.mjs" %*\r\n`,
         { mode: 0o700 },
       );
     } else {

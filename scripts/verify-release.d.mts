@@ -109,6 +109,10 @@ export function verifyStableReleaseOrder(input: {
   requestTimeoutMs?: number;
 }): Promise<{ state: "initial" } | { state: "current" | "forward"; latest: string }>;
 export function cleanSmokeEnvironment(root: string): NodeJS.ProcessEnv;
+export function installSmokeHostShims(
+  environment: NodeJS.ProcessEnv,
+  platform?: NodeJS.Platform,
+): Promise<string>;
 export function terminateSmokeProcessTree(
   crossSpawn: (
     command: string,

@@ -5,11 +5,13 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { installHost, uninstallHost, updateHost } from "../packages/cli/src/index.ts";
 
 import {
   artifactDigests,
   cleanSmokeEnvironment,
   compareArtifacts,
+  installSmokeHostShims,
   oneShotPackageInvocation,
   parseReleaseTag,
   registryState,
@@ -463,6 +465,48 @@ describe("release artifact and registry verification", () => {
       join("/isolated/release-smoke", "home", ".npmrc"),
     );
   });
+
+  it("keeps Windows smoke host wrappers ASCII-only and directory-relative", async () => {
+    const root = await temporaryDirectory("graphcraft-release-windows-shims-");
+    const environment = cleanSmokeEnvironment(join(root, "clean package home Ω"));
+    await installSmokeHostShims(environment, "win32");
+
+    for (const host of ["codex", "claude", "gh"]) {
+      const wrapper = await readFile(join(environment.PNPM_HOME!, `${host}.cmd`), "utf8");
+      expect(wrapper).toBe(`@echo off\r\n"%GRAPHCRAFT_SMOKE_NODE%" "%~dp0${host}.mjs" %*\r\n`);
+      expect(Buffer.from(wrapper).every((byte) => byte <= 0x7f)).toBe(true);
+      expect(wrapper).not.toContain(environment.PNPM_HOME!);
+    }
+    expect(environment.GRAPHCRAFT_SMOKE_NODE).toBe(process.execPath);
+  });
+
+  it.runIf(process.platform === "win32")(
+    "runs the production Codex lifecycle through a Windows shim in the Unicode path",
+    async () => {
+      const root = await temporaryDirectory("graphcraft-release-windows-host-");
+      const environment = cleanSmokeEnvironment(join(root, "clean package home Ω"));
+      environment.GRAPHCRAFT_HOME = join(environment.HOME!, "Graphcraft state 工具");
+      await Promise.all([
+        mkdir(environment.HOME!, { recursive: true }),
+        mkdir(environment.TMPDIR!, { recursive: true }),
+      ]);
+      const stateDirectory = await installSmokeHostShims(environment);
+      for (const [name, value] of Object.entries(environment)) {
+        if (typeof value === "string") vi.stubEnv(name, value);
+      }
+
+      const lifecycleOptions = { graphcraftHome: environment.GRAPHCRAFT_HOME };
+      const mcpPath = join(process.cwd(), "dist", "mcp.mjs");
+      await installHost("codex", mcpPath, lifecycleOptions);
+      await installHost("codex", mcpPath, lifecycleOptions);
+      await updateHost("codex", mcpPath, lifecycleOptions);
+      await uninstallHost("codex", lifecycleOptions);
+      await uninstallHost("codex", lifecycleOptions);
+
+      const state = JSON.parse(await readFile(join(stateDirectory, "codex.json"), "utf8"));
+      expect(state).toEqual({ registration: null, successfulAdds: 1, successfulRemoves: 1 });
+    },
+  );
 
   it("falls back when Windows smoke taskkill exits nonzero", () => {
     const killer = Object.assign(new EventEmitter(), { unref: vi.fn() });
