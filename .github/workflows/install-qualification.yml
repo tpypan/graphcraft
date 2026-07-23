@@ -1,0 +1,164 @@
+name: Install qualification
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/install-qualification.yml"
+      - ".agents/**"
+      - ".claude-plugin/**"
+      - ".codex-plugin/**"
+      - ".mcp.json"
+      - ".npmrc"
+      - "benchmarks/**"
+      - "dist/**"
+      - "package.json"
+      - "packages/**"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "scripts/build.mjs"
+      - "scripts/check-package.mjs"
+      - "scripts/generate-plugin-artifacts.mjs"
+      - "scripts/verify-release.mjs"
+      - "tsconfig.json"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/install-qualification.yml"
+      - ".agents/**"
+      - ".claude-plugin/**"
+      - ".codex-plugin/**"
+      - ".mcp.json"
+      - ".npmrc"
+      - "benchmarks/**"
+      - "dist/**"
+      - "package.json"
+      - "packages/**"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "scripts/build.mjs"
+      - "scripts/check-package.mjs"
+      - "scripts/generate-plugin-artifacts.mjs"
+      - "scripts/verify-release.mjs"
+      - "tsconfig.json"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      artifact_id: ${{ steps.candidate_artifact.outputs.artifact-id }}
+      version: ${{ steps.candidate.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.15.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build one exact-SHA package candidate
+        id: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidate_root="$RUNNER_TEMP/install-qualification"
+          mkdir -p "$candidate_root"
+          pnpm build
+          node scripts/check-package.mjs
+          npm pack --ignore-scripts --json --pack-destination "$candidate_root" > "$candidate_root/pack.json"
+          node --input-type=module - "$candidate_root" "$GITHUB_OUTPUT" <<'NODE'
+          import { createHash } from "node:crypto";
+          import { appendFile, readFile, writeFile } from "node:fs/promises";
+          import { basename, join } from "node:path";
+
+          const [candidateRoot, outputPath] = process.argv.slice(2);
+          const packed = JSON.parse(await readFile(join(candidateRoot, "pack.json"), "utf8"));
+          if (!Array.isArray(packed) || packed.length !== 1) {
+            throw new Error("npm pack must produce exactly one package candidate");
+          }
+          const filename = packed[0]?.filename;
+          const version = packed[0]?.version;
+          if (typeof filename !== "string" || basename(filename) !== filename) {
+            throw new Error("npm pack returned an unsafe candidate filename");
+          }
+          if (typeof version !== "string" || version.length === 0) {
+            throw new Error("npm pack did not report the package version");
+          }
+          const bytes = await readFile(join(candidateRoot, filename));
+          const digest = createHash("sha256").update(bytes).digest("hex");
+          await writeFile(join(candidateRoot, "SHA256SUMS"), `${digest}  ${filename}\n`);
+          await appendFile(outputPath, `version=${version}\n`);
+          console.log(`Candidate SHA-256 ${digest}`);
+          NODE
+      - id: candidate_artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: graphcraft-install-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/install-qualification/*.tgz
+            ${{ runner.temp }}/install-qualification/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  smoke:
+    needs: package
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        method: [npm, pnpm, npx, pnpm-dlx]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.15.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact_id }}
+          path: ${{ runner.temp }}/install-qualification
+      - name: Clean ${{ matrix.method }} lifecycle on ${{ matrix.os }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidate_root="$RUNNER_TEMP/install-qualification"
+          tarball="$(node --input-type=module - "$candidate_root" <<'NODE'
+          import { createHash } from "node:crypto";
+          import { readFile, readdir } from "node:fs/promises";
+          import { basename, join } from "node:path";
+
+          const candidateRoot = process.argv[2];
+          const checksum = (await readFile(join(candidateRoot, "SHA256SUMS"), "utf8")).trim();
+          const match = checksum.match(/^([a-f0-9]{64})  ([^/\\]+\.tgz)$/u);
+          if (!match) throw new Error("Package candidate checksum manifest is invalid");
+          const entries = (await readdir(candidateRoot)).filter((entry) => entry.endsWith(".tgz"));
+          if (entries.length !== 1 || entries[0] !== match[2] || basename(entries[0]) !== entries[0]) {
+            throw new Error("Package candidate artifact set is ambiguous");
+          }
+          const tarball = join(candidateRoot, entries[0]);
+          const digest = createHash("sha256").update(await readFile(tarball)).digest("hex");
+          if (digest !== match[1]) throw new Error("Package candidate checksum does not match");
+          console.error(`Verified candidate SHA-256 ${digest}`);
+          process.stdout.write(tarball);
+          NODE
+          )"
+          node scripts/verify-release.mjs smoke \
+            --source "$tarball" \
+            --method "${{ matrix.method }}" \
+            --version "${{ needs.package.outputs.version }}"

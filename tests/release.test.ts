@@ -306,6 +306,36 @@ describe("release metadata", () => {
     expect(releasePolicy).toContain("repos/tpypan/graphcraft/immutable-releases");
     expect(releasePolicy).toContain("admin-only repository setting");
   });
+
+  it("qualifies one exact-SHA package candidate across every supported install path", async () => {
+    const qualification = await readFile(
+      join(process.cwd(), ".github", "workflows", "install-qualification.yml"),
+      "utf8",
+    );
+
+    expect(qualification).toContain("workflow_dispatch:");
+    expect(qualification).toContain("branches: [main]");
+    expect(qualification).toContain("permissions:\n  contents: read");
+    expect(qualification).toContain(
+      "name: graphcraft-install-${{ github.sha }}-${{ github.run_attempt }}",
+    );
+    expect(qualification).toContain(
+      "artifact_id: ${{ steps.candidate_artifact.outputs.artifact-id }}",
+    );
+    expect(qualification).toContain("artifact-ids: ${{ needs.package.outputs.artifact_id }}");
+    expect(qualification.match(/name: graphcraft-install-\$\{\{ github\.sha \}\}/gu)).toHaveLength(
+      1,
+    );
+    expect(qualification.match(/ref: \$\{\{ github\.sha \}\}/gu)).toHaveLength(2);
+    expect(qualification).toContain("os: [ubuntu-latest, macos-latest, windows-latest]");
+    expect(qualification).toContain("method: [npm, pnpm, npx, pnpm-dlx]");
+    expect(qualification).toContain("scripts/verify-release.mjs smoke");
+    expect(qualification).toContain("SHA256SUMS");
+    expect(qualification).not.toContain("npm publish");
+    expect(qualification).not.toContain("gh release");
+    expect(qualification).not.toContain("id-token: write");
+    expect(qualification).not.toContain("contents: write");
+  });
 });
 
 describe("signed annotated tag binding", () => {
