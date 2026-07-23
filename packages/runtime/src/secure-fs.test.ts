@@ -141,6 +141,22 @@ function windowsAclIsOwnerExclusive(evidence: WindowsAclEvidence): boolean {
   return (grantedRights & 0x1f01ff) === 0x1f01ff;
 }
 
+function windowsAclIsOwnerOnly(
+  evidence: WindowsAclEvidence,
+  expectedInheritanceFlags: number,
+): boolean {
+  return (
+    evidence.protected &&
+    windowsAclIsOwnerExclusive(evidence) &&
+    evidence.aces.every(
+      (ace) =>
+        !ace.isInherited &&
+        ace.inheritanceFlags === expectedInheritanceFlags &&
+        ace.propagationFlags === 0,
+    )
+  );
+}
+
 function windowsAclDiagnostic(evidence: WindowsAclEvidence): string {
   const aces = evidence.aces
     .map(
@@ -179,10 +195,13 @@ function parseWindowsAclEvidence(output: string): WindowsAclEvidence {
 }
 
 async function expectWindowsOwnerOnly(path: string): Promise<void> {
-  await runWindowsPowerShell(
-    path,
-    String.raw`
+  const expectedInheritanceFlags = (await lstat(path)).isDirectory() ? 3 : 0;
+  const evidence = parseWindowsAclEvidence(
+    await runWindowsPowerShell(
+      path,
+      String.raw`
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $path = [Environment]::GetEnvironmentVariable('GRAPHCRAFT_ACL_TEST_PATH')
 $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
 $attributes = [System.IO.File]::GetAttributes($path)
@@ -192,38 +211,6 @@ if ($isDirectory) {
 } else {
   $item = [System.IO.FileInfo]::new($path)
 }
-$sections = ([System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner)
-$acl = $item.GetAccessControl($sections)
-$owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier])
-$rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
-$expectedInheritance = if ($isDirectory) {
-  ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit)
-} else {
-  [System.Security.AccessControl.InheritanceFlags]::None
-}
-if (-not $acl.AreAccessRulesProtected -or $owner.Value -ne $sid.Value -or
-    $rules.Count -ne 1 -or $rules[0].IsInherited -or
-    $rules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
-    $rules[0].FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl -or
-    $rules[0].InheritanceFlags -ne $expectedInheritance -or
-    $rules[0].PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None -or
-    $rules[0].IdentityReference.Value -ne $sid.Value) {
-  throw 'Owner-only ACL assertion failed'
-}
-`,
-  );
-}
-
-async function expectWindowsOwnerExclusive(path: string): Promise<void> {
-  const evidence = parseWindowsAclEvidence(
-    await runWindowsPowerShell(
-      path,
-      String.raw`
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$path = [Environment]::GetEnvironmentVariable('GRAPHCRAFT_ACL_TEST_PATH')
-$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-$item = [System.IO.FileInfo]::new($path)
 $sections = ([System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner)
 $acl = $item.GetAccessControl($sections)
 $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier])
@@ -247,8 +234,8 @@ foreach ($rule in $rules) {
 `,
     ),
   );
-  if (!windowsAclIsOwnerExclusive(evidence))
-    throw new Error(`Owner-exclusive ACL assertion failed: ${windowsAclDiagnostic(evidence)}`);
+  if (!windowsAclIsOwnerOnly(evidence, expectedInheritanceFlags))
+    throw new Error(`Owner-only ACL assertion failed: ${windowsAclDiagnostic(evidence)}`);
 }
 
 describe("secure filesystem permissions", () => {
@@ -287,7 +274,7 @@ describe("secure filesystem permissions", () => {
     expect(privatePublicationIdentityFingerprint({ ...before, ino: 0n })).toBeUndefined();
   });
 
-  it("accepts only demonstrably owner-exclusive Windows file ACL observations", () => {
+  it("accepts only demonstrably owner-exclusive and owner-only Windows ACL observations", () => {
     const inheritedFullControl = {
       identityIsCurrent: true,
       accessControlType: 0,
@@ -303,16 +290,18 @@ describe("secure filesystem permissions", () => {
     };
 
     expect(windowsAclIsOwnerExclusive(inherited)).toBe(true);
-    expect(
-      windowsAclIsOwnerExclusive({
-        ...inherited,
-        protected: true,
-        aces: [
-          { ...inheritedFullControl, rights: 0x1f0000, isInherited: false },
-          { ...inheritedFullControl, rights: 0x01ff, isInherited: false },
-        ],
-      }),
-    ).toBe(true);
+    const explicit = {
+      ...inherited,
+      protected: true,
+      aces: [
+        { ...inheritedFullControl, rights: 0x1f0000, isInherited: false },
+        { ...inheritedFullControl, rights: 0x01ff, isInherited: false },
+      ],
+    };
+    expect(windowsAclIsOwnerExclusive(explicit)).toBe(true);
+    expect(windowsAclIsOwnerOnly(explicit, 0)).toBe(true);
+    expect(windowsAclIsOwnerOnly(inherited, 0)).toBe(false);
+    expect(windowsAclIsOwnerOnly({ ...explicit, ownerIsCurrent: false }, 0)).toBe(false);
     expect(windowsAclIsOwnerExclusive({ ...inherited, ownerIsCurrent: false })).toBe(false);
     expect(
       windowsAclIsOwnerExclusive({
@@ -630,7 +619,7 @@ describe("secure filesystem permissions", () => {
     }
 
     if (process.platform !== "win32") await expectMode(path, 0o600);
-    else await expectWindowsOwnerExclusive(path);
+    else await expectWindowsOwnerOnly(path);
   });
 
   it("keeps strict publication identity by default but accepts a private projection supersession", async () => {
@@ -676,7 +665,7 @@ describe("secure filesystem permissions", () => {
       await expectMode(strictPath, 0o600);
       await expectMode(projectionPath, 0o600);
     } else {
-      await expectWindowsOwnerExclusive(strictPath);
+      await expectWindowsOwnerOnly(strictPath);
       await expectWindowsOwnerOnly(projectionPath);
     }
   });
@@ -750,14 +739,14 @@ describe("secure filesystem permissions", () => {
   );
 
   it.skipIf(process.platform !== "win32")(
-    "publishes concurrent JSON replacements with owner-exclusive final ACLs",
+    "publishes concurrent JSON replacements with owner-only final ACLs",
     async () => {
       const root = await temporaryRoot();
       const ownedRoot = join(root, "private projections");
       const path = join(ownedRoot, "state.json");
       await ensurePrivateDirectory(ownedRoot);
       await writePrivateJsonAtomic(path, { sequence: 0 }, ownedRoot);
-      await expectWindowsOwnerExclusive(path);
+      await expectWindowsOwnerOnly(path);
 
       await grantWindowsEveryone(path);
       await Promise.all(
@@ -770,7 +759,7 @@ describe("secure filesystem permissions", () => {
         JSON.parse((await readPrivateFileBounded(path, 1024, ownedRoot)).toString("utf8")),
       ).toMatchObject({ sequence: expect.any(Number) });
       await expectWindowsOwnerOnly(ownedRoot);
-      await expectWindowsOwnerExclusive(path);
+      await expectWindowsOwnerOnly(path);
       await hardenPrivateFile(path, ownedRoot);
       await expectWindowsOwnerOnly(path);
     },
@@ -806,6 +795,7 @@ describe("secure filesystem permissions", () => {
 
         expect(receiptIdentity).toBeDefined();
         expect(privatePublicationIdentityFingerprint(finalStatus)).toBe(receiptIdentity);
+        await expectWindowsOwnerOnly(path);
       }
     },
   );
@@ -825,9 +815,9 @@ describe("secure filesystem permissions", () => {
       const store = await RunStore.create(root, contract, graph);
       const path = join(store.runRoot, "artifacts", "nested", "result.txt");
 
-      await store.writeArtifact("nested/result.txt", "owner-exclusive artifact\n");
+      await store.writeArtifact("nested/result.txt", "owner-only artifact\n");
 
-      await expectWindowsOwnerExclusive(path);
+      await expectWindowsOwnerOnly(path);
       await hardenPrivateFile(path, store.runRoot);
       await expectWindowsOwnerOnly(path);
     },

@@ -118,7 +118,7 @@ async function fileSnapshot(root: string): Promise<Record<string, string>> {
   const visit = async (directory: string): Promise<void> => {
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name);
-      const key = relative(root, path);
+      const key = relative(root, path).replaceAll("\\", "/");
       if (key === ".backup-complete.json") continue;
       if (entry.isDirectory()) {
         snapshot[key] = "directory";

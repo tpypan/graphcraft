@@ -917,7 +917,7 @@ export async function publishPrivateFileAtomic(input: {
         Promise.all(parentPaths.map(inspectPrivateEntry)),
         inspectPrivateEntry(absolute),
       ]);
-      let requiresFallbackHardening = false;
+      let requiresParentHardening = false;
       for (const [index, parentAfter] of parentsAfter.entries()) {
         const parentBefore = parentsBefore[index]!;
         if (parentAfter.entry.kind !== "directory")
@@ -932,7 +932,7 @@ export async function publishPrivateFileAtomic(input: {
           throw new Error(
             `Private publication parent changed filesystem identity: ${parentAfter.entry.path}`,
           );
-        requiresFallbackHardening ||=
+        requiresParentHardening ||=
           parentBefore.identityFingerprint === undefined ||
           parentAfter.identityFingerprint === undefined;
       }
@@ -946,27 +946,29 @@ export async function publishPrivateFileAtomic(input: {
       });
       if (resolve(publication.path) !== absolute)
         throw new Error(`Published private file changed filesystem identity: ${absolute}`);
+      // Windows inherits a parent's DACL but can assign a different owner SID
+      // to the new file. Canonicalize the observed final file before returning
+      // or reporting strict supersession. Unknown parent identities also need
+      // re-hardening because their pre-publication ACL provenance is unbound.
+      await hardenWindowsEntriesLocked(
+        requiresParentHardening
+          ? [...parentsAfter.map(({ entry }) => entry), fileAfter.entry]
+          : [fileAfter.entry],
+        true,
+      );
+      // Rebind the strict decision after path-based ACL hardening. Another
+      // Graphcraft process may have atomically replaced the path between the
+      // first observation and the hardener's own identity-bound pass.
+      const finalFile = await inspectPrivateEntry(absolute);
+      if (finalFile.entry.kind !== "file")
+        throw new Error(`Published private path is not a regular file: ${absolute}`);
       const superseded =
         publicationIdentity !== undefined &&
-        fileAfter.publicationIdentityFingerprint !== undefined &&
-        fileAfter.publicationIdentityFingerprint !== publicationIdentity;
+        finalFile.publicationIdentityFingerprint !== undefined &&
+        finalFile.publicationIdentityFingerprint !== publicationIdentity;
       if (superseded && input.supersessionPolicy !== "reconstructable_projection")
         throw new Error(`Published private file changed filesystem identity: ${absolute}`);
-      requiresFallbackHardening ||=
-        superseded ||
-        publicationIdentity === undefined ||
-        fileAfter.publicationIdentityFingerprint === undefined;
-      // A descriptor-identified file created beneath a canonically verified
-      // source parent has demonstrably owner-exclusive inherited access. If
-      // either parent or file identity cannot establish that provenance, or a
-      // reconstructable projection superseded this publication, canonicalize
-      // the final file through the existing protected owner-only hardener.
-      if (requiresFallbackHardening)
-        await hardenWindowsEntriesLocked(
-          [...parentsAfter.map(({ entry }) => entry), fileAfter.entry],
-          true,
-        );
-      else
+      if (!requiresParentHardening)
         for (const parentAfter of parentsAfter)
           rememberWindowsIdentity(parentAfter.identityFingerprint, parentAfter.metadataFingerprint);
     });
@@ -976,9 +978,9 @@ export async function publishPrivateFileAtomic(input: {
 /**
  * Atomically replace JSON beneath an owner-only directory. Windows inherits
  * the verified parent ACL, while the descriptor receipt proves that the final
- * path is the file Graphcraft created. The inherited file is deliberately not
- * entered in the strict ACL cache, so an explicit hardenPrivateFile call still
- * canonicalizes it to a protected, non-inherited owner-only ACL.
+ * path is the file Graphcraft created. The final file is then canonicalized to
+ * a protected, non-inherited owner-SID-only ACL because Windows does not inherit
+ * file ownership from the parent directory.
  *
  * @internal
  */

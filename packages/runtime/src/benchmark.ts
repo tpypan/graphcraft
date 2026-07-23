@@ -90,6 +90,11 @@ async function materializeTask(task: BenchmarkTask): Promise<{
     }
     const initialized = await runProcess("git", ["init", "-b", "main"], { cwd: repository });
     if (initialized.exitCode !== 0) throw new Error(`Unable to initialize ${task.id}`);
+    const configured = await runProcess("git", ["config", "core.autocrlf", "false"], {
+      cwd: repository,
+    });
+    if (configured.exitCode !== 0)
+      throw new Error(`Unable to configure deterministic line endings for ${task.id}`);
     const staged = await runProcess("git", ["add", "."], { cwd: repository });
     if (staged.exitCode !== 0) throw new Error(`Unable to stage fixture ${task.id}`);
     const committed = await runProcess(

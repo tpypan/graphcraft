@@ -23,6 +23,7 @@ import {
   type TokenUsage,
   type WorkerRequest,
 } from "@graphcraft/core";
+import { runProcess } from "@graphcraft/probes";
 import { runBenchmark } from "./benchmark.ts";
 
 const temporaryRoots: string[] = [];
@@ -66,6 +67,7 @@ class BenchmarkAdapter implements HostAdapter {
       makeBaselineAcceptancePathDirectory?: boolean;
       capabilities?: Partial<HostCapabilities>;
       capabilitySequence?: HostCapabilities[];
+      expectDeterministicLfFixture?: boolean;
       revalidatePlan?: boolean;
       revalidateExecute?: boolean;
     } = {},
@@ -143,6 +145,17 @@ class BenchmarkAdapter implements HostAdapter {
   async *execute(request: WorkerRequest): AsyncIterable<HostEvent> {
     if (this.options.revalidateExecute) assertRequiredHostCapabilities(this.id, await this.probe());
     this.workerRequests.push(request);
+    if (this.options.expectDeterministicLfFixture) {
+      const lineEndingPolicy = await runProcess(
+        "git",
+        ["config", "--local", "--get", "core.autocrlf"],
+        { cwd: request.repositoryPath },
+      );
+      if (lineEndingPolicy.exitCode !== 0 || lineEndingPolicy.stdout.trim() !== "false")
+        throw new Error("Benchmark fixture did not pin core.autocrlf=false");
+      if ((await readFile(join(request.repositoryPath, "source.js"), "utf8")).includes("\r"))
+        throw new Error("Benchmark fixture materialized non-LF line endings");
+    }
     yield { type: "started", invocationId: request.invocationId };
     yield { type: "session", hostSessionId: request.invocationId };
     if (this.options.failureMessage) {
@@ -272,6 +285,77 @@ describe("benchmark harness", () => {
       await expect(access(outputPath)).rejects.toMatchObject({ code: "ENOENT" });
     },
   );
+
+  it("pins deterministic LF fixtures when Git inherits core.autocrlf=true", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-autocrlf-"));
+    temporaryRoots.push(root);
+    const globalConfigPath = join(root, "gitconfig");
+    await writeFile(globalConfigPath, "[core]\n\tautocrlf = true\n", "utf8");
+    const previousGlobalConfig = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = globalConfigPath;
+    try {
+      const inherited = await runProcess("git", ["config", "--global", "--get", "core.autocrlf"], {
+        cwd: root,
+      });
+      expect(inherited).toMatchObject({ exitCode: 0 });
+      expect(inherited.stdout.trim()).toBe("true");
+      const suite = BenchmarkSuiteSchema.parse({
+        schemaVersion: 2,
+        id: "autocrlf-suite",
+        version: 1,
+        description: "Deterministic line-ending fixture",
+        tasks: [
+          {
+            id: "autocrlf-task",
+            family: "feature",
+            task: "Exercise deterministic benchmark line endings",
+            initialFiles: {
+              "package.json":
+                '{"name":"autocrlf-fixture","private":true,"type":"module","scripts":{"test":"node verify.mjs"}}\n',
+              "source.js": "export const value = 'pending';\n",
+              "verify.mjs":
+                "import { value } from './source.js'; if (value !== 'implemented') process.exit(1);\n",
+              "score.mjs":
+                "import { value } from './source.js'; if (value !== 'implemented') process.exit(1);\n",
+            },
+            checks: [{ command: "node", scorerPath: "score.mjs" }],
+            acceptance: [{ kind: "contains", path: "source.js", value: "implemented" }],
+            repetitions: 1,
+          },
+        ],
+      });
+      const adapter = new BenchmarkAdapter({ expectDeterministicLfFixture: true });
+
+      const { report } = await runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: { codex: adapter },
+        policies: { codex: { model: "autocrlf-fixture", effort: "low" } },
+        graphcraftVersion: "0.1.2-autocrlf-fixture",
+        seed: "autocrlf-seed",
+        repetitions: 1,
+        outputPath: join(root, "report.json"),
+      });
+
+      expect(report.results).toHaveLength(2);
+      expect(
+        report.results.every(({ accepted }) => accepted),
+        JSON.stringify(
+          report.results.map(({ trial, executionStatus, accepted, acceptance, failureTrace }) => ({
+            mode: trial.mode,
+            executionStatus,
+            accepted,
+            acceptance,
+            failureTrace,
+          })),
+        ),
+      ).toBe(true);
+      expect(adapter.workerRequests).toHaveLength(2);
+    } finally {
+      if (previousGlobalConfig === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = previousGlobalConfig;
+    }
+  });
 
   it.each([
     ["authentication loss", "not authenticated"],

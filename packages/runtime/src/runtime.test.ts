@@ -7,6 +7,7 @@ import {
   mkdir,
   readFile,
   readdir,
+  rename,
   rm,
   stat,
   writeFile,
@@ -145,6 +146,10 @@ async function waitFor(
 
 function itWin(name: string, test: () => Promise<void>): void {
   it(name, test, process.platform === "win32" ? 60_000 : 15_000);
+}
+
+function itSlow(name: string, test: () => Promise<void>): void {
+  it(name, test, process.platform === "win32" ? 60_000 : 30_000);
 }
 
 function itGitHub(name: string, test: () => Promise<void>): void {
@@ -4970,14 +4975,15 @@ process.stdin.on("end", () => {
     expect(adapter.calls).not.toContain("write-b");
   });
 
-  it("preserves progress-probe scope evidence for a blocked parallel batch", async () => {
+  itSlow("preserves progress-probe scope evidence for a blocked parallel batch", async () => {
     const repository = await createRepository();
     const siblingReady = join(repository, "..", "inspect-b-ready");
     const adapter = new FakeAdapter(async (request, _call, signal) => {
       if (request.capsule.nodeId === "inspect-a")
         throw new Error("the worker must not run after a mutating progress probe");
       if (request.capsule.nodeId === "inspect-b") {
-        await writeFile(siblingReady, "ready\n");
+        await writeFile(`${siblingReady}.tmp`, JSON.stringify(request.repositoryPath), "utf8");
+        await rename(`${siblingReady}.tmp`, siblingReady);
         await waitForAbort(signal);
       }
     });
@@ -5001,11 +5007,12 @@ process.stdin.on("end", () => {
                 command: process.execPath,
                 args: [
                   "-e",
-                  "const fs = require('node:fs'); const marker = process.argv[1]; const deadline = Date.now() + 5000; while (!fs.existsSync(marker)) { if (Date.now() > deadline) throw new Error('timed out waiting for sibling'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); } fs.writeFileSync('parallel-progress-probe-output.txt', 'mutation\\n');",
+                  "const fs = require('node:fs'); const path = require('node:path'); const marker = process.argv[1]; const deadline = Date.now() + Number(process.argv[2]); while (!fs.existsSync(marker)) { if (Date.now() > deadline) throw new Error('timed out waiting for sibling'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); } const repository = JSON.parse(fs.readFileSync(marker, 'utf8')); fs.writeFileSync(path.join(repository, 'parallel-progress-probe-output.txt'), 'mutation\\n');",
                   siblingReady,
+                  String(process.platform === "win32" ? 30_000 : 5_000),
                 ],
                 expectedExitCode: 0,
-                timeoutMs: 30_000,
+                timeoutMs: process.platform === "win32" ? 45_000 : 30_000,
                 platforms: [process.platform] as Array<"darwin" | "linux" | "win32">,
               },
             }
@@ -5069,7 +5076,7 @@ process.stdin.on("end", () => {
       acceptedSiblingIds: [],
       quarantinedSiblingIds: ["inspect-b"],
     });
-  }, 30_000);
+  });
 
   itWin("resumes only the unfinished branch after a parallel interruption", async () => {
     const repository = await createRepository();
