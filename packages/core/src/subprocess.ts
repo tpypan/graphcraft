@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { realpath, stat } from "node:fs/promises";
-import { extname, isAbsolute, join, relative, resolve, sep, win32 } from "node:path";
+import { constants } from "node:fs";
+import { access, lstat, realpath, stat } from "node:fs/promises";
+import { dirname, extname, isAbsolute, join, relative, resolve, sep, win32 } from "node:path";
 import type { HostTermination, InterruptionCause } from "./schemas.ts";
 
 export const HOST_CAPABILITY_PROBE_TIMEOUT_MS = 10_000;
@@ -68,36 +69,90 @@ export interface TrustedExecutableResolutionOptions {
   environment?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   untrustedCwd?: string;
+  untrustedRoots?: readonly string[];
 }
 
 /**
- * Resolves Windows PATH commands without the platform's implicit current-directory lookup.
- * Relative commands containing a path separator remain explicit repository commands.
+ * Finds repository roots containing a path without invoking a PATH-resolved VCS command.
+ * All containing roots are returned so nested repositories cannot hide a broader checkout.
+ */
+export async function discoverRepositoryTrustRoots(cwd: string): Promise<string[]> {
+  const roots: string[] = [];
+  let current = resolve(cwd);
+  while (true) {
+    if (
+      await lstat(join(current, ".git")).then(
+        () => true,
+        () => false,
+      )
+    )
+      roots.push(current);
+    const parent = dirname(current);
+    if (parent === current) return roots;
+    current = parent;
+  }
+}
+
+/**
+ * Resolves bare PATH commands without an implicit lookup through an untrusted repository.
+ * Commands containing a path separator remain explicit repository commands.
  */
 export async function resolveTrustedExecutable(
   command: string,
   options: TrustedExecutableResolutionOptions = {},
 ): Promise<string> {
   const selectedPlatform = options.platform ?? process.platform;
-  if (selectedPlatform !== "win32" || isAbsolute(command) || /[\\/]/u.test(command)) {
+  const windows = selectedPlatform === "win32";
+  const hasPathSeparator = windows ? /[\\/]/u.test(command) : command.includes("/");
+  if (isAbsolute(command) || hasPathSeparator) {
     return command;
   }
-  if (/^node(?:\.exe)?$/iu.test(command)) return process.execPath;
+  if (windows ? /^node(?:\.exe)?$/iu.test(command) : command === "node") {
+    return process.execPath;
+  }
 
   const environment = options.environment ?? process.env;
-  const searchPath = environmentValue(environment, "PATH") ?? "";
-  const pathExtensions = (environmentValue(environment, "PATHEXT") ?? ".COM;.EXE;.BAT;.CMD")
-    .split(";")
-    .map((value) => value.trim())
-    .filter(Boolean);
-  const suffixes = extname(command) ? ["", ...pathExtensions] : [...pathExtensions, ""];
-  const untrustedRoot = options.untrustedCwd
-    ? await realpath(resolve(options.untrustedCwd)).catch(() => resolve(options.untrustedCwd!))
-    : undefined;
+  const searchPath = windows
+    ? (environmentValue(environment, "PATH") ?? "")
+    : (environment.PATH ?? "");
+  const pathExtensions = windows
+    ? (environmentValue(environment, "PATHEXT") ?? ".COM;.EXE;.BAT;.CMD")
+        .split(";")
+        .map((value) => value.trim())
+        .filter(Boolean)
+    : [];
+  const suffixes = windows
+    ? extname(command)
+      ? ["", ...pathExtensions]
+      : [...pathExtensions, ""]
+    : [""];
+  const untrustedResolvedRoots = [
+    ...new Set(
+      [options.untrustedCwd, ...(options.untrustedRoots ?? [])]
+        .filter((root): root is string => root !== undefined)
+        .map((root) => resolve(root)),
+    ),
+  ];
+  const untrustedRoots = await Promise.all(
+    untrustedResolvedRoots.map(async (root) => ({
+      resolved: root,
+      canonical: await realpath(root).catch(() => root),
+    })),
+  );
 
-  for (const rawDirectory of searchPath.split(";")) {
-    const directory = rawDirectory.trim().replace(/^"|"$/gu, "");
+  for (const rawDirectory of searchPath.split(windows ? ";" : ":")) {
+    const directory = windows ? rawDirectory.trim().replace(/^"|"$/gu, "") : rawDirectory;
     if (!directory || !isAbsolute(directory)) continue;
+    if (!windows && untrustedRoots.length > 0) {
+      if (untrustedRoots.some((root) => pathIsWithin(root.resolved, directory))) continue;
+      const canonicalDirectory = await realpath(directory).catch(() => undefined);
+      if (
+        !canonicalDirectory ||
+        untrustedRoots.some((root) => pathIsWithin(root.canonical, canonicalDirectory))
+      ) {
+        continue;
+      }
+    }
     for (const suffix of suffixes) {
       const candidate = join(directory, `${command}${suffix}`);
       try {
@@ -106,14 +161,17 @@ export async function resolveTrustedExecutable(
           realpath(candidate),
         ]);
         if (!candidateStatus.isFile()) continue;
-        if (untrustedRoot && pathIsWithin(untrustedRoot, canonicalCandidate)) continue;
+        if (untrustedRoots.some((root) => pathIsWithin(root.canonical, canonicalCandidate))) {
+          continue;
+        }
+        if (!windows) await access(canonicalCandidate, constants.X_OK);
         return canonicalCandidate;
       } catch {
         // Try the next trusted PATH candidate.
       }
     }
   }
-  throw new Error(`Unable to resolve trusted Windows executable: ${command}`);
+  throw new Error(`Unable to resolve trusted ${windows ? "Windows " : ""}executable: ${command}`);
 }
 
 function windowsTaskkillExecutable(environment: NodeJS.ProcessEnv): string {

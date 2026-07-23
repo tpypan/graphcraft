@@ -5,16 +5,19 @@ import {
   HOST_CAPABILITY_PROBE_SETTLE_GRACE_MS,
   HOST_CAPABILITY_PROBE_TIMEOUT_MS,
   HostTerminationError,
-  HostCapabilitiesSchema,
   SemanticVerdictSchema,
   WorkerResultSchema,
+  assertRequiredHostCapabilities,
+  discoverRepositoryTrustRoots,
   graphPlanJsonSchema,
+  hostCapabilitiesFromProtocolProfile,
   normalizeTokenUsage,
   reconcilePersistedInvocation,
   resolveTrustedExecutable,
   renderPlannerPrompt,
   renderSemanticVerifierPrompt,
   renderWorkerPrompt,
+  stripSingleHostVersionLineEnding,
   workerResultJsonSchema,
   semanticVerdictJsonSchema,
   type HostAdapter,
@@ -83,15 +86,16 @@ export function claudeUsage(value: unknown) {
   return normalizeTokenUsage("claude", value);
 }
 
+async function claudeUntrustedRoots(repositoryPath?: string): Promise<string[]> {
+  const paths = [...new Set([process.cwd(), ...(repositoryPath ? [repositoryPath] : [])])];
+  const discovered = await Promise.all(paths.map(discoverRepositoryTrustRoots));
+  return [...new Set([...paths, ...discovered.flat()])];
+}
+
 async function runCapabilityProbe(
+  executable: string,
   args: string[],
 ): Promise<{ code: number | null; output: string; overflowed: boolean; terminated: boolean }> {
-  let executable: string;
-  try {
-    executable = await resolveTrustedExecutable("claude", { untrustedCwd: process.cwd() });
-  } catch {
-    return { code: null, output: "", overflowed: false, terminated: false };
-  }
   return await new Promise((resolve) => {
     const child = spawn(executable, args, { stdio: ["ignore", "pipe", "ignore"] });
     const output = new BoundedTextCapture(ADAPTER_STDERR_LIMIT_BYTES);
@@ -133,15 +137,17 @@ async function runCapabilityProbe(
   });
 }
 
-async function claudeVersion(): Promise<{ installed: boolean; version?: string }> {
-  const result = await runCapabilityProbe(["--version"]);
+async function claudeVersion(
+  executable: string,
+): Promise<{ installed: boolean; version?: string }> {
+  const result = await runCapabilityProbe(executable, ["--version"]);
   return result.code === 0 && !result.overflowed && !result.terminated
-    ? { installed: true, version: result.output.trim() }
+    ? { installed: true, version: stripSingleHostVersionLineEnding(result.output) }
     : { installed: false };
 }
 
-async function claudeAuthenticated(): Promise<boolean> {
-  const result = await runCapabilityProbe(["auth", "status", "--json"]);
+async function claudeAuthenticated(executable: string): Promise<boolean> {
+  const result = await runCapabilityProbe(executable, ["auth", "status", "--json"]);
   if (result.code !== 0 || result.overflowed || result.terminated) return false;
   try {
     const status = JSON.parse(result.output) as { loggedIn?: boolean };
@@ -151,27 +157,58 @@ async function claudeAuthenticated(): Promise<boolean> {
   }
 }
 
+export async function probeClaudeExecutable(executable: string) {
+  const result = await claudeVersion(executable);
+  const authenticated = result.installed && (await claudeAuthenticated(executable));
+  return hostCapabilitiesFromProtocolProfile("claude", {
+    installed: result.installed,
+    authenticated,
+    ...(result.version ? { version: result.version } : {}),
+  });
+}
+
 export class ClaudeAdapter implements HostAdapter {
   readonly id = "claude" as const;
 
   constructor(private readonly policy?: HostExecutionPolicy) {}
 
+  private async resolveReadyExecutable(repositoryPath: string): Promise<string> {
+    let executable: string;
+    try {
+      executable = await resolveTrustedExecutable("claude", {
+        untrustedRoots: await claudeUntrustedRoots(repositoryPath),
+      });
+    } catch {
+      assertRequiredHostCapabilities(
+        this.id,
+        hostCapabilitiesFromProtocolProfile("claude", {
+          installed: false,
+          authenticated: false,
+        }),
+      );
+      throw new Error("Unreachable Claude capability admission state");
+    }
+    assertRequiredHostCapabilities(this.id, await probeClaudeExecutable(executable));
+    return executable;
+  }
+
   async probe() {
-    const result = await claudeVersion();
-    const authenticated = result.installed && (await claudeAuthenticated());
-    return HostCapabilitiesSchema.parse({
-      ...result,
-      authenticated,
-      structuredOutput: result.installed,
-      streamingEvents: result.installed,
-      tokenReporting: result.installed,
-    });
+    let executable: string;
+    try {
+      executable = await resolveTrustedExecutable("claude", {
+        untrustedRoots: await claudeUntrustedRoots(),
+      });
+    } catch {
+      return hostCapabilitiesFromProtocolProfile("claude", {
+        installed: false,
+        authenticated: false,
+      });
+    }
+    return await probeClaudeExecutable(executable);
   }
 
   async plan(request: PlanningRequest, signal: AbortSignal): Promise<PlanningResult> {
-    const executable = await resolveTrustedExecutable("claude", {
-      untrustedCwd: request.repositoryPath,
-    });
+    const executable = await this.resolveReadyExecutable(request.repositoryPath);
     const child = spawn(executable, claudePlannerArgs(request, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -231,9 +268,7 @@ export class ClaudeAdapter implements HostAdapter {
     request: SemanticVerificationRequest,
     signal: AbortSignal,
   ): Promise<SemanticVerificationResult> {
-    const executable = await resolveTrustedExecutable("claude", {
-      untrustedCwd: request.repositoryPath,
-    });
+    const executable = await this.resolveReadyExecutable(request.repositoryPath);
     const child = spawn(executable, claudeSemanticVerifierArgs(request, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -290,10 +325,8 @@ export class ClaudeAdapter implements HostAdapter {
   }
 
   async *execute(request: WorkerRequest, signal: AbortSignal): AsyncIterable<HostEvent> {
+    const executable = await this.resolveReadyExecutable(request.repositoryPath);
     const args = claudeWorkerArgs(request, this.policy);
-    const executable = await resolveTrustedExecutable("claude", {
-      untrustedCwd: request.repositoryPath,
-    });
     const child = spawn(executable, args, {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },

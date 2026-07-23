@@ -8,18 +8,21 @@ import {
   HOST_CAPABILITY_PROBE_SETTLE_GRACE_MS,
   HOST_CAPABILITY_PROBE_TIMEOUT_MS,
   HostTerminationError,
-  HostCapabilitiesSchema,
   SemanticVerdictSchema,
   WorkerResultSchema,
+  assertRequiredHostCapabilities,
   codexGraphPlanJsonSchema,
   codexSemanticVerdictJsonSchema,
   codexWorkerResultJsonSchema,
+  discoverRepositoryTrustRoots,
+  hostCapabilitiesFromProtocolProfile,
   normalizeTokenUsage,
   reconcilePersistedInvocation,
   resolveTrustedExecutable,
   renderPlannerPrompt,
   renderSemanticVerifierPrompt,
   renderWorkerPrompt,
+  stripSingleHostVersionLineEnding,
   type HostAdapter,
   type HostExecutionPolicy,
   type HostEvent,
@@ -98,17 +101,17 @@ export function codexUsage(value: unknown) {
   return normalizeTokenUsage("codex", value);
 }
 
+async function codexUntrustedRoots(repositoryPath?: string): Promise<string[]> {
+  const paths = [...new Set([process.cwd(), ...(repositoryPath ? [repositoryPath] : [])])];
+  const discovered = await Promise.all(paths.map(discoverRepositoryTrustRoots));
+  return [...new Set([...paths, ...discovered.flat()])];
+}
+
 async function runCapabilityProbe(
-  command: string,
+  executable: string,
   args: string[],
   captureErrorOutput = false,
 ): Promise<{ code: number | null; output: string; overflowed: boolean; terminated: boolean }> {
-  let executable: string;
-  try {
-    executable = await resolveTrustedExecutable(command, { untrustedCwd: process.cwd() });
-  } catch {
-    return { code: null, output: "", overflowed: false, terminated: false };
-  }
   return await new Promise((resolve) => {
     const child = spawn(executable, args, { stdio: ["ignore", "pipe", "pipe"] });
     const output = new BoundedTextCapture(ADAPTER_STDERR_LIMIT_BYTES);
@@ -139,7 +142,7 @@ async function runCapabilityProbe(
     timeout = setTimeout(() => {
       timeoutAbort.abort({
         cause: "timeout",
-        reason: `${command} capability probe timed out`,
+        reason: `${executable} capability probe timed out`,
       });
       if (settled) return;
       settlement = setTimeout(() => {
@@ -154,21 +157,32 @@ async function runCapabilityProbe(
   });
 }
 
-async function commandVersion(command: string): Promise<{ installed: boolean; version?: string }> {
-  const result = await runCapabilityProbe(command, ["--version"]);
+async function codexVersion(executable: string): Promise<{ installed: boolean; version?: string }> {
+  const result = await runCapabilityProbe(executable, ["--version"]);
   return result.code === 0 && !result.overflowed && !result.terminated
-    ? { installed: true, version: result.output.trim() }
+    ? { installed: true, version: stripSingleHostVersionLineEnding(result.output) }
     : { installed: false };
 }
 
-async function codexAuthenticated(): Promise<boolean> {
-  const result = await runCapabilityProbe("codex", ["login", "status"], true);
+async function codexAuthenticated(executable: string): Promise<boolean> {
+  const result = await runCapabilityProbe(executable, ["login", "status"], true);
   return (
     result.code === 0 &&
     !result.overflowed &&
     !result.terminated &&
-    !/not logged in/i.test(result.output)
+    !/(?:^|\r?\n)Not logged in\.?($|\r?\n)/u.test(result.output) &&
+    /(?:^|\r?\n)Logged in(?: using [^\r\n]+)?\.?($|\r?\n)/u.test(result.output)
   );
+}
+
+export async function probeCodexExecutable(executable: string) {
+  const result = await codexVersion(executable);
+  const authenticated = result.installed && (await codexAuthenticated(executable));
+  return hostCapabilitiesFromProtocolProfile("codex", {
+    installed: result.installed,
+    authenticated,
+    ...(result.version ? { version: result.version } : {}),
+  });
 }
 
 export class CodexAdapter implements HostAdapter {
@@ -176,25 +190,46 @@ export class CodexAdapter implements HostAdapter {
 
   constructor(private readonly policy?: HostExecutionPolicy) {}
 
+  private async resolveReadyExecutable(repositoryPath: string): Promise<string> {
+    let executable: string;
+    try {
+      executable = await resolveTrustedExecutable("codex", {
+        untrustedRoots: await codexUntrustedRoots(repositoryPath),
+      });
+    } catch {
+      assertRequiredHostCapabilities(
+        this.id,
+        hostCapabilitiesFromProtocolProfile("codex", {
+          installed: false,
+          authenticated: false,
+        }),
+      );
+      throw new Error("Unreachable Codex capability admission state");
+    }
+    assertRequiredHostCapabilities(this.id, await probeCodexExecutable(executable));
+    return executable;
+  }
+
   async probe() {
-    const result = await commandVersion("codex");
-    const authenticated = result.installed && (await codexAuthenticated());
-    return HostCapabilitiesSchema.parse({
-      ...result,
-      authenticated,
-      structuredOutput: result.installed,
-      streamingEvents: result.installed,
-      tokenReporting: result.installed,
-    });
+    let executable: string;
+    try {
+      executable = await resolveTrustedExecutable("codex", {
+        untrustedRoots: await codexUntrustedRoots(),
+      });
+    } catch {
+      return hostCapabilitiesFromProtocolProfile("codex", {
+        installed: false,
+        authenticated: false,
+      });
+    }
+    return await probeCodexExecutable(executable);
   }
 
   async plan(request: PlanningRequest, signal: AbortSignal): Promise<PlanningResult> {
+    const executable = await this.resolveReadyExecutable(request.repositoryPath);
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-plan-"));
     const schemaPath = join(schemaDirectory, "graph-plan.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexGraphPlanJsonSchema), "utf8");
-    const executable = await resolveTrustedExecutable("codex", {
-      untrustedCwd: request.repositoryPath,
-    });
     const child = spawn(executable, codexPlannerArgs(request, schemaPath, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -259,12 +294,10 @@ export class CodexAdapter implements HostAdapter {
     request: SemanticVerificationRequest,
     signal: AbortSignal,
   ): Promise<SemanticVerificationResult> {
+    const executable = await this.resolveReadyExecutable(request.repositoryPath);
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-verify-"));
     const schemaPath = join(schemaDirectory, "semantic-verdict.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexSemanticVerdictJsonSchema), "utf8");
-    const executable = await resolveTrustedExecutable("codex", {
-      untrustedCwd: request.repositoryPath,
-    });
     const child = spawn(executable, codexSemanticVerifierArgs(request, schemaPath, this.policy), {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
@@ -324,13 +357,11 @@ export class CodexAdapter implements HostAdapter {
   }
 
   async *execute(request: WorkerRequest, signal: AbortSignal): AsyncIterable<HostEvent> {
+    const executable = await this.resolveReadyExecutable(request.repositoryPath);
     const schemaDirectory = await mkdtemp(join(tmpdir(), "graphcraft-codex-"));
     const schemaPath = join(schemaDirectory, "worker-result.schema.json");
     await writeFile(schemaPath, JSON.stringify(codexWorkerResultJsonSchema), "utf8");
     const args = codexWorkerArgs(request, schemaPath, this.policy);
-    const executable = await resolveTrustedExecutable("codex", {
-      untrustedCwd: request.repositoryPath,
-    });
     const child = spawn(executable, args, {
       cwd: request.repositoryPath,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },

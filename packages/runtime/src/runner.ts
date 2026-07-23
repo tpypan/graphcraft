@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import {
   HostTerminationError,
+  HostCapabilityAdmissionError,
   HostEventSchema,
   OptimizationDecisionSchema,
   ProgressDecisionPacketSchema,
@@ -17,6 +18,8 @@ import {
   compileRunContract,
   contentHash,
   createModelAuthorityBoundary,
+  assertRequiredHostCapabilities,
+  diagnoseRequiredHostCapabilities,
   deterministicTokenUsage,
   evidenceSnapshot,
   interruptionReason,
@@ -41,6 +44,7 @@ import {
   type ProbePlan,
   type ProgressDecisionPacket,
   type ProgressTrajectoryEntry,
+  type RequiredHostCapabilityDiagnostic,
   type RunContract,
   type RunControlRequest,
   type RunEvent,
@@ -354,16 +358,7 @@ export async function createRun(
   let planningUsage: TokenUsage | undefined;
   if (options.planner) {
     const capabilities = await options.planner.probe();
-    if (
-      !capabilities.installed ||
-      !capabilities.authenticated ||
-      !capabilities.structuredOutput ||
-      !capabilities.streamingEvents
-    ) {
-      throw new Error(
-        `${options.planner.id} is not authenticated or does not provide the required structured unattended interface`,
-      );
-    }
+    assertRequiredHostCapabilities(options.planner.id, capabilities);
     const planned = await options.planner.plan(
       {
         contract,
@@ -487,6 +482,7 @@ async function executeWorker(input: {
   result?: WorkerResult;
   error?: string;
   errorCause?: "host_crash" | "timeout";
+  capabilityDiagnostic?: RequiredHostCapabilityDiagnostic;
   termination?: HostTermination;
   artifact: string;
 }> {
@@ -587,11 +583,41 @@ async function executeWorker(input: {
   let result: WorkerResult | undefined;
   let error: string | undefined;
   let errorCause: "host_crash" | "timeout" | undefined;
+  let capabilityDiagnostic: RequiredHostCapabilityDiagnostic | undefined;
   let termination: HostTermination | undefined;
   let usageReceipts = 0;
   const tokenPhase = input.node.id.startsWith("repair-") ? "repair" : "worker";
 
   let artifact = join(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+  const preInvocationDiagnostic = diagnoseRequiredHostCapabilities(
+    input.adapter.id,
+    await input.adapter.probe(),
+  );
+  if (!preInvocationDiagnostic.ready) {
+    artifact = await input.store.appendInvocationEvent(invocationId, {
+      type: "error",
+      message: preInvocationDiagnostic.detail,
+    });
+    await input.store.append(
+      "runtime",
+      "invocation.finished",
+      {
+        invocationId,
+        nodeId: input.node.id,
+        artifact,
+        success: false,
+        reason: preInvocationDiagnostic.detail,
+        capabilityDiagnostic: preInvocationDiagnostic,
+      },
+      invocationId,
+    );
+    return {
+      invocationId,
+      error: preInvocationDiagnostic.detail,
+      capabilityDiagnostic: preInvocationDiagnostic,
+      artifact,
+    };
+  }
   const execution = input.adapter.execute(
     {
       invocationId,
@@ -611,9 +637,15 @@ async function executeWorker(input: {
       next = await iterator.next();
     } catch (cause) {
       error = cause instanceof Error ? cause.message : String(cause);
-      errorCause = "host_crash";
-      const event: HostEvent = { type: "error", message: error, cause: errorCause };
+      const capabilityError = cause instanceof HostCapabilityAdmissionError;
+      if (!capabilityError) errorCause = "host_crash";
+      const event: HostEvent = {
+        type: "error",
+        message: error,
+        ...(errorCause ? { cause: errorCause } : {}),
+      };
       artifact = await input.store.appendInvocationEvent(invocationId, event);
+      if (capabilityError) capabilityDiagnostic = cause.diagnostic;
       break;
     }
     if (next.done) break;
@@ -660,7 +692,7 @@ async function executeWorker(input: {
       if (event.cause === "host_crash" || event.cause === "timeout") errorCause = event.cause;
     }
   }
-  if (usageReceipts === 0)
+  if (usageReceipts === 0 && !capabilityDiagnostic)
     await input.store.append(
       "host",
       "tokens.recorded",
@@ -684,6 +716,9 @@ async function executeWorker(input: {
       interrupted: Boolean(termination),
       ...(termination ? { termination } : {}),
       ...(errorCause ? { errorCause } : {}),
+      ...(capabilityDiagnostic
+        ? { reason: capabilityDiagnostic.detail, capabilityDiagnostic }
+        : {}),
     },
     invocationId,
   );
@@ -692,6 +727,7 @@ async function executeWorker(input: {
     ...(result ? { result } : {}),
     ...(error ? { error } : {}),
     ...(errorCause ? { errorCause } : {}),
+    ...(capabilityDiagnostic ? { capabilityDiagnostic } : {}),
     ...(termination ? { termination } : {}),
     artifact,
   };
@@ -1103,9 +1139,21 @@ async function runSemanticVerification(input: {
   );
   const failVerification = async (error: unknown): Promise<never> => {
     const failure = error instanceof Error ? error : new Error(String(error));
+    const capabilityDiagnostic =
+      error instanceof HostCapabilityAdmissionError ? error.diagnostic : undefined;
     const artifact = await input.store.writeArtifact(
       `semantic/${invocationId}-error.json`,
-      `${JSON.stringify({ schemaVersion: 1, host: input.adapter.id, context, error: failure.message }, null, 2)}\n`,
+      `${JSON.stringify(
+        {
+          schemaVersion: 1,
+          host: input.adapter.id,
+          context,
+          error: failure.message,
+          ...(capabilityDiagnostic ? { capabilityDiagnostic } : {}),
+        },
+        null,
+        2,
+      )}\n`,
     );
     await input.store.append(
       "host",
@@ -1119,6 +1167,7 @@ async function runSemanticVerification(input: {
         contextHash,
         beforeDigest: beforeScope.digest,
         error: failure.message,
+        ...(capabilityDiagnostic ? { capabilityDiagnostic } : {}),
         artifact,
       },
       invocationId,
@@ -1127,6 +1176,7 @@ async function runSemanticVerification(input: {
   };
   let result: SemanticVerificationResult;
   try {
+    assertRequiredHostCapabilities(input.adapter.id, await input.adapter.probe());
     result = await input.adapter.verify(
       {
         invocationId,
@@ -2693,6 +2743,15 @@ async function executeWorkNode(input: {
       ...(worker.termination ? { termination: worker.termination } : {}),
       artifact: worker.artifact,
     };
+  if (worker.capabilityDiagnostic) {
+    const reason = `Host capability admission failed before worker invocation: ${worker.error}`;
+    await input.store.append("host", "node.failed", {
+      nodeId: input.node.id,
+      invocationId: worker.invocationId,
+      reason,
+    });
+    return { status: "failed", nodeId: input.node.id, reason };
+  }
   if (!worker.result || worker.error || worker.result.status !== "completed") {
     const detail = worker.error ?? worker.result?.summary ?? "Worker did not complete the node";
     const cause = worker.errorCause ?? "host_crash";
@@ -3152,14 +3211,11 @@ export async function executeRun(input: {
     const ensureAdapterReady = async (): Promise<boolean> => {
       if (adapterReady) return true;
       const capabilities = await input.adapter.probe();
-      adapterReady =
-        capabilities.installed &&
-        capabilities.authenticated &&
-        capabilities.structuredOutput &&
-        capabilities.streamingEvents;
+      const diagnostic = diagnoseRequiredHostCapabilities(input.adapter.id, capabilities);
+      adapterReady = diagnostic.ready;
       if (!adapterReady)
         await input.store.append("runtime", "run.blocked", {
-          reason: `${input.adapter.id} is not authenticated or does not provide the required structured unattended interface`,
+          reason: diagnostic.detail,
         });
       return adapterReady;
     };

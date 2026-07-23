@@ -799,9 +799,12 @@ export const HostCapabilitiesSchema = z.strictObject({
   installed: z.boolean(),
   authenticated: z.boolean(),
   version: z.string().optional(),
+  protocolProfile: z.string().min(1).nullable(),
   structuredOutput: z.boolean(),
   streamingEvents: z.boolean(),
   tokenReporting: z.boolean(),
+  cancellation: z.boolean(),
+  resume: z.boolean(),
 });
 
 export const InterruptionCauseSchema = z.enum([

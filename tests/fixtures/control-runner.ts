@@ -36,9 +36,12 @@ class ControlFixtureAdapter implements HostAdapter {
       installed: true,
       authenticated: true,
       version: "control-fixture",
+      protocolProfile: "test/control-fixture",
       structuredOutput: true,
       streamingEvents: true,
       tokenReporting: true,
+      cancellation: true,
+      resume: true,
     };
   }
 

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -102,6 +102,86 @@ describe("native host continuation protocol", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it.skipIf(process.platform === "win32")(
+    "resolves POSIX PATH commands without trusting repository-controlled entries",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "graphcraft-trusted-command-"));
+      const untrusted = join(root, "repository");
+      const untrustedBin = join(untrusted, "node_modules", ".bin");
+      const redirectedTools = join(root, "redirected tools");
+      const nonExecutableTools = join(root, "non-executable tools");
+      const trustedTools = join(root, "trusted tools");
+      const decoyTarget = join(root, "decoy codex");
+      const hostileTarget = join(untrusted, "hostile codex");
+      const trustedTarget = join(root, "installed codex");
+      await Promise.all([
+        mkdir(untrustedBin, { recursive: true }),
+        mkdir(redirectedTools),
+        mkdir(nonExecutableTools),
+        mkdir(trustedTools),
+      ]);
+      await Promise.all([
+        writeFile(decoyTarget, "#!/bin/sh\nexit 11\n", "utf8"),
+        writeFile(hostileTarget, "#!/bin/sh\nexit 12\n", "utf8"),
+        writeFile(join(nonExecutableTools, "codex"), "#!/bin/sh\nexit 13\n", "utf8"),
+        writeFile(trustedTarget, "#!/bin/sh\nexit 0\n", "utf8"),
+      ]);
+      await Promise.all([
+        chmod(decoyTarget, 0o755),
+        chmod(hostileTarget, 0o755),
+        chmod(trustedTarget, 0o755),
+      ]);
+      await Promise.all([
+        symlink(decoyTarget, join(untrustedBin, "codex")),
+        symlink(hostileTarget, join(redirectedTools, "codex")),
+        symlink(trustedTarget, join(trustedTools, "codex")),
+      ]);
+
+      try {
+        const untrustedPath = ["", "relative-bin", untrustedBin, redirectedTools].join(":");
+        await expect(
+          resolveTrustedExecutable("codex", {
+            platform: process.platform,
+            environment: { PATH: untrustedPath },
+            untrustedCwd: untrusted,
+          }),
+        ).rejects.toThrow("Unable to resolve trusted executable");
+
+        const trustedExecutable = await realpath(trustedTarget);
+        await expect(
+          resolveTrustedExecutable("codex", {
+            platform: process.platform,
+            environment: { PATH: `${untrustedPath}:${nonExecutableTools}:${trustedTools}` },
+            untrustedCwd: untrusted,
+          }),
+        ).resolves.toBe(trustedExecutable);
+        await expect(
+          resolveTrustedExecutable("node", {
+            platform: process.platform,
+            environment: { PATH: untrustedBin },
+            untrustedCwd: untrusted,
+          }),
+        ).resolves.toBe(process.execPath);
+        await expect(
+          resolveTrustedExecutable(join(untrustedBin, "codex"), {
+            platform: process.platform,
+            environment: { PATH: trustedTools },
+            untrustedCwd: untrusted,
+          }),
+        ).resolves.toBe(join(untrustedBin, "codex"));
+        await expect(
+          resolveTrustedExecutable("./node_modules/.bin/codex", {
+            platform: process.platform,
+            environment: { PATH: trustedTools },
+            untrustedCwd: untrusted,
+          }),
+        ).resolves.toBe("./node_modules/.bin/codex");
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("normalizes provider token dimensions without fabricating missing values", () => {
     expect(

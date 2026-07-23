@@ -24,10 +24,14 @@ import { ClaudeAdapter } from "@graphcraft/adapter-claude";
 import { assertGitHubPushCapability, probeGitHub } from "@graphcraft/github";
 import {
   ContextSelectionReceiptSchema,
+  REQUIRED_HOST_PROTOCOL_CAPABILITIES,
   terminateChildProcessTree,
   graphPlanShape,
   inferFinishLine,
+  parseHostProtocolVersion,
   probePlanFromGraph,
+  recordedHostProtocolVersions,
+  resolveHostProtocolProfile,
   tokenCostReport,
   type Graph,
   type GraphAmendment,
@@ -71,10 +75,6 @@ const REGISTRATION_RECEIPT_MAX_BYTES = 16 * 1024;
 const RUNTIME_MANIFEST_MAX_BYTES = 16 * 1024;
 const MANAGED_RUNTIME_MAX_BYTES = 32 * 1024 * 1024;
 const RUNTIME_STAGING_RESERVATION_ATTEMPTS = 8;
-const HOST_MINIMUM_VERSIONS: Record<HostName, string> = {
-  codex: "0.144.6",
-  claude: "2.1.212",
-};
 
 const LEGACY_GRAPHCRAFT_RUNTIME_SHA256 = new Set([
   // v0.1.0 tagged bundle. This release predates durable runtime staging.
@@ -1467,46 +1467,53 @@ export function hostCompatibilityDiagnostic(
 ): {
   status: "missing" | "unsupported" | "compatible" | "unknown";
   installedVersion?: string;
-  minimumVersion: string;
+  supportedVersions: string[];
+  protocolProfile?: string;
   authenticated: boolean;
   exactTestedVersion: boolean;
   detail: string;
 } {
-  const minimumVersion = HOST_MINIMUM_VERSIONS[host];
+  const supportedVersions = recordedHostProtocolVersions(host);
   if (!capabilities.installed) {
     return {
       status: "missing",
-      minimumVersion,
+      supportedVersions,
       authenticated: false,
       exactTestedVersion: false,
       detail: `${host} is not installed`,
     };
   }
-  const installed = parseVersion(capabilities.version);
-  const minimum = parseVersion(minimumVersion)!;
-  if (!installed) {
+  const installedVersion = parseHostProtocolVersion(capabilities.version);
+  if (!installedVersion) {
     return {
       status: "unknown",
       ...(capabilities.version ? { installedVersion: capabilities.version } : {}),
-      minimumVersion,
+      supportedVersions,
       authenticated: capabilities.authenticated,
       exactTestedVersion: false,
       detail: `${host} did not report a parseable semantic version`,
     };
   }
-  const exactTestedVersion = compareVersion(installed, minimum) === 0;
-  const compatible = compareVersion(installed, minimum) >= 0;
+  const profile = resolveHostProtocolProfile(host, capabilities.version);
+  const missingCapabilities = REQUIRED_HOST_PROTOCOL_CAPABILITIES.filter(
+    (capability) => !capabilities[capability],
+  );
+  const compatible =
+    profile !== undefined &&
+    capabilities.protocolProfile === profile.id &&
+    missingCapabilities.length === 0;
   return {
     status: compatible ? "compatible" : "unsupported",
     ...(capabilities.version ? { installedVersion: capabilities.version } : {}),
-    minimumVersion,
+    supportedVersions,
+    ...(profile ? { protocolProfile: profile.id } : {}),
     authenticated: capabilities.authenticated,
-    exactTestedVersion,
+    exactTestedVersion: compatible,
     detail: compatible
-      ? exactTestedVersion
-        ? `${host} matches the recorded live-test version`
-        : `${host} meets the minimum version; this exact version is not in the recorded live-test matrix`
-      : `${host} is older than the minimum supported version`,
+      ? `${host} matches recorded protocol profile ${profile.id}`
+      : profile
+        ? `${host} ${installedVersion} did not report the complete recorded protocol profile`
+        : `${host} ${installedVersion} has no recorded protocol profile; supported versions: ${supportedVersions.join(", ")}`,
   };
 }
 

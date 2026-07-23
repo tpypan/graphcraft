@@ -1,6 +1,7 @@
 import { appendFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
+  hostCapabilitiesFromProtocolProfile,
   reconcilePersistedInvocation,
   type HostAdapter,
   type HostCapabilities,
@@ -105,14 +106,11 @@ class ColdRestartAdapter implements HostAdapter {
   }
 
   async probe(): Promise<HostCapabilities> {
-    return {
+    return hostCapabilitiesFromProtocolProfile(this.id, {
       installed: true,
       authenticated: true,
-      version: "cold-restart-fixture",
-      structuredOutput: true,
-      streamingEvents: true,
-      tokenReporting: true,
-    };
+      version: this.id === "codex" ? "codex-cli 0.144.6" : "2.1.212 (Claude Code)",
+    });
   }
 
   async plan(_request: PlanningRequest, _signal: AbortSignal): Promise<PlanningResult> {

@@ -1,12 +1,17 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   BenchmarkSuiteSchema,
+  REQUIRED_HOST_PROTOCOL_CAPABILITIES,
+  assertRequiredHostCapabilities,
+  createBenchmarkSchedule,
+  hostCapabilitiesFromProtocolProfile,
   reconcilePersistedInvocation,
   summarizeBenchmark,
   type HostAdapter,
+  type BenchmarkSuite,
   type HostCapabilities,
   type HostEvent,
   type InvocationRecord,
@@ -48,8 +53,10 @@ function usage(input: number, output: number): TokenUsage {
 }
 
 class BenchmarkAdapter implements HostAdapter {
-  readonly id = "test" as const;
+  readonly id = "codex" as const;
   readonly graphcraftRepositories: string[] = [];
+  readonly workerRequests: WorkerRequest[] = [];
+  probeCalls = 0;
 
   constructor(
     private readonly options: {
@@ -57,6 +64,10 @@ class BenchmarkAdapter implements HostAdapter {
       usageReceipt?: TokenUsage;
       weakenBaselineScorer?: boolean;
       makeBaselineAcceptancePathDirectory?: boolean;
+      capabilities?: Partial<HostCapabilities>;
+      capabilitySequence?: HostCapabilities[];
+      revalidatePlan?: boolean;
+      revalidateExecute?: boolean;
     } = {},
   ) {}
 
@@ -65,17 +76,21 @@ class BenchmarkAdapter implements HostAdapter {
   }
 
   async probe(): Promise<HostCapabilities> {
-    return {
-      installed: true,
-      authenticated: true,
-      version: "benchmark-fixture",
-      structuredOutput: true,
-      streamingEvents: true,
-      tokenReporting: true,
+    const capabilities = {
+      ...hostCapabilitiesFromProtocolProfile("codex", {
+        installed: true,
+        authenticated: true,
+        version: "codex-cli 0.144.6",
+      }),
+      ...this.options.capabilities,
     };
+    const sequenced = this.options.capabilitySequence?.[this.probeCalls];
+    this.probeCalls += 1;
+    return sequenced ?? capabilities;
   }
 
   async plan(request: PlanningRequest): Promise<PlanningResult> {
+    if (this.options.revalidatePlan) assertRequiredHostCapabilities(this.id, await this.probe());
     this.graphcraftRepositories.push(request.contract.repository.root);
     return {
       plan: {
@@ -126,6 +141,8 @@ class BenchmarkAdapter implements HostAdapter {
   }
 
   async *execute(request: WorkerRequest): AsyncIterable<HostEvent> {
+    if (this.options.revalidateExecute) assertRequiredHostCapabilities(this.id, await this.probe());
+    this.workerRequests.push(request);
     yield { type: "started", invocationId: request.invocationId };
     yield { type: "session", hostSessionId: request.invocationId };
     if (this.options.failureMessage) {
@@ -200,6 +217,274 @@ class BenchmarkAdapter implements HostAdapter {
 }
 
 describe("benchmark harness", () => {
+  function seedStartingWith(suite: BenchmarkSuite, mode: "baseline" | "graphcraft"): string {
+    for (let index = 0; index < 100; index += 1) {
+      const seed = `start-${mode}-${index}`;
+      if (
+        createBenchmarkSchedule({ suite, hosts: ["codex"], seed, repetitions: 1 })[0]?.mode === mode
+      )
+        return seed;
+    }
+    throw new Error(`Could not construct a benchmark schedule starting with ${mode}`);
+  }
+
+  it.each(REQUIRED_HOST_PROTOCOL_CAPABILITIES)(
+    "rejects benchmark admission before fixture or report creation when %s is unavailable",
+    async (capability) => {
+      const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-admission-"));
+      temporaryRoots.push(root);
+      const outputPath = join(root, "report.json");
+      const adapter = new BenchmarkAdapter({ capabilities: { [capability]: false } });
+      const suite = BenchmarkSuiteSchema.parse({
+        schemaVersion: 2,
+        id: "admission-suite",
+        version: 1,
+        description: "Host capability admission fixture",
+        tasks: [
+          {
+            id: "admission-task",
+            family: "feature",
+            task: "Exercise benchmark host admission",
+            initialFiles: {
+              "source.js": "export const value = 'pending';\n",
+              "score.mjs": "process.exit(0);\n",
+            },
+            checks: [{ command: "node", scorerPath: "score.mjs", args: ["--version"] }],
+            acceptance: [{ kind: "exists", path: "source.js" }],
+            repetitions: 1,
+          },
+        ],
+      });
+
+      await expect(
+        runBenchmark({
+          suite,
+          hosts: ["codex"],
+          adapters: { codex: adapter },
+          policies: { codex: { model: "admission-fixture", effort: "low" } },
+          graphcraftVersion: "0.1.2-admission-fixture",
+          seed: "admission-seed",
+          repetitions: 1,
+          outputPath,
+        }),
+      ).rejects.toThrow(capability);
+      expect(adapter.graphcraftRepositories).toEqual([]);
+      await expect(access(outputPath)).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
+  it.each([
+    ["authentication loss", "not authenticated"],
+    ["unsupported protocol", "no matching recorded protocol profile"],
+  ] as const)(
+    "revalidates each benchmark trial after %s without persisting a stale host version",
+    async (transition, expectedError) => {
+      const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-revalidation-"));
+      temporaryRoots.push(root);
+      const outputPath = join(root, "report.json");
+      const ready = hostCapabilitiesFromProtocolProfile("codex", {
+        installed: true,
+        authenticated: true,
+        version: "codex-cli 0.144.6",
+      });
+      const unavailable =
+        transition === "authentication loss"
+          ? { ...ready, authenticated: false }
+          : hostCapabilitiesFromProtocolProfile("codex", {
+              installed: true,
+              authenticated: true,
+              version: "codex-cli 0.145.0",
+            });
+      const adapter = new BenchmarkAdapter({ capabilitySequence: [ready, unavailable] });
+      const suite = BenchmarkSuiteSchema.parse({
+        schemaVersion: 2,
+        id: "revalidation-suite",
+        version: 1,
+        description: "Per-trial host capability revalidation fixture",
+        tasks: [
+          {
+            id: "revalidation-task",
+            family: "feature",
+            task: "Exercise per-trial host admission",
+            initialFiles: {
+              "source.js": "export const value = 'pending';\n",
+              "score.mjs": "process.exit(0);\n",
+            },
+            checks: [{ command: "node", scorerPath: "score.mjs" }],
+            acceptance: [{ kind: "exists", path: "source.js" }],
+            repetitions: 1,
+          },
+        ],
+      });
+
+      await expect(
+        runBenchmark({
+          suite,
+          hosts: ["codex"],
+          adapters: { codex: adapter },
+          policies: { codex: { model: "revalidation-fixture", effort: "low" } },
+          graphcraftVersion: "0.1.2-revalidation-fixture",
+          seed: "revalidation-seed",
+          repetitions: 1,
+          outputPath,
+        }),
+      ).rejects.toThrow(expectedError);
+
+      expect(adapter.probeCalls).toBe(2);
+      expect(adapter.workerRequests).toEqual([]);
+      expect(adapter.graphcraftRepositories).toEqual([]);
+      expect(JSON.parse(await readFile(outputPath, "utf8"))).toMatchObject({
+        status: "running",
+        results: [],
+      });
+    },
+  );
+
+  it("rejects post-trial host identity drift before persisting the completed trial", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-post-trial-drift-"));
+    temporaryRoots.push(root);
+    const outputPath = join(root, "report.json");
+    const ready = hostCapabilitiesFromProtocolProfile("codex", {
+      installed: true,
+      authenticated: true,
+      version: "codex-cli 0.144.6",
+    });
+    const adapter = new BenchmarkAdapter({
+      capabilitySequence: [
+        ready,
+        ready,
+        { ...ready, version: "codex-cli 0.145.0", protocolProfile: "codex-cli@0.145.0" },
+      ],
+    });
+    const suite = BenchmarkSuiteSchema.parse({
+      schemaVersion: 2,
+      id: "post-trial-drift-suite",
+      version: 1,
+      description: "Post-trial host identity drift fixture",
+      tasks: [
+        {
+          id: "post-trial-drift-task",
+          family: "feature",
+          task: "Exercise post-trial benchmark host identity validation",
+          initialFiles: {
+            "source.js": "export const value = 'pending';\n",
+            "score.mjs": "process.exit(0);\n",
+          },
+          checks: [{ command: "node", scorerPath: "score.mjs" }],
+          acceptance: [{ kind: "exists", path: "source.js" }],
+          repetitions: 1,
+        },
+      ],
+    });
+
+    await expect(
+      runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: { codex: adapter },
+        policies: { codex: { model: "post-trial-drift-fixture", effort: "low" } },
+        graphcraftVersion: "0.1.2-post-trial-drift-fixture",
+        seed: seedStartingWith(suite, "baseline"),
+        repetitions: 1,
+        outputPath,
+      }),
+    ).rejects.toThrow("no matching recorded protocol profile");
+
+    expect(adapter.probeCalls).toBe(3);
+    expect(adapter.workerRequests).toHaveLength(1);
+    expect(JSON.parse(await readFile(outputPath, "utf8"))).toMatchObject({
+      status: "running",
+      results: [],
+    });
+  });
+
+  it.each([
+    ["baseline", "worker", "authentication loss"],
+    ["graphcraft", "planner", "unsupported protocol"],
+    ["graphcraft", "worker", "authentication loss"],
+  ] as const)(
+    "does not persist a stale host version when %s %s revalidation catches %s",
+    async (mode, stage, transition) => {
+      const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-late-admission-"));
+      temporaryRoots.push(root);
+      const outputPath = join(root, "report.json");
+      const ready = hostCapabilitiesFromProtocolProfile("codex", {
+        installed: true,
+        authenticated: true,
+        version: "codex-cli 0.144.6",
+      });
+      const unavailable =
+        transition === "authentication loss"
+          ? { ...ready, authenticated: false }
+          : hostCapabilitiesFromProtocolProfile("codex", {
+              installed: true,
+              authenticated: true,
+              version: "codex-cli 0.145.0",
+            });
+      const capabilitySequence = Array.from(
+        {
+          length: mode === "baseline" ? 2 : stage === "planner" ? 3 : 5,
+        },
+        () => ready,
+      ).concat(unavailable);
+      const adapter = new BenchmarkAdapter({
+        capabilitySequence,
+        revalidatePlan: stage === "planner",
+        revalidateExecute: stage === "worker",
+      });
+      const suite = BenchmarkSuiteSchema.parse({
+        schemaVersion: 2,
+        id: `late-${mode}-admission-suite`,
+        version: 1,
+        description: "Invocation-level benchmark host admission fixture",
+        tasks: [
+          {
+            id: `late-${mode}-admission-task`,
+            family: "feature",
+            task: "Exercise invocation-level benchmark host admission",
+            initialFiles: {
+              "package.json": `${JSON.stringify({ scripts: { verify: "node verify.mjs" } })}\n`,
+              "source.js": "export const value = 'pending';\n",
+              "score.mjs": "process.exit(0);\n",
+              "verify.mjs": "process.exit(0);\n",
+            },
+            checks: [{ command: "node", scorerPath: "score.mjs" }],
+            acceptance: [{ kind: "exists", path: "source.js" }],
+            repetitions: 1,
+          },
+        ],
+      });
+      const seed = seedStartingWith(suite, mode);
+
+      await expect(
+        runBenchmark({
+          suite,
+          hosts: ["codex"],
+          adapters: { codex: adapter },
+          policies: { codex: { model: "late-admission-fixture", effort: "low" } },
+          graphcraftVersion: "0.1.2-late-admission-fixture",
+          seed,
+          repetitions: 1,
+          outputPath,
+        }),
+      ).rejects.toThrow(
+        transition === "authentication loss"
+          ? "not authenticated"
+          : "no matching recorded protocol profile",
+      );
+
+      expect(adapter.probeCalls).toBe(mode === "baseline" ? 3 : stage === "planner" ? 4 : 6);
+      expect(adapter.workerRequests).toEqual([]);
+      expect(adapter.graphcraftRepositories).toHaveLength(
+        mode === "graphcraft" && stage === "worker" ? 1 : 0,
+      );
+      expect(JSON.parse(await readFile(outputPath, "utf8"))).toMatchObject({
+        status: "running",
+        results: [],
+      });
+    },
+  );
+
   it("removes a temporary fixture when materialization fails", async () => {
     const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-cleanup-report-"));
     temporaryRoots.push(root);

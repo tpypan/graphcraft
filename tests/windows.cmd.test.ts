@@ -132,11 +132,17 @@ describe.skipIf(process.platform !== "win32")("Windows .cmd executable boundarie
       installed: true,
       authenticated: true,
       version: "codex-cli 0.144.6",
+      protocolProfile: "codex-cli@0.144.6",
+      cancellation: true,
+      resume: true,
     });
     await expect(new ClaudeAdapter().probe()).resolves.toMatchObject({
       installed: true,
       authenticated: true,
       version: "2.1.212 (Claude Code)",
+      protocolProfile: "claude-code@2.1.212",
+      cancellation: true,
+      resume: true,
     });
 
     await expect(recordedInvocations(fixture.recordPath)).resolves.toEqual([

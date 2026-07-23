@@ -18,7 +18,10 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ContextSelectionReceiptSchema,
+  REQUIRED_HOST_PROTOCOL_CAPABILITIES,
+  assertRequiredHostCapabilities,
   evidenceSnapshot,
+  hostCapabilitiesFromProtocolProfile,
   interruptionReason,
   reconcilePersistedInvocation,
   tokenCostReport,
@@ -88,6 +91,8 @@ const pushMatrixTimeout = process.platform === "win32" ? 300_000 : 120_000;
 const checkRerunMatrixTimeout = process.platform === "win32" ? 600_000 : 180_000;
 const pullRequestCreateMatrixTimeout = process.platform === "win32" ? 300_000 : 180_000;
 const interruptionClassificationTimeout = process.platform === "win32" ? 60_000 : 30_000;
+const githubRepairTimeout =
+  process.platform === "win32" ? 60_000 : process.platform === "darwin" ? 30_000 : 15_000;
 
 function reportedUsage(
   input: number,
@@ -140,6 +145,10 @@ async function waitFor(
 
 function itWin(name: string, test: () => Promise<void>): void {
   it(name, test, process.platform === "win32" ? 60_000 : 15_000);
+}
+
+function itGitHub(name: string, test: () => Promise<void>): void {
+  it(name, test, githubRepairTimeout);
 }
 
 async function waitForAbort(signal: AbortSignal): Promise<void> {
@@ -243,7 +252,11 @@ const statePath = process.env.GRAPHCRAFT_RUNTIME_GH_STATE;
 const logPath = process.env.GRAPHCRAFT_RUNTIME_GH_LOG;
 const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
 fs.appendFileSync(logPath, JSON.stringify(args) + "\\n");
-const save = () => fs.writeFileSync(statePath, JSON.stringify(state) + "\\n");
+const save = () => {
+  const temporaryStatePath = statePath + "." + process.pid + ".tmp";
+  fs.writeFileSync(temporaryStatePath, JSON.stringify(state) + "\\n");
+  fs.renameSync(temporaryStatePath, statePath);
+};
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
 const fail = (message, code = 1) => { process.stderr.write(message + "\\n"); process.exit(code); };
 const value = (flag) => args[args.indexOf(flag) + 1];
@@ -612,13 +625,24 @@ class FakeAdapter implements HostAdapter {
   }
 
   async probe(): Promise<HostCapabilities> {
+    if (this.id !== "test") {
+      const version = this.id === "codex" ? "codex-cli 0.144.6" : "2.1.212 (Claude Code)";
+      return hostCapabilitiesFromProtocolProfile(this.id, {
+        installed: true,
+        authenticated: this.authenticated,
+        version,
+      });
+    }
     return {
       installed: true,
       authenticated: this.authenticated,
       version: "test",
+      protocolProfile: "test/fixture",
       structuredOutput: true,
       streamingEvents: true,
       tokenReporting: true,
+      cancellation: true,
+      resume: true,
     };
   }
 
@@ -1739,7 +1763,7 @@ describe("durable runtime", () => {
         planner: adapter,
       });
       const repositoryRoot = created.store.repositoryRoot;
-      const fakeBin = join(repository, ".test-bin");
+      const fakeBin = join(repository, "..", ".test-bin");
       const fakeCodex = join(fakeBin, "codex");
       await mkdir(fakeBin);
       await writeFile(
@@ -1747,7 +1771,7 @@ describe("durable runtime", () => {
         `#!/usr/bin/env node
 const fs = require("node:fs");
 const args = process.argv.slice(2);
-if (args[0] === "--version") { console.log("codex-cli 0.0.0-test"); process.exit(0); }
+if (args[0] === "--version") { console.log("codex-cli 0.144.6"); process.exit(0); }
 if (args[0] === "login" && args[1] === "status") { console.log("Logged in"); process.exit(0); }
 let input = "";
 process.stdin.setEncoding("utf8");
@@ -5689,7 +5713,7 @@ process.stdin.on("end", () => {
     const restarted = new RunStore(repository, created.contract.runId);
     const beforeWake = await executeRun({ store: restarted, adapter, github });
 
-    expect(waiting.status).toBe("waiting");
+    expect(waiting.status, waiting.stopReason).toBe("waiting");
     expect(waiting.nodes["pull-request"]?.status).toBe("waiting");
     expect(waiting.waits).toMatchObject([
       {
@@ -7292,7 +7316,7 @@ process.stdin.on("end", () => {
     process.platform === "win32" ? 1_200_000 : process.platform === "darwin" ? 600_000 : 240_000,
   );
 
-  it("resumes a confirmed review-repair push without repeating the mutation", async () => {
+  itGitHub("resumes a confirmed review-repair push without repeating the mutation", async () => {
     const { repository, remote } = await createRepositoryWithRemote();
     const github = await fakePullRequestGitHub(remote, {
       syncPullRequestHead: true,
@@ -7366,7 +7390,7 @@ process.stdin.on("end", () => {
     expect(adapter.calls).toEqual(["implement", "repair-review-1"]);
   });
 
-  it("routes an actionable CI failure through a bounded verified repair push", async () => {
+  itGitHub("routes an actionable CI failure through a bounded verified repair push", async () => {
     const { repository, remote } = await createRepositoryWithRemote();
     const github = await fakePullRequestGitHub(remote, {
       syncPullRequestHead: true,
@@ -7484,6 +7508,7 @@ process.stdin.on("end", () => {
         },
       ]);
     },
+    githubRepairTimeout,
   );
 
   it("durably retries same-SHA check-rerun revalidation before dispatch", async () => {
@@ -7835,7 +7860,7 @@ process.stdin.on("end", () => {
     checkRerunMatrixTimeout,
   );
 
-  it("stops instead of repeating an unchanged actionable CI repair", async () => {
+  itGitHub("stops instead of repeating an unchanged actionable CI repair", async () => {
     const { repository, remote } = await createRepositoryWithRemote();
     const github = await fakePullRequestGitHub(remote, {
       syncPullRequestHead: true,
@@ -8505,6 +8530,221 @@ process.stdin.on("end", () => {
     expect(state.stopReason).toMatch(/not authenticated/);
     expect(adapter.calls).toHaveLength(0);
     await expect(created.store.loadWorkspace()).rejects.toThrow();
+  });
+
+  it.each(REQUIRED_HOST_PROTOCOL_CAPABILITIES)(
+    "rejects a planner before invocation when %s is unavailable",
+    async (capability) => {
+      const repository = await createRepository();
+      const planner = new FakeAdapter(async () => undefined);
+      const readyProbe = planner.probe.bind(planner);
+      planner.probe = async () => ({ ...(await readyProbe()), [capability]: false });
+
+      await expect(
+        createRun("Implement a substantial feature across the fixture", {
+          cwd: repository,
+          planner,
+        }),
+      ).rejects.toThrow(capability);
+      expect(planner.planningRequests).toHaveLength(0);
+    },
+  );
+
+  it.each(REQUIRED_HOST_PROTOCOL_CAPABILITIES)(
+    "blocks execution before workspace creation when %s is unavailable",
+    async (capability) => {
+      const repository = await createRepository();
+      const adapter = new FakeAdapter(async () => undefined);
+      const readyProbe = adapter.probe.bind(adapter);
+      adapter.probe = async () => ({ ...(await readyProbe()), [capability]: false });
+      const created = await createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+      });
+
+      const state = await executeRun({ store: created.store, adapter, approve: true });
+      expect(state.status).toBe("blocked");
+      expect(state.stopReason).toContain(capability);
+      expect(adapter.calls).toHaveLength(0);
+      await expect(created.store.loadWorkspace()).rejects.toThrow();
+    },
+  );
+
+  it.each([
+    ["authentication loss", "unauthenticated"],
+    ["unsupported protocol", "unsupported_protocol"],
+  ] as const)(
+    "revalidates immediately before a worker invocation after %s",
+    async (transition, expectedStatus) => {
+      const repository = await createRepository();
+      const adapter = new FakeAdapter(async () => undefined);
+      const ready = await adapter.probe();
+      let probes = 0;
+      adapter.probe = async () => {
+        probes += 1;
+        if (probes === 1) return ready;
+        return transition === "authentication loss"
+          ? { ...ready, authenticated: false }
+          : {
+              ...ready,
+              version: "test-development",
+              protocolProfile: null,
+              structuredOutput: false,
+              streamingEvents: false,
+              tokenReporting: false,
+              cancellation: false,
+              resume: false,
+            };
+      };
+      const created = await createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+      });
+
+      const state = await executeRun({ store: created.store, adapter, approve: true });
+
+      expect(probes).toBe(2);
+      expect(adapter.calls).toEqual([]);
+      expect(state.status).toBe("blocked");
+      expect(state.stopReason).toMatch(/capability admission failed before worker invocation/i);
+      const events = await created.store.loadEvents();
+      const finished = events.findLast(({ type }) => type === "invocation.finished");
+      expect(finished).toMatchObject({
+        data: {
+          success: false,
+          capabilityDiagnostic: { ready: false, status: expectedStatus },
+        },
+      });
+      const invocationId = String(finished?.data.invocationId ?? "");
+      expect(await created.store.loadInvocationEvents(invocationId)).toEqual([
+        {
+          type: "error",
+          message: expect.stringContaining(
+            transition === "authentication loss"
+              ? "not authenticated"
+              : "no matching recorded protocol profile",
+          ),
+        },
+      ]);
+      expect(events.findLast(({ type }) => type === "run.blocked")?.data.reason).toBe(
+        state.stopReason,
+      );
+    },
+  );
+
+  it.each([
+    ["authentication loss", "unauthenticated"],
+    ["unsupported protocol", "unsupported_protocol"],
+  ] as const)(
+    "persists the adapter-internal worker admission diagnostic after %s",
+    async (transition, expectedStatus) => {
+      const repository = await createRepository();
+      const adapter = new FakeAdapter(async () => undefined);
+      const ready = await adapter.probe();
+      const execute = adapter.execute.bind(adapter);
+      let probes = 0;
+      adapter.probe = async () => {
+        probes += 1;
+        if (probes < 3) return ready;
+        return transition === "authentication loss"
+          ? { ...ready, authenticated: false }
+          : {
+              ...ready,
+              version: "test-development",
+              protocolProfile: null,
+              structuredOutput: false,
+              streamingEvents: false,
+              tokenReporting: false,
+              cancellation: false,
+              resume: false,
+            };
+      };
+      adapter.execute = async function* (request, signal) {
+        assertRequiredHostCapabilities(adapter.id, await adapter.probe());
+        yield* execute(request, signal);
+      };
+      const created = await createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+      });
+
+      const state = await executeRun({ store: created.store, adapter, approve: true });
+
+      expect(probes).toBe(3);
+      expect(adapter.calls).toEqual([]);
+      expect(state.status).toBe("blocked");
+      expect(state.stopReason).toMatch(/capability admission failed before worker invocation/i);
+      expect(state.tokenLedger.filter(({ phase }) => phase === "worker")).toEqual([]);
+      const finished = (await created.store.loadEvents()).findLast(
+        ({ type }) => type === "invocation.finished",
+      );
+      expect(finished).toMatchObject({
+        data: {
+          success: false,
+          capabilityDiagnostic: { ready: false, status: expectedStatus },
+        },
+      });
+      expect(finished?.data).not.toHaveProperty("errorCause");
+    },
+  );
+
+  it("revalidates immediately before a later semantic invocation", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async () => undefined);
+    const ready = await adapter.probe();
+    let probes = 0;
+    adapter.probe = async () => {
+      probes += 1;
+      return probes < 4 ? ready : { ...ready, authenticated: false };
+    };
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+      planner: adapter,
+    });
+
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+
+    expect(probes).toBe(4);
+    expect(adapter.calls).toEqual(["investigate"]);
+    expect(adapter.semanticRequests).toEqual([]);
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toMatch(/semantic progress verification failed.*not authenticated/i);
+    expect(
+      (await created.store.loadEvents()).findLast(({ type }) => type === "semantic.verdict"),
+    ).toMatchObject({ data: { error: expect.stringMatching(/not authenticated/i) } });
+  });
+
+  it("persists the adapter-internal semantic admission diagnostic", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async () => undefined);
+    const ready = await adapter.probe();
+    const verify = adapter.verify.bind(adapter);
+    let probes = 0;
+    adapter.probe = async () => {
+      probes += 1;
+      return probes < 5 ? ready : { ...ready, authenticated: false };
+    };
+    adapter.verify = async (request) => {
+      assertRequiredHostCapabilities(adapter.id, await adapter.probe());
+      return await verify(request);
+    };
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+      planner: adapter,
+    });
+
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+
+    expect(probes).toBe(5);
+    expect(adapter.calls).toEqual(["investigate"]);
+    expect(adapter.semanticRequests).toEqual([]);
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toMatch(/semantic progress verification failed.*not authenticated/i);
+    expect(
+      (await created.store.loadEvents()).findLast(({ type }) => type === "semantic.verdict"),
+    ).toMatchObject({
+      data: {
+        error: expect.stringMatching(/not authenticated/i),
+        capabilityDiagnostic: { ready: false, status: "unauthenticated" },
+      },
+    });
   });
 
   it("rejects an oversized worker result before it can enlarge durable events or state", async () => {

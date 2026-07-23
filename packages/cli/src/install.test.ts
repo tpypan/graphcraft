@@ -19,7 +19,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { HostCapabilities } from "@graphcraft/core";
+import { hostCapabilitiesFromProtocolProfile, type HostCapabilities } from "@graphcraft/core";
 import {
   GRAPHCRAFT_VERSION,
   createHostCommandRunner,
@@ -1586,32 +1586,51 @@ describe("local viewer URL boundary", () => {
 });
 
 describe("host compatibility diagnostics", () => {
-  const capabilities = (version?: string, installed = true): HostCapabilities => ({
-    installed,
-    authenticated: installed,
-    ...(version ? { version } : {}),
-    structuredOutput: installed,
-    streamingEvents: installed,
-    tokenReporting: installed,
-  });
+  const capabilities = (host: HostName, version?: string, installed = true): HostCapabilities =>
+    hostCapabilitiesFromProtocolProfile(host, {
+      installed,
+      authenticated: installed,
+      ...(version ? { version } : {}),
+    });
 
-  it("distinguishes tested, newer, older, missing, and unparseable hosts", () => {
-    expect(hostCompatibilityDiagnostic("codex", capabilities("codex-cli 0.144.6"))).toMatchObject({
+  it("admits only exact complete recorded host protocol profiles", () => {
+    expect(
+      hostCompatibilityDiagnostic("codex", capabilities("codex", "codex-cli 0.144.6")),
+    ).toMatchObject({
       status: "compatible",
+      protocolProfile: "codex-cli@0.144.6",
+      supportedVersions: ["0.144.6"],
       exactTestedVersion: true,
     });
-    expect(hostCompatibilityDiagnostic("codex", capabilities("codex-cli 0.145.0"))).toMatchObject({
-      status: "compatible",
+    expect(
+      hostCompatibilityDiagnostic("codex", capabilities("codex", "codex-cli 0.145.0")),
+    ).toMatchObject({
+      status: "unsupported",
       exactTestedVersion: false,
     });
-    expect(hostCompatibilityDiagnostic("codex", capabilities("codex-cli 0.143.9"))).toMatchObject({
+    expect(
+      hostCompatibilityDiagnostic("codex", capabilities("codex", "codex-cli 0.143.9")),
+    ).toMatchObject({ status: "unsupported" });
+    expect(
+      hostCompatibilityDiagnostic("claude", capabilities("claude", "2.1.212 (Claude Code)")),
+    ).toMatchObject({
+      status: "compatible",
+      protocolProfile: "claude-code@2.1.212",
+      supportedVersions: ["2.1.212"],
+    });
+    expect(
+      hostCompatibilityDiagnostic("claude", capabilities("claude", "2.1.217 (Claude Code)")),
+    ).toMatchObject({ status: "unsupported" });
+    expect(
+      hostCompatibilityDiagnostic("claude", capabilities("claude", undefined, false)),
+    ).toMatchObject({ status: "missing" });
+    expect(
+      hostCompatibilityDiagnostic("claude", capabilities("claude", "development build")),
+    ).toMatchObject({ status: "unknown" });
+
+    const incomplete = capabilities("codex", "codex-cli 0.144.6");
+    expect(hostCompatibilityDiagnostic("codex", { ...incomplete, resume: false })).toMatchObject({
       status: "unsupported",
-    });
-    expect(hostCompatibilityDiagnostic("claude", capabilities(undefined, false))).toMatchObject({
-      status: "missing",
-    });
-    expect(hostCompatibilityDiagnostic("claude", capabilities("development build"))).toMatchObject({
-      status: "unknown",
     });
   });
 });

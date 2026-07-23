@@ -7,7 +7,10 @@ import {
   BenchmarkReportSchema,
   BenchmarkTrialResultSchema,
   ContextCapsuleSchema,
+  HostCapabilityAdmissionError,
+  RequiredHostCapabilityDiagnosticSchema,
   aggregateTokenUsage,
+  assertRequiredHostCapabilities,
   contentHash,
   createBenchmarkSchedule,
   summarizeBenchmark,
@@ -20,6 +23,7 @@ import {
   type BenchmarkTrialResult,
   type HostAdapter,
   type HostExecutionPolicy,
+  type RunEvent,
   type TokenUsage,
 } from "@graphcraft/core";
 import { runProcess } from "@graphcraft/probes";
@@ -40,6 +44,18 @@ const reportLimitations = [
   "Stable efficiency claims require at least three jointly accepted reconciled baseline/Graphcraft pairs per task and host.",
   "Blinded human defect review remains outside this deterministic harness slice.",
 ];
+
+function persistedCapabilityAdmissionError(
+  events: readonly RunEvent[],
+): HostCapabilityAdmissionError | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const parsed = RequiredHostCapabilityDiagnosticSchema.safeParse(
+      events[index]!.data.capabilityDiagnostic,
+    );
+    if (parsed.success && !parsed.data.ready) return new HostCapabilityAdmissionError(parsed.data);
+  }
+  return undefined;
+}
 
 function benchmarkPermissionPolicy(host: "codex" | "claude"): BenchmarkPermissionPolicy {
   return host === "codex"
@@ -363,6 +379,7 @@ async function runBaselineTrial(input: {
       }
     }
   } catch (error) {
+    if (error instanceof HostCapabilityAdmissionError) throw error;
     resultStatus = "error";
     failureTrace.push(error instanceof Error ? error.message : String(error));
   }
@@ -420,6 +437,9 @@ async function runGraphcraftTrial(input: {
       finishLine: "local_verified",
     });
     const state = await executeRun({ store: created.store, adapter: input.adapter, approve: true });
+    const events = await created.store.loadEvents();
+    const capabilityError = persistedCapabilityAdmissionError(events);
+    if (capabilityError) throw capabilityError;
     executionStatus =
       state.status === "completed"
         ? "completed"
@@ -436,13 +456,13 @@ async function runGraphcraftTrial(input: {
         .filter((value): value is string => typeof value === "string"),
       ...state.latestProgressEvidence,
     ].join("\n");
-    const events = await created.store.loadEvents();
     failureTrace.push(
       ...events
         .filter(({ type }) => type === "node.failed" || type === "run.blocked")
         .map(({ data }) => String(data.reason ?? "run blocked")),
     );
   } catch (error) {
+    if (error instanceof HostCapabilityAdmissionError) throw error;
     failureTrace.push(error instanceof Error ? error.message : String(error));
   }
   const score = await scoreAcceptance(input.task, acceptanceRepository, summaryEvidence);
@@ -613,14 +633,11 @@ export async function runBenchmark(input: {
     await writeJsonAtomic(outputPath, report);
     return report;
   };
-  const hostVersions = new Map<string, string>();
   for (const host of hosts) {
     const adapter = input.adapters[host];
     if (!adapter) throw new Error(`No ${host} benchmark adapter was configured`);
     const capabilities = await adapter.probe();
-    if (!capabilities.installed || !capabilities.authenticated || !capabilities.structuredOutput)
-      throw new Error(`${host} is not ready for structured benchmark execution`);
-    hostVersions.set(host, capabilities.version ?? "unknown");
+    assertRequiredHostCapabilities(host, capabilities);
   }
   await persist("running");
   const completedTrialIds = new Set(results.map(({ trial }) => trial.trialId));
@@ -633,7 +650,10 @@ export async function runBenchmark(input: {
     );
     const fixture = await materializeTask(task);
     try {
-      results.push(
+      const capabilities = await adapter.probe();
+      assertRequiredHostCapabilities(trial.host, capabilities);
+      const hostVersion = capabilities.version ?? "unknown";
+      const result =
         trial.mode === "baseline"
           ? await runBaselineTrial({
               trial,
@@ -642,7 +662,7 @@ export async function runBenchmark(input: {
               repository: fixture.repository,
               repositoryDigest: fixture.repositoryDigest,
               baseSha: fixture.baseSha,
-              hostVersion: hostVersions.get(trial.host)!,
+              hostVersion,
               policy: policies[trial.host]!,
             })
           : await runGraphcraftTrial({
@@ -652,10 +672,20 @@ export async function runBenchmark(input: {
               repository: fixture.repository,
               repositoryDigest: fixture.repositoryDigest,
               baseSha: fixture.baseSha,
-              hostVersion: hostVersions.get(trial.host)!,
+              hostVersion,
               policy: policies[trial.host]!,
-            }),
-      );
+            });
+      const finalCapabilities = await adapter.probe();
+      assertRequiredHostCapabilities(trial.host, finalCapabilities);
+      if (
+        finalCapabilities.version !== capabilities.version ||
+        finalCapabilities.protocolProfile !== capabilities.protocolProfile
+      ) {
+        throw new Error(
+          `${trial.host} protocol identity changed during benchmark trial ${trial.trialId}; refusing stale host-version evidence`,
+        );
+      }
+      results.push(result);
     } finally {
       await removeBenchmarkFixture(fixture.repository);
     }

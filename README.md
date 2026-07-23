@@ -9,7 +9,10 @@ Graphcraft is a local execution layer for long-running coding agents. It turns a
 
 ## Install the alpha
 
-Requirements: Git, Node.js 22+, and an authenticated Codex or Claude Code CLI.
+Requirements: Git, Node.js 22+, and an authenticated, protocol-qualified Codex or Claude Code CLI.
+The current exact profiles are Codex CLI 0.144.6 and Claude Code 2.1.212; other versions fail
+closed until their structured output, streaming, usage, cancellation, and resume behavior is
+qualified. `graphcraft doctor` reports the supported versions without invoking a model.
 Remote `pushed`, `pr_open`, and `pr_green` finish lines additionally require an authenticated GitHub CLI (`gh`).
 
 The public npm package is `@tpypan/graphcraft`; the unscoped `graphcraft` name belongs to an unrelated project. Install it globally with either package manager:

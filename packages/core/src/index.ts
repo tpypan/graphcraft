@@ -5,6 +5,7 @@ export * from "./capsule.ts";
 export * from "./events.ts";
 export * from "./graph.ts";
 export * from "./held-out.ts";
+export * from "./host-capabilities.ts";
 export * from "./leases.ts";
 export * from "./planner.ts";
 export * from "./prompt.ts";

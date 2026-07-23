@@ -1,7 +1,7 @@
 import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
@@ -29,7 +29,6 @@ import {
   readBoundedProtocolLines as readCodexProtocolLines,
 } from "../packages/adapter-codex/src/protocol.ts";
 import type {
-  HostAdapter,
   HostEvent,
   PlanningRequest,
   SemanticVerificationRequest,
@@ -166,25 +165,53 @@ function claudeStructuredEvent(value: unknown, sessionId?: string): string {
 
 type AdapterFixture = {
   host: "Codex" | "Claude";
-  adapter: HostAdapter;
+  adapter: CodexAdapter | ClaudeAdapter;
   structuredEvent(value: unknown, sessionId?: string): string;
 };
 
-function adapters(): AdapterFixture[] {
+function rawAdapters(): AdapterFixture[] {
   return [
     { host: "Codex", adapter: new CodexAdapter(), structuredEvent: codexStructuredEvent },
     { host: "Claude", adapter: new ClaudeAdapter(), structuredEvent: claudeStructuredEvent },
   ];
 }
 
+function adapters(): AdapterFixture[] {
+  return rawAdapters();
+}
+
+function queueReadyCapabilityProbe(host: "codex" | "claude"): void {
+  queueChild({
+    stdout: host === "codex" ? "codex-cli 0.144.6\n" : "2.1.212 (Claude Code)\n",
+  });
+  queueChild({
+    stdout: host === "codex" ? "Logged in\n" : '{"loggedIn":true}\n',
+  });
+}
+
+function queueUnauthenticatedCapabilityProbe(host: "codex" | "claude"): void {
+  queueChild({
+    stdout: host === "codex" ? "codex-cli 0.144.6\n" : "2.1.212 (Claude Code)\n",
+  });
+  queueChild({
+    stdout: host === "codex" ? "Not logged in\n" : '{"loggedIn":false}\n',
+  });
+}
+
 describe("bounded adapter streams", () => {
   beforeAll(async () => {
-    if (process.platform !== "win32") return;
     trustedCommandDirectory = await mkdtemp(join(tmpdir(), "graphcraft-adapter-path-"));
+    const suffix = process.platform === "win32" ? ".cmd" : "";
     await Promise.all(
-      ["codex.cmd", "claude.cmd"].map((name) =>
-        writeFile(join(trustedCommandDirectory!, name), "@exit /b 0\r\n", "utf8"),
-      ),
+      ["codex", "claude"].map(async (host) => {
+        const executable = join(trustedCommandDirectory!, `${host}${suffix}`);
+        await writeFile(
+          executable,
+          process.platform === "win32" ? "@exit /b 0\r\n" : "#!/bin/sh\nexit 0\n",
+          "utf8",
+        );
+        if (process.platform !== "win32") await chmod(executable, 0o755);
+      }),
     );
     const inheritedPath = process.env.PATH ?? process.env.Path ?? "";
     vi.stubEnv("PATH", `${trustedCommandDirectory}${delimiter}${inheritedPath}`);
@@ -229,16 +256,19 @@ describe("bounded adapter streams", () => {
   it("rejects an oversized protocol line after draining planner, verifier, and worker streams", async () => {
     const oversizedLine = `${"x".repeat(CODEX_PROTOCOL_LINE_LIMIT_BYTES + 1)}\n{}\n`;
     for (const { host, adapter } of adapters()) {
+      queueReadyCapabilityProbe(adapter.id);
       queueChild({ stdout: oversizedLine });
       await expect(adapter.plan(planningRequest(), new AbortController().signal)).rejects.toThrow(
         `${host} protocol line exceeded the ${CODEX_PROTOCOL_LINE_LIMIT_BYTES}-byte limit`,
       );
 
+      queueReadyCapabilityProbe(adapter.id);
       queueChild({ stdout: oversizedLine });
       await expect(adapter.verify(semanticRequest(), new AbortController().signal)).rejects.toThrow(
         `${host} protocol line exceeded the ${CODEX_PROTOCOL_LINE_LIMIT_BYTES}-byte limit`,
       );
 
+      queueReadyCapabilityProbe(adapter.id);
       queueChild({ stdout: oversizedLine });
       const events = await collectEvents(
         adapter.execute(workerRequest(), new AbortController().signal),
@@ -255,11 +285,13 @@ describe("bounded adapter streams", () => {
     expect(CODEX_STRUCTURED_OUTPUT_LIMIT_BYTES).toBe(CLAUDE_STRUCTURED_OUTPUT_LIMIT_BYTES);
     const oversizedAuthority = "x".repeat(CODEX_STRUCTURED_OUTPUT_LIMIT_BYTES + 1);
     for (const { host, adapter, structuredEvent } of adapters()) {
+      queueReadyCapabilityProbe(adapter.id);
       queueChild({ stdout: `${structuredEvent(oversizedAuthority)}\n` });
       await expect(adapter.plan(planningRequest(), new AbortController().signal)).rejects.toThrow(
         `${host} structured graph plan exceeded the ${CODEX_STRUCTURED_OUTPUT_LIMIT_BYTES}-byte structured-output limit`,
       );
 
+      queueReadyCapabilityProbe(adapter.id);
       queueChild({ stdout: `${structuredEvent(oversizedAuthority)}\n` });
       await expect(adapter.verify(semanticRequest(), new AbortController().signal)).rejects.toThrow(
         `${host} semantic verdict exceeded the ${CODEX_STRUCTURED_OUTPUT_LIMIT_BYTES}-byte structured-output limit`,
@@ -275,6 +307,7 @@ describe("bounded adapter streams", () => {
         host === "Codex"
           ? `${JSON.stringify({ type: "thread.started", thread_id: sessionId })}\n`
           : "";
+      queueReadyCapabilityProbe(adapter.id);
       queueChild({
         stdout: `${sessionEvent}${structuredEvent(oversizedAuthority, sessionId)}\n`,
       });
@@ -304,6 +337,7 @@ describe("bounded adapter streams", () => {
     expect(CODEX_STDERR_LIMIT_BYTES).toBe(CLAUDE_STDERR_LIMIT_BYTES);
     const stderr = "s".repeat(CODEX_STDERR_LIMIT_BYTES * 2);
     for (const { adapter } of adapters()) {
+      queueReadyCapabilityProbe(adapter.id);
       queueChild({ stderr, exitCode: 1 });
       const events = await collectEvents(
         adapter.execute(workerRequest(), new AbortController().signal),
@@ -323,7 +357,7 @@ describe("bounded adapter streams", () => {
   });
 
   it("fails host capability probes closed when version or authentication output is oversized", async () => {
-    for (const { adapter } of adapters()) {
+    for (const { adapter } of rawAdapters()) {
       queueChild({ stdout: "v".repeat(CODEX_STDERR_LIMIT_BYTES + 1) });
       await expect(adapter.probe()).resolves.toMatchObject({
         installed: false,
@@ -339,14 +373,253 @@ describe("bounded adapter streams", () => {
       await expect(adapter.probe()).resolves.toMatchObject({
         installed: true,
         authenticated: false,
-        structuredOutput: true,
+        protocolProfile: null,
+        structuredOutput: false,
+        cancellation: false,
+        resume: false,
       });
     }
   });
 
+  it("requires a positive Codex authentication marker", async () => {
+    const adapter = new CodexAdapter();
+    for (const authenticationOutput of ["", "Authentication status unavailable\n"]) {
+      queueChild({ stdout: "codex-cli 0.144.6\n" });
+      queueChild({ stdout: authenticationOutput });
+      await expect(adapter.probe()).resolves.toMatchObject({
+        installed: true,
+        authenticated: false,
+        protocolProfile: "codex-cli@0.144.6",
+      });
+    }
+  });
+
+  it("derives protocol capabilities only from exact recorded host versions", async () => {
+    for (const { adapter } of rawAdapters()) {
+      const version = adapter.id === "codex" ? "codex-cli 0.144.6\n" : "2.1.212 (Claude Code)\n";
+      const profile = adapter.id === "codex" ? "codex-cli@0.144.6" : "claude-code@2.1.212";
+      const authentication =
+        adapter.id === "codex" ? { stdout: "Logged in\n" } : { stdout: '{"loggedIn":true}\n' };
+      queueChild({ stdout: version });
+      queueChild(authentication);
+      await expect(adapter.probe()).resolves.toMatchObject({
+        installed: true,
+        authenticated: true,
+        protocolProfile: profile,
+        structuredOutput: true,
+        streamingEvents: true,
+        tokenReporting: true,
+        cancellation: true,
+        resume: true,
+      });
+
+      queueChild({
+        stdout: adapter.id === "codex" ? "codex-cli 0.145.0\n" : "2.1.217 (Claude Code)\n",
+      });
+      queueChild(authentication);
+      await expect(adapter.probe()).resolves.toMatchObject({
+        installed: true,
+        authenticated: true,
+        protocolProfile: null,
+        structuredOutput: false,
+        streamingEvents: false,
+        tokenReporting: false,
+        cancellation: false,
+        resume: false,
+      });
+
+      const recordedVersion =
+        adapter.id === "codex" ? "codex-cli 0.144.6" : "2.1.212 (Claude Code)";
+      for (const rawVersion of [
+        ` ${recordedVersion}\n`,
+        `${recordedVersion} \n`,
+        `${recordedVersion}\n\n`,
+      ]) {
+        queueChild({ stdout: rawVersion });
+        queueChild(authentication);
+        await expect(adapter.probe()).resolves.toMatchObject({
+          installed: true,
+          authenticated: true,
+          protocolProfile: null,
+          structuredOutput: false,
+          streamingEvents: false,
+          tokenReporting: false,
+          cancellation: false,
+          resume: false,
+        });
+      }
+    }
+  });
+
+  it("revalidates direct adapter calls before spawning a host invocation", async () => {
+    for (const { adapter } of rawAdapters()) {
+      queueUnauthenticatedCapabilityProbe(adapter.id);
+      await expect(adapter.plan(planningRequest(), new AbortController().signal)).rejects.toThrow(
+        /not authenticated/,
+      );
+      queueUnauthenticatedCapabilityProbe(adapter.id);
+      await expect(adapter.verify(semanticRequest(), new AbortController().signal)).rejects.toThrow(
+        /not authenticated/,
+      );
+      queueUnauthenticatedCapabilityProbe(adapter.id);
+      await expect(
+        collectEvents(adapter.execute(workerRequest(), new AbortController().signal)),
+      ).rejects.toThrow(/not authenticated/);
+    }
+    expect(spawnMock).toHaveBeenCalledTimes(12);
+  });
+
+  it("reports an unavailable trusted host as not installed without spawning", async () => {
+    const inheritedPath = process.env.PATH ?? "";
+    vi.stubEnv("PATH", join(tmpdir(), `graphcraft-missing-host-${randomUUID()}`));
+    try {
+      for (const { adapter } of rawAdapters()) {
+        await expect(adapter.probe()).resolves.toMatchObject({
+          installed: false,
+          authenticated: false,
+          protocolProfile: null,
+        });
+        const missingCapability = {
+          name: "HostCapabilityAdmissionError",
+          diagnostic: expect.objectContaining({ status: "missing" }),
+        };
+        await expect(
+          adapter.plan(planningRequest(), new AbortController().signal),
+        ).rejects.toMatchObject(missingCapability);
+        await expect(
+          adapter.verify(semanticRequest(), new AbortController().signal),
+        ).rejects.toMatchObject(missingCapability);
+        await expect(
+          collectEvents(adapter.execute(workerRequest(), new AbortController().signal)),
+        ).rejects.toMatchObject(missingCapability);
+      }
+      expect(spawnMock).not.toHaveBeenCalled();
+    } finally {
+      vi.stubEnv("PATH", inheritedPath);
+    }
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "binds every host probe and invocation to one executable outside both worktrees",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "graphcraft-adapter-binding-"));
+      const originalRepository = join(root, "original repository");
+      const originalCwd = join(originalRepository, "packages", "adapter fixture");
+      const siblingWorktree = join(root, "sibling worktree");
+      const originalBin = join(originalRepository, "node_modules", ".bin");
+      const siblingBin = join(siblingWorktree, "node_modules", ".bin");
+      const trustedBin = join(root, "trusted tools");
+      await Promise.all(
+        [
+          originalCwd,
+          join(originalRepository, ".git"),
+          join(siblingWorktree, ".git"),
+          originalBin,
+          siblingBin,
+          trustedBin,
+        ].map((directory) => mkdir(directory, { recursive: true })),
+      );
+      await Promise.all(
+        [originalBin, siblingBin, trustedBin].flatMap((directory) =>
+          ["codex", "claude"].map(async (host) => {
+            const executable = join(directory, host);
+            await writeFile(executable, "#!/bin/sh\nexit 0\n", "utf8");
+            await chmod(executable, 0o755);
+          }),
+        ),
+      );
+
+      const inheritedPath = process.env.PATH ?? "";
+      const cwd = vi.spyOn(process, "cwd").mockReturnValue(originalCwd);
+      vi.stubEnv("PATH", [originalBin, siblingBin, trustedBin].join(delimiter));
+      try {
+        const graphPlan = {
+          schemaVersion: 1,
+          family: "feature",
+          nodes: [
+            {
+              id: "bind-executable",
+              kind: "implementation",
+              objective: "Bind the trusted executable",
+              dependsOn: [],
+              scope: ["src/**"],
+              contextSelector: {
+                includeRepositoryInstructions: true,
+                predecessorResults: [],
+                relevantPaths: ["src"],
+              },
+              progressProbes: [],
+              completionProbes: [],
+              sideEffectClass: "workspace_write",
+            },
+          ],
+        };
+        const semanticVerdict = {
+          verdict: "supported",
+          evidence: ["Bound executable observed"],
+          rationale: "All subprocesses used the same canonical executable.",
+          uncertainty: 0,
+        };
+        const workerResult = {
+          status: "completed",
+          summary: "bound",
+          changedPaths: [],
+          evidence: ["Bound executable observed"],
+        };
+
+        for (const { adapter, structuredEvent } of rawAdapters()) {
+          const trustedExecutable = await realpath(join(trustedBin, adapter.id));
+          const expectBoundInvocation = async (
+            output: string,
+            invoke: () => Promise<unknown>,
+          ): Promise<void> => {
+            const callOffset = spawnMock.mock.calls.length;
+            queueReadyCapabilityProbe(adapter.id);
+            queueChild({ stdout: output });
+            await invoke();
+            expect(
+              spawnMock.mock.calls.slice(callOffset).map(([executable]) => executable),
+            ).toEqual([trustedExecutable, trustedExecutable, trustedExecutable]);
+          };
+
+          await expectBoundInvocation(
+            `${structuredEvent(JSON.stringify(graphPlan))}\n`,
+            async () =>
+              await adapter.plan(
+                { ...planningRequest(), repositoryPath: siblingWorktree },
+                new AbortController().signal,
+              ),
+          );
+          await expectBoundInvocation(
+            `${structuredEvent(JSON.stringify(semanticVerdict))}\n`,
+            async () =>
+              await adapter.verify(
+                { ...semanticRequest(), repositoryPath: siblingWorktree },
+                new AbortController().signal,
+              ),
+          );
+          await expectBoundInvocation(
+            `${structuredEvent(JSON.stringify(workerResult))}\n`,
+            async () =>
+              await collectEvents(
+                adapter.execute(
+                  { ...workerRequest(), repositoryPath: siblingWorktree },
+                  new AbortController().signal,
+                ),
+              ),
+          );
+        }
+      } finally {
+        cwd.mockRestore();
+        vi.stubEnv("PATH", inheritedPath);
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("bounds hanging capability probes and terminates their process tree", async () => {
     vi.useFakeTimers();
-    for (const { adapter } of adapters()) {
+    for (const { adapter } of rawAdapters()) {
       const { child, spawned } = queueTerminatingChild();
       const probing = adapter.probe();
       await spawned;
@@ -362,7 +635,7 @@ describe("bounded adapter streams", () => {
 
   it("settles capability probes even when a child never emits close", async () => {
     vi.useFakeTimers();
-    for (const { adapter } of adapters()) {
+    for (const { adapter } of rawAdapters()) {
       const { child, spawned } = queueNeverClosingChild();
       const probing = adapter.probe();
       await spawned;
@@ -382,6 +655,7 @@ describe("bounded adapter streams", () => {
 
   it("terminates planner process trees through the shared cancellation controller", async () => {
     for (const { adapter } of adapters()) {
+      queueReadyCapabilityProbe(adapter.id);
       const { child, spawned } = queueTerminatingChild();
       const abort = new AbortController();
       const planning = adapter.plan(planningRequest(), abort.signal);
@@ -402,6 +676,7 @@ describe("bounded adapter streams", () => {
 
   it("settles operational adapter cancellation when a child never emits close", async () => {
     for (const { adapter } of adapters()) {
+      queueReadyCapabilityProbe(adapter.id);
       const { child, spawned } = queueNeverClosingChild();
       const abort = new AbortController();
       const planning = adapter.plan(planningRequest(), abort.signal);
@@ -512,6 +787,7 @@ describe("bounded adapter streams", () => {
       evidence: ["focused adapter evidence"],
     };
     for (const { adapter, structuredEvent } of adapters()) {
+      queueReadyCapabilityProbe(adapter.id);
       queueChild({ stdout: `${structuredEvent(JSON.stringify(result))}\n` });
       const events = await collectEvents(
         adapter.execute(workerRequest(), new AbortController().signal),
@@ -528,6 +804,7 @@ describe("bounded adapter streams", () => {
       evidence: ["fast structured result"],
     };
     for (const { adapter, structuredEvent } of adapters()) {
+      queueReadyCapabilityProbe(adapter.id);
       queueChild({ stdout: `${structuredEvent(JSON.stringify(result))}\n` });
       const iterator = adapter
         .execute(workerRequest(), new AbortController().signal)
