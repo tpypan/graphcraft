@@ -18733,7 +18733,36 @@ function date4(params) {
 // node_modules/.pnpm/zod@4.4.3/node_modules/zod/v4/classic/external.js
 config(en_default());
 
+// packages/core/src/canonical.ts
+import { createHash } from "node:crypto";
+var LEGACY_CANONICAL_HASH_ALGORITHM = "graphcraft-canonical-json-sha256-v1";
+var PORTABLE_CANONICAL_HASH_ALGORITHM = "graphcraft-canonical-json-sha256-v2";
+function compareCodeUnits(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+function sortValue(value, algorithm) {
+  if (Array.isArray(value)) return value.map((entry) => sortValue(entry, algorithm));
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).sort(
+        ([left], [right]) => algorithm === LEGACY_CANONICAL_HASH_ALGORITHM ? left.localeCompare(right) : compareCodeUnits(left, right)
+      ).map(([key, entry]) => [key, sortValue(entry, algorithm)])
+    );
+  }
+  return value;
+}
+function canonicalJson(value, algorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
+  return JSON.stringify(sortValue(value, algorithm));
+}
+function contentHash(value, algorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
+  return createHash("sha256").update(canonicalJson(value, algorithm)).digest("hex");
+}
+
 // packages/core/src/schemas.ts
+var CanonicalHashAlgorithmSchema = external_exports.enum([
+  LEGACY_CANONICAL_HASH_ALGORITHM,
+  PORTABLE_CANONICAL_HASH_ALGORITHM
+]);
 var FinishLineSchema = external_exports.discriminatedUnion("kind", [
   external_exports.strictObject({ kind: external_exports.literal("local_verified") }),
   external_exports.strictObject({ kind: external_exports.literal("committed") }),
@@ -18877,13 +18906,25 @@ var HeldOutProbeEntrySchema = external_exports.strictObject({
   source: external_exports.string().min(1),
   integrity: external_exports.array(HeldOutProbeIntegritySchema)
 });
-var HeldOutProbePlanSchema = external_exports.strictObject({
+var HeldOutProbePlanV1Schema = external_exports.strictObject({
   schemaVersion: external_exports.literal(1),
   runId: external_exports.uuid(),
   family: external_exports.enum(["bug", "feature", "migration", "refactor", "audit"]),
   probes: external_exports.array(HeldOutProbeEntrySchema).min(1),
   digest: external_exports.string().regex(/^[a-f0-9]{64}$/)
 });
+var HeldOutProbePlanV2Schema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(2),
+  hashAlgorithm: external_exports.literal(PORTABLE_CANONICAL_HASH_ALGORITHM),
+  runId: external_exports.uuid(),
+  family: external_exports.enum(["bug", "feature", "migration", "refactor", "audit"]),
+  probes: external_exports.array(HeldOutProbeEntrySchema).min(1),
+  digest: external_exports.string().regex(/^[a-f0-9]{64}$/)
+});
+var HeldOutProbePlanSchema = external_exports.discriminatedUnion("schemaVersion", [
+  HeldOutProbePlanV1Schema,
+  HeldOutProbePlanV2Schema
+]);
 var ProbeResultSchema = external_exports.strictObject({
   probeId: external_exports.string().min(1),
   kind: external_exports.enum(["command", "file", "git_diff", "repository_inventory", "github_snapshot"]),
@@ -19548,7 +19589,7 @@ var RunEventTypeSchema = external_exports.enum([
   "wait.timed_out",
   "graph.amended"
 ]);
-var RunEventSchema = external_exports.strictObject({
+var RunEventV1Schema = external_exports.strictObject({
   schemaVersion: external_exports.literal(1),
   sequence: external_exports.number().int().positive(),
   timestamp: external_exports.iso.datetime(),
@@ -19558,6 +19599,21 @@ var RunEventSchema = external_exports.strictObject({
   data: external_exports.record(external_exports.string(), external_exports.unknown()),
   hash: external_exports.string().regex(/^[a-f0-9]{64}$/)
 });
+var RunEventV2Schema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(2),
+  hashAlgorithm: external_exports.literal(PORTABLE_CANONICAL_HASH_ALGORITHM),
+  sequence: external_exports.number().int().positive(),
+  timestamp: external_exports.iso.datetime(),
+  actor: external_exports.enum(["user", "runtime", "worker", "probe", "host"]),
+  causationId: external_exports.string().min(1),
+  type: RunEventTypeSchema,
+  data: external_exports.record(external_exports.string(), external_exports.unknown()),
+  hash: external_exports.string().regex(/^[a-f0-9]{64}$/)
+});
+var RunEventSchema = external_exports.discriminatedUnion("schemaVersion", [
+  RunEventV1Schema,
+  RunEventV2Schema
+]);
 var NodeRuntimeStateSchema = external_exports.strictObject({
   status: NodeStatusSchema,
   attempts: external_exports.number().int().nonnegative(),
@@ -19697,8 +19753,7 @@ var ArtifactPolicySchema = external_exports.strictObject({
       message: "run reserve is smaller than the invocation recovery reserve"
     });
 });
-var ArtifactMutationJournalSchema = external_exports.strictObject({
-  schemaVersion: external_exports.literal(1),
+var ArtifactMutationJournalFields = {
   runId: external_exports.uuid(),
   mutationId: external_exports.uuid(),
   action: external_exports.enum(["write", "delete", "unchanged"]),
@@ -19708,7 +19763,18 @@ var ArtifactMutationJournalSchema = external_exports.strictObject({
   previousEntry: ArtifactInventoryEntrySchema.optional(),
   nextEntry: ArtifactInventoryEntrySchema,
   createdAt: external_exports.iso.datetime()
-}).superRefine((journal, context) => {
+};
+var ArtifactMutationJournalSchema = external_exports.union([
+  external_exports.strictObject({
+    schemaVersion: external_exports.literal(1),
+    ...ArtifactMutationJournalFields
+  }),
+  external_exports.strictObject({
+    schemaVersion: external_exports.literal(2),
+    hashAlgorithm: CanonicalHashAlgorithmSchema,
+    ...ArtifactMutationJournalFields
+  })
+]).superRefine((journal, context) => {
   if (artifactPathCanonicalKey(journal.path) === void 0)
     context.addIssue({
       code: "custom",
@@ -19799,7 +19865,11 @@ var ArtifactInventorySchema = external_exports.strictObject({
       message: "stored bytes exceed the persisted run quota"
     });
 });
-var RunStorageManifestSchema = external_exports.discriminatedUnion("schemaVersion", [
+var RunStorageFormatsV2Schema = RunStorageFormatsV1Schema.extend({
+  artifactInventory: external_exports.literal(1),
+  artifactPolicy: external_exports.literal(1)
+});
+var RunStorageManifestSchema = external_exports.union([
   external_exports.strictObject({
     schemaVersion: external_exports.literal(1),
     runId: external_exports.uuid(),
@@ -19810,9 +19880,18 @@ var RunStorageManifestSchema = external_exports.discriminatedUnion("schemaVersio
     schemaVersion: external_exports.literal(2),
     runId: external_exports.uuid(),
     migratedFrom: external_exports.union([external_exports.literal(0), external_exports.literal(1), external_exports.literal(2)]),
-    formats: RunStorageFormatsV1Schema.extend({
-      artifactInventory: external_exports.literal(1),
-      artifactPolicy: external_exports.literal(1)
+    formats: RunStorageFormatsV2Schema
+  }),
+  external_exports.strictObject({
+    schemaVersion: external_exports.literal(3),
+    runId: external_exports.uuid(),
+    migratedFrom: external_exports.union([external_exports.literal(0), external_exports.literal(1), external_exports.literal(2), external_exports.literal(3)]),
+    initialization: external_exports.enum(["initializing", "ready"]),
+    canonicalHashAlgorithm: CanonicalHashAlgorithmSchema,
+    formats: RunStorageFormatsV2Schema.extend({
+      heldOutProbes: external_exports.union([external_exports.literal(1), external_exports.literal(2)]),
+      events: external_exports.union([external_exports.literal(1), external_exports.literal(2)]),
+      artifactInventory: external_exports.union([external_exports.literal(1), external_exports.literal(2)])
     })
   })
 ]);
@@ -19894,24 +19973,6 @@ function reconcilePersistedInvocation(invocation) {
   if (result?.type === "result") return { state: "completed", result: result.result };
   if (invocation.hostSessionId) return { state: "in_progress" };
   return { state: "not_started" };
-}
-
-// packages/core/src/canonical.ts
-import { createHash } from "node:crypto";
-function sortValue(value) {
-  if (Array.isArray(value)) return value.map(sortValue);
-  if (value !== null && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).map(([key, entry]) => [key, sortValue(entry)])
-    );
-  }
-  return value;
-}
-function canonicalJson(value) {
-  return JSON.stringify(sortValue(value));
-}
-function contentHash(value) {
-  return createHash("sha256").update(canonicalJson(value)).digest("hex");
 }
 
 // packages/core/src/benchmark.ts
@@ -20875,9 +20936,8 @@ function createContextCapsule(input) {
 }
 
 // packages/core/src/events.ts
-function createRunEvent(input) {
-  const withoutHash = {
-    schemaVersion: 1,
+function createRunEvent(input, algorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
+  const common = {
     sequence: input.sequence,
     timestamp: input.timestamp ?? (/* @__PURE__ */ new Date()).toISOString(),
     actor: input.actor,
@@ -20885,12 +20945,18 @@ function createRunEvent(input) {
     type: input.type,
     data: input.data
   };
-  return RunEventSchema.parse({ ...withoutHash, hash: contentHash(withoutHash) });
+  const withoutHash = algorithm === PORTABLE_CANONICAL_HASH_ALGORITHM ? {
+    schemaVersion: 2,
+    hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+    ...common
+  } : { schemaVersion: 1, ...common };
+  return RunEventSchema.parse({ ...withoutHash, hash: contentHash(withoutHash, algorithm) });
 }
 function verifyRunEvent(event) {
   const parsed = RunEventSchema.parse(event);
   const { hash: hash2, ...withoutHash } = parsed;
-  if (contentHash(withoutHash) !== hash2)
+  const algorithm = parsed.schemaVersion === 1 ? LEGACY_CANONICAL_HASH_ALGORITHM : PORTABLE_CANONICAL_HASH_ALGORITHM;
+  if (contentHash(withoutHash, algorithm) !== hash2)
     throw new Error(`Invalid event hash at sequence ${event.sequence}`);
 }
 
@@ -21849,7 +21915,7 @@ function graphPlanShape(graph) {
 }
 
 // packages/core/src/held-out.ts
-function createHeldOutProbePlan(runId, input, integrity = {}) {
+function createHeldOutProbePlan(runId, input, integrity = {}, algorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
   const plan = ProbePlanSchema.parse(input);
   if (plan.items.some(({ probe }) => probe.kind === "held_out"))
     throw new Error("An approved probe plan cannot contain held-out references");
@@ -21857,26 +21923,39 @@ function createHeldOutProbePlan(runId, input, integrity = {}) {
     if (probe.kind === "held_out") throw new Error("Unreachable held-out probe reference");
     return {
       probe,
-      probeHash: contentHash(probe),
+      probeHash: contentHash(probe, algorithm),
       source,
       integrity: integrity[probe.id] ?? []
     };
   });
   if (probes.length === 0)
     throw new Error("Every finish line requires at least one executable held-out proof");
-  const value = { schemaVersion: 1, runId, family: plan.family, probes };
+  const value = algorithm === PORTABLE_CANONICAL_HASH_ALGORITHM ? {
+    schemaVersion: 2,
+    hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+    runId,
+    family: plan.family,
+    probes
+  } : { schemaVersion: 1, runId, family: plan.family, probes };
   return validateHeldOutProbePlan(
-    HeldOutProbePlanSchema.parse({ ...value, digest: contentHash(value) })
+    HeldOutProbePlanSchema.parse({ ...value, digest: contentHash(value, algorithm) }),
+    algorithm
   );
 }
-function validateHeldOutProbePlan(input) {
+function heldOutProbePlanHashAlgorithm(plan) {
+  return plan.schemaVersion === 1 ? LEGACY_CANONICAL_HASH_ALGORITHM : PORTABLE_CANONICAL_HASH_ALGORITHM;
+}
+function validateHeldOutProbePlan(input, expectedAlgorithm) {
   const plan = HeldOutProbePlanSchema.parse(input);
+  const algorithm = heldOutProbePlanHashAlgorithm(plan);
+  if (expectedAlgorithm && algorithm !== expectedAlgorithm)
+    throw new Error("Held-out completion plan format disagrees with its storage hash algorithm");
   const ids = /* @__PURE__ */ new Set();
   for (const entry of plan.probes) {
     if (ids.has(entry.probe.id))
       throw new Error(`Held-out completion probe ID ${entry.probe.id} is duplicated`);
     ids.add(entry.probe.id);
-    if (entry.probeHash !== contentHash(entry.probe))
+    if (entry.probeHash !== contentHash(entry.probe, algorithm))
       throw new Error(`Held-out completion probe ${entry.probe.id} failed its integrity hash`);
     for (const integrity of entry.integrity) {
       const normalized = integrity.path.replaceAll("\\", "/");
@@ -21886,13 +21965,14 @@ function validateHeldOutProbePlan(input) {
     }
   }
   const { digest: _digest, ...value } = plan;
-  if (plan.digest !== contentHash(value))
+  if (plan.digest !== contentHash(value, algorithm))
     throw new Error("Held-out completion plan failed its integrity hash");
   return plan;
 }
 function workerVisibleProbePlan(input, heldOutInput) {
   const probePlan = ProbePlanSchema.parse(input);
   const heldOut = validateHeldOutProbePlan(heldOutInput);
+  const algorithm = heldOutProbePlanHashAlgorithm(heldOut);
   if (probePlan.family !== heldOut.family)
     throw new Error("Held-out completion probes do not match the task family");
   const byId = new Map(heldOut.probes.map((entry) => [entry.probe.id, entry]));
@@ -21901,7 +21981,7 @@ function workerVisibleProbePlan(input, heldOutInput) {
     items: probePlan.items.map((item) => {
       if (item.phase !== "completion") return item;
       const entry = byId.get(item.probe.id);
-      if (!entry || entry.probeHash !== contentHash(item.probe))
+      if (!entry || entry.probeHash !== contentHash(item.probe, algorithm))
         throw new Error(`Completion probe ${item.probe.id} is not in the held-out plan`);
       return {
         ...item,
@@ -21918,6 +21998,7 @@ function workerVisibleProbePlan(input, heldOutInput) {
 }
 function resolveHeldOutProbes(input, heldOutInput) {
   const heldOut = validateHeldOutProbePlan(heldOutInput);
+  const algorithm = heldOutProbePlanHashAlgorithm(heldOut);
   if (input.length !== heldOut.probes.length)
     throw new Error("The graph omitted or added a held-out completion check");
   const resolved = input.map((probe) => {
@@ -21926,7 +22007,7 @@ function resolveHeldOutProbes(input, heldOutInput) {
     if (probe.kind === "held_out") {
       if (probe.planDigest !== heldOut.digest || probe.probeHash !== entry.probeHash)
         throw new Error(`Held-out completion reference ${probe.id} was substituted`);
-    } else if (contentHash(probe) !== entry.probeHash) {
+    } else if (contentHash(probe, algorithm) !== entry.probeHash) {
       throw new Error(`Completion check ${probe.id} was weakened or substituted`);
     }
     return entry.probe;
@@ -27304,8 +27385,11 @@ var RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3
 function now() {
   return (/* @__PURE__ */ new Date()).toISOString();
 }
-function bytesHash(bytes) {
-  return contentHash({ contents: Buffer.from(bytes).toString("base64") });
+function bytesHash(bytes, algorithm) {
+  return contentHash({ contents: Buffer.from(bytes).toString("base64") }, algorithm);
+}
+function compareStrings(left, right, algorithm) {
+  return algorithm === LEGACY_CANONICAL_HASH_ALGORITHM ? left.localeCompare(right) : left < right ? -1 : left > right ? 1 : 0;
 }
 function formatForPath(path2) {
   const extension = posix.extname(path2).toLowerCase();
@@ -27861,8 +27945,10 @@ function boundedRecoveryCheckpoint(checkpoint, limit) {
     throw new Error("Invocation recovery checkpoint cannot fit its reserved artifact capacity");
   return { source, stored };
 }
-function inventoryTotals(inventory, updatedAt = now()) {
-  const entries = [...inventory.entries].sort((left, right) => left.path.localeCompare(right.path));
+function inventoryTotals(inventory, algorithm, updatedAt = now()) {
+  const entries = [...inventory.entries].sort(
+    (left, right) => compareStrings(left.path, right.path, algorithm)
+  );
   return validateArtifactInventory({
     ...inventory,
     sourceBytes: entries.reduce((total, entry) => total + entry.sourceBytes, 0),
@@ -27884,7 +27970,7 @@ function emptyInventory(runId, policy) {
     updatedAt: now()
   });
 }
-function entryFor(path2, kind, format, source, stored, previous, reason, disposition) {
+function entryFor(path2, kind, format, source, stored, previous, algorithm, reason, disposition) {
   const timestamp = now();
   const hasStoredBytes = stored !== void 0;
   return {
@@ -27897,21 +27983,23 @@ function entryFor(path2, kind, format, source, stored, previous, reason, disposi
     omittedBytes: Math.max(0, source.length - (stored?.length ?? 0)),
     truncated: Boolean(hasStoredBytes && stored.length < source.length),
     legacy: false,
-    sourceHash: bytesHash(source),
-    ...hasStoredBytes ? { storedHash: bytesHash(stored) } : {},
+    sourceHash: bytesHash(source, algorithm),
+    ...hasStoredBytes ? { storedHash: bytesHash(stored, algorithm) } : {},
     ...reason ? { reason } : {},
     createdAt: previous?.createdAt ?? timestamp,
     updatedAt: timestamp
   };
 }
 var RunArtifactStore = class {
-  constructor(runRoot, runId, policy = DEFAULT_ARTIFACT_POLICY, publicationHook, parentSignal) {
+  constructor(runRoot, runId, hashAlgorithm, policy = DEFAULT_ARTIFACT_POLICY, publicationHook, parentSignal) {
     this.runRoot = runRoot;
     this.runId = runId;
+    this.hashAlgorithm = hashAlgorithm;
     this.policy = policy;
     this.publicationHook = publicationHook;
     this.parentSignal = parentSignal;
     if (!RUN_ID_PATTERN.test(runId)) throw new Error(`Invalid Graphcraft run ID: ${runId}`);
+    CanonicalHashAlgorithmSchema.parse(hashAlgorithm);
     ArtifactPolicySchema.parse(policy);
     if (policy.invocationReservedBytes >= policy.invocationTranscriptBytes)
       throw new Error("Invocation artifact reserve must be smaller than the transcript limit");
@@ -27925,6 +28013,7 @@ var RunArtifactStore = class {
   }
   runRoot;
   runId;
+  hashAlgorithm;
   policy;
   publicationHook;
   parentSignal;
@@ -27932,6 +28021,9 @@ var RunArtifactStore = class {
   mutationLockPath;
   tail = Promise.resolve();
   validatedFiles = /* @__PURE__ */ new Map();
+  hash(value) {
+    return contentHash(value, this.hashAlgorithm);
+  }
   async acquireMutationLock() {
     while (true) {
       if (this.parentSignal?.aborted) throw this.parentSignal.reason;
@@ -28079,6 +28171,11 @@ var RunArtifactStore = class {
     const journal = ArtifactMutationJournalSchema.parse(JSON.parse(source.toString("utf8")));
     if (journal.runId !== this.runId)
       throw new Error(`Artifact mutation journal belongs to ${journal.runId}, not ${this.runId}`);
+    const journalHashAlgorithm = journal.schemaVersion === 1 ? LEGACY_CANONICAL_HASH_ALGORITHM : journal.hashAlgorithm;
+    if (journalHashAlgorithm !== this.hashAlgorithm)
+      throw new Error(
+        `Artifact mutation journal hash policy ${journalHashAlgorithm} does not match run policy ${this.hashAlgorithm}`
+      );
     if (artifactPathCanonicalKey(journal.path) === void 0)
       throw new Error("Artifact mutation journal path is not portable");
     return journal;
@@ -28118,7 +28215,7 @@ var RunArtifactStore = class {
     );
     if (!contents) return void 0;
     if (!expectedSizes.has(contents.length)) return { bytes: contents.length };
-    return { bytes: contents.length, hash: bytesHash(contents) };
+    return { bytes: contents.length, hash: bytesHash(contents, this.hashAlgorithm) };
   }
   targetMatches(actual, entry) {
     const expected = this.expectedTarget(entry);
@@ -28158,7 +28255,7 @@ var RunArtifactStore = class {
     this.assertMutationAction(journal);
     const inventory = await this.rawInventory(lease);
     lease.assertHeld();
-    const inventoryHash = contentHash(inventory);
+    const inventoryHash = this.hash(inventory);
     const currentEntry = inventory.entries.find(({ path: path2 }) => path2 === journal.path);
     const currentIsPrevious = inventoryHash === journal.previousInventoryHash && isDeepStrictEqual(currentEntry, journal.previousEntry);
     const currentIsNext = inventoryHash === journal.nextInventoryHash && isDeepStrictEqual(currentEntry, journal.nextEntry);
@@ -28189,7 +28286,7 @@ var RunArtifactStore = class {
         `Artifact ${journal.path} changed after its mutation was journaled; recovery stopped without changing files`
       );
     const nextInventory = this.replaceEntry(inventory, journal.nextEntry, journal.createdAt);
-    if (contentHash(nextInventory) !== journal.nextInventoryHash)
+    if (this.hash(nextInventory) !== journal.nextInventoryHash)
       throw new Error(
         `Artifact mutation ${journal.mutationId} does not reproduce its next inventory snapshot; recovery stopped without changing files`
       );
@@ -28207,7 +28304,7 @@ var RunArtifactStore = class {
       lease.assertHeld();
       if (payload.length !== expected.bytes)
         throw new Error("Artifact mutation payload size does not match its journal");
-      if (bytesHash(payload) !== expected.hash)
+      if (bytesHash(payload, this.hashAlgorithm) !== expected.hash)
         throw new Error("Artifact mutation payload hash does not match its journal");
       await atomicWrite(this.runRoot, journal.path, payload, lease);
     } else if (journal.action === "delete" && !targetIsNext) {
@@ -28215,7 +28312,7 @@ var RunArtifactStore = class {
     }
     lease.assertHeld();
     await this.checkpointMutation(journal, "recovery", "after_target", lease);
-    if (contentHash(await this.rawInventory(lease)) !== journal.previousInventoryHash)
+    if (this.hash(await this.rawInventory(lease)) !== journal.previousInventoryHash)
       throw new Error(
         `Artifact mutation ${journal.mutationId} inventory changed during recovery; recovery stopped without changing inventory metadata`
       );
@@ -28227,7 +28324,7 @@ var RunArtifactStore = class {
       lease
     );
     await lease.observe(() => this.persistInventory(nextInventory, lease));
-    if (contentHash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
+    if (this.hash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
       throw new Error(
         `Artifact mutation ${journal.mutationId} inventory changed while it was recovered; recovery stopped without cleaning mutation evidence`
       );
@@ -28238,7 +28335,7 @@ var RunArtifactStore = class {
       `Artifact ${journal.path} changed while its inventory was recovered; recovery stopped without cleaning mutation evidence`,
       lease
     );
-    if (contentHash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
+    if (this.hash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
       throw new Error(
         `Artifact mutation ${journal.mutationId} inventory changed after it was recovered; recovery stopped without cleaning mutation evidence`
       );
@@ -28374,7 +28471,7 @@ var RunArtifactStore = class {
       lease.assertHeld();
       if (contents.length !== file2.bytes)
         throw new Error(`Artifact ${file2.path} changed while its legacy metadata was scanned`);
-      const storedHash = bytesHash(contents);
+      const storedHash = bytesHash(contents, this.hashAlgorithm);
       const previous = byPath.get(file2.path);
       if (previous) {
         if (previous.storedBytes === file2.bytes && previous.reason !== "missing_on_disk") {
@@ -28431,7 +28528,7 @@ var RunArtifactStore = class {
         updatedAt: now()
       });
     }
-    return inventoryTotals({ ...inventory, entries: [...byPath.values()] });
+    return inventoryTotals({ ...inventory, entries: [...byPath.values()] }, this.hashAlgorithm);
   }
   async reconcile(inventory) {
     const files = [...await this.scanFiles("artifacts"), ...await this.scanFiles("capsules")];
@@ -28451,7 +28548,10 @@ var RunArtifactStore = class {
       const fingerprint = `${file2.bytes}:${file2.modifiedMs}:${file2.changedMs}:${file2.inode}:${expected.hash}`;
       if (this.validatedFiles.get(file2.path) === fingerprint) continue;
       const absolute = join5(this.runRoot, ...validatePortableRelativePath(file2.path));
-      if (bytesHash(await readPrivateFileBounded(absolute, expected.bytes, this.runRoot)) !== expected.hash)
+      if (bytesHash(
+        await readPrivateFileBounded(absolute, expected.bytes, this.runRoot),
+        this.hashAlgorithm
+      ) !== expected.hash)
         throw new Error(
           `Artifact ${file2.path} hash does not match its durable inventory; no inventory metadata was changed`
         );
@@ -28471,6 +28571,7 @@ var RunArtifactStore = class {
         ...inventory,
         entries: [...inventory.entries.filter(({ path: path2 }) => path2 !== entry.path), entry]
       },
+      this.hashAlgorithm,
       updatedAt
     );
   }
@@ -28480,12 +28581,13 @@ var RunArtifactStore = class {
     const mutationTimestamp = now();
     const nextInventory = this.replaceEntry(input.inventory, input.entry, mutationTimestamp);
     const journal = ArtifactMutationJournalSchema.parse({
-      schemaVersion: 1,
+      schemaVersion: this.hashAlgorithm === LEGACY_CANONICAL_HASH_ALGORITHM ? 1 : 2,
+      ...this.hashAlgorithm === LEGACY_CANONICAL_HASH_ALGORITHM ? {} : { hashAlgorithm: this.hashAlgorithm },
       runId: this.runId,
       mutationId: randomUUID4(),
       action: input.action,
-      previousInventoryHash: contentHash(input.inventory),
-      nextInventoryHash: contentHash(nextInventory),
+      previousInventoryHash: this.hash(input.inventory),
+      nextInventoryHash: this.hash(nextInventory),
       path: input.entry.path,
       ...previousEntry ? { previousEntry } : {},
       nextEntry: input.entry,
@@ -28496,7 +28598,7 @@ var RunArtifactStore = class {
       const expected = this.expectedTarget(input.entry);
       if (!input.bytes || !expected || input.bytes.length !== expected.bytes)
         throw new Error("Artifact mutation bytes do not match the inventory entry size");
-      if (bytesHash(input.bytes) !== expected.hash)
+      if (bytesHash(input.bytes, this.hashAlgorithm) !== expected.hash)
         throw new Error("Artifact mutation bytes do not match the inventory entry hash");
       await atomicWrite(this.runRoot, MUTATION_PAYLOAD_PATH, input.bytes, lease);
     } else if (input.bytes) {
@@ -28511,7 +28613,7 @@ var RunArtifactStore = class {
       lease
     );
     await this.checkpointMutation(journal, "publication", "after_journal", lease);
-    if (contentHash(await this.rawInventory(lease)) !== journal.previousInventoryHash)
+    if (this.hash(await this.rawInventory(lease)) !== journal.previousInventoryHash)
       throw new Error(
         `Artifact ${input.entry.path} inventory changed while its mutation was being published; recovery stopped without changing files`
       );
@@ -28528,7 +28630,7 @@ var RunArtifactStore = class {
     else if (input.action === "delete")
       await removePrivateFile(this.runRoot, input.entry.path, lease);
     await this.checkpointMutation(journal, "publication", "after_target", lease);
-    if (contentHash(await this.rawInventory(lease)) !== journal.previousInventoryHash)
+    if (this.hash(await this.rawInventory(lease)) !== journal.previousInventoryHash)
       throw new Error(
         `Artifact ${input.entry.path} inventory changed before its mutation inventory was published; recovery stopped without changing files`
       );
@@ -28540,7 +28642,7 @@ var RunArtifactStore = class {
       lease
     );
     const persisted = await lease.observe(() => this.persistInventory(nextInventory, lease));
-    if (contentHash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
+    if (this.hash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
       throw new Error(
         `Artifact mutation ${journal.mutationId} inventory changed while it was published; recovery stopped without cleaning mutation evidence`
       );
@@ -28552,7 +28654,7 @@ var RunArtifactStore = class {
       lease
     );
     await this.checkpointMutation(journal, "publication", "after_inventory", lease);
-    if (contentHash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
+    if (this.hash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
       throw new Error(
         `Artifact mutation ${journal.mutationId} inventory changed after it was published; recovery stopped without cleaning mutation evidence`
       );
@@ -28563,7 +28665,7 @@ var RunArtifactStore = class {
       `Artifact ${input.entry.path} changed after its mutation inventory was published; recovery stopped without cleaning mutation evidence`,
       lease
     );
-    if (contentHash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
+    if (this.hash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
       throw new Error(
         `Artifact mutation ${journal.mutationId} inventory changed before mutation evidence cleanup; recovery stopped without cleaning mutation evidence`
       );
@@ -28588,7 +28690,16 @@ var RunArtifactStore = class {
       const limit = Math.min(inventory.policy.ordinaryArtifactBytes, runAvailable);
       const stored = truncateArtifact(source, format, limit);
       const reason = source.length <= limit ? void 0 : runAvailable < inventory.policy.ordinaryArtifactBytes ? "run_quota" : "artifact_limit";
-      const entry = entryFor(inventoryPath, "artifact", format, source, stored, previous, reason);
+      const entry = entryFor(
+        inventoryPath,
+        "artifact",
+        format,
+        source,
+        stored,
+        previous,
+        this.hashAlgorithm,
+        reason
+      );
       await lease.observe(
         () => this.publishEntryMutation(
           {
@@ -28634,6 +28745,7 @@ var RunArtifactStore = class {
           source,
           void 0,
           previous,
+          this.hashAlgorithm,
           reason,
           "rejected"
         );
@@ -28659,7 +28771,8 @@ var RunArtifactStore = class {
         formatForPath(input.relativePath),
         source,
         source,
-        previous
+        previous,
+        this.hashAlgorithm
       );
       await lease.observe(
         () => this.publishEntryMutation(
@@ -28733,6 +28846,7 @@ var RunArtifactStore = class {
           bounded.source,
           bounded.stored,
           previousEntry,
+          this.hashAlgorithm,
           bounded.source.length > bounded.stored.length ? "artifact_limit" : void 0
         );
         inventory = await lease.observe(
@@ -28781,7 +28895,7 @@ var RunArtifactStore = class {
         omittedBytes,
         truncated: omittedBytes > 0,
         legacy: false,
-        storedHash: bytesHash(stored),
+        storedHash: bytesHash(stored, this.hashAlgorithm),
         ...reason ? { reason } : {},
         createdAt: previous?.createdAt ?? timestamp,
         updatedAt: timestamp
@@ -32121,7 +32235,7 @@ import { constants as fsConstants4 } from "node:fs";
 import { lstat as lstat7, mkdir as mkdir4, open as open6, readdir as readdir3, rename as rename2, rm as rm3 } from "node:fs/promises";
 import { join as join9, relative as relative5, resolve as resolve8 } from "node:path";
 import { isDeepStrictEqual as isDeepStrictEqual2 } from "node:util";
-var CURRENT_RUN_STORAGE_VERSION = 2;
+var CURRENT_RUN_STORAGE_VERSION = 3;
 var BACKUP_COMPLETION_FILE = ".backup-complete.json";
 var ARTIFACT_INVENTORY_FILE = "artifact-inventory.json";
 var MIB5 = 1024 * 1024;
@@ -32141,17 +32255,19 @@ var LEGACY_MIGRATION_RESOURCE_LIMITS = Object.freeze({
   maximumFileCount: 4 * 1024,
   maximumEntryCount: 8 * 1024
 });
-function manifest(runId, migratedFrom) {
+function manifest(runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, initialization) {
   return RunStorageManifestSchema.parse({
     schemaVersion: CURRENT_RUN_STORAGE_VERSION,
     runId,
     migratedFrom,
+    initialization,
+    canonicalHashAlgorithm,
     formats: {
       contract: 1,
       graph: 1,
       probePlan: 1,
-      heldOutProbes: 1,
-      events: 1,
+      heldOutProbes: heldOutProbeFormat,
+      events: canonicalHashAlgorithm === PORTABLE_CANONICAL_HASH_ALGORITHM ? 2 : 1,
       state: 1,
       workspace: 1,
       capsules: 1,
@@ -32160,7 +32276,7 @@ function manifest(runId, migratedFrom) {
       rawArtifacts: 1,
       controlRequests: 1,
       locks: 1,
-      artifactInventory: 1,
+      artifactInventory: artifactInventoryFormat,
       artifactPolicy: 1
     }
   });
@@ -32175,8 +32291,15 @@ async function validateRunStorageRoot(input) {
   if (validated !== runRoot)
     throw new Error(`Run storage path escaped the Graphcraft state directory: ${input.runRoot}`);
 }
-async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom, lease) {
-  const value = manifest(runId, migratedFrom);
+async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, initialization, lease) {
+  const value = manifest(
+    runId,
+    migratedFrom,
+    canonicalHashAlgorithm,
+    heldOutProbeFormat,
+    artifactInventoryFormat,
+    initialization
+  );
   await migrationStep(lease, async () => await ensurePrivateDirectory(runRoot));
   const path2 = runStorageManifestPath(runRoot);
   await migrationStep(lease, async () => await writeJsonAtomic(path2, value));
@@ -32188,7 +32311,26 @@ async function writeCurrentRunStorageManifest(runRoot, runId, migratedFrom) {
     throw new Error(
       "Legacy storage manifests can only be published after verified backup migration"
     );
-  return await persistCurrentRunStorageManifest(runRoot, runId, migratedFrom);
+  return await persistCurrentRunStorageManifest(
+    runRoot,
+    runId,
+    migratedFrom,
+    PORTABLE_CANONICAL_HASH_ALGORITHM,
+    2,
+    2,
+    "ready"
+  );
+}
+async function writeInitializingRunStorageManifest(runRoot, runId) {
+  return await persistCurrentRunStorageManifest(
+    runRoot,
+    runId,
+    CURRENT_RUN_STORAGE_VERSION,
+    PORTABLE_CANONICAL_HASH_ALGORITHM,
+    2,
+    2,
+    "initializing"
+  );
 }
 async function readRawManifest(runRoot, runId) {
   try {
@@ -32214,7 +32356,7 @@ async function inspectStorage(runRoot, runId) {
     throw new Error(
       `Run ${runId} uses future storage schema ${version2}; this Graphcraft supports through ${CURRENT_RUN_STORAGE_VERSION}. No files were changed.`
     );
-  if (version2 !== 1 && version2 !== CURRENT_RUN_STORAGE_VERSION)
+  if (version2 !== 1 && version2 !== 2 && version2 !== CURRENT_RUN_STORAGE_VERSION)
     throw new Error(
       `Run ${runId} uses unsupported storage schema ${String(version2)}; no migration path is available. No files were changed.`
     );
@@ -32230,7 +32372,7 @@ async function inspectStorage(runRoot, runId) {
     throw new Error(
       `Run storage manifest belongs to ${parsed.runId}, not ${runId}. No files were changed.`
     );
-  if (parsed.schemaVersion !== CURRENT_RUN_STORAGE_VERSION) return { version: 1 };
+  if (parsed.schemaVersion === 1) return { version: 1 };
   try {
     await validatePrivatePath(runRoot, ARTIFACT_INVENTORY_FILE);
     const inventory = await readBoundedArtifactInventory(join9(runRoot, ARTIFACT_INVENTORY_FILE));
@@ -32238,10 +32380,15 @@ async function inspectStorage(runRoot, runId) {
       throw new Error(`artifact inventory belongs to ${inventory.runId}`);
   } catch (error51) {
     throw new Error(
-      `Run ${runId} has an invalid schema-v2 artifact inventory: ${error51 instanceof Error ? error51.message : String(error51)}. No files were changed.`
+      `Run ${runId} has an invalid schema-v${parsed.schemaVersion} artifact inventory: ${error51 instanceof Error ? error51.message : String(error51)}. No files were changed.`
     );
   }
-  return { version: 2, manifest: parsed };
+  if (parsed.schemaVersion === 2) return { version: 2 };
+  if (parsed.canonicalHashAlgorithm === LEGACY_CANONICAL_HASH_ALGORITHM && parsed.formats.events !== 1 || parsed.canonicalHashAlgorithm === PORTABLE_CANONICAL_HASH_ALGORITHM && parsed.formats.events !== 2)
+    throw new Error(
+      `Run ${runId} has a storage hash algorithm that disagrees with its event format. No files were changed.`
+    );
+  return { version: 3, manifest: parsed };
 }
 function isActiveLockError(error51) {
   return error51 instanceof Error && error51.message.includes("already active");
@@ -32347,7 +32494,8 @@ async function acquireMigrationLock(input) {
   while (true) {
     await validateRunStorageRoot(input);
     const storage = await inspectStorage(input.runRoot, input.runId);
-    if (storage.version === CURRENT_RUN_STORAGE_VERSION) return { manifest: storage.manifest };
+    if (storage.version === CURRENT_RUN_STORAGE_VERSION && storage.manifest.initialization === "ready")
+      return { manifest: storage.manifest };
     const lock = new RunLock(lockPath);
     try {
       await lock.acquire();
@@ -33153,6 +33301,109 @@ async function validateLegacyRun(runRoot, runId, lease) {
       );
     }
   });
+  await migrationStep(lease, async () => {
+    let source;
+    try {
+      source = (await readPrivateFileBounded(
+        join9(runRoot, "events.jsonl"),
+        LEGACY_MIGRATION_DESTINATION_LIMITS.maximumEventLogBytes,
+        runRoot
+      )).toString("utf8");
+    } catch (error51) {
+      throw new Error(
+        `Legacy run ${runId} event format could not be inspected safely: ${error51 instanceof Error ? error51.message : String(error51)}. No files were changed.`
+      );
+    }
+    for (const line2 of source.split("\n")) {
+      if (line2.length === 0) continue;
+      let value;
+      try {
+        value = JSON.parse(line2);
+      } catch {
+        continue;
+      }
+      if (typeof value === "object" && value !== null && value.schemaVersion === 2)
+        throw new Error(
+          `Run ${runId} contains schema-v2 events without an intact schema-v3 storage manifest. No files were changed.`
+        );
+    }
+  });
+}
+async function validateInitializingRunStorage(runRoot, runId, manifest2, lease) {
+  for (const relativePath of [
+    "contract.json",
+    "graph.json",
+    "probe-plan.json",
+    "held-out-probes.json",
+    "events.jsonl"
+  ])
+    await migrationStep(lease, async () => {
+      try {
+        await validatePrivatePath(runRoot, relativePath);
+      } catch {
+        throw new Error(
+          `Run ${runId} has an incomplete schema-v3 initialization before its first durable event. No files were changed.`
+        );
+      }
+    });
+  let source;
+  try {
+    source = await migrationStep(
+      lease,
+      async () => await readPrivateFileBounded(
+        join9(runRoot, "events.jsonl"),
+        LEGACY_MIGRATION_DESTINATION_LIMITS.maximumEventLogBytes,
+        runRoot
+      )
+    );
+  } catch {
+    throw new Error(
+      `Run ${runId} has an incomplete schema-v3 initialization before its first durable event. No files were changed.`
+    );
+  }
+  let decoded;
+  try {
+    decoded = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(source);
+  } catch {
+    throw new Error(
+      `Run ${runId} has an invalid event log during schema-v3 initialization. No files were changed.`
+    );
+  }
+  const events = [];
+  for (const line2 of decoded.split("\n")) {
+    if (line2.length === 0) continue;
+    let event;
+    try {
+      event = RunEventSchema.parse(JSON.parse(line2));
+      verifyRunEvent(event);
+    } catch {
+      throw new Error(
+        `Run ${runId} has an invalid event log during schema-v3 initialization. No files were changed.`
+      );
+    }
+    const expectedEventSchemaVersion = manifest2.canonicalHashAlgorithm === PORTABLE_CANONICAL_HASH_ALGORITHM ? 2 : 1;
+    if (event.schemaVersion !== expectedEventSchemaVersion || event.sequence !== events.length + 1)
+      throw new Error(
+        `Run ${runId} has an event format that disagrees with its schema-v3 initialization descriptor. No files were changed.`
+      );
+    events.push(event);
+  }
+  const first = events[0];
+  const contract = first?.data.contract;
+  if (first?.type !== "run.created" || first.sequence !== 1 || typeof contract !== "object" || contract === null || contract.runId !== runId)
+    throw new Error(
+      `Run ${runId} has an incomplete schema-v3 initialization before its first durable event. No files were changed.`
+    );
+  try {
+    validateHeldOutProbePlan(
+      HeldOutProbePlanSchema.parse(first.data.heldOutProbePlan),
+      manifest2.formats.heldOutProbes === 2 ? PORTABLE_CANONICAL_HASH_ALGORITHM : LEGACY_CANONICAL_HASH_ALGORITHM
+    );
+  } catch {
+    throw new Error(
+      `Run ${runId} has a held-out plan format that disagrees with its schema-v3 initialization descriptor. No files were changed.`
+    );
+  }
 }
 async function assertMigratedInventoryCurrent(artifactStore, expected, lease) {
   const current = await migrationStep(lease, async () => await artifactStore.inventory());
@@ -33164,8 +33415,10 @@ async function assertMigratedInventoryCurrent(artifactStore, expected, lease) {
 async function ensureCurrentRunStorage(input) {
   await validateRunStorageRoot(input);
   const initial = await inspectStorage(input.runRoot, input.runId);
-  if (initial.version === CURRENT_RUN_STORAGE_VERSION) return initial.manifest;
-  await validateLegacyRun(input.runRoot, input.runId);
+  if (initial.version === CURRENT_RUN_STORAGE_VERSION && initial.manifest.initialization === "ready")
+    return initial.manifest;
+  if (initial.version !== CURRENT_RUN_STORAGE_VERSION)
+    await validateLegacyRun(input.runRoot, input.runId);
   const acquisition = await acquireMigrationLock(input);
   if (acquisition.manifest) return acquisition.manifest;
   const migrationLock = acquisition.lock;
@@ -33184,7 +33437,20 @@ async function ensureCurrentRunStorage(input) {
       lease,
       async () => await inspectStorage(input.runRoot, input.runId)
     );
-    if (storage.version === CURRENT_RUN_STORAGE_VERSION) return storage.manifest;
+    if (storage.version === CURRENT_RUN_STORAGE_VERSION) {
+      if (storage.manifest.initialization === "ready") return storage.manifest;
+      await validateInitializingRunStorage(input.runRoot, input.runId, storage.manifest, lease);
+      return await persistCurrentRunStorageManifest(
+        input.runRoot,
+        input.runId,
+        storage.manifest.migratedFrom,
+        storage.manifest.canonicalHashAlgorithm,
+        storage.manifest.formats.heldOutProbes,
+        storage.manifest.formats.artifactInventory,
+        "ready",
+        lease
+      );
+    }
     await validateLegacyRun(input.runRoot, input.runId, lease);
     const sourceSnapshot = await assertLegacyTreeRedactionSafe(input.runRoot, lease);
     if (input.onBoundary)
@@ -33201,13 +33467,14 @@ async function ensureCurrentRunStorage(input) {
     const artifactStore = new RunArtifactStore(
       input.runRoot,
       input.runId,
+      LEGACY_CANONICAL_HASH_ALGORITHM,
       DEFAULT_ARTIFACT_POLICY,
       void 0,
       lease.signal
     );
     const migratedInventory = await migrationStep(
       lease,
-      async () => await artifactStore.migrateLegacy()
+      async () => storage.version === 2 ? await artifactStore.inventory() : await artifactStore.migrateLegacy()
     );
     await assertMigratedInventoryCurrent(artifactStore, migratedInventory, lease);
     await migrationStep(
@@ -33231,6 +33498,10 @@ async function ensureCurrentRunStorage(input) {
       input.runRoot,
       input.runId,
       storage.version,
+      LEGACY_CANONICAL_HASH_ALGORITHM,
+      1,
+      1,
+      "ready",
       lease
     );
   } catch (error51) {
@@ -33277,7 +33548,7 @@ var RunStoreLimitError = class extends Error {
 var RunStoreEventLogCorruptionError = class extends Error {
   constructor(record2, offsetBytes, trailing, reason) {
     const location = trailing ? "trailing record" : `record ${record2}`;
-    const problem = reason === "encoding" ? "invalid UTF-8" : reason === "json" ? "invalid JSON" : reason === "schema" ? "an invalid event schema" : reason === "hash" ? "an invalid event hash" : "an invalid event sequence";
+    const problem = reason === "encoding" ? "invalid UTF-8" : reason === "json" ? "invalid JSON" : reason === "schema" ? "an invalid event schema" : reason === "hash" ? "an invalid event hash" : reason === "format" ? "an event format that disagrees with its storage manifest" : "an invalid event sequence";
     super(
       `Run event log has ${problem} in ${location} at byte ${offsetBytes}; event log bytes were left unchanged`
     );
@@ -33329,11 +33600,11 @@ function sameFileIdentity(left, right) {
   if (left.ino !== 0n && right.ino !== 0n) return left.dev === right.dev && left.ino === right.ino;
   return left.dev === right.dev && left.birthtimeNs === right.birthtimeNs;
 }
-function optionalHeldOutProbePlan(value) {
+function optionalHeldOutProbePlan(value, algorithm) {
   const parsed = HeldOutProbePlanSchema.safeParse(value);
   if (!parsed.success) return void 0;
   try {
-    return validateHeldOutProbePlan(parsed.data);
+    return validateHeldOutProbePlan(parsed.data, algorithm);
   } catch {
     return void 0;
   }
@@ -33348,19 +33619,28 @@ var RunStore = class _RunStore {
   appendTail = Promise.resolve();
   initializing = false;
   storageReady;
-  constructor(repositoryRoot, runId, limits = {}) {
+  _canonicalHashAlgorithm;
+  _heldOutProbePlanHashAlgorithm;
+  _artifactHashAlgorithm;
+  constructor(repositoryRoot, runId, limits = {}, canonicalHashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
     this.repositoryRoot = repositoryRoot;
     this.runId = runId;
     this.graphcraftRoot = join10(repositoryRoot, ".graphcraft");
     this.runRoot = join10(this.graphcraftRoot, "runs", runId);
     this.limits = normalizeLimits(limits);
-    this.artifactStore = new RunArtifactStore(this.runRoot, runId);
-    const blocker = this.createPersistenceLimitBlocker(1, "event_log");
-    const blockerBytes = Buffer.byteLength(serializedEvent(blocker));
-    if (blockerBytes > this.limits.maxEventBytes)
-      throw new Error("RunStore per-event limit cannot fit its durable blocked event");
-    if (blockerBytes > this.limits.blockedEventReserveBytes)
-      throw new Error("RunStore blocked-event reserve cannot fit its durable blocked event");
+    this._canonicalHashAlgorithm = canonicalHashAlgorithm;
+    this._heldOutProbePlanHashAlgorithm = canonicalHashAlgorithm;
+    for (const algorithm of [
+      LEGACY_CANONICAL_HASH_ALGORITHM,
+      PORTABLE_CANONICAL_HASH_ALGORITHM
+    ]) {
+      const blocker = this.createPersistenceLimitBlocker(1, "event_log", algorithm);
+      const blockerBytes = Buffer.byteLength(serializedEvent(blocker));
+      if (blockerBytes > this.limits.maxEventBytes)
+        throw new Error("RunStore per-event limit cannot fit its durable blocked event");
+      if (blockerBytes > this.limits.blockedEventReserveBytes)
+        throw new Error("RunStore blocked-event reserve cannot fit its durable blocked event");
+    }
   }
   async validateStorageRoot() {
     const graphcraftRoot2 = resolve9(this.graphcraftRoot);
@@ -33378,7 +33658,13 @@ var RunStore = class _RunStore {
       runId: this.runId
     });
     try {
-      await ready;
+      const manifest2 = await ready;
+      if (manifest2.schemaVersion !== 3)
+        throw new Error("Run storage preparation did not return the current schema");
+      this._canonicalHashAlgorithm = manifest2.canonicalHashAlgorithm;
+      this._heldOutProbePlanHashAlgorithm = manifest2.formats.heldOutProbes === 2 ? PORTABLE_CANONICAL_HASH_ALGORITHM : LEGACY_CANONICAL_HASH_ALGORITHM;
+      const artifactHashAlgorithm = manifest2.formats.artifactInventory === 2 ? PORTABLE_CANONICAL_HASH_ALGORITHM : LEGACY_CANONICAL_HASH_ALGORITHM;
+      this.bindArtifactHashAlgorithm(artifactHashAlgorithm);
       await this.validateStorageRoot();
     } catch (error51) {
       if (this.storageReady === ready) this.storageReady = void 0;
@@ -33387,6 +33673,35 @@ var RunStore = class _RunStore {
   }
   async ensureStorage() {
     await this.prepareStorage();
+  }
+  get canonicalHashAlgorithm() {
+    return this._canonicalHashAlgorithm;
+  }
+  get heldOutProbePlanHashAlgorithm() {
+    return this._heldOutProbePlanHashAlgorithm;
+  }
+  get artifactHashAlgorithm() {
+    if (!this._artifactHashAlgorithm)
+      throw new Error("Artifact hash policy is unavailable before run storage is prepared");
+    return this._artifactHashAlgorithm;
+  }
+  bindArtifactHashAlgorithm(algorithm) {
+    if (this.artifactStore && this.artifactStore.hashAlgorithm !== algorithm)
+      throw new Error("Artifact store was bound before its storage manifest policy was known");
+    this._artifactHashAlgorithm = algorithm;
+  }
+  artifacts() {
+    return this.artifactStore ??= new RunArtifactStore(
+      this.runRoot,
+      this.runId,
+      this.artifactHashAlgorithm
+    );
+  }
+  contentHash(value) {
+    return contentHash(value, this._canonicalHashAlgorithm);
+  }
+  artifactContentHash(value) {
+    return contentHash(value, this.artifactHashAlgorithm);
   }
   assertJsonProjectionFits(value, maximumBytes, label) {
     const bytes = serializedJsonBytes(value);
@@ -33429,35 +33744,23 @@ var RunStore = class _RunStore {
     }
   }
   static async create(repositoryRoot, contract, graph, inputProbePlan, inputHeldOutProbePlan, limits = {}) {
-    const store = new _RunStore(repositoryRoot, contract.runId, limits);
+    const store = new _RunStore(
+      repositoryRoot,
+      contract.runId,
+      limits,
+      PORTABLE_CANONICAL_HASH_ALGORITHM
+    );
     store.initializing = true;
+    store.bindArtifactHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     const persistedContract = RunContractSchema.parse(redactValue(contract));
     const persistedGraph = GraphSchema.parse(redactValue(graph));
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
-    const heldOutProbePlan = inputHeldOutProbePlan ? validateHeldOutProbePlan(inputHeldOutProbePlan) : createHeldOutProbePlan(contract.runId, probePlan);
+    const heldOutProbePlan = inputHeldOutProbePlan ? validateHeldOutProbePlan(inputHeldOutProbePlan, store.heldOutProbePlanHashAlgorithm) : createHeldOutProbePlan(contract.runId, probePlan, {}, store.heldOutProbePlanHashAlgorithm);
     assertPersistenceSafe(probePlan, "Probe plan");
     assertPersistenceSafe(heldOutProbePlan, "Held-out probe plan");
-    const event = createRunEvent({
-      sequence: 1,
-      actor: "runtime",
-      causationId: contract.runId,
-      type: "run.created",
-      data: {
-        contract: persistedContract,
-        graph: persistedGraph,
-        probePlan,
-        heldOutProbePlan,
-        nodeIds: graph.nodes.map(({ id }) => id)
-      }
-    });
-    const eventLine = serializedEvent(event);
-    store.assertNormalEventCapacity(0, eventLine);
-    const state = RunStateSchema.parse(reduceEvents([event]));
-    store.assertNormalStateCapacity(state, event.sequence + 1);
     store.assertJsonProjectionFits(persistedContract, RUN_METADATA_MAX_BYTES, "Run contract");
     store.assertJsonProjectionFits(persistedGraph, RUN_METADATA_MAX_BYTES, "Run graph");
     store.assertJsonProjectionFits(probePlan, RUN_METADATA_MAX_BYTES, "Probe plan");
-    store.assertJsonProjectionFits(heldOutProbePlan, RUN_METADATA_MAX_BYTES, "Held-out probe plan");
     await ensurePrivateDirectory(store.graphcraftRoot);
     await Promise.all([
       ensurePrivateDirectory(join10(store.graphcraftRoot, "runs")),
@@ -33469,7 +33772,29 @@ var RunStore = class _RunStore {
       ensurePrivateDirectory(join10(store.runRoot, "capsules")),
       ensurePrivateDirectory(join10(store.runRoot, "reports"))
     ]);
-    await store.artifactStore.initialize();
+    await store.artifacts().initialize();
+    await writeInitializingRunStorageManifest(store.runRoot, store.runId);
+    const event = createRunEvent(
+      {
+        sequence: 1,
+        actor: "runtime",
+        causationId: contract.runId,
+        type: "run.created",
+        data: {
+          contract: persistedContract,
+          graph: persistedGraph,
+          probePlan,
+          heldOutProbePlan,
+          nodeIds: graph.nodes.map(({ id }) => id)
+        }
+      },
+      store.canonicalHashAlgorithm
+    );
+    const eventLine = serializedEvent(event);
+    store.assertNormalEventCapacity(0, eventLine);
+    const state = RunStateSchema.parse(reduceEvents([event]));
+    store.assertNormalStateCapacity(state, event.sequence + 1);
+    store.assertJsonProjectionFits(heldOutProbePlan, RUN_METADATA_MAX_BYTES, "Held-out probe plan");
     await Promise.all([
       store.saveContract(persistedContract),
       store.saveGraph(persistedGraph),
@@ -33478,24 +33803,27 @@ var RunStore = class _RunStore {
     ]);
     await store.appendEventLine(eventLine, 0);
     await store.writeMaterializedState(state);
-    await writeCurrentRunStorageManifest(store.runRoot, store.runId, 2);
+    await writeCurrentRunStorageManifest(store.runRoot, store.runId, 3);
     store.initializing = false;
     return store;
   }
   eventsPath() {
     return join10(this.runRoot, "events.jsonl");
   }
-  createPersistenceLimitBlocker(sequence, kind) {
-    return createRunEvent({
-      sequence,
-      actor: "runtime",
-      causationId: this.runId,
-      type: "run.blocked",
-      data: {
-        reason: PERSISTENCE_LIMIT_BLOCK_REASON,
-        persistenceLimit: kind
-      }
-    });
+  createPersistenceLimitBlocker(sequence, kind, algorithm = this.canonicalHashAlgorithm) {
+    return createRunEvent(
+      {
+        sequence,
+        actor: "runtime",
+        causationId: this.runId,
+        type: "run.blocked",
+        data: {
+          reason: PERSISTENCE_LIMIT_BLOCK_REASON,
+          persistenceLimit: kind
+        }
+      },
+      algorithm
+    );
   }
   persistenceBlockedState(state, blocker) {
     const { progressDecision: _progressDecision, ...rest } = state;
@@ -33667,7 +33995,7 @@ var RunStore = class _RunStore {
     assertPersistenceSafe(heldOutProbePlan, "Held-out probe plan");
     await this.writeBoundedJson(
       "held-out-probes.json",
-      validateHeldOutProbePlan(heldOutProbePlan),
+      validateHeldOutProbePlan(heldOutProbePlan, this.heldOutProbePlanHashAlgorithm),
       RUN_METADATA_MAX_BYTES,
       "Held-out probe plan",
       "reconstructable_projection"
@@ -33680,17 +34008,27 @@ var RunStore = class _RunStore {
       (event) => (event.type === "run.created" || event.type === "graph.amended") && event.data.heldOutProbePlan
     )?.data.heldOutProbePlan;
     if (eventPlan) {
-      const heldOutProbePlan = validateHeldOutProbePlan(HeldOutProbePlanSchema.parse(eventPlan));
+      const heldOutProbePlan = validateHeldOutProbePlan(
+        HeldOutProbePlanSchema.parse(eventPlan),
+        this.heldOutProbePlanHashAlgorithm
+      );
       const materialized = optionalHeldOutProbePlan(
-        await this.readOptionalBoundedJson("held-out-probes.json", RUN_METADATA_MAX_BYTES)
+        await this.readOptionalBoundedJson("held-out-probes.json", RUN_METADATA_MAX_BYTES),
+        this.heldOutProbePlanHashAlgorithm
       );
       if (JSON.stringify(materialized) !== JSON.stringify(heldOutProbePlan))
         await this.saveHeldOutProbePlan(heldOutProbePlan);
       return heldOutProbePlan;
     }
     return optionalHeldOutProbePlan(
-      await this.readOptionalBoundedJson("held-out-probes.json", RUN_METADATA_MAX_BYTES)
-    ) ?? createHeldOutProbePlan(this.runId, await this.loadProbePlan());
+      await this.readOptionalBoundedJson("held-out-probes.json", RUN_METADATA_MAX_BYTES),
+      this.heldOutProbePlanHashAlgorithm
+    ) ?? createHeldOutProbePlan(
+      this.runId,
+      await this.loadProbePlan(),
+      {},
+      this.heldOutProbePlanHashAlgorithm
+    );
   }
   async loadEventLog() {
     await this.ensureStorage();
@@ -33757,6 +34095,9 @@ var RunStore = class _RunStore {
         throw new RunStoreEventLogCorruptionError(record2, offset, trailing, "hash");
       }
       const event = parsed.data;
+      const expectedEventSchemaVersion = this.canonicalHashAlgorithm === PORTABLE_CANONICAL_HASH_ALGORITHM ? 2 : 1;
+      if (event.schemaVersion !== expectedEventSchemaVersion)
+        throw new RunStoreEventLogCorruptionError(record2, offset, trailing, "format");
       if (event.sequence !== record2)
         throw new RunStoreEventLogCorruptionError(record2, offset, trailing, "sequence");
       events.push(event);
@@ -33796,7 +34137,7 @@ var RunStore = class _RunStore {
         if (!(error51 instanceof SyntaxError)) throw error51;
       }
     }
-    if (!materialized || contentHash(materialized) !== contentHash(authoritative))
+    if (!materialized || this.contentHash(materialized) !== this.contentHash(authoritative))
       await this.writeMaterializedState(authoritative);
     return authoritative;
   }
@@ -33812,13 +34153,16 @@ var RunStore = class _RunStore {
         error51.blockerPersisted = true;
         throw error51;
       }
-      const event = createRunEvent({
-        sequence: events.length + 1,
-        actor,
-        causationId,
-        type,
-        data: redactValue(data)
-      });
+      const event = createRunEvent(
+        {
+          sequence: events.length + 1,
+          actor,
+          causationId,
+          type,
+          data: redactValue(data)
+        },
+        this.canonicalHashAlgorithm
+      );
       const eventLine = serializedEvent(event);
       let state;
       try {
@@ -33867,14 +34211,18 @@ var RunStore = class _RunStore {
     const createdGraph = GraphSchema.parse(events[0]?.data.graph);
     let graph = createdGraph;
     let probePlan = events[0]?.data.probePlan ? ProbePlanSchema.parse(events[0].data.probePlan) : probePlanFromGraph(createdGraph);
-    let heldOutProbePlan = events[0]?.data.heldOutProbePlan ? validateHeldOutProbePlan(HeldOutProbePlanSchema.parse(events[0].data.heldOutProbePlan)) : createHeldOutProbePlan(this.runId, probePlan);
+    let heldOutProbePlan = events[0]?.data.heldOutProbePlan ? validateHeldOutProbePlan(
+      HeldOutProbePlanSchema.parse(events[0].data.heldOutProbePlan),
+      this.heldOutProbePlanHashAlgorithm
+    ) : createHeldOutProbePlan(this.runId, probePlan, {}, this.heldOutProbePlanHashAlgorithm);
     for (const event of events) {
       if (event.type === "graph.amended" && event.data.graph) {
         graph = GraphSchema.parse(event.data.graph);
         if (event.data.probePlan) probePlan = ProbePlanSchema.parse(event.data.probePlan);
         if (event.data.heldOutProbePlan)
           heldOutProbePlan = validateHeldOutProbePlan(
-            HeldOutProbePlanSchema.parse(event.data.heldOutProbePlan)
+            HeldOutProbePlanSchema.parse(event.data.heldOutProbePlan),
+            this.heldOutProbePlanHashAlgorithm
           );
       }
     }
@@ -33887,15 +34235,15 @@ var RunStore = class _RunStore {
   }
   async writeArtifact(relativePath, value) {
     await this.ensureStorage();
-    return (await this.artifactStore.writeArtifact(relativePath, value)).path;
+    return (await this.artifacts().writeArtifact(relativePath, value)).path;
   }
   async appendInvocationEvent(invocationId, event) {
     await this.ensureStorage();
-    return (await this.artifactStore.appendInvocationEvent(invocationId, event)).path;
+    return (await this.artifacts().appendInvocationEvent(invocationId, event)).path;
   }
   async loadInvocationEvents(invocationId) {
     await this.ensureStorage();
-    return await this.artifactStore.loadInvocationEvents(invocationId);
+    return await this.artifacts().loadInvocationEvents(invocationId);
   }
   async loadGraphHistory() {
     await this.ensureStorage();
@@ -33944,9 +34292,9 @@ var RunStore = class _RunStore {
   async writeCapsule(hash2, value) {
     await this.ensureStorage();
     const persistedValue = redactValue(value);
-    if (contentHash(persistedValue) !== hash2)
+    if (this.artifactContentHash(persistedValue) !== hash2)
       throw new Error("Context capsule must be redacted before content addressing");
-    const result = await this.artifactStore.writeIdentityArtifact({
+    const result = await this.artifacts().writeIdentityArtifact({
       relativePath: `capsules/${hash2}.json`,
       value: `${JSON.stringify(persistedValue, null, 2)}
 `,
@@ -33959,8 +34307,8 @@ var RunStore = class _RunStore {
     if (!/^[a-z0-9][a-z0-9-]*$/.test(category) || !/^[a-z0-9]+$/.test(extension))
       throw new Error("Content-addressed artifact category or extension is invalid");
     const bytes = redactTextBytes(value);
-    const hash2 = contentHash({ contents: bytes.toString("base64") });
-    const result = await this.artifactStore.writeIdentityArtifact({
+    const hash2 = this.artifactContentHash({ contents: bytes.toString("base64") });
+    const result = await this.artifacts().writeIdentityArtifact({
       relativePath: `artifacts/${category}/${hash2}.${extension}`,
       value: bytes,
       kind: "content_addressed"
@@ -33969,11 +34317,11 @@ var RunStore = class _RunStore {
   }
   async loadArtifactInventory() {
     await this.ensureStorage();
-    return ArtifactInventorySchema.parse(await this.artifactStore.inventory());
+    return ArtifactInventorySchema.parse(await this.artifacts().inventory());
   }
   async readArtifactPreview(relativePath, maxBytes) {
     await this.ensureStorage();
-    return await this.artifactStore.readArtifactPreview(`artifacts/${relativePath}`, maxBytes);
+    return await this.artifacts().readArtifactPreview(`artifacts/${relativePath}`, maxBytes);
   }
   async writeWorkspace(value) {
     await this.ensureStorage();
@@ -34311,7 +34659,7 @@ function contextTerms(objective) {
     )
   ].slice(0, 12);
 }
-function groundedRelevantPaths(paths, objective) {
+function groundedRelevantPaths(paths, objective, algorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
   const terms = contextTerms(objective);
   return [...new Set(paths)].filter(
     (path2) => path2.length > 0 && !path2.startsWith("dist/") && !path2.endsWith(".map") && !path2.endsWith(".lock")
@@ -34321,7 +34669,9 @@ function groundedRelevantPaths(paths, objective) {
     const source = /(?:^|\/)(?:src|test|tests)\//.test(path2) ? 2 : 0;
     const policy = /(?:^|\/)(?:agents\.md|package\.json|pyproject\.toml|go\.mod)$/i.test(path2) ? 1 : 0;
     return { path: path2, score: affinity * 4 + source + policy };
-  }).sort((left, right) => right.score - left.score || left.path.localeCompare(right.path)).slice(0, 4).map(({ path: path2 }) => path2);
+  }).sort(
+    (left, right) => right.score - left.score || (algorithm === LEGACY_CANONICAL_HASH_ALGORITHM ? left.path.localeCompare(right.path) : left.path < right.path ? -1 : left.path > right.path ? 1 : 0)
+  ).slice(0, 4).map(({ path: path2 }) => path2);
 }
 function selectedTrackedPaths(inventory, selected) {
   const matches = /* @__PURE__ */ new Set();
@@ -34348,7 +34698,11 @@ async function prepareWorkerContext(input) {
     `${JSON.stringify(repositoryPaths)}
 `
   );
-  const relevantPaths = input.node.contextSelector.relevantPaths.length ? input.node.contextSelector.relevantPaths : groundedRelevantPaths(repositoryPaths, input.node.objective);
+  const relevantPaths = input.node.contextSelector.relevantPaths.length ? input.node.contextSelector.relevantPaths : groundedRelevantPaths(
+    repositoryPaths,
+    input.node.objective,
+    input.store.artifactHashAlgorithm
+  );
   if (input.node.kind !== "commit" && input.node.kind !== "push" && input.node.kind !== "pull_request" && relevantPaths.length === 0)
     throw new Error(`Node ${input.node.id} has no grounded repository context`);
   for (const repositoryPath of relevantPaths)
@@ -34369,7 +34723,7 @@ async function prepareWorkerContext(input) {
       })
     )
   );
-  const capsuleHash = contentHash(capsule);
+  const capsuleHash = input.store.artifactContentHash(capsule);
   const storedCapsule = await input.store.writeCapsule(capsuleHash, capsule);
   const matchedPaths = selectedTrackedPaths(repositoryPaths, capsule.relevantPaths);
   const selectedPredecessorNodeIds = input.node.contextSelector.predecessorResults.filter(
@@ -34394,7 +34748,9 @@ async function prepareWorkerContext(input) {
     selected: {
       repositoryPaths: capsule.relevantPaths,
       predecessorNodeIds: selectedPredecessorNodeIds,
-      predecessorEvidenceHashes: capsule.predecessorEvidence.map((value) => contentHash(value)),
+      predecessorEvidenceHashes: capsule.predecessorEvidence.map(
+        (value) => input.store.artifactContentHash(value)
+      ),
       probeIds: selectedProbeResults.map(({ probeId }) => probeId),
       probeSignatures: selectedProbeResults.map(({ signature }) => signature),
       acceptanceAnchorIds: capsule.acceptanceAnchors.map(({ id }) => id)
@@ -34605,7 +34961,7 @@ function relativeRepositoryDirectoryPath(repositoryRoot, candidate) {
   const result = relative8(root, path2);
   return result && !isAbsolute9(result) ? result.split(sep7).join("/") : ".";
 }
-async function directoryValueHash(repositoryRoot, path2, signal) {
+async function directoryValueHash(repositoryRoot, path2, algorithm, signal) {
   const [canonicalRoot, canonicalPath] = await Promise.all([
     assertRepositoryDirectory(repositoryRoot, ".", signal),
     assertRepositoryDirectory(repositoryRoot, path2, signal)
@@ -34614,12 +34970,15 @@ async function directoryValueHash(repositoryRoot, path2, signal) {
   const target = relative8(canonicalRoot, canonicalPath);
   if (isAbsolute9(target) || target === ".." || target.startsWith(`..${sep7}`))
     throw new Error(`Completion working directory ${path2} escapes the repository`);
-  return contentHash({
-    path: path2,
-    target: target ? target.split(sep7).join("/") : "."
-  });
+  return contentHash(
+    {
+      path: path2,
+      target: target ? target.split(sep7).join("/") : "."
+    },
+    algorithm
+  );
 }
-async function gitObjectValueHash(repositoryRoot, path2, contents, signal) {
+async function gitObjectValueHash(repositoryRoot, path2, contents, algorithm, signal) {
   signal?.throwIfAborted();
   const result = await runProcess(
     "git",
@@ -34638,9 +34997,9 @@ async function gitObjectValueHash(repositoryRoot, path2, contents, signal) {
   const objectHash = result.stdout.trim();
   if (!/^[a-f0-9]{40,64}$/.test(objectHash))
     throw new Error(`Unable to establish held-out integrity for ${path2}`);
-  return contentHash({ path: path2, objectHash });
+  return contentHash({ path: path2, objectHash }, algorithm);
 }
-async function fileValueHash(repositoryRoot, path2, algorithm, signal) {
+async function fileValueHash(repositoryRoot, path2, fileAlgorithm, canonicalHashAlgorithm, signal) {
   let contents;
   try {
     contents = await readRepositoryFile(repositoryRoot, path2, {
@@ -34649,19 +35008,22 @@ async function fileValueHash(repositoryRoot, path2, algorithm, signal) {
   } catch (error51) {
     signal?.throwIfAborted();
     if (isRepositoryFileError(error51, "missing", "not_file"))
-      return contentHash({ missing: true, path: path2, ...algorithm ? { algorithm } : {} });
+      return contentHash(
+        { missing: true, path: path2, ...fileAlgorithm ? { algorithm: fileAlgorithm } : {} },
+        canonicalHashAlgorithm
+      );
     throw error51;
   }
-  if (algorithm === "git_hash_object")
-    return await gitObjectValueHash(repositoryRoot, path2, contents, signal);
-  return contentHash({ path: path2, contents: contents.toString("base64") });
+  if (fileAlgorithm === "git_hash_object")
+    return await gitObjectValueHash(repositoryRoot, path2, contents, canonicalHashAlgorithm, signal);
+  return contentHash({ path: path2, contents: contents.toString("base64") }, canonicalHashAlgorithm);
 }
 function possibleFileArguments(values) {
   return values.map((value) => value.replace(/^["']|["']$/g, "").replace(/[;&|]+$/g, "")).filter(
     (value) => !value.startsWith("-") && (value.startsWith(".") || value.includes("/") || /\.[a-z0-9]{1,8}$/i.test(value))
   );
 }
-async function fileIntegrity(repositoryRoot, cwd, values, signal) {
+async function fileIntegrity(repositoryRoot, cwd, values, algorithm, signal) {
   const result = [];
   for (const value of possibleFileArguments(values)) {
     signal?.throwIfAborted();
@@ -34680,12 +35042,12 @@ async function fileIntegrity(repositoryRoot, cwd, values, signal) {
       kind: "file",
       path: path2,
       algorithm: "git_hash_object",
-      valueHash: await fileValueHash(repositoryRoot, path2, "git_hash_object", signal)
+      valueHash: await fileValueHash(repositoryRoot, path2, "git_hash_object", algorithm, signal)
     });
   }
   return result;
 }
-async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot, signal) {
+async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot, signal, algorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
   const integrity = {};
   for (const item of probePlan.items.filter(({ phase }) => phase === "completion")) {
     signal?.throwIfAborted();
@@ -34699,10 +35061,16 @@ async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot, s
       protectedValues.push({
         kind: "directory",
         path: cwd,
-        valueHash: await directoryValueHash(repositoryRoot, cwd, signal)
+        valueHash: await directoryValueHash(repositoryRoot, cwd, algorithm, signal)
       });
       protectedValues.push(
-        ...await fileIntegrity(repositoryRoot, item.probe.cwd, item.probe.args, signal)
+        ...await fileIntegrity(
+          repositoryRoot,
+          item.probe.cwd,
+          item.probe.args,
+          algorithm,
+          signal
+        )
       );
     }
     if (item.probe.kind === "repository_inventory")
@@ -34728,11 +35096,17 @@ async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot, s
       kind: "package_script",
       path: manifestPath,
       script,
-      valueHash: contentHash({ path: manifestPath, script, value })
+      valueHash: contentHash({ path: manifestPath, script, value }, algorithm)
     });
     const scriptDirectory = manifestPath.includes("/") ? manifestPath.slice(0, manifestPath.lastIndexOf("/")) : void 0;
     protectedValues.push(
-      ...await fileIntegrity(repositoryRoot, scriptDirectory, value.split(/\s+/), signal)
+      ...await fileIntegrity(
+        repositoryRoot,
+        scriptDirectory,
+        value.split(/\s+/),
+        algorithm,
+        signal
+      )
     );
     const unique2 = new Map(
       protectedValues.map((entry) => [
@@ -34742,11 +35116,13 @@ async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot, s
     );
     integrity[item.probe.id] = [...unique2.values()];
   }
-  return createHeldOutProbePlan(runId, probePlan, integrity);
+  return createHeldOutProbePlan(runId, probePlan, integrity, algorithm);
 }
 async function heldOutIntegrityFailures(plan, repositoryPath, signal) {
+  const heldOutPlan = validateHeldOutProbePlan(plan);
+  const algorithm = heldOutProbePlanHashAlgorithm(heldOutPlan);
   const failures = [];
-  for (const entry of plan.probes) {
+  for (const entry of heldOutPlan.probes) {
     signal?.throwIfAborted();
     const changedKinds = /* @__PURE__ */ new Set();
     let signature = "";
@@ -34756,11 +35132,14 @@ async function heldOutIntegrityFailures(plan, repositoryPath, signal) {
       } catch (error51) {
         signal?.throwIfAborted();
         changedKinds.add("repository_path");
-        signature += contentHash({
-          probeId: entry.probe.id,
-          kind: "repository_path",
-          reason: isRepositoryFileError(error51) ? error51.kind : "invalid"
-        });
+        signature += contentHash(
+          {
+            probeId: entry.probe.id,
+            kind: "repository_path",
+            reason: isRepositoryFileError(error51) ? error51.kind : "invalid"
+          },
+          algorithm
+        );
       }
     }
     for (const integrity of entry.integrity) {
@@ -34774,25 +35153,32 @@ async function heldOutIntegrityFailures(plan, repositoryPath, signal) {
             })
           );
           const value = manifest2.scripts?.[integrity.script];
-          actualHash = value ? contentHash({ path: integrity.path, script: integrity.script, value }) : contentHash({ missing: true, path: integrity.path, script: integrity.script });
+          actualHash = value ? contentHash({ path: integrity.path, script: integrity.script, value }, algorithm) : contentHash(
+            { missing: true, path: integrity.path, script: integrity.script },
+            algorithm
+          );
         } else if (integrity.kind === "directory") {
-          actualHash = await directoryValueHash(repositoryPath, integrity.path, signal);
+          actualHash = await directoryValueHash(repositoryPath, integrity.path, algorithm, signal);
         } else {
           actualHash = await fileValueHash(
             repositoryPath,
             integrity.path,
             integrity.algorithm,
+            algorithm,
             signal
           );
         }
       } catch (error51) {
         signal?.throwIfAborted();
-        actualHash = contentHash({
-          unavailable: true,
-          path: integrity.path,
-          kind: integrity.kind,
-          reason: isRepositoryFileError(error51) ? error51.kind : "invalid"
-        });
+        actualHash = contentHash(
+          {
+            unavailable: true,
+            path: integrity.path,
+            kind: integrity.kind,
+            reason: isRepositoryFileError(error51) ? error51.kind : "invalid"
+          },
+          algorithm
+        );
       }
       if (actualHash === integrity.valueHash) continue;
       changedKinds.add(integrity.kind);
@@ -34809,7 +35195,7 @@ async function heldOutIntegrityFailures(plan, repositoryPath, signal) {
         probeId: `${entry.probe.id}-integrity`,
         kind: "file",
         passed: false,
-        signature: contentHash(signature),
+        signature: contentHash(signature, algorithm),
         summary: `Approved completion check ${entry.probe.id} changed or was removed; restore its ${detail}`,
         durationMs: 0
       });
@@ -36786,8 +37172,16 @@ function populateMissingGraphContext(graph, repositoryEvidence) {
           ...node2.contextSelector,
           relevantPaths: [
             .../* @__PURE__ */ new Set([
-              ...groundedRelevantPaths(evidencePaths, node2.objective),
-              ...groundedRelevantPaths(repositoryEvidence.trackedPaths, node2.objective)
+              ...groundedRelevantPaths(
+                evidencePaths,
+                node2.objective,
+                PORTABLE_CANONICAL_HASH_ALGORITHM
+              ),
+              ...groundedRelevantPaths(
+                repositoryEvidence.trackedPaths,
+                node2.objective,
+                PORTABLE_CANONICAL_HASH_ALGORITHM
+              )
             ])
           ].slice(0, 4)
         }
@@ -36929,7 +37323,13 @@ async function createRun(task, options) {
   );
   const heldOutProbePlan = await runCreationStep(
     options.signal,
-    () => createRuntimeHeldOutProbePlan(contract.runId, probePlan, repository.root, options.signal)
+    () => createRuntimeHeldOutProbePlan(
+      contract.runId,
+      probePlan,
+      repository.root,
+      options.signal,
+      PORTABLE_CANONICAL_HASH_ALGORITHM
+    )
   );
   const graphProbePlan = workerVisibleProbePlan(probePlan, heldOutProbePlan);
   const completionProbes = graphProbePlan.items.filter(({ phase }) => phase === "completion").map(({ probe }) => probe);
@@ -37025,7 +37425,9 @@ async function configureRunProbes(store, input) {
     const heldOutProbePlan = await createRuntimeHeldOutProbePlan(
       contract.runId,
       probePlan,
-      store.repositoryRoot
+      store.repositoryRoot,
+      void 0,
+      store.heldOutProbePlanHashAlgorithm
     );
     const graphProbePlan = workerVisibleProbePlan(probePlan, heldOutProbePlan);
     const graph = applyProbePlan(
@@ -46310,7 +46712,7 @@ var program2 = new Command().name("graphcraft").description("Progress-aware exec
 async function benchmarkSourceIdentity() {
   if (true) {
     return BenchmarkSourceIdentitySchema.parse({
-      commitSha: "5d0f0ce00155b5d6cbe1787a5926d5db2d114d5d",
+      commitSha: "3b0121611ab1b678fb8ea5534c04e8e4f69135bd",
       dirty: false,
       dirtyStatusDigest: false ? null : null
     });
