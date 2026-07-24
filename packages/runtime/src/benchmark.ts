@@ -42,9 +42,15 @@ import {
   type TokenUsage,
 } from "@graphcraft/core";
 import { runProcess } from "@graphcraft/probes";
+import {
+  assertBenchmarkReportEvidence,
+  benchmarkPermissionPolicy,
+  BENCHMARK_REPORT_LIMITATIONS,
+} from "./benchmark-validation.ts";
 import { createRun, executeRun } from "./runner.ts";
 import { writeJsonAtomic } from "./json.ts";
 import { redactString, redactValue } from "./redaction.ts";
+import { readRegularFileBounded } from "./secure-fs.ts";
 
 const tokenDimensions = [
   "input",
@@ -67,12 +73,7 @@ export const DEFAULT_BENCHMARK_MODEL_CALL_TIMEOUT_MS = 15 * 60_000;
 const BENCHMARK_MODEL_CALL_SETTLEMENT_GRACE_MS = 5_000;
 const UNCONFIRMED_CALL_SETTLEMENT_LIMITATION = "model_call_settlement:unconfirmed";
 const PROVISIONAL_ATTEMPT_LIMITATION = "attempt_checkpoint:provisional";
-const reportLimitations = [
-  "Stable efficiency claims require at least three jointly accepted reconciled baseline/Graphcraft pairs per task and host.",
-  "Each trial retains a bounded redacted patch and transcript packet; blinded reviewer assignment and defect labels remain external.",
-  "Every model call has a recorded timeout; an interrupted in-flight attempt is retained as unsuccessful evidence instead of being silently retried.",
-  "An unconfirmed model-call settlement blocks all later trials and resume until the child is reconciled outside this harness.",
-];
+export const BENCHMARK_SUITE_MAX_BYTES = 16 * 1024 * 1024;
 
 type BenchmarkInterruption = {
   cause: "cancellation" | "runtime_shutdown" | "timeout";
@@ -311,12 +312,6 @@ function persistedCapabilityAdmissionError(
     if (parsed.success && !parsed.data.ready) return new HostCapabilityAdmissionError(parsed.data);
   }
   return undefined;
-}
-
-function benchmarkPermissionPolicy(host: "codex" | "claude"): BenchmarkPermissionPolicy {
-  return host === "codex"
-    ? "codex_workspace_write_shell_external_not_graphcraft_enforced"
-    : "claude_accept_edits_bash_external_not_graphcraft_enforced";
 }
 
 function safeFixturePath(root: string, path: string): string {
@@ -645,7 +640,8 @@ export async function inspectBenchmarkSourceIdentity(
 }
 
 export async function loadBenchmarkSuite(path: string): Promise<BenchmarkSuite> {
-  return BenchmarkSuiteSchema.parse(JSON.parse(await readFile(resolve(path), "utf8")));
+  const source = await readRegularFileBounded(resolve(path), BENCHMARK_SUITE_MAX_BYTES);
+  return BenchmarkSuiteSchema.parse(JSON.parse(source.toString("utf8")));
 }
 
 async function materializeTask(task: BenchmarkTask): Promise<{
@@ -1612,42 +1608,8 @@ export async function runBenchmark(input: {
       if (error instanceof Error && !error.message.includes("ENOENT")) throw error;
     }
   }
-  const scheduledIds = new Set(schedule.map(({ trialId }) => trialId));
-  if (results.some(({ trial }) => !scheduledIds.has(trial.trialId)))
-    throw new Error("The existing benchmark report contains a trial outside the current schedule");
-  if (new Set(results.map(({ trial }) => trial.trialId)).size !== results.length)
-    throw new Error("The existing benchmark report contains duplicated trial results");
-  if (
-    results.some(
-      ({ trial, modelPolicy: resultModel, effortPolicy: resultEffort, ...result }) =>
-        JSON.stringify(trial) !==
-          JSON.stringify(schedule.find(({ trialId }) => trialId === trial.trialId)) ||
-        resultModel !== policies[trial.host]!.model ||
-        resultEffort !== policies[trial.host]!.effort ||
-        result.permissionPolicy !== permissionPolicy[trial.host] ||
-        result.repositoryDigest !== contentHash(byTask.get(trial.taskId)!.initialFiles) ||
-        result.acceptanceScorerDigest !==
-          scorerDigest(byTask.get(trial.taskId)!, expectedScorerFiles(byTask.get(trial.taskId)!)) ||
-        result.scorerVerified !== (result.acceptanceScorerDigest === result.observedScorerDigest) ||
-        result.acceptance.length !==
-          byTask.get(trial.taskId)!.checks.length + byTask.get(trial.taskId)!.acceptance.length ||
-        result.accepted !==
-          (result.executionStatus === "completed" &&
-            result.scorerVerified &&
-            result.acceptance.every(({ passed }) => passed) &&
-            result.reviewPacket?.captureFailures.length === 0),
-    )
-  )
-    throw new Error("The existing benchmark report contains mismatched trial controls");
-  if (existingReport?.status === "complete" && results.length !== schedule.length)
-    throw new Error("The complete benchmark report does not cover the exact current schedule");
-  if (
-    existingReport &&
-    contentHash(existingReport.summary) !== contentHash(summarizeBenchmark(results, schedule))
-  )
-    throw new Error("The existing benchmark report summary does not match its trial evidence");
-  if (existingReport && contentHash(existingReport.limitations) !== contentHash(reportLimitations))
-    throw new Error("The existing benchmark report limitations do not match this harness");
+  if (existingReport)
+    assertBenchmarkReportEvidence({ report: existingReport, suite, expectedSchedule: schedule });
   const recoveredProvisionalAttempts = results.some(
     ({ attemptCheckpoint }) => attemptCheckpoint === "provisional",
   );
@@ -1684,12 +1646,13 @@ export async function runBenchmark(input: {
         modelCallTimeoutMs,
         ...(hostPreflightCheckpoint ? { hostPreflightCheckpoint } : {}),
         environment,
-        limitations: reportLimitations,
+        limitations: BENCHMARK_REPORT_LIMITATIONS,
         schedule,
         results,
         summary: summarizeBenchmark(results, schedule),
       }),
     );
+    assertBenchmarkReportEvidence({ report, suite, expectedSchedule: schedule });
     await writeJsonAtomic(outputPath, report);
     return report;
   };

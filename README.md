@@ -83,7 +83,7 @@ Graphcraft displays a concise run contract before doing work. Use `--yes` only w
 - Classifies exact-SHA PR lifecycle state deterministically, giving current review feedback precedence over same-head CI failures and separating pending, actionable, infrastructure, cancelled, stale, human-decision, and green outcomes. `pr_green` waits with persisted bounded backoff and no model calls while checks or approvals are pending. Review and actionable-CI changes receive bounded, fully reverified repair pushes; unchanged signatures stop. Verified review fixes receive an exact reply and resolution, infrastructure or cancelled GitHub check runs receive at most one justified rerun, changes-requested decisions remain sticky until approval, and base movement is durably rebound without inferring rebase or merge authority.
 - Serves `graphcraft view [run]` only on `127.0.0.1` as a read-only live projection of verified run files. The accessible local viewer distinguishes dependency and governance edges, exposes node context/probes/evidence, revisions, recovery and side-effect timelines, per-phase/per-node token dimensions, redacted on-demand artifacts, and a redacted self-contained export without writing to the run.
 - Tracks cached, uncached, output, reasoning, and total tokens with explicit provider availability, and reports planning, worker, repair, semantic-verification, and Graphcraft-overhead costs by phase and node.
-- Provides an experimental matched benchmark harness with a versioned ten-task public corpus, fresh deterministic fixtures, explicit model/effort controls, immutable fixture-bound scoring, atomic checkpoints, and resumable randomized trials.
+- Provides an experimental matched benchmark harness with a versioned ten-task public corpus, fresh deterministic fixtures, explicit model/effort controls, immutable fixture-bound scoring, atomic checkpoints, resumable randomized trials, deterministic blinded-review packets, and digest-bound Markdown publication.
 
 ## Commands
 
@@ -108,6 +108,8 @@ graphcraft view [run] [--no-open] [--port <port>]
 graphcraft doctor
 graphcraft github-snapshot [pull-request]
 graphcraft benchmark <suite> --host both --codex-model <model> --claude-model <model> --effort <level>
+graphcraft benchmark-review <report> [--suite <suite>] --blinding-key-stdin --output <blinded-review.json>
+graphcraft benchmark-report <report> [--suite <suite>] --blinding-key-stdin --labels <review-labels.json> --output <report.md>
 graphcraft uninstall --host <codex|claude>
 ```
 
@@ -123,11 +125,13 @@ Small localized tasks bypass Graphcraft by default using measured task-shape sig
 
 Use `stable-v1` as the bundled benchmark suite name. A dry run validates and prints its schedule without requiring model options. Real trials require an explicit model for every selected host and one shared `low`, `medium`, `high`, or `xhigh` effort policy; reports remain local under `.graphcraft/benchmarks/` unless `--output` is supplied.
 
+`benchmark-review` and `benchmark-report` accept the blinding key only through standard input when `--blinding-key-stdin` is explicit. Supply the same private high-entropy 32-byte key to both commands as exactly 64 lowercase hexadecimal characters, with an optional final LF or CRLF, from a protected external source such as a secret manager. Graphcraft bounds the input, does not accept a key-file path, and does not persist or print the key. Packet IDs use domain-separated HMAC; artifacts contain only the key digest. The review export is separate and create-only, removes explicit host/model/mode/session/usage metadata, and includes packet digests for external review. After every packet has one digest-bound reviewer verdict, `benchmark-report` validates the same key digest and exact packet coverage, then renders a separate create-only report containing raw/blinded/label provenance, per-task and aggregate results, blinded defect findings, uncertainty intervals, unsuccessful trials, and the existing quantitative gate. Neither command modifies the raw report, performs model calls, publishes results, or turns a passing quantitative gate into a stable-release claim.
+
 ## Evidence and scope
 
 The [v0.1 implementation report](https://github.com/tpypan/graphcraft/blob/v0.1.2/docs/V0.1.md) records the acceptance boundary, architecture, tests, real-host dogfood, and known gaps. Research and competitive rationale live under [docs/research](https://github.com/tpypan/graphcraft/tree/v0.1.2/docs/research).
 
-Graphcraft does not yet claim stable reliability or a 20% token-savings gate. The harness and public fixtures exist, but repeated real Codex and Claude trials, blinded defect review, and a passing stable gate remain outstanding.
+Graphcraft does not yet claim stable reliability or a 20% token-savings gate. The harness, public fixtures, and blinded-review/publication tooling exist, but repeated real Codex and Claude trials, completed independent defect review, published evidence, and a passing stable gate remain outstanding.
 
 ## Development
 

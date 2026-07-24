@@ -37,14 +37,17 @@ import {
   applyRunRetention,
   discoverRepository,
   executeRun,
+  exportBlindedBenchmarkReview,
   inspectSupervisorRecord,
   listSupervisorRecords,
   loadBenchmarkSuite,
   inspectBenchmarkSourceIdentity,
   planCompletedRunPrune,
   planRunRetention,
+  readBenchmarkBlindingKeyFromStdin,
   redactString,
   redactValue,
+  renderBenchmarkPublicationReport,
   runBenchmark,
   startDetachedSupervisor,
   startRunViewer,
@@ -109,6 +112,21 @@ async function benchmarkSourceIdentity(): Promise<BenchmarkSourceIdentity> {
 const hostOption = new Option("--host <host>", "coding-agent host")
   .choices(["codex", "claude"])
   .default("codex");
+
+async function benchmarkSuite(path: string) {
+  return path === "stable-v1"
+    ? BenchmarkSuiteSchema.parse(stableBenchmarkSuite)
+    : await loadBenchmarkSuite(path);
+}
+
+async function withBenchmarkBlindingKey<T>(operation: (key: Buffer) => Promise<T>): Promise<T> {
+  const key = await readBenchmarkBlindingKeyFromStdin(process.stdin);
+  try {
+    return await operation(key);
+  } finally {
+    key.fill(0);
+  }
+}
 
 function collectScope(value: string, previous: string[] | undefined): string[] {
   return [...(previous ?? []), value];
@@ -198,10 +216,7 @@ program
         dryRun?: boolean;
       },
     ) => {
-      const suite =
-        suitePath === "stable-v1"
-          ? BenchmarkSuiteSchema.parse(stableBenchmarkSuite)
-          : await loadBenchmarkSuite(suitePath);
+      const suite = await benchmarkSuite(suitePath);
       const hosts: Array<"codex" | "claude"> =
         options.host === "both" ? ["codex", "claude"] : [options.host];
       const repetitions = options.repetitions ? Number(options.repetitions) : undefined;
@@ -275,6 +290,83 @@ program
       }
       console.log(
         JSON.stringify({ outputPath: result.outputPath, summary: result.report.summary }, null, 2),
+      );
+    },
+  );
+
+program
+  .command("benchmark-review")
+  .description("Export deterministic opaque packets for blinded benchmark defect review")
+  .argument("<report>", "complete schema-3 benchmark report")
+  .option("--suite <suite>", "exact benchmark suite JSON", "stable-v1")
+  .requiredOption(
+    "--blinding-key-stdin",
+    "read the 32-byte hexadecimal blinding key from standard input",
+  )
+  .requiredOption("--output <path>", "separate blinded-review JSON path")
+  .action(
+    async (
+      report: string,
+      options: {
+        suite: string;
+        blindingKeyStdin: boolean;
+        output: string;
+      },
+    ) => {
+      console.log(
+        JSON.stringify(
+          await withBenchmarkBlindingKey(
+            async (blindingKey) =>
+              await exportBlindedBenchmarkReview({
+                reportPath: report,
+                suite: await benchmarkSuite(options.suite),
+                blindingKey,
+                outputPath: options.output,
+              }),
+          ),
+          null,
+          2,
+        ),
+      );
+    },
+  );
+
+program
+  .command("benchmark-report")
+  .description("Render a validated benchmark report from raw evidence and blinded labels")
+  .argument("<report>", "complete schema-3 benchmark report")
+  .option("--suite <suite>", "exact benchmark suite JSON", "stable-v1")
+  .requiredOption(
+    "--blinding-key-stdin",
+    "read the same 32-byte hexadecimal blinding key from standard input",
+  )
+  .requiredOption("--labels <path>", "completed digest-bound review-label JSON")
+  .requiredOption("--output <path>", "separate Markdown report path")
+  .action(
+    async (
+      report: string,
+      options: {
+        suite: string;
+        blindingKeyStdin: boolean;
+        labels: string;
+        output: string;
+      },
+    ) => {
+      console.log(
+        JSON.stringify(
+          await withBenchmarkBlindingKey(
+            async (blindingKey) =>
+              await renderBenchmarkPublicationReport({
+                reportPath: report,
+                suite: await benchmarkSuite(options.suite),
+                blindingKey,
+                labelsPath: options.labels,
+                outputPath: options.output,
+              }),
+          ),
+          null,
+          2,
+        ),
       );
     },
   );
