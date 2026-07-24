@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { PORTABLE_CANONICAL_HASH_ALGORITHM } from "./canonical.ts";
 
 export const FinishLineSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("local_verified") }),
@@ -919,7 +920,7 @@ export const RunEventTypeSchema = z.enum([
   "graph.amended",
 ]);
 
-export const RunEventSchema = z.strictObject({
+export const RunEventV1Schema = z.strictObject({
   schemaVersion: z.literal(1),
   sequence: z.number().int().positive(),
   timestamp: z.iso.datetime(),
@@ -929,6 +930,23 @@ export const RunEventSchema = z.strictObject({
   data: z.record(z.string(), z.unknown()),
   hash: z.string().regex(/^[a-f0-9]{64}$/),
 });
+
+export const RunEventV2Schema = z.strictObject({
+  schemaVersion: z.literal(2),
+  hashAlgorithm: z.literal(PORTABLE_CANONICAL_HASH_ALGORITHM),
+  sequence: z.number().int().positive(),
+  timestamp: z.iso.datetime(),
+  actor: z.enum(["user", "runtime", "worker", "probe", "host"]),
+  causationId: z.string().min(1),
+  type: RunEventTypeSchema,
+  data: z.record(z.string(), z.unknown()),
+  hash: z.string().regex(/^[a-f0-9]{64}$/),
+});
+
+export const RunEventSchema = z.discriminatedUnion("schemaVersion", [
+  RunEventV1Schema,
+  RunEventV2Schema,
+]);
 
 export const NodeRuntimeStateSchema = z.strictObject({
   status: NodeStatusSchema,
