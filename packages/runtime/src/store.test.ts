@@ -5,8 +5,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   LEGACY_CANONICAL_HASH_ALGORITHM,
   PORTABLE_CANONICAL_HASH_ALGORITHM,
+  HeldOutProbePlanSchema,
   compileGraph,
   compileRunContract,
+  createHeldOutProbePlan,
   createRunEvent,
   type CanonicalHashAlgorithm,
   type RunEvent,
@@ -74,9 +76,89 @@ describe("storage v3 initialization", () => {
       migratedFrom: 3,
       initialization: "ready",
       canonicalHashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
-      formats: { events: 2 },
+      formats: { heldOutProbes: 2, events: 2 },
     });
     expect(await readFile(store.eventsPath())).toEqual(eventsBefore);
+  });
+
+  it("replays and repairs only portable-v2 held-out plans for fresh storage", async () => {
+    const { store, event } = await createStoreFixture();
+    const heldOutPath = join(store.runRoot, "held-out-probes.json");
+    const portable = await store.loadHeldOutProbePlan();
+    const eventPlan = HeldOutProbePlanSchema.parse(event.data.heldOutProbePlan);
+
+    expect(portable).toMatchObject({
+      schemaVersion: 2,
+      hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+    });
+    expect(eventPlan).toEqual(portable);
+    expect(JSON.parse(await readFile(heldOutPath, "utf8"))).toEqual(portable);
+
+    const legacy = createHeldOutProbePlan(store.runId, await store.loadProbePlan());
+    await writeFile(heldOutPath, `${JSON.stringify(legacy, null, 2)}\n`);
+    const legacyBytes = await readFile(heldOutPath);
+    await expect(store.saveHeldOutProbePlan(legacy)).rejects.toThrow(
+      /format disagrees with its storage hash algorithm/,
+    );
+    expect(await readFile(heldOutPath)).toEqual(legacyBytes);
+
+    expect(await store.loadHeldOutProbePlan()).toEqual(portable);
+    expect(JSON.parse(await readFile(heldOutPath, "utf8"))).toEqual(portable);
+    const eventsBeforeRebuild = await readFile(store.eventsPath());
+    await writeFile(heldOutPath, "not-json\n");
+    await store.rebuildViews();
+    expect(JSON.parse(await readFile(heldOutPath, "utf8"))).toEqual(portable);
+    expect(await readFile(store.eventsPath())).toEqual(eventsBeforeRebuild);
+  });
+
+  it("preserves prior event-v2 and held-out-v1 runs through initialization recovery", async () => {
+    const { root, store, event } = await createStoreFixture();
+    const storagePath = join(store.runRoot, "storage.json");
+    const heldOutPath = join(store.runRoot, "held-out-probes.json");
+    const portable = await store.loadHeldOutProbePlan();
+    const legacy = createHeldOutProbePlan(store.runId, await store.loadProbePlan());
+    const priorEvent = createRunEvent(
+      {
+        sequence: event.sequence,
+        timestamp: event.timestamp,
+        actor: event.actor,
+        causationId: event.causationId,
+        type: event.type,
+        data: { ...event.data, heldOutProbePlan: legacy },
+      },
+      PORTABLE_CANONICAL_HASH_ALGORITHM,
+    );
+    await writeFile(store.eventsPath(), serializedEvent(priorEvent));
+    await writeFile(heldOutPath, `${JSON.stringify(legacy, null, 2)}\n`);
+    const descriptor = JSON.parse(await readFile(storagePath, "utf8")) as {
+      initialization: string;
+      formats: { heldOutProbes: number };
+    };
+    descriptor.initialization = "initializing";
+    descriptor.formats.heldOutProbes = 1;
+    await writeFile(storagePath, `${JSON.stringify(descriptor, null, 2)}\n`);
+    const eventsBeforeRecovery = await readFile(store.eventsPath());
+
+    const reopened = new RunStore(root, store.runId);
+    await reopened.prepareStorage();
+
+    expect(reopened.canonicalHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    expect(reopened.heldOutProbePlanHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
+    expect(JSON.parse(await readFile(storagePath, "utf8"))).toMatchObject({
+      initialization: "ready",
+      canonicalHashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+      formats: { heldOutProbes: 1, events: 2 },
+    });
+    expect(await readFile(store.eventsPath())).toEqual(eventsBeforeRecovery);
+    expect(await reopened.loadHeldOutProbePlan()).toEqual(legacy);
+
+    await writeFile(heldOutPath, `${JSON.stringify(portable, null, 2)}\n`);
+    expect(await reopened.loadHeldOutProbePlan()).toEqual(legacy);
+    expect(JSON.parse(await readFile(heldOutPath, "utf8"))).toEqual(legacy);
+    expect(
+      await reopened.append("runtime", "run.paused", { reason: "continue prior v3 run" }),
+    ).toMatchObject({ schemaVersion: 2 });
+    expect(await reopened.loadHeldOutProbePlan()).toEqual(legacy);
   });
 
   it("leaves a pre-event initializing descriptor intact with a precise blocker", async () => {

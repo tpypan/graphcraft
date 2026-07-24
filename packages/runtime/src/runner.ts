@@ -5,6 +5,7 @@ import {
   HostCapabilityAdmissionError,
   HostEventSchema,
   OptimizationDecisionSchema,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
   ProgressDecisionPacketSchema,
   ProgressTrajectoryEntrySchema,
   SemanticVerdictSchema,
@@ -414,7 +415,13 @@ export async function createRun(
     ]),
   );
   const heldOutProbePlan = await runCreationStep(options.signal, () =>
-    createRuntimeHeldOutProbePlan(contract.runId, probePlan, repository.root, options.signal),
+    createRuntimeHeldOutProbePlan(
+      contract.runId,
+      probePlan,
+      repository.root,
+      options.signal,
+      PORTABLE_CANONICAL_HASH_ALGORITHM,
+    ),
   );
   const graphProbePlan = workerVisibleProbePlan(probePlan, heldOutProbePlan);
   const completionProbes = graphProbePlan.items
@@ -514,6 +521,8 @@ export async function configureRunProbes(
       contract.runId,
       probePlan,
       store.repositoryRoot,
+      undefined,
+      store.heldOutProbePlanHashAlgorithm,
     );
     const graphProbePlan = workerVisibleProbePlan(probePlan, heldOutProbePlan);
     const graph = applyProbePlan(

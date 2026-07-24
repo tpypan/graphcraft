@@ -170,13 +170,27 @@ export const HeldOutProbeEntrySchema = z.strictObject({
   integrity: z.array(HeldOutProbeIntegritySchema),
 });
 
-export const HeldOutProbePlanSchema = z.strictObject({
+export const HeldOutProbePlanV1Schema = z.strictObject({
   schemaVersion: z.literal(1),
   runId: z.uuid(),
   family: z.enum(["bug", "feature", "migration", "refactor", "audit"]),
   probes: z.array(HeldOutProbeEntrySchema).min(1),
   digest: z.string().regex(/^[a-f0-9]{64}$/),
 });
+
+export const HeldOutProbePlanV2Schema = z.strictObject({
+  schemaVersion: z.literal(2),
+  hashAlgorithm: z.literal(PORTABLE_CANONICAL_HASH_ALGORITHM),
+  runId: z.uuid(),
+  family: z.enum(["bug", "feature", "migration", "refactor", "audit"]),
+  probes: z.array(HeldOutProbeEntrySchema).min(1),
+  digest: z.string().regex(/^[a-f0-9]{64}$/),
+});
+
+export const HeldOutProbePlanSchema = z.discriminatedUnion("schemaVersion", [
+  HeldOutProbePlanV1Schema,
+  HeldOutProbePlanV2Schema,
+]);
 
 export const ProbeResultSchema = z.strictObject({
   probeId: z.string().min(1),
@@ -1295,6 +1309,7 @@ export const RunStorageManifestSchema = z.union([
     initialization: z.enum(["initializing", "ready"]),
     canonicalHashAlgorithm: CanonicalHashAlgorithmSchema,
     formats: RunStorageFormatsV2Schema.extend({
+      heldOutProbes: z.union([z.literal(1), z.literal(2)]),
       events: z.union([z.literal(1), z.literal(2)]),
     }),
   }),

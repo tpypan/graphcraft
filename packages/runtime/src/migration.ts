@@ -6,8 +6,10 @@ import { isDeepStrictEqual } from "node:util";
 import {
   LEGACY_CANONICAL_HASH_ALGORITHM,
   PORTABLE_CANONICAL_HASH_ALGORITHM,
+  HeldOutProbePlanSchema,
   RunEventSchema,
   RunStorageManifestSchema,
+  validateHeldOutProbePlan,
   verifyRunEvent,
   type CanonicalHashAlgorithm,
   type ArtifactInventory,
@@ -66,6 +68,7 @@ export const LEGACY_MIGRATION_RESOURCE_LIMITS = Object.freeze({
 });
 
 type LegacyStorageVersion = 0 | 1 | 2;
+type HeldOutProbeFormat = 1 | 2;
 type CurrentRunStorageManifest = Extract<RunStorageManifest, { schemaVersion: 3 }>;
 
 interface LegacyStorage {
@@ -83,6 +86,7 @@ function manifest(
   runId: string,
   migratedFrom: 0 | 1 | 2 | 3,
   canonicalHashAlgorithm: CanonicalHashAlgorithm,
+  heldOutProbeFormat: HeldOutProbeFormat,
   initialization: "initializing" | "ready",
 ): CurrentRunStorageManifest {
   return RunStorageManifestSchema.parse({
@@ -95,7 +99,7 @@ function manifest(
       contract: 1,
       graph: 1,
       probePlan: 1,
-      heldOutProbes: 1,
+      heldOutProbes: heldOutProbeFormat,
       events: canonicalHashAlgorithm === PORTABLE_CANONICAL_HASH_ALGORITHM ? 2 : 1,
       state: 1,
       workspace: 1,
@@ -131,10 +135,17 @@ async function persistCurrentRunStorageManifest(
   runId: string,
   migratedFrom: 0 | 1 | 2 | 3,
   canonicalHashAlgorithm: CanonicalHashAlgorithm,
+  heldOutProbeFormat: HeldOutProbeFormat,
   initialization: "initializing" | "ready",
   lease?: MigrationLeaseContext,
 ): Promise<CurrentRunStorageManifest> {
-  const value = manifest(runId, migratedFrom, canonicalHashAlgorithm, initialization);
+  const value = manifest(
+    runId,
+    migratedFrom,
+    canonicalHashAlgorithm,
+    heldOutProbeFormat,
+    initialization,
+  );
   await migrationStep(lease, async () => await ensurePrivateDirectory(runRoot));
   const path = runStorageManifestPath(runRoot);
   await migrationStep(lease, async () => await writeJsonAtomic(path, value));
@@ -157,6 +168,7 @@ export async function writeCurrentRunStorageManifest(
     runId,
     migratedFrom,
     PORTABLE_CANONICAL_HASH_ALGORITHM,
+    2,
     "ready",
   );
 }
@@ -170,6 +182,7 @@ export async function writeInitializingRunStorageManifest(
     runId,
     CURRENT_RUN_STORAGE_VERSION,
     PORTABLE_CANONICAL_HASH_ALGORITHM,
+    2,
     "initializing",
   );
 }
@@ -1545,6 +1558,7 @@ async function validateLegacyRun(
 async function validateInitializingRunStorage(
   runRoot: string,
   runId: string,
+  manifest: CurrentRunStorageManifest,
   lease: MigrationLeaseContext,
 ): Promise<void> {
   for (const relativePath of [
@@ -1601,7 +1615,9 @@ async function validateInitializingRunStorage(
         `Run ${runId} has an invalid event log during schema-v3 initialization. No files were changed.`,
       );
     }
-    if (event.schemaVersion !== 2 || event.sequence !== events.length + 1)
+    const expectedEventSchemaVersion =
+      manifest.canonicalHashAlgorithm === PORTABLE_CANONICAL_HASH_ALGORITHM ? 2 : 1;
+    if (event.schemaVersion !== expectedEventSchemaVersion || event.sequence !== events.length + 1)
       throw new Error(
         `Run ${runId} has an event format that disagrees with its schema-v3 initialization descriptor. No files were changed.`,
       );
@@ -1619,6 +1635,18 @@ async function validateInitializingRunStorage(
     throw new Error(
       `Run ${runId} has an incomplete schema-v3 initialization before its first durable event. No files were changed.`,
     );
+  try {
+    validateHeldOutProbePlan(
+      HeldOutProbePlanSchema.parse(first.data.heldOutProbePlan),
+      manifest.formats.heldOutProbes === 2
+        ? PORTABLE_CANONICAL_HASH_ALGORITHM
+        : LEGACY_CANONICAL_HASH_ALGORITHM,
+    );
+  } catch {
+    throw new Error(
+      `Run ${runId} has a held-out plan format that disagrees with its schema-v3 initialization descriptor. No files were changed.`,
+    );
+  }
 }
 
 async function assertMigratedInventoryCurrent(
@@ -1676,12 +1704,13 @@ export async function ensureCurrentRunStorage(input: {
     );
     if (storage.version === CURRENT_RUN_STORAGE_VERSION) {
       if (storage.manifest.initialization === "ready") return storage.manifest;
-      await validateInitializingRunStorage(input.runRoot, input.runId, lease);
+      await validateInitializingRunStorage(input.runRoot, input.runId, storage.manifest, lease);
       return await persistCurrentRunStorageManifest(
         input.runRoot,
         input.runId,
         storage.manifest.migratedFrom,
         storage.manifest.canonicalHashAlgorithm,
+        storage.manifest.formats.heldOutProbes,
         "ready",
         lease,
       );
@@ -1733,6 +1762,7 @@ export async function ensureCurrentRunStorage(input: {
       input.runId,
       storage.version,
       LEGACY_CANONICAL_HASH_ALGORITHM,
+      1,
       "ready",
       lease,
     );

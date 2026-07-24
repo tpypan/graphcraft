@@ -475,7 +475,12 @@ describe("run storage schema v3 migration", () => {
         schemaVersion: 3,
         migratedFrom: 1,
         canonicalHashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM,
-        formats: { events: 1, artifactInventory: 1, artifactPolicy: 1 },
+        formats: {
+          heldOutProbes: 1,
+          events: 1,
+          artifactInventory: 1,
+          artifactPolicy: 1,
+        },
       },
     );
   });
@@ -503,7 +508,12 @@ describe("run storage schema v3 migration", () => {
       runId: fixture.runId,
       migratedFrom: 2,
       canonicalHashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM,
-      formats: { events: 1, artifactInventory: 1, artifactPolicy: 1 },
+      formats: {
+        heldOutProbes: 1,
+        events: 1,
+        artifactInventory: 1,
+        artifactPolicy: 1,
+      },
     });
     const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "2-to-3");
     expect(await fileSnapshot(backupRoot)).toEqual(before);
@@ -1665,6 +1675,31 @@ describe("run storage schema v3 migration", () => {
     const current = await ensureCurrentRunStorage(input);
 
     expect(current).toEqual(expected);
+    expect(await treeSnapshot(fixture.graphcraftRoot)).toEqual(before);
+  });
+
+  it("preserves an independent held-out format in a current manifest", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000046", 0);
+    const input = {
+      graphcraftRoot: fixture.graphcraftRoot,
+      runRoot: fixture.runRoot,
+      runId: fixture.runId,
+    };
+    await ensureCurrentRunStorage(input);
+    const storagePath = join(fixture.runRoot, "storage.json");
+    const manifest = JSON.parse(await readFile(storagePath, "utf8")) as {
+      formats: { heldOutProbes: number };
+    };
+    manifest.formats.heldOutProbes = 2;
+    await writeFile(storagePath, `${JSON.stringify(manifest, null, 2)}\n`);
+    const before = await treeSnapshot(fixture.graphcraftRoot);
+
+    await expect(ensureCurrentRunStorage(input)).resolves.toMatchObject({
+      schemaVersion: 3,
+      canonicalHashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM,
+      formats: { heldOutProbes: 2, events: 1 },
+    });
+
     expect(await treeSnapshot(fixture.graphcraftRoot)).toEqual(before);
   });
 

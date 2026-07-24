@@ -158,11 +158,14 @@ function sameFileIdentity(left: BigIntStats, right: BigIntStats): boolean {
   return left.dev === right.dev && left.birthtimeNs === right.birthtimeNs;
 }
 
-function optionalHeldOutProbePlan(value: unknown): HeldOutProbePlan | undefined {
+function optionalHeldOutProbePlan(
+  value: unknown,
+  algorithm: CanonicalHashAlgorithm,
+): HeldOutProbePlan | undefined {
   const parsed = HeldOutProbePlanSchema.safeParse(value);
   if (!parsed.success) return undefined;
   try {
-    return validateHeldOutProbePlan(parsed.data);
+    return validateHeldOutProbePlan(parsed.data, algorithm);
   } catch {
     return undefined;
   }
@@ -179,6 +182,7 @@ export class RunStore {
   private initializing = false;
   private storageReady: Promise<RunStorageManifest> | undefined;
   private _canonicalHashAlgorithm: CanonicalHashAlgorithm;
+  private _heldOutProbePlanHashAlgorithm: CanonicalHashAlgorithm;
 
   constructor(
     repositoryRoot: string,
@@ -192,6 +196,7 @@ export class RunStore {
     this.runRoot = join(this.graphcraftRoot, "runs", runId);
     this.limits = normalizeLimits(limits);
     this._canonicalHashAlgorithm = canonicalHashAlgorithm;
+    this._heldOutProbePlanHashAlgorithm = canonicalHashAlgorithm;
     this.artifactStore = new RunArtifactStore(this.runRoot, runId);
     for (const algorithm of [
       LEGACY_CANONICAL_HASH_ALGORITHM,
@@ -227,6 +232,10 @@ export class RunStore {
       if (manifest.schemaVersion !== 3)
         throw new Error("Run storage preparation did not return the current schema");
       this._canonicalHashAlgorithm = manifest.canonicalHashAlgorithm;
+      this._heldOutProbePlanHashAlgorithm =
+        manifest.formats.heldOutProbes === 2
+          ? PORTABLE_CANONICAL_HASH_ALGORITHM
+          : LEGACY_CANONICAL_HASH_ALGORITHM;
       await this.validateStorageRoot();
     } catch (error) {
       if (this.storageReady === ready) this.storageReady = undefined;
@@ -240,6 +249,10 @@ export class RunStore {
 
   get canonicalHashAlgorithm(): CanonicalHashAlgorithm {
     return this._canonicalHashAlgorithm;
+  }
+
+  get heldOutProbePlanHashAlgorithm(): CanonicalHashAlgorithm {
+    return this._heldOutProbePlanHashAlgorithm;
   }
 
   contentHash(value: unknown): string {
@@ -320,7 +333,11 @@ export class RunStore {
     const persistedContract = RunContractSchema.parse(redactValue(contract));
     const persistedGraph = GraphSchema.parse(redactValue(graph));
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
+    const heldOutProbePlan = inputHeldOutProbePlan
+      ? validateHeldOutProbePlan(inputHeldOutProbePlan, store.heldOutProbePlanHashAlgorithm)
+      : createHeldOutProbePlan(contract.runId, probePlan, {}, store.heldOutProbePlanHashAlgorithm);
     assertPersistenceSafe(probePlan, "Probe plan");
+    assertPersistenceSafe(heldOutProbePlan, "Held-out probe plan");
     store.assertJsonProjectionFits(persistedContract, RUN_METADATA_MAX_BYTES, "Run contract");
     store.assertJsonProjectionFits(persistedGraph, RUN_METADATA_MAX_BYTES, "Run graph");
     store.assertJsonProjectionFits(probePlan, RUN_METADATA_MAX_BYTES, "Probe plan");
@@ -337,10 +354,6 @@ export class RunStore {
     ]);
     await store.artifactStore.initialize();
     await writeInitializingRunStorageManifest(store.runRoot, store.runId);
-    const heldOutProbePlan = inputHeldOutProbePlan
-      ? validateHeldOutProbePlan(inputHeldOutProbePlan)
-      : createHeldOutProbePlan(contract.runId, probePlan);
-    assertPersistenceSafe(heldOutProbePlan, "Held-out probe plan");
     const event = createRunEvent(
       {
         sequence: 1,
@@ -589,7 +602,7 @@ export class RunStore {
     assertPersistenceSafe(heldOutProbePlan, "Held-out probe plan");
     await this.writeBoundedJson(
       "held-out-probes.json",
-      validateHeldOutProbePlan(heldOutProbePlan),
+      validateHeldOutProbePlan(heldOutProbePlan, this.heldOutProbePlanHashAlgorithm),
       RUN_METADATA_MAX_BYTES,
       "Held-out probe plan",
       "reconstructable_projection",
@@ -605,9 +618,13 @@ export class RunStore {
         event.data.heldOutProbePlan,
     )?.data.heldOutProbePlan;
     if (eventPlan) {
-      const heldOutProbePlan = validateHeldOutProbePlan(HeldOutProbePlanSchema.parse(eventPlan));
+      const heldOutProbePlan = validateHeldOutProbePlan(
+        HeldOutProbePlanSchema.parse(eventPlan),
+        this.heldOutProbePlanHashAlgorithm,
+      );
       const materialized = optionalHeldOutProbePlan(
         await this.readOptionalBoundedJson("held-out-probes.json", RUN_METADATA_MAX_BYTES),
+        this.heldOutProbePlanHashAlgorithm,
       );
       if (JSON.stringify(materialized) !== JSON.stringify(heldOutProbePlan))
         await this.saveHeldOutProbePlan(heldOutProbePlan);
@@ -616,7 +633,14 @@ export class RunStore {
     return (
       optionalHeldOutProbePlan(
         await this.readOptionalBoundedJson("held-out-probes.json", RUN_METADATA_MAX_BYTES),
-      ) ?? createHeldOutProbePlan(this.runId, await this.loadProbePlan())
+        this.heldOutProbePlanHashAlgorithm,
+      ) ??
+      createHeldOutProbePlan(
+        this.runId,
+        await this.loadProbePlan(),
+        {},
+        this.heldOutProbePlanHashAlgorithm,
+      )
     );
   }
 
@@ -836,8 +860,11 @@ export class RunStore {
       ? ProbePlanSchema.parse(events[0].data.probePlan)
       : probePlanFromGraph(createdGraph);
     let heldOutProbePlan = events[0]?.data.heldOutProbePlan
-      ? validateHeldOutProbePlan(HeldOutProbePlanSchema.parse(events[0].data.heldOutProbePlan))
-      : createHeldOutProbePlan(this.runId, probePlan);
+      ? validateHeldOutProbePlan(
+          HeldOutProbePlanSchema.parse(events[0].data.heldOutProbePlan),
+          this.heldOutProbePlanHashAlgorithm,
+        )
+      : createHeldOutProbePlan(this.runId, probePlan, {}, this.heldOutProbePlanHashAlgorithm);
     for (const event of events) {
       if (event.type === "graph.amended" && event.data.graph) {
         graph = GraphSchema.parse(event.data.graph);
@@ -845,6 +872,7 @@ export class RunStore {
         if (event.data.heldOutProbePlan)
           heldOutProbePlan = validateHeldOutProbePlan(
             HeldOutProbePlanSchema.parse(event.data.heldOutProbePlan),
+            this.heldOutProbePlanHashAlgorithm,
           );
       }
     }

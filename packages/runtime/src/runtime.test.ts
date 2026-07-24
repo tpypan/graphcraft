@@ -22,6 +22,7 @@ import {
   ContextSelectionReceiptSchema,
   HostTerminationError,
   LEGACY_CANONICAL_HASH_ALGORITHM,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
   REQUIRED_HOST_PROTOCOL_CAPABILITIES,
   assertRequiredHostCapabilities,
   createRunEvent,
@@ -2237,6 +2238,80 @@ process.stdin.on("end", () => {
     expect(JSON.stringify(failures)).not.toContain(outside);
   });
 
+  it("keeps portable runtime held-out integrity hashes independent of ambient collation", async () => {
+    const repository = await createRepository();
+    const runId = "40000000-0000-4000-8000-000000000002";
+    const probePlan: ProbePlan = {
+      schemaVersion: 1,
+      family: "feature",
+      items: [
+        {
+          phase: "completion",
+          purpose: "acceptance",
+          source: `${join(repository, "package.json")} script test`,
+          probe: {
+            id: "portable-runtime-integrity",
+            kind: "command",
+            command: "pnpm",
+            args: ["test"],
+            expectedExitCode: 0,
+            timeoutMs: 1_000,
+          },
+        },
+      ],
+    };
+    const identities = new Set<string>();
+    const packagePath = join(repository, "package.json");
+    const originalPackage = await readFile(packagePath, "utf8");
+
+    for (const locale of ["en-US", "sv-SE", "tr-TR"]) {
+      const localeCompare = vi
+        .spyOn(String.prototype, "localeCompare")
+        .mockImplementation(function () {
+          throw new Error(`portable hashing used ambient ${locale} collation`);
+        });
+      const heldOut = await createRuntimeHeldOutProbePlan(
+        runId,
+        probePlan,
+        repository,
+        undefined,
+        PORTABLE_CANONICAL_HASH_ALGORITHM,
+      );
+      expect(await heldOutIntegrityFailures(heldOut, repository)).toEqual([]);
+      await writeFile(
+        packagePath,
+        JSON.stringify({ name: "fixture", private: true, scripts: { test: "node changed.mjs" } }),
+      );
+      const failures = await heldOutIntegrityFailures(heldOut, repository);
+      await writeFile(packagePath, originalPackage);
+
+      identities.add(JSON.stringify({ heldOut, failures }));
+      expect(heldOut).toMatchObject({
+        schemaVersion: 2,
+        hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+        probes: [
+          {
+            integrity: expect.arrayContaining([
+              expect.objectContaining({ kind: "directory" }),
+              expect.objectContaining({ kind: "package_script" }),
+              expect.objectContaining({ kind: "file", path: "verify.mjs" }),
+            ]),
+          },
+        ],
+      });
+      expect(failures).toEqual([
+        expect.objectContaining({
+          probeId: "portable-runtime-integrity-integrity",
+          signature: expect.stringMatching(/^[a-f0-9]{64}$/),
+        }),
+      ]);
+      expect(localeCompare).not.toHaveBeenCalled();
+      localeCompare.mockRestore();
+    }
+
+    expect(identities.size).toBe(1);
+  });
+
   it("refuses an external repository-inventory path before held-out execution", async () => {
     const repository = await createRepository();
     await mkdir(join(repository, "inventory"));
@@ -2469,6 +2544,10 @@ process.stdin.on("end", () => {
       expect.objectContaining({ kind: "held_out" }),
     ]);
     const heldOut = await created.store.loadHeldOutProbePlan();
+    expect(heldOut).toMatchObject({
+      schemaVersion: 2,
+      hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+    });
     expect(heldOut.probes).toEqual([
       expect.objectContaining({ probe: expect.objectContaining({ kind: "command" }) }),
     ]);
@@ -8827,12 +8906,21 @@ process.stdin.on("end", () => {
       const current = JSON.parse(await readFile(storagePath, "utf8")) as {
         formats: Record<string, number>;
       };
+      const freshHeldOutProbePlan = await created.store.loadHeldOutProbePlan();
+      const legacyHeldOutProbePlan = await createRuntimeHeldOutProbePlan(
+        created.contract.runId,
+        created.probePlan,
+        repository,
+        undefined,
+        LEGACY_CANONICAL_HASH_ALGORITHM,
+      );
       const formats = {
         ...Object.fromEntries(
           Object.entries(current.formats).filter(
             ([key]) => key !== "artifactInventory" && key !== "artifactPolicy",
           ),
         ),
+        heldOutProbes: 1,
         events: 1,
       };
       const legacyEvents = (await created.store.loadEvents()).map((event) =>
@@ -8843,7 +8931,9 @@ process.stdin.on("end", () => {
             actor: event.actor,
             causationId: event.causationId,
             type: event.type,
-            data: event.data,
+            data: event.data.heldOutProbePlan
+              ? { ...event.data, heldOutProbePlan: legacyHeldOutProbePlan }
+              : event.data,
           },
           LEGACY_CANONICAL_HASH_ALGORITHM,
         ),
@@ -8852,6 +8942,10 @@ process.stdin.on("end", () => {
       await writeFile(
         created.store.eventsPath(),
         `${legacyEvents.map((event) => JSON.stringify(event)).join("\n")}\n`,
+      );
+      await writeFile(
+        join(created.store.runRoot, "held-out-probes.json"),
+        `${JSON.stringify(legacyHeldOutProbePlan, null, 2)}\n`,
       );
       await writeFile(
         storagePath,
@@ -8903,10 +8997,23 @@ process.stdin.on("end", () => {
         );
       }
 
+      expect(reopened.canonicalHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
+      const heldOutPath = join(created.store.runRoot, "held-out-probes.json");
+      await writeFile(heldOutPath, `${JSON.stringify(freshHeldOutProbePlan, null, 2)}\n`);
+      expect(await reopened.loadHeldOutProbePlan()).toMatchObject({ schemaVersion: 1 });
+      expect(JSON.parse(await readFile(heldOutPath, "utf8"))).toMatchObject({ schemaVersion: 1 });
       expect(JSON.parse(await readFile(storagePath, "utf8"))).toMatchObject({
         schemaVersion: 3,
         migratedFrom: 1,
+        canonicalHashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM,
+        formats: { heldOutProbes: 1, events: 1 },
       });
+      if (operation === "configure probes") {
+        const amended = (await reopened.loadEvents()).findLast(
+          ({ type, data }) => type === "graph.amended" && data.heldOutProbePlan,
+        );
+        expect(amended?.data.heldOutProbePlan).toMatchObject({ schemaVersion: 1 });
+      }
       expect(
         await readFile(
           join(
@@ -8921,6 +9028,71 @@ process.stdin.on("end", () => {
       ).toContain('"schemaVersion":1');
     },
   );
+
+  it("continues prior event-v2 and held-out-v1 storage without relabelling its plan", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a prior mixed-v3 compatibility feature", {
+      cwd: repository,
+    });
+    const legacyHeldOutProbePlan = await createRuntimeHeldOutProbePlan(
+      created.contract.runId,
+      created.probePlan,
+      repository,
+      undefined,
+      LEGACY_CANONICAL_HASH_ALGORITHM,
+    );
+    const priorEvents = (await created.store.loadEvents()).map((event) =>
+      createRunEvent(
+        {
+          sequence: event.sequence,
+          timestamp: event.timestamp,
+          actor: event.actor,
+          causationId: event.causationId,
+          type: event.type,
+          data: event.data.heldOutProbePlan
+            ? { ...event.data, heldOutProbePlan: legacyHeldOutProbePlan }
+            : event.data,
+        },
+        PORTABLE_CANONICAL_HASH_ALGORITHM,
+      ),
+    );
+    await writeFile(
+      created.store.eventsPath(),
+      `${priorEvents.map((event) => JSON.stringify(event)).join("\n")}\n`,
+    );
+    await writeFile(
+      join(created.store.runRoot, "held-out-probes.json"),
+      `${JSON.stringify(legacyHeldOutProbePlan, null, 2)}\n`,
+    );
+    const storagePath = join(created.store.runRoot, "storage.json");
+    const manifest = JSON.parse(await readFile(storagePath, "utf8")) as {
+      formats: { heldOutProbes: number };
+    };
+    manifest.formats.heldOutProbes = 1;
+    await writeFile(storagePath, `${JSON.stringify(manifest, null, 2)}\n`);
+    const priorEventBytes = await readFile(created.store.eventsPath());
+
+    const reopened = new RunStore(repository, created.store.runId);
+    await configureRunProbes(reopened, created.probePlan);
+
+    expect(reopened.canonicalHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    expect(reopened.heldOutProbePlanHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
+    expect(await reopened.loadHeldOutProbePlan()).toMatchObject({ schemaVersion: 1 });
+    const continuedEvents = await reopened.loadEvents();
+    expect(continuedEvents.slice(0, priorEvents.length)).toEqual(priorEvents);
+    expect(
+      (await readFile(created.store.eventsPath())).subarray(0, priorEventBytes.length),
+    ).toEqual(priorEventBytes);
+    expect(continuedEvents.at(-1)).toMatchObject({
+      schemaVersion: 2,
+      type: "graph.amended",
+      data: { heldOutProbePlan: { schemaVersion: 1 } },
+    });
+    expect(JSON.parse(await readFile(storagePath, "utf8"))).toMatchObject({
+      canonicalHashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+      formats: { heldOutProbes: 1, events: 2 },
+    });
+  });
 
   it("refuses a future storage schema without changing durable run files", async () => {
     const repository = await createRepository();

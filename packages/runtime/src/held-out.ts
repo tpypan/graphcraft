@@ -1,7 +1,11 @@
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import {
+  LEGACY_CANONICAL_HASH_ALGORITHM,
   contentHash,
   createHeldOutProbePlan,
+  heldOutProbePlanHashAlgorithm,
+  validateHeldOutProbePlan,
+  type CanonicalHashAlgorithm,
   type HeldOutProbeIntegrity,
   type HeldOutProbePlan,
   type ProbePlan,
@@ -38,6 +42,7 @@ function relativeRepositoryDirectoryPath(
 async function directoryValueHash(
   repositoryRoot: string,
   path: string,
+  algorithm: CanonicalHashAlgorithm,
   signal?: AbortSignal,
 ): Promise<string> {
   const [canonicalRoot, canonicalPath] = await Promise.all([
@@ -48,16 +53,20 @@ async function directoryValueHash(
   const target = relative(canonicalRoot, canonicalPath);
   if (isAbsolute(target) || target === ".." || target.startsWith(`..${sep}`))
     throw new Error(`Completion working directory ${path} escapes the repository`);
-  return contentHash({
-    path,
-    target: target ? target.split(sep).join("/") : ".",
-  });
+  return contentHash(
+    {
+      path,
+      target: target ? target.split(sep).join("/") : ".",
+    },
+    algorithm,
+  );
 }
 
 async function gitObjectValueHash(
   repositoryRoot: string,
   path: string,
   contents: Buffer,
+  algorithm: CanonicalHashAlgorithm,
   signal?: AbortSignal,
 ): Promise<string> {
   signal?.throwIfAborted();
@@ -78,13 +87,14 @@ async function gitObjectValueHash(
   const objectHash = result.stdout.trim();
   if (!/^[a-f0-9]{40,64}$/.test(objectHash))
     throw new Error(`Unable to establish held-out integrity for ${path}`);
-  return contentHash({ path, objectHash });
+  return contentHash({ path, objectHash }, algorithm);
 }
 
 async function fileValueHash(
   repositoryRoot: string,
   path: string,
-  algorithm: "git_hash_object" | undefined,
+  fileAlgorithm: "git_hash_object" | undefined,
+  canonicalHashAlgorithm: CanonicalHashAlgorithm,
   signal?: AbortSignal,
 ): Promise<string> {
   let contents: Buffer;
@@ -95,12 +105,15 @@ async function fileValueHash(
   } catch (error) {
     signal?.throwIfAborted();
     if (isRepositoryFileError(error, "missing", "not_file"))
-      return contentHash({ missing: true, path, ...(algorithm ? { algorithm } : {}) });
+      return contentHash(
+        { missing: true, path, ...(fileAlgorithm ? { algorithm: fileAlgorithm } : {}) },
+        canonicalHashAlgorithm,
+      );
     throw error;
   }
-  if (algorithm === "git_hash_object")
-    return await gitObjectValueHash(repositoryRoot, path, contents, signal);
-  return contentHash({ path, contents: contents.toString("base64") });
+  if (fileAlgorithm === "git_hash_object")
+    return await gitObjectValueHash(repositoryRoot, path, contents, canonicalHashAlgorithm, signal);
+  return contentHash({ path, contents: contents.toString("base64") }, canonicalHashAlgorithm);
 }
 
 function possibleFileArguments(values: string[]): string[] {
@@ -117,6 +130,7 @@ async function fileIntegrity(
   repositoryRoot: string,
   cwd: string | undefined,
   values: string[],
+  algorithm: CanonicalHashAlgorithm,
   signal?: AbortSignal,
 ): Promise<HeldOutProbeIntegrity[]> {
   const result: HeldOutProbeIntegrity[] = [];
@@ -137,7 +151,7 @@ async function fileIntegrity(
       kind: "file",
       path,
       algorithm: "git_hash_object",
-      valueHash: await fileValueHash(repositoryRoot, path, "git_hash_object", signal),
+      valueHash: await fileValueHash(repositoryRoot, path, "git_hash_object", algorithm, signal),
     });
   }
   return result;
@@ -148,6 +162,7 @@ export async function createRuntimeHeldOutProbePlan(
   probePlan: ProbePlan,
   repositoryRoot: string,
   signal?: AbortSignal,
+  algorithm: CanonicalHashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM,
 ): Promise<HeldOutProbePlan> {
   const integrity: Record<string, HeldOutProbeIntegrity[]> = {};
   for (const item of probePlan.items.filter(({ phase }) => phase === "completion")) {
@@ -162,10 +177,16 @@ export async function createRuntimeHeldOutProbePlan(
       protectedValues.push({
         kind: "directory",
         path: cwd,
-        valueHash: await directoryValueHash(repositoryRoot, cwd, signal),
+        valueHash: await directoryValueHash(repositoryRoot, cwd, algorithm, signal),
       });
       protectedValues.push(
-        ...(await fileIntegrity(repositoryRoot, item.probe.cwd, item.probe.args, signal)),
+        ...(await fileIntegrity(
+          repositoryRoot,
+          item.probe.cwd,
+          item.probe.args,
+          algorithm,
+          signal,
+        )),
       );
     }
     if (item.probe.kind === "repository_inventory")
@@ -191,13 +212,19 @@ export async function createRuntimeHeldOutProbePlan(
       kind: "package_script",
       path: manifestPath,
       script,
-      valueHash: contentHash({ path: manifestPath, script, value }),
+      valueHash: contentHash({ path: manifestPath, script, value }, algorithm),
     });
     const scriptDirectory = manifestPath.includes("/")
       ? manifestPath.slice(0, manifestPath.lastIndexOf("/"))
       : undefined;
     protectedValues.push(
-      ...(await fileIntegrity(repositoryRoot, scriptDirectory, value.split(/\s+/), signal)),
+      ...(await fileIntegrity(
+        repositoryRoot,
+        scriptDirectory,
+        value.split(/\s+/),
+        algorithm,
+        signal,
+      )),
     );
     const unique = new Map(
       protectedValues.map((entry) => [
@@ -207,7 +234,7 @@ export async function createRuntimeHeldOutProbePlan(
     );
     integrity[item.probe.id] = [...unique.values()];
   }
-  return createHeldOutProbePlan(runId, probePlan, integrity);
+  return createHeldOutProbePlan(runId, probePlan, integrity, algorithm);
 }
 
 export async function heldOutIntegrityFailures(
@@ -215,8 +242,10 @@ export async function heldOutIntegrityFailures(
   repositoryPath: string,
   signal?: AbortSignal,
 ): Promise<ProbeResult[]> {
+  const heldOutPlan = validateHeldOutProbePlan(plan);
+  const algorithm = heldOutProbePlanHashAlgorithm(heldOutPlan);
   const failures: ProbeResult[] = [];
-  for (const entry of plan.probes) {
+  for (const entry of heldOutPlan.probes) {
     signal?.throwIfAborted();
     const changedKinds = new Set<string>();
     let signature = "";
@@ -226,11 +255,14 @@ export async function heldOutIntegrityFailures(
       } catch (error) {
         signal?.throwIfAborted();
         changedKinds.add("repository_path");
-        signature += contentHash({
-          probeId: entry.probe.id,
-          kind: "repository_path",
-          reason: isRepositoryFileError(error) ? error.kind : "invalid",
-        });
+        signature += contentHash(
+          {
+            probeId: entry.probe.id,
+            kind: "repository_path",
+            reason: isRepositoryFileError(error) ? error.kind : "invalid",
+          },
+          algorithm,
+        );
       }
     }
     for (const integrity of entry.integrity) {
@@ -247,26 +279,33 @@ export async function heldOutIntegrityFailures(
           };
           const value = manifest.scripts?.[integrity.script];
           actualHash = value
-            ? contentHash({ path: integrity.path, script: integrity.script, value })
-            : contentHash({ missing: true, path: integrity.path, script: integrity.script });
+            ? contentHash({ path: integrity.path, script: integrity.script, value }, algorithm)
+            : contentHash(
+                { missing: true, path: integrity.path, script: integrity.script },
+                algorithm,
+              );
         } else if (integrity.kind === "directory") {
-          actualHash = await directoryValueHash(repositoryPath, integrity.path, signal);
+          actualHash = await directoryValueHash(repositoryPath, integrity.path, algorithm, signal);
         } else {
           actualHash = await fileValueHash(
             repositoryPath,
             integrity.path,
             integrity.algorithm,
+            algorithm,
             signal,
           );
         }
       } catch (error) {
         signal?.throwIfAborted();
-        actualHash = contentHash({
-          unavailable: true,
-          path: integrity.path,
-          kind: integrity.kind,
-          reason: isRepositoryFileError(error) ? error.kind : "invalid",
-        });
+        actualHash = contentHash(
+          {
+            unavailable: true,
+            path: integrity.path,
+            kind: integrity.kind,
+            reason: isRepositoryFileError(error) ? error.kind : "invalid",
+          },
+          algorithm,
+        );
       }
       if (actualHash === integrity.valueHash) continue;
       changedKinds.add(integrity.kind);
@@ -285,7 +324,7 @@ export async function heldOutIntegrityFailures(
         probeId: `${entry.probe.id}-integrity`,
         kind: "file",
         passed: false,
-        signature: contentHash(signature),
+        signature: contentHash(signature, algorithm),
         summary: `Approved completion check ${entry.probe.id} changed or was removed; restore its ${detail}`,
         durationMs: 0,
       });
