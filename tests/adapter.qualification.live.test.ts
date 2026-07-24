@@ -2,6 +2,8 @@
  * Opt in by setting GRAPHCRAFT_LIVE_QUALIFICATION_HOSTS and
  * GRAPHCRAFT_LIVE_QUALIFICATION_OUTPUT_PATH. For every selected host, also set
  * GRAPHCRAFT_LIVE_QUALIFICATION_<HOST>_RAW_VERSION, _MODEL, and _EFFORT.
+ * Optionally set GRAPHCRAFT_LIVE_QUALIFICATION_PROTOCOL_EVIDENCE_PATH to an
+ * absolute, normalized, not-yet-existing directory outside the source repository.
  * Setting any variable in this namespace activates fail-closed configuration validation.
  * Run this file with `pnpm vitest run tests/adapter.qualification.live.test.ts`.
  */
@@ -47,6 +49,7 @@ import {
   codexWorkerResultJsonSchema,
   compilePlannedGraph,
   compileRunContract,
+  contentHash,
   discoverRepositoryTrustRoots,
   renderPlannerPrompt,
   renderSemanticVerifierPrompt,
@@ -64,6 +67,12 @@ import {
 } from "../packages/core/src/index.ts";
 import { runProbe } from "../packages/probes/src/index.ts";
 import { writeJsonAtomic } from "../packages/runtime/src/json.ts";
+import {
+  buildSanitizedLiveProtocolEvidence,
+  verifyLiveQualificationEvidenceBinding,
+  writeSanitizedLiveProtocolEvidence,
+  type SanitizedLiveProtocolEvidence,
+} from "./live-qualification-protocol-evidence.ts";
 
 const execFileAsync = promisify(execFile);
 const QUALIFICATION_PREFIX = "GRAPHCRAFT_LIVE_QUALIFICATION_";
@@ -87,6 +96,7 @@ interface HostConfiguration {
 interface QualificationConfiguration {
   hosts: HostConfiguration[];
   outputPath: string;
+  protocolEvidencePath?: string;
 }
 
 interface UsageNumbers {
@@ -171,6 +181,7 @@ interface NativeProcessResult {
 
 interface NativeWorkerResult {
   events: HostEvent[];
+  nativeEvents: Record<string, unknown>[];
   nativeEventCount: number;
   streamingEvidence: boolean;
   sessionId?: string;
@@ -245,11 +256,25 @@ function parseConfiguration(): QualificationConfiguration {
     return { host, rawVersion, model, effort: effortValue as Effort };
   });
   const configuredOutputPath = requiredEnvironment(`${QUALIFICATION_PREFIX}OUTPUT_PATH`);
+  const protocolEvidencePath = process.env[`${QUALIFICATION_PREFIX}PROTOCOL_EVIDENCE_PATH`];
+  if (protocolEvidencePath !== undefined) {
+    if (
+      protocolEvidencePath.length === 0 ||
+      protocolEvidencePath !== protocolEvidencePath.trim() ||
+      !isAbsolute(protocolEvidencePath) ||
+      resolve(protocolEvidencePath) !== protocolEvidencePath
+    ) {
+      throw new Error(
+        `${QUALIFICATION_PREFIX}PROTOCOL_EVIDENCE_PATH must be an absolute normalized path`,
+      );
+    }
+  }
   return {
     hosts,
     outputPath: isAbsolute(configuredOutputPath)
       ? configuredOutputPath
       : resolve(process.cwd(), configuredOutputPath),
+    ...(protocolEvidencePath ? { protocolEvidencePath } : {}),
   };
 }
 
@@ -545,6 +570,7 @@ async function runWorker(
   request: WorkerRequest,
   abortAfterSession: boolean,
   executable: string,
+  captureNativeEvents = false,
 ): Promise<NativeWorkerResult> {
   return await withCodexSchema(
     configuration.host,
@@ -558,6 +584,7 @@ async function runWorker(
       const events: HostEvent[] = [
         HostEventSchema.parse({ type: "started", invocationId: request.invocationId }),
       ];
+      const nativeEvents: Record<string, unknown>[] = [];
       let nativeEventCount = 0;
       let observedSessionId: string | undefined;
       let sessionReported = false;
@@ -569,6 +596,7 @@ async function runWorker(
         request.repositoryPath,
         configuration.host === "codex" ? renderWorkerPrompt(request.capsule) : undefined,
         (event, abort) => {
+          if (captureNativeEvents) nativeEvents.push(event);
           nativeEventCount += 1;
           const type = String(event.type ?? "");
           if (configuration.host === "codex") {
@@ -679,6 +707,7 @@ async function runWorker(
       }
       return {
         events,
+        nativeEvents,
         nativeEventCount,
         streamingEvidence,
         ...(observedSessionId ? { sessionId: observedSessionId } : {}),
@@ -748,10 +777,15 @@ async function qualifyHost(
   request: PlanningRequest,
   workerRequest: WorkerRequest,
   fixtureTreeSha256: string,
+  captureProtocolEvidence: boolean,
 ): Promise<{
   report: HostQualification;
   rawSessionId: string;
   rawContinuityToken: string;
+  protocolCapture?: {
+    interruptedWorker: Record<string, unknown>[];
+    resumedWorker: Record<string, unknown>[];
+  };
 }> {
   const startedAt = new Date().toISOString();
   const repositoryPaths = [
@@ -832,7 +866,13 @@ async function qualifyHost(
   };
   if (JSON.stringify(interruptionRequest).includes(rawContinuityToken))
     throw new Error("The interruption request leaked the continuity token");
-  const interrupted = await runWorker(configuration, interruptionRequest, true, executable);
+  const interrupted = await runWorker(
+    configuration,
+    interruptionRequest,
+    true,
+    executable,
+    captureProtocolEvidence,
+  );
   if (interrupted.sessionId !== rawSessionId)
     throw new Error(`${configuration.host} changed session identity before interruption`);
   const terminated = interrupted.events.findLast((event) => event.type === "terminated");
@@ -862,7 +902,13 @@ async function qualifyHost(
   };
   if (JSON.stringify(resumeRequest).includes(rawContinuityToken))
     throw new Error("The resume request leaked the continuity token");
-  const resumed = await runWorker(configuration, resumeRequest, false, executable);
+  const resumed = await runWorker(
+    configuration,
+    resumeRequest,
+    false,
+    executable,
+    captureProtocolEvidence,
+  );
   if (resumed.sessionId !== rawSessionId)
     throw new Error(`${configuration.host} did not resume the exact interrupted session`);
   const resultEvent = resumed.events.findLast((event) => event.type === "result");
@@ -930,6 +976,14 @@ async function qualifyHost(
   return {
     rawSessionId,
     rawContinuityToken,
+    ...(captureProtocolEvidence
+      ? {
+          protocolCapture: {
+            interruptedWorker: interrupted.nativeEvents,
+            resumedWorker: resumed.nativeEvents,
+          },
+        }
+      : {}),
     report: {
       control: {
         rawVersion: configuration.rawVersion,
@@ -1348,6 +1402,15 @@ describe.skipIf(!qualificationRequested)("candidate host live qualification", ()
         };
 
         const results: Partial<Record<Host, HostQualification>> = {};
+        const protocolCaptures: Partial<
+          Record<
+            Host,
+            {
+              interruptedWorker: Record<string, unknown>[];
+              resumedWorker: Record<string, unknown>[];
+            }
+          >
+        > = {};
         const rawSessionIds: string[] = [];
         const rawContinuityTokens: string[] = [];
         for (const host of configuration.hosts) {
@@ -1356,8 +1419,10 @@ describe.skipIf(!qualificationRequested)("candidate host live qualification", ()
             planningRequest,
             workerRequest,
             fixture.treeSha256,
+            configuration.protocolEvidencePath !== undefined,
           );
           results[host.host] = result.report;
+          if (result.protocolCapture) protocolCaptures[host.host] = result.protocolCapture;
           rawSessionIds.push(result.rawSessionId);
           rawContinuityTokens.push(result.rawContinuityToken);
         }
@@ -1386,6 +1451,57 @@ describe.skipIf(!qualificationRequested)("candidate host live qualification", ()
           JSON.parse(await readFile(configuration.outputPath, "utf8")),
         );
         assertReportControls(persisted, controls, configuration.hosts);
+        if (configuration.protocolEvidencePath) {
+          const reportBytes = await readFile(configuration.outputPath);
+          const evidence: SanitizedLiveProtocolEvidence[] = configuration.hosts.map(
+            (hostConfiguration) => {
+              const hostReport = persisted.hosts[hostConfiguration.host];
+              const capture = protocolCaptures[hostConfiguration.host];
+              if (!hostReport || !capture)
+                throw new Error(
+                  `${hostConfiguration.host} protocol evidence lacks a successful qualification binding`,
+                );
+              const binding = {
+                hashAlgorithms: {
+                  qualificationReport: "sha256-exact-bytes-v1" as const,
+                  hostQualification: "graphcraft-canonical-json-sha256-v1" as const,
+                },
+                qualificationReportSha256: sha256(reportBytes),
+                hostQualificationSha256: contentHash(hostReport),
+                qualificationReportSchemaVersion: persisted.schemaVersion,
+                qualificationReportKind: persisted.kind,
+                qualificationCompletedAt: persisted.completedAt,
+                source: controls,
+                control: hostReport.control,
+              };
+              verifyLiveQualificationEvidenceBinding({
+                host: hostConfiguration.host,
+                binding,
+                qualificationReportBytes: reportBytes,
+              });
+              return buildSanitizedLiveProtocolEvidence({
+                host: hostConfiguration.host,
+                binding,
+                interruptedWorker: capture.interruptedWorker,
+                resumedWorker: capture.resumedWorker,
+                expectedUsage: hostReport.usageSummary.resumedWorker,
+                prohibitedValues: [
+                  QUALIFICATION_TASK,
+                  sourceRoot,
+                  fixture.root,
+                  configuration.outputPath,
+                  ...rawSessionIds,
+                  ...rawContinuityTokens,
+                ],
+              });
+            },
+          );
+          await writeSanitizedLiveProtocolEvidence({
+            outputPath: configuration.protocolEvidencePath,
+            evidence,
+            forbiddenRoots: [sourceRoot, fixture.root],
+          });
+        }
       } finally {
         await rm(fixture.root, { recursive: true, force: true });
       }

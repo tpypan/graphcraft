@@ -23,6 +23,11 @@ import {
   type HostEvent,
   type WorkerRequest,
 } from "../packages/core/src/index.ts";
+import {
+  buildSanitizedLiveProtocolEvidence,
+  protocolEventsJsonl,
+  type LiveQualificationEvidenceBinding,
+} from "./live-qualification-protocol-evidence.ts";
 
 type Host = "codex" | "claude";
 
@@ -194,6 +199,37 @@ function observedSessionIds(host: Host, events: Record<string, unknown>[]): stri
 
 function replaceSessionIdentity(fixture: ProtocolFixture, replacement: string): string {
   return fixture.resumedWorker.replaceAll(fixture.manifest.sessionPlaceholder, replacement);
+}
+
+function liveEvidenceBinding(fixture: ProtocolFixture): LiveQualificationEvidenceBinding {
+  return {
+    hashAlgorithms: {
+      qualificationReport: "sha256-exact-bytes-v1",
+      hostQualification: "graphcraft-canonical-json-sha256-v1",
+    },
+    qualificationReportSha256: "a".repeat(64),
+    hostQualificationSha256: "b".repeat(64),
+    qualificationReportSchemaVersion: 1,
+    qualificationReportKind: "graphcraft-live-host-qualification",
+    qualificationCompletedAt: "2026-07-24T00:00:00.000Z",
+    source: {
+      graphcraftPackageVersion: "0.1.2",
+      sourceGitHead: "c".repeat(40),
+      sourceGitStatus: "clean",
+      platform: process.platform,
+      arch: process.arch,
+      node: process.version,
+      fixtureGitHead: "d".repeat(40),
+      fixtureTreeSha256: "e".repeat(64),
+      taskSha256: "f".repeat(64),
+      fixtureTaskSha256: "1".repeat(64),
+    },
+    control: {
+      rawVersion: fixture.manifest.reportedVersion,
+      model: "fixture-model",
+      effort: "high",
+    },
+  };
 }
 
 function removeSessionIdentity(host: Host, raw: string): string {
@@ -411,6 +447,66 @@ describe("versioned host protocol contract fixtures", () => {
           ),
         ).toEqual(["--resume", fixture.manifest.sessionPlaceholder]);
       }
+    },
+  );
+
+  it.each(["codex-cli-0.144.6", "claude-code-2.1.212"])(
+    "replays sanitized live qualification evidence derived from %s",
+    async (directory) => {
+      const fixture = await loadFixture(directory);
+      const evidence = buildSanitizedLiveProtocolEvidence({
+        host: fixture.manifest.host,
+        binding: liveEvidenceBinding(fixture),
+        interruptedWorker: protocolObjects(fixture.interruptedWorker),
+        resumedWorker: protocolObjects(fixture.resumedWorker),
+        expectedUsage: fixture.manifest.expected.normalizedUsage,
+        prohibitedValues: [fixture.manifest.sessionPlaceholder],
+      });
+      const adapter = adapterFor(fixture.manifest.host);
+      const initialRequest = workerRequest(
+        undefined,
+        evidence.sessionPlaceholder as WorkerRequest["invocationId"],
+      );
+
+      queueReadyCapabilityProbe(fixture);
+      const interruptedChild = queueInterruptedChild(
+        protocolEventsJsonl(evidence.captures.interruptedWorker),
+      );
+      const cancellation = new AbortController();
+      const interruptedEvents: HostEvent[] = [];
+      for await (const event of adapter.execute(initialRequest, cancellation.signal)) {
+        interruptedEvents.push(event);
+        if (event.type === "session" && !cancellation.signal.aborted)
+          cancellation.abort({ cause: "user_pause", reason: "Sanitized capture boundary" });
+      }
+      expect(interruptedEvents).toContainEqual({
+        type: "session",
+        hostSessionId: evidence.sessionPlaceholder,
+      });
+      expect(interruptedEvents).toContainEqual(expect.objectContaining({ type: "tool" }));
+      expect(interruptedEvents.at(-1)).toMatchObject({
+        type: "terminated",
+        termination: { cause: "user_pause" },
+      });
+      expect(interruptedChild.kill).toHaveBeenCalledWith("SIGTERM");
+
+      queueReadyCapabilityProbe(fixture);
+      queueSettledChild(protocolEventsJsonl(evidence.captures.resumedWorker));
+      const resumedEvents = await collectEvents(
+        adapter.execute(workerRequest(evidence.sessionPlaceholder), new AbortController().signal),
+      );
+      expect(resumedEvents).toContainEqual({
+        type: "session",
+        hostSessionId: evidence.sessionPlaceholder,
+      });
+      expect(resumedEvents).toContainEqual({
+        type: "usage",
+        usage: expect.objectContaining(evidence.expected.normalizedUsage),
+      });
+      expect(resumedEvents.at(-1)).toMatchObject({
+        type: "result",
+        result: { status: "completed", changedPaths: [] },
+      });
     },
   );
 
