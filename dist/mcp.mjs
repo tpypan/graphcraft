@@ -2992,7 +2992,7 @@ var require_compile = __commonJS({
       const schOrFunc = root.refs[ref];
       if (schOrFunc)
         return schOrFunc;
-      let _sch = resolve14.call(this, root, ref);
+      let _sch = resolve15.call(this, root, ref);
       if (_sch === void 0) {
         const schema = (_a3 = root.localRefs) === null || _a3 === void 0 ? void 0 : _a3[ref];
         const { schemaId } = this.opts;
@@ -3019,7 +3019,7 @@ var require_compile = __commonJS({
     function sameSchemaEnv(s1, s2) {
       return s1.schema === s2.schema && s1.root === s2.root && s1.baseId === s2.baseId;
     }
-    function resolve14(root, ref) {
+    function resolve15(root, ref) {
       let sch;
       while (typeof (sch = this.refs[ref]) == "string")
         ref = sch;
@@ -3650,55 +3650,55 @@ var require_fast_uri = __commonJS({
       }
       return uri;
     }
-    function resolve14(baseURI, relativeURI, options) {
+    function resolve15(baseURI, relativeURI, options) {
       const schemelessOptions = options ? Object.assign({ scheme: "null" }, options) : { scheme: "null" };
       const resolved = resolveComponent(parse3(baseURI, schemelessOptions), parse3(relativeURI, schemelessOptions), schemelessOptions, true);
       schemelessOptions.skipEscape = true;
       return serialize(resolved, schemelessOptions);
     }
-    function resolveComponent(base, relative10, options, skipNormalization) {
+    function resolveComponent(base, relative11, options, skipNormalization) {
       const target = {};
       if (!skipNormalization) {
         base = parse3(serialize(base, options), options);
-        relative10 = parse3(serialize(relative10, options), options);
+        relative11 = parse3(serialize(relative11, options), options);
       }
       options = options || {};
-      if (!options.tolerant && relative10.scheme) {
-        target.scheme = relative10.scheme;
-        target.userinfo = relative10.userinfo;
-        target.host = relative10.host;
-        target.port = relative10.port;
-        target.path = removeDotSegments(relative10.path || "");
-        target.query = relative10.query;
+      if (!options.tolerant && relative11.scheme) {
+        target.scheme = relative11.scheme;
+        target.userinfo = relative11.userinfo;
+        target.host = relative11.host;
+        target.port = relative11.port;
+        target.path = removeDotSegments(relative11.path || "");
+        target.query = relative11.query;
       } else {
-        if (relative10.userinfo !== void 0 || relative10.host !== void 0 || relative10.port !== void 0) {
-          target.userinfo = relative10.userinfo;
-          target.host = relative10.host;
-          target.port = relative10.port;
-          target.path = removeDotSegments(relative10.path || "");
-          target.query = relative10.query;
+        if (relative11.userinfo !== void 0 || relative11.host !== void 0 || relative11.port !== void 0) {
+          target.userinfo = relative11.userinfo;
+          target.host = relative11.host;
+          target.port = relative11.port;
+          target.path = removeDotSegments(relative11.path || "");
+          target.query = relative11.query;
         } else {
-          if (!relative10.path) {
+          if (!relative11.path) {
             target.path = base.path;
-            if (relative10.query !== void 0) {
-              target.query = relative10.query;
+            if (relative11.query !== void 0) {
+              target.query = relative11.query;
             } else {
               target.query = base.query;
             }
           } else {
-            if (relative10.path[0] === "/") {
-              target.path = removeDotSegments(relative10.path);
+            if (relative11.path[0] === "/") {
+              target.path = removeDotSegments(relative11.path);
             } else {
               if ((base.userinfo !== void 0 || base.host !== void 0 || base.port !== void 0) && !base.path) {
-                target.path = "/" + relative10.path;
+                target.path = "/" + relative11.path;
               } else if (!base.path) {
-                target.path = relative10.path;
+                target.path = relative11.path;
               } else {
-                target.path = base.path.slice(0, base.path.lastIndexOf("/") + 1) + relative10.path;
+                target.path = base.path.slice(0, base.path.lastIndexOf("/") + 1) + relative11.path;
               }
               target.path = removeDotSegments(target.path);
             }
-            target.query = relative10.query;
+            target.query = relative11.query;
           }
           target.userinfo = base.userinfo;
           target.host = base.host;
@@ -3706,7 +3706,7 @@ var require_fast_uri = __commonJS({
         }
         target.scheme = base.scheme;
       }
-      target.fragment = relative10.fragment;
+      target.fragment = relative11.fragment;
       return target;
     }
     function equal(uriA, uriB, options) {
@@ -3914,7 +3914,7 @@ var require_fast_uri = __commonJS({
     var fastUri = {
       SCHEMES,
       normalize,
-      resolve: resolve14,
+      resolve: resolve15,
       resolveComponent,
       equal,
       serialize,
@@ -6926,15 +6926,15 @@ var require_windows = __commonJS({
       }
       return false;
     }
-    function checkStat(stat5, path, options) {
-      if (!stat5.isSymbolicLink() && !stat5.isFile()) {
+    function checkStat(stat4, path, options) {
+      if (!stat4.isSymbolicLink() && !stat4.isFile()) {
         return false;
       }
       return checkPathExt(path, options);
     }
     function isexe(path, options, cb) {
-      fs.stat(path, function(er, stat5) {
-        cb(er, er ? false : checkStat(stat5, path, options));
+      fs.stat(path, function(er, stat4) {
+        cb(er, er ? false : checkStat(stat4, path, options));
       });
     }
     function sync(path, options) {
@@ -6950,20 +6950,20 @@ var require_mode = __commonJS({
     isexe.sync = sync;
     var fs = __require("fs");
     function isexe(path, options, cb) {
-      fs.stat(path, function(er, stat5) {
-        cb(er, er ? false : checkStat(stat5, options));
+      fs.stat(path, function(er, stat4) {
+        cb(er, er ? false : checkStat(stat4, options));
       });
     }
     function sync(path, options) {
       return checkStat(fs.statSync(path), options);
     }
-    function checkStat(stat5, options) {
-      return stat5.isFile() && checkMode(stat5, options);
+    function checkStat(stat4, options) {
+      return stat4.isFile() && checkMode(stat4, options);
     }
-    function checkMode(stat5, options) {
-      var mod = stat5.mode;
-      var uid = stat5.uid;
-      var gid = stat5.gid;
+    function checkMode(stat4, options) {
+      var mod = stat4.mode;
+      var uid = stat4.uid;
+      var gid = stat4.gid;
       var myUid = options.uid !== void 0 ? options.uid : process.getuid && process.getuid();
       var myGid = options.gid !== void 0 ? options.gid : process.getgid && process.getgid();
       var u = parseInt("100", 8);
@@ -6997,12 +6997,12 @@ var require_isexe = __commonJS({
         if (typeof Promise !== "function") {
           throw new TypeError("callback not provided");
         }
-        return new Promise(function(resolve14, reject) {
+        return new Promise(function(resolve15, reject) {
           isexe(path, options || {}, function(er, is) {
             if (er) {
               reject(er);
             } else {
-              resolve14(is);
+              resolve15(is);
             }
           });
         });
@@ -7068,27 +7068,27 @@ var require_which = __commonJS({
         opt = {};
       const { pathEnv, pathExt, pathExtExe } = getPathInfo(cmd, opt);
       const found = [];
-      const step = (i) => new Promise((resolve14, reject) => {
+      const step = (i) => new Promise((resolve15, reject) => {
         if (i === pathEnv.length)
-          return opt.all && found.length ? resolve14(found) : reject(getNotFoundError(cmd));
+          return opt.all && found.length ? resolve15(found) : reject(getNotFoundError(cmd));
         const ppRaw = pathEnv[i];
         const pathPart = /^".*"$/.test(ppRaw) ? ppRaw.slice(1, -1) : ppRaw;
         const pCmd = path.join(pathPart, cmd);
         const p = !pathPart && /^\.[\\\/]/.test(cmd) ? cmd.slice(0, 2) + pCmd : pCmd;
-        resolve14(subStep(p, i, 0));
+        resolve15(subStep(p, i, 0));
       });
-      const subStep = (p, i, ii) => new Promise((resolve14, reject) => {
+      const subStep = (p, i, ii) => new Promise((resolve15, reject) => {
         if (ii === pathExt.length)
-          return resolve14(step(i + 1));
+          return resolve15(step(i + 1));
         const ext = pathExt[ii];
         isexe(p + ext, { pathExt: pathExtExe }, (er, is) => {
           if (!er && is) {
             if (opt.all)
               found.push(p + ext);
             else
-              return resolve14(p + ext);
+              return resolve15(p + ext);
           }
-          return resolve14(subStep(p, i, ii + 1));
+          return resolve15(subStep(p, i, ii + 1));
         });
       });
       return cb ? step(0).then((res) => cb(null, res), cb) : step(0);
@@ -23526,12 +23526,12 @@ var StdioServerTransport = class {
     this.onclose?.();
   }
   send(message) {
-    return new Promise((resolve14) => {
+    return new Promise((resolve15) => {
       const json2 = serializeMessage(message);
       if (this._stdout.write(json2)) {
-        resolve14();
+        resolve15();
       } else {
-        this._stdout.once("drain", resolve14);
+        this._stdout.once("drain", resolve15);
       }
     });
   }
@@ -29434,7 +29434,7 @@ var Protocol = class {
           return;
         }
         const pollInterval = task2.pollInterval ?? this._options?.defaultTaskPollInterval ?? 1e3;
-        await new Promise((resolve14) => setTimeout(resolve14, pollInterval));
+        await new Promise((resolve15) => setTimeout(resolve15, pollInterval));
         options?.signal?.throwIfAborted();
       }
     } catch (error51) {
@@ -29451,7 +29451,7 @@ var Protocol = class {
    */
   request(request, resultSchema, options) {
     const { relatedRequestId, resumptionToken, onresumptiontoken, task, relatedTask } = options ?? {};
-    return new Promise((resolve14, reject) => {
+    return new Promise((resolve15, reject) => {
       const earlyReject = (error51) => {
         reject(error51);
       };
@@ -29529,7 +29529,7 @@ var Protocol = class {
           if (!parseResult2.success) {
             reject(parseResult2.error);
           } else {
-            resolve14(parseResult2.data);
+            resolve15(parseResult2.data);
           }
         } catch (error51) {
           reject(error51);
@@ -29790,12 +29790,12 @@ var Protocol = class {
       }
     } catch {
     }
-    return new Promise((resolve14, reject) => {
+    return new Promise((resolve15, reject) => {
       if (signal.aborted) {
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
         return;
       }
-      const timeoutId = setTimeout(resolve14, interval);
+      const timeoutId = setTimeout(resolve15, interval);
       signal.addEventListener("abort", () => {
         clearTimeout(timeoutId);
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
@@ -30895,7 +30895,7 @@ var McpServer = class {
     let task = createTaskResult.task;
     const pollInterval = task.pollInterval ?? 5e3;
     while (task.status !== "completed" && task.status !== "failed" && task.status !== "cancelled") {
-      await new Promise((resolve14) => setTimeout(resolve14, pollInterval));
+      await new Promise((resolve15) => setTimeout(resolve15, pollInterval));
       const updatedTask = await extra.taskStore.getTask(taskId);
       if (!updatedTask) {
         throw new McpError(ErrorCode.InternalError, `Task ${taskId} not found during polling`);
@@ -31467,12 +31467,12 @@ var EMPTY_COMPLETION_RESULT = {
 import { createInterface } from "node:readline/promises";
 import { createHash as createHash6, randomUUID as randomUUID10 } from "node:crypto";
 import {
-  access as access3,
+  access as access2,
   chmod as chmod2,
-  lstat as lstat10,
+  lstat as lstat11,
   mkdir as mkdir5,
   mkdtemp as mkdtemp2,
-  open as open9,
+  open as open10,
   readdir as readdir6,
   rename as rename3,
   rm as rm4,
@@ -31480,7 +31480,7 @@ import {
 } from "node:fs/promises";
 import { homedir, platform, tmpdir as tmpdir2 } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname as dirname11, isAbsolute as isAbsolute9, join as join15, resolve as resolve13 } from "node:path";
+import { dirname as dirname12, isAbsolute as isAbsolute10, join as join14, resolve as resolve14 } from "node:path";
 var import_cross_spawn5 = __toESM(require_cross_spawn(), 1);
 
 // package.json
@@ -31693,6 +31693,11 @@ var HeldOutProbeIntegritySchema = external_exports.discriminatedUnion("kind", [
     kind: external_exports.literal("file"),
     path: external_exports.string().min(1),
     algorithm: external_exports.literal("git_hash_object").optional(),
+    valueHash: external_exports.string().regex(/^[a-f0-9]{64}$/)
+  }),
+  external_exports.strictObject({
+    kind: external_exports.literal("directory"),
+    path: external_exports.string().min(1),
     valueHash: external_exports.string().regex(/^[a-f0-9]{64}$/)
   })
 ]);
@@ -35591,7 +35596,7 @@ function abortedCapabilityProbeError(signal) {
 }
 async function runCapabilityProbe(executable, args, captureErrorOutput = false, signal) {
   if (signal?.aborted) throw abortedCapabilityProbeError(signal);
-  return await new Promise((resolve14, reject) => {
+  return await new Promise((resolve15, reject) => {
     const child = spawn2(executable, args, { stdio: ["ignore", "pipe", "pipe"] });
     const output = new BoundedTextCapture(ADAPTER_STDERR_LIMIT_BYTES);
     const probeAbort = new AbortController();
@@ -35626,7 +35631,7 @@ async function runCapabilityProbe(executable, args, captureErrorOutput = false, 
         );
         return;
       }
-      resolve14(result);
+      resolve15(result);
     };
     const scheduleSettlement = () => {
       if (settled || settlement) return;
@@ -35739,7 +35744,7 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve14) => child.once("close", (code, closeSignal) => resolve14({ code, signal: closeSignal }))
+      (resolve15) => child.once("close", (code, closeSignal) => resolve15({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderPlannerPrompt(request));
@@ -35804,7 +35809,7 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve14) => child.once("close", (code, closeSignal) => resolve14({ code, signal: closeSignal }))
+      (resolve15) => child.once("close", (code, closeSignal) => resolve15({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderSemanticVerifierPrompt(request.context, request.authorityBoundary));
@@ -35870,7 +35875,7 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve14) => child.once("close", (code, closeSignal) => resolve14({ code, signal: closeSignal }))
+      (resolve15) => child.once("close", (code, closeSignal) => resolve15({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderWorkerPrompt(request.capsule, request.authorityBoundary));
@@ -36209,7 +36214,7 @@ function abortedCapabilityProbeError2(signal) {
 }
 async function runCapabilityProbe2(executable, args, signal) {
   if (signal?.aborted) throw abortedCapabilityProbeError2(signal);
-  return await new Promise((resolve14, reject) => {
+  return await new Promise((resolve15, reject) => {
     const child = spawn3(executable, args, { stdio: ["ignore", "pipe", "ignore"] });
     const output = new BoundedTextCapture2(ADAPTER_STDERR_LIMIT_BYTES2);
     const probeAbort = new AbortController();
@@ -36244,7 +36249,7 @@ async function runCapabilityProbe2(executable, args, signal) {
         );
         return;
       }
-      resolve14(result);
+      resolve15(result);
     };
     const scheduleSettlement = () => {
       if (settled || settlement) return;
@@ -36353,7 +36358,7 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve14) => child.once("close", (code, closeSignal) => resolve14({ code, signal: closeSignal }))
+      (resolve15) => child.once("close", (code, closeSignal) => resolve15({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     let protocolExceededLimit = false;
@@ -36408,7 +36413,7 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve14) => child.once("close", (code, closeSignal) => resolve14({ code, signal: closeSignal }))
+      (resolve15) => child.once("close", (code, closeSignal) => resolve15({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     let protocolExceededLimit = false;
@@ -36464,7 +36469,7 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve14) => child.once("close", (code, closeSignal) => resolve14({ code, signal: closeSignal }))
+      (resolve15) => child.once("close", (code, closeSignal) => resolve15({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     let protocolExceededLimit = false;
@@ -36795,7 +36800,7 @@ async function runCommand(options, args) {
     untrustedCwd: options.cwd
   });
   const commandArgs = [...options.commandArgs ?? [], ...args];
-  return await new Promise((resolve14, reject) => {
+  return await new Promise((resolve15, reject) => {
     const child = import_cross_spawn3.default.spawn(command, commandArgs, {
       cwd: options.cwd,
       env: options.env ?? process.env,
@@ -36835,7 +36840,7 @@ async function runCommand(options, args) {
         return;
       }
       const code = exitCode ?? 1;
-      if (code === 0) resolve14({ stdout, stderr });
+      if (code === 0) resolve15({ stdout, stderr });
       else
         reject(
           new GitHubCommandError(
@@ -38322,7 +38327,7 @@ async function replacePathAtomic(temporaryPath, path) {
     } catch (error51) {
       if (!retryable.has(error51.code ?? "") || Date.now() >= deadline)
         throw error51;
-      await new Promise((resolve14) => setTimeout(resolve14, delayMs));
+      await new Promise((resolve15) => setTimeout(resolve15, delayMs));
       delayMs = Math.min(100, delayMs * 2);
     }
   }
@@ -41157,9 +41162,7 @@ var RunArtifactStore = class {
 };
 
 // packages/probes/src/index.ts
-import { access as access2, readFile, stat as stat3 } from "node:fs/promises";
-import { constants as constants2 } from "node:fs";
-import { dirname as dirname6, join as join6, resolve as resolve5, sep as sep3 } from "node:path";
+import { dirname as dirname7, resolve as resolve6, sep as sep4 } from "node:path";
 
 // packages/probes/src/process.ts
 var import_cross_spawn4 = __toESM(require_cross_spawn(), 1);
@@ -41168,6 +41171,7 @@ import { constants as osConstants } from "node:os";
 var MIB4 = 1024 * 1024;
 var DEFAULT_PROCESS_OUTPUT_BYTES_PER_STREAM = 8 * MIB4;
 var DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM = MIB4;
+var DEFAULT_PROCESS_INPUT_BYTES = 8 * MIB4;
 var PROCESS_TERMINATION_GRACE_MS = 2e3;
 var PROCESS_SETTLEMENT_GRACE_MS = 2e3;
 var ProcessOutputLimitError = class extends Error {
@@ -41531,7 +41535,7 @@ function validManagedSettlement(value, lifecycle) {
 }
 async function runManagedProcess(executable, args, environment, options, started, timeoutMs, maxOutputBytesPerStream, outputOverflow) {
   const lifecycle = options.lifecycle;
-  return await new Promise((resolve14, reject) => {
+  return await new Promise((resolve15, reject) => {
     const broker = import_cross_spawn4.default.spawn(
       process.execPath,
       ["-e", MANAGED_PROCESS_BROKER_SOURCE, lifecycle.executionId, lifecycle.ownerToken],
@@ -41639,7 +41643,7 @@ async function runManagedProcess(executable, args, environment, options, started
         reject(new ProcessOutputLimitError(overflowStream, captureMetadata));
         return;
       }
-      resolve14({
+      resolve15({
         exitCode: timedOut ? 124 : targetSettlement.exitCode ?? 1,
         stdout: stdout.text,
         stderr: stderr.text,
@@ -41711,6 +41715,13 @@ async function runProcess(command, args, options) {
   const outputOverflow = options.outputOverflow ?? "reject";
   if (!Number.isSafeInteger(maxOutputBytesPerStream) || maxOutputBytesPerStream <= 0)
     throw new Error("Subprocess output capture limit must be a positive safe integer");
+  const inputBytes = options.input === void 0 ? 0 : typeof options.input === "string" ? Buffer.byteLength(options.input) : options.input.length;
+  if (inputBytes > DEFAULT_PROCESS_INPUT_BYTES)
+    throw new Error(
+      `Subprocess input exceeded the ${DEFAULT_PROCESS_INPUT_BYTES}-byte bounded input limit`
+    );
+  if (options.lifecycle && options.input !== void 0)
+    throw new Error("Managed subprocess input is not supported");
   const environment = { ...process.env, ...options.env, NO_COLOR: "1", FORCE_COLOR: "0" };
   const executable = await resolveTrustedExecutable(command, {
     environment,
@@ -41727,17 +41738,20 @@ async function runProcess(command, args, options) {
       maxOutputBytesPerStream,
       outputOverflow
     );
-  return await new Promise((resolve14, reject) => {
+  return await new Promise((resolve15, reject) => {
     const child = import_cross_spawn4.default.spawn(executable, args, {
       cwd: options.cwd,
       env: environment,
       shell: false,
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: [options.input === void 0 ? "ignore" : "pipe", "pipe", "pipe"]
     });
+    const childStdout = child.stdout;
+    const childStderr = child.stderr;
     const stdoutCapture = new BoundedStreamCapture(maxOutputBytesPerStream);
     const stderrCapture = new BoundedStreamCapture(maxOutputBytesPerStream);
     let timedOut = false;
     let overflowStream;
+    let inputError;
     let settled = false;
     let terminationStarted = false;
     let escalationTimer;
@@ -41768,8 +41782,16 @@ async function runProcess(command, args, options) {
         terminateWithEscalation();
       }
     };
-    child.stdout.on("data", (chunk) => capture("stdout", stdoutCapture, chunk));
-    child.stderr.on("data", (chunk) => capture("stderr", stderrCapture, chunk));
+    childStdout.on("data", (chunk) => capture("stdout", stdoutCapture, chunk));
+    childStderr.on("data", (chunk) => capture("stderr", stderrCapture, chunk));
+    if (options.input !== void 0 && child.stdin) {
+      child.stdin.on("error", (error51) => {
+        if (terminationStarted || settled) return;
+        inputError = error51;
+        terminateWithEscalation();
+      });
+      child.stdin.end(options.input);
+    }
     const abort = () => terminateWithEscalation();
     options.signal?.addEventListener("abort", abort, { once: true });
     timer = setTimeout(() => {
@@ -41788,13 +41810,18 @@ async function runProcess(command, args, options) {
       settled = true;
       cleanup();
       try {
-        child.stdout.destroy();
-        child.stderr.destroy();
+        child.stdin?.destroy();
+        childStdout.destroy();
+        childStderr.destroy();
         child.unref();
       } catch {
       }
       if (error51) {
         reject(error51);
+        return;
+      }
+      if (inputError) {
+        reject(inputError);
         return;
       }
       const stdout = stdoutCapture.finish("stdout");
@@ -41807,7 +41834,7 @@ async function runProcess(command, args, options) {
         reject(new ProcessOutputLimitError(overflowStream, captureMetadata));
         return;
       }
-      resolve14({
+      resolve15({
         exitCode: timedOut ? 124 : code ?? 1,
         stdout: stdout.text,
         stderr: stderr.text,
@@ -41820,6 +41847,249 @@ async function runProcess(command, args, options) {
     child.once("close", (code) => complete(code));
     if (options.signal?.aborted) abort();
   });
+}
+
+// packages/probes/src/repository-file.ts
+import { constants as constants2 } from "node:fs";
+import { lstat as lstat5, open as open5, readlink, realpath as realpath2, stat as stat3 } from "node:fs/promises";
+import { dirname as dirname6, isAbsolute as isAbsolute5, relative as relative4, resolve as resolve5, sep as sep3 } from "node:path";
+var MEBIBYTE = 1024 * 1024;
+var READ_CHUNK_BYTES = 64 * 1024;
+var REPOSITORY_FILE_MAX_BYTES = 8 * MEBIBYTE;
+var RepositoryFileError = class extends Error {
+  kind;
+  repositoryPath;
+  constructor(kind, repositoryPath, detail) {
+    super(`Repository path ${JSON.stringify(repositoryPath)} ${detail}`);
+    this.name = "RepositoryFileError";
+    this.kind = kind;
+    this.repositoryPath = repositoryPath;
+  }
+};
+function isRepositoryFileError(error51, ...kinds) {
+  return error51 instanceof RepositoryFileError && (kinds.length === 0 || kinds.includes(error51.kind));
+}
+function sanitizedPath(candidate) {
+  return candidate.slice(0, 4096);
+}
+function inside(root, candidate) {
+  const path = relative4(root, candidate);
+  return path === "" || !isAbsolute5(path) && path !== ".." && !path.startsWith(`..${sep3}`);
+}
+async function assertUnresolvedPathInsideRepository(canonicalRoot, candidate, displayPath, signal) {
+  let current = candidate;
+  const visited = /* @__PURE__ */ new Set();
+  for (let hop = 0; hop < 64; hop += 1) {
+    signal?.throwIfAborted();
+    if (visited.has(current))
+      throw new RepositoryFileError("unreadable", displayPath, "could not be resolved safely");
+    visited.add(current);
+    let details;
+    try {
+      details = await lstat5(current);
+    } catch (error51) {
+      signal?.throwIfAborted();
+      const code = error51.code;
+      if (code !== "ENOENT" && code !== "ENOTDIR")
+        throw new RepositoryFileError("unreadable", displayPath, "could not be resolved safely");
+    }
+    if (details?.isSymbolicLink()) {
+      try {
+        current = resolve5(dirname6(current), await readlink(current));
+      } catch {
+        signal?.throwIfAborted();
+        throw new RepositoryFileError("unreadable", displayPath, "could not be resolved safely");
+      }
+      continue;
+    }
+    try {
+      const canonicalExistingPath = await realpath2(current);
+      if (!inside(canonicalRoot, canonicalExistingPath))
+        throw new RepositoryFileError(
+          "outside_repository",
+          displayPath,
+          "resolves outside the repository boundary"
+        );
+      return;
+    } catch (error51) {
+      signal?.throwIfAborted();
+      if (isRepositoryFileError(error51)) throw error51;
+      const code = error51.code;
+      if (code !== "ENOENT" && code !== "ENOTDIR")
+        throw new RepositoryFileError("unreadable", displayPath, "could not be resolved safely");
+    }
+    const parent = dirname6(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  throw new RepositoryFileError("unreadable", displayPath, "could not be resolved safely");
+}
+function validateMaximumBytes(maximumBytes) {
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes <= 0)
+    throw new Error("Repository file read limit must be a positive safe integer");
+}
+async function canonicalRepositoryPath(repositoryRoot, candidate, signal) {
+  signal?.throwIfAborted();
+  const displayPath = sanitizedPath(candidate);
+  if (candidate.includes("\0") || isAbsolute5(candidate))
+    throw new RepositoryFileError(
+      "outside_repository",
+      displayPath,
+      "is outside the repository boundary"
+    );
+  const root = resolve5(repositoryRoot);
+  const lexicalPath = resolve5(root, candidate);
+  if (!inside(root, lexicalPath))
+    throw new RepositoryFileError(
+      "outside_repository",
+      displayPath,
+      "is outside the repository boundary"
+    );
+  let canonicalRoot;
+  try {
+    canonicalRoot = await realpath2(root);
+  } catch (error51) {
+    signal?.throwIfAborted();
+    throw new RepositoryFileError("unreadable", ".", "could not establish the repository boundary");
+  }
+  let canonicalPath;
+  try {
+    canonicalPath = await realpath2(lexicalPath);
+  } catch (error51) {
+    signal?.throwIfAborted();
+    const code = error51.code;
+    if (code === "ENOENT" || code === "ENOTDIR")
+      await assertUnresolvedPathInsideRepository(canonicalRoot, lexicalPath, displayPath, signal);
+    throw new RepositoryFileError(
+      code === "ENOENT" || code === "ENOTDIR" ? "missing" : "unreadable",
+      displayPath,
+      code === "ENOENT" || code === "ENOTDIR" ? "does not exist" : "could not be resolved safely"
+    );
+  }
+  signal?.throwIfAborted();
+  if (!inside(canonicalRoot, canonicalPath))
+    throw new RepositoryFileError(
+      "outside_repository",
+      displayPath,
+      "resolves outside the repository boundary"
+    );
+  return { canonicalRoot, canonicalPath, displayPath };
+}
+function sameIdentity(left, right) {
+  if (left.dev !== right.dev) return false;
+  if (left.ino !== 0n && right.ino !== 0n && left.ino !== right.ino) return false;
+  return true;
+}
+async function closeIgnoringFailure(handle) {
+  if (!handle) return;
+  await handle.close().catch(() => void 0);
+}
+async function inspectRepositoryPath(repositoryRoot, repositoryPath, signal) {
+  const resolved = await canonicalRepositoryPath(repositoryRoot, repositoryPath, signal);
+  let details;
+  try {
+    details = await stat3(resolved.canonicalPath, { bigint: true });
+  } catch (error51) {
+    signal?.throwIfAborted();
+    const code = error51.code;
+    throw new RepositoryFileError(
+      code === "ENOENT" || code === "ENOTDIR" ? "missing" : "unreadable",
+      resolved.displayPath,
+      code === "ENOENT" || code === "ENOTDIR" ? "does not exist" : "could not be inspected"
+    );
+  }
+  signal?.throwIfAborted();
+  return {
+    canonicalPath: resolved.canonicalPath,
+    displayPath: resolved.displayPath,
+    details
+  };
+}
+async function assertRepositoryPath(repositoryRoot, repositoryPath, signal) {
+  const inspected = await inspectRepositoryPath(repositoryRoot, repositoryPath, signal);
+  if (!inspected.details.isFile() && !inspected.details.isDirectory())
+    throw new RepositoryFileError(
+      "unsupported_type",
+      inspected.displayPath,
+      "is not a regular file or repository directory"
+    );
+  return inspected.canonicalPath;
+}
+async function assertRepositoryFile(repositoryRoot, repositoryPath, signal) {
+  const inspected = await inspectRepositoryPath(repositoryRoot, repositoryPath, signal);
+  if (!inspected.details.isFile())
+    throw new RepositoryFileError("not_file", inspected.displayPath, "is not a regular file");
+  return inspected.canonicalPath;
+}
+async function readRepositoryFile(repositoryRoot, repositoryPath, options = {}) {
+  const maximumBytes = options.maximumBytes ?? REPOSITORY_FILE_MAX_BYTES;
+  validateMaximumBytes(maximumBytes);
+  const inspected = await inspectRepositoryPath(repositoryRoot, repositoryPath, options.signal);
+  if (!inspected.details.isFile())
+    throw new RepositoryFileError("not_file", inspected.displayPath, "is not a regular file");
+  if (inspected.details.size > BigInt(maximumBytes))
+    throw new RepositoryFileError(
+      "too_large",
+      inspected.displayPath,
+      `exceeds the ${maximumBytes}-byte bounded read limit`
+    );
+  let handle;
+  try {
+    const noFollow = process.platform === "win32" ? 0 : constants2.O_NOFOLLOW;
+    handle = await open5(inspected.canonicalPath, constants2.O_RDONLY | noFollow);
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile())
+      throw new RepositoryFileError("not_file", inspected.displayPath, "is not a regular file");
+    if (!sameIdentity(inspected.details, before))
+      throw new RepositoryFileError("changed", inspected.displayPath, "changed during validation");
+    if (before.size > BigInt(maximumBytes))
+      throw new RepositoryFileError(
+        "too_large",
+        inspected.displayPath,
+        `exceeds the ${maximumBytes}-byte bounded read limit`
+      );
+    const chunks = [];
+    let total = 0;
+    while (total <= maximumBytes) {
+      options.signal?.throwIfAborted();
+      const remaining = maximumBytes + 1 - total;
+      const buffer = Buffer.allocUnsafe(Math.min(READ_CHUNK_BYTES, remaining));
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
+      total += bytesRead;
+    }
+    options.signal?.throwIfAborted();
+    if (total > maximumBytes)
+      throw new RepositoryFileError(
+        "too_large",
+        inspected.displayPath,
+        `exceeds the ${maximumBytes}-byte bounded read limit`
+      );
+    const after = await handle.stat({ bigint: true });
+    if (!sameIdentity(before, after) || before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs)
+      throw new RepositoryFileError("changed", inspected.displayPath, "changed while being read");
+    return Buffer.concat(chunks, total);
+  } catch (error51) {
+    options.signal?.throwIfAborted();
+    if (isRepositoryFileError(error51)) throw error51;
+    throw new RepositoryFileError("unreadable", inspected.displayPath, "could not be read safely");
+  } finally {
+    await closeIgnoringFailure(handle);
+  }
+}
+async function readRepositoryTextFile(repositoryRoot, repositoryPath, options = {}) {
+  return (await readRepositoryFile(repositoryRoot, repositoryPath, options)).toString("utf8");
+}
+async function assertRepositoryDirectory(repositoryRoot, repositoryPath, signal) {
+  const inspected = await inspectRepositoryPath(repositoryRoot, repositoryPath, signal);
+  if (!inspected.details.isDirectory())
+    throw new RepositoryFileError(
+      "not_directory",
+      inspected.displayPath,
+      "is not a repository directory"
+    );
+  return inspected.canonicalPath;
 }
 
 // packages/probes/src/index.ts
@@ -41837,13 +42107,49 @@ function compactOutput(result) {
   return `${prefix}${value.length > available ? "\n\u2026" : ""}
 ${note}`;
 }
+async function assertRepositoryInventoryPaths(repositoryPath, paths, signal) {
+  const inventory = await runProcess("git", ["ls-files", "--stage", "-z", "--", ...paths], {
+    cwd: repositoryPath,
+    timeoutMs: 3e4,
+    ...signal ? { signal } : {}
+  });
+  signal?.throwIfAborted();
+  if (inventory.exitCode !== 0)
+    throw new Error("Unable to validate repository-inventory probe paths");
+  const entries = /* @__PURE__ */ new Map();
+  for (const record2 of inventory.stdout.split("\0").filter(Boolean)) {
+    const separator = record2.indexOf("	");
+    const metadata = separator === -1 ? [] : record2.slice(0, separator).split(" ");
+    const path = separator === -1 ? "" : record2.slice(separator + 1);
+    if (!metadata[0] || !path) throw new Error("Git returned an invalid repository-inventory path");
+    entries.set(path, metadata[0]);
+  }
+  const values = [...entries.entries()];
+  for (let index = 0; index < values.length; index += 32) {
+    signal?.throwIfAborted();
+    await Promise.all(
+      values.slice(index, index + 32).map(async ([path, mode]) => {
+        try {
+          if (mode === "120000" || mode === "160000")
+            await assertRepositoryPath(repositoryPath, path, signal);
+          else await assertRepositoryFile(repositoryPath, path, signal);
+        } catch (error51) {
+          signal?.throwIfAborted();
+          if (isRepositoryFileError(error51, "missing")) return;
+          throw error51;
+        }
+      })
+    );
+  }
+}
 async function runProbe(spec, repositoryPath, signal, lifecycle) {
   const started = performance.now();
   if (spec.kind === "held_out")
     throw new Error(`Held-out probe ${spec.id} must be resolved by the runtime`);
   if (spec.kind === "command") {
+    const cwd = await assertRepositoryDirectory(repositoryPath, spec.cwd ?? ".", signal);
     const processResult = await runProcess(spec.command, spec.args, {
-      cwd: spec.cwd ? resolve5(repositoryPath, spec.cwd) : repositoryPath,
+      cwd,
       timeoutMs: spec.timeoutMs,
       maxOutputBytesPerStream: DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM,
       outputOverflow: "truncate",
@@ -41870,15 +42176,20 @@ async function runProbe(spec, repositoryPath, signal, lifecycle) {
     };
   }
   if (spec.kind === "file") {
-    const path = resolve5(repositoryPath, spec.path);
     let exists = true;
+    let contents;
     try {
-      await access2(path, constants2.F_OK);
-    } catch {
-      exists = false;
+      if (spec.contains)
+        contents = await readRepositoryFile(repositoryPath, spec.path, {
+          ...signal ? { signal } : {}
+        });
+      else await assertRepositoryFile(repositoryPath, spec.path, signal);
+    } catch (error51) {
+      if (isRepositoryFileError(error51, "missing")) exists = false;
+      else throw error51;
     }
     let contains = true;
-    if (exists && spec.contains) contains = (await readFile(path, "utf8")).includes(spec.contains);
+    if (exists && spec.contains) contains = contents.toString("utf8").includes(spec.contains);
     const passed2 = exists === spec.shouldExist && contains;
     const summary = `${spec.path} ${exists ? "exists" : "does not exist"}${spec.contains ? ` and ${contains ? "contains" : "does not contain"} the required text` : ""}`;
     return {
@@ -41894,6 +42205,7 @@ async function runProbe(spec, repositoryPath, signal, lifecycle) {
     };
   }
   if (spec.kind === "repository_inventory") {
+    await assertRepositoryInventoryPaths(repositoryPath, spec.paths, signal);
     const args = ["grep", "-l", "-I", "-F"];
     for (const term of spec.terms) args.push("-e", term);
     args.push("--", ...spec.paths);
@@ -42014,12 +42326,6 @@ function familyScriptPurpose(family, name, terms) {
   if (["check", "test", "typecheck", "lint", "build"].includes(normalized)) return "regression";
   return void 0;
 }
-async function readUtf8File(path, signal) {
-  return await readFile(path, {
-    encoding: "utf8",
-    ...signal ? { signal } : {}
-  });
-}
 async function packageCandidates(repositoryPath, family, terms, signal) {
   signal?.throwIfAborted();
   const tracked = await runProcess("git", ["ls-files"], {
@@ -42029,13 +42335,21 @@ async function packageCandidates(repositoryPath, family, terms, signal) {
   signal?.throwIfAborted();
   if (tracked.exitCode !== 0) return [];
   const manifests = tracked.stdout.split("\n").filter((path) => path === "package.json" || path.endsWith("/package.json")).slice(0, 100);
-  const rootManifest = manifests.includes("package.json") ? JSON.parse(await readUtf8File(join6(repositoryPath, "package.json"), signal)) : void 0;
+  const rootManifest = manifests.includes("package.json") ? JSON.parse(
+    await readRepositoryTextFile(repositoryPath, "package.json", {
+      ...signal ? { signal } : {}
+    })
+  ) : void 0;
   signal?.throwIfAborted();
   const candidates = [];
   for (const manifestPath of manifests) {
     signal?.throwIfAborted();
-    const manifest2 = JSON.parse(await readUtf8File(join6(repositoryPath, manifestPath), signal));
-    const directory = dirname6(manifestPath) === "." ? void 0 : dirname6(manifestPath);
+    const manifest2 = JSON.parse(
+      await readRepositoryTextFile(repositoryPath, manifestPath, {
+        ...signal ? { signal } : {}
+      })
+    );
+    const directory = dirname7(manifestPath) === "." ? void 0 : dirname7(manifestPath);
     const relevant = !directory || terms.some(
       (term) => directory.toLowerCase().includes(term) || manifest2.name?.toLowerCase().includes(term)
     );
@@ -42079,16 +42393,18 @@ function selectPackageCandidates(candidates) {
   );
 }
 function withinRepository(repositoryPath, candidate) {
-  const root = resolve5(repositoryPath);
-  const path = resolve5(repositoryPath, candidate);
-  return path === root || path.startsWith(`${root}${sep3}`);
+  const root = resolve6(repositoryPath);
+  const path = resolve6(repositoryPath, candidate);
+  return path === root || path.startsWith(`${root}${sep4}`);
 }
-async function validateProbePlan(input, repositoryPath) {
+async function validateProbePlan(input, repositoryPath, signal) {
+  signal?.throwIfAborted();
   const plan = ProbePlanSchema.parse(input);
   if (!plan.items.some(({ phase }) => phase === "completion"))
     throw new Error("A probe plan must contain at least one completion probe");
   const keys = /* @__PURE__ */ new Set();
   for (const item of plan.items) {
+    signal?.throwIfAborted();
     const key = `${item.phase}:${item.probe.id}`;
     if (keys.has(key)) throw new Error(`Duplicate ${item.phase} probe ID ${item.probe.id}`);
     keys.add(key);
@@ -42104,17 +42420,30 @@ async function validateProbePlan(input, repositoryPath) {
       const cwd = item.probe.cwd ?? ".";
       if (!withinRepository(repositoryPath, cwd))
         throw new Error(`Probe ${item.probe.id} escapes the repository working directory`);
-      const directory = await stat3(resolve5(repositoryPath, cwd)).catch(() => void 0);
-      if (!directory?.isDirectory())
-        throw new Error(`Probe ${item.probe.id} uses missing working directory ${cwd}`);
+      try {
+        await assertRepositoryDirectory(repositoryPath, cwd, signal);
+      } catch (error51) {
+        if (isRepositoryFileError(error51, "missing", "not_directory"))
+          throw new Error(`Probe ${item.probe.id} uses missing working directory ${cwd}`);
+        throw error51;
+      }
     }
-    if (item.probe.kind === "file" && !withinRepository(repositoryPath, item.probe.path)) {
-      throw new Error(`Probe ${item.probe.id} escapes the repository`);
+    if (item.probe.kind === "file") {
+      if (!withinRepository(repositoryPath, item.probe.path))
+        throw new Error(`Probe ${item.probe.id} escapes the repository`);
+      try {
+        await assertRepositoryFile(repositoryPath, item.probe.path, signal);
+      } catch (error51) {
+        if (!isRepositoryFileError(error51, "missing")) throw error51;
+      }
     }
     if (item.probe.kind === "repository_inventory" && item.probe.paths.some((path) => !withinRepository(repositoryPath, path))) {
       throw new Error(`Probe ${item.probe.id} escapes the repository inventory scope`);
     }
+    if (item.probe.kind === "repository_inventory")
+      await assertRepositoryInventoryPaths(repositoryPath, item.probe.paths, signal);
   }
+  signal?.throwIfAborted();
   return plan;
 }
 async function discoverProbePlan(repositoryPath, task, baseSha, options = {}) {
@@ -42171,7 +42500,7 @@ async function discoverProbePlan(repositoryPath, task, baseSha, options = {}) {
     items.push(completion);
   }
   try {
-    await access2(join6(repositoryPath, "pyproject.toml"));
+    await assertRepositoryFile(repositoryPath, "pyproject.toml", options.signal);
     items.push({
       phase: "completion",
       purpose: "regression",
@@ -42186,10 +42515,11 @@ async function discoverProbePlan(repositoryPath, task, baseSha, options = {}) {
         platforms: ["darwin", "linux", "win32"]
       }
     });
-  } catch {
+  } catch (error51) {
+    if (!isRepositoryFileError(error51, "missing")) throw error51;
   }
   try {
-    await access2(join6(repositoryPath, "go.mod"));
+    await assertRepositoryFile(repositoryPath, "go.mod", options.signal);
     items.push({
       phase: "completion",
       purpose: "regression",
@@ -42204,7 +42534,8 @@ async function discoverProbePlan(repositoryPath, task, baseSha, options = {}) {
         platforms: ["darwin", "linux", "win32"]
       }
     });
-  } catch {
+  } catch (error51) {
+    if (!isRepositoryFileError(error51, "missing")) throw error51;
   }
   if (family === "audit" || !items.some(({ phase }) => phase === "completion")) {
     items.push({
@@ -42215,23 +42546,27 @@ async function discoverProbePlan(repositoryPath, task, baseSha, options = {}) {
     });
   }
   options.signal?.throwIfAborted();
-  return await validateProbePlan({ schemaVersion: 1, family, items }, repositoryPath);
+  return await validateProbePlan(
+    { schemaVersion: 1, family, items },
+    repositoryPath,
+    options.signal
+  );
 }
 
 // packages/runtime/src/runner.ts
 import { randomUUID as randomUUID9 } from "node:crypto";
-import { join as join13 } from "node:path";
+import { join as join12 } from "node:path";
 
 // packages/runtime/src/control.ts
 import { randomUUID as randomUUID5 } from "node:crypto";
 import { unlink as unlink3 } from "node:fs/promises";
-import { dirname as dirname7, join as join7 } from "node:path";
+import { dirname as dirname8, join as join6 } from "node:path";
 var CONTROL_REQUEST_MAX_BYTES = 64 * 1024;
 var RunControlChannel = class {
   constructor(graphcraftRoot2, runId) {
     this.graphcraftRoot = graphcraftRoot2;
     this.runId = runId;
-    this.path = join7(graphcraftRoot2, "controls", `${runId}.json`);
+    this.path = join6(graphcraftRoot2, "controls", `${runId}.json`);
   }
   graphcraftRoot;
   runId;
@@ -42240,7 +42575,7 @@ var RunControlChannel = class {
   async ensureStorage() {
     this.storageReady ??= (async () => {
       await ensurePrivateDirectory(this.graphcraftRoot);
-      await ensurePrivateDirectory(dirname7(this.path), this.graphcraftRoot);
+      await ensurePrivateDirectory(dirname8(this.path), this.graphcraftRoot);
     })();
     try {
       await this.storageReady;
@@ -42349,7 +42684,7 @@ async function requestRunControl(store, action, reason = action === "pause" ? "P
   if (targetReached(action, state)) return state;
   const channel = new RunControlChannel(store.graphcraftRoot, store.runId);
   const request = await channel.request(action, reason);
-  const lockPath = join7(store.graphcraftRoot, "locks", `${store.runId}.lock`);
+  const lockPath = join6(store.graphcraftRoot, "locks", `${store.runId}.lock`);
   const deadline = Date.now() + waitMs;
   while (Date.now() <= deadline) {
     const lock = new RunLock(lockPath);
@@ -42379,7 +42714,7 @@ async function requestRunControl(store, action, reason = action === "pause" ? "P
       if (!(error51 instanceof Error) || error51.message !== "Graphcraft run is already active")
         throw error51;
     }
-    await new Promise((resolve14) => setTimeout(resolve14, 50));
+    await new Promise((resolve15) => setTimeout(resolve15, 50));
   }
   throw new Error(
     `The active Graphcraft process did not acknowledge ${action} within ${waitMs}ms; the durable request remains pending`
@@ -42388,7 +42723,7 @@ async function requestRunControl(store, action, reason = action === "pause" ? "P
 
 // packages/runtime/src/governance.ts
 import { randomUUID as randomUUID6 } from "node:crypto";
-import { join as join8 } from "node:path";
+import { join as join7 } from "node:path";
 function decisionFor(state, sourceId, targetId) {
   const explicit = state.controlDecisions.findLast(
     (decision) => decision.sourceId === sourceId && decision.targetId === targetId
@@ -43033,7 +43368,7 @@ async function evaluateControlAcceptance(store, graph, state, targetId, evidence
 }
 async function decideRunControl(store, input) {
   await store.prepareStorage();
-  const lock = new RunLock(join8(store.graphcraftRoot, "locks", `${store.runId}.lock`));
+  const lock = new RunLock(join7(store.graphcraftRoot, "locks", `${store.runId}.lock`));
   await lock.acquire();
   try {
     const [graph, state] = await Promise.all([store.loadGraph(), store.loadState()]);
@@ -43075,8 +43410,8 @@ async function decideRunControl(store, input) {
 }
 
 // packages/runtime/src/repository.ts
-import { appendFile, lstat as lstat5, mkdir as mkdir3, readFile as readFile2, readlink } from "node:fs/promises";
-import { basename as basename3, dirname as dirname8, isAbsolute as isAbsolute5, join as join9, resolve as resolve6 } from "node:path";
+import { appendFile, lstat as lstat6, mkdir as mkdir3, readFile, readlink as readlink2 } from "node:fs/promises";
+import { basename as basename3, dirname as dirname9, isAbsolute as isAbsolute6, join as join8, resolve as resolve7 } from "node:path";
 
 // packages/runtime/src/side-effect.ts
 var SideEffectBoundaryInterruption = class extends Error {
@@ -43255,7 +43590,7 @@ async function git(repositoryPath, args, signal) {
   return (await gitRaw(repositoryPath, args, signal)).trim();
 }
 async function readUtf8(path, signal) {
-  return await readFile2(path, {
+  return await readFile(path, {
     encoding: "utf8",
     ...signal ? { signal } : {}
   });
@@ -43349,8 +43684,48 @@ function taskSnippet(content, terms, maximumCharacters) {
 ${lines.slice(start, end).join("\n")}`).join("\n\n");
   return snippet.slice(0, maximumCharacters);
 }
+var TRACKED_PATH_VALIDATION_CONCURRENCY = 32;
+async function trackedRepositoryPaths(repositoryRoot, signal) {
+  const records = await gitRaw(repositoryRoot, ["ls-files", "--stage", "-z"], signal);
+  return records.split("\0").filter(Boolean).map((record2) => {
+    const separator = record2.indexOf("	");
+    const metadata = separator === -1 ? [] : record2.slice(0, separator).split(" ");
+    const path = separator === -1 ? "" : record2.slice(separator + 1);
+    if (!metadata[0] || !path) throw new Error("Git returned an invalid tracked-path inventory");
+    return { mode: metadata[0], path };
+  });
+}
+async function plannerVisibleTrackedPaths(repositoryRoot, tracked, signal) {
+  const distinct = [...new Map(tracked.map((entry) => [entry.path, entry])).values()];
+  const visible = [];
+  for (let index = 0; index < distinct.length; index += TRACKED_PATH_VALIDATION_CONCURRENCY) {
+    signal?.throwIfAborted();
+    const batch = await Promise.all(
+      distinct.slice(index, index + TRACKED_PATH_VALIDATION_CONCURRENCY).map(async (entry) => {
+        try {
+          if (entry.mode === "120000" || entry.mode === "160000")
+            await assertRepositoryPath(repositoryRoot, entry.path, signal);
+          else await assertRepositoryFile(repositoryRoot, entry.path, signal);
+          return entry;
+        } catch (error51) {
+          signal?.throwIfAborted();
+          if (isRepositoryFileError(error51, "missing")) return void 0;
+          throw error51;
+        }
+      })
+    );
+    visible.push(...batch.filter((entry) => entry !== void 0));
+  }
+  return visible;
+}
 async function discoverPlanningEvidence(repositoryRoot, task, signal) {
-  const trackedPaths = (await git(repositoryRoot, ["ls-files"], signal)).split("\n").filter(Boolean);
+  const tracked = await plannerVisibleTrackedPaths(
+    repositoryRoot,
+    await trackedRepositoryPaths(repositoryRoot, signal),
+    signal
+  );
+  const trackedPaths = tracked.map(({ path }) => path);
+  const trackedPathSet = new Set(trackedPaths);
   const files = [];
   let remainingCharacters = 24e3;
   const searchTerms = planningSearchTerms(task);
@@ -43363,14 +43738,13 @@ async function discoverPlanningEvidence(repositoryRoot, task, signal) {
     signal?.throwIfAborted();
     return "";
   })).split("\n").filter(
-    (path) => path.length > 0 && !path.startsWith("dist/") && !path.endsWith(".map") && !path.endsWith(".lock")
+    (path) => path.length > 0 && trackedPathSet.has(path) && !path.startsWith("dist/") && !path.endsWith(".map") && !path.endsWith(".lock")
   ) : [];
   const taskMatches = await Promise.all(
     matchedPaths.map(async (path) => {
       signal?.throwIfAborted();
-      const content = await readUtf8(join9(repositoryRoot, path), signal).catch(() => {
-        signal?.throwIfAborted();
-        return "";
+      const content = await readRepositoryTextFile(repositoryRoot, path, {
+        ...signal ? { signal } : {}
       });
       const normalized = content.toLowerCase();
       const score = searchTerms.filter((term) => normalized.includes(term)).length;
@@ -43399,9 +43773,8 @@ async function discoverPlanningEvidence(repositoryRoot, task, signal) {
     signal?.throwIfAborted();
     if (remainingCharacters <= 0 || files.length >= 7) break;
     if (files.some((file2) => file2.path === path)) continue;
-    const content = await readUtf8(join9(repositoryRoot, path), signal).catch(() => {
-      signal?.throwIfAborted();
-      return "";
+    const content = await readRepositoryTextFile(repositoryRoot, path, {
+      ...signal ? { signal } : {}
     });
     const limit = Math.min(2e3, remainingCharacters);
     const selected = content.slice(0, limit);
@@ -43423,13 +43796,13 @@ async function ensureGraphcraftIgnored(repositoryRoot, signal) {
     ["rev-parse", "--git-path", "info/exclude"],
     signal
   );
-  const excludePath = isAbsolute5(rawExcludePath) ? rawExcludePath : resolve6(repositoryRoot, rawExcludePath);
+  const excludePath = isAbsolute6(rawExcludePath) ? rawExcludePath : resolve7(repositoryRoot, rawExcludePath);
   let content = "";
   try {
     content = await readUtf8(excludePath, signal);
   } catch {
     signal?.throwIfAborted();
-    await mkdir3(dirname8(excludePath), { recursive: true });
+    await mkdir3(dirname9(excludePath), { recursive: true });
   }
   signal?.throwIfAborted();
   if (!content.split("\n").includes(".graphcraft/"))
@@ -43440,11 +43813,11 @@ function slug(task) {
 }
 async function createRunWorkspace(contract) {
   const branch = `graphcraft/${contract.runId.slice(0, 8)}-${slug(contract.task)}`;
-  const parent = join9(
-    dirname8(contract.repository.root),
+  const parent = join8(
+    dirname9(contract.repository.root),
     `.${basename3(contract.repository.root)}-graphcraft-worktrees`
   );
-  const path = join9(parent, contract.runId);
+  const path = join8(parent, contract.runId);
   await mkdir3(parent, { recursive: true });
   const registered = await git(contract.repository.root, ["worktree", "list", "--porcelain"]);
   if (registered.includes(`worktree ${path}`)) return { path, branch, created: false };
@@ -43472,17 +43845,17 @@ async function commitContentDigest(repositoryPath) {
   ].sort();
   const changes = await Promise.all(
     paths.map(async (path) => {
-      const absolutePath = join9(repositoryPath, path);
-      const stats = await lstat5(absolutePath).catch(() => void 0);
+      const absolutePath = join8(repositoryPath, path);
+      const stats = await lstat6(absolutePath).catch(() => void 0);
       if (!stats) return { path, kind: "absent" };
       if (stats.isSymbolicLink())
-        return { path, kind: "symlink", target: await readlink(absolutePath) };
+        return { path, kind: "symlink", target: await readlink2(absolutePath) };
       if (stats.isFile())
         return {
           path,
           kind: "file",
           executable: (stats.mode & 73) !== 0,
-          contents: (await readFile2(absolutePath)).toString("base64")
+          contents: (await readFile(absolutePath)).toString("base64")
         };
       return { path, kind: "other" };
     })
@@ -43699,15 +44072,15 @@ async function reconcileAtomicPush(workspace, claim) {
 
 // packages/runtime/src/store.ts
 import { constants as fsConstants5 } from "node:fs";
-import { lstat as lstat7, open as open6, readdir as readdir4 } from "node:fs/promises";
-import { join as join11, relative as relative5, resolve as resolve8 } from "node:path";
+import { lstat as lstat8, open as open7, readdir as readdir4 } from "node:fs/promises";
+import { join as join10, relative as relative6, resolve as resolve9 } from "node:path";
 import { TextDecoder as TextDecoder2 } from "node:util";
 
 // packages/runtime/src/migration.ts
 import { createHash as createHash4 } from "node:crypto";
 import { constants as fsConstants4 } from "node:fs";
-import { lstat as lstat6, mkdir as mkdir4, open as open5, readdir as readdir3, rename as rename2, rm as rm3 } from "node:fs/promises";
-import { join as join10, relative as relative4, resolve as resolve7 } from "node:path";
+import { lstat as lstat7, mkdir as mkdir4, open as open6, readdir as readdir3, rename as rename2, rm as rm3 } from "node:fs/promises";
+import { join as join9, relative as relative5, resolve as resolve8 } from "node:path";
 import { isDeepStrictEqual as isDeepStrictEqual2 } from "node:util";
 var CURRENT_RUN_STORAGE_VERSION = 2;
 var BACKUP_COMPLETION_FILE = ".backup-complete.json";
@@ -43754,12 +44127,12 @@ function manifest(runId, migratedFrom) {
   });
 }
 function runStorageManifestPath(runRoot) {
-  return join10(runRoot, "storage.json");
+  return join9(runRoot, "storage.json");
 }
 async function validateRunStorageRoot(input) {
-  const graphcraftRoot2 = resolve7(input.graphcraftRoot);
-  const runRoot = resolve7(input.runRoot);
-  const validated = await validatePrivatePath(graphcraftRoot2, relative4(graphcraftRoot2, runRoot));
+  const graphcraftRoot2 = resolve8(input.graphcraftRoot);
+  const runRoot = resolve8(input.runRoot);
+  const validated = await validatePrivatePath(graphcraftRoot2, relative5(graphcraftRoot2, runRoot));
   if (validated !== runRoot)
     throw new Error(`Run storage path escaped the Graphcraft state directory: ${input.runRoot}`);
 }
@@ -43821,7 +44194,7 @@ async function inspectStorage(runRoot, runId) {
   if (parsed.schemaVersion !== CURRENT_RUN_STORAGE_VERSION) return { version: 1 };
   try {
     await validatePrivatePath(runRoot, ARTIFACT_INVENTORY_FILE);
-    const inventory = await readBoundedArtifactInventory(join10(runRoot, ARTIFACT_INVENTORY_FILE));
+    const inventory = await readBoundedArtifactInventory(join9(runRoot, ARTIFACT_INVENTORY_FILE));
     if (inventory.runId !== runId)
       throw new Error(`artifact inventory belongs to ${inventory.runId}`);
   } catch (error51) {
@@ -43931,7 +44304,7 @@ async function acquireMigrationHandle(lease, operation) {
   }
 }
 async function acquireMigrationLock(input) {
-  const lockPath = join10(input.graphcraftRoot, "locks", `${input.runId}.migration.lock`);
+  const lockPath = join9(input.graphcraftRoot, "locks", `${input.runId}.migration.lock`);
   while (true) {
     await validateRunStorageRoot(input);
     const storage = await inspectStorage(input.runRoot, input.runId);
@@ -43943,7 +44316,7 @@ async function acquireMigrationLock(input) {
     } catch (error51) {
       if (!isActiveLockError(error51)) throw error51;
     }
-    await new Promise((resolve14) => setTimeout(resolve14, 25));
+    await new Promise((resolve15) => setTimeout(resolve15, 25));
   }
 }
 async function acquireActiveAwareLock(path, lease) {
@@ -43962,7 +44335,7 @@ async function acquireActiveAwareLock(path, lease) {
 }
 async function status2(path) {
   try {
-    return await lstat6(path);
+    return await lstat7(path);
   } catch (error51) {
     if (error51.code === "ENOENT") return void 0;
     throw error51;
@@ -44088,7 +44461,7 @@ function legacyTreeDigest(entries, ignoredRootName) {
   return createHash4("sha256").update(JSON.stringify(values)).digest("hex");
 }
 async function scanLegacyTreeMetadata(root, options, lease) {
-  const rootMetadata = await migrationStep(lease, async () => await lstat6(root, { bigint: true }));
+  const rootMetadata = await migrationStep(lease, async () => await lstat7(root, { bigint: true }));
   if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory())
     throw new Error("Storage migration cannot scan an unsafe legacy run root");
   let entryCount = 0;
@@ -44105,14 +44478,14 @@ async function scanLegacyTreeMetadata(root, options, lease) {
         throw new Error(
           `Legacy run contains reserved root file ${BACKUP_COMPLETION_FILE}; remove it before retrying`
         );
-      const path = join10(directory, name);
+      const path = join9(directory, name);
       const relativePath = relativeDirectory ? `${relativeDirectory}/${name}` : name;
       entryCount += 1;
       if (entryCount > LEGACY_MIGRATION_RESOURCE_LIMITS.maximumEntryCount)
         throw new Error(
           `Legacy run contains more than the ${LEGACY_MIGRATION_RESOURCE_LIMITS.maximumEntryCount}-entry safe migration limit; prune legacy run state before retrying`
         );
-      const metadata = await migrationStep(lease, async () => await lstat6(path, { bigint: true }));
+      const metadata = await migrationStep(lease, async () => await lstat7(path, { bigint: true }));
       if (metadata.isSymbolicLink())
         throw new Error("Storage migration cannot scan a symbolic link; no backup was created");
       if (metadata.isDirectory()) {
@@ -44224,14 +44597,14 @@ function advanceLegacyEventLineLength(chunk, previousLength) {
 }
 async function readLegacySnapshotFile(expected, options, lease) {
   assertLegacyFileMetadata(
-    await migrationStep(lease, async () => await lstat6(expected.path, { bigint: true })),
+    await migrationStep(lease, async () => await lstat7(expected.path, { bigint: true })),
     expected,
     "before opening"
   );
   const noFollow = process.platform === "win32" ? 0 : fsConstants4.O_NOFOLLOW;
   const handle = await acquireMigrationHandle(
     lease,
-    async () => await open5(expected.path, fsConstants4.O_RDONLY | noFollow)
+    async () => await open6(expected.path, fsConstants4.O_RDONLY | noFollow)
   );
   const hash2 = createHash4("sha256");
   const redactionChunks = options.scanRedaction ? [] : void 0;
@@ -44273,7 +44646,7 @@ async function readLegacySnapshotFile(expected, options, lease) {
       "while being read"
     );
     assertLegacyFileMetadata(
-      await migrationStep(lease, async () => await lstat6(expected.path, { bigint: true })),
+      await migrationStep(lease, async () => await lstat7(expected.path, { bigint: true })),
       expected,
       "after reading"
     );
@@ -44345,7 +44718,7 @@ async function validateCompleteBackup(backupRoot, input, lease) {
       return parseBackupCompletion(
         JSON.parse(
           (await readPrivateFileBounded(
-            join10(backupRoot, BACKUP_COMPLETION_FILE),
+            join9(backupRoot, BACKUP_COMPLETION_FILE),
             MIGRATION_DESCRIPTOR_MAX_BYTES,
             backupRoot
           )).toString("utf8")
@@ -44374,7 +44747,7 @@ async function validateCompleteBackup(backupRoot, input, lease) {
   return { marker, snapshot };
 }
 async function hasMigrationOwnedInventory(runRoot, backupSnapshot, runId, lease) {
-  const inventoryPath = join10(runRoot, ARTIFACT_INVENTORY_FILE);
+  const inventoryPath = join9(runRoot, ARTIFACT_INVENTORY_FILE);
   const inventoryStatus = await migrationStep(lease, async () => await status2(inventoryPath));
   if (!inventoryStatus) return false;
   if (inventoryStatus.isSymbolicLink() || !inventoryStatus.isFile())
@@ -44428,7 +44801,7 @@ async function syncBackupFile(path, observed, lease) {
   const noFollow = process.platform === "win32" ? 0 : fsConstants4.O_NOFOLLOW;
   const handle = await acquireMigrationHandle(
     lease,
-    async () => await open5(path, fsConstants4.O_RDWR | noFollow)
+    async () => await open6(path, fsConstants4.O_RDWR | noFollow)
   );
   try {
     const before = await migrationStep(lease, async () => await handle.stat());
@@ -44436,7 +44809,7 @@ async function syncBackupFile(path, observed, lease) {
       throw new Error(`Storage migration backup payload changed before fsync: ${path}`);
     await migrationStep(lease, async () => await handle.sync());
     const after = await migrationStep(lease, async () => await handle.stat());
-    const current = await migrationStep(lease, async () => await lstat6(path));
+    const current = await migrationStep(lease, async () => await lstat7(path));
     if (backupEntryFingerprint(after) !== expected || backupEntryFingerprint(current) !== expected)
       throw new Error(`Storage migration backup payload changed during fsync: ${path}`);
   } catch (error51) {
@@ -44447,7 +44820,7 @@ async function syncBackupFile(path, observed, lease) {
 }
 async function syncBackupTree(root, lease) {
   const visit = async (directory) => {
-    const observed = await migrationStep(lease, async () => await lstat6(directory));
+    const observed = await migrationStep(lease, async () => await lstat7(directory));
     if (observed.isSymbolicLink() || !observed.isDirectory())
       throw new Error(`Storage migration backup directory is unsafe: ${directory}`);
     const expected = backupEntryFingerprint(observed);
@@ -44455,12 +44828,12 @@ async function syncBackupTree(root, lease) {
       (left, right) => left.localeCompare(right)
     )) {
       lease.assertHeld();
-      const path = join10(directory, name);
-      const metadata = await migrationStep(lease, async () => await lstat6(path));
+      const path = join9(directory, name);
+      const metadata = await migrationStep(lease, async () => await lstat7(path));
       if (metadata.isDirectory() && !metadata.isSymbolicLink()) await visit(path);
       else await syncBackupFile(path, metadata, lease);
     }
-    if (backupEntryFingerprint(await migrationStep(lease, async () => await lstat6(directory))) !== expected)
+    if (backupEntryFingerprint(await migrationStep(lease, async () => await lstat7(directory))) !== expected)
       throw new Error(`Storage migration backup directory changed during fsync: ${directory}`);
     await migrationStep(lease, async () => await syncDirectory(directory));
   };
@@ -44484,14 +44857,14 @@ async function checkpointBackup(hook, checkpoint, lease) {
 }
 async function copyLegacySnapshotFile(source, destinationPath, lease, checkpoint) {
   assertLegacyFileMetadata(
-    await migrationStep(lease, async () => await lstat6(source.path, { bigint: true })),
+    await migrationStep(lease, async () => await lstat7(source.path, { bigint: true })),
     source,
     "before backup copy"
   );
   const noFollow = process.platform === "win32" ? 0 : fsConstants4.O_NOFOLLOW;
   const sourceHandle = await acquireMigrationHandle(
     lease,
-    async () => await open5(source.path, fsConstants4.O_RDONLY | noFollow)
+    async () => await open6(source.path, fsConstants4.O_RDONLY | noFollow)
   );
   let destinationHandle;
   try {
@@ -44502,7 +44875,7 @@ async function copyLegacySnapshotFile(source, destinationPath, lease, checkpoint
     );
     destinationHandle = await acquireMigrationHandle(
       lease,
-      async () => await open5(
+      async () => await open6(
         destinationPath,
         fsConstants4.O_WRONLY | fsConstants4.O_CREAT | fsConstants4.O_EXCL | noFollow,
         384
@@ -44543,7 +44916,7 @@ async function copyLegacySnapshotFile(source, destinationPath, lease, checkpoint
       "during backup copy"
     );
     assertLegacyFileMetadata(
-      await migrationStep(lease, async () => await lstat6(source.path, { bigint: true })),
+      await migrationStep(lease, async () => await lstat7(source.path, { bigint: true })),
       source,
       "after backup copy"
     );
@@ -44558,7 +44931,7 @@ async function copyLegacySnapshotFile(source, destinationPath, lease, checkpoint
     );
     const destinationPathMetadata = await migrationStep(
       lease,
-      async () => await lstat6(destinationPath, { bigint: true })
+      async () => await lstat7(destinationPath, { bigint: true })
     );
     if (destination.isSymbolicLink() || !destination.isFile() || destination.nlink > 1n || destination.size !== BigInt(source.bytes) || legacyMetadataFingerprint(destination) !== legacyMetadataFingerprint(destinationPathMetadata))
       throw new Error(
@@ -44581,13 +44954,13 @@ async function copyLegacySnapshot(sourceRoot, temporaryRoot, snapshot, lease, ch
     lease.assertHeld();
     if (entry.kind !== "directory") continue;
     assertLegacyDirectoryMetadata(
-      await migrationStep(lease, async () => await lstat6(entry.path, { bigint: true })),
+      await migrationStep(lease, async () => await lstat7(entry.path, { bigint: true })),
       entry,
       "before backup copy"
     );
     await migrationStep(
       lease,
-      async () => await mkdir4(join10(temporaryRoot, ...entry.relativePath.split("/")), { mode: 448 })
+      async () => await mkdir4(join9(temporaryRoot, ...entry.relativePath.split("/")), { mode: 448 })
     );
     await checkpointBackup(
       checkpoint,
@@ -44599,7 +44972,7 @@ async function copyLegacySnapshot(sourceRoot, temporaryRoot, snapshot, lease, ch
     lease.assertHeld();
     await copyLegacySnapshotFile(
       file2,
-      join10(temporaryRoot, ...file2.relativePath.split("/")),
+      join9(temporaryRoot, ...file2.relativePath.split("/")),
       lease,
       checkpoint
     );
@@ -44626,11 +44999,11 @@ async function ensureCompleteBackup(input, sourceSnapshot, lease, checkpoint) {
     lease,
     async () => await validatePrivatePath(
       input.graphcraftRoot,
-      relative4(input.graphcraftRoot, input.runRoot)
+      relative5(input.graphcraftRoot, input.runRoot)
     )
   );
-  const backupBase = join10(input.graphcraftRoot, "migration-backups");
-  const backupParent = join10(backupBase, input.runId);
+  const backupBase = join9(input.graphcraftRoot, "migration-backups");
+  const backupParent = join9(backupBase, input.runId);
   await migrationStep(
     lease,
     async () => await ensurePrivateDirectory(backupBase, input.graphcraftRoot)
@@ -44648,7 +45021,7 @@ async function ensureCompleteBackup(input, sourceSnapshot, lease, checkpoint) {
     legacySnapshotRefreshEvidence(refreshedSource)
   );
   const step = `${input.sourceVersion}-to-${CURRENT_RUN_STORAGE_VERSION}`;
-  const backupRoot = join10(backupParent, step);
+  const backupRoot = join9(backupParent, step);
   const existing = await migrationStep(lease, async () => await status2(backupRoot));
   if (existing) {
     if (existing.isSymbolicLink() || !existing.isDirectory())
@@ -44672,7 +45045,7 @@ async function ensureCompleteBackup(input, sourceSnapshot, lease, checkpoint) {
     await migrationStep(lease, async () => await syncDirectory(backupParent));
     return backupRoot;
   }
-  const temporaryRoot = join10(backupParent, `.${step}.tmp`);
+  const temporaryRoot = join9(backupParent, `.${step}.tmp`);
   const staleTemporary = await migrationStep(lease, async () => await status2(temporaryRoot));
   if (staleTemporary) {
     if (staleTemporary.isSymbolicLink() || !staleTemporary.isDirectory())
@@ -44698,10 +45071,10 @@ async function ensureCompleteBackup(input, sourceSnapshot, lease, checkpoint) {
       targetVersion: CURRENT_RUN_STORAGE_VERSION,
       treeDigest: refreshedSource.digest
     };
-    const completionPath = join10(temporaryRoot, BACKUP_COMPLETION_FILE);
+    const completionPath = join9(temporaryRoot, BACKUP_COMPLETION_FILE);
     await migrationStep(lease, async () => await writeJsonAtomic(completionPath, completion));
     await migrationStep(lease, async () => await hardenPrivateFile(completionPath, temporaryRoot));
-    const completionStatus = await migrationStep(lease, async () => await lstat6(completionPath));
+    const completionStatus = await migrationStep(lease, async () => await lstat7(completionPath));
     await syncBackupFile(completionPath, completionStatus, lease);
     await migrationStep(lease, async () => await syncDirectory(temporaryRoot));
     await migrationStep(lease, async () => await rename2(temporaryRoot, backupRoot));
@@ -44734,7 +45107,7 @@ async function validateLegacyRun(runRoot, runId, lease) {
   });
   await migrationStep(lease, async () => {
     try {
-      await lstat6(join10(runRoot, "events.jsonl"));
+      await lstat7(join9(runRoot, "events.jsonl"));
     } catch (error51) {
       throw new Error(
         `Legacy run ${runId} cannot migrate because events.jsonl is unavailable: ${error51 instanceof Error ? error51.message : String(error51)}`
@@ -44762,7 +45135,7 @@ async function ensureCurrentRunStorage(input) {
   let bodyFailureWasThrown = false;
   try {
     runLock = await acquireActiveAwareLock(
-      join10(input.graphcraftRoot, "locks", `${input.runId}.lock`),
+      join9(input.graphcraftRoot, "locks", `${input.runId}.lock`),
       lease
     );
     lease.addSignal(runLock.signal);
@@ -44840,12 +45213,12 @@ async function ensureCurrentRunStorage(input) {
 }
 
 // packages/runtime/src/store.ts
-var MEBIBYTE = 1024 * 1024;
-var RUN_EVENT_MAX_BYTES = 4 * MEBIBYTE;
-var RUN_EVENT_LOG_MAX_BYTES = 64 * MEBIBYTE;
-var RUN_STATE_MAX_BYTES = 16 * MEBIBYTE;
+var MEBIBYTE2 = 1024 * 1024;
+var RUN_EVENT_MAX_BYTES = 4 * MEBIBYTE2;
+var RUN_EVENT_LOG_MAX_BYTES = 64 * MEBIBYTE2;
+var RUN_STATE_MAX_BYTES = 16 * MEBIBYTE2;
 var RUN_BLOCKED_EVENT_RESERVE_BYTES = 64 * 1024;
-var RUN_METADATA_MAX_BYTES = 4 * MEBIBYTE;
+var RUN_METADATA_MAX_BYTES = 4 * MEBIBYTE2;
 var RUN_WORKSPACE_MAX_BYTES = 64 * 1024;
 var RunStoreLimitError = class extends Error {
   constructor(kind, attemptedBytes, limitBytes) {
@@ -44939,8 +45312,8 @@ var RunStore = class _RunStore {
   constructor(repositoryRoot, runId, limits = {}) {
     this.repositoryRoot = repositoryRoot;
     this.runId = runId;
-    this.graphcraftRoot = join11(repositoryRoot, ".graphcraft");
-    this.runRoot = join11(this.graphcraftRoot, "runs", runId);
+    this.graphcraftRoot = join10(repositoryRoot, ".graphcraft");
+    this.runRoot = join10(this.graphcraftRoot, "runs", runId);
     this.limits = normalizeLimits(limits);
     this.artifactStore = new RunArtifactStore(this.runRoot, runId);
     const blocker = this.createPersistenceLimitBlocker(1, "event_log");
@@ -44951,9 +45324,9 @@ var RunStore = class _RunStore {
       throw new Error("RunStore blocked-event reserve cannot fit its durable blocked event");
   }
   async validateStorageRoot() {
-    const graphcraftRoot2 = resolve8(this.graphcraftRoot);
-    const runRoot = resolve8(this.runRoot);
-    const validated = await validatePrivatePath(graphcraftRoot2, relative5(graphcraftRoot2, runRoot));
+    const graphcraftRoot2 = resolve9(this.graphcraftRoot);
+    const runRoot = resolve9(this.runRoot);
+    const validated = await validatePrivatePath(graphcraftRoot2, relative6(graphcraftRoot2, runRoot));
     if (validated !== runRoot)
       throw new Error(`Run storage path escaped the Graphcraft state directory: ${this.runRoot}`);
   }
@@ -44984,13 +45357,13 @@ var RunStore = class _RunStore {
   async writeBoundedJson(relativePath, value, maximumBytes, label, supersessionPolicy = "strict") {
     const persisted = redactValue(value);
     this.assertJsonProjectionFits(persisted, maximumBytes, label);
-    await writePrivateJsonAtomic(join11(this.runRoot, relativePath), persisted, this.runRoot, {
+    await writePrivateJsonAtomic(join10(this.runRoot, relativePath), persisted, this.runRoot, {
       supersessionPolicy
     });
   }
   async readBoundedJson(relativePath, maximumBytes) {
     const bytes = await readPrivateFileBounded(
-      join11(this.runRoot, relativePath),
+      join10(this.runRoot, relativePath),
       maximumBytes,
       this.runRoot
     );
@@ -45000,7 +45373,7 @@ var RunStore = class _RunStore {
     let bytes;
     try {
       bytes = await readPrivateFileBounded(
-        join11(this.runRoot, relativePath),
+        join10(this.runRoot, relativePath),
         maximumBytes,
         this.runRoot
       );
@@ -45048,14 +45421,14 @@ var RunStore = class _RunStore {
     store.assertJsonProjectionFits(heldOutProbePlan, RUN_METADATA_MAX_BYTES, "Held-out probe plan");
     await ensurePrivateDirectory(store.graphcraftRoot);
     await Promise.all([
-      ensurePrivateDirectory(join11(store.graphcraftRoot, "runs")),
-      ensurePrivateDirectory(join11(store.graphcraftRoot, "locks"))
+      ensurePrivateDirectory(join10(store.graphcraftRoot, "runs")),
+      ensurePrivateDirectory(join10(store.graphcraftRoot, "locks"))
     ]);
     await ensurePrivateDirectory(store.runRoot);
     await Promise.all([
-      ensurePrivateDirectory(join11(store.runRoot, "artifacts")),
-      ensurePrivateDirectory(join11(store.runRoot, "capsules")),
-      ensurePrivateDirectory(join11(store.runRoot, "reports"))
+      ensurePrivateDirectory(join10(store.runRoot, "artifacts")),
+      ensurePrivateDirectory(join10(store.runRoot, "capsules")),
+      ensurePrivateDirectory(join10(store.runRoot, "reports"))
     ]);
     await store.artifactStore.initialize();
     await Promise.all([
@@ -45071,7 +45444,7 @@ var RunStore = class _RunStore {
     return store;
   }
   eventsPath() {
-    return join11(this.runRoot, "events.jsonl");
+    return join10(this.runRoot, "events.jsonl");
   }
   createPersistenceLimitBlocker(sequence, kind) {
     return createRunEvent({
@@ -45129,7 +45502,7 @@ var RunStore = class _RunStore {
     let handle;
     const noFollow = process.platform === "win32" ? 0 : fsConstants5.O_NOFOLLOW;
     try {
-      handle = await open6(
+      handle = await open7(
         this.eventsPath(),
         fsConstants5.O_WRONLY | fsConstants5.O_APPEND | fsConstants5.O_CREAT | fsConstants5.O_EXCL | noFollow,
         384
@@ -45138,9 +45511,9 @@ var RunStore = class _RunStore {
     } catch (error51) {
       if (error51.code !== "EEXIST") throw error51;
       await validatePrivatePath(this.runRoot, "events.jsonl");
-      observed = await lstat7(this.eventsPath(), { bigint: true });
+      observed = await lstat8(this.eventsPath(), { bigint: true });
       assertEventLogFile(this.eventsPath(), observed);
-      handle = await open6(
+      handle = await open7(
         this.eventsPath(),
         fsConstants5.O_WRONLY | fsConstants5.O_APPEND | noFollow,
         384
@@ -45151,7 +45524,7 @@ var RunStore = class _RunStore {
       assertEventLogFile(this.eventsPath(), before);
       if (observed && !sameFileIdentity(observed, before))
         throw new Error("Run event log changed before its append descriptor was opened");
-      const pathBefore = await lstat7(this.eventsPath(), { bigint: true });
+      const pathBefore = await lstat8(this.eventsPath(), { bigint: true });
       assertEventLogFile(this.eventsPath(), pathBefore);
       if (!sameFileIdentity(before, pathBefore))
         throw new Error("Run event log path changed before append");
@@ -45160,7 +45533,7 @@ var RunStore = class _RunStore {
       await handle.writeFile(line, "utf8");
       await handle.sync();
       const after = await handle.stat({ bigint: true });
-      const pathAfter = await lstat7(this.eventsPath(), { bigint: true });
+      const pathAfter = await lstat8(this.eventsPath(), { bigint: true });
       assertEventLogFile(this.eventsPath(), after);
       assertEventLogFile(this.eventsPath(), pathAfter);
       if (!sameFileIdentity(after, pathAfter))
@@ -45363,7 +45736,7 @@ var RunStore = class _RunStore {
     const authoritativeBytes = serializedStateBytes(authoritative);
     if (authoritativeBytes > this.limits.maxStateBytes)
       throw new RunStoreLimitError("state", authoritativeBytes, this.limits.maxStateBytes);
-    const statePath = join11(this.runRoot, "state.json");
+    const statePath = join10(this.runRoot, "state.json");
     let materialized;
     let materializedBytes;
     try {
@@ -45580,14 +45953,14 @@ var RunStore = class _RunStore {
     const bytes = serializedStateBytes(state);
     if (bytes > this.limits.maxStateBytes)
       throw new RunStoreLimitError("state", bytes, this.limits.maxStateBytes);
-    await writePrivateJsonAtomic(join11(this.runRoot, "state.json"), state, this.runRoot, {
+    await writePrivateJsonAtomic(join10(this.runRoot, "state.json"), state, this.runRoot, {
       supersessionPolicy: "reconstructable_projection"
     });
   }
 };
 async function listRunIds(repositoryRoot) {
   try {
-    const entries = await readdir4(join11(repositoryRoot, ".graphcraft", "runs"), {
+    const entries = await readdir4(join10(repositoryRoot, ".graphcraft", "runs"), {
       withFileTypes: true
     });
     return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
@@ -45617,8 +45990,8 @@ async function resolveRunId(repositoryRoot, reference) {
 // packages/runtime/src/scope.ts
 import { createHash as createHash5 } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { lstat as lstat8, readlink as readlink2 } from "node:fs/promises";
-import { isAbsolute as isAbsolute6, matchesGlob, relative as relative6, resolve as resolve9, sep as sep4 } from "node:path";
+import { lstat as lstat9, readlink as readlink3 } from "node:fs/promises";
+import { isAbsolute as isAbsolute7, matchesGlob, relative as relative7, resolve as resolve10, sep as sep5 } from "node:path";
 var maximumChangedPaths = 1e4;
 async function gitOutput(repositoryPath, args) {
   const result = await runProcess("git", args, { cwd: repositoryPath, timeoutMs: 12e4 });
@@ -45630,10 +46003,10 @@ function nulPaths(value) {
   return value.split("\0").filter(Boolean);
 }
 function confinedPath(repositoryPath, path) {
-  if (isAbsolute6(path)) throw new Error(`Git reported an absolute workspace path: ${path}`);
-  const absolute = resolve9(repositoryPath, path);
-  const confined = relative6(repositoryPath, absolute);
-  if (confined === ".." || confined.startsWith(`..${sep4}`) || isAbsolute6(confined))
+  if (isAbsolute7(path)) throw new Error(`Git reported an absolute workspace path: ${path}`);
+  const absolute = resolve10(repositoryPath, path);
+  const confined = relative7(repositoryPath, absolute);
+  if (confined === ".." || confined.startsWith(`..${sep5}`) || isAbsolute7(confined))
     throw new Error(`Git reported a path outside the workspace: ${path}`);
   return absolute;
 }
@@ -45646,14 +46019,14 @@ async function pathSignature(repositoryPath, path) {
   const absolute = confinedPath(repositoryPath, path);
   let status3;
   try {
-    status3 = await lstat8(absolute);
+    status3 = await lstat9(absolute);
   } catch (error51) {
     if (error51.code === "ENOENT") return "missing";
     throw error51;
   }
   const mode = status3.mode & 511;
   if (status3.isSymbolicLink())
-    return contentHash({ kind: "symlink", mode, target: await readlink2(absolute) });
+    return contentHash({ kind: "symlink", mode, target: await readlink3(absolute) });
   if (status3.isFile())
     return contentHash({
       kind: "file",
@@ -45864,9 +46237,11 @@ async function prepareWorkerContext(input) {
     ["ls-files", "--cached", "--others", "--exclude-standard"],
     {
       cwd: input.repositoryPath,
-      timeoutMs: 3e4
+      timeoutMs: 3e4,
+      ...input.signal ? { signal: input.signal } : {}
     }
   );
+  input.signal?.throwIfAborted();
   if (tracked.exitCode !== 0) throw new Error("Unable to inventory repository context");
   const repositoryPaths = tracked.stdout.split("\n").filter(Boolean).sort();
   const inventory = await input.store.writeContentAddressedArtifact(
@@ -45877,6 +46252,10 @@ async function prepareWorkerContext(input) {
   const relevantPaths = input.node.contextSelector.relevantPaths.length ? input.node.contextSelector.relevantPaths : groundedRelevantPaths(repositoryPaths, input.node.objective);
   if (input.node.kind !== "commit" && input.node.kind !== "push" && input.node.kind !== "pull_request" && relevantPaths.length === 0)
     throw new Error(`Node ${input.node.id} has no grounded repository context`);
+  for (const repositoryPath of relevantPaths)
+    await assertRepositoryPath(input.repositoryPath, repositoryPath, input.signal);
+  if (relevantPaths.length > 0)
+    await assertRepositoryInventoryPaths(input.repositoryPath, relevantPaths, input.signal);
   const node2 = {
     ...input.node,
     contextSelector: { ...input.node.contextSelector, relevantPaths }
@@ -45949,29 +46328,29 @@ async function prepareWorkerContext(input) {
 }
 
 // packages/runtime/src/wait.ts
-import { lstat as lstat9, readFile as readFile3, readlink as readlink3 } from "node:fs/promises";
+import { lstat as lstat10, readFile as readFile2, readlink as readlink4 } from "node:fs/promises";
 import { setTimeout as waitForTimeout } from "node:timers/promises";
-import { isAbsolute as isAbsolute7, resolve as resolve10, sep as sep5 } from "node:path";
+import { isAbsolute as isAbsolute8, resolve as resolve11, sep as sep6 } from "node:path";
 function waitPath(root, path) {
-  if (isAbsolute7(path) || path.split(/[\\/]/).includes(".."))
+  if (isAbsolute8(path) || path.split(/[\\/]/).includes(".."))
     throw new Error(`Wait condition path is unsafe: ${path}`);
-  const absolute = resolve10(root, path);
-  if (absolute !== root && !absolute.startsWith(`${root}${sep5}`))
+  const absolute = resolve11(root, path);
+  if (absolute !== root && !absolute.startsWith(`${root}${sep6}`))
     throw new Error(`Wait condition path escapes the workspace: ${path}`);
   return absolute;
 }
 async function fileSignature(root, path) {
   const absolute = waitPath(root, path);
-  const stats = await lstat9(absolute).catch(() => void 0);
+  const stats = await lstat10(absolute).catch(() => void 0);
   if (!stats) return contentHash({ kind: "absent", path });
   if (stats.isSymbolicLink())
-    return contentHash({ kind: "symlink", path, target: await readlink3(absolute) });
+    return contentHash({ kind: "symlink", path, target: await readlink4(absolute) });
   if (stats.isFile())
     return contentHash({
       kind: "file",
       path,
       executable: (stats.mode & 73) !== 0,
-      contents: (await readFile3(absolute)).toString("base64")
+      contents: (await readFile2(absolute)).toString("base64")
     });
   return contentHash({ kind: stats.isDirectory() ? "directory" : "other", path });
 }
@@ -46112,59 +46491,71 @@ async function sleepUntilWake(nextWakeAt2, signal) {
 }
 
 // packages/runtime/src/held-out.ts
-import { execFile } from "node:child_process";
-import { readFile as readFile4, stat as stat4 } from "node:fs/promises";
-import { isAbsolute as isAbsolute8, relative as relative7, resolve as resolve11, sep as sep6 } from "node:path";
-import { promisify } from "node:util";
-var execFileAsync = promisify(execFile);
+import { isAbsolute as isAbsolute9, relative as relative8, resolve as resolve12, sep as sep7 } from "node:path";
 function relativeRepositoryPath(repositoryRoot, candidate) {
-  const root = resolve11(repositoryRoot);
-  const path = resolve11(repositoryRoot, candidate);
-  if (path !== root && !path.startsWith(`${root}${sep6}`)) return void 0;
-  const result = relative7(root, path);
-  return result && !isAbsolute8(result) ? result.split(sep6).join("/") : void 0;
+  const root = resolve12(repositoryRoot);
+  const path = resolve12(repositoryRoot, candidate);
+  if (path !== root && !path.startsWith(`${root}${sep7}`)) return void 0;
+  const result = relative8(root, path);
+  return result && !isAbsolute9(result) ? result.split(sep7).join("/") : void 0;
 }
-async function gitObjectValueHash(repositoryRoot, path, signal) {
+function relativeRepositoryDirectoryPath(repositoryRoot, candidate) {
+  const root = resolve12(repositoryRoot);
+  const path = resolve12(repositoryRoot, candidate);
+  if (path !== root && !path.startsWith(`${root}${sep7}`)) return void 0;
+  const result = relative8(root, path);
+  return result && !isAbsolute9(result) ? result.split(sep7).join("/") : ".";
+}
+async function directoryValueHash(repositoryRoot, path, signal) {
+  const [canonicalRoot, canonicalPath] = await Promise.all([
+    assertRepositoryDirectory(repositoryRoot, ".", signal),
+    assertRepositoryDirectory(repositoryRoot, path, signal)
+  ]);
   signal?.throwIfAborted();
-  const args = [
-    "hash-object",
-    `--path=${path.replaceAll("\\", "/")}`,
-    resolve11(repositoryRoot, path)
-  ];
-  const stdout = signal ? await runProcess("git", args, {
-    cwd: repositoryRoot,
-    signal,
-    timeoutMs: 12e4,
-    maxOutputBytesPerStream: 1024 * 1024
-  }).then((result) => {
-    signal.throwIfAborted();
-    if (result.exitCode !== 0)
-      throw new Error(result.stderr.trim() || `git hash-object failed for ${path}`);
-    return result.stdout;
-  }) : (await execFileAsync("git", args, {
-    cwd: repositoryRoot,
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024
-  })).stdout;
+  const target = relative8(canonicalRoot, canonicalPath);
+  if (isAbsolute9(target) || target === ".." || target.startsWith(`..${sep7}`))
+    throw new Error(`Completion working directory ${path} escapes the repository`);
+  return contentHash({
+    path,
+    target: target ? target.split(sep7).join("/") : "."
+  });
+}
+async function gitObjectValueHash(repositoryRoot, path, contents, signal) {
   signal?.throwIfAborted();
-  const objectHash = stdout.trim();
+  const result = await runProcess(
+    "git",
+    ["hash-object", "--stdin", `--path=${path.replaceAll("\\", "/")}`],
+    {
+      cwd: repositoryRoot,
+      input: contents,
+      timeoutMs: 12e4,
+      maxOutputBytesPerStream: 1024 * 1024,
+      ...signal ? { signal } : {}
+    }
+  );
+  signal?.throwIfAborted();
+  if (result.exitCode !== 0)
+    throw new Error(result.stderr.trim() || `git hash-object failed for ${path}`);
+  const objectHash = result.stdout.trim();
   if (!/^[a-f0-9]{40,64}$/.test(objectHash))
     throw new Error(`Unable to establish held-out integrity for ${path}`);
   return contentHash({ path, objectHash });
 }
 async function fileValueHash(repositoryRoot, path, algorithm, signal) {
-  if (algorithm === "git_hash_object") {
-    const details = await stat4(resolve11(repositoryRoot, path)).catch(() => void 0);
+  let contents;
+  try {
+    contents = await readRepositoryFile(repositoryRoot, path, {
+      ...signal ? { signal } : {}
+    });
+  } catch (error51) {
     signal?.throwIfAborted();
-    return details?.isFile() ? await gitObjectValueHash(repositoryRoot, path, signal) : contentHash({ missing: true, path, algorithm });
+    if (isRepositoryFileError(error51, "missing", "not_file"))
+      return contentHash({ missing: true, path, ...algorithm ? { algorithm } : {} });
+    throw error51;
   }
-  const contents = await readFile4(resolve11(repositoryRoot, path), {
-    ...signal ? { signal } : {}
-  }).catch(() => {
-    signal?.throwIfAborted();
-    return void 0;
-  });
-  return contents ? contentHash({ path, contents: contents.toString("base64") }) : contentHash({ missing: true, path });
+  if (algorithm === "git_hash_object")
+    return await gitObjectValueHash(repositoryRoot, path, contents, signal);
+  return contentHash({ path, contents: contents.toString("base64") });
 }
 function possibleFileArguments(values) {
   return values.map((value) => value.replace(/^["']|["']$/g, "").replace(/[;&|]+$/g, "")).filter(
@@ -46175,11 +46566,17 @@ async function fileIntegrity(repositoryRoot, cwd, values, signal) {
   const result = [];
   for (const value of possibleFileArguments(values)) {
     signal?.throwIfAborted();
-    const path = relativeRepositoryPath(repositoryRoot, resolve11(repositoryRoot, cwd ?? ".", value));
+    const path = relativeRepositoryPath(repositoryRoot, resolve12(repositoryRoot, cwd ?? ".", value));
     if (!path) continue;
-    const details = await stat4(resolve11(repositoryRoot, path)).catch(() => void 0);
-    signal?.throwIfAborted();
-    if (!details?.isFile()) continue;
+    try {
+      await readRepositoryFile(repositoryRoot, path, {
+        ...signal ? { signal } : {}
+      });
+    } catch (error51) {
+      signal?.throwIfAborted();
+      if (isRepositoryFileError(error51, "missing", "not_file")) continue;
+      throw error51;
+    }
     result.push({
       kind: "file",
       path,
@@ -46197,10 +46594,20 @@ async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot, s
       throw new Error("An approved probe plan cannot contain held-out references");
     const protectedValues = [];
     if (item.probe.kind === "command") {
+      const cwd = relativeRepositoryDirectoryPath(repositoryRoot, item.probe.cwd ?? ".");
+      if (!cwd)
+        throw new Error(`Completion probe ${item.probe.id} working directory escapes repository`);
+      protectedValues.push({
+        kind: "directory",
+        path: cwd,
+        valueHash: await directoryValueHash(repositoryRoot, cwd, signal)
+      });
       protectedValues.push(
         ...await fileIntegrity(repositoryRoot, item.probe.cwd, item.probe.args, signal)
       );
     }
+    if (item.probe.kind === "repository_inventory")
+      await assertRepositoryInventoryPaths(repositoryRoot, item.probe.paths, signal);
     const match = /^(.*package\.json) script (.+)$/.exec(item.source);
     if (!match) {
       integrity[item.probe.id] = protectedValues;
@@ -46211,8 +46618,7 @@ async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot, s
     const manifestPath = relativeRepositoryPath(repositoryRoot, path);
     if (!manifestPath) throw new Error(`Completion script ${script} escapes the repository`);
     const manifest2 = JSON.parse(
-      await readFile4(resolve11(repositoryRoot, manifestPath), {
-        encoding: "utf8",
+      await readRepositoryTextFile(repositoryRoot, manifestPath, {
         ...signal ? { signal } : {}
       })
     );
@@ -46239,21 +46645,55 @@ async function createRuntimeHeldOutProbePlan(runId, probePlan, repositoryRoot, s
   }
   return createHeldOutProbePlan(runId, probePlan, integrity);
 }
-async function heldOutIntegrityFailures(plan, repositoryPath) {
+async function heldOutIntegrityFailures(plan, repositoryPath, signal) {
   const failures = [];
   for (const entry of plan.probes) {
+    signal?.throwIfAborted();
     const changedKinds = /* @__PURE__ */ new Set();
     let signature = "";
+    if (entry.probe.kind === "repository_inventory") {
+      try {
+        await assertRepositoryInventoryPaths(repositoryPath, entry.probe.paths, signal);
+      } catch (error51) {
+        signal?.throwIfAborted();
+        changedKinds.add("repository_path");
+        signature += contentHash({
+          probeId: entry.probe.id,
+          kind: "repository_path",
+          reason: isRepositoryFileError(error51) ? error51.kind : "invalid"
+        });
+      }
+    }
     for (const integrity of entry.integrity) {
+      signal?.throwIfAborted();
       let actualHash;
-      if (integrity.kind === "package_script") {
-        const manifest2 = await readFile4(resolve11(repositoryPath, integrity.path), "utf8").then(
-          (value2) => JSON.parse(value2)
-        ).catch(() => void 0);
-        const value = manifest2?.scripts?.[integrity.script];
-        actualHash = value ? contentHash({ path: integrity.path, script: integrity.script, value }) : contentHash({ missing: true, path: integrity.path, script: integrity.script });
-      } else {
-        actualHash = await fileValueHash(repositoryPath, integrity.path, integrity.algorithm);
+      try {
+        if (integrity.kind === "package_script") {
+          const manifest2 = JSON.parse(
+            await readRepositoryTextFile(repositoryPath, integrity.path, {
+              ...signal ? { signal } : {}
+            })
+          );
+          const value = manifest2.scripts?.[integrity.script];
+          actualHash = value ? contentHash({ path: integrity.path, script: integrity.script, value }) : contentHash({ missing: true, path: integrity.path, script: integrity.script });
+        } else if (integrity.kind === "directory") {
+          actualHash = await directoryValueHash(repositoryPath, integrity.path, signal);
+        } else {
+          actualHash = await fileValueHash(
+            repositoryPath,
+            integrity.path,
+            integrity.algorithm,
+            signal
+          );
+        }
+      } catch (error51) {
+        signal?.throwIfAborted();
+        actualHash = contentHash({
+          unavailable: true,
+          path: integrity.path,
+          kind: integrity.kind,
+          reason: isRepositoryFileError(error51) ? error51.kind : "invalid"
+        });
       }
       if (actualHash === integrity.valueHash) continue;
       changedKinds.add(integrity.kind);
@@ -46262,7 +46702,9 @@ async function heldOutIntegrityFailures(plan, repositoryPath) {
     if (changedKinds.size > 0) {
       const detail = [
         changedKinds.has("package_script") ? "package script definition" : void 0,
-        changedKinds.has("file") ? "protected measurement file" : void 0
+        changedKinds.has("file") ? "protected measurement file" : void 0,
+        changedKinds.has("directory") ? "working directory" : void 0,
+        changedKinds.has("repository_path") ? "repository inventory path boundary" : void 0
       ].filter(Boolean).join(" and ");
       failures.push({
         probeId: `${entry.probe.id}-integrity`,
@@ -46382,9 +46824,9 @@ function createProgressDecisionPacket(input) {
 // packages/runtime/src/probe-process.ts
 import { randomUUID as randomUUID8 } from "node:crypto";
 import { constants as fsConstants6 } from "node:fs";
-import { open as open7, rmdir as rmdir2, unlink as unlink4 } from "node:fs/promises";
+import { open as open8, rmdir as rmdir2, unlink as unlink4 } from "node:fs/promises";
 import { constants as osConstants2 } from "node:os";
-import { dirname as dirname9, join as join12, relative as relative8 } from "node:path";
+import { dirname as dirname10, join as join11, relative as relative9 } from "node:path";
 var PROBE_PROCESS_JOURNAL_MAX_BYTES = 64 * 1024;
 var PROBE_PROCESS_SETTLEMENT_WAIT_MS = 6e3;
 var PROBE_PROCESS_REMOVAL_RETRY_MS = 2e3;
@@ -46475,12 +46917,12 @@ function probeProcessEventSettlement(input) {
   };
 }
 function journalPath(graphcraftRoot2, runId, executionId) {
-  return join12(graphcraftRoot2, "locks", "probe-processes", runId, `${executionId}.jsonl`);
+  return join11(graphcraftRoot2, "locks", "probe-processes", runId, `${executionId}.jsonl`);
 }
 async function withProbeProcessRunMutation(runRoot, action) {
   const previous = probeProcessRunMutationTails.get(runRoot) ?? Promise.resolve();
   let release;
-  const gate = new Promise((resolve14) => release = resolve14);
+  const gate = new Promise((resolve15) => release = resolve15);
   const tail = previous.then(() => gate);
   probeProcessRunMutationTails.set(runRoot, tail);
   await previous;
@@ -46497,19 +46939,19 @@ function serialized(value) {
 `;
 }
 async function createProbeProcessLease(input) {
-  const root = join12(input.graphcraftRoot, "locks", "probe-processes", input.runId);
+  const root = join11(input.graphcraftRoot, "locks", "probe-processes", input.runId);
   return await withProbeProcessRunMutation(root, async () => {
     await ensurePrivateDirectory(root, input.graphcraftRoot);
     const path = journalPath(input.graphcraftRoot, input.runId, input.definition.executionId);
-    await validatePrivatePath(input.graphcraftRoot, relative8(input.graphcraftRoot, path));
+    await validatePrivatePath(input.graphcraftRoot, relative9(input.graphcraftRoot, path));
     const directoryMutation = await preparePrivateDirectoryMutation(
-      dirname9(path),
+      dirname10(path),
       input.graphcraftRoot
     );
     const noFollow = process.platform === "win32" ? 0 : fsConstants6.O_NOFOLLOW;
     let handle;
     try {
-      handle = await open7(
+      handle = await open8(
         path,
         fsConstants6.O_CREAT | fsConstants6.O_EXCL | fsConstants6.O_RDWR | fsConstants6.O_APPEND | noFollow,
         384
@@ -46535,7 +46977,7 @@ async function createProbeProcessLease(input) {
         definition: input.definition,
         ownerTokenHash: contentHash(ownerToken),
         journalPath: path,
-        journalRelativePath: relative8(input.graphcraftRoot, path).replaceAll("\\", "/"),
+        journalRelativePath: relative9(input.graphcraftRoot, path).replaceAll("\\", "/"),
         handle,
         lifecycle: ({ onReady, onSettled }) => ({
           executionId: input.definition.executionId,
@@ -46693,7 +47135,7 @@ async function waitForProbeProcessSettlement(input, timeoutMs = PROBE_PROCESS_SE
     const inspected = await inspectProbeProcessJournal(input);
     if (!inspected || inspected.settlement) return inspected;
     if (Date.now() >= deadline) return inspected;
-    await new Promise((resolve14) => setTimeout(resolve14, 25));
+    await new Promise((resolve15) => setTimeout(resolve15, 25));
   }
 }
 async function closeProbeProcessLease(lease) {
@@ -46711,20 +47153,20 @@ async function retryWindowsRemoval(action, ignoredErrors) {
       if (ignoredErrors.has(code)) return;
       if (process.platform !== "win32" || !WINDOWS_TRANSIENT_REMOVAL_ERRORS.has(code) || Date.now() >= deadline)
         throw error51;
-      await new Promise((resolve14) => setTimeout(resolve14, delayMs));
+      await new Promise((resolve15) => setTimeout(resolve15, delayMs));
       delayMs = Math.min(100, delayMs * 2);
     }
   }
 }
 async function removeProbeProcessJournal(input) {
-  const runRoot = join12(input.graphcraftRoot, "locks", "probe-processes", input.runId);
+  const runRoot = join11(input.graphcraftRoot, "locks", "probe-processes", input.runId);
   const path = journalPath(input.graphcraftRoot, input.runId, input.executionId);
   await withProbeProcessRunMutation(runRoot, async () => {
-    const mutation = await preparePrivateDirectoryMutation(dirname9(path), input.graphcraftRoot);
+    const mutation = await preparePrivateDirectoryMutation(dirname10(path), input.graphcraftRoot);
     try {
       await retryWindowsRemoval(
         async () => {
-          await validatePrivatePath(input.graphcraftRoot, relative8(input.graphcraftRoot, path));
+          await validatePrivatePath(input.graphcraftRoot, relative9(input.graphcraftRoot, path));
           await unlink4(path);
         },
         /* @__PURE__ */ new Set(["ENOENT"])
@@ -46733,7 +47175,7 @@ async function removeProbeProcessJournal(input) {
       await finalizePrivateDirectoryMutation(mutation, input.graphcraftRoot);
     }
     const parentMutation = await preparePrivateDirectoryMutation(
-      dirname9(runRoot),
+      dirname10(runRoot),
       input.graphcraftRoot
     );
     try {
@@ -48350,7 +48792,19 @@ async function validatePlannedContext(graph, repositoryPath, signal) {
         throw new Error(
           `Planned node ${node2.id} selected nonexistent or untracked context path ${relevantPath}`
         );
+      try {
+        await assertRepositoryPath(repositoryPath, relevantPath, signal);
+      } catch (error51) {
+        throw new Error(
+          `Planned node ${node2.id} selected unsafe context path ${relevantPath}: ${error51.message}`
+        );
+      }
     }
+    await assertRepositoryInventoryPaths(
+      repositoryPath,
+      node2.contextSelector.relevantPaths,
+      signal
+    );
   }
 }
 async function createRun(task, options) {
@@ -48413,7 +48867,10 @@ async function createRun(task, options) {
       )
     );
     graph = compilePlannedGraph(contract, planned.plan, completionProbes, approvedProbes);
-    await validatePlannedContext(graph, repository.root, options.signal);
+    await runCreationStep(
+      options.signal,
+      () => validatePlannedContext(graph, repository.root, options.signal)
+    );
     assertRunCreationActive(options.signal);
     planningUsage = planned.usage;
   } else {
@@ -48428,7 +48885,10 @@ async function createRun(task, options) {
     approvedProbes
   });
   graph = optimized.graph;
-  await validatePlannedContext(graph, repository.root, options.signal);
+  await runCreationStep(
+    options.signal,
+    () => validatePlannedContext(graph, repository.root, options.signal)
+  );
   assertRunCreationActive(options.signal);
   const store = await RunStore.create(
     repository.root,
@@ -48455,7 +48915,7 @@ async function createRun(task, options) {
 }
 async function configureRunProbes(store, input) {
   await store.prepareStorage();
-  const lock = new RunLock(join13(store.graphcraftRoot, "locks", `${store.runId}.lock`));
+  const lock = new RunLock(join12(store.graphcraftRoot, "locks", `${store.runId}.lock`));
   await lock.acquire();
   try {
     const state = await store.loadState();
@@ -48500,7 +48960,7 @@ async function executeWorker(input) {
     await recordMissingUsage(input.store, input.resume, input.node, input.adapter.id);
     const reconciliation = await input.adapter.reconcile(input.resume);
     if (reconciliation.state === "completed" && reconciliation.result) {
-      const artifact2 = join13(
+      const artifact2 = join12(
         input.store.runRoot,
         "artifacts",
         "invocations",
@@ -48548,7 +49008,8 @@ async function executeWorker(input) {
     node: input.node,
     repositoryPath: input.workspace.path,
     predecessorEvidence: input.predecessorEvidence ?? [],
-    probeResults: input.probeResults ?? []
+    probeResults: input.probeResults ?? [],
+    ...input.signal ? { signal: input.signal } : {}
   });
   const authorityInputs = [
     {
@@ -48593,7 +49054,7 @@ async function executeWorker(input) {
   let termination;
   let usageReceipts = 0;
   const tokenPhase = input.node.id.startsWith("repair-") ? "repair" : "worker";
-  let artifact = join13(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+  let artifact = join12(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
   let preInvocationDiagnostic;
   try {
     preInvocationDiagnostic = diagnoseRequiredHostCapabilities(
@@ -49011,6 +49472,14 @@ async function runSemanticVerification(input) {
   let context;
   let beforeScope;
   try {
+    for (const repositoryPath of input.node.contextSelector.relevantPaths)
+      await assertRepositoryPath(input.workspace.path, repositoryPath, input.signal);
+    if (input.node.contextSelector.relevantPaths.length > 0)
+      await assertRepositoryInventoryPaths(
+        input.workspace.path,
+        input.node.contextSelector.relevantPaths,
+        input.signal
+      );
     context = SemanticVerifierContextSchema.parse(
       redactValue({
         schemaVersion: 1,
@@ -50580,24 +51049,33 @@ async function executeWorkNode(input) {
     await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason: reason2 });
     return { status: "failed", nodeId: input.node.id, reason: reason2 };
   }
-  const worker = await executeWorker({
-    adapter: input.adapter,
-    store: input.store,
-    contract: input.contract,
-    node: input.node,
-    workspace: input.workspace,
-    predecessorEvidence: input.node.contextSelector.predecessorResults.flatMap((nodeId) => {
-      const predecessor = input.state.nodes[nodeId];
-      return predecessor?.lastSummary ? [`${nodeId}: ${predecessor.lastSummary}`] : [];
-    }),
-    ...baselineProbeResults.length ? { probeResults: baselineProbeResults } : {},
-    ...input.observer ? { observer: input.observer } : {},
-    signal: input.signal,
-    baseline,
-    scopeBaseline,
-    ...input.recovery ? { resume: input.recovery } : {},
-    ...input.reuseSession ? { reuseSession: input.reuseSession } : {}
-  });
+  let worker;
+  try {
+    worker = await executeWorker({
+      adapter: input.adapter,
+      store: input.store,
+      contract: input.contract,
+      node: input.node,
+      workspace: input.workspace,
+      predecessorEvidence: input.node.contextSelector.predecessorResults.flatMap((nodeId) => {
+        const predecessor = input.state.nodes[nodeId];
+        return predecessor?.lastSummary ? [`${nodeId}: ${predecessor.lastSummary}`] : [];
+      }),
+      ...baselineProbeResults.length ? { probeResults: baselineProbeResults } : {},
+      ...input.observer ? { observer: input.observer } : {},
+      signal: input.signal,
+      baseline,
+      scopeBaseline,
+      ...input.recovery ? { resume: input.recovery } : {},
+      ...input.reuseSession ? { reuseSession: input.reuseSession } : {}
+    });
+  } catch (error51) {
+    if (input.signal.aborted) return { status: "interrupted", nodeId: input.node.id, artifact: "" };
+    if (!isRepositoryFileError(error51)) throw error51;
+    const reason2 = `Repository context validation failed before node ${input.node.id}: ${error51.message}`;
+    await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason: reason2 });
+    return { status: "failed", nodeId: input.node.id, reason: reason2 };
+  }
   let currentScope;
   try {
     currentScope = await captureWorkspaceScopeSnapshot(
@@ -50931,7 +51409,7 @@ async function executeRun(input) {
   const externalSignal = input.signal ?? new AbortController().signal;
   const contract = await input.store.loadContract();
   let graph = await input.store.loadGraph();
-  const lock = new RunLock(join13(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
+  const lock = new RunLock(join12(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
   await lock.acquire();
   const lockSignal = lock.signal;
   const ownedStore = new Proxy(input.store, {
@@ -51706,7 +52184,17 @@ async function executeRun(input) {
           });
           return await input.store.loadState();
         }
-        const integrityFailures = await heldOutIntegrityFailures(heldOutProbePlan, workspace.path);
+        let integrityFailures;
+        try {
+          integrityFailures = await heldOutIntegrityFailures(
+            heldOutProbePlan,
+            workspace.path,
+            signal
+          );
+        } catch (error51) {
+          if (signal.aborted) return await finishInterruption(current.id);
+          throw error51;
+        }
         let executed = [];
         let verificationScopeCurrent;
         if (integrityFailures.length === 0) {
@@ -52279,8 +52767,8 @@ var TRANSCRIPT_OMISSION_MARKER = Buffer.from(
 );
 
 // packages/runtime/src/supervisor.ts
-import { open as open8, readdir as readdir5 } from "node:fs/promises";
-import { dirname as dirname10, join as join14, relative as relative9, resolve as resolve12 } from "node:path";
+import { open as open9, readdir as readdir5 } from "node:fs/promises";
+import { dirname as dirname11, join as join13, relative as relative10, resolve as resolve13 } from "node:path";
 var KIB3 = 1024;
 var SUPERVISOR_LOG_MAX_BYTES = 64 * KIB3;
 var SUPERVISOR_LOG_RETAIN_BYTES = 32 * KIB3;
@@ -52291,10 +52779,10 @@ var SUPERVISOR_LOG_TRUNCATION_MARKER = Buffer.from(
 `
 );
 function graphcraftRoot(repositoryRoot) {
-  return join14(repositoryRoot, ".graphcraft");
+  return join13(repositoryRoot, ".graphcraft");
 }
 function supervisorRoot(repositoryRoot, runId) {
-  return join14(graphcraftRoot(repositoryRoot), "supervisors", runId);
+  return join13(graphcraftRoot(repositoryRoot), "supervisors", runId);
 }
 async function readSupervisorRecord(path, ownedRoot) {
   const source = await readPrivateFileBounded(path, SUPERVISOR_RECORD_MAX_BYTES, ownedRoot);
@@ -52313,7 +52801,7 @@ async function listSupervisorRecords(repositoryRoot, runId) {
   const ownedRoot = graphcraftRoot(repositoryRoot);
   let entries;
   try {
-    await validatePrivatePath(ownedRoot, relative9(ownedRoot, root));
+    await validatePrivatePath(ownedRoot, relative10(ownedRoot, root));
     entries = await readdir5(root, { withFileTypes: true });
   } catch (error51) {
     if (error51.code === "ENOENT") return [];
@@ -52321,8 +52809,8 @@ async function listSupervisorRecords(repositoryRoot, runId) {
   }
   const records = await Promise.all(
     entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json")).map(async (entry) => {
-      const path = join14(root, entry.name);
-      await validatePrivatePath(ownedRoot, relative9(ownedRoot, path));
+      const path = join13(root, entry.name);
+      await validatePrivatePath(ownedRoot, relative10(ownedRoot, path));
       return await readSupervisorRecord(path, ownedRoot);
     })
   );
@@ -52511,7 +52999,7 @@ async function readRuntimeManifest(path) {
       path,
       384,
       RUNTIME_MANIFEST_MAX_BYTES,
-      dirname11(dirname11(path))
+      dirname12(dirname12(path))
     );
     return source ? parseRuntimeManifest(JSON.parse(source.toString("utf8"))) : void 0;
   } catch {
@@ -52542,7 +53030,7 @@ async function loadBundledMcpRuntime(sourcePath) {
   };
 }
 async function runtimePairMatches(runtimeDirectory, bundled) {
-  const runtimeRoot = dirname11(runtimeDirectory);
+  const runtimeRoot = dirname12(runtimeDirectory);
   if (await runtimeDirectoryKind(runtimeDirectory) !== "directory") return false;
   if (!await managedDirectoryMatches(runtimeDirectory, 448)) return false;
   if (!await runtimePairHasExactEntries(runtimeDirectory, bundled)) return false;
@@ -52551,10 +53039,10 @@ async function runtimePairMatches(runtimeDirectory, bundled) {
   } catch {
     return false;
   }
-  const manifest2 = await readRuntimeManifest(join15(runtimeDirectory, RUNTIME_MANIFEST));
+  const manifest2 = await readRuntimeManifest(join14(runtimeDirectory, RUNTIME_MANIFEST));
   if (!sameRuntimeManifest(manifest2, bundled.manifest)) return false;
   const runtime = await readRegularFile(
-    join15(runtimeDirectory, bundled.manifest.runtimeFile),
+    join14(runtimeDirectory, bundled.manifest.runtimeFile),
     384,
     bundled.manifest.bytes,
     runtimeRoot
@@ -52566,9 +53054,9 @@ async function runtimePairMatches(runtimeDirectory, bundled) {
     return false;
   }
   const [hardenedManifest, hardenedRuntime] = await Promise.all([
-    readRuntimeManifest(join15(runtimeDirectory, RUNTIME_MANIFEST)),
+    readRuntimeManifest(join14(runtimeDirectory, RUNTIME_MANIFEST)),
     readRegularFile(
-      join15(runtimeDirectory, bundled.manifest.runtimeFile),
+      join14(runtimeDirectory, bundled.manifest.runtimeFile),
       384,
       bundled.manifest.bytes,
       runtimeRoot
@@ -52587,7 +53075,7 @@ async function runtimePairHasExactEntries(runtimeDirectory, bundled) {
 }
 async function runtimeDirectoryKind(path) {
   try {
-    const metadata = await lstat10(path);
+    const metadata = await lstat11(path);
     return metadata.isDirectory() && !metadata.isSymbolicLink() ? "directory" : "other";
   } catch (error51) {
     if (error51.code === "ENOENT") return "missing";
@@ -52599,7 +53087,7 @@ function modeMatches(mode, expectedMode) {
 }
 async function managedDirectoryMatches(path, expectedMode) {
   try {
-    const metadata = await lstat10(path);
+    const metadata = await lstat11(path);
     return metadata.isDirectory() && !metadata.isSymbolicLink() && modeMatches(metadata.mode, expectedMode);
   } catch {
     return false;
@@ -52623,7 +53111,7 @@ async function readRegularFile(path, expectedMode, maximumBytes = MANAGED_RUNTIM
   if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0) return void 0;
   let pathMetadata;
   try {
-    pathMetadata = await lstat10(path);
+    pathMetadata = await lstat11(path);
   } catch {
     return void 0;
   }
@@ -52631,22 +53119,22 @@ async function readRegularFile(path, expectedMode, maximumBytes = MANAGED_RUNTIM
     return void 0;
   try {
     const source = await readPrivateFileBounded(path, maximumBytes, ownedRoot);
-    const finalPathMetadata = await lstat10(path);
+    const finalPathMetadata = await lstat11(path);
     return finalPathMetadata.isFile() && !finalPathMetadata.isSymbolicLink() && modeMatches(finalPathMetadata.mode, expectedMode) && finalPathMetadata.dev === pathMetadata.dev && finalPathMetadata.ino === pathMetadata.ino && finalPathMetadata.size === source.byteLength ? source : void 0;
   } catch {
     return void 0;
   }
 }
 async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
-  const moduleDirectory = dirname11(fileURLToPath(moduleUrl));
+  const moduleDirectory = dirname12(fileURLToPath(moduleUrl));
   const candidates = [
-    join15(moduleDirectory, "mcp.mjs"),
-    resolve13(moduleDirectory, "../../../dist/mcp.mjs"),
-    resolve13(process.cwd(), "dist/mcp.mjs")
+    join14(moduleDirectory, "mcp.mjs"),
+    resolve14(moduleDirectory, "../../../dist/mcp.mjs"),
+    resolve14(process.cwd(), "dist/mcp.mjs")
   ];
   for (const candidate of candidates) {
     try {
-      await access3(candidate);
+      await access2(candidate);
       return candidate;
     } catch {
     }
@@ -52654,7 +53142,7 @@ async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
   throw new Error("dist/mcp.mjs is missing; run pnpm build before installing Graphcraft");
 }
 function resolveGraphcraftHome(configuredHome = process.env.GRAPHCRAFT_HOME) {
-  return configuredHome?.trim() ? resolve13(configuredHome) : join15(homedir(), ".graphcraft");
+  return configuredHome?.trim() ? resolve14(configuredHome) : join14(homedir(), ".graphcraft");
 }
 async function ensureGraphcraftHomeIfPresent(graphcraftHome) {
   if (await runtimeDirectoryKind(graphcraftHome) === "missing") return false;
@@ -52665,7 +53153,7 @@ function commandFor(host) {
   return host;
 }
 async function withPrivateHostCommandCwd(operation, createdBoundary) {
-  const cwd = await mkdtemp2(join15(tmpdir2(), "graphcraft-host-config-"));
+  const cwd = await mkdtemp2(join14(tmpdir2(), "graphcraft-host-config-"));
   try {
     await createdBoundary?.(cwd);
     await ensurePrivateDirectory(cwd);
@@ -52680,9 +53168,9 @@ async function withPrivateHostCommandCwd(operation, createdBoundary) {
   }
 }
 function sameRuntimePath(left, right) {
-  if (!isAbsolute9(left) || !isAbsolute9(right)) return false;
-  const normalizedLeft = resolve13(left);
-  const normalizedRight = resolve13(right);
+  if (!isAbsolute10(left) || !isAbsolute10(right)) return false;
+  const normalizedLeft = resolve14(left);
+  const normalizedRight = resolve14(right);
   return platform() === "win32" ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase() : normalizedLeft === normalizedRight;
 }
 async function inspectHostRegistration(host, expected, runner, cwd, knownSingleArguments = []) {
@@ -52766,19 +53254,19 @@ async function inspectHostRegistration(host, expected, runner, cwd, knownSingleA
   };
 }
 async function readRegistrationReceiptBytes(graphcraftHome, host) {
-  const directory = join15(graphcraftHome, "registrations");
+  const directory = join14(graphcraftHome, "registrations");
   const directoryKind = await runtimeDirectoryKind(directory);
   if (directoryKind === "missing") return void 0;
   await ensurePrivateManagedDirectory(directory, "registration receipts", graphcraftHome);
   if (!await managedDirectoryMatches(directory, 448)) {
     throw new Error("The managed Graphcraft registration receipts directory is unsafe");
   }
-  const path = join15(directory, `${host}.json`);
+  const path = join14(directory, `${host}.json`);
   await hardenPrivateFile(path, graphcraftHome);
   const source = await readRegularFile(path, 384, REGISTRATION_RECEIPT_MAX_BYTES, graphcraftHome);
   if (source) return source;
   try {
-    await lstat10(path);
+    await lstat11(path);
   } catch (error51) {
     if (error51.code === "ENOENT") return void 0;
     throw error51;
@@ -52808,8 +53296,8 @@ async function verifiedReceiptRuntimePath(graphcraftHome, receipt) {
   return hardened && sha256(hardened) === receipt.runtimeSha256 ? expectedPath : void 0;
 }
 async function readManagedRuntimeFile(graphcraftHome, runtimePath, expectedMode) {
-  const runtimeRoot = join15(graphcraftHome, "runtime");
-  const runtimeDirectory = dirname11(runtimePath);
+  const runtimeRoot = join14(graphcraftHome, "runtime");
+  const runtimeDirectory = dirname12(runtimePath);
   if (await runtimeDirectoryKind(runtimeRoot) !== "directory" || await runtimeDirectoryKind(runtimeDirectory) !== "directory")
     return void 0;
   try {
@@ -52829,7 +53317,7 @@ async function readManagedRuntimeFile(graphcraftHome, runtimePath, expectedMode)
 }
 function receiptRuntimePath(graphcraftHome, receipt) {
   if (!receipt) return void 0;
-  const expectedPath = join15(graphcraftHome, "runtime", receipt.graphcraftVersion, "mcp.mjs");
+  const expectedPath = join14(graphcraftHome, "runtime", receipt.graphcraftVersion, "mcp.mjs");
   return sameRuntimePath(receipt.runtimePath, expectedPath) ? expectedPath : void 0;
 }
 function parseVersion(value) {
@@ -52886,12 +53374,12 @@ async function installationDiagnostics(options = {}) {
   const expectedSource = options.mcpPath ?? await resolveBundledMcpPath();
   const bundled = await loadBundledMcpRuntime(expectedSource);
   const expectedSha256 = bundled.manifest.sha256;
-  const runtimeRoot = join15(graphcraftHome, "runtime");
-  const runtimeDirectory = join15(runtimeRoot, GRAPHCRAFT_VERSION);
-  const runtimePath = join15(runtimeDirectory, "mcp.mjs");
+  const runtimeRoot = join14(graphcraftHome, "runtime");
+  const runtimeDirectory = join14(runtimeRoot, GRAPHCRAFT_VERSION);
+  const runtimePath = join14(runtimeDirectory, "mcp.mjs");
   const runtimeDirectoryState = await runtimeDirectoryKind(runtimeDirectory);
   const safeRuntimeDirectories = await managedDirectoryMatches(runtimeRoot, 448) && await managedDirectoryMatches(runtimeDirectory, 448);
-  const manifest2 = safeRuntimeDirectories ? await readRuntimeManifest(join15(runtimeDirectory, RUNTIME_MANIFEST)) : void 0;
+  const manifest2 = safeRuntimeDirectories ? await readRuntimeManifest(join14(runtimeDirectory, RUNTIME_MANIFEST)) : void 0;
   const actualRuntime = safeRuntimeDirectories ? await readRegularFile(runtimePath, 384, MANAGED_RUNTIME_MAX_BYTES, graphcraftHome) : void 0;
   const actualSha256 = actualRuntime ? sha256(actualRuntime) : void 0;
   const runtimeCurrent = safeRuntimeDirectories && await runtimePairMatches(runtimeDirectory, bundled);
