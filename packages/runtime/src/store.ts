@@ -177,12 +177,13 @@ export class RunStore {
   readonly graphcraftRoot: string;
   readonly runRoot: string;
   readonly limits: RunStoreLimits;
-  private readonly artifactStore: RunArtifactStore;
+  private artifactStore: RunArtifactStore | undefined;
   private appendTail: Promise<void> = Promise.resolve();
   private initializing = false;
   private storageReady: Promise<RunStorageManifest> | undefined;
   private _canonicalHashAlgorithm: CanonicalHashAlgorithm;
   private _heldOutProbePlanHashAlgorithm: CanonicalHashAlgorithm;
+  private _artifactHashAlgorithm: CanonicalHashAlgorithm | undefined;
 
   constructor(
     repositoryRoot: string,
@@ -197,7 +198,6 @@ export class RunStore {
     this.limits = normalizeLimits(limits);
     this._canonicalHashAlgorithm = canonicalHashAlgorithm;
     this._heldOutProbePlanHashAlgorithm = canonicalHashAlgorithm;
-    this.artifactStore = new RunArtifactStore(this.runRoot, runId);
     for (const algorithm of [
       LEGACY_CANONICAL_HASH_ALGORITHM,
       PORTABLE_CANONICAL_HASH_ALGORITHM,
@@ -236,6 +236,11 @@ export class RunStore {
         manifest.formats.heldOutProbes === 2
           ? PORTABLE_CANONICAL_HASH_ALGORITHM
           : LEGACY_CANONICAL_HASH_ALGORITHM;
+      const artifactHashAlgorithm =
+        manifest.formats.artifactInventory === 2
+          ? PORTABLE_CANONICAL_HASH_ALGORITHM
+          : LEGACY_CANONICAL_HASH_ALGORITHM;
+      this.bindArtifactHashAlgorithm(artifactHashAlgorithm);
       await this.validateStorageRoot();
     } catch (error) {
       if (this.storageReady === ready) this.storageReady = undefined;
@@ -255,8 +260,32 @@ export class RunStore {
     return this._heldOutProbePlanHashAlgorithm;
   }
 
+  get artifactHashAlgorithm(): CanonicalHashAlgorithm {
+    if (!this._artifactHashAlgorithm)
+      throw new Error("Artifact hash policy is unavailable before run storage is prepared");
+    return this._artifactHashAlgorithm;
+  }
+
+  private bindArtifactHashAlgorithm(algorithm: CanonicalHashAlgorithm): void {
+    if (this.artifactStore && this.artifactStore.hashAlgorithm !== algorithm)
+      throw new Error("Artifact store was bound before its storage manifest policy was known");
+    this._artifactHashAlgorithm = algorithm;
+  }
+
+  private artifacts(): RunArtifactStore {
+    return (this.artifactStore ??= new RunArtifactStore(
+      this.runRoot,
+      this.runId,
+      this.artifactHashAlgorithm,
+    ));
+  }
+
   contentHash(value: unknown): string {
     return contentHash(value, this._canonicalHashAlgorithm);
+  }
+
+  artifactContentHash(value: unknown): string {
+    return contentHash(value, this.artifactHashAlgorithm);
   }
 
   private assertJsonProjectionFits(value: unknown, maximumBytes: number, label: string): void {
@@ -330,6 +359,7 @@ export class RunStore {
       PORTABLE_CANONICAL_HASH_ALGORITHM,
     );
     store.initializing = true;
+    store.bindArtifactHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     const persistedContract = RunContractSchema.parse(redactValue(contract));
     const persistedGraph = GraphSchema.parse(redactValue(graph));
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
@@ -352,7 +382,7 @@ export class RunStore {
       ensurePrivateDirectory(join(store.runRoot, "capsules")),
       ensurePrivateDirectory(join(store.runRoot, "reports")),
     ]);
-    await store.artifactStore.initialize();
+    await store.artifacts().initialize();
     await writeInitializingRunStorageManifest(store.runRoot, store.runId);
     const event = createRunEvent(
       {
@@ -765,7 +795,7 @@ export class RunStore {
         if (!(error instanceof SyntaxError)) throw error;
       }
     }
-    if (!materialized || contentHash(materialized) !== contentHash(authoritative))
+    if (!materialized || this.contentHash(materialized) !== this.contentHash(authoritative))
       await this.writeMaterializedState(authoritative);
     return authoritative;
   }
@@ -886,17 +916,17 @@ export class RunStore {
 
   async writeArtifact(relativePath: string, value: string | Uint8Array): Promise<string> {
     await this.ensureStorage();
-    return (await this.artifactStore.writeArtifact(relativePath, value)).path;
+    return (await this.artifacts().writeArtifact(relativePath, value)).path;
   }
 
   async appendInvocationEvent(invocationId: string, event: HostEvent): Promise<string> {
     await this.ensureStorage();
-    return (await this.artifactStore.appendInvocationEvent(invocationId, event)).path;
+    return (await this.artifacts().appendInvocationEvent(invocationId, event)).path;
   }
 
   async loadInvocationEvents(invocationId: string): Promise<HostEvent[]> {
     await this.ensureStorage();
-    return await this.artifactStore.loadInvocationEvents(invocationId);
+    return await this.artifacts().loadInvocationEvents(invocationId);
   }
 
   async loadGraphHistory(): Promise<GraphRevisionRecord[]> {
@@ -960,9 +990,9 @@ export class RunStore {
   async writeCapsule(hash: string, value: unknown): Promise<{ path: string; reused: boolean }> {
     await this.ensureStorage();
     const persistedValue = redactValue(value);
-    if (contentHash(persistedValue) !== hash)
+    if (this.artifactContentHash(persistedValue) !== hash)
       throw new Error("Context capsule must be redacted before content addressing");
-    const result = await this.artifactStore.writeIdentityArtifact({
+    const result = await this.artifacts().writeIdentityArtifact({
       relativePath: `capsules/${hash}.json`,
       value: `${JSON.stringify(persistedValue, null, 2)}\n`,
       kind: "capsule",
@@ -979,8 +1009,8 @@ export class RunStore {
     if (!/^[a-z0-9][a-z0-9-]*$/.test(category) || !/^[a-z0-9]+$/.test(extension))
       throw new Error("Content-addressed artifact category or extension is invalid");
     const bytes = redactTextBytes(value);
-    const hash = contentHash({ contents: bytes.toString("base64") });
-    const result = await this.artifactStore.writeIdentityArtifact({
+    const hash = this.artifactContentHash({ contents: bytes.toString("base64") });
+    const result = await this.artifacts().writeIdentityArtifact({
       relativePath: `artifacts/${category}/${hash}.${extension}`,
       value: bytes,
       kind: "content_addressed",
@@ -990,12 +1020,12 @@ export class RunStore {
 
   async loadArtifactInventory(): Promise<ArtifactInventory> {
     await this.ensureStorage();
-    return ArtifactInventorySchema.parse(await this.artifactStore.inventory());
+    return ArtifactInventorySchema.parse(await this.artifacts().inventory());
   }
 
   async readArtifactPreview(relativePath: string, maxBytes: number): Promise<ArtifactPreview> {
     await this.ensureStorage();
-    return await this.artifactStore.readArtifactPreview(`artifacts/${relativePath}`, maxBytes);
+    return await this.artifacts().readArtifactPreview(`artifacts/${relativePath}`, maxBytes);
   }
 
   async writeWorkspace(value: unknown): Promise<void> {

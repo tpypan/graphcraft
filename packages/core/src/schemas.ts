@@ -1150,19 +1150,30 @@ export const ArtifactPolicySchema = z
       });
   });
 
+const ArtifactMutationJournalFields = {
+  runId: z.uuid(),
+  mutationId: z.uuid(),
+  action: z.enum(["write", "delete", "unchanged"]),
+  previousInventoryHash: z.string().regex(/^[a-f0-9]{64}$/),
+  nextInventoryHash: z.string().regex(/^[a-f0-9]{64}$/),
+  path: z.string().min(1).max(MAX_ARTIFACT_PATH_CHARACTERS),
+  previousEntry: ArtifactInventoryEntrySchema.optional(),
+  nextEntry: ArtifactInventoryEntrySchema,
+  createdAt: z.iso.datetime(),
+};
+
 export const ArtifactMutationJournalSchema = z
-  .strictObject({
-    schemaVersion: z.literal(1),
-    runId: z.uuid(),
-    mutationId: z.uuid(),
-    action: z.enum(["write", "delete", "unchanged"]),
-    previousInventoryHash: z.string().regex(/^[a-f0-9]{64}$/),
-    nextInventoryHash: z.string().regex(/^[a-f0-9]{64}$/),
-    path: z.string().min(1).max(MAX_ARTIFACT_PATH_CHARACTERS),
-    previousEntry: ArtifactInventoryEntrySchema.optional(),
-    nextEntry: ArtifactInventoryEntrySchema,
-    createdAt: z.iso.datetime(),
-  })
+  .union([
+    z.strictObject({
+      schemaVersion: z.literal(1),
+      ...ArtifactMutationJournalFields,
+    }),
+    z.strictObject({
+      schemaVersion: z.literal(2),
+      hashAlgorithm: CanonicalHashAlgorithmSchema,
+      ...ArtifactMutationJournalFields,
+    }),
+  ])
   .superRefine((journal, context) => {
     if (artifactPathCanonicalKey(journal.path) === undefined)
       context.addIssue({
@@ -1311,6 +1322,7 @@ export const RunStorageManifestSchema = z.union([
     formats: RunStorageFormatsV2Schema.extend({
       heldOutProbes: z.union([z.literal(1), z.literal(2)]),
       events: z.union([z.literal(1), z.literal(2)]),
+      artifactInventory: z.union([z.literal(1), z.literal(2)]),
     }),
   }),
 ]);

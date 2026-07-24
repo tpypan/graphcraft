@@ -1,9 +1,10 @@
 import {
   ContextCapsuleSchema,
   ContextSelectionReceiptSchema,
-  contentHash,
+  LEGACY_CANONICAL_HASH_ALGORITHM,
   contextCapsuleCharacters,
   createContextCapsule,
+  type CanonicalHashAlgorithm,
   type ContextCapsule,
   type ContextSelectionReceipt,
   type GraphNode,
@@ -41,7 +42,11 @@ function contextTerms(objective: string): string[] {
   ].slice(0, 12);
 }
 
-export function groundedRelevantPaths(paths: string[], objective: string): string[] {
+export function groundedRelevantPaths(
+  paths: string[],
+  objective: string,
+  algorithm: CanonicalHashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM,
+): string[] {
   const terms = contextTerms(objective);
   return [...new Set(paths)]
     .filter(
@@ -60,7 +65,17 @@ export function groundedRelevantPaths(paths: string[], objective: string): strin
         : 0;
       return { path, score: affinity * 4 + source + policy };
     })
-    .sort((left, right) => right.score - left.score || left.path.localeCompare(right.path))
+    .sort(
+      (left, right) =>
+        right.score - left.score ||
+        (algorithm === LEGACY_CANONICAL_HASH_ALGORITHM
+          ? left.path.localeCompare(right.path)
+          : left.path < right.path
+            ? -1
+            : left.path > right.path
+              ? 1
+              : 0),
+    )
     .slice(0, 4)
     .map(({ path }) => path);
 }
@@ -105,7 +120,11 @@ export async function prepareWorkerContext(input: {
   );
   const relevantPaths = input.node.contextSelector.relevantPaths.length
     ? input.node.contextSelector.relevantPaths
-    : groundedRelevantPaths(repositoryPaths, input.node.objective);
+    : groundedRelevantPaths(
+        repositoryPaths,
+        input.node.objective,
+        input.store.artifactHashAlgorithm,
+      );
   if (
     input.node.kind !== "commit" &&
     input.node.kind !== "push" &&
@@ -131,7 +150,7 @@ export async function prepareWorkerContext(input: {
       }),
     ),
   );
-  const capsuleHash = contentHash(capsule);
+  const capsuleHash = input.store.artifactContentHash(capsule);
   const storedCapsule = await input.store.writeCapsule(capsuleHash, capsule);
   const matchedPaths = selectedTrackedPaths(repositoryPaths, capsule.relevantPaths);
   const selectedPredecessorNodeIds = input.node.contextSelector.predecessorResults.filter(
@@ -156,7 +175,9 @@ export async function prepareWorkerContext(input: {
     selected: {
       repositoryPaths: capsule.relevantPaths,
       predecessorNodeIds: selectedPredecessorNodeIds,
-      predecessorEvidenceHashes: capsule.predecessorEvidence.map((value) => contentHash(value)),
+      predecessorEvidenceHashes: capsule.predecessorEvidence.map((value) =>
+        input.store.artifactContentHash(value),
+      ),
       probeIds: selectedProbeResults.map(({ probeId }) => probeId),
       probeSignatures: selectedProbeResults.map(({ signature }) => signature),
       acceptanceAnchorIds: capsule.acceptanceAnchors.map(({ id }) => id),

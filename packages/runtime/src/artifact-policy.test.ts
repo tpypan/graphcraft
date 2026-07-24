@@ -15,10 +15,13 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   HostEventSchema,
+  LEGACY_CANONICAL_HASH_ALGORITHM,
   MAX_ARTIFACT_INVENTORY_BYTES,
   MAX_ARTIFACT_INVENTORY_PATH_BYTES,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
   contentHash,
   type ArtifactInventory,
+  type CanonicalHashAlgorithm,
 } from "@graphcraft/core";
 import { redactTextBytes } from "./redaction.ts";
 import {
@@ -39,6 +42,7 @@ afterEach(async () => {
 
 async function temporaryStore(
   overrides: Partial<ArtifactPolicy> = {},
+  hashAlgorithm: CanonicalHashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM,
 ): Promise<{ root: string; runRoot: string; store: RunArtifactStore }> {
   const root = await mkdtemp(join(tmpdir(), "graphcraft-artifact-policy-test-"));
   temporaryRoots.push(root);
@@ -53,7 +57,7 @@ async function temporaryStore(
     runReservedBytes: 4096,
     ...overrides,
   };
-  const store = new RunArtifactStore(runRoot, randomUUID(), policy);
+  const store = new RunArtifactStore(runRoot, randomUUID(), hashAlgorithm, policy);
   await store.initialize();
   return { root, runRoot, store };
 }
@@ -128,6 +132,17 @@ interface ArtifactStoreInternal {
 }
 
 describe("artifact lifecycle policy", () => {
+  it("rejects an undeclared durable hash policy at construction", () => {
+    expect(
+      () =>
+        new RunArtifactStore(
+          join(tmpdir(), "graphcraft-unsupported-artifact-policy"),
+          randomUUID(),
+          "unsupported" as CanonicalHashAlgorithm,
+        ),
+    ).toThrow();
+  });
+
   it("rejects traversal, absolute paths, symlink parents, and multiply-linked targets", async () => {
     const { root, runRoot, store } = await temporaryStore();
     await expect(store.writeArtifact("../escape.txt", "escape")).rejects.toThrow(/unsafe segment/);
@@ -186,7 +201,7 @@ describe("artifact lifecycle policy", () => {
         code: "ENOENT",
       });
       await expect(
-        new RunArtifactStore(runRoot, store.runId, store.policy).inventory(),
+        new RunArtifactStore(runRoot, store.runId, store.hashAlgorithm, store.policy).inventory(),
       ).resolves.toEqual(JSON.parse(inventoryBefore));
     },
   );
@@ -307,7 +322,12 @@ describe("artifact lifecycle policy", () => {
 
     process.env[environmentName] = "result";
     try {
-      const reopened = new RunArtifactStore(runRoot, store.runId, store.policy);
+      const reopened = new RunArtifactStore(
+        runRoot,
+        store.runId,
+        store.hashAlgorithm,
+        store.policy,
+      );
       expect(await readFile(artifact.path, "utf8")).toBe("durable result\n");
       expect((await reopened.inventory()).entries).toContainEqual(
         expect.objectContaining({ path: "artifacts/reports/result.txt" }),
@@ -705,7 +725,7 @@ describe("artifact lifecycle policy", () => {
       runArtifactBytes: 4096,
       runReservedBytes: 512,
     });
-    const peer = new RunArtifactStore(runRoot, store.runId, store.policy);
+    const peer = new RunArtifactStore(runRoot, store.runId, store.hashAlgorithm, store.policy);
     await peer.initialize();
 
     await Promise.all(
@@ -769,6 +789,7 @@ describe("artifact lifecycle policy", () => {
     const orderedStore = new RunArtifactStore(
       runRoot,
       store.runId,
+      store.hashAlgorithm,
       store.policy,
       async ({ boundary, path }) => {
         if (path !== "artifacts/ordered.txt") return;
@@ -830,12 +851,56 @@ describe("artifact lifecycle policy", () => {
       code: "ENOENT",
     });
 
-    const reopened = new RunArtifactStore(runRoot, store.runId, store.policy);
+    const reopened = new RunArtifactStore(runRoot, store.runId, store.hashAlgorithm, store.policy);
     await expect(reopened.inventory()).resolves.toMatchObject({
       entries: [expect.objectContaining({ path: "artifacts/stable.txt", storedBytes: 7 })],
     });
     await expect(readFile(join(runRoot, "artifacts", "stable.txt"), "utf8")).resolves.toBe(
       "stable\n",
+    );
+  });
+
+  it("rejects portable mutation recovery under the wrong legacy policy without mutation", async () => {
+    const { runRoot, store } = await temporaryStore({}, PORTABLE_CANONICAL_HASH_ALGORITHM);
+    const faultStore = new RunArtifactStore(
+      runRoot,
+      store.runId,
+      PORTABLE_CANONICAL_HASH_ALGORITHM,
+      store.policy,
+      ({ boundary, path }) => {
+        if (boundary === "after_journal" && path === "artifacts/policy-bound.txt")
+          throw new Error("leave portable mutation pending");
+      },
+    );
+    await expect(faultStore.writeArtifact("policy-bound.txt", "portable\n")).rejects.toThrow(
+      "leave portable mutation pending",
+    );
+    const before = await artifactMutationSnapshot(runRoot, "artifacts/policy-bound.txt");
+    expect(before.journal).toBeDefined();
+    expect(JSON.parse(before.journal!.toString("utf8"))).toMatchObject({
+      schemaVersion: 2,
+      hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+    });
+    expect(before.payload).toBeDefined();
+    expect(before.target).toBeUndefined();
+
+    const wrongPolicy = new RunArtifactStore(
+      runRoot,
+      store.runId,
+      LEGACY_CANONICAL_HASH_ALGORITHM,
+      store.policy,
+    );
+    await expect(wrongPolicy.inventory()).rejects.toThrow(/journal hash policy .*run policy/);
+
+    expect(await artifactMutationSnapshot(runRoot, "artifacts/policy-bound.txt")).toEqual(before);
+    const recovered = await new RunArtifactStore(
+      runRoot,
+      store.runId,
+      PORTABLE_CANONICAL_HASH_ALGORITHM,
+      store.policy,
+    ).inventory();
+    expect(recovered.entries).toContainEqual(
+      expect.objectContaining({ path: "artifacts/policy-bound.txt", storedBytes: 9 }),
     );
   });
 
@@ -847,6 +912,7 @@ describe("artifact lifecycle policy", () => {
       const faultStore = new RunArtifactStore(
         runRoot,
         store.runId,
+        store.hashAlgorithm,
         store.policy,
         ({ boundary, path }) => {
           if (!injected && boundary === faultPoint && path === "artifacts/recover.txt") {
@@ -861,7 +927,12 @@ describe("artifact lifecycle policy", () => {
       );
       expect(injected).toBe(true);
 
-      const reopened = new RunArtifactStore(runRoot, store.runId, store.policy);
+      const reopened = new RunArtifactStore(
+        runRoot,
+        store.runId,
+        store.hashAlgorithm,
+        store.policy,
+      );
       const inventory = await reopened.inventory();
       const entry = inventory.entries.find(({ path }) => path === "artifacts/recover.txt");
       if (faultPoint === "after_payload") {
@@ -903,6 +974,7 @@ describe("artifact lifecycle policy", () => {
         const faultStore = new RunArtifactStore(
           runRoot,
           store.runId,
+          store.hashAlgorithm,
           store.policy,
           async ({ phase, boundary, path }) => {
             if (
@@ -933,7 +1005,12 @@ describe("artifact lifecycle policy", () => {
         snapshotAtLoss,
       );
 
-      const reopened = new RunArtifactStore(runRoot, store.runId, store.policy);
+      const reopened = new RunArtifactStore(
+        runRoot,
+        store.runId,
+        store.hashAlgorithm,
+        store.policy,
+      );
       const inventory = await reopened.inventory();
       const entry = inventory.entries.find(
         ({ path }) => path === "artifacts/lease-publication.txt",
@@ -963,6 +1040,7 @@ describe("artifact lifecycle policy", () => {
       const seedStore = new RunArtifactStore(
         runRoot,
         store.runId,
+        store.hashAlgorithm,
         store.policy,
         ({ phase, boundary, path }) => {
           if (
@@ -989,6 +1067,7 @@ describe("artifact lifecycle policy", () => {
         const recoveryStore = new RunArtifactStore(
           runRoot,
           store.runId,
+          store.hashAlgorithm,
           store.policy,
           async ({ phase, boundary, path }) => {
             if (
@@ -1035,6 +1114,7 @@ describe("artifact lifecycle policy", () => {
       const recoveredInventory = await new RunArtifactStore(
         runRoot,
         store.runId,
+        store.hashAlgorithm,
         store.policy,
       ).inventory();
       expect(recoveredInventory.entries).toContainEqual(
@@ -1078,6 +1158,7 @@ describe("artifact lifecycle policy", () => {
         const faultStore = new RunArtifactStore(
           runRoot,
           store.runId,
+          store.hashAlgorithm,
           store.policy,
           async ({ phase, boundary, path }) => {
             if (
@@ -1142,6 +1223,7 @@ describe("artifact lifecycle policy", () => {
       const faultStore = new RunArtifactStore(
         runRoot,
         store.runId,
+        store.hashAlgorithm,
         store.policy,
         ({ phase, boundary }) => {
           if (phase !== "publication" || boundary !== "after_journal") return;
@@ -1197,7 +1279,7 @@ describe("artifact lifecycle policy", () => {
     const root = await mkdtemp(join(tmpdir(), "graphcraft-artifact-initialize-lease-test-"));
     temporaryRoots.push(root);
     const runRoot = join(root, "run");
-    const store = new RunArtifactStore(runRoot, randomUUID());
+    const store = new RunArtifactStore(runRoot, randomUUID(), LEGACY_CANONICAL_HASH_ALGORITHM);
     const internal = store as unknown as ArtifactStoreInternal;
     const originalPersistInventory = internal.persistInventory;
     const controller = new AbortController();
@@ -1225,7 +1307,12 @@ describe("artifact lifecycle policy", () => {
       release.mockRestore();
     }
 
-    const initialized = await new RunArtifactStore(runRoot, store.runId, store.policy).initialize();
+    const initialized = await new RunArtifactStore(
+      runRoot,
+      store.runId,
+      store.hashAlgorithm,
+      store.policy,
+    ).initialize();
     expect(initialized).toMatchObject({ runId: store.runId, entries: [] });
     await expect(stat(join(runRoot, store.inventoryRelativePath))).resolves.toBeDefined();
   });
@@ -1264,7 +1351,12 @@ describe("artifact lifecycle policy", () => {
       release.mockRestore();
     }
 
-    const migrated = await new RunArtifactStore(runRoot, store.runId, store.policy).migrateLegacy();
+    const migrated = await new RunArtifactStore(
+      runRoot,
+      store.runId,
+      store.hashAlgorithm,
+      store.policy,
+    ).migrateLegacy();
     expect(migrated.entries).toContainEqual(
       expect.objectContaining({
         path: "artifacts/legacy.txt",
@@ -1289,6 +1381,7 @@ describe("artifact lifecycle policy", () => {
     const parentStore = new RunArtifactStore(
       runRoot,
       store.runId,
+      store.hashAlgorithm,
       store.policy,
       undefined,
       controller.signal,
@@ -1311,7 +1404,7 @@ describe("artifact lifecycle policy", () => {
     }
 
     await expect(
-      new RunArtifactStore(runRoot, store.runId, store.policy).migrateLegacy(),
+      new RunArtifactStore(runRoot, store.runId, store.hashAlgorithm, store.policy).migrateLegacy(),
     ).resolves.toEqual(
       expect.objectContaining({
         entries: expect.arrayContaining([
@@ -1332,6 +1425,7 @@ describe("artifact lifecycle policy", () => {
       const faultStore = new RunArtifactStore(
         runRoot,
         store.runId,
+        store.hashAlgorithm,
         store.policy,
         async ({ boundary, path }) => {
           if (!injected && boundary === faultPoint && path === "artifacts/tampered.txt") {
@@ -1351,7 +1445,13 @@ describe("artifact lifecycle policy", () => {
       const recoveryHook = vi.fn();
 
       await expect(
-        new RunArtifactStore(runRoot, store.runId, store.policy, recoveryHook).inventory(),
+        new RunArtifactStore(
+          runRoot,
+          store.runId,
+          store.hashAlgorithm,
+          store.policy,
+          recoveryHook,
+        ).inventory(),
       ).rejects.toThrow(
         /does not match its completed mutation|changed after its mutation was journaled/,
       );
@@ -1360,7 +1460,12 @@ describe("artifact lifecycle policy", () => {
       expect(await readFile(payloadPath)).toEqual(payloadBefore);
 
       await writeFile(targetPath, "expected\n");
-      const recovered = await new RunArtifactStore(runRoot, store.runId, store.policy).inventory();
+      const recovered = await new RunArtifactStore(
+        runRoot,
+        store.runId,
+        store.hashAlgorithm,
+        store.policy,
+      ).inventory();
       expect(recovered.entries).toContainEqual(
         expect.objectContaining({
           path: "artifacts/tampered.txt",
@@ -1383,6 +1488,7 @@ describe("artifact lifecycle policy", () => {
     const faultStore = new RunArtifactStore(
       runRoot,
       store.runId,
+      store.hashAlgorithm,
       store.policy,
       async ({ boundary, path }) => {
         if (boundary !== "after_inventory" || path !== "artifacts/inventory-drift.txt") return;
@@ -1406,11 +1512,16 @@ describe("artifact lifecycle policy", () => {
     await expect(stat(journalPath)).resolves.toBeDefined();
     await expect(stat(payloadPath)).resolves.toBeDefined();
     await expect(
-      new RunArtifactStore(runRoot, store.runId, store.policy).inventory(),
+      new RunArtifactStore(runRoot, store.runId, store.hashAlgorithm, store.policy).inventory(),
     ).rejects.toThrow(/does not match an exact durable inventory snapshot/);
 
     await writeFile(inventoryPath, publishedInventory!);
-    const recovered = await new RunArtifactStore(runRoot, store.runId, store.policy).inventory();
+    const recovered = await new RunArtifactStore(
+      runRoot,
+      store.runId,
+      store.hashAlgorithm,
+      store.policy,
+    ).inventory();
     expect(recovered.entries).toContainEqual(
       expect.objectContaining({ path: "artifacts/inventory-drift.txt", storedBytes: 9 }),
     );
@@ -1425,6 +1536,7 @@ describe("artifact lifecycle policy", () => {
       const faultStore = new RunArtifactStore(
         runRoot,
         store.runId,
+        store.hashAlgorithm,
         store.policy,
         ({ boundary, path }) => {
           if (boundary === "after_journal" && path === "artifacts/recover-drift.txt")
@@ -1461,7 +1573,7 @@ describe("artifact lifecycle policy", () => {
       const payloadBefore = await readFile(payloadPath);
 
       await expect(
-        new RunArtifactStore(runRoot, store.runId, store.policy).inventory(),
+        new RunArtifactStore(runRoot, store.runId, store.hashAlgorithm, store.policy).inventory(),
       ).rejects.toThrow(/does not match an exact durable inventory snapshot/);
 
       expect(await readFile(inventoryPath)).toEqual(inventoryBefore);
@@ -1480,6 +1592,7 @@ describe("artifact lifecycle policy", () => {
     const faultStore = new RunArtifactStore(
       runRoot,
       store.runId,
+      store.hashAlgorithm,
       store.policy,
       ({ boundary, path, action }) => {
         if (
@@ -1499,7 +1612,7 @@ describe("artifact lifecycle policy", () => {
     ).rejects.toThrow("Injected artifact deletion fault");
     expect(injected).toBe(true);
 
-    const reopened = new RunArtifactStore(runRoot, store.runId, store.policy);
+    const reopened = new RunArtifactStore(runRoot, store.runId, store.hashAlgorithm, store.policy);
     expect(
       (await reopened.inventory()).entries.find(({ path }) => path === "artifacts/managed.json"),
     ).toMatchObject({ disposition: "omitted", storedBytes: 0, reason: "artifact_limit" });
@@ -1514,6 +1627,7 @@ describe("artifact lifecycle policy", () => {
     const faultStore = new RunArtifactStore(
       runRoot,
       store.runId,
+      store.hashAlgorithm,
       store.policy,
       ({ boundary, path }) => {
         if (!injected && boundary === "after_target" && path.endsWith(".recovery.json")) {
@@ -1531,7 +1645,7 @@ describe("artifact lifecycle policy", () => {
     ).rejects.toThrow("Injected invocation checkpoint fault");
     expect(injected).toBe(true);
 
-    const reopened = new RunArtifactStore(runRoot, store.runId, store.policy);
+    const reopened = new RunArtifactStore(runRoot, store.runId, store.hashAlgorithm, store.policy);
     expect(await reopened.loadInvocationEvents("invocation")).toEqual([
       { type: "session", hostSessionId: "session-1" },
     ]);
@@ -1600,7 +1714,7 @@ describe("artifact lifecycle policy", () => {
     await expect(store.inventory()).rejects.toThrow(/stored entry lacks a content hash/);
 
     await writeFile(inventoryPath, `${JSON.stringify(original)}\n`);
-    const peer = new RunArtifactStore(runRoot, store.runId, {
+    const peer = new RunArtifactStore(runRoot, store.runId, store.hashAlgorithm, {
       ...store.policy,
       ordinaryArtifactBytes: 1,
     });

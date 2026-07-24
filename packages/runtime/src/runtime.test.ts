@@ -25,6 +25,7 @@ import {
   PORTABLE_CANONICAL_HASH_ALGORITHM,
   REQUIRED_HOST_PROTOCOL_CAPABILITIES,
   assertRequiredHostCapabilities,
+  contentHash,
   createRunEvent,
   evidenceSnapshot,
   hostCapabilitiesFromProtocolProfile,
@@ -65,6 +66,7 @@ import {
 import { RunLock } from "./lock.ts";
 import { createRunWorkspace, discoverPlanningEvidence } from "./repository.ts";
 import { createRuntimeHeldOutProbePlan, heldOutIntegrityFailures } from "./held-out.ts";
+import { groundedRelevantPaths, prepareWorkerContext } from "./context.ts";
 import {
   RUN_METADATA_MAX_BYTES,
   RUN_WORKSPACE_MAX_BYTES,
@@ -2625,6 +2627,81 @@ process.stdin.on("end", () => {
     expect((await created.store.loadEvents()).map(({ type }) => type)).toContain(
       "semantic.verdict",
     );
+  });
+
+  it("selects fresh context identities with the portable artifact policy without ambient locale", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    const selectedNode = created.graph.nodes.find(
+      ({ kind }) => kind !== "commit" && kind !== "push" && kind !== "pull_request",
+    );
+    if (!selectedNode) throw new Error("Expected a worker node for context selection");
+    const predecessorEvidence = ["prior-node: learned Å before Z"];
+    const localeCompare = vi.spyOn(String.prototype, "localeCompare").mockImplementation(() => {
+      throw new Error("portable context identity used ambient locale ordering");
+    });
+    let selected: Awaited<ReturnType<typeof prepareWorkerContext>>;
+    try {
+      selected = await prepareWorkerContext({
+        store: created.store,
+        invocationId: randomUUID(),
+        contract: created.contract,
+        node: {
+          ...selectedNode,
+          contextSelector: {
+            ...selectedNode.contextSelector,
+            relevantPaths: [],
+            predecessorResults: ["prior-node"],
+          },
+        },
+        repositoryPath: repository,
+        predecessorEvidence,
+        probeResults: [],
+      });
+    } finally {
+      localeCompare.mockRestore();
+    }
+
+    expect(created.store.artifactHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    expect(selected.capsuleHash).toBe(
+      contentHash(selected.capsule, PORTABLE_CANONICAL_HASH_ALGORITHM),
+    );
+    expect(selected.receipt.selected.predecessorEvidenceHashes).toEqual([
+      contentHash(predecessorEvidence[0], PORTABLE_CANONICAL_HASH_ALGORITHM),
+    ]);
+    expect(selected.receipt.selected.predecessorNodeIds).toEqual(["prior-node"]);
+  });
+
+  it("uses the artifact domain policy for grounded path tie-breaking", () => {
+    const localeCompare = vi.spyOn(String.prototype, "localeCompare").mockImplementation(function (
+      this: string,
+      other: string,
+    ) {
+      const left = String(this);
+      return left < other ? 1 : left > other ? -1 : 0;
+    });
+    try {
+      expect(
+        groundedRelevantPaths(
+          ["Zulu.txt", "Ångstrom.txt"],
+          "unrelated objective",
+          LEGACY_CANONICAL_HASH_ALGORITHM,
+        ),
+      ).toEqual(["Ångstrom.txt", "Zulu.txt"]);
+      const legacyCalls = localeCompare.mock.calls.length;
+      expect(
+        groundedRelevantPaths(
+          ["Zulu.txt", "Ångstrom.txt"],
+          "unrelated objective",
+          PORTABLE_CANONICAL_HASH_ALGORITHM,
+        ),
+      ).toEqual(["Zulu.txt", "Ångstrom.txt"]);
+      expect(localeCompare).toHaveBeenCalledTimes(legacyCalls);
+    } finally {
+      localeCompare.mockRestore();
+    }
   });
 
   it("keeps held-out file integrity stable across Git checkout line-ending conversion", async () => {

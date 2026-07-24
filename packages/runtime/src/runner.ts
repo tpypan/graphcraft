@@ -209,8 +209,16 @@ function populateMissingGraphContext(
               ...node.contextSelector,
               relevantPaths: [
                 ...new Set([
-                  ...groundedRelevantPaths(evidencePaths, node.objective),
-                  ...groundedRelevantPaths(repositoryEvidence.trackedPaths, node.objective),
+                  ...groundedRelevantPaths(
+                    evidencePaths,
+                    node.objective,
+                    PORTABLE_CANONICAL_HASH_ALGORITHM,
+                  ),
+                  ...groundedRelevantPaths(
+                    repositoryEvidence.trackedPaths,
+                    node.objective,
+                    PORTABLE_CANONICAL_HASH_ALGORITHM,
+                  ),
                 ]),
               ].slice(0, 4),
             },

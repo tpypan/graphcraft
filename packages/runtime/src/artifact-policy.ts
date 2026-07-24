@@ -7,7 +7,9 @@ import {
   ArtifactInventorySchema,
   ArtifactMutationJournalSchema,
   ArtifactPolicySchema,
+  CanonicalHashAlgorithmSchema,
   HostEventSchema,
+  LEGACY_CANONICAL_HASH_ALGORITHM,
   MAX_ARTIFACT_INVENTORY_BYTES,
   artifactInventorySerializedBytes,
   artifactPathCanonicalKey,
@@ -18,6 +20,7 @@ import {
   type ArtifactInventoryReason,
   type ArtifactKind,
   type ArtifactMutationJournal,
+  type CanonicalHashAlgorithm,
   type HostEvent,
 } from "@graphcraft/core";
 import { redactTextBytes, redactValue } from "./redaction.ts";
@@ -95,8 +98,18 @@ function now(): string {
   return new Date().toISOString();
 }
 
-function bytesHash(bytes: Uint8Array): string {
-  return contentHash({ contents: Buffer.from(bytes).toString("base64") });
+function bytesHash(bytes: Uint8Array, algorithm: CanonicalHashAlgorithm): string {
+  return contentHash({ contents: Buffer.from(bytes).toString("base64") }, algorithm);
+}
+
+function compareStrings(left: string, right: string, algorithm: CanonicalHashAlgorithm): number {
+  return algorithm === LEGACY_CANONICAL_HASH_ALGORITHM
+    ? left.localeCompare(right)
+    : left < right
+      ? -1
+      : left > right
+        ? 1
+        : 0;
 }
 
 function formatForPath(path: string): ArtifactFormat {
@@ -749,8 +762,14 @@ function boundedRecoveryCheckpoint(
   return { source, stored };
 }
 
-function inventoryTotals(inventory: ArtifactInventory, updatedAt = now()): ArtifactInventory {
-  const entries = [...inventory.entries].sort((left, right) => left.path.localeCompare(right.path));
+function inventoryTotals(
+  inventory: ArtifactInventory,
+  algorithm: CanonicalHashAlgorithm,
+  updatedAt = now(),
+): ArtifactInventory {
+  const entries = [...inventory.entries].sort((left, right) =>
+    compareStrings(left.path, right.path, algorithm),
+  );
   return validateArtifactInventory({
     ...inventory,
     sourceBytes: entries.reduce((total, entry) => total + entry.sourceBytes, 0),
@@ -781,6 +800,7 @@ function entryFor(
   source: Buffer,
   stored: Buffer | undefined,
   previous: ArtifactInventoryEntry | undefined,
+  algorithm: CanonicalHashAlgorithm,
   reason?: ArtifactInventoryReason,
   disposition?: ArtifactInventoryEntry["disposition"],
 ): ArtifactInventoryEntry {
@@ -798,8 +818,8 @@ function entryFor(
     omittedBytes: Math.max(0, source.length - (stored?.length ?? 0)),
     truncated: Boolean(hasStoredBytes && stored.length < source.length),
     legacy: false,
-    sourceHash: bytesHash(source),
-    ...(hasStoredBytes ? { storedHash: bytesHash(stored) } : {}),
+    sourceHash: bytesHash(source, algorithm),
+    ...(hasStoredBytes ? { storedHash: bytesHash(stored, algorithm) } : {}),
     ...(reason ? { reason } : {}),
     createdAt: previous?.createdAt ?? timestamp,
     updatedAt: timestamp,
@@ -815,11 +835,13 @@ export class RunArtifactStore {
   constructor(
     readonly runRoot: string,
     readonly runId: string,
+    readonly hashAlgorithm: CanonicalHashAlgorithm,
     readonly policy: ArtifactPolicy = DEFAULT_ARTIFACT_POLICY,
     private readonly publicationHook?: ArtifactPublicationHook,
     private readonly parentSignal?: AbortSignal,
   ) {
     if (!RUN_ID_PATTERN.test(runId)) throw new Error(`Invalid Graphcraft run ID: ${runId}`);
+    CanonicalHashAlgorithmSchema.parse(hashAlgorithm);
     ArtifactPolicySchema.parse(policy);
     if (policy.invocationReservedBytes >= policy.invocationTranscriptBytes)
       throw new Error("Invocation artifact reserve must be smaller than the transcript limit");
@@ -830,6 +852,10 @@ export class RunArtifactStore {
     const runParent = dirname(resolve(runRoot));
     const lockRoot = basename(runParent) === "runs" ? dirname(runParent) : runParent;
     this.mutationLockPath = join(lockRoot, "locks", `${runId}.artifacts.lock`);
+  }
+
+  private hash(value: unknown): string {
+    return contentHash(value, this.hashAlgorithm);
   }
 
   private async acquireMutationLock(): Promise<RunLock> {
@@ -991,6 +1017,12 @@ export class RunArtifactStore {
     const journal = ArtifactMutationJournalSchema.parse(JSON.parse(source.toString("utf8")));
     if (journal.runId !== this.runId)
       throw new Error(`Artifact mutation journal belongs to ${journal.runId}, not ${this.runId}`);
+    const journalHashAlgorithm =
+      journal.schemaVersion === 1 ? LEGACY_CANONICAL_HASH_ALGORITHM : journal.hashAlgorithm;
+    if (journalHashAlgorithm !== this.hashAlgorithm)
+      throw new Error(
+        `Artifact mutation journal hash policy ${journalHashAlgorithm} does not match run policy ${this.hashAlgorithm}`,
+      );
     if (artifactPathCanonicalKey(journal.path) === undefined)
       throw new Error("Artifact mutation journal path is not portable");
     return journal;
@@ -1042,7 +1074,7 @@ export class RunArtifactStore {
     );
     if (!contents) return undefined;
     if (!expectedSizes.has(contents.length)) return { bytes: contents.length };
-    return { bytes: contents.length, hash: bytesHash(contents) };
+    return { bytes: contents.length, hash: bytesHash(contents, this.hashAlgorithm) };
   }
 
   private targetMatches(
@@ -1103,7 +1135,7 @@ export class RunArtifactStore {
     this.assertMutationAction(journal);
     const inventory = await this.rawInventory(lease);
     lease.assertHeld();
-    const inventoryHash = contentHash(inventory);
+    const inventoryHash = this.hash(inventory);
     const currentEntry = inventory.entries.find(({ path }) => path === journal.path);
     const currentIsPrevious =
       inventoryHash === journal.previousInventoryHash &&
@@ -1141,7 +1173,7 @@ export class RunArtifactStore {
       );
 
     const nextInventory = this.replaceEntry(inventory, journal.nextEntry, journal.createdAt);
-    if (contentHash(nextInventory) !== journal.nextInventoryHash)
+    if (this.hash(nextInventory) !== journal.nextInventoryHash)
       throw new Error(
         `Artifact mutation ${journal.mutationId} does not reproduce its next inventory snapshot; recovery stopped without changing files`,
       );
@@ -1159,7 +1191,7 @@ export class RunArtifactStore {
       lease.assertHeld();
       if (payload.length !== expected.bytes)
         throw new Error("Artifact mutation payload size does not match its journal");
-      if (bytesHash(payload) !== expected.hash)
+      if (bytesHash(payload, this.hashAlgorithm) !== expected.hash)
         throw new Error("Artifact mutation payload hash does not match its journal");
       await atomicWrite(this.runRoot, journal.path, payload, lease);
     } else if (journal.action === "delete" && !targetIsNext) {
@@ -1167,7 +1199,7 @@ export class RunArtifactStore {
     }
     lease.assertHeld();
     await this.checkpointMutation(journal, "recovery", "after_target", lease);
-    if (contentHash(await this.rawInventory(lease)) !== journal.previousInventoryHash)
+    if (this.hash(await this.rawInventory(lease)) !== journal.previousInventoryHash)
       throw new Error(
         `Artifact mutation ${journal.mutationId} inventory changed during recovery; recovery stopped without changing inventory metadata`,
       );
@@ -1179,7 +1211,7 @@ export class RunArtifactStore {
       lease,
     );
     await lease.observe(() => this.persistInventory(nextInventory, lease));
-    if (contentHash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
+    if (this.hash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
       throw new Error(
         `Artifact mutation ${journal.mutationId} inventory changed while it was recovered; recovery stopped without cleaning mutation evidence`,
       );
@@ -1190,7 +1222,7 @@ export class RunArtifactStore {
       `Artifact ${journal.path} changed while its inventory was recovered; recovery stopped without cleaning mutation evidence`,
       lease,
     );
-    if (contentHash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
+    if (this.hash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
       throw new Error(
         `Artifact mutation ${journal.mutationId} inventory changed after it was recovered; recovery stopped without cleaning mutation evidence`,
       );
@@ -1358,7 +1390,7 @@ export class RunArtifactStore {
       lease.assertHeld();
       if (contents.length !== file.bytes)
         throw new Error(`Artifact ${file.path} changed while its legacy metadata was scanned`);
-      const storedHash = bytesHash(contents);
+      const storedHash = bytesHash(contents, this.hashAlgorithm);
       const previous = byPath.get(file.path);
       if (previous) {
         if (previous.storedBytes === file.bytes && previous.reason !== "missing_on_disk") {
@@ -1424,7 +1456,7 @@ export class RunArtifactStore {
         updatedAt: now(),
       });
     }
-    return inventoryTotals({ ...inventory, entries: [...byPath.values()] });
+    return inventoryTotals({ ...inventory, entries: [...byPath.values()] }, this.hashAlgorithm);
   }
 
   private async reconcile(inventory: ArtifactInventory): Promise<ArtifactInventory> {
@@ -1446,8 +1478,10 @@ export class RunArtifactStore {
       if (this.validatedFiles.get(file.path) === fingerprint) continue;
       const absolute = join(this.runRoot, ...validatePortableRelativePath(file.path));
       if (
-        bytesHash(await readPrivateFileBounded(absolute, expected.bytes, this.runRoot)) !==
-        expected.hash
+        bytesHash(
+          await readPrivateFileBounded(absolute, expected.bytes, this.runRoot),
+          this.hashAlgorithm,
+        ) !== expected.hash
       )
         throw new Error(
           `Artifact ${file.path} hash does not match its durable inventory; no inventory metadata was changed`,
@@ -1478,6 +1512,7 @@ export class RunArtifactStore {
         ...inventory,
         entries: [...inventory.entries.filter(({ path }) => path !== entry.path), entry],
       },
+      this.hashAlgorithm,
       updatedAt,
     );
   }
@@ -1496,12 +1531,15 @@ export class RunArtifactStore {
     const mutationTimestamp = now();
     const nextInventory = this.replaceEntry(input.inventory, input.entry, mutationTimestamp);
     const journal = ArtifactMutationJournalSchema.parse({
-      schemaVersion: 1,
+      schemaVersion: this.hashAlgorithm === LEGACY_CANONICAL_HASH_ALGORITHM ? 1 : 2,
+      ...(this.hashAlgorithm === LEGACY_CANONICAL_HASH_ALGORITHM
+        ? {}
+        : { hashAlgorithm: this.hashAlgorithm }),
       runId: this.runId,
       mutationId: randomUUID(),
       action: input.action,
-      previousInventoryHash: contentHash(input.inventory),
-      nextInventoryHash: contentHash(nextInventory),
+      previousInventoryHash: this.hash(input.inventory),
+      nextInventoryHash: this.hash(nextInventory),
       path: input.entry.path,
       ...(previousEntry ? { previousEntry } : {}),
       nextEntry: input.entry,
@@ -1512,7 +1550,7 @@ export class RunArtifactStore {
       const expected = this.expectedTarget(input.entry);
       if (!input.bytes || !expected || input.bytes.length !== expected.bytes)
         throw new Error("Artifact mutation bytes do not match the inventory entry size");
-      if (bytesHash(input.bytes) !== expected.hash)
+      if (bytesHash(input.bytes, this.hashAlgorithm) !== expected.hash)
         throw new Error("Artifact mutation bytes do not match the inventory entry hash");
       await atomicWrite(this.runRoot, MUTATION_PAYLOAD_PATH, input.bytes, lease);
     } else if (input.bytes) {
@@ -1527,7 +1565,7 @@ export class RunArtifactStore {
     );
     await this.checkpointMutation(journal, "publication", "after_journal", lease);
 
-    if (contentHash(await this.rawInventory(lease)) !== journal.previousInventoryHash)
+    if (this.hash(await this.rawInventory(lease)) !== journal.previousInventoryHash)
       throw new Error(
         `Artifact ${input.entry.path} inventory changed while its mutation was being published; recovery stopped without changing files`,
       );
@@ -1547,7 +1585,7 @@ export class RunArtifactStore {
     else if (input.action === "delete")
       await removePrivateFile(this.runRoot, input.entry.path, lease);
     await this.checkpointMutation(journal, "publication", "after_target", lease);
-    if (contentHash(await this.rawInventory(lease)) !== journal.previousInventoryHash)
+    if (this.hash(await this.rawInventory(lease)) !== journal.previousInventoryHash)
       throw new Error(
         `Artifact ${input.entry.path} inventory changed before its mutation inventory was published; recovery stopped without changing files`,
       );
@@ -1559,7 +1597,7 @@ export class RunArtifactStore {
       lease,
     );
     const persisted = await lease.observe(() => this.persistInventory(nextInventory, lease));
-    if (contentHash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
+    if (this.hash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
       throw new Error(
         `Artifact mutation ${journal.mutationId} inventory changed while it was published; recovery stopped without cleaning mutation evidence`,
       );
@@ -1571,7 +1609,7 @@ export class RunArtifactStore {
       lease,
     );
     await this.checkpointMutation(journal, "publication", "after_inventory", lease);
-    if (contentHash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
+    if (this.hash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
       throw new Error(
         `Artifact mutation ${journal.mutationId} inventory changed after it was published; recovery stopped without cleaning mutation evidence`,
       );
@@ -1582,7 +1620,7 @@ export class RunArtifactStore {
       `Artifact ${input.entry.path} changed after its mutation inventory was published; recovery stopped without cleaning mutation evidence`,
       lease,
     );
-    if (contentHash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
+    if (this.hash(await this.rawInventory(lease)) !== journal.nextInventoryHash)
       throw new Error(
         `Artifact mutation ${journal.mutationId} inventory changed before mutation evidence cleanup; recovery stopped without cleaning mutation evidence`,
       );
@@ -1616,7 +1654,16 @@ export class RunArtifactStore {
           : runAvailable < inventory.policy.ordinaryArtifactBytes
             ? "run_quota"
             : "artifact_limit";
-      const entry = entryFor(inventoryPath, "artifact", format, source, stored, previous, reason);
+      const entry = entryFor(
+        inventoryPath,
+        "artifact",
+        format,
+        source,
+        stored,
+        previous,
+        this.hashAlgorithm,
+        reason,
+      );
       await lease.observe(() =>
         this.publishEntryMutation(
           {
@@ -1680,6 +1727,7 @@ export class RunArtifactStore {
           source,
           undefined,
           previous,
+          this.hashAlgorithm,
           reason,
           "rejected",
         );
@@ -1706,6 +1754,7 @@ export class RunArtifactStore {
         source,
         source,
         previous,
+        this.hashAlgorithm,
       );
       await lease.observe(() =>
         this.publishEntryMutation(
@@ -1784,6 +1833,7 @@ export class RunArtifactStore {
           bounded.source,
           bounded.stored,
           previousEntry,
+          this.hashAlgorithm,
           bounded.source.length > bounded.stored.length ? "artifact_limit" : undefined,
         );
         inventory = await lease.observe(() =>
@@ -1845,7 +1895,7 @@ export class RunArtifactStore {
         omittedBytes,
         truncated: omittedBytes > 0,
         legacy: false,
-        storedHash: bytesHash(stored),
+        storedHash: bytesHash(stored, this.hashAlgorithm),
         ...(reason ? { reason } : {}),
         createdAt: previous?.createdAt ?? timestamp,
         updatedAt: timestamp,

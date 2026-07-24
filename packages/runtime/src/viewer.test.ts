@@ -200,7 +200,11 @@ describe("local read-only viewer", () => {
     const store = await viewerFixture();
     const artifactPath = await store.writeArtifact("logs/large.log", "bounded prefix\n");
     await truncate(artifactPath, 2 * 1024 * 1024);
-    await new RunArtifactStore(store.runRoot, store.runId).migrateLegacy();
+    await new RunArtifactStore(
+      store.runRoot,
+      store.runId,
+      store.artifactHashAlgorithm,
+    ).migrateLegacy();
     const viewer = await startRunViewer({ store, port: 0 });
     viewers.push(viewer);
 

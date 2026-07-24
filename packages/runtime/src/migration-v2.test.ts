@@ -21,6 +21,7 @@ import {
   LEGACY_CANONICAL_HASH_ALGORITHM,
   MAX_ARTIFACT_INVENTORY_BYTES,
   PORTABLE_CANONICAL_HASH_ALGORITHM,
+  contentHash,
   createRunEvent,
   type ArtifactInventory,
 } from "@graphcraft/core";
@@ -124,7 +125,11 @@ async function createLegacyFixture(runId: string, sourceVersion: 0 | 1): Promise
 
 async function createV2Fixture(runId: string): Promise<LegacyFixture> {
   const fixture = await createLegacyFixture(runId, 1);
-  await new RunArtifactStore(fixture.runRoot, fixture.runId).migrateLegacy();
+  await new RunArtifactStore(
+    fixture.runRoot,
+    fixture.runId,
+    LEGACY_CANONICAL_HASH_ALGORITHM,
+  ).migrateLegacy();
   await writeFile(
     join(fixture.runRoot, "storage.json"),
     `${JSON.stringify({
@@ -483,6 +488,41 @@ describe("run storage schema v3 migration", () => {
         },
       },
     );
+  });
+
+  it("continues migrated legacy artifact identities under the v1 domain policy", async () => {
+    const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000047", 1);
+    await ensureCurrentRunStorage({
+      graphcraftRoot: fixture.graphcraftRoot,
+      runRoot: fixture.runRoot,
+      runId: fixture.runId,
+    });
+    const store = new RunStore(dirname(fixture.graphcraftRoot), fixture.runId);
+    await store.prepareStorage();
+    expect(store.canonicalHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
+    expect(store.artifactHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
+
+    const localeCompare = vi.spyOn(String.prototype, "localeCompare").mockImplementation(function (
+      this: string,
+      other: string,
+    ) {
+      const left = String(this);
+      return left < other ? 1 : left > other ? -1 : 0;
+    });
+    try {
+      const capsule = { z: 1, A: 2 };
+      const legacyHash = contentHash(capsule, LEGACY_CANONICAL_HASH_ALGORITHM);
+      const portableHash = contentHash(capsule, PORTABLE_CANONICAL_HASH_ALGORITHM);
+      expect(legacyHash).not.toBe(portableHash);
+      await expect(store.writeCapsule(legacyHash, capsule)).resolves.toMatchObject({
+        reused: false,
+      });
+      await expect(store.writeCapsule(portableHash, capsule)).rejects.toThrow(
+        /redacted before content addressing/,
+      );
+    } finally {
+      localeCompare.mockRestore();
+    }
   });
 
   it("concurrently migrates v2 through an exact 2-to-3 backup without rewriting durable payloads", async () => {
@@ -1678,7 +1718,7 @@ describe("run storage schema v3 migration", () => {
     expect(await treeSnapshot(fixture.graphcraftRoot)).toEqual(before);
   });
 
-  it("preserves an independent held-out format in a current manifest", async () => {
+  it("preserves independent held-out and artifact formats in a ready current manifest", async () => {
     const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000046", 0);
     const input = {
       graphcraftRoot: fixture.graphcraftRoot,
@@ -1697,7 +1737,7 @@ describe("run storage schema v3 migration", () => {
     await expect(ensureCurrentRunStorage(input)).resolves.toMatchObject({
       schemaVersion: 3,
       canonicalHashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM,
-      formats: { heldOutProbes: 2, events: 1 },
+      formats: { heldOutProbes: 2, events: 1, artifactInventory: 1 },
     });
 
     expect(await treeSnapshot(fixture.graphcraftRoot)).toEqual(before);

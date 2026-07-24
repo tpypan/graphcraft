@@ -1,13 +1,14 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   LEGACY_CANONICAL_HASH_ALGORITHM,
   PORTABLE_CANONICAL_HASH_ALGORITHM,
   HeldOutProbePlanSchema,
   compileGraph,
   compileRunContract,
+  contentHash,
   createHeldOutProbePlan,
   createRunEvent,
   type CanonicalHashAlgorithm,
@@ -24,6 +25,7 @@ import {
 const temporaryRoots: string[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(
     temporaryRoots.splice(0).map(async (path) => await rm(path, { recursive: true, force: true })),
   );
@@ -76,9 +78,49 @@ describe("storage v3 initialization", () => {
       migratedFrom: 3,
       initialization: "ready",
       canonicalHashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
-      formats: { heldOutProbes: 2, events: 2 },
+      formats: { heldOutProbes: 2, events: 2, artifactInventory: 2 },
     });
     expect(await readFile(store.eventsPath())).toEqual(eventsBefore);
+  });
+
+  it("binds fresh and reopened artifact identities to portable v2 without ambient locale", async () => {
+    const { root, store } = await createStoreFixture();
+    const reopened = new RunStore(root, store.runId);
+    expect(() => reopened.artifactHashAlgorithm).toThrow(/before run storage is prepared/);
+    expect(() => reopened.artifactContentHash({ pending: true })).toThrow(
+      /before run storage is prepared/,
+    );
+    await reopened.prepareStorage();
+
+    expect(store.artifactHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    expect(reopened.artifactHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    expect(JSON.parse(await readFile(join(store.runRoot, "storage.json"), "utf8"))).toMatchObject({
+      formats: { artifactInventory: 2 },
+    });
+
+    const capsule = { z: { a: 1 }, A: { b: 2 } };
+    const capsuleHash = contentHash(capsule, PORTABLE_CANONICAL_HASH_ALGORITHM);
+    const localeCompare = vi.spyOn(String.prototype, "localeCompare").mockImplementation(() => {
+      throw new Error("portable artifact persistence used ambient locale ordering");
+    });
+    let inventoryPaths: string[] = [];
+    try {
+      await reopened.writeCapsule(capsuleHash, capsule);
+      await reopened.writeArtifact("Ångstrom.txt", "portable\n");
+      await reopened.writeArtifact("Zulu.txt", "portable\n");
+      inventoryPaths = (await reopened.loadArtifactInventory()).entries.map(({ path }) => path);
+    } finally {
+      localeCompare.mockRestore();
+    }
+
+    expect(inventoryPaths).toEqual([...inventoryPaths].sort());
+    expect(inventoryPaths).toEqual(
+      expect.arrayContaining([
+        `capsules/${capsuleHash}.json`,
+        "artifacts/Ångstrom.txt",
+        "artifacts/Zulu.txt",
+      ]),
+    );
   });
 
   it("replays and repairs only portable-v2 held-out plans for fresh storage", async () => {
@@ -132,10 +174,11 @@ describe("storage v3 initialization", () => {
     await writeFile(heldOutPath, `${JSON.stringify(legacy, null, 2)}\n`);
     const descriptor = JSON.parse(await readFile(storagePath, "utf8")) as {
       initialization: string;
-      formats: { heldOutProbes: number };
+      formats: { heldOutProbes: number; artifactInventory: number };
     };
     descriptor.initialization = "initializing";
     descriptor.formats.heldOutProbes = 1;
+    descriptor.formats.artifactInventory = 1;
     await writeFile(storagePath, `${JSON.stringify(descriptor, null, 2)}\n`);
     const eventsBeforeRecovery = await readFile(store.eventsPath());
 
@@ -144,10 +187,11 @@ describe("storage v3 initialization", () => {
 
     expect(reopened.canonicalHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
     expect(reopened.heldOutProbePlanHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
+    expect(reopened.artifactHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
     expect(JSON.parse(await readFile(storagePath, "utf8"))).toMatchObject({
       initialization: "ready",
       canonicalHashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
-      formats: { heldOutProbes: 1, events: 2 },
+      formats: { heldOutProbes: 1, events: 2, artifactInventory: 1 },
     });
     expect(await readFile(store.eventsPath())).toEqual(eventsBeforeRecovery);
     expect(await reopened.loadHeldOutProbePlan()).toEqual(legacy);
@@ -159,6 +203,28 @@ describe("storage v3 initialization", () => {
       await reopened.append("runtime", "run.paused", { reason: "continue prior v3 run" }),
     ).toMatchObject({ schemaVersion: 2 });
     expect(await reopened.loadHeldOutProbePlan()).toEqual(legacy);
+
+    const localeCompare = vi.spyOn(String.prototype, "localeCompare").mockImplementation(function (
+      this: string,
+      other: string,
+    ) {
+      const left = String(this);
+      return left < other ? 1 : left > other ? -1 : 0;
+    });
+    try {
+      const capsule = { z: 1, A: 2 };
+      const legacyHash = contentHash(capsule, LEGACY_CANONICAL_HASH_ALGORITHM);
+      const portableHash = contentHash(capsule, PORTABLE_CANONICAL_HASH_ALGORITHM);
+      expect(legacyHash).not.toBe(portableHash);
+      await expect(reopened.writeCapsule(legacyHash, capsule)).resolves.toMatchObject({
+        reused: false,
+      });
+      await expect(reopened.writeCapsule(portableHash, capsule)).rejects.toThrow(
+        /redacted before content addressing/,
+      );
+    } finally {
+      localeCompare.mockRestore();
+    }
   });
 
   it("leaves a pre-event initializing descriptor intact with a precise blocker", async () => {
