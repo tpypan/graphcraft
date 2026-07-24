@@ -780,6 +780,7 @@ describe("run-state retention", () => {
           ([key]) => key !== "artifactInventory" && key !== "artifactPolicy",
         ),
       ),
+      heldOutProbes: 1,
       events: 1,
     };
     const eventsPath = join(store.runRoot, "events.jsonl");
