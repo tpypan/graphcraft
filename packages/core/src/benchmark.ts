@@ -2,6 +2,8 @@ import { z } from "zod";
 import { contentHash } from "./canonical.ts";
 import { TokenUsageSchema } from "./schemas.ts";
 
+export const MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS = 2_147_483_647;
+
 export const BenchmarkTaskFamilySchema = z.enum([
   "bug",
   "feature",
@@ -201,7 +203,7 @@ export const BenchmarkReviewPacketSchema = z.strictObject({
   captureFailures: z.array(z.string().min(1)),
 });
 
-export const BenchmarkTrialResultSchema = z
+export const BenchmarkTrialResultV2Schema = z
   .strictObject({
     trial: BenchmarkScheduleEntrySchema,
     hostVersion: z.string().min(1),
@@ -249,7 +251,150 @@ export const BenchmarkTrialResultSchema = z
     }
   });
 
-export const BenchmarkReportSchema = z
+export const BenchmarkTrialResultV3Schema = z
+  .strictObject({
+    trial: BenchmarkScheduleEntrySchema,
+    hostVersion: z.string().min(1),
+    modelPolicy: z.string().min(1),
+    effortPolicy: BenchmarkEffortPolicySchema,
+    permissionPolicy: BenchmarkPermissionPolicySchema,
+    acceptanceScorerDigest: z.string().min(1),
+    observedScorerDigest: z.string().min(1),
+    scorerVerified: z.boolean(),
+    repositoryDigest: z.string().min(1),
+    baseSha: z.string().min(1),
+    executionStatus: z.enum([
+      "completed",
+      "blocked",
+      "failed",
+      "error",
+      "interrupted",
+      "timed_out",
+    ]),
+    attemptCheckpoint: z.enum(["provisional", "settled"]),
+    interruption: z
+      .strictObject({
+        cause: z.enum(["cancellation", "runtime_shutdown", "timeout"]),
+        reason: z.string().min(1),
+        childSettlement: z.enum(["confirmed", "unconfirmed"]),
+      })
+      .optional(),
+    recovery: z
+      .strictObject({
+        disposition: z.literal("preserved"),
+        fixtureRepository: z.string().min(1),
+        lastKnownRepository: z.string().min(1),
+        requiredAction: z.literal("reconcile_child_before_cleanup_or_resume"),
+      })
+      .optional(),
+    accepted: z.boolean(),
+    acceptance: z.array(BenchmarkAssertionResultSchema),
+    usage: TokenUsageSchema,
+    usageReconciled: z.boolean(),
+    limitations: z.array(z.string()),
+    durationMs: z.number().int().nonnegative(),
+    humanInterventions: z.number().int().nonnegative(),
+    failureTrace: z.array(z.string()),
+    reviewPacket: BenchmarkReviewPacketSchema.optional(),
+  })
+  .superRefine((result, context) => {
+    const interrupted = ["interrupted", "timed_out"].includes(result.executionStatus);
+    if (interrupted !== (result.interruption !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["interruption"],
+        message: "Interrupted benchmark results must retain their interruption evidence",
+      });
+    }
+    if (result.executionStatus === "timed_out" && result.interruption?.cause !== "timeout") {
+      context.addIssue({
+        code: "custom",
+        path: ["interruption", "cause"],
+        message: "Timed-out benchmark results must retain a timeout cause",
+      });
+    }
+    if (result.executionStatus === "interrupted" && result.interruption?.cause === "timeout") {
+      context.addIssue({
+        code: "custom",
+        path: ["interruption", "cause"],
+        message: "Timeout interruptions must use the timed_out execution status",
+      });
+    }
+    if (result.attemptCheckpoint === "provisional" && result.accepted) {
+      context.addIssue({
+        code: "custom",
+        path: ["accepted"],
+        message: "A provisional benchmark attempt cannot be accepted",
+      });
+    }
+    if (
+      result.attemptCheckpoint === "provisional" &&
+      result.interruption?.childSettlement !== "unconfirmed"
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["interruption"],
+        message: "A provisional benchmark attempt must retain unconfirmed settlement evidence",
+      });
+    }
+    const unconfirmed = result.interruption?.childSettlement === "unconfirmed";
+    if (unconfirmed !== (result.recovery !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["recovery"],
+        message: "Unconfirmed benchmark calls must retain the preserved workspace recovery receipt",
+      });
+    }
+    if (unconfirmed && result.accepted) {
+      context.addIssue({
+        code: "custom",
+        path: ["accepted"],
+        message: "A benchmark attempt with unconfirmed child settlement cannot be accepted",
+      });
+    }
+    if (result.accepted && (result.reviewPacket?.captureFailures.length ?? 0) > 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["accepted"],
+        message:
+          "A trial with review-packet capture failures cannot be accepted as review-complete",
+      });
+    }
+    if (result.accepted && result.reviewPacket?.patch.truncated) {
+      context.addIssue({
+        code: "custom",
+        path: ["accepted"],
+        message: "A trial with truncated patch evidence cannot be accepted as review-complete",
+      });
+    }
+    if (result.accepted && result.reviewPacket?.transcript.truncated) {
+      context.addIssue({
+        code: "custom",
+        path: ["accepted"],
+        message: "A trial with truncated transcript evidence cannot be accepted as review-complete",
+      });
+    }
+  });
+
+export const BenchmarkTrialResultSchema = BenchmarkTrialResultV3Schema;
+const BenchmarkAnyTrialResultSchema = z.union([
+  BenchmarkTrialResultV2Schema,
+  BenchmarkTrialResultV3Schema,
+]);
+
+export const BenchmarkHostPreflightCheckpointSchema = z.strictObject({
+  host: z.enum(["codex", "claude"]),
+  phase: z.literal("capability_probe"),
+  attemptCheckpoint: z.enum(["provisional", "settled"]),
+  interruption: z.strictObject({
+    cause: z.enum(["cancellation", "runtime_shutdown", "timeout"]),
+    reason: z.string().min(1),
+    childSettlement: z.literal("unconfirmed"),
+  }),
+  requiredAction: z.literal("reconcile_host_child_before_resume"),
+});
+
+export const BenchmarkReportV2Schema = z
   .strictObject({
     schemaVersion: z.literal(2),
     status: z.enum(["running", "complete"]),
@@ -276,7 +421,7 @@ export const BenchmarkReportSchema = z
     }),
     limitations: z.array(z.string()),
     schedule: z.array(BenchmarkScheduleEntrySchema).min(1),
-    results: z.array(BenchmarkTrialResultSchema),
+    results: z.array(BenchmarkTrialResultV2Schema),
     summary: z.record(z.string(), z.unknown()),
   })
   .superRefine((report, context) => {
@@ -361,10 +506,162 @@ export const BenchmarkReportSchema = z
     }
   });
 
+export const BenchmarkReportV3Schema = z
+  .strictObject({
+    schemaVersion: z.literal(3),
+    status: z.enum(["running", "complete"]),
+    suite: z.strictObject({
+      id: z.string().min(1),
+      version: z.number().int().positive(),
+      digest: z.string().min(1),
+    }),
+    startedAt: z.iso.datetime(),
+    updatedAt: z.iso.datetime(),
+    seed: z.string().min(1),
+    randomized: z.literal(true),
+    modelPolicy: BenchmarkModelPolicySchema,
+    effortPolicy: BenchmarkEffortPolicySchema,
+    permissionPolicy: BenchmarkPermissionPoliciesSchema,
+    scorerPolicy: z.literal("fixture_bound_scorers_plus_suite_assertions"),
+    reviewPolicy: z.literal("bounded_redacted_patch_and_transcript_v1").optional(),
+    modelCallTimeoutMs: z.number().int().positive().max(MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS),
+    hostPreflightCheckpoint: BenchmarkHostPreflightCheckpointSchema.optional(),
+    environment: z.strictObject({
+      platform: z.string().min(1),
+      architecture: z.string().min(1),
+      nodeVersion: z.string().min(1),
+      graphcraftVersion: z.string().trim().min(1),
+      graphcraftSource: BenchmarkSourceIdentitySchema.optional(),
+    }),
+    limitations: z.array(z.string()),
+    schedule: z.array(BenchmarkScheduleEntrySchema).min(1),
+    results: z.array(BenchmarkTrialResultSchema),
+    summary: z.record(z.string(), z.unknown()),
+  })
+  .superRefine((report, context) => {
+    if (report.reviewPolicy !== undefined && report.environment.graphcraftSource === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["environment", "graphcraftSource"],
+        message: "Evidence-backed benchmark reports must bind an exact Graphcraft source identity",
+      });
+    }
+    if (report.reviewPolicy !== undefined && report.environment.graphcraftSource?.dirty) {
+      context.addIssue({
+        code: "custom",
+        path: ["environment", "graphcraftSource", "dirty"],
+        message: "Evidence-backed benchmark reports require a clean Graphcraft source tree",
+      });
+    }
+
+    const scheduleByTrialId = new Map<string, BenchmarkScheduleEntry>();
+    for (const [index, trial] of report.schedule.entries()) {
+      if (scheduleByTrialId.has(trial.trialId)) {
+        context.addIssue({
+          code: "custom",
+          path: ["schedule", index, "trialId"],
+          message: "Benchmark schedule trial IDs must be unique",
+        });
+      }
+      scheduleByTrialId.set(trial.trialId, trial);
+    }
+
+    const resultTrialIds = new Set<string>();
+    for (const [index, result] of report.results.entries()) {
+      const { trial } = result;
+      if (resultTrialIds.has(trial.trialId)) {
+        context.addIssue({
+          code: "custom",
+          path: ["results", index, "trial", "trialId"],
+          message: "Benchmark result trial IDs must be unique",
+        });
+      }
+      resultTrialIds.add(trial.trialId);
+
+      const scheduled = scheduleByTrialId.get(trial.trialId);
+      if (scheduled === undefined || contentHash(scheduled) !== contentHash(trial)) {
+        context.addIssue({
+          code: "custom",
+          path: ["results", index, "trial"],
+          message: "Benchmark result trials must exactly match a scheduled trial",
+        });
+      }
+      if (report.reviewPolicy !== undefined && result.reviewPacket === undefined) {
+        context.addIssue({
+          code: "custom",
+          path: ["results", index, "reviewPacket"],
+          message: "Every evidence-backed benchmark result must retain a review packet",
+        });
+      }
+    }
+
+    if (
+      report.status === "complete" &&
+      (report.results.length !== report.schedule.length ||
+        resultTrialIds.size !== scheduleByTrialId.size ||
+        [...scheduleByTrialId].some(([trialId]) => !resultTrialIds.has(trialId)))
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["status"],
+        message: "The complete benchmark report does not cover the exact current schedule",
+      });
+    }
+    if (
+      report.status === "complete" &&
+      report.results.some((result) => result.attemptCheckpoint === "provisional")
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["status"],
+        message: "A complete benchmark report cannot retain an in-flight provisional attempt",
+      });
+    }
+    if (
+      report.status === "complete" &&
+      report.results.some((result) => result.interruption?.childSettlement === "unconfirmed")
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["status"],
+        message: "A complete benchmark report cannot retain unconfirmed child settlement",
+      });
+    }
+    if (report.status === "complete" && report.hostPreflightCheckpoint !== undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["status"],
+        message: "A complete benchmark report cannot retain an unfinished host preflight",
+      });
+    }
+
+    if (
+      contentHash(report.summary) !==
+      contentHash(summarizeBenchmark(report.results, report.schedule))
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["summary"],
+        message: "The benchmark report summary does not match its trial evidence",
+      });
+    }
+  });
+
+export const BenchmarkReportSchema = z.discriminatedUnion("schemaVersion", [
+  BenchmarkReportV2Schema,
+  BenchmarkReportV3Schema,
+]);
+
 export type BenchmarkTask = z.infer<typeof BenchmarkTaskSchema>;
 export type BenchmarkSuite = z.infer<typeof BenchmarkSuiteSchema>;
 export type BenchmarkScheduleEntry = z.infer<typeof BenchmarkScheduleEntrySchema>;
-export type BenchmarkTrialResult = z.infer<typeof BenchmarkTrialResultSchema>;
+export type BenchmarkTrialResultV2 = z.infer<typeof BenchmarkTrialResultV2Schema>;
+export type BenchmarkTrialResult = z.infer<typeof BenchmarkTrialResultV3Schema>;
+export type BenchmarkHostPreflightCheckpoint = z.infer<
+  typeof BenchmarkHostPreflightCheckpointSchema
+>;
+export type BenchmarkReportV2 = z.infer<typeof BenchmarkReportV2Schema>;
+export type BenchmarkReportV3 = z.infer<typeof BenchmarkReportV3Schema>;
 export type BenchmarkReport = z.infer<typeof BenchmarkReportSchema>;
 export type BenchmarkPermissionPolicy = z.infer<typeof BenchmarkPermissionPolicySchema>;
 export type BenchmarkSourceIdentity = z.infer<typeof BenchmarkSourceIdentitySchema>;
@@ -429,7 +726,9 @@ const MINIMUM_MATCHED_ACCEPTED_PAIRS_PER_TASK = 3;
 const TOKEN_REDUCTION_AGGREGATION =
   "median_pair_reduction_within_task_then_median_across_tasks" as const;
 
-function modeStats(results: BenchmarkTrialResult[], mode: "baseline" | "graphcraft") {
+type BenchmarkComparableTrial = z.infer<typeof BenchmarkAnyTrialResultSchema>;
+
+function modeStats(results: BenchmarkComparableTrial[], mode: "baseline" | "graphcraft") {
   const selected = results.filter((result) => result.trial.mode === mode);
   const accepted = selected.filter((result) => result.accepted);
   const reconciled = selected.filter((result) => result.usageReconciled);
@@ -445,8 +744,8 @@ function modeStats(results: BenchmarkTrialResult[], mode: "baseline" | "graphcra
   };
 }
 
-function matchedAcceptedTokenStats(results: BenchmarkTrialResult[], expectedTaskIds: string[]) {
-  const groups = new Map<string, BenchmarkTrialResult[]>();
+function matchedAcceptedTokenStats(results: BenchmarkComparableTrial[], expectedTaskIds: string[]) {
+  const groups = new Map<string, BenchmarkComparableTrial[]>();
   for (const result of results) {
     const key = `${result.trial.taskId}:${result.trial.repetition}`;
     groups.set(key, [...(groups.get(key) ?? []), result]);
@@ -506,8 +805,8 @@ function matchedAcceptedTokenStats(results: BenchmarkTrialResult[], expectedTask
   };
 }
 
-function matchedTrialControls(results: BenchmarkTrialResult[]): boolean {
-  const groups = new Map<string, BenchmarkTrialResult[]>();
+function matchedTrialControls(results: BenchmarkComparableTrial[]): boolean {
+  const groups = new Map<string, BenchmarkComparableTrial[]>();
   for (const result of results) {
     const key = `${result.trial.host}:${result.trial.taskId}:${result.trial.repetition}`;
     groups.set(key, [...(groups.get(key) ?? []), result]);
@@ -531,10 +830,10 @@ function matchedTrialControls(results: BenchmarkTrialResult[]): boolean {
 }
 
 export function summarizeBenchmark(
-  results: BenchmarkTrialResult[],
+  results: BenchmarkComparableTrial[],
   schedule: BenchmarkScheduleEntry[] = results.map(({ trial }) => trial),
 ) {
-  const parsed = results.map((result) => BenchmarkTrialResultSchema.parse(result));
+  const parsed = results.map((result) => BenchmarkAnyTrialResultSchema.parse(result));
   const parsedSchedule = schedule.map((entry) => BenchmarkScheduleEntrySchema.parse(entry));
   return Object.fromEntries(
     (["codex", "claude"] as const).map((host) => {

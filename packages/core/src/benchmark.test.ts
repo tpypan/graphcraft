@@ -8,6 +8,7 @@ import {
   BenchmarkReportSchema,
   BenchmarkSuiteSchema,
   BenchmarkTrialResultSchema,
+  MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS,
   contentHash,
   createBenchmarkSchedule,
   summarizeBenchmark,
@@ -53,6 +54,7 @@ function reportedTrial(
     repositoryDigest: "same-fixture",
     baseSha: "same-base-sha",
     executionStatus: accepted ? "completed" : "failed",
+    attemptCheckpoint: "settled",
     accepted,
     acceptance: [{ path: "result.js", passed: accepted, summary: "fixture score" }],
     usage: {
@@ -85,7 +87,7 @@ function reportValue(
   status: "running" | "complete" = "running",
 ) {
   return {
-    schemaVersion: 2 as const,
+    schemaVersion: 3 as const,
     status,
     suite: { id: suite.id, version: suite.version, digest: "fixture-suite-digest" },
     startedAt: "2026-07-22T12:00:00.000Z",
@@ -98,6 +100,7 @@ function reportValue(
       codex: "codex_workspace_write_shell_external_not_graphcraft_enforced" as const,
     },
     scorerPolicy: "fixture_bound_scorers_plus_suite_assertions" as const,
+    modelCallTimeoutMs: 15 * 60_000,
     environment: {
       platform: "fixture",
       architecture: "fixture",
@@ -227,6 +230,82 @@ describe("matched benchmark protocol", () => {
     expect(() => BenchmarkReportSchema.parse(reportValue(schedule, results, "complete"))).toThrow(
       /complete benchmark report does not cover the exact current schedule/i,
     );
+  });
+
+  it("rejects complete reports with unconfirmed child settlement", () => {
+    const schedule = createBenchmarkSchedule({
+      suite,
+      hosts: ["codex"],
+      seed: "report-schema-seed",
+    });
+    const results = schedule.map((trial) => reportedTrial(trial, 100));
+    results[0] = BenchmarkTrialResultSchema.parse({
+      ...results[0],
+      executionStatus: "timed_out",
+      interruption: {
+        cause: "timeout",
+        reason: "fixture child did not settle",
+        childSettlement: "unconfirmed",
+      },
+      recovery: {
+        disposition: "preserved",
+        fixtureRepository: "/tmp/benchmark-fixture",
+        lastKnownRepository: "/tmp/benchmark-fixture",
+        requiredAction: "reconcile_child_before_cleanup_or_resume",
+      },
+      accepted: false,
+    });
+
+    expect(() => BenchmarkReportSchema.parse(reportValue(schedule, results, "complete"))).toThrow(
+      /cannot retain unconfirmed child settlement/i,
+    );
+  });
+
+  it("rejects complete reports with an unfinished host preflight", () => {
+    const schedule = createBenchmarkSchedule({
+      suite,
+      hosts: ["codex"],
+      seed: "report-schema-seed",
+    });
+    const results = schedule.map((trial) => reportedTrial(trial, 100));
+
+    expect(() =>
+      BenchmarkReportSchema.parse({
+        ...reportValue(schedule, results, "complete"),
+        hostPreflightCheckpoint: {
+          host: "codex",
+          phase: "capability_probe",
+          attemptCheckpoint: "settled",
+          interruption: {
+            cause: "timeout",
+            reason: "fixture capability probe did not settle",
+            childSettlement: "unconfirmed",
+          },
+          requiredAction: "reconcile_host_child_before_resume",
+        },
+      }),
+    ).toThrow(/cannot retain an unfinished host preflight/i);
+  });
+
+  it("rejects model-call timeouts above the Node timer maximum", () => {
+    const schedule = createBenchmarkSchedule({
+      suite,
+      hosts: ["codex"],
+      seed: "report-schema-seed",
+    });
+    const report = reportValue(schedule, []);
+    expect(
+      BenchmarkReportSchema.parse({
+        ...report,
+        modelCallTimeoutMs: MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS,
+      }),
+    ).toMatchObject({ modelCallTimeoutMs: MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS });
+    expect(() =>
+      BenchmarkReportSchema.parse({
+        ...report,
+        modelCallTimeoutMs: MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS + 1,
+      }),
+    ).toThrow();
   });
 
   it("derives the report summary from its trial evidence", () => {
@@ -456,6 +535,7 @@ describe("matched benchmark protocol", () => {
         repositoryDigest: "same-fixture",
         baseSha: "same-base-sha",
         executionStatus: accepted ? "completed" : "failed",
+        attemptCheckpoint: "settled",
         accepted,
         acceptance: [{ path: "result.js", passed: accepted, summary: "fixture score" }],
         usage: unavailableTokenUsage(),
@@ -516,6 +596,7 @@ describe("matched benchmark protocol", () => {
         repositoryDigest: "same-fixture",
         baseSha: "same-base-sha",
         executionStatus: accepted ? "completed" : "failed",
+        attemptCheckpoint: "settled",
         accepted,
         acceptance: [{ path: "result.js", passed: accepted, summary: "fixture score" }],
         usage: {
@@ -572,6 +653,7 @@ describe("matched benchmark protocol", () => {
         repositoryDigest: "same-fixture",
         baseSha: "same-base-sha",
         executionStatus: accepted ? "completed" : "failed",
+        attemptCheckpoint: "settled",
         accepted,
         acceptance: [{ path: "result.js", passed: accepted, summary: "fixture score" }],
         usage: {

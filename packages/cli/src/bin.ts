@@ -32,6 +32,7 @@ import {
 } from "./index.ts";
 import {
   createRun,
+  DEFAULT_BENCHMARK_MODEL_CALL_TIMEOUT_MS,
   applyCompletedRunPrune,
   applyRunRetention,
   discoverRepository,
@@ -53,6 +54,7 @@ import {
 import {
   BenchmarkSuiteSchema,
   BenchmarkSourceIdentitySchema,
+  MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS,
   createBenchmarkSchedule,
   type BenchmarkSourceIdentity,
   type GraphAmendment,
@@ -163,6 +165,11 @@ program
   )
   .option("--repetitions <count>", "override repetitions per task, host, and mode")
   .option("--seed <seed>", "deterministic schedule seed", "graphcraft-stable-v1")
+  .option(
+    "--model-call-timeout-ms <milliseconds>",
+    "maximum duration of each benchmark model call",
+    String(DEFAULT_BENCHMARK_MODEL_CALL_TIMEOUT_MS),
+  )
   .option("--output <path>", "report path")
   .option("--codex-model <model>", "exact Codex model used for every Codex trial")
   .option("--claude-model <model>", "exact Claude model used for every Claude trial")
@@ -183,6 +190,7 @@ program
         host: "codex" | "claude" | "both";
         repetitions?: string;
         seed: string;
+        modelCallTimeoutMs: string;
         output?: string;
         codexModel?: string;
         claudeModel?: string;
@@ -221,6 +229,15 @@ program
         return;
       }
       if (!options.effort) throw new Error("--effort is required for benchmark execution");
+      const modelCallTimeoutMs = Number(options.modelCallTimeoutMs);
+      if (
+        !Number.isSafeInteger(modelCallTimeoutMs) ||
+        modelCallTimeoutMs <= 0 ||
+        modelCallTimeoutMs > MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS
+      )
+        throw new Error(
+          `--model-call-timeout-ms must be an integer between 1 and ${MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS}`,
+        );
       const policies: Partial<Record<HostName, HostExecutionPolicy>> = {};
       for (const host of hosts) {
         const model = host === "codex" ? options.codexModel : options.claudeModel;
@@ -236,18 +253,26 @@ program
         hosts.map((host) => [host, createAdapter(host, policies[host])]),
       );
       const graphcraftSource = await benchmarkSourceIdentity();
-      const result = await runBenchmark({
-        suite,
-        hosts,
-        adapters,
-        policies,
-        graphcraftVersion: GRAPHCRAFT_VERSION,
-        graphcraftSource,
-        seed: options.seed,
-        ...(repetitions ? { repetitions } : {}),
-        outputPath,
-        observer: (message) => console.log(message),
-      });
+      const execution = executionSignal();
+      let result;
+      try {
+        result = await runBenchmark({
+          suite,
+          hosts,
+          adapters,
+          policies,
+          graphcraftVersion: GRAPHCRAFT_VERSION,
+          graphcraftSource,
+          seed: options.seed,
+          ...(repetitions ? { repetitions } : {}),
+          outputPath,
+          signal: execution.signal,
+          modelCallTimeoutMs,
+          observer: (message) => console.log(message),
+        });
+      } finally {
+        execution.dispose();
+      }
       console.log(
         JSON.stringify({ outputPath: result.outputPath, summary: result.report.summary }, null, 2),
       );

@@ -275,12 +275,19 @@ describe("versioned protocol fixtures", () => {
     expect(events[0]?.data.graph).toEqual(graph);
     expect(reduceEvents(events)).toMatchObject({ status: "completed", lastEventSequence: 9 });
 
-    const report = BenchmarkReportSchema.parse(
-      await readJson(join(protocolFixtures, "benchmark-report.v2.json")),
+    const reports = await Promise.all(
+      [2, 3].map(async (version) =>
+        BenchmarkReportSchema.parse(
+          await readJson(join(protocolFixtures, `benchmark-report.v${version}.json`)),
+        ),
+      ),
     );
-    expect(report.environment.graphcraftVersion).toBe("0.1.2");
-    expect(report.summary).toEqual(summarizeBenchmark(report.results, report.schedule));
-    expect(BenchmarkReportSchema.parse(JSON.parse(JSON.stringify(report)))).toEqual(report);
+    expect(reports.map(({ schemaVersion }) => schemaVersion)).toEqual([2, 3]);
+    for (const report of reports) {
+      expect(report.environment.graphcraftVersion).toBe("0.1.2");
+      expect(report.summary).toEqual(summarizeBenchmark(report.results, report.schedule));
+      expect(BenchmarkReportSchema.parse(JSON.parse(JSON.stringify(report)))).toEqual(report);
+    }
 
     const manifests = await Promise.all(
       [1, 2].map(async (version) =>

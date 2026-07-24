@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { access, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve, sep } from "node:path";
 import {
   BenchmarkSuiteSchema,
   BenchmarkScheduleEntrySchema,
-  BenchmarkReportSchema,
+  BenchmarkReportV3Schema,
+  BenchmarkReportV2Schema,
   BenchmarkReviewPacketSchema,
   BenchmarkSourceIdentitySchema,
   BenchmarkTrialResultSchema,
@@ -14,15 +15,19 @@ import {
   ContextCapsuleSchema,
   HostCapabilityAdmissionError,
   HostEventSchema,
+  HostTerminationError,
+  MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS,
   RequiredHostCapabilityDiagnosticSchema,
   aggregateTokenUsage,
   assertRequiredHostCapabilities,
   contentHash,
   createBenchmarkSchedule,
+  interruptionReason,
   summarizeBenchmark,
   unavailableTokenUsage,
   type BenchmarkScheduleEntry,
-  type BenchmarkReport,
+  type BenchmarkHostPreflightCheckpoint,
+  type BenchmarkReportV3,
   type BenchmarkPermissionPolicy,
   type BenchmarkReviewPacket,
   type BenchmarkSourceIdentity,
@@ -30,7 +35,9 @@ import {
   type BenchmarkTask,
   type BenchmarkTrialResult,
   type HostAdapter,
+  type HostCapabilities,
   type HostExecutionPolicy,
+  type HostEvent,
   type RunEvent,
   type TokenUsage,
 } from "@graphcraft/core";
@@ -56,10 +63,243 @@ const TRANSCRIPT_OMISSION_MARKER = Buffer.from(
 );
 const TRANSCRIPT_INCOMPLETE_FAILURE =
   "transcript review evidence exceeded its retained bound; review is incomplete";
+export const DEFAULT_BENCHMARK_MODEL_CALL_TIMEOUT_MS = 15 * 60_000;
+const BENCHMARK_MODEL_CALL_SETTLEMENT_GRACE_MS = 5_000;
+const UNCONFIRMED_CALL_SETTLEMENT_LIMITATION = "model_call_settlement:unconfirmed";
+const PROVISIONAL_ATTEMPT_LIMITATION = "attempt_checkpoint:provisional";
 const reportLimitations = [
   "Stable efficiency claims require at least three jointly accepted reconciled baseline/Graphcraft pairs per task and host.",
   "Each trial retains a bounded redacted patch and transcript packet; blinded reviewer assignment and defect labels remain external.",
+  "Every model call has a recorded timeout; an interrupted in-flight attempt is retained as unsuccessful evidence instead of being silently retried.",
+  "An unconfirmed model-call settlement blocks all later trials and resume until the child is reconciled outside this harness.",
 ];
+
+type BenchmarkInterruption = {
+  cause: "cancellation" | "runtime_shutdown" | "timeout";
+  reason: string;
+  childSettlement: "confirmed" | "unconfirmed";
+};
+
+class BenchmarkCallInterruptedError extends Error {
+  constructor(readonly interruption: BenchmarkInterruption) {
+    super(interruption.reason);
+    this.name = "BenchmarkCallInterruptedError";
+  }
+}
+
+function benchmarkInterruptionReason(
+  value: unknown,
+): Omit<BenchmarkInterruption, "childSettlement"> {
+  const reason = interruptionReason(value, "runtime_shutdown");
+  return {
+    cause:
+      reason.cause === "timeout"
+        ? "timeout"
+        : reason.cause === "runtime_shutdown"
+          ? "runtime_shutdown"
+          : "cancellation",
+    reason: redactString(reason.reason),
+  };
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolveDelay) => {
+    setTimeout(resolveDelay, ms);
+  });
+}
+
+function timedCallContext(
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+  label: string,
+  onInterruption?: (interruption: Omit<BenchmarkInterruption, "childSettlement">) => void,
+) {
+  const timeout = new AbortController();
+  const timer = setTimeout(() => {
+    timeout.abort({
+      cause: "timeout",
+      reason: `${label} exceeded the ${timeoutMs} ms benchmark model-call timeout`,
+    });
+  }, timeoutMs);
+  timer.unref();
+  const combined = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal;
+  let rejectAbort: (error: BenchmarkCallInterruptedError) => void = () => undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectAbort = reject;
+  });
+  const abort = (): void => {
+    const interruption = benchmarkInterruptionReason(combined.reason);
+    onInterruption?.(interruption);
+    rejectAbort(
+      new BenchmarkCallInterruptedError({
+        ...interruption,
+        childSettlement: "unconfirmed",
+      }),
+    );
+  };
+  combined.addEventListener("abort", abort, { once: true });
+  if (combined.aborted) abort();
+  return {
+    signal: combined,
+    aborted,
+    dispose: () => {
+      clearTimeout(timer);
+      combined.removeEventListener("abort", abort);
+    },
+  };
+}
+
+async function awaitTimedCall<T>(
+  operation: Promise<T>,
+  context: ReturnType<typeof timedCallContext>,
+): Promise<T> {
+  try {
+    const result = await Promise.race([operation, context.aborted]);
+    if (context.signal.aborted)
+      throw new BenchmarkCallInterruptedError({
+        ...benchmarkInterruptionReason(context.signal.reason),
+        childSettlement: "confirmed",
+      });
+    return result;
+  } catch (error) {
+    if (!context.signal.aborted) throw error;
+    const settled = await Promise.race([
+      operation.then(
+        () => true,
+        () => true,
+      ),
+      delay(BENCHMARK_MODEL_CALL_SETTLEMENT_GRACE_MS).then(() => false),
+    ]);
+    throw new BenchmarkCallInterruptedError({
+      ...benchmarkInterruptionReason(context.signal.reason),
+      childSettlement: settled ? "confirmed" : "unconfirmed",
+    });
+  }
+}
+
+async function runTimedCall<T>(input: {
+  signal?: AbortSignal;
+  timeoutMs: number;
+  label: string;
+  operation: (signal: AbortSignal) => Promise<T>;
+  onInterruption?: (interruption: Omit<BenchmarkInterruption, "childSettlement">) => void;
+}): Promise<T> {
+  const context = timedCallContext(
+    input.signal,
+    input.timeoutMs,
+    input.label,
+    input.onInterruption,
+  );
+  try {
+    return await awaitTimedCall(input.operation(context.signal), context);
+  } finally {
+    context.dispose();
+  }
+}
+
+class TimedBenchmarkAdapter implements HostAdapter {
+  readonly id: HostAdapter["id"];
+  private lastInterruption: BenchmarkInterruption | undefined;
+
+  constructor(
+    private readonly adapter: HostAdapter,
+    private readonly timeoutMs: number,
+    private readonly onInterruption?: (
+      interruption: Omit<BenchmarkInterruption, "childSettlement">,
+    ) => void,
+  ) {
+    this.id = adapter.id;
+  }
+
+  interruptionEvidence(): BenchmarkInterruption | undefined {
+    return this.lastInterruption ? { ...this.lastInterruption } : undefined;
+  }
+
+  private rememberInterruption(error: unknown): void {
+    if (error instanceof BenchmarkCallInterruptedError) {
+      this.lastInterruption = { ...error.interruption };
+    }
+  }
+
+  async probe(signal?: AbortSignal): Promise<HostCapabilities> {
+    try {
+      return await runTimedCall<HostCapabilities>({
+        ...(signal ? { signal } : {}),
+        timeoutMs: this.timeoutMs,
+        label: `${this.id} capability probe`,
+        operation: async (callSignal) => await this.adapter.probe(callSignal),
+        ...(this.onInterruption ? { onInterruption: this.onInterruption } : {}),
+      });
+    } catch (error) {
+      this.rememberInterruption(error);
+      throw error;
+    }
+  }
+
+  async plan(request: Parameters<HostAdapter["plan"]>[0], signal: AbortSignal) {
+    try {
+      return await runTimedCall<Awaited<ReturnType<HostAdapter["plan"]>>>({
+        signal,
+        timeoutMs: this.timeoutMs,
+        label: `${this.id} planner call`,
+        operation: async (callSignal) => await this.adapter.plan(request, callSignal),
+        ...(this.onInterruption ? { onInterruption: this.onInterruption } : {}),
+      });
+    } catch (error) {
+      this.rememberInterruption(error);
+      throw error;
+    }
+  }
+
+  async *execute(
+    request: Parameters<HostAdapter["execute"]>[0],
+    signal: AbortSignal,
+  ): AsyncIterable<HostEvent> {
+    const context = timedCallContext(
+      signal,
+      this.timeoutMs,
+      `${this.id} worker call`,
+      this.onInterruption,
+    );
+    const iterator = this.adapter.execute(request, context.signal)[Symbol.asyncIterator]();
+    let completed = false;
+    try {
+      for (;;) {
+        const next = await awaitTimedCall(iterator.next(), context);
+        if (next.done) {
+          completed = true;
+          return;
+        }
+        yield next.value;
+      }
+    } catch (error) {
+      this.rememberInterruption(error);
+      throw error;
+    } finally {
+      context.dispose();
+      if (!completed) void iterator.return?.().catch(() => undefined);
+    }
+  }
+
+  async verify(request: Parameters<HostAdapter["verify"]>[0], signal: AbortSignal) {
+    try {
+      return await runTimedCall<Awaited<ReturnType<HostAdapter["verify"]>>>({
+        signal,
+        timeoutMs: this.timeoutMs,
+        label: `${this.id} semantic-verifier call`,
+        operation: async (callSignal) => await this.adapter.verify(request, callSignal),
+        ...(this.onInterruption ? { onInterruption: this.onInterruption } : {}),
+      });
+    } catch (error) {
+      this.rememberInterruption(error);
+      throw error;
+    }
+  }
+
+  async reconcile(record: Parameters<HostAdapter["reconcile"]>[0]) {
+    return await this.adapter.reconcile(record);
+  }
+}
 
 function persistedCapabilityAdmissionError(
   events: readonly RunEvent[],
@@ -413,7 +653,9 @@ async function materializeTask(task: BenchmarkTask): Promise<{
   repositoryDigest: string;
   baseSha: string;
 }> {
-  const repository = await mkdtemp(join(tmpdir(), `graphcraft-benchmark-${task.id}-`));
+  const repository = await realpath(
+    await mkdtemp(join(tmpdir(), `graphcraft-benchmark-${task.id}-`)),
+  );
   try {
     for (const [path, value] of Object.entries(task.initialFiles)) {
       const target = safeFixturePath(repository, path);
@@ -652,6 +894,215 @@ function usageSummary(usages: TokenUsage[]): {
   };
 }
 
+function classifyBenchmarkInterruption(
+  error: unknown,
+  signal?: AbortSignal,
+): BenchmarkInterruption | undefined {
+  if (error instanceof BenchmarkCallInterruptedError) return error.interruption;
+  if (error instanceof HostTerminationError && error.termination.cause !== "host_crash") {
+    return {
+      ...benchmarkInterruptionReason({
+        cause: error.termination.cause,
+        reason: error.message,
+      }),
+      childSettlement: "confirmed",
+    };
+  }
+  if (signal?.aborted) {
+    return {
+      ...benchmarkInterruptionReason(signal.reason),
+      childSettlement: "confirmed",
+    };
+  }
+  return undefined;
+}
+
+function classifyTimedAdapterInterruption(
+  error: unknown,
+  signal: AbortSignal | undefined,
+  adapter: HostAdapter,
+): BenchmarkInterruption | undefined {
+  const classified = classifyBenchmarkInterruption(error, signal);
+  const adapterEvidence =
+    adapter instanceof TimedBenchmarkAdapter ? adapter.interruptionEvidence() : undefined;
+  return adapterEvidence && (!classified || adapterEvidence.cause === classified.cause)
+    ? adapterEvidence
+    : classified;
+}
+
+function interruptionExecutionStatus(
+  interruption: BenchmarkInterruption,
+): "interrupted" | "timed_out" {
+  return interruption.cause === "timeout" ? "timed_out" : "interrupted";
+}
+
+function unresolvedAcceptance(task: BenchmarkTask, reason: string) {
+  return [
+    ...task.checks.map((_check, index) => ({
+      path: `$check:${index + 1}`,
+      passed: false,
+      summary: reason,
+    })),
+    ...task.acceptance.map((assertion) => ({
+      path: assertion.kind === "summary_contains" ? "$summary" : assertion.path,
+      passed: false,
+      summary: reason,
+    })),
+  ];
+}
+
+function preservedWorkspaceRecovery(
+  fixtureRepository: string,
+  lastKnownRepository: string,
+): NonNullable<BenchmarkTrialResult["recovery"]> {
+  return {
+    disposition: "preserved",
+    fixtureRepository,
+    lastKnownRepository,
+    requiredAction: "reconcile_child_before_cleanup_or_resume",
+  };
+}
+
+function provisionalHostPreflightCheckpoint(
+  host: "codex" | "claude",
+): BenchmarkHostPreflightCheckpoint {
+  return {
+    host,
+    phase: "capability_probe",
+    attemptCheckpoint: "provisional",
+    interruption: {
+      cause: "runtime_shutdown",
+      reason: "Host capability probe has not checkpointed a settled result",
+      childSettlement: "unconfirmed",
+    },
+    requiredAction: "reconcile_host_child_before_resume",
+  };
+}
+
+function settledHostPreflightCheckpoint(
+  host: "codex" | "claude",
+  interruption: BenchmarkInterruption,
+): BenchmarkHostPreflightCheckpoint {
+  return {
+    host,
+    phase: "capability_probe",
+    attemptCheckpoint: "settled",
+    interruption: {
+      cause: interruption.cause,
+      reason: interruption.reason,
+      childSettlement: "unconfirmed",
+    },
+    requiredAction: "reconcile_host_child_before_resume",
+  };
+}
+
+function provisionalTrialResult(input: {
+  trial: BenchmarkScheduleEntry;
+  task: BenchmarkTask;
+  repository: string;
+  repositoryDigest: string;
+  baseSha: string;
+  hostVersion: string;
+  policy: HostExecutionPolicy;
+}): BenchmarkTrialResult {
+  const reason = "Benchmark attempt started but has not checkpointed a settled result";
+  const reviewPacket = BenchmarkReviewPacketSchema.parse({
+    schemaVersion: 1,
+    patch: boundedReviewEvidence("text/x-diff", ""),
+    transcript: boundedReviewEvidence("application/x-ndjson", ""),
+    captureFailures: ["trial review evidence is unavailable until the attempt settles"],
+  });
+  const tokens = usageSummary([]);
+  return BenchmarkTrialResultSchema.parse({
+    trial: input.trial,
+    hostVersion: input.hostVersion,
+    modelPolicy: input.policy.model,
+    effortPolicy: input.policy.effort,
+    permissionPolicy: benchmarkPermissionPolicy(input.trial.host),
+    acceptanceScorerDigest: scorerDigest(input.task, expectedScorerFiles(input.task)),
+    observedScorerDigest: scorerDigest(input.task, expectedScorerFiles(input.task)),
+    scorerVerified: true,
+    repositoryDigest: input.repositoryDigest,
+    baseSha: input.baseSha,
+    executionStatus: "interrupted",
+    attemptCheckpoint: "provisional",
+    interruption: {
+      cause: "runtime_shutdown",
+      reason,
+      childSettlement: "unconfirmed",
+    },
+    recovery: preservedWorkspaceRecovery(input.repository, input.repository),
+    accepted: false,
+    acceptance: unresolvedAcceptance(input.task, reason),
+    usage: tokens.usage,
+    usageReconciled: false,
+    limitations: [...tokens.limitations, PROVISIONAL_ATTEMPT_LIMITATION],
+    durationMs: 0,
+    humanInterventions: 0,
+    failureTrace: [reason],
+    reviewPacket,
+  });
+}
+
+function settleRecoveredProvisionalAttempt(result: BenchmarkTrialResult): BenchmarkTrialResult {
+  if (result.attemptCheckpoint !== "provisional") return result;
+  const reason =
+    "Recovered an unfinished benchmark attempt; unknown model usage and missing review evidence make this trial unsuccessful";
+  return BenchmarkTrialResultSchema.parse({
+    ...result,
+    attemptCheckpoint: "settled",
+    interruption: {
+      cause: "runtime_shutdown",
+      reason,
+      childSettlement: "unconfirmed",
+    },
+    limitations: [
+      ...result.limitations.filter((limitation) => limitation !== PROVISIONAL_ATTEMPT_LIMITATION),
+      UNCONFIRMED_CALL_SETTLEMENT_LIMITATION,
+    ],
+    failureTrace: [...new Set([...result.failureTrace, reason])],
+  });
+}
+
+function settleFailedAttempt(
+  result: BenchmarkTrialResult,
+  error: unknown,
+  signal?: AbortSignal,
+  fallbackRecovery?: NonNullable<BenchmarkTrialResult["recovery"]>,
+  adapter?: HostAdapter,
+): BenchmarkTrialResult {
+  const classified = adapter
+    ? classifyTimedAdapterInterruption(error, signal, adapter)
+    : classifyBenchmarkInterruption(error, signal);
+  const reason = redactString(error instanceof Error ? error.message : String(error));
+  const { interruption: _provisionalInterruption, recovery: existingRecovery, ...base } = result;
+  return BenchmarkTrialResultSchema.parse({
+    ...base,
+    executionStatus: classified ? interruptionExecutionStatus(classified) : "error",
+    attemptCheckpoint: "settled",
+    ...(classified ? { interruption: classified } : {}),
+    ...(classified?.childSettlement === "unconfirmed"
+      ? { recovery: existingRecovery ?? fallbackRecovery }
+      : {}),
+    accepted: false,
+    limitations: [
+      ...result.limitations.filter((limitation) => limitation !== PROVISIONAL_ATTEMPT_LIMITATION),
+      ...(classified?.childSettlement === "unconfirmed"
+        ? [UNCONFIRMED_CALL_SETTLEMENT_LIMITATION]
+        : []),
+    ],
+    failureTrace: [...new Set([...result.failureTrace, reason])],
+  });
+}
+
+function assertBenchmarkActive(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  const reason = benchmarkInterruptionReason(signal.reason);
+  const error = new Error(reason.reason);
+  error.name = "BenchmarkInterruptedError";
+  throw error;
+}
+
 async function runBaselineTrial(input: {
   trial: BenchmarkScheduleEntry;
   task: BenchmarkTask;
@@ -661,6 +1112,7 @@ async function runBaselineTrial(input: {
   baseSha: string;
   hostVersion: string;
   policy: HostExecutionPolicy;
+  signal?: AbortSignal;
 }): Promise<BenchmarkTrialResult> {
   const started = performance.now();
   const usages: TokenUsage[] = [];
@@ -668,6 +1120,7 @@ async function runBaselineTrial(input: {
   const summaryEvidence: string[] = [];
   const transcript = new BoundedTranscriptCapture();
   let resultStatus: "completed" | "blocked" | "failed" | "error" = "error";
+  let interruption: BenchmarkInterruption | undefined;
   const capsule = ContextCapsuleSchema.parse({
     schemaVersion: 1,
     runId: randomUUID(),
@@ -700,7 +1153,7 @@ async function runBaselineTrial(input: {
         capsule,
         allowedTools: ["read", "write", "shell"],
       },
-      new AbortController().signal,
+      input.signal ?? new AbortController().signal,
     )) {
       const event = HostEventSchema.parse(candidate);
       transcript.append({ source: "baseline_host_event", event });
@@ -720,9 +1173,11 @@ async function runBaselineTrial(input: {
     }
   } catch (error) {
     if (error instanceof HostCapabilityAdmissionError) throw error;
-    resultStatus = "error";
+    interruption = classifyTimedAdapterInterruption(error, input.signal, input.adapter);
     failureTrace.push(error instanceof Error ? error.message : String(error));
   }
+  if (!interruption && input.signal?.aborted)
+    interruption = classifyTimedAdapterInterruption(undefined, input.signal, input.adapter);
   const score = await scoreAcceptance(input.task, input.repository, summaryEvidence.join("\n"));
   failureTrace.push(
     ...score.results.filter(({ passed }) => !passed).map(({ summary }) => `acceptance: ${summary}`),
@@ -749,8 +1204,14 @@ async function runBaselineTrial(input: {
     scorerVerified: score.scorerVerified,
     repositoryDigest: input.repositoryDigest,
     baseSha: input.baseSha,
-    executionStatus: resultStatus,
+    executionStatus: interruption ? interruptionExecutionStatus(interruption) : resultStatus,
+    attemptCheckpoint: "settled",
+    ...(interruption ? { interruption } : {}),
+    ...(interruption?.childSettlement === "unconfirmed"
+      ? { recovery: preservedWorkspaceRecovery(input.repository, input.repository) }
+      : {}),
     accepted:
+      !interruption &&
       resultStatus === "completed" &&
       score.scorerVerified &&
       score.results.every(({ passed }) => passed) &&
@@ -758,7 +1219,13 @@ async function runBaselineTrial(input: {
     acceptance: score.results,
     usage: tokens.usage,
     usageReconciled: tokens.reconciled,
-    limitations: [...tokens.limitations, ...reviewLimitations],
+    limitations: [
+      ...tokens.limitations,
+      ...reviewLimitations,
+      ...(interruption?.childSettlement === "unconfirmed"
+        ? [UNCONFIRMED_CALL_SETTLEMENT_LIMITATION]
+        : []),
+    ],
     durationMs: Math.round(performance.now() - started),
     humanInterventions: 0,
     failureTrace,
@@ -775,6 +1242,7 @@ async function runGraphcraftTrial(input: {
   baseSha: string;
   hostVersion: string;
   policy: HostExecutionPolicy;
+  signal?: AbortSignal;
 }): Promise<BenchmarkTrialResult> {
   const started = performance.now();
   const failureTrace: string[] = [];
@@ -785,17 +1253,46 @@ async function runGraphcraftTrial(input: {
   let store: Awaited<ReturnType<typeof createRun>>["store"] | undefined;
   const transcript = new BoundedTranscriptCapture();
   const transcriptCaptureFailures: string[] = [];
+  let interruption: BenchmarkInterruption | undefined;
   try {
     const created = await createRun(input.task.task, {
       cwd: input.repository,
       planner: input.adapter,
       finishLine: "local_verified",
+      ...(input.signal ? { signal: input.signal } : {}),
     });
     store = created.store;
-    const state = await executeRun({ store: created.store, adapter: input.adapter, approve: true });
+    const state = await executeRun({
+      store: created.store,
+      adapter: input.adapter,
+      approve: true,
+      ...(input.signal ? { signal: input.signal } : {}),
+    });
     const events = await created.store.loadEvents();
     const capabilityError = persistedCapabilityAdmissionError(events);
     if (capabilityError) throw capabilityError;
+    const interruptionEvent = events.findLast(
+      ({ type, data }) =>
+        (type === "run.paused" || type === "run.stopped") &&
+        ["cancellation", "runtime_shutdown", "timeout"].includes(String(data.cause)),
+    );
+    if (interruptionEvent) {
+      const callInterruption =
+        input.adapter instanceof TimedBenchmarkAdapter
+          ? input.adapter.interruptionEvidence()
+          : undefined;
+      const eventInterruption = benchmarkInterruptionReason({
+        cause: interruptionEvent.data.cause,
+        reason: interruptionEvent.data.reason,
+      });
+      interruption = {
+        ...eventInterruption,
+        childSettlement:
+          callInterruption?.cause === eventInterruption.cause
+            ? callInterruption.childSettlement
+            : "confirmed",
+      };
+    }
     executionStatus =
       state.status === "completed"
         ? "completed"
@@ -819,8 +1316,11 @@ async function runGraphcraftTrial(input: {
     );
   } catch (error) {
     if (error instanceof HostCapabilityAdmissionError) throw error;
+    interruption = classifyTimedAdapterInterruption(error, input.signal, input.adapter);
     failureTrace.push(error instanceof Error ? error.message : String(error));
   }
+  if (!interruption && input.signal?.aborted)
+    interruption = classifyTimedAdapterInterruption(undefined, input.signal, input.adapter);
   if (store) {
     try {
       const workspace = await store.loadWorkspace<{ path: string }>();
@@ -889,8 +1389,16 @@ async function runGraphcraftTrial(input: {
     scorerVerified: score.scorerVerified,
     repositoryDigest: input.repositoryDigest,
     baseSha: input.baseSha,
-    executionStatus,
+    executionStatus: interruption ? interruptionExecutionStatus(interruption) : executionStatus,
+    attemptCheckpoint: "settled",
+    ...(interruption ? { interruption } : {}),
+    ...(interruption?.childSettlement === "unconfirmed"
+      ? {
+          recovery: preservedWorkspaceRecovery(input.repository, acceptanceRepository),
+        }
+      : {}),
     accepted:
+      !interruption &&
       executionStatus === "completed" &&
       score.scorerVerified &&
       score.results.every(({ passed }) => passed) &&
@@ -898,7 +1406,13 @@ async function runGraphcraftTrial(input: {
     acceptance: score.results,
     usage: tokens.usage,
     usageReconciled: tokens.reconciled,
-    limitations: [...tokens.limitations, ...reviewLimitations],
+    limitations: [
+      ...tokens.limitations,
+      ...reviewLimitations,
+      ...(interruption?.childSettlement === "unconfirmed"
+        ? [UNCONFIRMED_CALL_SETTLEMENT_LIMITATION]
+        : []),
+    ],
     durationMs: Math.round(performance.now() - started),
     humanInterventions: 0,
     failureTrace,
@@ -918,12 +1432,18 @@ function appendUniqueString(values: unknown, value: string): unknown {
 }
 
 function parseBenchmarkReportWithReviewMigration(value: unknown): {
-  report: BenchmarkReport;
+  report: BenchmarkReportV3;
   migrated: boolean;
 } {
   const record = objectRecord(value);
+  if (record?.schemaVersion === 2) {
+    BenchmarkReportV2Schema.parse(value);
+    throw new Error(
+      "Benchmark report schema version 2 predates model-call settlement evidence and cannot be resumed; preserve it and use a new output path",
+    );
+  }
   if (record?.reviewPolicy !== reviewPolicy || !Array.isArray(record.results))
-    return { report: BenchmarkReportSchema.parse(value), migrated: false };
+    return { report: BenchmarkReportV3Schema.parse(value), migrated: false };
 
   let migrated = false;
   const legacyResults: BenchmarkTrialResult[] = [];
@@ -959,12 +1479,12 @@ function parseBenchmarkReportWithReviewMigration(value: unknown): {
       },
     });
   });
-  if (!migrated) return { report: BenchmarkReportSchema.parse(value), migrated: false };
+  if (!migrated) return { report: BenchmarkReportV3Schema.parse(value), migrated: false };
   const schedule = BenchmarkScheduleEntrySchema.array().parse(record.schedule);
   if (contentHash(record.summary) !== contentHash(summarizeBenchmark(legacyResults, schedule)))
     throw new Error("The existing benchmark report summary does not match its trial evidence");
   return {
-    report: BenchmarkReportSchema.parse({
+    report: BenchmarkReportV3Schema.parse({
       ...record,
       results,
       summary: summarizeBenchmark(results, schedule),
@@ -984,8 +1504,24 @@ export async function runBenchmark(input: {
   repetitions?: number;
   outputPath: string;
   observer?: (message: string) => void;
-}): Promise<{ outputPath: string; report: BenchmarkReport }> {
+  signal?: AbortSignal;
+  modelCallTimeoutMs?: number;
+  trialBoundary?: (
+    point: "after_provisional_persist" | "after_settled_persist",
+    trial: BenchmarkScheduleEntry,
+  ) => void | Promise<void>;
+}): Promise<{ outputPath: string; report: BenchmarkReportV3 }> {
   const suite = BenchmarkSuiteSchema.parse(input.suite);
+  const modelCallTimeoutMs = input.modelCallTimeoutMs ?? DEFAULT_BENCHMARK_MODEL_CALL_TIMEOUT_MS;
+  if (
+    !Number.isSafeInteger(modelCallTimeoutMs) ||
+    modelCallTimeoutMs <= 0 ||
+    modelCallTimeoutMs > MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS
+  )
+    throw new Error(
+      `Benchmark model-call timeout must be an integer between 1 and ${MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS}`,
+    );
+  assertBenchmarkActive(input.signal);
   const graphcraftVersion = input.graphcraftVersion?.trim();
   if (!graphcraftVersion) throw new Error("A Graphcraft version identity is required");
   const graphcraftSource = input.graphcraftSource
@@ -1031,7 +1567,8 @@ export async function runBenchmark(input: {
   const byTask = new Map(suite.tasks.map((task) => [task.id, task]));
   let startedAt = new Date().toISOString();
   let results: BenchmarkTrialResult[] = [];
-  let existingReport: BenchmarkReport | undefined;
+  let existingReport: BenchmarkReportV3 | undefined;
+  let hostPreflightCheckpoint: BenchmarkHostPreflightCheckpoint | undefined;
   let existingReportMigrated = false;
   try {
     const loaded = parseBenchmarkReportWithReviewMigration(
@@ -1055,6 +1592,7 @@ export async function runBenchmark(input: {
       existing.effortPolicy !== effortPolicy ||
       JSON.stringify(existing.permissionPolicy) !== JSON.stringify(permissionPolicy) ||
       existing.reviewPolicy !== reviewPolicy ||
+      existing.modelCallTimeoutMs !== modelCallTimeoutMs ||
       JSON.stringify(existingRuntimeEnvironment) !== JSON.stringify(currentRuntimeEnvironment) ||
       JSON.stringify(existing.schedule) !== JSON.stringify(schedule)
     )
@@ -1065,6 +1603,7 @@ export async function runBenchmark(input: {
       );
     startedAt = existing.startedAt;
     results = existing.results;
+    hostPreflightCheckpoint = existing.hostPreflightCheckpoint;
     existingReport = existing;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -1109,12 +1648,28 @@ export async function runBenchmark(input: {
     throw new Error("The existing benchmark report summary does not match its trial evidence");
   if (existingReport && contentHash(existingReport.limitations) !== contentHash(reportLimitations))
     throw new Error("The existing benchmark report limitations do not match this harness");
-  if (existingReportMigrated && existingReport) await writeJsonAtomic(outputPath, existingReport);
-  if (existingReport?.status === "complete") return { outputPath, report: existingReport };
-  const persist = async (status: "running" | "complete"): Promise<BenchmarkReport> => {
-    const report = BenchmarkReportSchema.parse(
+  const recoveredProvisionalAttempts = results.some(
+    ({ attemptCheckpoint }) => attemptCheckpoint === "provisional",
+  );
+  if (recoveredProvisionalAttempts) results = results.map(settleRecoveredProvisionalAttempt);
+  if (existingReport?.status === "complete") {
+    if (existingReportMigrated) await writeJsonAtomic(outputPath, existingReport);
+    return { outputPath, report: existingReport };
+  }
+  if (hostPreflightCheckpoint)
+    throw new Error(
+      `Benchmark cannot resume because the ${hostPreflightCheckpoint.host} host capability probe may still be active; preserve this report and reconcile the host child before using a new output path`,
+    );
+  const adapters: Partial<Record<"codex" | "claude", HostAdapter>> = {};
+  for (const host of hosts) {
+    const adapter = input.adapters[host];
+    if (!adapter) throw new Error(`No ${host} benchmark adapter was configured`);
+    adapters[host] = new TimedBenchmarkAdapter(adapter, modelCallTimeoutMs);
+  }
+  const persist = async (status: "running" | "complete"): Promise<BenchmarkReportV3> => {
+    const report = BenchmarkReportV3Schema.parse(
       redactValue({
-        schemaVersion: 2,
+        schemaVersion: 3,
         status,
         suite: { id: suite.id, version: suite.version, digest: suiteDigest },
         startedAt,
@@ -1126,6 +1681,8 @@ export async function runBenchmark(input: {
         permissionPolicy,
         scorerPolicy,
         reviewPolicy,
+        modelCallTimeoutMs,
+        ...(hostPreflightCheckpoint ? { hostPreflightCheckpoint } : {}),
         environment,
         limitations: reportLimitations,
         schedule,
@@ -1136,64 +1693,197 @@ export async function runBenchmark(input: {
     await writeJsonAtomic(outputPath, report);
     return report;
   };
+  if (existingReportMigrated || recoveredProvisionalAttempts) await persist("running");
+  const unconfirmedResult = results.find(
+    ({ interruption }) => interruption?.childSettlement === "unconfirmed",
+  );
+  if (unconfirmedResult)
+    throw new Error(
+      `Benchmark cannot continue after trial ${unconfirmedResult.trial.trialId} because model-call settlement is unconfirmed; preserve this report and reconcile the host child before using a new output path. Preserved fixture: ${unconfirmedResult.recovery?.fixtureRepository ?? "unknown"}; last known repository: ${unconfirmedResult.recovery?.lastKnownRepository ?? "unknown"}`,
+    );
   for (const host of hosts) {
-    const adapter = input.adapters[host];
-    if (!adapter) throw new Error(`No ${host} benchmark adapter was configured`);
-    const capabilities = await adapter.probe();
+    assertBenchmarkActive(input.signal);
+    hostPreflightCheckpoint = provisionalHostPreflightCheckpoint(host);
+    await persist("running");
+    let capabilities: HostCapabilities;
+    try {
+      capabilities = await adapters[host]!.probe(input.signal);
+    } catch (error) {
+      const interruption =
+        error instanceof BenchmarkCallInterruptedError ? error.interruption : undefined;
+      hostPreflightCheckpoint =
+        interruption?.childSettlement === "unconfirmed"
+          ? settledHostPreflightCheckpoint(host, interruption)
+          : undefined;
+      await persist("running");
+      throw error;
+    }
+    hostPreflightCheckpoint = undefined;
+    await persist("running");
     assertRequiredHostCapabilities(host, capabilities);
   }
-  await persist("running");
   const completedTrialIds = new Set(results.map(({ trial }) => trial.trialId));
   for (const trial of schedule) {
     if (completedTrialIds.has(trial.trialId)) continue;
+    assertBenchmarkActive(input.signal);
     const task = byTask.get(trial.taskId)!;
-    const adapter = input.adapters[trial.host]!;
+    const trialAbort = new AbortController();
+    const trialSignal = input.signal
+      ? AbortSignal.any([input.signal, trialAbort.signal])
+      : trialAbort.signal;
+    const adapter = new TimedBenchmarkAdapter(
+      input.adapters[trial.host]!,
+      modelCallTimeoutMs,
+      (interruption) => {
+        if (!trialAbort.signal.aborted) trialAbort.abort(interruption);
+      },
+    );
     input.observer?.(
       `[${trial.order + 1}/${schedule.length}] ${trial.host} ${trial.mode} ${trial.taskId} #${trial.repetition}`,
     );
     const fixture = await materializeTask(task);
+    let result: BenchmarkTrialResult | undefined;
+    let trialError: unknown;
+    let settledResultPersisted = false;
+    let provisional = provisionalTrialResult({
+      trial,
+      task,
+      repository: fixture.repository,
+      repositoryDigest: fixture.repositoryDigest,
+      baseSha: fixture.baseSha,
+      hostVersion: "pending-capability-probe",
+      policy: policies[trial.host]!,
+    });
+    results.push(provisional);
     try {
-      const capabilities = await adapter.probe();
-      assertRequiredHostCapabilities(trial.host, capabilities);
+      await persist("running");
+      await input.trialBoundary?.("after_provisional_persist", trial);
+      let capabilities: HostCapabilities;
+      try {
+        capabilities = await adapter.probe(trialSignal);
+        assertRequiredHostCapabilities(trial.host, capabilities);
+      } catch (error) {
+        const failedProbe = settleFailedAttempt(
+          provisional,
+          error,
+          trialSignal,
+          preservedWorkspaceRecovery(fixture.repository, fixture.repository),
+          adapter,
+        );
+        const provisionalIndex = results.findIndex(
+          ({ trial: candidate }) => candidate.trialId === trial.trialId,
+        );
+        if (provisionalIndex < 0)
+          throw new Error(`Benchmark lost provisional trial ${trial.trialId}`);
+        const settlementUnconfirmed = failedProbe.interruption?.childSettlement === "unconfirmed";
+        if (settlementUnconfirmed) {
+          results[provisionalIndex] = failedProbe;
+          result = failedProbe;
+        } else {
+          results.splice(provisionalIndex, 1);
+        }
+        try {
+          await persist("running");
+        } catch (persistError) {
+          if (!settlementUnconfirmed) results.splice(provisionalIndex, 0, provisional);
+          throw persistError;
+        }
+        settledResultPersisted = true;
+        throw error;
+      }
       const hostVersion = capabilities.version ?? "unknown";
-      const result =
-        trial.mode === "baseline"
-          ? await runBaselineTrial({
-              trial,
-              task,
-              adapter,
-              repository: fixture.repository,
-              repositoryDigest: fixture.repositoryDigest,
-              baseSha: fixture.baseSha,
-              hostVersion,
-              policy: policies[trial.host]!,
-            })
-          : await runGraphcraftTrial({
-              trial,
-              task,
-              adapter,
-              repository: fixture.repository,
-              repositoryDigest: fixture.repositoryDigest,
-              baseSha: fixture.baseSha,
-              hostVersion,
-              policy: policies[trial.host]!,
-            });
-      const finalCapabilities = await adapter.probe();
-      assertRequiredHostCapabilities(trial.host, finalCapabilities);
-      if (
-        finalCapabilities.version !== capabilities.version ||
-        finalCapabilities.protocolProfile !== capabilities.protocolProfile
-      ) {
-        throw new Error(
-          `${trial.host} protocol identity changed during benchmark trial ${trial.trialId}; refusing stale host-version evidence`,
+      provisional = BenchmarkTrialResultSchema.parse({
+        ...provisional,
+        hostVersion,
+      });
+      const provisionalIndex = results.findIndex(
+        ({ trial: candidate }) => candidate.trialId === trial.trialId,
+      );
+      if (provisionalIndex < 0)
+        throw new Error(`Benchmark lost provisional trial ${trial.trialId}`);
+      results[provisionalIndex] = provisional;
+      await persist("running");
+      try {
+        result =
+          trial.mode === "baseline"
+            ? await runBaselineTrial({
+                trial,
+                task,
+                adapter,
+                repository: fixture.repository,
+                repositoryDigest: fixture.repositoryDigest,
+                baseSha: fixture.baseSha,
+                hostVersion,
+                policy: policies[trial.host]!,
+                signal: trialSignal,
+              })
+            : await runGraphcraftTrial({
+                trial,
+                task,
+                adapter,
+                repository: fixture.repository,
+                repositoryDigest: fixture.repositoryDigest,
+                baseSha: fixture.baseSha,
+                hostVersion,
+                policy: policies[trial.host]!,
+                signal: trialSignal,
+              });
+        if (!trialSignal.aborted && result.interruption?.childSettlement !== "unconfirmed") {
+          const finalCapabilities = await adapter.probe(trialSignal);
+          assertRequiredHostCapabilities(trial.host, finalCapabilities);
+          if (
+            finalCapabilities.version !== capabilities.version ||
+            finalCapabilities.protocolProfile !== capabilities.protocolProfile
+          ) {
+            throw new Error(
+              `${trial.host} protocol identity changed during benchmark trial ${trial.trialId}; refusing stale host-version evidence`,
+            );
+          }
+        }
+      } catch (error) {
+        trialError = error;
+        result = settleFailedAttempt(
+          result ?? provisional,
+          error,
+          trialSignal,
+          preservedWorkspaceRecovery(fixture.repository, fixture.repository),
+          adapter,
         );
       }
-      results.push(result);
+      if (!result) throw new Error(`Benchmark trial ${trial.trialId} produced no result`);
+      const resultIndex = results.findIndex(
+        ({ trial: candidate }) => candidate.trialId === trial.trialId,
+      );
+      if (resultIndex < 0) throw new Error(`Benchmark lost provisional trial ${trial.trialId}`);
+      results[resultIndex] = result;
+      await persist("running");
+      settledResultPersisted = true;
+      await input.trialBoundary?.("after_settled_persist", trial);
     } finally {
-      await removeBenchmarkFixture(fixture.repository);
+      const checkpoint = results.find(
+        ({ trial: candidate }) => candidate.trialId === trial.trialId,
+      );
+      const cleanupIsSafe =
+        checkpoint === undefined ||
+        (settledResultPersisted &&
+          checkpoint.attemptCheckpoint === "settled" &&
+          checkpoint.interruption?.childSettlement !== "unconfirmed");
+      if (cleanupIsSafe) await removeBenchmarkFixture(fixture.repository);
     }
     completedTrialIds.add(trial.trialId);
-    await persist("running");
+    if (trialError) throw trialError;
+    if (input.signal?.aborted) {
+      const reason = benchmarkInterruptionReason(input.signal.reason);
+      const error = new Error(
+        `${reason.reason}. The interrupted trial was checkpointed as unsuccessful evidence.`,
+      );
+      error.name = "BenchmarkInterruptedError";
+      throw error;
+    }
+    if (result?.interruption?.childSettlement === "unconfirmed")
+      throw new Error(
+        `Benchmark stopped after trial ${trial.trialId} because model-call settlement was not confirmed`,
+      );
   }
   const report = await persist("complete");
   return { outputPath, report };

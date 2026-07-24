@@ -4,6 +4,7 @@ import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   BenchmarkSuiteSchema,
+  MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS,
   REQUIRED_HOST_PROTOCOL_CAPABILITIES,
   assertRequiredHostCapabilities,
   createBenchmarkSchedule,
@@ -69,7 +70,13 @@ class BenchmarkAdapter implements HostAdapter {
   readonly id = "codex" as const;
   readonly graphcraftRepositories: string[] = [];
   readonly workerRequests: WorkerRequest[] = [];
+  readonly activeWorkerRepositories = new Set<string>();
+  readonly activePlannerRepositories = new Set<string>();
+  readonly activeVerifierRepositories = new Set<string>();
+  activeProbeCalls = 0;
   probeCalls = 0;
+  planCalls = 0;
+  verifyCalls = 0;
 
   constructor(
     private readonly options: {
@@ -87,6 +94,13 @@ class BenchmarkAdapter implements HostAdapter {
       expectDeterministicLfFixture?: boolean;
       revalidatePlan?: boolean;
       revalidateExecute?: boolean;
+      waitForWorkerAbort?: boolean;
+      ignoreProbeAbort?: boolean;
+      ignoreProbeAbortOnCall?: number;
+      ignoreWorkerAbort?: boolean;
+      ignorePlanAbort?: boolean;
+      ignoreVerifyAbort?: boolean;
+      onWorkerStarted?: () => void;
     } = {},
   ) {}
 
@@ -95,6 +109,12 @@ class BenchmarkAdapter implements HostAdapter {
   }
 
   async probe(): Promise<HostCapabilities> {
+    const call = this.probeCalls + 1;
+    this.probeCalls = call;
+    if (this.options.ignoreProbeAbort || this.options.ignoreProbeAbortOnCall === call) {
+      this.activeProbeCalls += 1;
+      await new Promise<void>(() => undefined);
+    }
     const capabilities = {
       ...hostCapabilitiesFromProtocolProfile("codex", {
         installed: true,
@@ -103,12 +123,16 @@ class BenchmarkAdapter implements HostAdapter {
       }),
       ...this.options.capabilities,
     };
-    const sequenced = this.options.capabilitySequence?.[this.probeCalls];
-    this.probeCalls += 1;
+    const sequenced = this.options.capabilitySequence?.[call - 1];
     return sequenced ?? capabilities;
   }
 
   async plan(request: PlanningRequest): Promise<PlanningResult> {
+    this.planCalls += 1;
+    if (this.options.ignorePlanAbort) {
+      this.activePlannerRepositories.add(request.contract.repository.root);
+      await new Promise<void>(() => undefined);
+    }
     if (this.options.revalidatePlan) assertRequiredHostCapabilities(this.id, await this.probe());
     this.graphcraftRepositories.push(request.contract.repository.root);
     return {
@@ -159,9 +183,22 @@ class BenchmarkAdapter implements HostAdapter {
     };
   }
 
-  async *execute(request: WorkerRequest): AsyncIterable<HostEvent> {
+  async *execute(request: WorkerRequest, signal: AbortSignal): AsyncIterable<HostEvent> {
     if (this.options.revalidateExecute) assertRequiredHostCapabilities(this.id, await this.probe());
     this.workerRequests.push(request);
+    this.options.onWorkerStarted?.();
+    if (this.options.ignoreWorkerAbort) {
+      this.activeWorkerRepositories.add(request.repositoryPath);
+      await new Promise<void>(() => undefined);
+      return;
+    }
+    if (this.options.waitForWorkerAbort) {
+      if (!signal.aborted)
+        await new Promise<void>((resolveAbort) => {
+          signal.addEventListener("abort", () => resolveAbort(), { once: true });
+        });
+      return;
+    }
     if (this.options.expectDeterministicLfFixture) {
       const lineEndingPolicy = await runProcess(
         "git",
@@ -256,7 +293,12 @@ class BenchmarkAdapter implements HostAdapter {
     };
   }
 
-  async verify(_request: SemanticVerificationRequest): Promise<SemanticVerificationResult> {
+  async verify(request: SemanticVerificationRequest): Promise<SemanticVerificationResult> {
+    this.verifyCalls += 1;
+    if (this.options.ignoreVerifyAbort) {
+      this.activeVerifierRepositories.add(request.repositoryPath);
+      await new Promise<void>(() => undefined);
+    }
     return {
       verdict: {
         verdict: "supported",
@@ -284,6 +326,696 @@ describe("benchmark harness", () => {
     }
     throw new Error(`Could not construct a benchmark schedule starting with ${mode}`);
   }
+
+  function interruptionSuite(
+    id: string,
+    options: { withoutVerifyScript?: boolean } = {},
+  ): BenchmarkSuite {
+    return BenchmarkSuiteSchema.parse({
+      schemaVersion: 2,
+      id: `${id}-suite`,
+      version: 1,
+      description: "Benchmark interruption fixture",
+      tasks: [
+        {
+          id: `${id}-task`,
+          family: "feature",
+          task: "Set the exported value to implemented and verify it",
+          initialFiles: {
+            "package.json": `${JSON.stringify(
+              options.withoutVerifyScript ? {} : { scripts: { verify: "node verify.mjs" } },
+            )}\n`,
+            "source.js": "export const value = 'pending';\n",
+            "verify.mjs":
+              "import { value } from './source.js'; if (value !== 'implemented') process.exit(1);\n",
+            "score.mjs":
+              "import { value } from './source.js'; if (value !== 'implemented') process.exit(1);\n",
+          },
+          checks: [{ command: "node", scorerPath: "score.mjs" }],
+          acceptance: [{ kind: "contains", path: "source.js", value: "implemented" }],
+          repetitions: 1,
+        },
+      ],
+    });
+  }
+
+  function trackPreservedFixture(recovery: {
+    fixtureRepository: string;
+    lastKnownRepository: string;
+  }): void {
+    temporaryRoots.push(
+      recovery.fixtureRepository,
+      join(
+        dirname(recovery.fixtureRepository),
+        `.${basename(recovery.fixtureRepository)}-graphcraft-worktrees`,
+      ),
+    );
+  }
+
+  it("rejects model-call timeouts that Node would clamp to one millisecond", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-timeout-overflow-"));
+    temporaryRoots.push(root);
+    const outputPath = join(root, "report.json");
+    const adapter = new BenchmarkAdapter();
+
+    await expect(
+      runBenchmark({
+        suite: interruptionSuite("timeout-overflow"),
+        hosts: ["codex"],
+        adapters: { codex: adapter },
+        policies: { codex: { model: "timeout-overflow-fixture", effort: "low" } },
+        graphcraftVersion: "0.1.2-timeout-overflow-fixture",
+        seed: "timeout-overflow-seed",
+        repetitions: 1,
+        outputPath,
+        modelCallTimeoutMs: MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS + 1,
+      }),
+    ).rejects.toThrow(`between 1 and ${MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS}`);
+    expect(adapter.probeCalls).toBe(0);
+    await expect(access(outputPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("preserves stable v2 reports instead of fabricating v3 settlement controls", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-v2-refusal-"));
+    temporaryRoots.push(root);
+    const outputPath = join(root, "report.json");
+    const v2Report = await readFile(
+      new URL("../../../tests/fixtures/protocol/benchmark-report.v2.json", import.meta.url),
+      "utf8",
+    );
+    await writeFile(outputPath, v2Report, "utf8");
+    const adapter = new BenchmarkAdapter();
+
+    await expect(
+      runBenchmark({
+        suite: interruptionSuite("v2-refusal"),
+        hosts: ["codex"],
+        adapters: { codex: adapter },
+        policies: { codex: { model: "v2-refusal-fixture", effort: "low" } },
+        graphcraftVersion: "0.1.2-v2-refusal-fixture",
+        seed: "v2-refusal-seed",
+        repetitions: 1,
+        outputPath,
+      }),
+    ).rejects.toThrow(/schema version 2 predates model-call settlement evidence/i);
+    expect(adapter.probeCalls).toBe(0);
+    expect(await readFile(outputPath, "utf8")).toBe(v2Report);
+  });
+
+  it("persists an abort-ignoring host preflight and refuses every probe on resume", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-unsettled-preflight-"));
+    temporaryRoots.push(root);
+    const outputPath = join(root, "report.json");
+    const suite = interruptionSuite("unsettled-preflight");
+    const adapter = new BenchmarkAdapter({ ignoreProbeAbort: true });
+
+    await expect(
+      runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: { codex: adapter },
+        policies: { codex: { model: "unsettled-preflight-fixture", effort: "low" } },
+        graphcraftVersion: "0.1.2-unsettled-preflight-fixture",
+        seed: "unsettled-preflight-seed",
+        repetitions: 1,
+        outputPath,
+        modelCallTimeoutMs: 25,
+      }),
+    ).rejects.toThrow(/capability probe exceeded/i);
+
+    expect(adapter.probeCalls).toBe(1);
+    expect(adapter.activeProbeCalls).toBe(1);
+    expect(JSON.parse(await readFile(outputPath, "utf8"))).toMatchObject({
+      schemaVersion: 3,
+      status: "running",
+      hostPreflightCheckpoint: {
+        host: "codex",
+        phase: "capability_probe",
+        attemptCheckpoint: "settled",
+        interruption: { cause: "timeout", childSettlement: "unconfirmed" },
+        requiredAction: "reconcile_host_child_before_resume",
+      },
+      results: [],
+    });
+
+    const resumedAdapter = new BenchmarkAdapter();
+    await expect(
+      runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: { codex: resumedAdapter },
+        policies: { codex: { model: "unsettled-preflight-fixture", effort: "low" } },
+        graphcraftVersion: "0.1.2-unsettled-preflight-fixture",
+        seed: "unsettled-preflight-seed",
+        repetitions: 1,
+        outputPath,
+        modelCallTimeoutMs: 25,
+      }),
+    ).rejects.toThrow(/host capability probe may still be active/i);
+    expect(resumedAdapter.probeCalls).toBe(0);
+    expect(resumedAdapter.planCalls).toBe(0);
+    expect(resumedAdapter.workerRequests).toHaveLength(0);
+    expect(resumedAdapter.verifyCalls).toBe(0);
+  }, 30_000);
+
+  it("checkpoints an abort-ignoring per-trial probe before launch and blocks resume", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-unsettled-trial-probe-"));
+    temporaryRoots.push(root);
+    const outputPath = join(root, "report.json");
+    const suite = interruptionSuite("unsettled-trial-probe");
+    const adapter = new BenchmarkAdapter({ ignoreProbeAbortOnCall: 2 });
+
+    await expect(
+      runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: { codex: adapter },
+        policies: { codex: { model: "unsettled-trial-probe-fixture", effort: "low" } },
+        graphcraftVersion: "0.1.2-unsettled-trial-probe-fixture",
+        seed: "unsettled-trial-probe-seed",
+        repetitions: 1,
+        outputPath,
+        modelCallTimeoutMs: 25,
+      }),
+    ).rejects.toThrow(/capability probe exceeded/i);
+
+    const checkpoint = JSON.parse(await readFile(outputPath, "utf8"));
+    expect(checkpoint.hostPreflightCheckpoint).toBeUndefined();
+    expect(checkpoint).toMatchObject({
+      schemaVersion: 3,
+      status: "running",
+      results: [
+        {
+          hostVersion: "pending-capability-probe",
+          executionStatus: "timed_out",
+          attemptCheckpoint: "settled",
+          interruption: { cause: "timeout", childSettlement: "unconfirmed" },
+          recovery: {
+            disposition: "preserved",
+            requiredAction: "reconcile_child_before_cleanup_or_resume",
+          },
+          accepted: false,
+        },
+      ],
+    });
+    expect(checkpoint.results).toHaveLength(1);
+    const recovery = checkpoint.results[0].recovery as {
+      fixtureRepository: string;
+      lastKnownRepository: string;
+    };
+    trackPreservedFixture(recovery);
+    expect(adapter.probeCalls).toBe(2);
+    expect(adapter.activeProbeCalls).toBe(1);
+    await expect(access(recovery.fixtureRepository)).resolves.toBeUndefined();
+
+    const resumedAdapter = new BenchmarkAdapter();
+    await expect(
+      runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: { codex: resumedAdapter },
+        policies: { codex: { model: "unsettled-trial-probe-fixture", effort: "low" } },
+        graphcraftVersion: "0.1.2-unsettled-trial-probe-fixture",
+        seed: "unsettled-trial-probe-seed",
+        repetitions: 1,
+        outputPath,
+        modelCallTimeoutMs: 25,
+      }),
+    ).rejects.toThrow(/model-call settlement is unconfirmed/i);
+    expect(resumedAdapter.probeCalls).toBe(0);
+    expect(resumedAdapter.planCalls).toBe(0);
+    expect(resumedAdapter.workerRequests).toHaveLength(0);
+    expect(resumedAdapter.verifyCalls).toBe(0);
+  }, 30_000);
+
+  it("times out each model call and retains settled unsuccessful trial evidence", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-call-timeout-"));
+    temporaryRoots.push(root);
+    const outputPath = join(root, "report.json");
+    const suite = interruptionSuite("call-timeout");
+    const adapter = new BenchmarkAdapter({ waitForWorkerAbort: true });
+
+    const { report } = await runBenchmark({
+      suite,
+      hosts: ["codex"],
+      adapters: { codex: adapter },
+      policies: { codex: { model: "timeout-fixture", effort: "low" } },
+      graphcraftVersion: "0.1.2-timeout-fixture",
+      seed: "timeout-seed",
+      repetitions: 1,
+      outputPath,
+      modelCallTimeoutMs: 25,
+    });
+
+    expect(report).toMatchObject({ status: "complete", modelCallTimeoutMs: 25 });
+    expect(report.results).toHaveLength(2);
+    expect(
+      report.results.map(({ executionStatus, attemptCheckpoint, interruption, accepted }) => ({
+        executionStatus,
+        attemptCheckpoint,
+        interruption,
+        accepted,
+      })),
+    ).toEqual([
+      expect.objectContaining({
+        executionStatus: "timed_out",
+        attemptCheckpoint: "settled",
+        interruption: expect.objectContaining({ cause: "timeout", childSettlement: "confirmed" }),
+        accepted: false,
+      }),
+      expect.objectContaining({
+        executionStatus: "timed_out",
+        attemptCheckpoint: "settled",
+        interruption: expect.objectContaining({ cause: "timeout", childSettlement: "confirmed" }),
+        accepted: false,
+      }),
+    ]);
+    expect(report.summary.codex).toMatchObject({ gate: { comparable: false, passes: null } });
+  });
+
+  it("persists confirmed settlement before removing the trial fixture", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-settlement-order-"));
+    temporaryRoots.push(root);
+    const outputPath = join(root, "report.json");
+    const suite = interruptionSuite("settlement-order");
+    const seed = seedStartingWith(suite, "baseline");
+    let fixtureRepository: string | undefined;
+    let observedSettledCheckpoint = false;
+
+    await expect(
+      runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: { codex: new BenchmarkAdapter() },
+        policies: { codex: { model: "settlement-order-fixture", effort: "low" } },
+        graphcraftVersion: "0.1.2-settlement-order-fixture",
+        seed,
+        repetitions: 1,
+        outputPath,
+        modelCallTimeoutMs: 5_000,
+        trialBoundary: async (point) => {
+          const checkpoint = JSON.parse(await readFile(outputPath, "utf8"));
+          if (point === "after_provisional_persist") {
+            expect(checkpoint.results[0]).toMatchObject({
+              attemptCheckpoint: "provisional",
+              interruption: { childSettlement: "unconfirmed" },
+            });
+            const recovery = checkpoint.results[0].recovery as {
+              fixtureRepository: string;
+              lastKnownRepository: string;
+            };
+            trackPreservedFixture(recovery);
+            fixtureRepository = recovery.fixtureRepository;
+            return;
+          }
+
+          expect(fixtureRepository).toBeDefined();
+          expect(checkpoint).toMatchObject({
+            status: "running",
+            results: [
+              {
+                trial: { mode: "baseline" },
+                executionStatus: "completed",
+                attemptCheckpoint: "settled",
+                accepted: true,
+              },
+            ],
+          });
+          await expect(access(fixtureRepository!)).resolves.toBeUndefined();
+          observedSettledCheckpoint = true;
+          throw new Error("simulated process loss after settled persistence");
+        },
+      }),
+    ).rejects.toThrow("simulated process loss after settled persistence");
+
+    expect(observedSettledCheckpoint).toBe(true);
+    expect(JSON.parse(await readFile(outputPath, "utf8"))).toMatchObject({
+      status: "running",
+      results: [{ executionStatus: "completed", attemptCheckpoint: "settled" }],
+    });
+    await expect(access(fixtureRepository!)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each(["baseline", "graphcraft"] as const)(
+    "preserves an abort-ignoring %s child and blocks every later or resumed call",
+    async (mode) => {
+      const root = await mkdtemp(join(tmpdir(), `graphcraft-benchmark-unsettled-${mode}-`));
+      temporaryRoots.push(root);
+      const outputPath = join(root, "report.json");
+      const suite = interruptionSuite(`unsettled-${mode}`);
+      const seed = seedStartingWith(suite, mode);
+      const adapter = new BenchmarkAdapter({ ignoreWorkerAbort: true });
+
+      await expect(
+        runBenchmark({
+          suite,
+          hosts: ["codex"],
+          adapters: { codex: adapter },
+          policies: { codex: { model: "unsettled-fixture", effort: "low" } },
+          graphcraftVersion: "0.1.2-unsettled-fixture",
+          seed,
+          repetitions: 1,
+          outputPath,
+          modelCallTimeoutMs: 25,
+        }),
+      ).rejects.toThrow(/model-call settlement was not confirmed/i);
+
+      const checkpoint = JSON.parse(await readFile(outputPath, "utf8"));
+      expect(checkpoint).toMatchObject({
+        schemaVersion: 3,
+        status: "running",
+        results: [
+          {
+            trial: { mode },
+            executionStatus: "timed_out",
+            attemptCheckpoint: "settled",
+            interruption: { cause: "timeout", childSettlement: "unconfirmed" },
+            recovery: {
+              disposition: "preserved",
+              requiredAction: "reconcile_child_before_cleanup_or_resume",
+            },
+            accepted: false,
+          },
+        ],
+      });
+      expect(checkpoint.results).toHaveLength(1);
+      const recovery = checkpoint.results[0].recovery as {
+        fixtureRepository: string;
+        lastKnownRepository: string;
+      };
+      trackPreservedFixture(recovery);
+      expect(adapter.workerRequests).toHaveLength(1);
+      expect(adapter.workerRequests[0]!.repositoryPath).toBe(recovery.lastKnownRepository);
+      expect(adapter.activeWorkerRepositories.has(recovery.lastKnownRepository)).toBe(true);
+      await expect(access(recovery.fixtureRepository)).resolves.toBeUndefined();
+      await expect(access(recovery.lastKnownRepository)).resolves.toBeUndefined();
+
+      const resumedAdapter = new BenchmarkAdapter();
+      await expect(
+        runBenchmark({
+          suite,
+          hosts: ["codex"],
+          adapters: { codex: resumedAdapter },
+          policies: { codex: { model: "unsettled-fixture", effort: "low" } },
+          graphcraftVersion: "0.1.2-unsettled-fixture",
+          seed,
+          repetitions: 1,
+          outputPath,
+          modelCallTimeoutMs: 25,
+        }),
+      ).rejects.toThrow(/model-call settlement is unconfirmed/i);
+      expect(resumedAdapter.probeCalls).toBe(0);
+      expect(resumedAdapter.planCalls).toBe(0);
+      expect(resumedAdapter.workerRequests).toHaveLength(0);
+      expect(resumedAdapter.verifyCalls).toBe(0);
+    },
+    30_000,
+  );
+
+  it("preserves an abort-ignoring Graphcraft planner and blocks every later or resumed call", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-unsettled-planner-"));
+    temporaryRoots.push(root);
+    const outputPath = join(root, "report.json");
+    const suite = interruptionSuite("unsettled-planner");
+    const seed = seedStartingWith(suite, "graphcraft");
+    const adapter = new BenchmarkAdapter({ ignorePlanAbort: true });
+
+    await expect(
+      runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: { codex: adapter },
+        policies: { codex: { model: "unsettled-planner-fixture", effort: "low" } },
+        graphcraftVersion: "0.1.2-unsettled-planner-fixture",
+        seed,
+        repetitions: 1,
+        outputPath,
+        modelCallTimeoutMs: 25,
+      }),
+    ).rejects.toThrow(/model-call settlement was not confirmed/i);
+
+    const checkpoint = JSON.parse(await readFile(outputPath, "utf8"));
+    expect(checkpoint).toMatchObject({
+      schemaVersion: 3,
+      status: "running",
+      results: [
+        {
+          trial: { mode: "graphcraft" },
+          executionStatus: "timed_out",
+          attemptCheckpoint: "settled",
+          interruption: { cause: "timeout", childSettlement: "unconfirmed" },
+          recovery: { disposition: "preserved" },
+          accepted: false,
+        },
+      ],
+    });
+    expect(checkpoint.results).toHaveLength(1);
+    const recovery = checkpoint.results[0].recovery as {
+      fixtureRepository: string;
+      lastKnownRepository: string;
+    };
+    trackPreservedFixture(recovery);
+    expect(adapter.planCalls).toBe(1);
+    expect(adapter.workerRequests).toHaveLength(0);
+    expect(adapter.activePlannerRepositories.has(recovery.lastKnownRepository)).toBe(true);
+    await expect(access(recovery.fixtureRepository)).resolves.toBeUndefined();
+    await expect(access(recovery.lastKnownRepository)).resolves.toBeUndefined();
+
+    const resumedAdapter = new BenchmarkAdapter();
+    await expect(
+      runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: { codex: resumedAdapter },
+        policies: { codex: { model: "unsettled-planner-fixture", effort: "low" } },
+        graphcraftVersion: "0.1.2-unsettled-planner-fixture",
+        seed,
+        repetitions: 1,
+        outputPath,
+        modelCallTimeoutMs: 25,
+      }),
+    ).rejects.toThrow(/model-call settlement is unconfirmed/i);
+    expect(resumedAdapter.probeCalls).toBe(0);
+    expect(resumedAdapter.planCalls).toBe(0);
+    expect(resumedAdapter.workerRequests).toHaveLength(0);
+    expect(resumedAdapter.verifyCalls).toBe(0);
+  }, 30_000);
+
+  it("preserves an abort-ignoring Graphcraft verifier and blocks every later or resumed call", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-unsettled-verifier-"));
+    temporaryRoots.push(root);
+    const outputPath = join(root, "report.json");
+    const suite = interruptionSuite("unsettled-verifier", { withoutVerifyScript: true });
+    const seed = seedStartingWith(suite, "graphcraft");
+    const adapter = new BenchmarkAdapter({
+      ignoreVerifyAbort: true,
+    });
+
+    await expect(
+      runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: { codex: adapter },
+        policies: { codex: { model: "unsettled-verifier-fixture", effort: "low" } },
+        graphcraftVersion: "0.1.2-unsettled-verifier-fixture",
+        seed,
+        repetitions: 1,
+        outputPath,
+        modelCallTimeoutMs: 5_000,
+      }),
+    ).rejects.toThrow(/model-call settlement was not confirmed/i);
+
+    const checkpoint = JSON.parse(await readFile(outputPath, "utf8"));
+    expect(checkpoint).toMatchObject({
+      schemaVersion: 3,
+      status: "running",
+      results: [
+        {
+          trial: { mode: "graphcraft" },
+          executionStatus: "timed_out",
+          attemptCheckpoint: "settled",
+          interruption: { cause: "timeout", childSettlement: "unconfirmed" },
+          recovery: { disposition: "preserved" },
+          accepted: false,
+        },
+      ],
+    });
+    expect(checkpoint.results).toHaveLength(1);
+    const recovery = checkpoint.results[0].recovery as {
+      fixtureRepository: string;
+      lastKnownRepository: string;
+    };
+    trackPreservedFixture(recovery);
+    expect(adapter.planCalls).toBe(1);
+    expect(adapter.workerRequests).toHaveLength(1);
+    expect(adapter.verifyCalls).toBe(1);
+    expect(adapter.activeVerifierRepositories.has(recovery.lastKnownRepository)).toBe(true);
+    await expect(access(recovery.fixtureRepository)).resolves.toBeUndefined();
+    await expect(access(recovery.lastKnownRepository)).resolves.toBeUndefined();
+
+    const resumedAdapter = new BenchmarkAdapter();
+    await expect(
+      runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: { codex: resumedAdapter },
+        policies: { codex: { model: "unsettled-verifier-fixture", effort: "low" } },
+        graphcraftVersion: "0.1.2-unsettled-verifier-fixture",
+        seed,
+        repetitions: 1,
+        outputPath,
+        modelCallTimeoutMs: 5_000,
+      }),
+    ).rejects.toThrow(/model-call settlement is unconfirmed/i);
+    expect(resumedAdapter.probeCalls).toBe(0);
+    expect(resumedAdapter.planCalls).toBe(0);
+    expect(resumedAdapter.workerRequests).toHaveLength(0);
+    expect(resumedAdapter.verifyCalls).toBe(0);
+  }, 30_000);
+
+  it("checkpoints an externally interrupted trial and resumes without replaying it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-signal-resume-"));
+    temporaryRoots.push(root);
+    const outputPath = join(root, "report.json");
+    const suite = interruptionSuite("signal-resume");
+    const cancellation = new AbortController();
+    const interruptedAdapter = new BenchmarkAdapter({
+      waitForWorkerAbort: true,
+      onWorkerStarted: () =>
+        cancellation.abort({ cause: "cancellation", reason: "test-requested interruption" }),
+    });
+    const seed = seedStartingWith(suite, "baseline");
+
+    await expect(
+      runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: { codex: interruptedAdapter },
+        policies: { codex: { model: "signal-fixture", effort: "low" } },
+        graphcraftVersion: "0.1.2-signal-fixture",
+        seed,
+        repetitions: 1,
+        outputPath,
+        signal: cancellation.signal,
+        modelCallTimeoutMs: 5_000,
+      }),
+    ).rejects.toThrow(/interrupted trial was checkpointed/i);
+
+    const checkpoint = JSON.parse(await readFile(outputPath, "utf8"));
+    expect(checkpoint).toMatchObject({
+      status: "running",
+      modelCallTimeoutMs: 5_000,
+      results: [
+        {
+          trial: { mode: "baseline" },
+          executionStatus: "interrupted",
+          attemptCheckpoint: "settled",
+          interruption: { cause: "cancellation", childSettlement: "confirmed" },
+          accepted: false,
+        },
+      ],
+    });
+
+    const resumedAdapter = new BenchmarkAdapter();
+    const resumed = await runBenchmark({
+      suite,
+      hosts: ["codex"],
+      adapters: { codex: resumedAdapter },
+      policies: { codex: { model: "signal-fixture", effort: "low" } },
+      graphcraftVersion: "0.1.2-signal-fixture",
+      seed,
+      repetitions: 1,
+      outputPath,
+      modelCallTimeoutMs: 5_000,
+    });
+    expect(resumed.report.status).toBe("complete");
+    expect(resumed.report.results).toHaveLength(2);
+    expect(resumedAdapter.workerRequests).toHaveLength(1);
+    expect(resumed.report.results.find(({ trial }) => trial.mode === "baseline")).toMatchObject({
+      executionStatus: "interrupted",
+      accepted: false,
+    });
+  });
+
+  it("recovers a provisional checkpoint and refuses to risk replaying an unknown child", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-provisional-resume-"));
+    temporaryRoots.push(root);
+    const outputPath = join(root, "report.json");
+    const suite = interruptionSuite("provisional-resume");
+    const seed = seedStartingWith(suite, "baseline");
+
+    await expect(
+      runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: { codex: new BenchmarkAdapter() },
+        policies: { codex: { model: "provisional-fixture", effort: "low" } },
+        graphcraftVersion: "0.1.2-provisional-fixture",
+        seed,
+        repetitions: 1,
+        outputPath,
+        modelCallTimeoutMs: 5_000,
+        trialBoundary: (point) => {
+          if (point === "after_provisional_persist") throw new Error("simulated process loss");
+        },
+      }),
+    ).rejects.toThrow("simulated process loss");
+    const provisional = JSON.parse(await readFile(outputPath, "utf8"));
+    expect(provisional).toMatchObject({
+      schemaVersion: 3,
+      status: "running",
+      results: [
+        {
+          attemptCheckpoint: "provisional",
+          interruption: { childSettlement: "unconfirmed" },
+          recovery: {
+            disposition: "preserved",
+            requiredAction: "reconcile_child_before_cleanup_or_resume",
+          },
+          accepted: false,
+        },
+      ],
+    });
+    const recovery = provisional.results[0].recovery as {
+      fixtureRepository: string;
+      lastKnownRepository: string;
+    };
+    trackPreservedFixture(recovery);
+    await expect(access(recovery.fixtureRepository)).resolves.toBeUndefined();
+
+    const resumedAdapter = new BenchmarkAdapter();
+    await expect(
+      runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: { codex: resumedAdapter },
+        policies: { codex: { model: "provisional-fixture", effort: "low" } },
+        graphcraftVersion: "0.1.2-provisional-fixture",
+        seed,
+        repetitions: 1,
+        outputPath,
+        modelCallTimeoutMs: 5_000,
+      }),
+    ).rejects.toThrow(/model-call settlement is unconfirmed/i);
+
+    expect(resumedAdapter.probeCalls).toBe(0);
+    expect(resumedAdapter.planCalls).toBe(0);
+    expect(resumedAdapter.workerRequests).toHaveLength(0);
+    expect(resumedAdapter.verifyCalls).toBe(0);
+    expect(JSON.parse(await readFile(outputPath, "utf8"))).toMatchObject({
+      status: "running",
+      results: [
+        {
+          executionStatus: "interrupted",
+          attemptCheckpoint: "settled",
+          interruption: { cause: "runtime_shutdown", childSettlement: "unconfirmed" },
+          recovery,
+          accepted: false,
+          usageReconciled: false,
+        },
+      ],
+    });
+  });
 
   it("binds source provenance to the exact commit and fails evidence closed when dirty", async () => {
     const repository = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-source-identity-"));
@@ -353,7 +1085,7 @@ describe("benchmark harness", () => {
   });
 
   it.each(REQUIRED_HOST_PROTOCOL_CAPABILITIES)(
-    "rejects benchmark admission before fixture or report creation when %s is unavailable",
+    "rejects benchmark admission before fixture creation and clears preflight when %s is unavailable",
     async (capability) => {
       const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-admission-"));
       temporaryRoots.push(root);
@@ -393,7 +1125,9 @@ describe("benchmark harness", () => {
         }),
       ).rejects.toThrow(capability);
       expect(adapter.graphcraftRepositories).toEqual([]);
-      await expect(access(outputPath)).rejects.toMatchObject({ code: "ENOENT" });
+      const checkpoint = JSON.parse(await readFile(outputPath, "utf8"));
+      expect(checkpoint).toMatchObject({ status: "running", results: [] });
+      expect(checkpoint.hostPreflightCheckpoint).toBeUndefined();
     },
   );
 
@@ -589,7 +1323,17 @@ describe("benchmark harness", () => {
     expect(adapter.workerRequests).toHaveLength(1);
     expect(JSON.parse(await readFile(outputPath, "utf8"))).toMatchObject({
       status: "running",
-      results: [],
+      results: [
+        {
+          hostVersion: "codex-cli 0.144.6",
+          executionStatus: "error",
+          attemptCheckpoint: "settled",
+          accepted: false,
+          failureTrace: expect.arrayContaining([
+            expect.stringMatching(/no matching recorded protocol profile/),
+          ]),
+        },
+      ],
     });
   });
 
@@ -675,7 +1419,21 @@ describe("benchmark harness", () => {
       );
       expect(JSON.parse(await readFile(outputPath, "utf8"))).toMatchObject({
         status: "running",
-        results: [],
+        results: [
+          {
+            hostVersion: "codex-cli 0.144.6",
+            executionStatus: "error",
+            attemptCheckpoint: "settled",
+            accepted: false,
+            failureTrace: expect.arrayContaining([
+              expect.stringMatching(
+                transition === "authentication loss"
+                  ? /not authenticated/
+                  : /no matching recorded protocol profile/,
+              ),
+            ]),
+          },
+        ],
       });
     },
   );

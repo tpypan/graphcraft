@@ -1,0 +1,188 @@
+{
+  "schemaVersion": 3,
+  "status": "running",
+  "suite": {
+    "id": "protocol-fixture",
+    "version": 1,
+    "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "startedAt": "2026-07-22T12:00:00.000Z",
+  "updatedAt": "2026-07-22T12:00:05.000Z",
+  "seed": "protocol-fixture-seed",
+  "randomized": true,
+  "modelPolicy": {
+    "codex": "fixture-model"
+  },
+  "effortPolicy": "low",
+  "permissionPolicy": {
+    "codex": "codex_workspace_write_shell_external_not_graphcraft_enforced"
+  },
+  "scorerPolicy": "fixture_bound_scorers_plus_suite_assertions",
+  "modelCallTimeoutMs": 900000,
+  "environment": {
+    "platform": "fixture",
+    "architecture": "fixture",
+    "nodeVersion": "v22.0.0",
+    "graphcraftVersion": "0.1.2"
+  },
+  "limitations": ["Protocol fixture with an unconfirmed child settlement"],
+  "schedule": [
+    {
+      "trialId": "protocol-fixture-trial",
+      "order": 0,
+      "taskId": "protocol-fixture-task",
+      "family": "feature",
+      "host": "codex",
+      "mode": "graphcraft",
+      "repetition": 1,
+      "seed": "protocol-fixture-seed"
+    }
+  ],
+  "results": [
+    {
+      "trial": {
+        "trialId": "protocol-fixture-trial",
+        "order": 0,
+        "taskId": "protocol-fixture-task",
+        "family": "feature",
+        "host": "codex",
+        "mode": "graphcraft",
+        "repetition": 1,
+        "seed": "protocol-fixture-seed"
+      },
+      "hostVersion": "codex-cli 0.144.6",
+      "modelPolicy": "fixture-model",
+      "effortPolicy": "low",
+      "permissionPolicy": "codex_workspace_write_shell_external_not_graphcraft_enforced",
+      "acceptanceScorerDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "observedScorerDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "scorerVerified": true,
+      "repositoryDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "baseSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "executionStatus": "timed_out",
+      "attemptCheckpoint": "settled",
+      "interruption": {
+        "cause": "timeout",
+        "reason": "Fixture child did not settle after cancellation",
+        "childSettlement": "unconfirmed"
+      },
+      "recovery": {
+        "disposition": "preserved",
+        "fixtureRepository": "/tmp/graphcraft-benchmark-protocol-fixture",
+        "lastKnownRepository": "/tmp/graphcraft-benchmark-protocol-fixture",
+        "requiredAction": "reconcile_child_before_cleanup_or_resume"
+      },
+      "accepted": false,
+      "acceptance": [
+        {
+          "path": "$check:1",
+          "passed": false,
+          "summary": "Model call timed out before acceptance"
+        }
+      ],
+      "usage": {
+        "input": 0,
+        "cachedInput": 0,
+        "uncachedInput": 0,
+        "output": 0,
+        "reasoning": 0,
+        "total": 0,
+        "availability": {
+          "input": "unavailable",
+          "cachedInput": "unavailable",
+          "uncachedInput": "unavailable",
+          "output": "unavailable",
+          "reasoning": "unavailable",
+          "total": "unavailable"
+        }
+      },
+      "usageReconciled": false,
+      "limitations": ["model_call_settlement:unconfirmed"],
+      "durationMs": 5000,
+      "humanInterventions": 0,
+      "failureTrace": ["Fixture child did not settle after cancellation"]
+    }
+  ],
+  "summary": {
+    "codex": {
+      "baseline": {
+        "trials": 0,
+        "accepted": 0,
+        "unsuccessful": 0,
+        "acceptanceRate": 0,
+        "reconciledTokenTrials": 0,
+        "medianAcceptedTokens": null
+      },
+      "graphcraft": {
+        "trials": 1,
+        "accepted": 0,
+        "unsuccessful": 1,
+        "acceptanceRate": 0,
+        "reconciledTokenTrials": 0,
+        "medianAcceptedTokens": null
+      },
+      "matchedAccepted": {
+        "aggregation": "median_pair_reduction_within_task_then_median_across_tasks",
+        "pairs": 0,
+        "zeroBaselinePairs": 0,
+        "coveredTasks": 0,
+        "totalTasks": 1,
+        "minimumPairsPerTask": 3,
+        "completeTaskCoverage": false,
+        "medianBaselineTokens": null,
+        "medianGraphcraftTokens": null,
+        "medianTokenReductionPercent": null,
+        "byTask": {}
+      },
+      "gate": {
+        "completeSchedule": true,
+        "matchedControls": false,
+        "stableHostVersion": true,
+        "comparable": false,
+        "tokenReductionPercent": null,
+        "acceptanceDeltaPoints": null,
+        "passes": null
+      }
+    },
+    "claude": {
+      "baseline": {
+        "trials": 0,
+        "accepted": 0,
+        "unsuccessful": 0,
+        "acceptanceRate": 0,
+        "reconciledTokenTrials": 0,
+        "medianAcceptedTokens": null
+      },
+      "graphcraft": {
+        "trials": 0,
+        "accepted": 0,
+        "unsuccessful": 0,
+        "acceptanceRate": 0,
+        "reconciledTokenTrials": 0,
+        "medianAcceptedTokens": null
+      },
+      "matchedAccepted": {
+        "aggregation": "median_pair_reduction_within_task_then_median_across_tasks",
+        "pairs": 0,
+        "zeroBaselinePairs": 0,
+        "coveredTasks": 0,
+        "totalTasks": 0,
+        "minimumPairsPerTask": 3,
+        "completeTaskCoverage": false,
+        "medianBaselineTokens": null,
+        "medianGraphcraftTokens": null,
+        "medianTokenReductionPercent": null,
+        "byTask": {}
+      },
+      "gate": {
+        "completeSchedule": true,
+        "matchedControls": true,
+        "stableHostVersion": true,
+        "comparable": false,
+        "tokenReductionPercent": null,
+        "acceptanceDeltaPoints": null,
+        "passes": null
+      }
+    }
+  }
+}
