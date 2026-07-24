@@ -15,6 +15,7 @@ import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RunLock } from "./lock.ts";
+import { privatePublicationIdentityFingerprint } from "./secure-fs.ts";
 
 const temporaryRoots: string[] = [];
 
@@ -333,7 +334,9 @@ describe("run lock persistence", () => {
       const currentStatus = await lstat(path, { bigint: true });
       expect(currentStatus.dev).toBe(replacementStatus.dev);
       expect(currentStatus.ino).toBe(replacementStatus.ino);
-      expect(currentStatus.birthtimeNs).toBe(replacementStatus.birthtimeNs);
+      expect(privatePublicationIdentityFingerprint(currentStatus)).toBe(
+        privatePublicationIdentityFingerprint(replacementStatus),
+      );
     } finally {
       mutation.mockRestore();
     }
