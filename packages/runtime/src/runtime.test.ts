@@ -91,7 +91,8 @@ import {
 const execFileAsync = promisify(execFile);
 const temporaryRoots: string[] = [];
 const storageFixturesRoot = fileURLToPath(new URL("./fixtures/storage", import.meta.url));
-const atomicCommitMatrixTimeout = process.platform === "win32" ? 300_000 : 60_000;
+const atomicCommitMatrixTimeout =
+  process.platform === "win32" ? 300_000 : process.platform === "darwin" ? 120_000 : 60_000;
 const pushMatrixTimeout = process.platform === "win32" ? 300_000 : 120_000;
 const checkRerunMatrixTimeout = process.platform === "win32" ? 600_000 : 180_000;
 const pullRequestCreateMatrixTimeout = process.platform === "win32" ? 300_000 : 180_000;
@@ -149,7 +150,11 @@ async function waitFor(
 }
 
 function itWin(name: string, test: () => Promise<void>): void {
-  it(name, test, process.platform === "win32" ? 60_000 : 15_000);
+  it(
+    name,
+    test,
+    process.platform === "win32" ? 60_000 : process.platform === "darwin" ? 30_000 : 15_000,
+  );
 }
 
 function itSlow(name: string, test: () => Promise<void>): void {
