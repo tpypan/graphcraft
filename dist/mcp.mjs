@@ -33426,6 +33426,153 @@ function summarizeBenchmark(results, schedule = results.map(({ trial }) => trial
   );
 }
 
+// packages/core/src/benchmark-publication.ts
+var BENCHMARK_DEFECT_CATEGORIES = [
+  "correctness",
+  "completeness",
+  "regression",
+  "safety_security",
+  "test_quality",
+  "maintainability",
+  "instruction_adherence",
+  "evidence_integrity"
+];
+var BENCHMARK_DEFECT_SEVERITIES = ["minor", "major", "critical"];
+var BenchmarkDefectCategorySchema = external_exports.enum(BENCHMARK_DEFECT_CATEGORIES);
+var BenchmarkDefectSeveritySchema = external_exports.enum(BENCHMARK_DEFECT_SEVERITIES);
+var BenchmarkReviewOpaqueIdSchema = external_exports.string().regex(/^packet-[0-9a-f]{32}$/);
+var BenchmarkBlindedInterruptionSchema = external_exports.strictObject({
+  cause: external_exports.enum(["cancellation", "runtime_shutdown", "timeout"]),
+  reason: external_exports.string().min(1),
+  childSettlement: external_exports.enum(["confirmed", "unconfirmed"])
+});
+var BenchmarkBlindedReviewPacketSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  opaqueId: BenchmarkReviewOpaqueIdSchema,
+  task: external_exports.strictObject({
+    family: BenchmarkTaskFamilySchema,
+    prompt: external_exports.string().min(1),
+    checks: external_exports.array(BenchmarkCheckSchema).min(1),
+    acceptanceCriteria: external_exports.array(BenchmarkAssertionSchema).min(1)
+  }),
+  outcome: external_exports.strictObject({
+    executionStatus: external_exports.enum([
+      "completed",
+      "blocked",
+      "failed",
+      "error",
+      "interrupted",
+      "timed_out"
+    ]),
+    accepted: external_exports.boolean(),
+    scorerVerified: external_exports.boolean(),
+    acceptance: external_exports.array(BenchmarkAssertionResultSchema),
+    interruption: BenchmarkBlindedInterruptionSchema.optional(),
+    limitations: external_exports.array(external_exports.string()),
+    failureTrace: external_exports.array(external_exports.string())
+  }),
+  reviewPacket: BenchmarkReviewPacketSchema
+});
+function exactOrderedValues(expected) {
+  return external_exports.array(external_exports.string()).superRefine((values, context) => {
+    if (contentHash(values) !== contentHash(expected)) {
+      context.addIssue({
+        code: "custom",
+        message: `Expected the exact ordered values: ${expected.join(", ")}`
+      });
+    }
+  });
+}
+var BenchmarkBlindedReviewExportSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  reviewPolicy: external_exports.literal("opaque_blinded_review_v1"),
+  rawReportSha256: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  blindingKeyDigest: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  suite: external_exports.strictObject({
+    id: external_exports.string().min(1),
+    version: external_exports.number().int().positive(),
+    digest: external_exports.string().min(1)
+  }),
+  taxonomy: external_exports.strictObject({
+    version: external_exports.literal(1),
+    categories: exactOrderedValues(BENCHMARK_DEFECT_CATEGORIES),
+    severities: exactOrderedValues(BENCHMARK_DEFECT_SEVERITIES)
+  }),
+  packets: external_exports.array(BenchmarkBlindedReviewPacketSchema).min(1)
+}).superRefine((artifact, context) => {
+  const ids = artifact.packets.map(({ opaqueId }) => opaqueId);
+  if (new Set(ids).size !== ids.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["packets"],
+      message: "Blinded benchmark packet IDs must be unique"
+    });
+  }
+  if (ids.some((id, index) => index > 0 && id < ids[index - 1])) {
+    context.addIssue({
+      code: "custom",
+      path: ["packets"],
+      message: "Blinded benchmark packets must be sorted by opaque ID"
+    });
+  }
+});
+var BenchmarkDefectSchema = external_exports.strictObject({
+  category: BenchmarkDefectCategorySchema,
+  severity: BenchmarkDefectSeveritySchema,
+  summary: external_exports.string().trim().min(1).max(4096)
+});
+var BenchmarkTrialReviewLabelSchema = external_exports.strictObject({
+  opaqueId: BenchmarkReviewOpaqueIdSchema,
+  packetDigest: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  reviewed: external_exports.literal(true),
+  reviewerId: external_exports.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
+  verdict: external_exports.enum(["no_defect", "defect"]),
+  defects: external_exports.array(BenchmarkDefectSchema)
+}).superRefine((label, context) => {
+  if (label.verdict === "no_defect" && label.defects.length > 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["defects"],
+      message: "A no-defect review label cannot contain defects"
+    });
+  }
+  if (label.verdict === "defect" && label.defects.length === 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["defects"],
+      message: "A defect review label must contain at least one defect"
+    });
+  }
+  const defectKeys = label.defects.map(
+    ({ category, severity, summary }) => `${category}\0${severity}\0${summary}`
+  );
+  if (new Set(defectKeys).size !== defectKeys.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["defects"],
+      message: "A review label cannot repeat the same defect"
+    });
+  }
+});
+var BenchmarkReviewLabelsSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  reviewPolicy: external_exports.literal("opaque_blinded_review_v1"),
+  taxonomyVersion: external_exports.literal(1),
+  rawReportSha256: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  blindingKeyDigest: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  blindedReviewDigest: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  labels: external_exports.array(BenchmarkTrialReviewLabelSchema).min(1)
+}).superRefine((artifact, context) => {
+  const ids = artifact.labels.map(({ opaqueId }) => opaqueId);
+  if (new Set(ids).size !== ids.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["labels"],
+      message: "A benchmark review artifact must contain one label per opaque ID"
+    });
+  }
+});
+
 // packages/core/src/capsule.ts
 var MAX_CONTEXT_CAPSULE_CHARACTERS = 24e3;
 function compactText(value, maximum) {
@@ -53416,6 +53563,11 @@ var TRANSCRIPT_OMISSION_MARKER = Buffer.from(
   "utf8"
 );
 var DEFAULT_BENCHMARK_MODEL_CALL_TIMEOUT_MS = 15 * 6e4;
+var BENCHMARK_SUITE_MAX_BYTES = 16 * 1024 * 1024;
+
+// packages/runtime/src/benchmark-publication.ts
+var BENCHMARK_PUBLICATION_REPORT_MAX_BYTES = 64 * 1024 * 1024;
+var BENCHMARK_PUBLICATION_LABELS_MAX_BYTES = 16 * 1024 * 1024;
 
 // packages/runtime/src/supervisor.ts
 import { open as open9, readdir as readdir5 } from "node:fs/promises";

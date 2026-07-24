@@ -135,12 +135,12 @@ var require_isexe = __commonJS({
         if (typeof Promise !== "function") {
           throw new TypeError("callback not provided");
         }
-        return new Promise(function(resolve18, reject) {
+        return new Promise(function(resolve19, reject) {
           isexe(path2, options || {}, function(er, is) {
             if (er) {
               reject(er);
             } else {
-              resolve18(is);
+              resolve19(is);
             }
           });
         });
@@ -206,27 +206,27 @@ var require_which = __commonJS({
         opt = {};
       const { pathEnv, pathExt, pathExtExe } = getPathInfo(cmd, opt);
       const found = [];
-      const step = (i) => new Promise((resolve18, reject) => {
+      const step = (i) => new Promise((resolve19, reject) => {
         if (i === pathEnv.length)
-          return opt.all && found.length ? resolve18(found) : reject(getNotFoundError(cmd));
+          return opt.all && found.length ? resolve19(found) : reject(getNotFoundError(cmd));
         const ppRaw = pathEnv[i];
         const pathPart = /^".*"$/.test(ppRaw) ? ppRaw.slice(1, -1) : ppRaw;
         const pCmd = path2.join(pathPart, cmd);
         const p = !pathPart && /^\.[\\\/]/.test(cmd) ? cmd.slice(0, 2) + pCmd : pCmd;
-        resolve18(subStep(p, i, 0));
+        resolve19(subStep(p, i, 0));
       });
-      const subStep = (p, i, ii) => new Promise((resolve18, reject) => {
+      const subStep = (p, i, ii) => new Promise((resolve19, reject) => {
         if (ii === pathExt.length)
-          return resolve18(step(i + 1));
+          return resolve19(step(i + 1));
         const ext = pathExt[ii];
         isexe(p + ext, { pathExt: pathExtExe }, (er, is) => {
           if (!er && is) {
             if (opt.all)
               found.push(p + ext);
             else
-              return resolve18(p + ext);
+              return resolve19(p + ext);
           }
-          return resolve18(subStep(p, i, ii + 1));
+          return resolve19(subStep(p, i, ii + 1));
         });
       });
       return cb ? step(0).then((res) => cb(null, res), cb) : step(0);
@@ -3909,7 +3909,7 @@ var program = new Command();
 // packages/cli/src/bin.ts
 import { spawn as spawn7 } from "node:child_process";
 import { readFile as readFile5 } from "node:fs/promises";
-import { dirname as dirname15, join as join17, parse as parse3, resolve as resolve17 } from "node:path";
+import { dirname as dirname16, join as join18, parse as parse3, resolve as resolve18 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // benchmarks/stable-v1.json
@@ -4121,22 +4121,22 @@ var stable_v1_default = {
 // packages/cli/src/index.ts
 var import_cross_spawn5 = __toESM(require_cross_spawn(), 1);
 import { createInterface } from "node:readline/promises";
-import { createHash as createHash6, randomUUID as randomUUID12 } from "node:crypto";
+import { createHash as createHash8, randomUUID as randomUUID13 } from "node:crypto";
 import {
   access as access3,
   chmod as chmod2,
-  lstat as lstat13,
-  mkdir as mkdir6,
+  lstat as lstat14,
+  mkdir as mkdir7,
   mkdtemp as mkdtemp3,
-  open as open10,
+  open as open11,
   readdir as readdir7,
   rename as rename3,
-  rm as rm6,
+  rm as rm7,
   rmdir as rmdir3
 } from "node:fs/promises";
 import { homedir, platform, tmpdir as tmpdir3 } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname as dirname14, isAbsolute as isAbsolute11, join as join16, resolve as resolve16 } from "node:path";
+import { dirname as dirname15, isAbsolute as isAbsolute11, join as join17, resolve as resolve17 } from "node:path";
 import { stdin, stdout } from "node:process";
 
 // package.json
@@ -20637,6 +20637,176 @@ function summarizeBenchmark(results, schedule = results.map(({ trial }) => trial
   );
 }
 
+// packages/core/src/benchmark-publication.ts
+import { createHash as createHash2, createHmac } from "node:crypto";
+var BENCHMARK_DEFECT_CATEGORIES = [
+  "correctness",
+  "completeness",
+  "regression",
+  "safety_security",
+  "test_quality",
+  "maintainability",
+  "instruction_adherence",
+  "evidence_integrity"
+];
+var BENCHMARK_DEFECT_SEVERITIES = ["minor", "major", "critical"];
+var BenchmarkDefectCategorySchema = external_exports.enum(BENCHMARK_DEFECT_CATEGORIES);
+var BenchmarkDefectSeveritySchema = external_exports.enum(BENCHMARK_DEFECT_SEVERITIES);
+var BenchmarkReviewOpaqueIdSchema = external_exports.string().regex(/^packet-[0-9a-f]{32}$/);
+var BenchmarkBlindedInterruptionSchema = external_exports.strictObject({
+  cause: external_exports.enum(["cancellation", "runtime_shutdown", "timeout"]),
+  reason: external_exports.string().min(1),
+  childSettlement: external_exports.enum(["confirmed", "unconfirmed"])
+});
+var BenchmarkBlindedReviewPacketSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  opaqueId: BenchmarkReviewOpaqueIdSchema,
+  task: external_exports.strictObject({
+    family: BenchmarkTaskFamilySchema,
+    prompt: external_exports.string().min(1),
+    checks: external_exports.array(BenchmarkCheckSchema).min(1),
+    acceptanceCriteria: external_exports.array(BenchmarkAssertionSchema).min(1)
+  }),
+  outcome: external_exports.strictObject({
+    executionStatus: external_exports.enum([
+      "completed",
+      "blocked",
+      "failed",
+      "error",
+      "interrupted",
+      "timed_out"
+    ]),
+    accepted: external_exports.boolean(),
+    scorerVerified: external_exports.boolean(),
+    acceptance: external_exports.array(BenchmarkAssertionResultSchema),
+    interruption: BenchmarkBlindedInterruptionSchema.optional(),
+    limitations: external_exports.array(external_exports.string()),
+    failureTrace: external_exports.array(external_exports.string())
+  }),
+  reviewPacket: BenchmarkReviewPacketSchema
+});
+function exactOrderedValues(expected) {
+  return external_exports.array(external_exports.string()).superRefine((values, context) => {
+    if (contentHash(values) !== contentHash(expected)) {
+      context.addIssue({
+        code: "custom",
+        message: `Expected the exact ordered values: ${expected.join(", ")}`
+      });
+    }
+  });
+}
+var BenchmarkBlindedReviewExportSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  reviewPolicy: external_exports.literal("opaque_blinded_review_v1"),
+  rawReportSha256: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  blindingKeyDigest: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  suite: external_exports.strictObject({
+    id: external_exports.string().min(1),
+    version: external_exports.number().int().positive(),
+    digest: external_exports.string().min(1)
+  }),
+  taxonomy: external_exports.strictObject({
+    version: external_exports.literal(1),
+    categories: exactOrderedValues(BENCHMARK_DEFECT_CATEGORIES),
+    severities: exactOrderedValues(BENCHMARK_DEFECT_SEVERITIES)
+  }),
+  packets: external_exports.array(BenchmarkBlindedReviewPacketSchema).min(1)
+}).superRefine((artifact, context) => {
+  const ids = artifact.packets.map(({ opaqueId }) => opaqueId);
+  if (new Set(ids).size !== ids.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["packets"],
+      message: "Blinded benchmark packet IDs must be unique"
+    });
+  }
+  if (ids.some((id, index) => index > 0 && id < ids[index - 1])) {
+    context.addIssue({
+      code: "custom",
+      path: ["packets"],
+      message: "Blinded benchmark packets must be sorted by opaque ID"
+    });
+  }
+});
+var BenchmarkDefectSchema = external_exports.strictObject({
+  category: BenchmarkDefectCategorySchema,
+  severity: BenchmarkDefectSeveritySchema,
+  summary: external_exports.string().trim().min(1).max(4096)
+});
+var BenchmarkTrialReviewLabelSchema = external_exports.strictObject({
+  opaqueId: BenchmarkReviewOpaqueIdSchema,
+  packetDigest: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  reviewed: external_exports.literal(true),
+  reviewerId: external_exports.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
+  verdict: external_exports.enum(["no_defect", "defect"]),
+  defects: external_exports.array(BenchmarkDefectSchema)
+}).superRefine((label, context) => {
+  if (label.verdict === "no_defect" && label.defects.length > 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["defects"],
+      message: "A no-defect review label cannot contain defects"
+    });
+  }
+  if (label.verdict === "defect" && label.defects.length === 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["defects"],
+      message: "A defect review label must contain at least one defect"
+    });
+  }
+  const defectKeys = label.defects.map(
+    ({ category, severity, summary }) => `${category}\0${severity}\0${summary}`
+  );
+  if (new Set(defectKeys).size !== defectKeys.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["defects"],
+      message: "A review label cannot repeat the same defect"
+    });
+  }
+});
+var BenchmarkReviewLabelsSchema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(1),
+  reviewPolicy: external_exports.literal("opaque_blinded_review_v1"),
+  taxonomyVersion: external_exports.literal(1),
+  rawReportSha256: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  blindingKeyDigest: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  blindedReviewDigest: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  labels: external_exports.array(BenchmarkTrialReviewLabelSchema).min(1)
+}).superRefine((artifact, context) => {
+  const ids = artifact.labels.map(({ opaqueId }) => opaqueId);
+  if (new Set(ids).size !== ids.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["labels"],
+      message: "A benchmark review artifact must contain one label per opaque ID"
+    });
+  }
+});
+function benchmarkBlindingKey(value) {
+  if (value.byteLength !== 32)
+    throw new Error("A benchmark blinding key must contain exactly 32 bytes");
+  return value;
+}
+function benchmarkBlindingKeyDigest(blindingKey) {
+  return createHash2("sha256").update("graphcraft-benchmark-blinding-key-v1\0", "utf8").update(benchmarkBlindingKey(blindingKey)).digest("hex");
+}
+function benchmarkReviewOpaqueId(rawReportSha256, trialId, blindingKey) {
+  const digest = external_exports.string().regex(/^[0-9a-f]{64}$/).parse(rawReportSha256);
+  const trial = external_exports.string().min(1).parse(trialId);
+  return BenchmarkReviewOpaqueIdSchema.parse(
+    `packet-${createHmac("sha256", benchmarkBlindingKey(blindingKey)).update(
+      canonicalJson({
+        namespace: "graphcraft-benchmark-review-packet-v1",
+        rawReportSha256: digest,
+        trialId: trial
+      }),
+      "utf8"
+    ).digest("hex").slice(0, 32)}`
+  );
+}
+
 // packages/core/src/capsule.ts
 var MAX_CONTEXT_CAPSULE_CHARACTERS = 24e3;
 function compactText(value, maximum) {
@@ -23061,7 +23231,7 @@ function abortedCapabilityProbeError(signal) {
 }
 async function runCapabilityProbe(executable, args, captureErrorOutput = false, signal) {
   if (signal?.aborted) throw abortedCapabilityProbeError(signal);
-  return await new Promise((resolve18, reject) => {
+  return await new Promise((resolve19, reject) => {
     const child = spawn2(executable, args, { stdio: ["ignore", "pipe", "pipe"] });
     const output = new BoundedTextCapture(ADAPTER_STDERR_LIMIT_BYTES);
     const probeAbort = new AbortController();
@@ -23096,7 +23266,7 @@ async function runCapabilityProbe(executable, args, captureErrorOutput = false, 
         );
         return;
       }
-      resolve18(result);
+      resolve19(result);
     };
     const scheduleSettlement = () => {
       if (settled || settlement) return;
@@ -23209,7 +23379,7 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve18) => child.once("close", (code, closeSignal) => resolve18({ code, signal: closeSignal }))
+      (resolve19) => child.once("close", (code, closeSignal) => resolve19({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderPlannerPrompt(request));
@@ -23274,7 +23444,7 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve18) => child.once("close", (code, closeSignal) => resolve18({ code, signal: closeSignal }))
+      (resolve19) => child.once("close", (code, closeSignal) => resolve19({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     child.stdin.end(renderSemanticVerifierPrompt(request.context, request.authorityBoundary));
@@ -23340,7 +23510,7 @@ var CodexAdapter = class {
       stdio: ["pipe", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve18) => child.once("close", (code, closeSignal) => resolve18({ code, signal: closeSignal }))
+      (resolve19) => child.once("close", (code, closeSignal) => resolve19({ code, signal: closeSignal }))
     );
     const protocolAbort = new AbortController();
     const executionSignal2 = AbortSignal.any([signal, protocolAbort.signal]);
@@ -23717,7 +23887,7 @@ function abortedCapabilityProbeError2(signal) {
 }
 async function runCapabilityProbe2(executable, args, signal) {
   if (signal?.aborted) throw abortedCapabilityProbeError2(signal);
-  return await new Promise((resolve18, reject) => {
+  return await new Promise((resolve19, reject) => {
     const child = spawn3(executable, args, { stdio: ["ignore", "pipe", "ignore"] });
     const output = new BoundedTextCapture2(ADAPTER_STDERR_LIMIT_BYTES2);
     const probeAbort = new AbortController();
@@ -23752,7 +23922,7 @@ async function runCapabilityProbe2(executable, args, signal) {
         );
         return;
       }
-      resolve18(result);
+      resolve19(result);
     };
     const scheduleSettlement = () => {
       if (settled || settlement) return;
@@ -23861,7 +24031,7 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve18) => child.once("close", (code, closeSignal) => resolve18({ code, signal: closeSignal }))
+      (resolve19) => child.once("close", (code, closeSignal) => resolve19({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     let protocolExceededLimit = false;
@@ -23916,7 +24086,7 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve18) => child.once("close", (code, closeSignal) => resolve18({ code, signal: closeSignal }))
+      (resolve19) => child.once("close", (code, closeSignal) => resolve19({ code, signal: closeSignal }))
     );
     const terminationController = new ChildTerminationController(child, signal);
     let protocolExceededLimit = false;
@@ -23972,7 +24142,7 @@ var ClaudeAdapter = class {
       stdio: ["ignore", "pipe", "pipe"]
     });
     const exitPromise = new Promise(
-      (resolve18) => child.once("close", (code, closeSignal) => resolve18({ code, signal: closeSignal }))
+      (resolve19) => child.once("close", (code, closeSignal) => resolve19({ code, signal: closeSignal }))
     );
     const protocolAbort = new AbortController();
     const executionSignal2 = AbortSignal.any([signal, protocolAbort.signal]);
@@ -24335,7 +24505,7 @@ async function runCommand(options, args) {
     untrustedCwd: options.cwd
   });
   const commandArgs = [...options.commandArgs ?? [], ...args];
-  return await new Promise((resolve18, reject) => {
+  return await new Promise((resolve19, reject) => {
     const child = import_cross_spawn3.default.spawn(command, commandArgs, {
       cwd: options.cwd,
       env: options.env ?? process.env,
@@ -24375,7 +24545,7 @@ async function runCommand(options, args) {
         return;
       }
       const code = exitCode ?? 1;
-      if (code === 0) resolve18({ stdout: stdout2, stderr });
+      if (code === 0) resolve19({ stdout: stdout2, stderr });
       else
         reject(
           new GitHubCommandError(
@@ -25862,7 +26032,7 @@ async function replacePathAtomic(temporaryPath, path2) {
     } catch (error51) {
       if (!retryable.has(error51.code ?? "") || Date.now() >= deadline)
         throw error51;
-      await new Promise((resolve18) => setTimeout(resolve18, delayMs));
+      await new Promise((resolve19) => setTimeout(resolve19, delayMs));
       delayMs = Math.min(100, delayMs * 2);
     }
   }
@@ -27112,7 +27282,7 @@ async function amendRunGraph(store, input, actor = "runtime") {
 }
 
 // packages/runtime/src/artifact-policy.ts
-import { createHash as createHash2, randomUUID as randomUUID4 } from "node:crypto";
+import { createHash as createHash3, randomUUID as randomUUID4 } from "node:crypto";
 import { constants as fsConstants3 } from "node:fs";
 import { lstat as lstat4, open as open4, readdir as readdir2, rmdir, unlink as unlink2 } from "node:fs/promises";
 import { basename as basename2, dirname as dirname5, isAbsolute as isAbsolute4, join as join5, posix, relative as relative3, resolve as resolve4, win32 as win323 } from "node:path";
@@ -28112,7 +28282,7 @@ var RunArtifactStore = class {
           throw new Error("Artifact preview size does not match its durable inventory");
         const preview = Buffer.alloc(Math.min(before.size, maxBytes));
         const chunkBuffer = Buffer.alloc(Math.min(64 * 1024, Math.max(1, before.size)));
-        const digest = createHash2("sha256").update('{"contents":"');
+        const digest = createHash3("sha256").update('{"contents":"');
         let carry = Buffer.alloc(0);
         let position = 0;
         while (position < before.size) {
@@ -28707,7 +28877,7 @@ import { dirname as dirname7, resolve as resolve6, sep as sep4 } from "node:path
 
 // packages/probes/src/process.ts
 var import_cross_spawn4 = __toESM(require_cross_spawn(), 1);
-import { createHash as createHash3 } from "node:crypto";
+import { createHash as createHash4 } from "node:crypto";
 import { constants as osConstants } from "node:os";
 var MIB4 = 1024 * 1024;
 var DEFAULT_PROCESS_OUTPUT_BYTES_PER_STREAM = 8 * MIB4;
@@ -28746,7 +28916,7 @@ var BoundedStreamCapture = class {
   }
   limitBytes;
   chunks = [];
-  digest = createHash3("sha256");
+  digest = createHash4("sha256");
   observedBytes = 0;
   retainedBytes = 0;
   append(chunk) {
@@ -29076,7 +29246,7 @@ function validManagedSettlement(value, lifecycle) {
 }
 async function runManagedProcess(executable, args, environment, options, started, timeoutMs, maxOutputBytesPerStream, outputOverflow) {
   const lifecycle = options.lifecycle;
-  return await new Promise((resolve18, reject) => {
+  return await new Promise((resolve19, reject) => {
     const broker = import_cross_spawn4.default.spawn(
       process.execPath,
       ["-e", MANAGED_PROCESS_BROKER_SOURCE, lifecycle.executionId, lifecycle.ownerToken],
@@ -29184,7 +29354,7 @@ async function runManagedProcess(executable, args, environment, options, started
         reject(new ProcessOutputLimitError(overflowStream, captureMetadata));
         return;
       }
-      resolve18({
+      resolve19({
         exitCode: timedOut ? 124 : targetSettlement.exitCode ?? 1,
         stdout: stdout2.text,
         stderr: stderr.text,
@@ -29279,7 +29449,7 @@ async function runProcess(command, args, options) {
       maxOutputBytesPerStream,
       outputOverflow
     );
-  return await new Promise((resolve18, reject) => {
+  return await new Promise((resolve19, reject) => {
     const child = import_cross_spawn4.default.spawn(executable, args, {
       cwd: options.cwd,
       env: environment,
@@ -29375,7 +29545,7 @@ async function runProcess(command, args, options) {
         reject(new ProcessOutputLimitError(overflowStream, captureMetadata));
         return;
       }
-      resolve18({
+      resolve19({
         exitCode: timedOut ? 124 : code ?? 1,
         stdout: stdout2.text,
         stderr: stderr.text,
@@ -30094,6 +30264,119 @@ async function discoverProbePlan(repositoryPath, task, baseSha, options = {}) {
   );
 }
 
+// packages/runtime/src/benchmark-validation.ts
+var BENCHMARK_REPORT_LIMITATIONS = [
+  "Stable efficiency claims require at least three jointly accepted reconciled baseline/Graphcraft pairs per task and host.",
+  "Each trial retains a bounded redacted patch and transcript packet; blinded reviewer assignment and defect labels remain external.",
+  "Every model call has a recorded timeout; an interrupted in-flight attempt is retained as unsuccessful evidence instead of being silently retried.",
+  "An unconfirmed model-call settlement blocks all later trials and resume until the child is reconciled outside this harness."
+];
+function benchmarkPermissionPolicy(host) {
+  return host === "codex" ? "codex_workspace_write_shell_external_not_graphcraft_enforced" : "claude_accept_edits_bash_external_not_graphcraft_enforced";
+}
+function expectedScorerFiles(task) {
+  return [...new Set(task.checks.map(({ scorerPath }) => scorerPath))].sort().map((path2) => ({
+    path: path2,
+    kind: "regular_file",
+    digest: contentHash(task.initialFiles[path2])
+  }));
+}
+function expectedBenchmarkScorerDigest(task) {
+  return contentHash({
+    checks: task.checks,
+    acceptance: task.acceptance,
+    files: expectedScorerFiles(task)
+  });
+}
+function expectedAcceptancePaths(task) {
+  return [
+    ...task.checks.map((_, index) => `$check:${index + 1}`),
+    ...task.acceptance.map(
+      (assertion) => assertion.kind === "summary_contains" ? "$summary" : assertion.path
+    )
+  ];
+}
+function validTokenEvidence(result) {
+  const known = (value) => value === "reported" || value === "derived";
+  const reconciled = known(result.usage.availability.total);
+  if (result.usageReconciled !== reconciled) return false;
+  if (result.usage.availability.total === "derived") {
+    if (!known(result.usage.availability.input) || !known(result.usage.availability.output))
+      return false;
+    if (result.usage.total !== result.usage.input + result.usage.output) return false;
+  }
+  if (result.usage.availability.uncachedInput === "derived" && known(result.usage.availability.input) && known(result.usage.availability.cachedInput) && result.usage.input !== result.usage.cachedInput + result.usage.uncachedInput)
+    return false;
+  return true;
+}
+function exactSchedule(report, suite, expected) {
+  const hosts = [...new Set(report.schedule.map(({ host }) => host))].sort();
+  const defaults = createBenchmarkSchedule({ suite, hosts, seed: report.seed });
+  let derived;
+  if (contentHash(defaults) === contentHash(report.schedule)) derived = defaults;
+  if (derived === void 0) {
+    const counts = /* @__PURE__ */ new Map();
+    for (const trial of report.schedule) {
+      const key = `${trial.taskId}\0${trial.host}\0${trial.mode}`;
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    const repetitions = [...new Set(counts.values())];
+    if (repetitions.length === 1) {
+      const overridden = createBenchmarkSchedule({
+        suite,
+        hosts,
+        seed: report.seed,
+        repetitions: repetitions[0]
+      });
+      if (contentHash(overridden) === contentHash(report.schedule)) derived = overridden;
+    }
+  }
+  if (derived === void 0)
+    throw new Error("The benchmark report schedule does not exactly cover its declared suite");
+  if (expected && contentHash(expected) !== contentHash(derived))
+    throw new Error("The expected benchmark schedule does not match the declared suite");
+  return expected ? [...expected] : derived;
+}
+function definedPolicyHosts(value) {
+  return Object.entries(value).filter(([, policy]) => policy !== void 0).map(([host]) => host).sort();
+}
+function assertBenchmarkReportEvidence(input) {
+  const report = BenchmarkReportV3Schema.parse(input.report);
+  const suite = BenchmarkSuiteSchema.parse(input.suite);
+  if (report.suite.id !== suite.id || report.suite.version !== suite.version || report.suite.digest !== contentHash(suite)) {
+    throw new Error("The benchmark report does not match its declared suite identity");
+  }
+  const schedule = exactSchedule(report, suite, input.expectedSchedule);
+  if (contentHash(schedule) !== contentHash(report.schedule))
+    throw new Error("The benchmark report schedule does not match the expected execution");
+  const hosts = [...new Set(schedule.map(({ host }) => host))].sort();
+  if (contentHash(definedPolicyHosts(report.modelPolicy)) !== contentHash(hosts) || contentHash(definedPolicyHosts(report.permissionPolicy)) !== contentHash(hosts)) {
+    throw new Error("The benchmark report host policies do not match its schedule");
+  }
+  for (const host of hosts) {
+    if (report.permissionPolicy[host] !== benchmarkPermissionPolicy(host))
+      throw new Error("The benchmark report permission policy does not match its host");
+  }
+  if (contentHash(report.limitations) !== contentHash(BENCHMARK_REPORT_LIMITATIONS))
+    throw new Error("The benchmark report limitations do not match this harness");
+  const scheduleById = new Map(schedule.map((trial) => [trial.trialId, trial]));
+  const taskById = new Map(suite.tasks.map((task) => [task.id, task]));
+  for (const result of report.results) {
+    const scheduled = scheduleById.get(result.trial.trialId);
+    const task = taskById.get(result.trial.taskId);
+    if (!scheduled || contentHash(scheduled) !== contentHash(result.trial) || !task)
+      throw new Error("The benchmark report contains a result outside its exact suite schedule");
+    const expectedScorerDigest = expectedBenchmarkScorerDigest(task);
+    const scorerVerified = result.acceptanceScorerDigest === result.observedScorerDigest;
+    const reviewComplete = result.reviewPacket !== void 0 && result.reviewPacket.captureFailures.length === 0 && !result.reviewPacket.patch.truncated && !result.reviewPacket.transcript.truncated;
+    const accepted = result.executionStatus === "completed" && scorerVerified && result.acceptance.every(({ passed }) => passed) && reviewComplete;
+    if (result.modelPolicy !== report.modelPolicy[result.trial.host] || result.effortPolicy !== report.effortPolicy || result.permissionPolicy !== report.permissionPolicy[result.trial.host] || result.permissionPolicy !== benchmarkPermissionPolicy(result.trial.host) || result.repositoryDigest !== contentHash(task.initialFiles) || result.acceptanceScorerDigest !== expectedScorerDigest || result.scorerVerified !== scorerVerified || !validTokenEvidence(result) || contentHash(result.acceptance.map(({ path: path2 }) => path2)) !== contentHash(expectedAcceptancePaths(task)) || result.accepted !== accepted) {
+      throw new Error("The benchmark report contains mismatched trial controls or evidence");
+    }
+  }
+  return report;
+}
+
 // packages/runtime/src/runner.ts
 import { randomUUID as randomUUID9 } from "node:crypto";
 import { join as join12 } from "node:path";
@@ -30255,7 +30538,7 @@ async function requestRunControl(store, action, reason = action === "pause" ? "P
       if (!(error51 instanceof Error) || error51.message !== "Graphcraft run is already active")
         throw error51;
     }
-    await new Promise((resolve18) => setTimeout(resolve18, 50));
+    await new Promise((resolve19) => setTimeout(resolve19, 50));
   }
   throw new Error(
     `The active Graphcraft process did not acknowledge ${action} within ${waitMs}ms; the durable request remains pending`
@@ -31833,7 +32116,7 @@ import { join as join10, relative as relative6, resolve as resolve9 } from "node
 import { TextDecoder as TextDecoder2 } from "node:util";
 
 // packages/runtime/src/migration.ts
-import { createHash as createHash4 } from "node:crypto";
+import { createHash as createHash5 } from "node:crypto";
 import { constants as fsConstants4 } from "node:fs";
 import { lstat as lstat7, mkdir as mkdir4, open as open6, readdir as readdir3, rename as rename2, rm as rm3 } from "node:fs/promises";
 import { join as join9, relative as relative5, resolve as resolve8 } from "node:path";
@@ -32072,7 +32355,7 @@ async function acquireMigrationLock(input) {
     } catch (error51) {
       if (!isActiveLockError(error51)) throw error51;
     }
-    await new Promise((resolve18) => setTimeout(resolve18, 25));
+    await new Promise((resolve19) => setTimeout(resolve19, 25));
   }
 }
 async function acquireActiveAwareLock(path2, lease) {
@@ -32214,7 +32497,7 @@ function legacyTreeDigest(entries, ignoredRootName) {
   ).map(
     (entry) => entry.kind === "directory" ? `directory:${entry.relativePath}` : `file:${entry.relativePath}:${entry.bytes}:${entry.hash}`
   );
-  return createHash4("sha256").update(JSON.stringify(values)).digest("hex");
+  return createHash5("sha256").update(JSON.stringify(values)).digest("hex");
 }
 async function scanLegacyTreeMetadata(root, options, lease) {
   const rootMetadata = await migrationStep(lease, async () => await lstat7(root, { bigint: true }));
@@ -32362,7 +32645,7 @@ async function readLegacySnapshotFile(expected, options, lease) {
     lease,
     async () => await open6(expected.path, fsConstants4.O_RDONLY | noFollow)
   );
-  const hash2 = createHash4("sha256");
+  const hash2 = createHash5("sha256");
   const redactionChunks = options.scanRedaction ? [] : void 0;
   const buffer = Buffer.alloc(Math.min(MIGRATION_COPY_CHUNK_BYTES, Math.max(1, expected.bytes)));
   let position = 0;
@@ -32637,7 +32920,7 @@ async function copyLegacySnapshotFile(source, destinationPath, lease, checkpoint
         384
       )
     );
-    const hash2 = createHash4("sha256");
+    const hash2 = createHash5("sha256");
     const buffer = Buffer.alloc(Math.min(MIGRATION_COPY_CHUNK_BYTES, Math.max(1, source.bytes)));
     let position = 0;
     while (position < source.bytes) {
@@ -33744,7 +34027,7 @@ async function resolveRunId(repositoryRoot, reference) {
 }
 
 // packages/runtime/src/scope.ts
-import { createHash as createHash5 } from "node:crypto";
+import { createHash as createHash6 } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { lstat as lstat9, readlink as readlink3 } from "node:fs/promises";
 import { isAbsolute as isAbsolute7, matchesGlob, relative as relative7, resolve as resolve10, sep as sep5 } from "node:path";
@@ -33774,7 +34057,7 @@ function confinedPath(repositoryPath, path2) {
 }
 async function fileDigest(path2, signal) {
   signal?.throwIfAborted();
-  const hash2 = createHash5("sha256");
+  const hash2 = createHash6("sha256");
   for await (const chunk of createReadStream(path2, signal ? { signal } : void 0)) {
     signal?.throwIfAborted();
     hash2.update(chunk);
@@ -34738,7 +35021,7 @@ function journalPath(graphcraftRoot2, runId, executionId) {
 async function withProbeProcessRunMutation(runRoot, action) {
   const previous = probeProcessRunMutationTails.get(runRoot) ?? Promise.resolve();
   let release;
-  const gate = new Promise((resolve18) => release = resolve18);
+  const gate = new Promise((resolve19) => release = resolve19);
   const tail = previous.then(() => gate);
   probeProcessRunMutationTails.set(runRoot, tail);
   await previous;
@@ -34951,7 +35234,7 @@ async function waitForProbeProcessSettlement(input, timeoutMs = PROBE_PROCESS_SE
     const inspected = await inspectProbeProcessJournal(input);
     if (!inspected || inspected.settlement) return inspected;
     if (Date.now() >= deadline) return inspected;
-    await new Promise((resolve18) => setTimeout(resolve18, 25));
+    await new Promise((resolve19) => setTimeout(resolve19, 25));
   }
 }
 async function closeProbeProcessLease(lease) {
@@ -34969,7 +35252,7 @@ async function retryWindowsRemoval(action, ignoredErrors) {
       if (ignoredErrors.has(code)) return;
       if (process.platform !== "win32" || !WINDOWS_TRANSIENT_REMOVAL_ERRORS.has(code) || Date.now() >= deadline)
         throw error51;
-      await new Promise((resolve18) => setTimeout(resolve18, delayMs));
+      await new Promise((resolve19) => setTimeout(resolve19, delayMs));
       delayMs = Math.min(100, delayMs * 2);
     }
   }
@@ -40647,12 +40930,7 @@ var DEFAULT_BENCHMARK_MODEL_CALL_TIMEOUT_MS = 15 * 6e4;
 var BENCHMARK_MODEL_CALL_SETTLEMENT_GRACE_MS = 5e3;
 var UNCONFIRMED_CALL_SETTLEMENT_LIMITATION = "model_call_settlement:unconfirmed";
 var PROVISIONAL_ATTEMPT_LIMITATION = "attempt_checkpoint:provisional";
-var reportLimitations = [
-  "Stable efficiency claims require at least three jointly accepted reconciled baseline/Graphcraft pairs per task and host.",
-  "Each trial retains a bounded redacted patch and transcript packet; blinded reviewer assignment and defect labels remain external.",
-  "Every model call has a recorded timeout; an interrupted in-flight attempt is retained as unsuccessful evidence instead of being silently retried.",
-  "An unconfirmed model-call settlement blocks all later trials and resume until the child is reconciled outside this harness."
-];
+var BENCHMARK_SUITE_MAX_BYTES = 16 * 1024 * 1024;
 var BenchmarkCallInterruptedError = class extends Error {
   constructor(interruption) {
     super(interruption.reason);
@@ -40845,9 +41123,6 @@ function persistedCapabilityAdmissionError(events) {
     if (parsed.success && !parsed.data.ready) return new HostCapabilityAdmissionError(parsed.data);
   }
   return void 0;
-}
-function benchmarkPermissionPolicy(host) {
-  return host === "codex" ? "codex_workspace_write_shell_external_not_graphcraft_enforced" : "claude_accept_edits_bash_external_not_graphcraft_enforced";
 }
 function safeFixturePath(root, path2) {
   if (isAbsolute10(path2) || path2.split(/[\\/]/).includes(".."))
@@ -41120,7 +41395,8 @@ async function inspectBenchmarkSourceIdentity(repositoryPath) {
   });
 }
 async function loadBenchmarkSuite(path2) {
-  return BenchmarkSuiteSchema.parse(JSON.parse(await readFile3(resolve13(path2), "utf8")));
+  const source = await readRegularFileBounded(resolve13(path2), BENCHMARK_SUITE_MAX_BYTES);
+  return BenchmarkSuiteSchema.parse(JSON.parse(source.toString("utf8")));
 }
 async function materializeTask(task) {
   const repository = await realpath4(
@@ -41198,7 +41474,7 @@ async function removeBenchmarkFixture(repository) {
   if (failures.length > 0)
     throw new AggregateError(failures, `Unable to remove benchmark fixture ${repository}`);
 }
-function expectedScorerFiles(task) {
+function expectedScorerFiles2(task) {
   return [...new Set(task.checks.map(({ scorerPath }) => scorerPath))].sort().map((path2) => ({
     path: path2,
     kind: "regular_file",
@@ -41231,7 +41507,7 @@ function scorerDigest(task, files) {
 }
 async function scoreAcceptance(task, repository, summaryEvidence = "") {
   const results = [];
-  const expectedScorerDigest = scorerDigest(task, expectedScorerFiles(task));
+  const expectedScorerDigest = scorerDigest(task, expectedScorerFiles2(task));
   const observedScorerDigest = scorerDigest(task, await observedScorerFiles(task, repository));
   const scorerVerified = expectedScorerDigest === observedScorerDigest;
   for (const [index, check2] of task.checks.entries()) {
@@ -41420,8 +41696,8 @@ function provisionalTrialResult(input) {
     modelPolicy: input.policy.model,
     effortPolicy: input.policy.effort,
     permissionPolicy: benchmarkPermissionPolicy(input.trial.host),
-    acceptanceScorerDigest: scorerDigest(input.task, expectedScorerFiles(input.task)),
-    observedScorerDigest: scorerDigest(input.task, expectedScorerFiles(input.task)),
+    acceptanceScorerDigest: scorerDigest(input.task, expectedScorerFiles2(input.task)),
+    observedScorerDigest: scorerDigest(input.task, expectedScorerFiles2(input.task)),
     scorerVerified: true,
     repositoryDigest: input.repositoryDigest,
     baseSha: input.baseSha,
@@ -41886,21 +42162,8 @@ async function runBenchmark(input) {
       if (error51 instanceof Error && !error51.message.includes("ENOENT")) throw error51;
     }
   }
-  const scheduledIds = new Set(schedule.map(({ trialId }) => trialId));
-  if (results.some(({ trial }) => !scheduledIds.has(trial.trialId)))
-    throw new Error("The existing benchmark report contains a trial outside the current schedule");
-  if (new Set(results.map(({ trial }) => trial.trialId)).size !== results.length)
-    throw new Error("The existing benchmark report contains duplicated trial results");
-  if (results.some(
-    ({ trial, modelPolicy: resultModel, effortPolicy: resultEffort, ...result }) => JSON.stringify(trial) !== JSON.stringify(schedule.find(({ trialId }) => trialId === trial.trialId)) || resultModel !== policies[trial.host].model || resultEffort !== policies[trial.host].effort || result.permissionPolicy !== permissionPolicy[trial.host] || result.repositoryDigest !== contentHash(byTask.get(trial.taskId).initialFiles) || result.acceptanceScorerDigest !== scorerDigest(byTask.get(trial.taskId), expectedScorerFiles(byTask.get(trial.taskId))) || result.scorerVerified !== (result.acceptanceScorerDigest === result.observedScorerDigest) || result.acceptance.length !== byTask.get(trial.taskId).checks.length + byTask.get(trial.taskId).acceptance.length || result.accepted !== (result.executionStatus === "completed" && result.scorerVerified && result.acceptance.every(({ passed }) => passed) && result.reviewPacket?.captureFailures.length === 0)
-  ))
-    throw new Error("The existing benchmark report contains mismatched trial controls");
-  if (existingReport?.status === "complete" && results.length !== schedule.length)
-    throw new Error("The complete benchmark report does not cover the exact current schedule");
-  if (existingReport && contentHash(existingReport.summary) !== contentHash(summarizeBenchmark(results, schedule)))
-    throw new Error("The existing benchmark report summary does not match its trial evidence");
-  if (existingReport && contentHash(existingReport.limitations) !== contentHash(reportLimitations))
-    throw new Error("The existing benchmark report limitations do not match this harness");
+  if (existingReport)
+    assertBenchmarkReportEvidence({ report: existingReport, suite, expectedSchedule: schedule });
   const recoveredProvisionalAttempts = results.some(
     ({ attemptCheckpoint }) => attemptCheckpoint === "provisional"
   );
@@ -41937,12 +42200,13 @@ async function runBenchmark(input) {
         modelCallTimeoutMs,
         ...hostPreflightCheckpoint ? { hostPreflightCheckpoint } : {},
         environment,
-        limitations: reportLimitations,
+        limitations: BENCHMARK_REPORT_LIMITATIONS,
         schedule,
         results,
         summary: summarizeBenchmark(results, schedule)
       })
     );
+    assertBenchmarkReportEvidence({ report: report2, suite, expectedSchedule: schedule });
     await writeJsonAtomic(outputPath, report2);
     return report2;
   };
@@ -42126,14 +42390,1040 @@ async function runBenchmark(input) {
   return { outputPath, report };
 }
 
+// packages/runtime/src/benchmark-publication.ts
+import { createHash as createHash7, randomUUID as randomUUID11 } from "node:crypto";
+import { link, lstat as lstat12, mkdir as mkdir6, open as open9, realpath as realpath5, rm as rm5, unlink as unlink5 } from "node:fs/promises";
+import { basename as basename5, dirname as dirname12, join as join14, resolve as resolve14 } from "node:path";
+var REVIEW_POLICY = "bounded_redacted_patch_and_transcript_v1";
+var BLINDED_REVIEW_POLICY = "opaque_blinded_review_v1";
+var WILSON_Z_95 = 1.959963984540054;
+var BENCHMARK_PUBLICATION_REPORT_MAX_BYTES = 64 * 1024 * 1024;
+var BENCHMARK_PUBLICATION_LABELS_MAX_BYTES = 16 * 1024 * 1024;
+var BENCHMARK_BLINDING_KEY_STDIN_MAX_BYTES = 66;
+var PUBLICATION_SECRET_KEY = /(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|passwd|credential)/iu;
+var MAX_PUBLICATION_REDACTION_DEPTH = 64;
+function publicationRedactString(value) {
+  return redactString(value, []);
+}
+function publicationRedactValue(value, key = "", depth = 0) {
+  if (depth > MAX_PUBLICATION_REDACTION_DEPTH)
+    throw new Error("Benchmark publication value exceeds the safe redaction depth");
+  if (PUBLICATION_SECRET_KEY.test(key)) return "[REDACTED]";
+  if (typeof value === "string") return publicationRedactString(value);
+  if (Array.isArray(value))
+    return value.map((entry) => publicationRedactValue(entry, "", depth + 1));
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([name, entry]) => [
+      name,
+      publicationRedactValue(entry, name, depth + 1)
+    ])
+  );
+}
+function rawSha256(value) {
+  return createHash7("sha256").update(value).digest("hex");
+}
+function compareText(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+function parseJson(path2, source) {
+  try {
+    return JSON.parse(source);
+  } catch {
+    throw new Error(`Benchmark artifact is not valid JSON: ${path2}`);
+  }
+}
+async function loadBenchmarkReportForPublication(path2) {
+  const absolute = resolve14(path2);
+  const source = await readPrivateFileBounded(absolute, BENCHMARK_PUBLICATION_REPORT_MAX_BYTES);
+  const report = BenchmarkReportV3Schema.parse(parseJson(absolute, source.toString("utf8")));
+  return { path: absolute, rawReportSha256: rawSha256(source), report };
+}
+async function loadBenchmarkReviewLabelsArtifact(path2) {
+  const absolute = resolve14(path2);
+  const source = await readPrivateFileBounded(absolute, BENCHMARK_PUBLICATION_LABELS_MAX_BYTES);
+  return {
+    path: absolute,
+    labelsSha256: rawSha256(source),
+    labels: BenchmarkReviewLabelsSchema.parse(parseJson(absolute, source.toString("utf8")))
+  };
+}
+function hexNibble(value) {
+  if (value >= 48 && value <= 57) return value - 48;
+  if (value >= 97 && value <= 102) return value - 97 + 10;
+  return void 0;
+}
+function parseBenchmarkBlindingKeyInput(value) {
+  const encoded = Buffer.from(value);
+  try {
+    const payloadLength = encoded.length === 64 ? 64 : encoded.length === 65 && encoded[64] === 10 ? 64 : encoded.length === 66 && encoded[64] === 13 && encoded[65] === 10 ? 64 : 0;
+    if (payloadLength !== 64)
+      throw new Error(
+        "Benchmark blinding key stdin must contain exactly 64 lowercase hexadecimal characters with an optional final LF or CRLF"
+      );
+    const key = Buffer.alloc(32);
+    try {
+      for (let index = 0; index < payloadLength; index += 2) {
+        const high = hexNibble(encoded[index]);
+        const low = hexNibble(encoded[index + 1]);
+        if (high === void 0 || low === void 0)
+          throw new Error(
+            "Benchmark blinding key stdin must contain exactly 64 lowercase hexadecimal characters with an optional final LF or CRLF"
+          );
+        key[index / 2] = high * 16 + low;
+      }
+      return key;
+    } catch (error51) {
+      key.fill(0);
+      throw error51;
+    }
+  } finally {
+    encoded.fill(0);
+  }
+}
+async function readBenchmarkBlindingKeyFromStdin(input) {
+  const encoded = Buffer.alloc(BENCHMARK_BLINDING_KEY_STDIN_MAX_BYTES);
+  let length = 0;
+  try {
+    for await (const chunk of input) {
+      const bytes = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+      try {
+        if (length + bytes.length > encoded.length)
+          throw new Error(
+            `Benchmark blinding key stdin exceeds ${BENCHMARK_BLINDING_KEY_STDIN_MAX_BYTES} bytes`
+          );
+        bytes.copy(encoded, length);
+        length += bytes.length;
+      } finally {
+        bytes.fill(0);
+      }
+    }
+    return parseBenchmarkBlindingKeyInput(encoded.subarray(0, length));
+  } finally {
+    encoded.fill(0);
+  }
+}
+function assertPublicationReady(report) {
+  if (report.status !== "complete")
+    throw new Error("Benchmark publication requires a complete schema-3 report");
+  if (report.reviewPolicy !== REVIEW_POLICY)
+    throw new Error("Benchmark publication requires bounded review evidence");
+  if (report.results.some(({ attemptCheckpoint }) => attemptCheckpoint !== "settled"))
+    throw new Error("Benchmark publication cannot include an unsettled trial");
+  if (report.results.some(({ reviewPacket }) => reviewPacket === void 0))
+    throw new Error("Every settled benchmark trial must retain a review packet");
+}
+function assertSuiteMatchesReport(suite, report) {
+  if (suite.id !== report.suite.id || suite.version !== report.suite.version || contentHash(suite) !== report.suite.digest)
+    throw new Error("The benchmark suite does not match the raw report identity");
+}
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+var IDENTITY_TOKEN_CHARACTER = /[A-Za-z0-9_.@-]/u;
+var IDENTITY_TOKEN_CLASS = "[A-Za-z0-9_.@-]";
+var MINIMUM_DISCOVERED_IDENTITY_LENGTH = 6;
+function normalizedMetadataKey(value) {
+  return value.replaceAll(/[^A-Za-z0-9]/gu, "").toLowerCase();
+}
+var IDENTITY_KEYS = /* @__PURE__ */ new Set([
+  "agent",
+  "agentid",
+  "host",
+  "hostname",
+  "hostsessionid",
+  "hostversion",
+  "invocationid",
+  "mode",
+  "model",
+  "modelid",
+  "modelname",
+  "modelpolicy",
+  "nodeid",
+  "order",
+  "permissionpolicy",
+  "provider",
+  "repetition",
+  "runid",
+  "seed",
+  "session",
+  "sessionid",
+  "source",
+  "tokenusage",
+  "tokens",
+  "trial",
+  "trialid",
+  "usage"
+]);
+function isIdentityKey(key) {
+  const normalized = normalizedMetadataKey(key);
+  return IDENTITY_KEYS.has(normalized) || normalized.endsWith("sessionid") || normalized.endsWith("invocationid") || normalized.endsWith("modelpolicy") || normalized.endsWith("tokenusage");
+}
+function collectStrings(value, output) {
+  if (typeof value === "string") {
+    if (value.length > 0) output.add(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) collectStrings(entry, output);
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  for (const entry of Object.values(value)) collectStrings(entry, output);
+}
+function collectIdentityStrings(value, output) {
+  if (Array.isArray(value)) {
+    for (const entry of value) collectIdentityStrings(entry, output);
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  for (const [key, entry] of Object.entries(value)) {
+    const normalized = normalizedMetadataKey(key);
+    if (["tokenusage", "tokens", "usage"].includes(normalized)) continue;
+    if (isIdentityKey(key)) collectStrings(entry, output);
+    else collectIdentityStrings(entry, output);
+  }
+}
+function transcriptIdentityStrings(text) {
+  const identities = /* @__PURE__ */ new Set();
+  for (const line2 of text.split("\n")) {
+    if (!line2.trim()) continue;
+    try {
+      collectIdentityStrings(JSON.parse(line2), identities);
+    } catch {
+    }
+  }
+  return identities;
+}
+function identityReplacements(result) {
+  const distinctive = (value) => value.length >= MINIMUM_DISCOVERED_IDENTITY_LENGTH;
+  const candidates = [
+    { value: result.trial.trialId, replacement: "[trial identity omitted]" },
+    { value: result.modelPolicy, replacement: "[model omitted]" },
+    { value: result.hostVersion, replacement: "[host version omitted]" },
+    { value: result.permissionPolicy, replacement: "[permission profile omitted]" },
+    { value: result.repositoryDigest, replacement: "[fixture identity omitted]" },
+    { value: result.baseSha, replacement: "[fixture identity omitted]" },
+    { value: result.acceptanceScorerDigest, replacement: "[scorer identity omitted]" },
+    { value: result.observedScorerDigest, replacement: "[scorer identity omitted]" },
+    {
+      value: result.trial.host,
+      replacement: "[host omitted]",
+      caseInsensitive: true
+    },
+    {
+      value: result.trial.mode,
+      replacement: "[execution mode omitted]",
+      caseInsensitive: true
+    },
+    {
+      value: "graphcraft",
+      replacement: "[execution mode omitted]",
+      caseInsensitive: true
+    },
+    {
+      value: "baseline",
+      replacement: "[execution mode omitted]",
+      caseInsensitive: true
+    },
+    { value: "codex", replacement: "[host omitted]", caseInsensitive: true },
+    { value: "claude", replacement: "[host omitted]", caseInsensitive: true }
+  ];
+  for (const identity of transcriptIdentityStrings(result.reviewPacket?.transcript.text ?? ""))
+    if (distinctive(identity))
+      candidates.push({ value: identity, replacement: "[identity metadata omitted]" });
+  const replacements = /* @__PURE__ */ new Map();
+  for (const candidate of candidates)
+    if (candidate.value.length > 0 && !replacements.has(candidate.value))
+      replacements.set(candidate.value, candidate);
+  return [...replacements.values()].sort((left, right) => right.value.length - left.value.length);
+}
+function blindText(value, replacements) {
+  let blinded = value;
+  for (const { value: identity, replacement, caseInsensitive } of replacements) {
+    const prefix = IDENTITY_TOKEN_CHARACTER.test(identity[0]) ? `(?<!${IDENTITY_TOKEN_CLASS})` : "";
+    const suffix = IDENTITY_TOKEN_CHARACTER.test(identity.at(-1)) ? `(?!${IDENTITY_TOKEN_CLASS})` : "";
+    const pattern = new RegExp(
+      `${prefix}${escapeRegExp(identity)}${suffix}`,
+      caseInsensitive ? "giu" : "gu"
+    );
+    blinded = blinded.replace(pattern, replacement);
+  }
+  return publicationRedactString(blinded);
+}
+function blindValue(value, replacements) {
+  if (typeof value === "string") return blindText(value, replacements);
+  if (Array.isArray(value)) return value.map((entry) => blindValue(entry, replacements));
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value).filter(([key]) => !isIdentityKey(key)).map(([key, entry]) => [key, blindValue(entry, replacements)])
+  );
+}
+var NEUTRAL_RESULT_STATUSES = /* @__PURE__ */ new Set(["completed", "blocked", "failed"]);
+var NEUTRAL_INTERRUPTION_CAUSES = /* @__PURE__ */ new Set([
+  "user_pause",
+  "user_stop",
+  "cancellation",
+  "host_crash",
+  "timeout",
+  "runtime_shutdown"
+]);
+var NEUTRAL_TERMINATION_OUTCOMES = /* @__PURE__ */ new Set(["graceful", "forced", "already_exited"]);
+function stringArray(value) {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+function neutralHostEvent(value, replacements) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return void 0;
+  const event = value;
+  if (event.type === "message" && typeof event.text === "string")
+    return { type: "message", text: blindText(event.text, replacements) };
+  if (event.type === "tool" && typeof event.name === "string" && typeof event.summary === "string")
+    return {
+      type: "tool",
+      name: "agent_tool",
+      summary: blindText(event.summary, replacements)
+    };
+  if (event.type === "result") {
+    if (event.result === null || typeof event.result !== "object" || Array.isArray(event.result))
+      return void 0;
+    const result = event.result;
+    if (typeof result.status !== "string" || !NEUTRAL_RESULT_STATUSES.has(result.status) || typeof result.summary !== "string" || !stringArray(result.evidence))
+      return void 0;
+    return {
+      type: "result",
+      status: result.status,
+      summary: blindText(result.summary, replacements),
+      evidence: result.evidence.map((entry) => blindText(entry, replacements))
+    };
+  }
+  if (event.type === "error" && typeof event.message === "string")
+    return {
+      type: "error",
+      reason: blindText(event.message, replacements),
+      ...typeof event.cause === "string" && NEUTRAL_INTERRUPTION_CAUSES.has(event.cause) ? { cause: event.cause } : {}
+    };
+  if (event.type === "terminated") {
+    if (event.termination === null || typeof event.termination !== "object" || Array.isArray(event.termination))
+      return void 0;
+    const termination = event.termination;
+    if (typeof termination.cause !== "string" || !NEUTRAL_INTERRUPTION_CAUSES.has(termination.cause) || typeof termination.outcome !== "string" || !NEUTRAL_TERMINATION_OUTCOMES.has(termination.outcome))
+      return void 0;
+    return {
+      type: "termination",
+      cause: termination.cause,
+      outcome: termination.outcome
+    };
+  }
+  return void 0;
+}
+function normalizedBlindedTranscript(text, replacements) {
+  const output = [
+    {
+      type: "evidence_notice",
+      message: "Host, model, mode, session, usage, and control-plane metadata were omitted for blinded review."
+    }
+  ];
+  for (const line2 of text.split("\n")) {
+    if (!line2.trim()) continue;
+    if (line2.trim() === "[GRAPHCRAFT REVIEW EVIDENCE MIDDLE OMITTED]") {
+      output.push({
+        type: "evidence_omission",
+        message: "The source transcript was truncated before blinded export."
+      });
+      continue;
+    }
+    let entry;
+    try {
+      entry = JSON.parse(line2);
+    } catch {
+      continue;
+    }
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const record2 = entry;
+    if (record2.source === "graphcraft_run_event") continue;
+    if (record2.source === "baseline_host_event" || record2.source === "graphcraft_host_event") {
+      const event = neutralHostEvent(record2.event, replacements);
+      if (event) output.push({ type: "agent_event", event });
+    }
+  }
+  return `${output.map((entry) => JSON.stringify(entry)).join("\n")}
+`;
+}
+function blindedPatch(text, replacements) {
+  return blindText(text, replacements);
+}
+function utf8Prefix3(value, maximumBytes) {
+  for (let end = Math.min(maximumBytes, value.length); end >= 0; end -= 1) {
+    try {
+      new TextDecoder("utf-8", { fatal: true }).decode(value.subarray(0, end));
+      return value.subarray(0, end);
+    } catch {
+    }
+  }
+  return Buffer.alloc(0);
+}
+function utf8Suffix2(value, maximumBytes) {
+  const start = Math.max(0, value.length - maximumBytes);
+  for (let offset = start; offset <= value.length; offset += 1) {
+    try {
+      new TextDecoder("utf-8", { fatal: true }).decode(value.subarray(offset));
+      return value.subarray(offset);
+    } catch {
+    }
+  }
+  return Buffer.alloc(0);
+}
+function blindedEvidence(evidence, replacements) {
+  const text = evidence.mediaType === "application/x-ndjson" ? normalizedBlindedTranscript(evidence.text, replacements) : blindedPatch(evidence.text, replacements);
+  const limit = evidence.mediaType === "text/x-diff" ? BENCHMARK_REVIEW_PATCH_LIMIT_BYTES : BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES;
+  const source = Buffer.from(text, "utf8");
+  const marker = Buffer.from("\n[BLINDED REVIEW EVIDENCE MIDDLE OMITTED]\n", "utf8");
+  let retained = source;
+  let locallyOmittedBytes = 0;
+  if (source.length > limit) {
+    const available = limit - marker.length;
+    const head = utf8Prefix3(source, Math.floor(available / 2));
+    const tail = utf8Suffix2(source, available - head.length);
+    locallyOmittedBytes = Math.max(0, source.length - head.length - tail.length);
+    retained = Buffer.concat([head, marker, tail]);
+  }
+  const retainedText = retained.toString("utf8");
+  const retainedBytes = retained.length;
+  const omittedBytes = evidence.omittedBytes + locallyOmittedBytes;
+  const observedBytes = retainedBytes + omittedBytes;
+  const truncated = omittedBytes > 0;
+  const blinded = {
+    mediaType: evidence.mediaType,
+    text: retainedText,
+    observedBytes,
+    retainedBytes,
+    omittedBytes,
+    truncated,
+    digest: contentHash({
+      mediaType: evidence.mediaType,
+      text: retainedText,
+      observedBytes,
+      omittedBytes,
+      truncated
+    })
+  };
+  return BenchmarkReviewPacketSchema.shape.patch.parse(blinded);
+}
+function blindedReviewPacket(reviewPacket, replacements) {
+  return BenchmarkReviewPacketSchema.parse({
+    schemaVersion: 1,
+    patch: blindedEvidence(reviewPacket.patch, replacements),
+    transcript: blindedEvidence(reviewPacket.transcript, replacements),
+    captureFailures: reviewPacket.captureFailures.map(
+      (failure) => blindedPatch(failure, replacements)
+    )
+  });
+}
+function createBlindedBenchmarkReview(input) {
+  const suite = BenchmarkSuiteSchema.parse(input.suite);
+  const report = assertBenchmarkReportEvidence({
+    report: BenchmarkReportV3Schema.parse(input.report),
+    suite
+  });
+  const rawReportSha256 = input.rawReportSha256.toLowerCase();
+  if (!/^[0-9a-f]{64}$/u.test(rawReportSha256))
+    throw new Error("The raw benchmark report SHA-256 digest is invalid");
+  const blindingKeyDigest = benchmarkBlindingKeyDigest(input.blindingKey);
+  assertPublicationReady(report);
+  assertSuiteMatchesReport(suite, report);
+  const byTask = new Map(suite.tasks.map((task) => [task.id, task]));
+  const packets = report.results.map((result) => {
+    const task = byTask.get(result.trial.taskId);
+    if (!task) throw new Error(`Missing suite task for result ${result.trial.taskId}`);
+    const replacements = identityReplacements(result);
+    return BenchmarkBlindedReviewPacketSchema.parse(
+      publicationRedactValue({
+        schemaVersion: 1,
+        opaqueId: benchmarkReviewOpaqueId(
+          rawReportSha256,
+          result.trial.trialId,
+          input.blindingKey
+        ),
+        task: {
+          family: task.family,
+          prompt: blindText(task.task, replacements),
+          checks: blindValue(task.checks, replacements),
+          acceptanceCriteria: blindValue(task.acceptance, replacements)
+        },
+        outcome: {
+          executionStatus: result.executionStatus,
+          accepted: result.accepted,
+          scorerVerified: result.scorerVerified,
+          acceptance: blindValue(result.acceptance, replacements),
+          ...result.interruption ? { interruption: blindValue(result.interruption, replacements) } : {},
+          limitations: blindValue(result.limitations, replacements),
+          failureTrace: blindValue(result.failureTrace, replacements)
+        },
+        reviewPacket: blindedReviewPacket(result.reviewPacket, replacements)
+      })
+    );
+  }).sort((left, right) => compareText(left.opaqueId, right.opaqueId));
+  return BenchmarkBlindedReviewExportSchema.parse({
+    schemaVersion: 1,
+    reviewPolicy: BLINDED_REVIEW_POLICY,
+    rawReportSha256,
+    blindingKeyDigest,
+    suite: report.suite,
+    taxonomy: {
+      version: 1,
+      categories: [...BENCHMARK_DEFECT_CATEGORIES],
+      severities: [...BENCHMARK_DEFECT_SEVERITIES]
+    },
+    packets
+  });
+}
+function validateBenchmarkReviewLabels(input) {
+  const blindedReview = createBlindedBenchmarkReview(input);
+  const labels = BenchmarkReviewLabelsSchema.parse(input.labels);
+  if (labels.rawReportSha256 !== blindedReview.rawReportSha256)
+    throw new Error("Review labels do not match the raw benchmark report digest");
+  if (labels.blindingKeyDigest !== blindedReview.blindingKeyDigest)
+    throw new Error("Review labels do not match the benchmark blinding-key digest");
+  if (labels.blindedReviewDigest !== contentHash(blindedReview))
+    throw new Error("Review labels do not match the blinded review artifact digest");
+  const packets = new Map(blindedReview.packets.map((packet2) => [packet2.opaqueId, packet2]));
+  const labelsByOpaqueId = new Map(labels.labels.map((label) => [label.opaqueId, label]));
+  if (labelsByOpaqueId.size !== packets.size || [...packets].some(([opaqueId]) => !labelsByOpaqueId.has(opaqueId)) || [...labelsByOpaqueId].some(([opaqueId]) => !packets.has(opaqueId)))
+    throw new Error("Review labels must cover every settled trial exactly once");
+  for (const [opaqueId, packet2] of packets) {
+    if (labelsByOpaqueId.get(opaqueId).packetDigest !== contentHash(packet2))
+      throw new Error(`Review label packet digest does not match ${opaqueId}`);
+  }
+  return { blindedReview, labels, labelsByOpaqueId };
+}
+function wilsonScoreInterval(successes, trials) {
+  if (!Number.isInteger(successes) || !Number.isInteger(trials) || trials < 0)
+    throw new Error("Wilson interval inputs must be non-negative integers");
+  if (successes < 0 || successes > trials)
+    throw new Error("Wilson interval successes must be within the trial count");
+  if (trials === 0) return null;
+  const proportion = successes / trials;
+  const zSquared = WILSON_Z_95 ** 2;
+  const denominator = 1 + zSquared / trials;
+  const center = (proportion + zSquared / (2 * trials)) / denominator;
+  const halfWidth = WILSON_Z_95 / denominator * Math.sqrt(proportion * (1 - proportion) / trials + zSquared / (4 * trials ** 2));
+  return {
+    method: "wilson_score",
+    confidenceLevel: 0.95,
+    lower: Math.max(0, center - halfWidth),
+    upper: Math.min(1, center + halfWidth)
+  };
+}
+function logAddExp(left, right) {
+  if (left === Number.NEGATIVE_INFINITY) return right;
+  if (right === Number.NEGATIVE_INFINITY) return left;
+  const maximum = Math.max(left, right);
+  return maximum + Math.log(Math.exp(left - maximum) + Math.exp(right - maximum));
+}
+function exactMedianInterval(values) {
+  if (values.some((value) => !Number.isFinite(value)))
+    throw new Error("Median interval values must be finite");
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((left, right) => left - right);
+  let rank = 1;
+  let achievedConfidenceLevel = 0;
+  let logProbability = -sorted.length * Math.LN2;
+  let logCumulativeProbability = Number.NEGATIVE_INFINITY;
+  for (let successes = 0; successes < Math.ceil(sorted.length / 2); successes += 1) {
+    logCumulativeProbability = logAddExp(logCumulativeProbability, logProbability);
+    const coverage = Math.max(0, Math.min(1, 1 - 2 * Math.exp(logCumulativeProbability)));
+    const candidate = successes + 1;
+    if (candidate === 1) achievedConfidenceLevel = coverage;
+    if (coverage < 0.95) break;
+    rank = candidate;
+    achievedConfidenceLevel = coverage;
+    logProbability += Math.log(sorted.length - successes) - Math.log(successes + 1);
+  }
+  return {
+    method: "exact_binomial_order_statistic",
+    requestedConfidenceLevel: 0.95,
+    achievedConfidenceLevel,
+    requestedConfidenceAchieved: achievedConfidenceLevel >= 0.95,
+    lower: sorted[rank - 1],
+    upper: sorted[sorted.length - rank],
+    sampleSize: sorted.length
+  };
+}
+function median2(values) {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[middle - 1] + sorted[middle]) / 2 : sorted[middle];
+}
+var MARKDOWN_PUNCTUATION = /* @__PURE__ */ new Set([
+  "!",
+  "#",
+  "&",
+  "(",
+  ")",
+  "*",
+  ".",
+  "/",
+  ":",
+  "<",
+  ">",
+  "@",
+  "[",
+  "\\",
+  "]",
+  "_",
+  "`",
+  "|",
+  "~"
+]);
+function markdown(value) {
+  const redacted = publicationRedactString(String(value));
+  return [...redacted].map((character) => MARKDOWN_PUNCTUATION.has(character) ? `\\${character}` : character).join("").replaceAll(/\r\n|\n|\r/gu, "<br>");
+}
+function percentage(value) {
+  return `${(value * 100).toFixed(1)}%`;
+}
+function percentagePoints(value) {
+  return value === null ? "n/a" : `${value.toFixed(1)} pp`;
+}
+function reduction(value) {
+  return value === null ? "n/a" : `${value.toFixed(1)}%`;
+}
+function duration3(value) {
+  return `${(value / 1e3).toFixed(2)} s`;
+}
+function intervalPercentage(interval) {
+  return interval ? `${percentage(interval.lower)}\u2013${percentage(interval.upper)}` : "n/a";
+}
+function intervalReduction(interval) {
+  return interval ? `${interval.lower.toFixed(1)}%\u2013${interval.upper.toFixed(1)}% (${percentage(
+    interval.achievedConfidenceLevel
+  )} exact coverage)` : "n/a";
+}
+var TOKEN_DIMENSIONS = [
+  "input",
+  "cachedInput",
+  "uncachedInput",
+  "output",
+  "reasoning",
+  "total"
+];
+function tokenDimension(results, dimension) {
+  const reconciled = results.filter(({ usageReconciled }) => usageReconciled);
+  if (reconciled.length === 0) return "n/a (0 reconciled)";
+  const available = reconciled.filter(
+    ({ usage }) => usage.availability[dimension] !== "unavailable"
+  );
+  const total = available.reduce((sum, { usage }) => sum + usage[dimension], 0);
+  return available.length === reconciled.length ? String(total) : `${total} (${available.length}/${reconciled.length} available)`;
+}
+function reconciledTokenTotal(results) {
+  const reconciled = results.filter(({ usageReconciled }) => usageReconciled);
+  const total = reconciled.reduce((sum, { usage }) => sum + usage.total, 0);
+  return `${total} (${reconciled.length}/${results.length} trials)`;
+}
+function resultKey(result) {
+  return `${result.trial.host}/${result.trial.mode}/${result.trial.taskId}#${result.trial.repetition}`;
+}
+function renderBenchmarkPublicationMarkdown(input) {
+  const report = BenchmarkReportV3Schema.parse(input.report);
+  const suite = BenchmarkSuiteSchema.parse(input.suite);
+  if (!/^[0-9a-f]{64}$/u.test(input.labelsSha256))
+    throw new Error("The review-label file SHA-256 digest is invalid");
+  const validated = validateBenchmarkReviewLabels({ ...input, report, suite });
+  const summary = summarizeBenchmark(report.results, report.schedule);
+  const hosts = [...new Set(report.schedule.map(({ host }) => host))].sort();
+  const labelFor = (result) => validated.labelsByOpaqueId.get(
+    benchmarkReviewOpaqueId(
+      validated.blindedReview.rawReportSha256,
+      result.trial.trialId,
+      input.blindingKey
+    )
+  );
+  const allDefects = report.results.flatMap(
+    (result) => labelFor(result).defects.map((defect) => ({ result, defect }))
+  );
+  const criticalDefects = allDefects.filter(({ defect }) => defect.severity === "critical");
+  const criticalTrials = new Set(criticalDefects.map(({ result }) => result.trial.trialId)).size;
+  const blindedReviewDigest = contentHash(validated.blindedReview);
+  const reviewerIds = [
+    ...new Set(validated.labels.labels.map(({ reviewerId }) => reviewerId))
+  ].sort();
+  const allGatesPass = hosts.every((host) => summary[host].gate.passes === true);
+  const anyGateFails = hosts.some((host) => summary[host].gate.passes === false);
+  const lines = [
+    `# Graphcraft benchmark report: ${markdown(report.suite.id)} v${report.suite.version}`,
+    "",
+    "## Provenance",
+    "",
+    `Raw report byte SHA-256: \`${validated.blindedReview.rawReportSha256}\`  `,
+    `Blinding-key digest: \`${validated.blindedReview.blindingKeyDigest}\`  `,
+    `Blinded review canonical SHA-256: \`${blindedReviewDigest}\`  `,
+    `Review-label file SHA-256: \`${input.labelsSha256}\`  `,
+    `Reviewer IDs: ${reviewerIds.map((reviewerId) => `\`${markdown(reviewerId)}\``).join(", ")}`,
+    "",
+    `**Quantitative benchmark gate (at least 20% median token reduction with no more than a five-point acceptance regression):** ${allGatesPass ? "PASS for every evaluated host." : anyGateFails ? "FAIL for at least one evaluated host." : "NOT COMPARABLE for at least one evaluated host."}`,
+    "",
+    `**Critical blinded defects:** ${criticalDefects.length} across ${criticalTrials} trial(s).${criticalDefects.length > 0 ? " A passing quantitative gate does not override these findings." : ""}`,
+    "",
+    "The quantitative gate is not a stable-release or broader product claim. Defect review is reported separately from scorer acceptance and does not alter the existing efficiency calculation.",
+    "",
+    "## Controls",
+    "",
+    `Suite digest: \`${markdown(report.suite.digest)}\`  `,
+    `Graphcraft: ${markdown(report.environment.graphcraftVersion)} at \`${markdown(
+      report.environment.graphcraftSource?.commitSha ?? "source identity unavailable"
+    )}\`  `,
+    `Environment: ${markdown(report.environment.platform)}/${markdown(
+      report.environment.architecture
+    )}, Node ${markdown(report.environment.nodeVersion)}  `,
+    `Shared effort: ${markdown(report.effortPolicy)}; model-call timeout: ${report.modelCallTimeoutMs} ms`,
+    "",
+    "| Host | Model | Host version(s) | Permission profile |",
+    "| --- | --- | --- | --- |"
+  ];
+  for (const host of hosts) {
+    const selected = report.results.filter(({ trial }) => trial.host === host);
+    lines.push(
+      `| ${host} | ${markdown(report.modelPolicy[host] ?? "unavailable")} | ${markdown(
+        [...new Set(selected.map(({ hostVersion }) => hostVersion))].sort().join(", ")
+      )} | ${markdown(report.permissionPolicy[host] ?? "unavailable")} |`
+    );
+  }
+  lines.push(
+    "",
+    "## Acceptance",
+    "",
+    "Unsuccessful trials remain in every denominator.",
+    "",
+    "| Host | Mode | Trials | Accepted | Unsuccessful | Acceptance rate | 95% Wilson interval |",
+    "| --- | --- | ---: | ---: | ---: | ---: | ---: |"
+  );
+  for (const host of hosts) {
+    for (const mode of ["baseline", "graphcraft"]) {
+      const selected = report.results.filter(
+        ({ trial }) => trial.host === host && trial.mode === mode
+      );
+      const accepted = selected.filter((result) => result.accepted).length;
+      lines.push(
+        `| ${host} | ${mode} | ${selected.length} | ${accepted} | ${selected.length - accepted} | ${selected.length > 0 ? percentage(accepted / selected.length) : "n/a"} | ${intervalPercentage(
+          wilsonScoreInterval(accepted, selected.length)
+        )} |`
+      );
+    }
+  }
+  const taskFamily = new Map(suite.tasks.map((task) => [task.id, task.family]));
+  lines.push(
+    "",
+    "## Per-task results",
+    "",
+    "Unsuccessful trials remain in the task totals; reconciled token totals state their exact trial coverage.",
+    "",
+    "| Task | Family | Host | Mode | Trials | Accepted | Reconciled total tokens | Median duration | Defects (critical) | Interventions |",
+    "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |"
+  );
+  for (const taskId of [...taskFamily.keys()].sort()) {
+    for (const host of hosts) {
+      for (const mode of ["baseline", "graphcraft"]) {
+        const selected = report.results.filter(
+          ({ trial }) => trial.taskId === taskId && trial.host === host && trial.mode === mode
+        );
+        if (selected.length === 0) continue;
+        const defects = selected.flatMap((result) => labelFor(result).defects);
+        lines.push(
+          `| ${markdown(taskId)} | ${taskFamily.get(taskId)} | ${host} | ${mode} | ${selected.length} | ${selected.filter(({ accepted }) => accepted).length} | ${reconciledTokenTotal(
+            selected
+          )} | ${duration3(median2(selected.map(({ durationMs }) => durationMs)))} | ${defects.length} (${defects.filter(({ severity }) => severity === "critical").length}) | ${selected.reduce(
+            (sum, { humanInterventions }) => sum + humanInterventions,
+            0
+          )} |`
+        );
+      }
+    }
+  }
+  lines.push(
+    "",
+    "## Blinded defect review",
+    "",
+    `Reviewed trials: ${report.results.length}/${report.results.length}. Trials with defects: ${report.results.filter((result) => labelFor(result).verdict === "defect").length}. Total defects: ${allDefects.length}.`,
+    "",
+    "| Severity | Count |",
+    "| --- | ---: |",
+    ...BENCHMARK_DEFECT_SEVERITIES.map(
+      (severity) => `| ${severity} | ${allDefects.filter(({ defect }) => defect.severity === severity).length} |`
+    ),
+    "",
+    "| Category | Count |",
+    "| --- | ---: |",
+    ...BENCHMARK_DEFECT_CATEGORIES.map(
+      (category) => `| ${category} | ${allDefects.filter(({ defect }) => defect.category === category).length} |`
+    )
+  );
+  if (allDefects.length > 0) {
+    lines.push(
+      "",
+      "| Trial | Reviewer | Category | Severity | Finding |",
+      "| --- | --- | --- | --- | --- |",
+      ...allDefects.sort((left, right) => {
+        const severityOrder = { critical: 0, major: 1, minor: 2 };
+        return severityOrder[left.defect.severity] - severityOrder[right.defect.severity] || compareText(resultKey(left.result), resultKey(right.result));
+      }).map(
+        ({ result, defect }) => `| ${markdown(resultKey(result))} | ${markdown(
+          labelFor(result).reviewerId
+        )} | ${defect.category} | ${defect.severity} | ${markdown(defect.summary)} |`
+      )
+    );
+  }
+  lines.push(
+    "",
+    "## Reconciled token dimensions",
+    "",
+    "Only trials whose total usage reconciled are aggregated. A partial availability count is shown instead of silently treating an unavailable dimension as zero.",
+    "",
+    "| Host | Mode | Reconciled trials | Input | Cached input | Uncached input | Output | Reasoning | Total |",
+    "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+  );
+  for (const host of hosts) {
+    for (const mode of ["baseline", "graphcraft"]) {
+      const selected = report.results.filter(
+        ({ trial }) => trial.host === host && trial.mode === mode
+      );
+      lines.push(
+        `| ${host} | ${mode} | ${selected.filter(({ usageReconciled }) => usageReconciled).length}/${selected.length} | ${TOKEN_DIMENSIONS.map((dimension) => tokenDimension(selected, dimension)).join(
+          " | "
+        )} |`
+      );
+    }
+  }
+  lines.push(
+    "",
+    "## Matched token reduction and existing gate",
+    "",
+    "| Host | Accepted pairs | Task coverage | Median paired reduction | Exact median interval | Acceptance delta | Existing gate |",
+    "| --- | ---: | --- | ---: | --- | ---: | --- |"
+  );
+  for (const host of hosts) {
+    const hostSummary = summary[host];
+    const taskReductions = Object.values(hostSummary.matchedAccepted.byTask).flatMap(
+      ({ medianPairReductionPercent }) => medianPairReductionPercent === null ? [] : [medianPairReductionPercent]
+    );
+    lines.push(
+      `| ${host} | ${hostSummary.matchedAccepted.pairs} | ${hostSummary.matchedAccepted.coveredTasks}/${hostSummary.matchedAccepted.totalTasks} | ${reduction(
+        hostSummary.gate.tokenReductionPercent
+      )} | ${intervalReduction(exactMedianInterval(taskReductions))} | ${percentagePoints(
+        hostSummary.gate.acceptanceDeltaPoints
+      )} | ${hostSummary.gate.passes === true ? "PASS" : hostSummary.gate.passes === false ? "FAIL" : "NOT COMPARABLE"} |`
+    );
+  }
+  lines.push(
+    "",
+    "## Duration and human intervention",
+    "",
+    "| Host | Mode | Trials | Total duration | Median duration | Exact median interval | Human interventions |",
+    "| --- | --- | ---: | ---: | ---: | --- | ---: |"
+  );
+  for (const host of hosts) {
+    for (const mode of ["baseline", "graphcraft"]) {
+      const selected = report.results.filter(
+        ({ trial }) => trial.host === host && trial.mode === mode
+      );
+      const durations = selected.map(({ durationMs }) => durationMs);
+      const durationInterval = exactMedianInterval(durations);
+      lines.push(
+        `| ${host} | ${mode} | ${selected.length} | ${duration3(
+          durations.reduce((sum, value) => sum + value, 0)
+        )} | ${duration3(median2(durations) ?? 0)} | ${durationInterval ? `${duration3(durationInterval.lower)}\u2013${duration3(
+          durationInterval.upper
+        )} (${percentage(durationInterval.achievedConfidenceLevel)} exact coverage)` : "n/a"} | ${selected.reduce((sum, { humanInterventions }) => sum + humanInterventions, 0)} |`
+      );
+    }
+  }
+  const unsuccessful = report.results.filter((result) => !result.accepted);
+  lines.push(
+    "",
+    "## Failures and interruptions",
+    "",
+    "| Execution status | Count |",
+    "| --- | ---: |",
+    ...["completed", "blocked", "failed", "error", "interrupted", "timed_out"].map(
+      (status3) => `| ${status3} | ${report.results.filter(({ executionStatus }) => executionStatus === status3).length} |`
+    ),
+    ""
+  );
+  if (unsuccessful.length === 0) {
+    lines.push("No unsuccessful trials were recorded.");
+  } else {
+    lines.push(
+      "| Trial | Status | Interruption | Failure evidence |",
+      "| --- | --- | --- | --- |",
+      ...unsuccessful.sort((left, right) => compareText(resultKey(left), resultKey(right))).map(
+        (result) => `| ${markdown(resultKey(result))} | ${result.executionStatus} | ${markdown(
+          result.interruption ? `${result.interruption.cause}; ${result.interruption.childSettlement}; ${result.interruption.reason}` : "none"
+        )} | ${markdown(
+          result.failureTrace.length > 0 ? result.failureTrace.join("; ") : "No failure trace recorded"
+        )} |`
+      )
+    );
+  }
+  const limitations = [
+    ...report.limitations,
+    ...report.results.flatMap(({ limitations: trialLimitations }) => trialLimitations),
+    "Human-intervention counts are harness-recorded values and are not an independent observational audit.",
+    "Defect labels are blinded adjudications and remain separate from deterministic scorer acceptance."
+  ];
+  lines.push(
+    "",
+    "## Limitations",
+    "",
+    ...[...new Set(limitations)].sort().map((limitation) => `- ${markdown(limitation)}`),
+    "",
+    "## Statistical uncertainty",
+    "",
+    "Acceptance intervals are two-sided 95% Wilson score intervals over all trials in each host/mode cell, including unsuccessful runs.",
+    "",
+    "Median intervals use the exact two-sided binomial order-statistic method. Task-level paired token reductions are the independent units for the reduction interval; trial durations are the units for duration intervals. The renderer chooses the narrowest interval with at least 95% exact coverage when the sample size permits it, otherwise reports the widest attainable interval and its achieved coverage.",
+    "",
+    "No p-values or causal claims are inferred from these intervals.",
+    ""
+  );
+  return publicationRedactString(lines.join("\n"));
+}
+async function canonicalTarget(path2) {
+  const absolute = resolve14(path2);
+  try {
+    return await realpath5(absolute);
+  } catch (error51) {
+    if (error51.code !== "ENOENT") throw error51;
+    const parent = await realpath5(dirname12(absolute)).catch(() => resolve14(dirname12(absolute)));
+    return join14(parent, basename5(absolute));
+  }
+}
+async function assertDistinctOutput(outputPath, protectedPaths) {
+  const output = await canonicalTarget(outputPath);
+  for (const protectedPath of protectedPaths) {
+    if (output === await canonicalTarget(protectedPath))
+      throw new Error("Derived benchmark output must not replace an input artifact");
+  }
+}
+async function assertCreateOnlyOutput(path2) {
+  try {
+    await lstat12(path2);
+  } catch (error51) {
+    if (error51.code === "ENOENT") return;
+    throw error51;
+  }
+  throw new Error(`Derived benchmark output already exists; refusing to overwrite: ${path2}`);
+}
+async function writeTextCreateOnly(path2, text) {
+  await mkdir6(dirname12(path2), { recursive: true });
+  await assertCreateOnlyOutput(path2);
+  const temporaryPath = `${path2}.${process.pid}.${randomUUID11()}.tmp`;
+  try {
+    const handle = await open9(temporaryPath, "wx", 384);
+    let publishedIdentity;
+    try {
+      await handle.writeFile(text, "utf8");
+      await handle.sync();
+      const status3 = await handle.stat({ bigint: true });
+      if (!status3.isFile() || status3.nlink !== 1n)
+        throw new Error(`Benchmark temporary output is not a private regular file: ${path2}`);
+      publishedIdentity = { device: status3.dev, inode: status3.ino };
+    } finally {
+      await handle.close();
+    }
+    if (publishedIdentity === void 0)
+      throw new Error(`Benchmark temporary output identity is unavailable: ${path2}`);
+    try {
+      await link(temporaryPath, path2);
+    } catch (error51) {
+      if (error51.code === "EEXIST")
+        throw new Error(`Derived benchmark output already exists; refusing to overwrite: ${path2}`);
+      throw error51;
+    }
+    await unlink5(temporaryPath);
+    const published = await lstat12(path2, { bigint: true });
+    if (published.isSymbolicLink() || !published.isFile() || published.nlink !== 1n)
+      throw new Error(`Derived benchmark output is not a private regular file: ${path2}`);
+    if (publishedIdentity.inode !== 0n && (published.dev !== publishedIdentity.device || published.ino !== publishedIdentity.inode))
+      throw new Error(`Derived benchmark output identity changed during publication: ${path2}`);
+    await syncDirectory(dirname12(path2));
+  } catch (error51) {
+    await rm5(temporaryPath, { force: true }).catch(() => void 0);
+    throw error51;
+  }
+}
+async function writeJsonCreateOnly(path2, value) {
+  const redacted = publicationRedactValue(value);
+  if (contentHash(redacted) !== contentHash(value))
+    throw new Error("Blinded benchmark artifact changed during final redaction");
+  await writeTextCreateOnly(path2, `${JSON.stringify(redacted, null, 2)}
+`);
+}
+async function exportBlindedBenchmarkReview(input) {
+  const loaded = await loadBenchmarkReportForPublication(input.reportPath);
+  const blindingKey = Buffer.from(input.blindingKey);
+  try {
+    const outputPath = resolve14(input.outputPath);
+    await assertDistinctOutput(outputPath, [loaded.path]);
+    await assertCreateOnlyOutput(outputPath);
+    const artifact = createBlindedBenchmarkReview({
+      report: loaded.report,
+      rawReportSha256: loaded.rawReportSha256,
+      suite: input.suite,
+      blindingKey
+    });
+    await writeJsonCreateOnly(outputPath, artifact);
+    return {
+      outputPath,
+      rawReportSha256: loaded.rawReportSha256,
+      blindingKeyDigest: benchmarkBlindingKeyDigest(blindingKey),
+      blindedReviewDigest: contentHash(artifact),
+      packetCount: artifact.packets.length
+    };
+  } finally {
+    blindingKey.fill(0);
+  }
+}
+async function renderBenchmarkPublicationReport(input) {
+  const [loaded, loadedLabels] = await Promise.all([
+    loadBenchmarkReportForPublication(input.reportPath),
+    loadBenchmarkReviewLabelsArtifact(input.labelsPath)
+  ]);
+  const blindingKey = Buffer.from(input.blindingKey);
+  try {
+    const outputPath = resolve14(input.outputPath);
+    await assertDistinctOutput(outputPath, [loaded.path, loadedLabels.path]);
+    await assertCreateOnlyOutput(outputPath);
+    const rendered = renderBenchmarkPublicationMarkdown({
+      report: loaded.report,
+      rawReportSha256: loaded.rawReportSha256,
+      suite: input.suite,
+      labels: loadedLabels.labels,
+      labelsSha256: loadedLabels.labelsSha256,
+      blindingKey
+    });
+    await writeTextCreateOnly(outputPath, rendered);
+    return {
+      outputPath,
+      rawReportSha256: loaded.rawReportSha256,
+      blindingKeyDigest: benchmarkBlindingKeyDigest(blindingKey),
+      blindedReviewDigest: loadedLabels.labels.blindedReviewDigest,
+      labelsSha256: loadedLabels.labelsSha256,
+      reportSha256: rawSha256(rendered)
+    };
+  } finally {
+    blindingKey.fill(0);
+  }
+}
+
 // packages/runtime/src/retention.ts
-import { lstat as lstat12, readdir as readdir6, rm as rm5, unlink as unlink5 } from "node:fs/promises";
-import { dirname as dirname13, join as join15, relative as relative11, resolve as resolve15 } from "node:path";
+import { lstat as lstat13, readdir as readdir6, rm as rm6, unlink as unlink6 } from "node:fs/promises";
+import { dirname as dirname14, join as join16, relative as relative11, resolve as resolve16 } from "node:path";
 import { isDeepStrictEqual as isDeepStrictEqual3 } from "node:util";
 
 // packages/runtime/src/supervisor.ts
 import { spawn as spawn5 } from "node:child_process";
-import { randomUUID as randomUUID11 } from "node:crypto";
+import { randomUUID as randomUUID12 } from "node:crypto";
 import {
   closeSync,
   constants as fsConstants7,
@@ -42145,8 +43435,8 @@ import {
   readSync,
   writeSync
 } from "node:fs";
-import { open as open9, readdir as readdir5 } from "node:fs/promises";
-import { dirname as dirname12, join as join14, relative as relative10, resolve as resolve14 } from "node:path";
+import { open as open10, readdir as readdir5 } from "node:fs/promises";
+import { dirname as dirname13, join as join15, relative as relative10, resolve as resolve15 } from "node:path";
 var KIB3 = 1024;
 var SUPERVISOR_LOG_MAX_BYTES = 64 * KIB3;
 var SUPERVISOR_LOG_RETAIN_BYTES = 32 * KIB3;
@@ -42157,13 +43447,13 @@ var SUPERVISOR_LOG_TRUNCATION_MARKER = Buffer.from(
 `
 );
 function graphcraftRoot(repositoryRoot) {
-  return join14(repositoryRoot, ".graphcraft");
+  return join15(repositoryRoot, ".graphcraft");
 }
 function supervisorRoot(repositoryRoot, runId) {
-  return join14(graphcraftRoot(repositoryRoot), "supervisors", runId);
+  return join15(graphcraftRoot(repositoryRoot), "supervisors", runId);
 }
 function supervisorRecordPath(repositoryRoot, runId, supervisorId) {
-  return join14(supervisorRoot(repositoryRoot, runId), `${supervisorId}.json`);
+  return join15(supervisorRoot(repositoryRoot, runId), `${supervisorId}.json`);
 }
 function compactSupervisorLog(logPath) {
   const before = lstatSync(logPath);
@@ -42272,7 +43562,7 @@ async function listSupervisorRecords(repositoryRoot, runId) {
   }
   const records = await Promise.all(
     entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json")).map(async (entry) => {
-      const path2 = join14(root, entry.name);
+      const path2 = join15(root, entry.name);
       await validatePrivatePath(ownedRoot, relative10(ownedRoot, path2));
       return await readSupervisorRecord(path2, ownedRoot);
     })
@@ -42301,7 +43591,7 @@ async function waitForSupervisorRecord(repositoryRoot, runId, supervisorId, time
       return await readSupervisorRecord(path2, ownedRoot);
     } catch (error51) {
       if (Date.now() >= deadline) throw error51;
-      await new Promise((resolve18) => setTimeout(resolve18, 25));
+      await new Promise((resolve19) => setTimeout(resolve19, 25));
     }
   }
 }
@@ -42311,14 +43601,14 @@ async function launchDetachedSupervisor(input) {
     throw new Error(
       `Run ${input.runId} already has active supervisor ${previous.supervisorId} (PID ${previous.pid})`
     );
-  const supervisorId = randomUUID11();
+  const supervisorId = randomUUID12();
   const ownedRoot = graphcraftRoot(input.repositoryRoot);
   const root = supervisorRoot(input.repositoryRoot, input.runId);
-  const logPath = join14(root, `${supervisorId}.log`);
+  const logPath = join15(root, `${supervisorId}.log`);
   await ensurePrivateDirectory(ownedRoot);
   await ensurePrivateDirectory(root, ownedRoot);
   await hardenPrivateFile(logPath, ownedRoot);
-  const log = await open9(logPath, "a", 384);
+  const log = await open10(logPath, "a", 384);
   await hardenPrivateFile(logPath, ownedRoot);
   let child;
   try {
@@ -42345,8 +43635,8 @@ async function launchDetachedSupervisor(input) {
         stdio: ["ignore", log.fd, log.fd]
       }
     );
-    await new Promise((resolve18, reject) => {
-      child.once("spawn", resolve18);
+    await new Promise((resolve19, reject) => {
+      child.once("spawn", resolve19);
       child.once("error", reject);
     });
     if (!child.pid) throw new Error("Detached supervisor did not report a process ID");
@@ -42382,7 +43672,7 @@ async function launchDetachedSupervisor(input) {
 }
 async function startDetachedSupervisor(input) {
   const lock = new RunLock(
-    join14(input.repositoryRoot, ".graphcraft", "locks", `${input.runId}.supervisor.lock`)
+    join15(input.repositoryRoot, ".graphcraft", "locks", `${input.runId}.supervisor.lock`)
   );
   await lock.acquire();
   try {
@@ -42409,8 +43699,8 @@ var SupervisorLease = class _SupervisorLease {
       throw new Error(
         `Supervisor ${supervisorId} expected PID ${record2.pid}, received ${process.pid}`
       );
-    const expectedLogPath = join14(supervisorRoot(repositoryRoot, runId), `${supervisorId}.log`);
-    if (resolve14(record2.logPath) !== resolve14(expectedLogPath))
+    const expectedLogPath = join15(supervisorRoot(repositoryRoot, runId), `${supervisorId}.log`);
+    if (resolve15(record2.logPath) !== resolve15(expectedLogPath))
       throw new Error(`Supervisor ${supervisorId} has an invalid log path`);
     return new _SupervisorLease(
       record2,
@@ -42432,7 +43722,7 @@ var SupervisorLease = class _SupervisorLease {
         updatedAt: now2
       });
       assertSupervisorRecordFits(this.record);
-      await ensurePrivateDirectory(dirname12(this.path), this.ownedRoot);
+      await ensurePrivateDirectory(dirname13(this.path), this.ownedRoot);
       await hardenPrivateFile(this.path, this.ownedRoot);
       await writeJsonAtomic(this.path, this.record);
       await hardenPrivateFile(this.path, this.ownedRoot);
@@ -42510,14 +43800,14 @@ var RETENTION_TARGET_IDS = [
   "migration_backup"
 ];
 function retentionTargets(repositoryRoot, runId) {
-  const graphcraftRoot2 = join15(repositoryRoot, ".graphcraft");
+  const graphcraftRoot2 = join16(repositoryRoot, ".graphcraft");
   return [
-    { id: "run", path: join15(graphcraftRoot2, "runs", runId), kind: "directory" },
-    { id: "control", path: join15(graphcraftRoot2, "controls", `${runId}.json`), kind: "file" },
-    { id: "supervisor", path: join15(graphcraftRoot2, "supervisors", runId), kind: "directory" },
+    { id: "run", path: join16(graphcraftRoot2, "runs", runId), kind: "directory" },
+    { id: "control", path: join16(graphcraftRoot2, "controls", `${runId}.json`), kind: "file" },
+    { id: "supervisor", path: join16(graphcraftRoot2, "supervisors", runId), kind: "directory" },
     {
       id: "migration_backup",
-      path: join15(graphcraftRoot2, "migration-backups", runId),
+      path: join16(graphcraftRoot2, "migration-backups", runId),
       kind: "directory"
     }
   ];
@@ -42644,14 +43934,14 @@ function parseRetentionJournal(value, expectedRunId) {
   return journal;
 }
 function retentionJournalRoot(repositoryRoot) {
-  return join15(repositoryRoot, ".graphcraft", "retention");
+  return join16(repositoryRoot, ".graphcraft", "retention");
 }
 function retentionJournalPath(repositoryRoot, runId) {
-  return join15(retentionJournalRoot(repositoryRoot), `${runId}.json`);
+  return join16(retentionJournalRoot(repositoryRoot), `${runId}.json`);
 }
 async function readRetentionJournal(repositoryRoot, runId) {
   if (!RUN_ID_PATTERN2.test(runId)) throw new Error(`Invalid Graphcraft run ID: ${runId}`);
-  const graphcraftRoot2 = join15(repositoryRoot, ".graphcraft");
+  const graphcraftRoot2 = join16(repositoryRoot, ".graphcraft");
   const path2 = retentionJournalPath(repositoryRoot, runId);
   let source;
   try {
@@ -42670,10 +43960,10 @@ async function readRetentionJournal(repositoryRoot, runId) {
   }
 }
 async function writeRetentionJournal(repositoryRoot, journal) {
-  const graphcraftRoot2 = join15(repositoryRoot, ".graphcraft");
+  const graphcraftRoot2 = join16(repositoryRoot, ".graphcraft");
   const root = retentionJournalRoot(repositoryRoot);
   await ensurePrivateDirectory(graphcraftRoot2);
-  const rootExisted = await lstat12(root).then(() => true).catch((error51) => {
+  const rootExisted = await lstat13(root).then(() => true).catch((error51) => {
     if (error51.code === "ENOENT") return false;
     throw error51;
   });
@@ -42707,12 +43997,12 @@ async function writeRetentionJournal(repositoryRoot, journal) {
 async function removeRetentionJournal(repositoryRoot, runId, assertLeaseHeld) {
   const existing = await readRetentionJournal(repositoryRoot, runId);
   if (!existing) return;
-  const graphcraftRoot2 = join15(repositoryRoot, ".graphcraft");
+  const graphcraftRoot2 = join16(repositoryRoot, ".graphcraft");
   const path2 = retentionJournalPath(repositoryRoot, runId);
   assertLeaseHeld();
   await hardenPrivateFile(path2, graphcraftRoot2);
   assertLeaseHeld();
-  await unlink5(path2).catch((error51) => {
+  await unlink6(path2).catch((error51) => {
     if (error51.code !== "ENOENT") throw error51;
   });
   await syncDirectory(retentionJournalRoot(repositoryRoot));
@@ -42720,7 +44010,7 @@ async function removeRetentionJournal(repositoryRoot, runId, assertLeaseHeld) {
     throw refusal(runId, "retention journal remained after cleanup");
 }
 async function listRetentionJournals(repositoryRoot) {
-  const graphcraftRoot2 = join15(repositoryRoot, ".graphcraft");
+  const graphcraftRoot2 = join16(repositoryRoot, ".graphcraft");
   const root = retentionJournalRoot(repositoryRoot);
   let entries;
   try {
@@ -42757,8 +44047,8 @@ function planFromJournal(repositoryRoot, journal) {
 }
 async function readPersistedState(repositoryRoot, runId) {
   try {
-    const graphcraftRoot2 = join15(repositoryRoot, ".graphcraft");
-    const runRoot = join15(graphcraftRoot2, "runs", runId);
+    const graphcraftRoot2 = join16(repositoryRoot, ".graphcraft");
+    const runRoot = join16(graphcraftRoot2, "runs", runId);
     await validatePrivatePath(graphcraftRoot2, relative11(graphcraftRoot2, runRoot));
     await Promise.all([
       validatePrivatePath(runRoot, "events.jsonl"),
@@ -42766,12 +44056,12 @@ async function readPersistedState(repositoryRoot, runId) {
     ]);
     const materialized = RunStateSchema.parse(
       JSON.parse(
-        (await readPrivateFileBounded(join15(runRoot, "state.json"), RUN_STATE_MAX_BYTES, runRoot)).toString("utf8")
+        (await readPrivateFileBounded(join16(runRoot, "state.json"), RUN_STATE_MAX_BYTES, runRoot)).toString("utf8")
       )
     );
     if (materialized.runId !== runId)
       throw new Error(`materialized state belongs to run ${materialized.runId}`);
-    const events = (await readPrivateFileBounded(join15(runRoot, "events.jsonl"), RUN_EVENT_LOG_MAX_BYTES, runRoot)).toString("utf8").split("\n").filter(Boolean).map((line2) => {
+    const events = (await readPrivateFileBounded(join16(runRoot, "events.jsonl"), RUN_EVENT_LOG_MAX_BYTES, runRoot)).toString("utf8").split("\n").filter(Boolean).map((line2) => {
       const bytes = Buffer.byteLength(`${line2}
 `);
       if (bytes > RUN_EVENT_MAX_BYTES)
@@ -42815,12 +44105,12 @@ function retentionStateIdentity(state) {
 }
 async function readPreservedWorkspace(repositoryRoot, runId) {
   try {
-    const runRoot = join15(repositoryRoot, ".graphcraft", "runs", runId);
+    const runRoot = join16(repositoryRoot, ".graphcraft", "runs", runId);
     await validatePrivatePath(runRoot, "workspace.json");
     return preservedWorkspaceProjection(
       JSON.parse(
         (await readPrivateFileBounded(
-          join15(runRoot, "workspace.json"),
+          join16(runRoot, "workspace.json"),
           RETENTION_WORKSPACE_FILE_MAX_BYTES,
           runRoot
         )).toString("utf8")
@@ -42844,7 +44134,7 @@ async function assertNoLiveSupervisor(repositoryRoot, runId) {
     );
   }
   for (const record2 of records) {
-    if (record2.runId !== runId || resolve15(record2.repositoryRoot) !== repositoryRoot)
+    if (record2.runId !== runId || resolve16(record2.repositoryRoot) !== repositoryRoot)
       throw refusal(runId, `supervisor ${record2.supervisorId} has ambiguous ownership`);
     const supervisor = inspectSupervisorRecord(record2);
     if (supervisor.health === "starting" || supervisor.health === "running")
@@ -42855,11 +44145,11 @@ async function assertNoLiveSupervisor(repositoryRoot, runId) {
   }
 }
 async function assertNoProbeProcessState(repositoryRoot, runId) {
-  const graphcraftRoot2 = join15(repositoryRoot, ".graphcraft");
-  const path2 = join15(graphcraftRoot2, "locks", "probe-processes", runId);
+  const graphcraftRoot2 = join16(repositoryRoot, ".graphcraft");
+  const path2 = join16(graphcraftRoot2, "locks", "probe-processes", runId);
   try {
     await validatePrivatePath(graphcraftRoot2, relative11(graphcraftRoot2, path2));
-    const stats = await lstat12(path2);
+    const stats = await lstat13(path2);
     if (stats.isSymbolicLink() || !stats.isDirectory())
       throw new Error("probe-process state is not an ordinary directory");
   } catch (error51) {
@@ -42894,7 +44184,7 @@ async function inspectDeletableRun(repositoryRoot, runId) {
 async function planRunRetention(input) {
   if (!input.runReference.trim())
     throw new Error("Retention requires an explicit, uniquely resolvable run reference");
-  const repositoryRoot = resolve15(input.repositoryRoot);
+  const repositoryRoot = resolve16(input.repositoryRoot);
   if (RUN_ID_PATTERN2.test(input.runReference)) {
     const journal = await readRetentionJournal(repositoryRoot, input.runReference);
     if (journal) {
@@ -42919,7 +44209,7 @@ function validateRetentionPlan(plan) {
     throw new Error("Retention plan has an unsupported schema or action");
   if (typeof record2.runId !== "string" || !RUN_ID_PATTERN2.test(record2.runId))
     throw new Error("Retention plan has an invalid run ID");
-  if (typeof record2.repositoryRoot !== "string" || resolve15(record2.repositoryRoot) !== record2.repositoryRoot)
+  if (typeof record2.repositoryRoot !== "string" || resolve16(record2.repositoryRoot) !== record2.repositoryRoot)
     throw refusal(record2.runId, "repository root is not an absolute normalized path");
   parseRetentionStateIdentity(record2.state, record2.runId);
   const workspace = safePreservedWorkspace(record2.preservedWorkspace);
@@ -42933,14 +44223,14 @@ function validateRetentionPlan(plan) {
     throw refusal(record2.runId, "delete paths do not match the repository and run ID");
 }
 async function validateTarget(graphcraftRoot2, target) {
-  const expected = resolve15(target.path);
+  const expected = resolve16(target.path);
   const validated = await validatePrivatePath(
     graphcraftRoot2,
-    relative11(resolve15(graphcraftRoot2), expected)
+    relative11(resolve16(graphcraftRoot2), expected)
   );
   if (validated !== expected)
     throw new Error(`Retention target ${target.path} escaped the Graphcraft state directory`);
-  const stats = await lstat12(target.path).catch((error51) => {
+  const stats = await lstat13(target.path).catch((error51) => {
     if (error51.code === "ENOENT") return void 0;
     throw error51;
   });
@@ -42970,9 +44260,9 @@ async function removeTargets(graphcraftRoot2, targets, runId, onCheckpoint, asse
     const exists = await validateTarget(graphcraftRoot2, target);
     assertLeaseHeld();
     if (!exists) continue;
-    if (target.kind === "directory") await rm5(target.path, { recursive: true, force: true });
+    if (target.kind === "directory") await rm6(target.path, { recursive: true, force: true });
     else
-      await unlink5(target.path).catch((error51) => {
+      await unlink6(target.path).catch((error51) => {
         if (error51.code !== "ENOENT") throw error51;
       });
     assertLeaseHeld();
@@ -42989,13 +44279,13 @@ async function removeTargets(graphcraftRoot2, targets, runId, onCheckpoint, asse
   const stillExists = await validateTarget(graphcraftRoot2, run);
   assertLeaseHeld();
   if (stillExists) {
-    await rm5(run.path, { recursive: true, force: true });
+    await rm6(run.path, { recursive: true, force: true });
     assertLeaseHeld();
   }
   await onCheckpoint?.({ boundary: "after_run", runId });
 }
 async function syncRetentionTargetParents(targets, assertLeaseHeld) {
-  for (const parent of new Set(targets.map(({ path: path2 }) => dirname13(path2)))) {
+  for (const parent of new Set(targets.map(({ path: path2 }) => dirname14(path2)))) {
     assertLeaseHeld();
     try {
       await syncDirectory(parent);
@@ -43021,14 +44311,14 @@ async function applyRetention(plan, confirmRunId, validateEligibility, options =
   if (confirmRunId !== plan.runId)
     throw new Error(`Retention confirmation must exactly equal run ID ${plan.runId}`);
   validateRetentionPlan(plan);
-  const repositoryRoot = resolve15(plan.repositoryRoot);
-  const graphcraftRoot2 = join15(repositoryRoot, ".graphcraft");
-  const retentionLock = new RunLock(join15(graphcraftRoot2, "locks", "retention.lock"));
+  const repositoryRoot = resolve16(plan.repositoryRoot);
+  const graphcraftRoot2 = join16(repositoryRoot, ".graphcraft");
+  const retentionLock = new RunLock(join16(graphcraftRoot2, "locks", "retention.lock"));
   const supervisorLock = new RunLock(
-    join15(graphcraftRoot2, "locks", `${plan.runId}.supervisor.lock`)
+    join16(graphcraftRoot2, "locks", `${plan.runId}.supervisor.lock`)
   );
-  const runLock = new RunLock(join15(graphcraftRoot2, "locks", `${plan.runId}.lock`));
-  const artifactLock = new RunLock(join15(graphcraftRoot2, "locks", `${plan.runId}.artifacts.lock`));
+  const runLock = new RunLock(join16(graphcraftRoot2, "locks", `${plan.runId}.lock`));
+  const artifactLock = new RunLock(join16(graphcraftRoot2, "locks", `${plan.runId}.artifacts.lock`));
   const locks = [retentionLock, supervisorLock, runLock, artifactLock];
   const acquiredLocks = [];
   const observedSignals = [];
@@ -43140,7 +44430,7 @@ async function planCompletedRunPrune(input) {
   if (!Number.isSafeInteger(input.keepNewest) || input.keepNewest < 0)
     throw new Error("Retention keepNewest must be a non-negative integer");
   const cutoff = isoCutoff(input.completedBefore);
-  const repositoryRoot = resolve15(input.repositoryRoot);
+  const repositoryRoot = resolve16(input.repositoryRoot);
   const journals = await listRetentionJournals(repositoryRoot);
   const journalByRunId = new Map(journals.map((journal) => [journal.runId, journal]));
   const liveStates = [];
@@ -43638,11 +44928,11 @@ ${result.stdout}`
   );
 }
 function sha256(value) {
-  return createHash6("sha256").update(value).digest("hex");
+  return createHash8("sha256").update(value).digest("hex");
 }
 async function syncDirectory2(path2) {
   if (platform() === "win32") return;
-  const handle = await open10(path2, "r");
+  const handle = await open11(path2, "r");
   try {
     await handle.sync();
   } finally {
@@ -43650,8 +44940,8 @@ async function syncDirectory2(path2) {
   }
 }
 async function writeAtomic(path2, value, mode) {
-  const temporaryPath = join16(dirname14(path2), `.${randomUUID12()}.tmp`);
-  const handle = await open10(temporaryPath, "wx", mode);
+  const temporaryPath = join17(dirname15(path2), `.${randomUUID13()}.tmp`);
+  const handle = await open11(temporaryPath, "wx", mode);
   try {
     try {
       await handle.writeFile(value);
@@ -43661,10 +44951,10 @@ async function writeAtomic(path2, value, mode) {
     }
     await rename3(temporaryPath, path2);
     await chmod2(path2, mode);
-    await syncDirectory2(dirname14(path2));
+    await syncDirectory2(dirname15(path2));
   } catch (error51) {
     await handle.close().catch(() => void 0);
-    await rm6(temporaryPath, { force: true });
+    await rm7(temporaryPath, { force: true });
     throw error51;
   }
 }
@@ -43681,7 +44971,7 @@ async function readRuntimeManifest(path2) {
       path2,
       384,
       RUNTIME_MANIFEST_MAX_BYTES,
-      dirname14(dirname14(path2))
+      dirname15(dirname15(path2))
     );
     return source ? parseRuntimeManifest(JSON.parse(source.toString("utf8"))) : void 0;
   } catch {
@@ -43712,7 +45002,7 @@ async function loadBundledMcpRuntime(sourcePath) {
   };
 }
 async function runtimePairMatches(runtimeDirectory, bundled) {
-  const runtimeRoot = dirname14(runtimeDirectory);
+  const runtimeRoot = dirname15(runtimeDirectory);
   if (await runtimeDirectoryKind(runtimeDirectory) !== "directory") return false;
   if (!await managedDirectoryMatches(runtimeDirectory, 448)) return false;
   if (!await runtimePairHasExactEntries(runtimeDirectory, bundled)) return false;
@@ -43721,10 +45011,10 @@ async function runtimePairMatches(runtimeDirectory, bundled) {
   } catch {
     return false;
   }
-  const manifest2 = await readRuntimeManifest(join16(runtimeDirectory, RUNTIME_MANIFEST));
+  const manifest2 = await readRuntimeManifest(join17(runtimeDirectory, RUNTIME_MANIFEST));
   if (!sameRuntimeManifest(manifest2, bundled.manifest)) return false;
   const runtime = await readRegularFile(
-    join16(runtimeDirectory, bundled.manifest.runtimeFile),
+    join17(runtimeDirectory, bundled.manifest.runtimeFile),
     384,
     bundled.manifest.bytes,
     runtimeRoot
@@ -43736,9 +45026,9 @@ async function runtimePairMatches(runtimeDirectory, bundled) {
     return false;
   }
   const [hardenedManifest, hardenedRuntime] = await Promise.all([
-    readRuntimeManifest(join16(runtimeDirectory, RUNTIME_MANIFEST)),
+    readRuntimeManifest(join17(runtimeDirectory, RUNTIME_MANIFEST)),
     readRegularFile(
-      join16(runtimeDirectory, bundled.manifest.runtimeFile),
+      join17(runtimeDirectory, bundled.manifest.runtimeFile),
       384,
       bundled.manifest.bytes,
       runtimeRoot
@@ -43756,14 +45046,14 @@ async function runtimePairHasExactEntries(runtimeDirectory, bundled) {
   }
 }
 async function runtimePairContentsMatch(runtimeDirectory, bundled) {
-  const runtimeRoot = dirname14(runtimeDirectory);
+  const runtimeRoot = dirname15(runtimeDirectory);
   if (await runtimeDirectoryKind(runtimeDirectory) !== "directory") return false;
   if (!await managedDirectoryMatches(runtimeDirectory, 448)) return false;
   if (!await runtimePairHasExactEntries(runtimeDirectory, bundled)) return false;
-  const manifest2 = await readRuntimeManifest(join16(runtimeDirectory, RUNTIME_MANIFEST));
+  const manifest2 = await readRuntimeManifest(join17(runtimeDirectory, RUNTIME_MANIFEST));
   if (!sameRuntimeManifest(manifest2, bundled.manifest)) return false;
   const runtime = await readRegularFile(
-    join16(runtimeDirectory, bundled.manifest.runtimeFile),
+    join17(runtimeDirectory, bundled.manifest.runtimeFile),
     384,
     bundled.manifest.bytes,
     runtimeRoot
@@ -43772,7 +45062,7 @@ async function runtimePairContentsMatch(runtimeDirectory, bundled) {
 }
 async function runtimeDirectoryKind(path2) {
   try {
-    const metadata = await lstat13(path2);
+    const metadata = await lstat14(path2);
     return metadata.isDirectory() && !metadata.isSymbolicLink() ? "directory" : "other";
   } catch (error51) {
     if (error51.code === "ENOENT") return "missing";
@@ -43784,7 +45074,7 @@ function modeMatches(mode, expectedMode) {
 }
 async function managedDirectoryMatches(path2, expectedMode) {
   try {
-    const metadata = await lstat13(path2);
+    const metadata = await lstat14(path2);
     return metadata.isDirectory() && !metadata.isSymbolicLink() && modeMatches(metadata.mode, expectedMode);
   } catch {
     return false;
@@ -43808,7 +45098,7 @@ async function readRegularFile(path2, expectedMode, maximumBytes = MANAGED_RUNTI
   if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0) return void 0;
   let pathMetadata;
   try {
-    pathMetadata = await lstat13(path2);
+    pathMetadata = await lstat14(path2);
   } catch {
     return void 0;
   }
@@ -43816,32 +45106,32 @@ async function readRegularFile(path2, expectedMode, maximumBytes = MANAGED_RUNTI
     return void 0;
   try {
     const source = await readPrivateFileBounded(path2, maximumBytes, ownedRoot);
-    const finalPathMetadata = await lstat13(path2);
+    const finalPathMetadata = await lstat14(path2);
     return finalPathMetadata.isFile() && !finalPathMetadata.isSymbolicLink() && modeMatches(finalPathMetadata.mode, expectedMode) && finalPathMetadata.dev === pathMetadata.dev && finalPathMetadata.ino === pathMetadata.ino && finalPathMetadata.size === source.byteLength ? source : void 0;
   } catch {
     return void 0;
   }
 }
 function runtimePublicationPaths(graphcraftHome) {
-  const runtimeRoot = join16(graphcraftHome, "runtime");
+  const runtimeRoot = join17(graphcraftHome, "runtime");
   return {
     runtimeRoot,
-    runtimeDirectory: join16(runtimeRoot, GRAPHCRAFT_VERSION)
+    runtimeDirectory: join17(runtimeRoot, GRAPHCRAFT_VERSION)
   };
 }
 async function runtimeStagingDirectoryIdentity(path2) {
-  const metadata = await lstat13(path2, { bigint: true });
+  const metadata = await lstat14(path2, { bigint: true });
   if (!metadata.isDirectory() || metadata.isSymbolicLink() || metadata.ino === 0n) return void 0;
   return `${metadata.dev}:${metadata.ino}:${metadata.birthtimeNs}`;
 }
 async function reserveRuntimeStagingDirectory(runtimeRoot, forceIdentityUnavailable = false, forceIdentityInspectionFailure = false) {
   for (let attempt = 0; attempt < RUNTIME_STAGING_RESERVATION_ATTEMPTS; attempt += 1) {
-    const candidate = join16(
+    const candidate = join17(
       runtimeRoot,
-      `.${GRAPHCRAFT_VERSION}.staged-${randomUUID12().replaceAll("-", "").slice(0, 12)}`
+      `.${GRAPHCRAFT_VERSION}.staged-${randomUUID13().replaceAll("-", "").slice(0, 12)}`
     );
     try {
-      await mkdir6(candidate, { mode: 448 });
+      await mkdir7(candidate, { mode: 448 });
       try {
         if (forceIdentityInspectionFailure)
           throw new Error("Injected runtime staging identity inspection failure");
@@ -43862,7 +45152,7 @@ async function reserveRuntimeStagingDirectory(runtimeRoot, forceIdentityUnavaila
 async function cleanupRuntimeStagingDirectory(reservation) {
   let metadata;
   try {
-    metadata = await lstat13(reservation.path, { bigint: true });
+    metadata = await lstat14(reservation.path, { bigint: true });
   } catch (error51) {
     if (error51.code === "ENOENT") return;
     throw error51;
@@ -43880,7 +45170,7 @@ async function cleanupRuntimeStagingDirectory(reservation) {
   }
   if (!metadata.isDirectory() || metadata.isSymbolicLink() || await runtimeStagingDirectoryIdentity(reservation.path) !== reservation.identity)
     return;
-  await rm6(reservation.path, {
+  await rm7(reservation.path, {
     recursive: true,
     force: true,
     maxRetries: 3,
@@ -43891,7 +45181,7 @@ async function stageBundledMcpRuntime(bundled, graphcraftHome, boundary, forceId
   const paths = runtimePublicationPaths(graphcraftHome);
   await ensurePrivateDirectory(graphcraftHome);
   await ensurePrivateManagedDirectory(paths.runtimeRoot, "runtime root", graphcraftHome);
-  const runtimePath = join16(paths.runtimeDirectory, bundled.manifest.runtimeFile);
+  const runtimePath = join17(paths.runtimeDirectory, bundled.manifest.runtimeFile);
   const previousKind = await runtimeDirectoryKind(paths.runtimeDirectory);
   if (previousKind === "directory") {
     if (await runtimePairMatches(paths.runtimeDirectory, bundled)) {
@@ -43918,9 +45208,9 @@ async function stageBundledMcpRuntime(bundled, graphcraftHome, boundary, forceId
       );
     }
     await ensurePrivateDirectory(stagedDirectory, paths.runtimeRoot);
-    await writeAtomic(join16(stagedDirectory, bundled.manifest.runtimeFile), bundled.source, 384);
+    await writeAtomic(join17(stagedDirectory, bundled.manifest.runtimeFile), bundled.source, 384);
     await writeAtomic(
-      join16(stagedDirectory, RUNTIME_MANIFEST),
+      join17(stagedDirectory, RUNTIME_MANIFEST),
       Buffer.from(`${JSON.stringify(bundled.manifest, null, 2)}
 `),
       384
@@ -43961,11 +45251,11 @@ async function stageBundledMcpRuntime(bundled, graphcraftHome, boundary, forceId
   }
 }
 async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
-  const moduleDirectory = dirname14(fileURLToPath(moduleUrl));
+  const moduleDirectory = dirname15(fileURLToPath(moduleUrl));
   const candidates = [
-    join16(moduleDirectory, "mcp.mjs"),
-    resolve16(moduleDirectory, "../../../dist/mcp.mjs"),
-    resolve16(process.cwd(), "dist/mcp.mjs")
+    join17(moduleDirectory, "mcp.mjs"),
+    resolve17(moduleDirectory, "../../../dist/mcp.mjs"),
+    resolve17(process.cwd(), "dist/mcp.mjs")
   ];
   for (const candidate of candidates) {
     try {
@@ -43977,7 +45267,7 @@ async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
   throw new Error("dist/mcp.mjs is missing; run pnpm build before installing Graphcraft");
 }
 function resolveGraphcraftHome(configuredHome = process.env.GRAPHCRAFT_HOME) {
-  return configuredHome?.trim() ? resolve16(configuredHome) : join16(homedir(), ".graphcraft");
+  return configuredHome?.trim() ? resolve17(configuredHome) : join17(homedir(), ".graphcraft");
 }
 async function ensureGraphcraftHomeIfPresent(graphcraftHome) {
   if (await runtimeDirectoryKind(graphcraftHome) === "missing") return false;
@@ -44006,7 +45296,7 @@ function commandFor(host) {
   return host;
 }
 async function withPrivateHostCommandCwd(operation, createdBoundary) {
-  const cwd = await mkdtemp3(join16(tmpdir3(), "graphcraft-host-config-"));
+  const cwd = await mkdtemp3(join17(tmpdir3(), "graphcraft-host-config-"));
   try {
     await createdBoundary?.(cwd);
     await ensurePrivateDirectory(cwd);
@@ -44017,7 +45307,7 @@ async function withPrivateHostCommandCwd(operation, createdBoundary) {
     }
     return await operation(cwd);
   } finally {
-    await rm6(cwd, { recursive: true, force: true });
+    await rm7(cwd, { recursive: true, force: true });
   }
 }
 async function removeHostRegistration(host, runner, cwd) {
@@ -44029,8 +45319,8 @@ async function removeHostRegistration(host, runner, cwd) {
 }
 function sameRuntimePath(left, right) {
   if (!isAbsolute11(left) || !isAbsolute11(right)) return false;
-  const normalizedLeft = resolve16(left);
-  const normalizedRight = resolve16(right);
+  const normalizedLeft = resolve17(left);
+  const normalizedRight = resolve17(right);
   return platform() === "win32" ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase() : normalizedLeft === normalizedRight;
 }
 async function inspectHostRegistration(host, expected, runner, cwd, knownSingleArguments = []) {
@@ -44141,7 +45431,7 @@ async function restoreHostRegistration(host, previous, runner, cwd) {
   return problems.length === 0 ? "The previous registration was restored and verified." : `Best-effort restoration was incomplete: ${problems.join("; ")}`;
 }
 async function writeRegistrationReceipt(graphcraftHome, host, runtimePath, runtimeSha256) {
-  const directory = join16(graphcraftHome, "registrations");
+  const directory = join17(graphcraftHome, "registrations");
   await ensurePrivateDirectory(graphcraftHome);
   await ensurePrivateManagedDirectory(directory, "registration receipts", graphcraftHome);
   const receipt = {
@@ -44151,7 +45441,7 @@ async function writeRegistrationReceipt(graphcraftHome, host, runtimePath, runti
     runtimePath,
     runtimeSha256
   };
-  const receiptPath = join16(directory, `${host}.json`);
+  const receiptPath = join17(directory, `${host}.json`);
   await writeAtomic(receiptPath, Buffer.from(`${JSON.stringify(receipt, null, 2)}
 `), 384);
   await hardenPrivateFile(receiptPath, graphcraftHome);
@@ -44160,9 +45450,9 @@ async function readRegistrationReceiptSnapshot(graphcraftHome, host) {
   return await readRegistrationReceiptBytes(graphcraftHome, host);
 }
 async function restoreRegistrationReceipt(graphcraftHome, host, previous) {
-  const path2 = join16(graphcraftHome, "registrations", `${host}.json`);
+  const path2 = join17(graphcraftHome, "registrations", `${host}.json`);
   if (previous === void 0) {
-    const directory2 = dirname14(path2);
+    const directory2 = dirname15(path2);
     const directoryKind = await runtimeDirectoryKind(directory2);
     if (directoryKind === "missing") {
       return "The previous registration receipt was absent and remains absent.";
@@ -44170,10 +45460,10 @@ async function restoreRegistrationReceipt(graphcraftHome, host, previous) {
     if (!await managedDirectoryMatches(directory2, 448)) {
       throw new Error("The managed Graphcraft registration receipts directory is unsafe");
     }
-    await rm6(path2, { force: true });
+    await rm7(path2, { force: true });
     return "The previous registration receipt was absent and remains absent.";
   }
-  const directory = dirname14(path2);
+  const directory = dirname15(path2);
   await ensurePrivateDirectory(graphcraftHome);
   await ensurePrivateManagedDirectory(directory, "registration receipts", graphcraftHome);
   await writeAtomic(path2, previous, 384);
@@ -44181,19 +45471,19 @@ async function restoreRegistrationReceipt(graphcraftHome, host, previous) {
   return "The previous registration receipt was restored.";
 }
 async function readRegistrationReceiptBytes(graphcraftHome, host) {
-  const directory = join16(graphcraftHome, "registrations");
+  const directory = join17(graphcraftHome, "registrations");
   const directoryKind = await runtimeDirectoryKind(directory);
   if (directoryKind === "missing") return void 0;
   await ensurePrivateManagedDirectory(directory, "registration receipts", graphcraftHome);
   if (!await managedDirectoryMatches(directory, 448)) {
     throw new Error("The managed Graphcraft registration receipts directory is unsafe");
   }
-  const path2 = join16(directory, `${host}.json`);
+  const path2 = join17(directory, `${host}.json`);
   await hardenPrivateFile(path2, graphcraftHome);
   const source = await readRegularFile(path2, 384, REGISTRATION_RECEIPT_MAX_BYTES, graphcraftHome);
   if (source) return source;
   try {
-    await lstat13(path2);
+    await lstat14(path2);
   } catch (error51) {
     if (error51.code === "ENOENT") return void 0;
     throw error51;
@@ -44233,7 +45523,7 @@ function isManagedLegacyGraphcraftRuntime(graphcraftHome, runtimePath, runtimeSh
 async function verifiedLegacyRuntimePath(graphcraftHome, registration) {
   if (registration?.command !== "node" || registration.args.length !== 1 || !isAbsolute11(registration.args[0]))
     return void 0;
-  const runtimePath = resolve16(registration.args[0]);
+  const runtimePath = resolve17(registration.args[0]);
   if (!legacyStagedRuntimePaths(graphcraftHome).some(
     (candidate) => sameRuntimePath(runtimePath, candidate)
   ))
@@ -44249,11 +45539,11 @@ function registrationUsesRuntime(registration, runtimePath) {
   return runtimePath !== void 0 && registration?.command === "node" && registration.args.length === 1 && sameRuntimePath(registration.args[0], runtimePath);
 }
 function legacyStagedRuntimePaths(graphcraftHome) {
-  return ["0.1.0", "0.1.1"].map((version2) => join16(graphcraftHome, "runtime", version2, "mcp.mjs"));
+  return ["0.1.0", "0.1.1"].map((version2) => join17(graphcraftHome, "runtime", version2, "mcp.mjs"));
 }
 async function readManagedRuntimeFile(graphcraftHome, runtimePath, expectedMode) {
-  const runtimeRoot = join16(graphcraftHome, "runtime");
-  const runtimeDirectory = dirname14(runtimePath);
+  const runtimeRoot = join17(graphcraftHome, "runtime");
+  const runtimeDirectory = dirname15(runtimePath);
   if (await runtimeDirectoryKind(runtimeRoot) !== "directory" || await runtimeDirectoryKind(runtimeDirectory) !== "directory")
     return void 0;
   try {
@@ -44273,12 +45563,12 @@ async function readManagedRuntimeFile(graphcraftHome, runtimePath, expectedMode)
 }
 function receiptRuntimePath(graphcraftHome, receipt) {
   if (!receipt) return void 0;
-  const expectedPath = join16(graphcraftHome, "runtime", receipt.graphcraftVersion, "mcp.mjs");
+  const expectedPath = join17(graphcraftHome, "runtime", receipt.graphcraftVersion, "mcp.mjs");
   return sameRuntimePath(receipt.runtimePath, expectedPath) ? expectedPath : void 0;
 }
 async function verifiedCurrentBundledRuntimePath(graphcraftHome, bundled) {
   const { runtimeRoot, runtimeDirectory } = runtimePublicationPaths(graphcraftHome);
-  return await managedDirectoryMatches(runtimeRoot, 448) && await runtimePairMatches(runtimeDirectory, bundled) ? join16(runtimeDirectory, bundled.manifest.runtimeFile) : void 0;
+  return await managedDirectoryMatches(runtimeRoot, 448) && await runtimePairMatches(runtimeDirectory, bundled) ? join17(runtimeDirectory, bundled.manifest.runtimeFile) : void 0;
 }
 async function configureHost(host, mcpPath, options) {
   const graphcraftHome = resolveGraphcraftHome(options.graphcraftHome);
@@ -44286,7 +45576,7 @@ async function configureHost(host, mcpPath, options) {
   const runner = options.runner ?? defaultHostCommandRunner;
   const bundledMcpPath = mcpPath ?? await resolveBundledMcpPath();
   const bundledRuntime = await loadBundledMcpRuntime(bundledMcpPath);
-  const runtimePath = join16(graphcraftHome, "runtime", GRAPHCRAFT_VERSION, "mcp.mjs");
+  const runtimePath = join17(graphcraftHome, "runtime", GRAPHCRAFT_VERSION, "mcp.mjs");
   const expectedRegistration = { command: "node", args: [runtimePath] };
   const previousReceipt = await readRegistrationReceipt(graphcraftHome, host);
   const knownPreviousRuntimePath = await verifiedReceiptRuntimePath(
@@ -44415,7 +45705,7 @@ async function uninstallHost(host, options = {}) {
   const runner = options.runner ?? defaultHostCommandRunner;
   const receipt = await readRegistrationReceipt(graphcraftHome, host);
   const recordedRuntimePath = receiptRuntimePath(graphcraftHome, receipt);
-  const inspectionRuntimePath = recordedRuntimePath ?? join16(graphcraftHome, "runtime", GRAPHCRAFT_VERSION, "mcp.mjs");
+  const inspectionRuntimePath = recordedRuntimePath ?? join17(graphcraftHome, "runtime", GRAPHCRAFT_VERSION, "mcp.mjs");
   const removed = await withPrivateHostCommandCwd(async (cwd) => {
     const registration = await inspectHostRegistration(
       host,
@@ -44461,7 +45751,7 @@ async function uninstallHost(host, options = {}) {
     }
     return await removeHostRegistration(host, runner, cwd);
   }, options.hostCommandCwdCreatedBoundary);
-  await rm6(join16(graphcraftHome, "registrations", `${host}.json`), { force: true });
+  await rm7(join17(graphcraftHome, "registrations", `${host}.json`), { force: true });
   return { host, removed };
 }
 function parseVersion(value) {
@@ -44518,12 +45808,12 @@ async function installationDiagnostics(options = {}) {
   const expectedSource = options.mcpPath ?? await resolveBundledMcpPath();
   const bundled = await loadBundledMcpRuntime(expectedSource);
   const expectedSha256 = bundled.manifest.sha256;
-  const runtimeRoot = join16(graphcraftHome, "runtime");
-  const runtimeDirectory = join16(runtimeRoot, GRAPHCRAFT_VERSION);
-  const runtimePath = join16(runtimeDirectory, "mcp.mjs");
+  const runtimeRoot = join17(graphcraftHome, "runtime");
+  const runtimeDirectory = join17(runtimeRoot, GRAPHCRAFT_VERSION);
+  const runtimePath = join17(runtimeDirectory, "mcp.mjs");
   const runtimeDirectoryState = await runtimeDirectoryKind(runtimeDirectory);
   const safeRuntimeDirectories = await managedDirectoryMatches(runtimeRoot, 448) && await managedDirectoryMatches(runtimeDirectory, 448);
-  const manifest2 = safeRuntimeDirectories ? await readRuntimeManifest(join16(runtimeDirectory, RUNTIME_MANIFEST)) : void 0;
+  const manifest2 = safeRuntimeDirectories ? await readRuntimeManifest(join17(runtimeDirectory, RUNTIME_MANIFEST)) : void 0;
   const actualRuntime = safeRuntimeDirectories ? await readRegularFile(runtimePath, 384, MANAGED_RUNTIME_MAX_BYTES, graphcraftHome) : void 0;
   const actualSha256 = actualRuntime ? sha256(actualRuntime) : void 0;
   const runtimeCurrent = safeRuntimeDirectories && await runtimePairMatches(runtimeDirectory, bundled);
@@ -44769,7 +46059,7 @@ function renderRunInspection(input) {
     `Governance    ${input.graph.controlEdges.length} control edges; ${input.contract.acceptanceAnchors.length} anchors`,
     `Revisions     ${input.graph.revision}; ${input.graphHistory.length} amendments`,
     `Artifacts     ${input.artifactInventory.storedBytes}/${input.artifactInventory.sourceBytes} bytes stored; ${input.artifactInventory.omittedBytes} omitted across ${input.artifactInventory.entries.length} entries`,
-    `Durable files ${join16(input.contract.repository.root, ".graphcraft", "runs", input.state.runId)}`
+    `Durable files ${join17(input.contract.repository.root, ".graphcraft", "runs", input.state.runId)}`
   ].join("\n");
 }
 async function loadRunList(cwd) {
@@ -45020,27 +46310,38 @@ var program2 = new Command().name("graphcraft").description("Progress-aware exec
 async function benchmarkSourceIdentity() {
   if (true) {
     return BenchmarkSourceIdentitySchema.parse({
-      commitSha: "0008e2de1edc58c22b76f4b7cebcc0b009bac408",
+      commitSha: "5d0f0ce00155b5d6cbe1787a5926d5db2d114d5d",
       dirty: false,
       dirtyStatusDigest: false ? null : null
     });
   }
-  let candidate = dirname15(fileURLToPath2(import.meta.url));
+  let candidate = dirname16(fileURLToPath2(import.meta.url));
   while (true) {
     try {
-      const metadata = JSON.parse(await readFile5(join17(candidate, "package.json"), "utf8"));
+      const metadata = JSON.parse(await readFile5(join18(candidate, "package.json"), "utf8"));
       if (metadata.name === "@tpypan/graphcraft")
         return await inspectBenchmarkSourceIdentity(candidate);
     } catch (error51) {
       if (error51.code !== "ENOENT") throw error51;
     }
-    const parent = dirname15(candidate);
+    const parent = dirname16(candidate);
     if (candidate === parent || candidate === parse3(candidate).root) break;
     candidate = parent;
   }
   throw new Error("Unable to locate the Graphcraft source repository for benchmark provenance");
 }
 var hostOption = new Option("--host <host>", "coding-agent host").choices(["codex", "claude"]).default("codex");
+async function benchmarkSuite(path2) {
+  return path2 === "stable-v1" ? BenchmarkSuiteSchema.parse(stable_v1_default) : await loadBenchmarkSuite(path2);
+}
+async function withBenchmarkBlindingKey(operation) {
+  const key = await readBenchmarkBlindingKeyFromStdin(process.stdin);
+  try {
+    return await operation(key);
+  } finally {
+    key.fill(0);
+  }
+}
 function collectScope(value, previous) {
   return [...previous ?? [], value];
 }
@@ -45092,7 +46393,7 @@ program2.command("benchmark").description("Run a randomized matched Graphcraft a
   ])
 ).option("--dry-run", "validate and print the randomized schedule without model calls").action(
   async (suitePath, options) => {
-    const suite = suitePath === "stable-v1" ? BenchmarkSuiteSchema.parse(stable_v1_default) : await loadBenchmarkSuite(suitePath);
+    const suite = await benchmarkSuite(suitePath);
     const hosts = options.host === "both" ? ["codex", "claude"] : [options.host];
     const repetitions = options.repetitions ? Number(options.repetitions) : void 0;
     if (repetitions !== void 0 && (!Number.isInteger(repetitions) || repetitions <= 0))
@@ -45131,8 +46432,8 @@ program2.command("benchmark").description("Run a randomized matched Graphcraft a
       policies[host] = { model: model.trim(), effort: options.effort };
     }
     const timestamp = (/* @__PURE__ */ new Date()).toISOString().replaceAll(/[:.]/g, "-");
-    const outputPath = resolve17(
-      options.output ?? join17(options.cwd, ".graphcraft", "benchmarks", suite.id, `${timestamp}.json`)
+    const outputPath = resolve18(
+      options.output ?? join18(options.cwd, ".graphcraft", "benchmarks", suite.id, `${timestamp}.json`)
     );
     const adapters = Object.fromEntries(
       hosts.map((host) => [host, createAdapter(host, policies[host])])
@@ -45160,6 +46461,49 @@ program2.command("benchmark").description("Run a randomized matched Graphcraft a
     }
     console.log(
       JSON.stringify({ outputPath: result.outputPath, summary: result.report.summary }, null, 2)
+    );
+  }
+);
+program2.command("benchmark-review").description("Export deterministic opaque packets for blinded benchmark defect review").argument("<report>", "complete schema-3 benchmark report").option("--suite <suite>", "exact benchmark suite JSON", "stable-v1").requiredOption(
+  "--blinding-key-stdin",
+  "read the 32-byte hexadecimal blinding key from standard input"
+).requiredOption("--output <path>", "separate blinded-review JSON path").action(
+  async (report, options) => {
+    console.log(
+      JSON.stringify(
+        await withBenchmarkBlindingKey(
+          async (blindingKey) => await exportBlindedBenchmarkReview({
+            reportPath: report,
+            suite: await benchmarkSuite(options.suite),
+            blindingKey,
+            outputPath: options.output
+          })
+        ),
+        null,
+        2
+      )
+    );
+  }
+);
+program2.command("benchmark-report").description("Render a validated benchmark report from raw evidence and blinded labels").argument("<report>", "complete schema-3 benchmark report").option("--suite <suite>", "exact benchmark suite JSON", "stable-v1").requiredOption(
+  "--blinding-key-stdin",
+  "read the same 32-byte hexadecimal blinding key from standard input"
+).requiredOption("--labels <path>", "completed digest-bound review-label JSON").requiredOption("--output <path>", "separate Markdown report path").action(
+  async (report, options) => {
+    console.log(
+      JSON.stringify(
+        await withBenchmarkBlindingKey(
+          async (blindingKey) => await renderBenchmarkPublicationReport({
+            reportPath: report,
+            suite: await benchmarkSuite(options.suite),
+            blindingKey,
+            labelsPath: options.labels,
+            outputPath: options.output
+          })
+        ),
+        null,
+        2
+      )
     );
   }
 );
