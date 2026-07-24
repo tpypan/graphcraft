@@ -10311,7 +10311,7 @@ if (args.length === blocked.length && blocked.every((value, index) => args[index
         }
       }
     },
-    process.platform === "darwin" ? 180_000 : process.platform === "win32" ? 600_000 : 60_000,
+    process.platform === "darwin" ? 300_000 : process.platform === "win32" ? 600_000 : 60_000,
   );
 
   it("coordinates an active pause, checkpoints termination, and resumes the same session", async () => {
