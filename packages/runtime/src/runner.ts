@@ -39,6 +39,7 @@ import {
   type HostTermination,
   type HeldOutProbePlan,
   type InvocationRecord,
+  type InterruptionCause,
   type OptimizationDecision,
   type PlannedGraphNode,
   type ProbeResult,
@@ -89,6 +90,7 @@ import {
   performAtomicPush,
   reconcileAtomicCommit,
   reconcileAtomicPush,
+  RunWorkspaceReconciliationError,
   type RunWorkspace,
 } from "./repository.ts";
 import {
@@ -660,6 +662,7 @@ async function executeWorker(input: {
   let result: WorkerResult | undefined;
   let error: string | undefined;
   let errorCause: "host_crash" | "timeout" | undefined;
+  let interruptionCause: InterruptionCause | undefined;
   let capabilityDiagnostic: RequiredHostCapabilityDiagnostic | undefined;
   let termination: HostTermination | undefined;
   let usageReceipts = 0;
@@ -747,11 +750,20 @@ async function executeWorker(input: {
       }
       error = cause instanceof Error ? cause.message : String(cause);
       const capabilityError = cause instanceof HostCapabilityAdmissionError;
-      if (!capabilityError) errorCause = "host_crash";
+      if (input.signal.aborted) {
+        interruptionCause = interruptionReason(input.signal.reason).cause;
+        if (interruptionCause === "timeout") errorCause = "timeout";
+      } else if (!capabilityError) {
+        errorCause = "host_crash";
+      }
       const event: HostEvent = {
         type: "error",
         message: error,
-        ...(errorCause ? { cause: errorCause } : {}),
+        ...(interruptionCause
+          ? { cause: interruptionCause }
+          : errorCause
+            ? { cause: errorCause }
+            : {}),
       };
       artifact = await input.store.appendInvocationEvent(invocationId, event);
       if (capabilityError) capabilityDiagnostic = cause.diagnostic;
@@ -800,6 +812,7 @@ async function executeWorker(input: {
     if (event.type === "error") {
       error = event.message;
       if (event.cause === "host_crash" || event.cause === "timeout") errorCause = event.cause;
+      if (event.cause && event.cause !== "host_crash") interruptionCause = event.cause;
     }
   }
   if (hostStarted && usageReceipts === 0 && !capabilityDiagnostic)
@@ -823,8 +836,9 @@ async function executeWorker(input: {
       nodeId: input.node.id,
       artifact,
       success: Boolean(result) && !error && !termination,
-      interrupted: Boolean(termination),
+      interrupted: Boolean(termination) || Boolean(interruptionCause) || input.signal.aborted,
       ...(termination ? { termination } : {}),
+      ...(interruptionCause ? { interruptionCause } : {}),
       ...(errorCause ? { errorCause } : {}),
       ...(capabilityDiagnostic
         ? { reason: capabilityDiagnostic.detail, capabilityDiagnostic }
@@ -1250,6 +1264,7 @@ async function runSemanticVerification(input: {
     beforeScope = await captureWorkspaceScopeSnapshot(
       input.workspace.path,
       input.contract.scope.exclude,
+      input.signal,
     );
   } catch (error) {
     const failure = error instanceof Error ? error : new Error(String(error));
@@ -1409,8 +1424,10 @@ async function runSemanticVerification(input: {
     afterScope = await captureWorkspaceScopeSnapshot(
       input.workspace.path,
       input.contract.scope.exclude,
+      input.signal,
     );
   } catch (error) {
+    if (input.signal.aborted) throw error;
     return failVerification(error);
   }
   const beforeDigest = beforeScope.digest;
@@ -2383,8 +2400,10 @@ async function executeReadOnlyProgressProbes(input: {
       baseline = await captureWorkspaceScopeSnapshot(
         input.workspace.path,
         input.contract.scope.exclude,
+        input.signal,
       );
     } catch (error) {
+      if (input.signal.aborted) return { status: "interrupted" };
       return {
         status: "failed",
         reason: `Workspace scope inspection failed before progress probes for node ${input.node.id}: ${(error as Error).message}`,
@@ -2448,8 +2467,10 @@ async function executeReadOnlyProgressProbes(input: {
     current = await captureWorkspaceScopeSnapshot(
       input.workspace.path,
       input.contract.scope.exclude,
+      input.signal,
     );
   } catch (error) {
+    if (input.signal.aborted) return { status: "interrupted" };
     return {
       status: "failed",
       reason: `Workspace scope inspection failed after progress probes for node ${input.node.id}: ${(error as Error).message}`,
@@ -2969,6 +2990,7 @@ async function reconcileProgressProbeScopeCheckpoints(input: {
   graph: Graph;
   state: RunState;
   workspace: RunWorkspace;
+  signal: AbortSignal;
 }): Promise<RunState | undefined> {
   const events = await input.store.loadEvents();
   const activeNodes = new Map(
@@ -3178,8 +3200,10 @@ async function reconcileProgressProbeScopeCheckpoints(input: {
         current = await captureWorkspaceScopeSnapshot(
           input.workspace.path,
           input.contract.scope.exclude,
+          input.signal,
         );
-      } catch {
+      } catch (error) {
+        if (input.signal.aborted) throw error;
         await ensureProgressProbeRunBlocker({ store: input.store, blocker });
         return await input.store.loadState();
       }
@@ -3204,8 +3228,10 @@ async function reconcileProgressProbeScopeCheckpoints(input: {
       current = await captureWorkspaceScopeSnapshot(
         input.workspace.path,
         input.contract.scope.exclude,
+        input.signal,
       );
     } catch (error) {
+      if (input.signal.aborted) throw error;
       const reason = `Workspace scope inspection failed while recovering progress probes for node ${active.node.id}: ${(error as Error).message}`;
       return await blockProgressProbeRecovery({
         store: input.store,
@@ -3304,8 +3330,13 @@ async function executeWorkNode(input: {
     scopeBaseline =
       input.recoveryScopeBaseline ??
       observedBaselineScope ??
-      (await captureWorkspaceScopeSnapshot(input.workspace.path, input.contract.scope.exclude));
+      (await captureWorkspaceScopeSnapshot(
+        input.workspace.path,
+        input.contract.scope.exclude,
+        input.signal,
+      ));
   } catch (error) {
+    if (input.signal.aborted) return { status: "interrupted", nodeId: input.node.id, artifact: "" };
     const reason = `Workspace scope inspection failed before node ${input.node.id}: ${(error as Error).message}`;
     await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason });
     return { status: "failed", nodeId: input.node.id, reason };
@@ -3342,6 +3373,7 @@ async function executeWorkNode(input: {
     currentScope = await captureWorkspaceScopeSnapshot(
       input.workspace.path,
       input.contract.scope.exclude,
+      input.signal,
     );
     const audit = auditWorkspaceScope({
       contract: input.contract,
@@ -3370,6 +3402,13 @@ async function executeWorkNode(input: {
       return { status: "failed", nodeId: input.node.id, reason };
     }
   } catch (error) {
+    if (input.signal.aborted)
+      return {
+        status: "interrupted",
+        nodeId: input.node.id,
+        ...(worker.termination ? { termination: worker.termination } : {}),
+        artifact: worker.artifact,
+      };
     const reason = `Workspace scope inspection failed after node ${input.node.id}: ${(error as Error).message}`;
     await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason });
     return { status: "failed", nodeId: input.node.id, reason };
@@ -3780,65 +3819,6 @@ export async function executeRun(input: {
     await recordRunApprovalDecisions(input.store, graph);
     state = await input.store.loadState();
 
-    let workspace: RunWorkspace | undefined;
-    const pendingScopeStarts = activeProgressProbeScopeStarts(
-      await input.store.loadEvents(),
-      graph,
-      state,
-    );
-    if (pendingScopeStarts.length > 0) {
-      try {
-        workspace = await input.store.loadWorkspace<RunWorkspace>();
-      } catch (error) {
-        const pendingScopeStart = pendingScopeStarts[0]!;
-        const nodeId =
-          typeof pendingScopeStart.data.nodeId === "string"
-            ? pendingScopeStart.data.nodeId
-            : undefined;
-        const stage = progressProbeStage(pendingScopeStart.data.stage);
-        const checkpointId =
-          typeof pendingScopeStart.data.checkpointId === "string" &&
-          pendingScopeStart.data.checkpointId.length > 0
-            ? pendingScopeStart.data.checkpointId
-            : pendingScopeStart.hash;
-        const reason = `Graphcraft cannot recover progress-probe scope checkpoint ${checkpointId} because its durable workspace is unavailable: ${(error as Error).message}`;
-        return await blockProgressProbeRecovery({
-          store: input.store,
-          ...(nodeId && state.nodes[nodeId] ? { nodeId } : {}),
-          blocker: progressProbeRecoveryBlocker({
-            reason,
-            checkpointId,
-            ...(stage ? { stage } : {}),
-          }),
-        });
-      }
-      const scopeRecovery = await reconcileProgressProbeScopeCheckpoints({
-        store: input.store,
-        contract,
-        graph,
-        state,
-        workspace,
-      });
-      if (scopeRecovery) return scopeRecovery;
-    }
-
-    const recoveredFailureBlocker = await recoverDurableNodeFailureBlocker(input.store, state);
-    if (recoveredFailureBlocker) return recoveredFailureBlocker;
-    const interruptedNodeIds = Object.entries(state.nodes)
-      .filter(([, nodeState]) => nodeState.status === "running")
-      .map(([nodeId]) => nodeId);
-    if (state.status === "blocked") {
-      for (const [nodeId, nodeState] of Object.entries(state.nodes)) {
-        if (nodeState.status === "failed") {
-          await input.store.append("runtime", "node.reset", {
-            nodeId,
-            reason: "Resume requested after a blocker or environment change",
-          });
-        }
-      }
-      state = await input.store.loadState();
-    }
-
     const finishInterruption = async (
       nodeIds?: string | string[],
       termination?: HostTermination,
@@ -3887,6 +3867,76 @@ export async function executeRun(input: {
       return await input.store.loadState();
     };
 
+    let workspace: RunWorkspace | undefined;
+    const pendingScopeStarts = activeProgressProbeScopeStarts(
+      await input.store.loadEvents(),
+      graph,
+      state,
+    );
+    if (pendingScopeStarts.length > 0) {
+      try {
+        workspace = await input.store.loadWorkspace<RunWorkspace>();
+      } catch (error) {
+        const pendingScopeStart = pendingScopeStarts[0]!;
+        const nodeId =
+          typeof pendingScopeStart.data.nodeId === "string"
+            ? pendingScopeStart.data.nodeId
+            : undefined;
+        const stage = progressProbeStage(pendingScopeStart.data.stage);
+        const checkpointId =
+          typeof pendingScopeStart.data.checkpointId === "string" &&
+          pendingScopeStart.data.checkpointId.length > 0
+            ? pendingScopeStart.data.checkpointId
+            : pendingScopeStart.hash;
+        const reason = `Graphcraft cannot recover progress-probe scope checkpoint ${checkpointId} because its durable workspace is unavailable: ${(error as Error).message}`;
+        return await blockProgressProbeRecovery({
+          store: input.store,
+          ...(nodeId && state.nodes[nodeId] ? { nodeId } : {}),
+          blocker: progressProbeRecoveryBlocker({
+            reason,
+            checkpointId,
+            ...(stage ? { stage } : {}),
+          }),
+        });
+      }
+      let scopeRecovery: RunState | undefined;
+      try {
+        scopeRecovery = await reconcileProgressProbeScopeCheckpoints({
+          store: input.store,
+          contract,
+          graph,
+          state,
+          workspace,
+          signal,
+        });
+      } catch (error) {
+        if (!signal.aborted) throw error;
+        return await finishInterruption(
+          Object.entries(state.nodes)
+            .filter(([, nodeState]) => nodeState.status === "running")
+            .map(([nodeId]) => nodeId),
+        );
+      }
+      if (scopeRecovery) return scopeRecovery;
+    }
+
+    const recoveredFailureBlocker = await recoverDurableNodeFailureBlocker(input.store, state);
+    if (recoveredFailureBlocker) return recoveredFailureBlocker;
+    const interruptedNodeIds = Object.entries(state.nodes)
+      .filter(([, nodeState]) => nodeState.status === "running")
+      .map(([nodeId]) => nodeId);
+    if (state.status === "blocked") {
+      for (const [nodeId, nodeState] of Object.entries(state.nodes)) {
+        if (nodeState.status === "failed") {
+          await input.store.append("runtime", "node.reset", {
+            nodeId,
+            reason: "Resume requested after a blocker or environment change",
+          });
+        }
+      }
+      state = await input.store.loadState();
+    }
+
     let adapterReady = false;
     let adapterProbeTermination: HostTermination | undefined;
     const ensureAdapterReady = async (): Promise<boolean> => {
@@ -3917,13 +3967,21 @@ export async function executeRun(input: {
       return signal.aborted
         ? await finishInterruption(undefined, adapterProbeTermination)
         : await input.store.loadState();
-    if (!workspace)
+    if (!workspace) {
       try {
         workspace = await input.store.loadWorkspace<RunWorkspace>();
       } catch {
-        workspace = await createRunWorkspace(contract);
-        await input.store.writeWorkspace(workspace);
+        try {
+          workspace = await createRunWorkspace(contract, { signal });
+          await input.store.writeWorkspace(workspace);
+        } catch (error) {
+          if (signal.aborted) return await finishInterruption();
+          if (!(error instanceof RunWorkspaceReconciliationError)) throw error;
+          await input.store.append("runtime", "run.blocked", { reason: error.message });
+          return await input.store.loadState();
+        }
       }
+    }
     const deferLifecycleConsistency = async (
       node: GraphNode,
       error: GitHubLifecycleConsistencyError,
@@ -4660,8 +4718,10 @@ export async function executeRun(input: {
             verificationScopeCurrent = await captureWorkspaceScopeSnapshot(
               workspace.path,
               contract.scope.exclude,
+              signal,
             );
           } catch (error) {
+            if (signal.aborted) return await finishInterruption(current.id);
             const reason = `Workspace scope inspection failed after held-out integrity verification for node ${current.id}: ${(error as Error).message}`;
             await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
             await input.store.append("runtime", "run.blocked", { reason });

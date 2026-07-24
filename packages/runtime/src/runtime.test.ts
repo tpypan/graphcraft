@@ -925,6 +925,39 @@ if (blockedPrefix.every((value, index) => args[index] === value)) {
   }
 }
 
+async function blockingScopeGit(repository: string): Promise<{
+  path: string;
+  marker: string;
+}> {
+  const originalGit = await resolveTrustedExecutable("git", { untrustedCwd: repository });
+  const fakeBin = join(repository, "..", `.scope-cancellation-bin-${randomUUID()}`);
+  const fakeGit = join(fakeBin, "git");
+  const marker = join(repository, "..", `scope-capture-started-${randomUUID()}`);
+  await mkdir(fakeBin);
+  await writeFile(
+    fakeGit,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const args = process.argv.slice(2);
+const blocked = ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"];
+if (args.length === blocked.length && blocked.every((value, index) => args[index] === value)) {
+  fs.writeFileSync(${JSON.stringify(marker)}, "started\\n");
+  setInterval(() => {}, 1_000);
+} else {
+  const result = spawnSync(${JSON.stringify(originalGit)}, args, { stdio: "inherit" });
+  if (result.error) throw result.error;
+  process.exit(result.status ?? 1);
+}
+`,
+  );
+  await chmod(fakeGit, 0o700);
+  return {
+    path: `${fakeBin}${delimiter}${process.env.PATH ?? ""}`,
+    marker,
+  };
+}
+
 class OversizedResultAdapter extends FakeAdapter {
   readonly hostileValue = "hostile-worker-result-".repeat(2_000);
 
@@ -3404,7 +3437,7 @@ process.stdin.on("end", () => {
     });
   });
 
-  it("audits a mutating progress probe even when cancellation arrives after its write", async () => {
+  it("re-audits a mutating progress probe after cancellation arrives after its write", async () => {
     const repository = await createRepository();
     const adapter = new FakeAdapter(async () => undefined);
     const created = await createRun("Implement a substantial cancellation-safe feature", {
@@ -3461,14 +3494,28 @@ process.stdin.on("end", () => {
     );
 
     interruption.abort({ cause: "cancellation", reason: "Cancel after the probe mutation" });
-    const state = await executing;
-    const events = await created.store.loadEvents();
-    const started = events.findLast(
+    const paused = await executing;
+    const pausedEvents = await created.store.loadEvents();
+    const started = pausedEvents.findLast(
       ({ type, data }) =>
         type === "scope.started" &&
         data.nodeId === "implement" &&
         data.stage === "progress_baseline",
     );
+    expect(paused.status).toBe("paused");
+    expect(paused.stopReason).toBe("Cancel after the probe mutation");
+    expect(adapter.calls).toEqual(["investigate"]);
+    expect(
+      pausedEvents.find(
+        ({ type, data }) =>
+          type === "scope.checked" && data.checkpointId === started?.data.checkpointId,
+      ),
+    ).toBeUndefined();
+    expect(pausedEvents.find(({ type }) => type === "node.failed")).toBeUndefined();
+    expect(pausedEvents.find(({ type }) => type === "run.blocked")).toBeUndefined();
+
+    const state = await executeRun({ store: created.store, adapter });
+    const events = await created.store.loadEvents();
     const checked = events.findLast(
       ({ type, data }) =>
         type === "scope.checked" &&
@@ -9437,6 +9484,168 @@ if (args.length === blocked.length && blocked.every((value, index) => args[index
             outcome: "checkpointed",
           },
         });
+      } finally {
+        if (originalPath === undefined) delete process.env.PATH;
+        else process.env.PATH = originalPath;
+      }
+    },
+    60_000,
+  );
+
+  it.skipIf(process.platform === "win32").each([
+    ["pause", "Pause during workspace scope capture"],
+    ["stop", "Stop during workspace scope capture"],
+    ["cancellation", "Cancel during workspace scope capture"],
+  ] as const)(
+    "settles %s during pre-worker workspace scope capture without recording a failure",
+    async (action, reason) => {
+      const repository = await createRepository();
+      const adapter = new FakeAdapter(async () => undefined);
+      const created = await createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+      });
+      const fake = await blockingScopeGit(repository);
+      const originalPath = process.env.PATH;
+      const cancellation = new AbortController();
+      process.env.PATH = fake.path;
+
+      try {
+        const execution = executeRun({
+          store: created.store,
+          adapter,
+          approve: true,
+          signal: cancellation.signal,
+        });
+        await waitFor(
+          () =>
+            stat(fake.marker).then(
+              () => true,
+              () => false,
+            ),
+          30_000,
+        );
+        const startedAt = performance.now();
+        let settledState;
+        if (action === "cancellation") {
+          cancellation.abort({ cause: "cancellation", reason });
+          settledState = await execution;
+        } else {
+          const [requestedState, executionState] = await Promise.all([
+            requestRunControl(created.store, action, reason, 5_000),
+            execution,
+          ]);
+          expect(requestedState.status).toBe(action === "pause" ? "paused" : "stopped");
+          settledState = executionState;
+        }
+
+        expect(performance.now() - startedAt).toBeLessThan(5_000);
+        expect(settledState.status).toBe(action === "stop" ? "stopped" : "paused");
+        expect(settledState.stopReason).toBe(reason);
+        expect(adapter.calls).toEqual([]);
+        const events = await created.store.loadEvents();
+        expect(events.find(({ type }) => type === "node.failed")).toBeUndefined();
+        expect(events.find(({ type }) => type === "run.blocked")).toBeUndefined();
+        expect(events.findLast(({ type }) => type === "control.applied")).toMatchObject({
+          data: {
+            action: action === "stop" ? "stop" : "pause",
+            cause:
+              action === "pause" ? "user_pause" : action === "stop" ? "user_stop" : "cancellation",
+            outcome: "checkpointed",
+          },
+        });
+      } finally {
+        if (originalPath === undefined) delete process.env.PATH;
+        else process.env.PATH = originalPath;
+      }
+    },
+    60_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "re-audits a completed worker result after scope capture is cancelled",
+    async () => {
+      const repository = await createRepository();
+      let fakePath: string | undefined;
+      const adapter = new FakeAdapter(async (request) => {
+        if (request.capsule.nodeId !== "investigate") return;
+        await writeFile(join(request.repositoryPath, "read-only-mutation.txt"), "mutated\n");
+        process.env.PATH = fakePath;
+      });
+      const created = await createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+        planner: adapter,
+      });
+      const fake = await blockingScopeGit(repository);
+      const originalPath = process.env.PATH;
+      fakePath = fake.path;
+      const cancellation = new AbortController();
+
+      try {
+        const execution = executeRun({
+          store: created.store,
+          adapter,
+          approve: true,
+          signal: cancellation.signal,
+        });
+        await waitFor(
+          () =>
+            stat(fake.marker).then(
+              () => true,
+              () => false,
+            ),
+          30_000,
+        );
+        const startedAt = performance.now();
+        cancellation.abort({
+          cause: "cancellation",
+          reason: "Cancel after worker result before scope audit",
+        });
+        const paused = await execution;
+
+        expect(performance.now() - startedAt).toBeLessThan(5_000);
+        expect(paused.status).toBe("paused");
+        expect(adapter.calls).toEqual(["investigate"]);
+        const pausedEvents = await created.store.loadEvents();
+        const invocation = pausedEvents.findLast(
+          ({ type, data }) => type === "invocation.finished" && data.nodeId === "investigate",
+        );
+        expect(invocation).toMatchObject({ data: { success: true } });
+        expect(
+          pausedEvents.find(
+            ({ type, data }) =>
+              type === "scope.checked" && data.invocationId === invocation?.data.invocationId,
+          ),
+        ).toBeUndefined();
+        expect(pausedEvents.find(({ type }) => type === "node.failed")).toBeUndefined();
+        expect(pausedEvents.find(({ type }) => type === "run.blocked")).toBeUndefined();
+
+        if (originalPath === undefined) delete process.env.PATH;
+        else process.env.PATH = originalPath;
+        const resumed = await executeRun({ store: created.store, adapter });
+
+        expect(resumed.status).toBe("blocked");
+        expect(resumed.stopReason).toMatch(/changed during read-only node investigate/);
+        expect(adapter.calls).toEqual(["investigate"]);
+        const resumedEvents = await created.store.loadEvents();
+        expect(
+          resumedEvents.findLast(
+            ({ type, data }) =>
+              type === "scope.checked" && data.invocationId === invocation?.data.invocationId,
+          ),
+        ).toMatchObject({
+          data: {
+            enforced: true,
+            audit: {
+              allowed: false,
+              violations: [expect.objectContaining({ kind: "read_only_write" })],
+            },
+          },
+        });
+        expect(
+          resumedEvents.find(
+            ({ type, data }) => type === "node.accepted" && data.nodeId === "investigate",
+          ),
+        ).toBeUndefined();
       } finally {
         if (originalPath === undefined) delete process.env.PATH;
         else process.env.PATH = originalPath;

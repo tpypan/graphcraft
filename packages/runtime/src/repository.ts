@@ -1,4 +1,4 @@
-import { appendFile, lstat, mkdir, readFile, readlink } from "node:fs/promises";
+import { appendFile, lstat, mkdir, readFile, readlink, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
   assertRepositoryFile,
@@ -327,13 +327,39 @@ async function ensureGraphcraftIgnored(
   }
   signal?.throwIfAborted();
   if (!content.split("\n").includes(".graphcraft/"))
-    await appendFile(excludePath, "\n.graphcraft/\n", "utf8");
+    await appendFile(excludePath, "\n.graphcraft/\n", {
+      encoding: "utf8",
+      ...(signal ? { signal } : {}),
+    });
+  signal?.throwIfAborted();
 }
 
 export interface RunWorkspace {
   path: string;
   branch: string;
   created: boolean;
+}
+
+export type RunWorkspaceCreationBoundary =
+  "after_parent_prepare" | "after_reconciliation" | "before_worktree_add" | "after_worktree_add";
+
+export interface RunWorkspaceCreationOptions {
+  signal?: AbortSignal;
+  boundary?: (point: RunWorkspaceCreationBoundary) => void | Promise<void>;
+}
+
+export class RunWorkspaceReconciliationError extends Error {
+  constructor(
+    readonly workspacePath: string,
+    detail: string,
+    options?: ErrorOptions,
+  ) {
+    super(
+      `Graphcraft found unsafe or ambiguous worktree state at ${workspacePath}: ${detail}. Existing Git state was preserved; resolve it before resuming`,
+      options,
+    );
+    this.name = "RunWorkspaceReconciliationError";
+  }
 }
 
 function slug(task: string): string {
@@ -346,31 +372,280 @@ function slug(task: string): string {
   );
 }
 
-export async function createRunWorkspace(contract: RunContract): Promise<RunWorkspace> {
+interface WorktreeRegistration {
+  path: string;
+  head?: string;
+  branch?: string;
+}
+
+type ReconciledWorkspaceCreationState =
+  { status: "absent" } | { status: "branch_only" } | { status: "ready" };
+
+function comparablePath(path: string): string {
+  const absolute = resolve(path);
+  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+}
+
+async function canonicalComparablePath(path: string, signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted();
+  try {
+    const canonical = await realpath(path);
+    signal?.throwIfAborted();
+    return comparablePath(canonical);
+  } catch (error) {
+    signal?.throwIfAborted();
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  try {
+    const canonicalParent = await realpath(dirname(path));
+    signal?.throwIfAborted();
+    return comparablePath(join(canonicalParent, basename(path)));
+  } catch (error) {
+    signal?.throwIfAborted();
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return comparablePath(path);
+  }
+}
+
+function parseWorktreeRegistrations(output: string): WorktreeRegistration[] {
+  const registrations: WorktreeRegistration[] = [];
+  let current: WorktreeRegistration | undefined;
+  for (const field of output.split("\0")) {
+    if (field.length === 0) {
+      if (current) registrations.push(current);
+      current = undefined;
+      continue;
+    }
+    const separator = field.indexOf(" ");
+    const name = separator === -1 ? field : field.slice(0, separator);
+    const value = separator === -1 ? "" : field.slice(separator + 1);
+    if (name === "worktree") {
+      if (current) throw new Error("Git returned overlapping worktree records");
+      if (!value) throw new Error("Git returned a worktree record without a path");
+      current = { path: value };
+      continue;
+    }
+    if (!current) throw new Error("Git returned a worktree field before its path");
+    if (name === "HEAD") current.head = value;
+    if (name === "branch") current.branch = value;
+  }
+  if (current) registrations.push(current);
+  return registrations;
+}
+
+async function branchSha(
+  repositoryPath: string,
+  branch: string,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
+  const ref = `refs/heads/${branch}`;
+  const output = await gitRaw(
+    repositoryPath,
+    ["for-each-ref", "--format=%(refname)%00%(objectname)", ref],
+    signal,
+  );
+  const matches = output
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => line.split("\0"))
+    .filter(([candidate]) => candidate === ref);
+  if (matches.length > 1 || matches.some(([, sha]) => !sha))
+    throw new Error(`Git returned an ambiguous ref inventory for ${ref}`);
+  return matches[0]?.[1];
+}
+
+async function canonicalGitCommonDirectory(
+  repositoryPath: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const value = await git(repositoryPath, ["rev-parse", "--git-common-dir"], signal);
+  signal?.throwIfAborted();
+  const path = isAbsolute(value) ? value : resolve(repositoryPath, value);
+  const canonical = await realpath(path);
+  signal?.throwIfAborted();
+  return comparablePath(canonical);
+}
+
+function workspaceStateError(
+  path: string,
+  detail: string,
+  cause?: unknown,
+): RunWorkspaceReconciliationError {
+  return new RunWorkspaceReconciliationError(path, detail, cause ? { cause } : undefined);
+}
+
+async function reconcileRunWorkspaceCreation(
+  contract: RunContract,
+  path: string,
+  branch: string,
+  signal?: AbortSignal,
+): Promise<ReconciledWorkspaceCreationState> {
+  signal?.throwIfAborted();
+  let pathStats: Awaited<ReturnType<typeof lstat>> | undefined;
+  try {
+    pathStats = await lstat(path);
+  } catch (error) {
+    signal?.throwIfAborted();
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+      throw workspaceStateError(path, "the intended path could not be inspected", error);
+  }
+  signal?.throwIfAborted();
+
+  let registrations: WorktreeRegistration[];
+  let expectedBranchSha: string | undefined;
+  try {
+    [registrations, expectedBranchSha] = await Promise.all([
+      gitRaw(contract.repository.root, ["worktree", "list", "--porcelain", "-z"], signal).then(
+        parseWorktreeRegistrations,
+      ),
+      branchSha(contract.repository.root, branch, signal),
+    ]);
+  } catch (error) {
+    signal?.throwIfAborted();
+    throw workspaceStateError(path, "Git could not inventory the intended path and branch", error);
+  }
+  signal?.throwIfAborted();
+
+  let targetPath: string;
+  try {
+    targetPath = await canonicalComparablePath(path, signal);
+  } catch (error) {
+    signal?.throwIfAborted();
+    throw workspaceStateError(path, "the intended path identity could not be resolved", error);
+  }
+  const targetRegistrations = registrations.filter(
+    (registration) => comparablePath(registration.path) === targetPath,
+  );
+  const expectedRef = `refs/heads/${branch}`;
+  const branchRegistrations = registrations.filter(
+    (registration) => registration.branch === expectedRef,
+  );
+
+  if (!pathStats && targetRegistrations.length === 0) {
+    if (branchRegistrations.length > 0)
+      throw workspaceStateError(path, "the intended branch is registered at another worktree");
+    if (!expectedBranchSha) return { status: "absent" };
+    if (expectedBranchSha === contract.repository.baseSha) return { status: "branch_only" };
+    throw workspaceStateError(
+      path,
+      `the unregistered intended branch does not point to approved base ${contract.repository.baseSha}`,
+    );
+  }
+
+  if (!pathStats)
+    throw workspaceStateError(path, "Git registers the intended path, but the path is missing");
+  if (!pathStats.isDirectory() || pathStats.isSymbolicLink())
+    throw workspaceStateError(path, "the intended path is not a plain directory");
+  if (targetRegistrations.length !== 1)
+    throw workspaceStateError(
+      path,
+      targetRegistrations.length === 0
+        ? "the intended path exists without an exact Git worktree registration"
+        : "Git reports duplicate registrations for the intended path",
+    );
+  if (branchRegistrations.length !== 1 || branchRegistrations[0] !== targetRegistrations[0])
+    throw workspaceStateError(path, "the intended branch is missing or registered elsewhere");
+  const registration = targetRegistrations[0]!;
+  if (registration.branch !== expectedRef)
+    throw workspaceStateError(path, "the registered worktree is on a different branch");
+  if (registration.head !== contract.repository.baseSha)
+    throw workspaceStateError(path, "the registered worktree HEAD differs from the approved base");
+  if (expectedBranchSha !== contract.repository.baseSha)
+    throw workspaceStateError(path, "the intended branch ref differs from the approved base");
+
+  try {
+    const topLevel = await git(path, ["rev-parse", "--show-toplevel"], signal);
+    if ((await canonicalComparablePath(topLevel, signal)) !== targetPath)
+      throw workspaceStateError(path, "the worktree top level differs from the intended path");
+    const currentBranch = await git(path, ["symbolic-ref", "--quiet", "--short", "HEAD"], signal);
+    if (currentBranch !== branch)
+      throw workspaceStateError(path, "the worktree checkout is on a different branch");
+    const head = await git(path, ["rev-parse", "HEAD"], signal);
+    if (head !== contract.repository.baseSha)
+      throw workspaceStateError(path, "the worktree checkout differs from the approved base");
+    const status = await gitRaw(
+      path,
+      ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching"],
+      signal,
+    );
+    if (status.length > 0)
+      throw workspaceStateError(
+        path,
+        "the worktree contains uncommitted or untracked changes, including ignored content",
+      );
+    const [sourceCommonDirectory, worktreeCommonDirectory] = await Promise.all([
+      canonicalGitCommonDirectory(contract.repository.root, signal),
+      canonicalGitCommonDirectory(path, signal),
+    ]);
+    if (sourceCommonDirectory !== worktreeCommonDirectory)
+      throw workspaceStateError(path, "the worktree belongs to a different common Git directory");
+  } catch (error) {
+    signal?.throwIfAborted();
+    if (error instanceof RunWorkspaceReconciliationError) throw error;
+    throw workspaceStateError(path, "the registered worktree could not be validated", error);
+  }
+  signal?.throwIfAborted();
+  return { status: "ready" };
+}
+
+async function crossRunWorkspaceCreationBoundary(
+  options: RunWorkspaceCreationOptions,
+  point: RunWorkspaceCreationBoundary,
+): Promise<void> {
+  await options.boundary?.(point);
+  options.signal?.throwIfAborted();
+}
+
+export async function createRunWorkspace(
+  contract: RunContract,
+  options: RunWorkspaceCreationOptions = {},
+): Promise<RunWorkspace> {
   const branch = `graphcraft/${contract.runId.slice(0, 8)}-${slug(contract.task)}`;
   const parent = join(
     dirname(contract.repository.root),
     `.${basename(contract.repository.root)}-graphcraft-worktrees`,
   );
   const path = join(parent, contract.runId);
+  options.signal?.throwIfAborted();
   await mkdir(parent, { recursive: true });
-  const registered = await git(contract.repository.root, ["worktree", "list", "--porcelain"]);
-  if (registered.includes(`worktree ${path}`)) return { path, branch, created: false };
+  options.signal?.throwIfAborted();
+  let parentStats: Awaited<ReturnType<typeof lstat>>;
+  try {
+    parentStats = await lstat(parent);
+  } catch (error) {
+    options.signal?.throwIfAborted();
+    throw workspaceStateError(path, "the worktree parent could not be inspected", error);
+  }
+  if (!parentStats.isDirectory() || parentStats.isSymbolicLink())
+    throw workspaceStateError(path, "the worktree parent is not a plain directory");
+  await crossRunWorkspaceCreationBoundary(options, "after_parent_prepare");
 
-  const branchExists = await git(contract.repository.root, [
-    "show-ref",
-    "--verify",
-    "--quiet",
-    `refs/heads/${branch}`,
-  ])
-    .then(() => true)
-    .catch(() => false);
-  await git(
-    contract.repository.root,
-    branchExists
-      ? ["worktree", "add", path, branch]
-      : ["worktree", "add", "-b", branch, path, contract.repository.baseSha],
-  );
+  const before = await reconcileRunWorkspaceCreation(contract, path, branch, options.signal);
+  await crossRunWorkspaceCreationBoundary(options, "after_reconciliation");
+  if (before.status === "ready") return { path, branch, created: false };
+
+  await crossRunWorkspaceCreationBoundary(options, "before_worktree_add");
+  let commandError: unknown;
+  try {
+    await git(
+      contract.repository.root,
+      before.status === "branch_only"
+        ? ["worktree", "add", path, branch]
+        : ["worktree", "add", "-b", branch, path, contract.repository.baseSha],
+      options.signal,
+    );
+  } catch (error) {
+    options.signal?.throwIfAborted();
+    commandError = error;
+  }
+  await crossRunWorkspaceCreationBoundary(options, "after_worktree_add");
+  const after = await reconcileRunWorkspaceCreation(contract, path, branch, options.signal);
+  if (after.status !== "ready")
+    throw workspaceStateError(
+      path,
+      `worktree creation stopped in the safe ${after.status.replace("_", "-")} state`,
+      commandError,
+    );
   return { path, branch, created: true };
 }
 

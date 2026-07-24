@@ -50,8 +50,18 @@ export interface WorkspaceScopeAudit {
 
 const maximumChangedPaths = 10_000;
 
-async function gitOutput(repositoryPath: string, args: string[]): Promise<string> {
-  const result = await runProcess("git", args, { cwd: repositoryPath, timeoutMs: 120_000 });
+async function gitOutput(
+  repositoryPath: string,
+  args: string[],
+  signal?: AbortSignal,
+): Promise<string> {
+  signal?.throwIfAborted();
+  const result = await runProcess("git", args, {
+    cwd: repositoryPath,
+    timeoutMs: 120_000,
+    ...(signal ? { signal } : {}),
+  });
+  signal?.throwIfAborted();
   if (result.exitCode !== 0)
     throw new Error(result.stderr.trim() || `git ${args[0] ?? "command"} failed`);
   return result.stdout;
@@ -70,38 +80,70 @@ function confinedPath(repositoryPath: string, path: string): string {
   return absolute;
 }
 
-async function fileDigest(path: string): Promise<string> {
+async function fileDigest(path: string, signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted();
   const hash = createHash("sha256");
-  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  for await (const chunk of createReadStream(path, signal ? { signal } : undefined)) {
+    signal?.throwIfAborted();
+    hash.update(chunk);
+  }
+  signal?.throwIfAborted();
   return hash.digest("hex");
 }
 
-async function pathSignature(repositoryPath: string, path: string): Promise<string> {
+async function pathSignature(
+  repositoryPath: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  signal?.throwIfAborted();
   const absolute = confinedPath(repositoryPath, path);
   let status;
   try {
     status = await lstat(absolute);
   } catch (error) {
+    signal?.throwIfAborted();
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return "missing";
     throw error;
   }
+  signal?.throwIfAborted();
   const mode = status.mode & 0o777;
-  if (status.isSymbolicLink())
-    return contentHash({ kind: "symlink", mode, target: await readlink(absolute) });
+  if (status.isSymbolicLink()) {
+    const target = await readlink(absolute);
+    signal?.throwIfAborted();
+    return contentHash({ kind: "symlink", mode, target });
+  }
   if (status.isFile())
     return contentHash({
       kind: "file",
       mode,
       size: status.size,
-      digest: await fileDigest(absolute),
+      digest: await fileDigest(absolute, signal),
     });
   if (status.isDirectory()) {
-    const [head, state] = await Promise.all([
-      gitOutput(absolute, ["rev-parse", "HEAD"]).catch(() => "not-a-repository"),
-      gitOutput(absolute, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]).catch(
-        () => "unavailable",
-      ),
-    ]);
+    const operations = [
+      gitOutput(absolute, ["rev-parse", "HEAD"], signal).catch(() => {
+        signal?.throwIfAborted();
+        return "not-a-repository";
+      }),
+      gitOutput(
+        absolute,
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        signal,
+      ).catch(() => {
+        signal?.throwIfAborted();
+        return "unavailable";
+      }),
+    ] as const;
+    let head: string;
+    let state: string;
+    try {
+      [head, state] = await Promise.all(operations);
+    } catch (error) {
+      if (signal?.aborted) await Promise.allSettled(operations);
+      throw error;
+    }
+    signal?.throwIfAborted();
     return contentHash({ kind: "directory", mode, head: head.trim(), state });
   }
   return contentHash({ kind: "other", mode, size: status.size });
@@ -110,29 +152,53 @@ async function pathSignature(repositoryPath: string, path: string): Promise<stri
 export async function captureWorkspaceScopeSnapshot(
   repositoryPath: string,
   inspectedIgnoredPatterns: string[] = [],
+  signal?: AbortSignal,
 ): Promise<WorkspaceScopeSnapshot> {
+  signal?.throwIfAborted();
   const ignored =
     inspectedIgnoredPatterns.length > 0
-      ? gitOutput(repositoryPath, [
-          "ls-files",
-          "--others",
-          "--ignored",
-          "--exclude-standard",
-          "-z",
-          "--",
-          ...inspectedIgnoredPatterns,
-        ])
+      ? gitOutput(
+          repositoryPath,
+          [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ...inspectedIgnoredPatterns,
+          ],
+          signal,
+        )
       : Promise.resolve("");
-  const [tracked, untracked, excludedIgnored, head, branch, index] = await Promise.all([
-    gitOutput(repositoryPath, ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"]),
-    gitOutput(repositoryPath, ["ls-files", "--others", "--exclude-standard", "-z"]),
+  const operations = [
+    gitOutput(repositoryPath, ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"], signal),
+    gitOutput(repositoryPath, ["ls-files", "--others", "--exclude-standard", "-z"], signal),
     ignored,
-    gitOutput(repositoryPath, ["rev-parse", "HEAD"]),
-    gitOutput(repositoryPath, ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(
-      () => "(detached)",
+    gitOutput(repositoryPath, ["rev-parse", "HEAD"], signal),
+    gitOutput(repositoryPath, ["symbolic-ref", "--quiet", "--short", "HEAD"], signal).catch(() => {
+      signal?.throwIfAborted();
+      return "(detached)";
+    }),
+    gitOutput(
+      repositoryPath,
+      ["diff", "--cached", "--no-ext-diff", "--binary", "HEAD", "--"],
+      signal,
     ),
-    gitOutput(repositoryPath, ["diff", "--cached", "--no-ext-diff", "--binary", "HEAD", "--"]),
-  ]);
+  ] as const;
+  let tracked: string;
+  let untracked: string;
+  let excludedIgnored: string;
+  let head: string;
+  let branch: string;
+  let index: string;
+  try {
+    [tracked, untracked, excludedIgnored, head, branch, index] = await Promise.all(operations);
+  } catch (error) {
+    if (signal?.aborted) await Promise.allSettled(operations);
+    throw error;
+  }
+  signal?.throwIfAborted();
   const paths = [
     ...new Set([...nulPaths(tracked), ...nulPaths(untracked), ...nulPaths(excludedIgnored)]),
   ].sort();
@@ -141,8 +207,11 @@ export async function captureWorkspaceScopeSnapshot(
       `Workspace scope inspection refused ${paths.length} changed paths; maximum is ${maximumChangedPaths}`,
     );
   const changed: Record<string, string> = {};
-  for (const path of paths)
-    changed[path.replaceAll("\\", "/")] = await pathSignature(repositoryPath, path);
+  for (const path of paths) {
+    signal?.throwIfAborted();
+    changed[path.replaceAll("\\", "/")] = await pathSignature(repositoryPath, path, signal);
+  }
+  signal?.throwIfAborted();
   const core = {
     headSha: head.trim(),
     branch: branch.trim(),
