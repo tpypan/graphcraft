@@ -19915,6 +19915,7 @@ function contentHash(value) {
 }
 
 // packages/core/src/benchmark.ts
+var MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS = 2147483647;
 var BenchmarkTaskFamilySchema = external_exports.enum([
   "bug",
   "feature",
@@ -20076,7 +20077,7 @@ var BenchmarkReviewPacketSchema = external_exports.strictObject({
   transcript: BenchmarkReviewEvidenceSchema,
   captureFailures: external_exports.array(external_exports.string().min(1))
 });
-var BenchmarkTrialResultSchema = external_exports.strictObject({
+var BenchmarkTrialResultV2Schema = external_exports.strictObject({
   trial: BenchmarkScheduleEntrySchema,
   hostVersion: external_exports.string().min(1),
   modelPolicy: external_exports.string().min(1),
@@ -20120,7 +20121,137 @@ var BenchmarkTrialResultSchema = external_exports.strictObject({
     });
   }
 });
-var BenchmarkReportSchema = external_exports.strictObject({
+var BenchmarkTrialResultV3Schema = external_exports.strictObject({
+  trial: BenchmarkScheduleEntrySchema,
+  hostVersion: external_exports.string().min(1),
+  modelPolicy: external_exports.string().min(1),
+  effortPolicy: BenchmarkEffortPolicySchema,
+  permissionPolicy: BenchmarkPermissionPolicySchema,
+  acceptanceScorerDigest: external_exports.string().min(1),
+  observedScorerDigest: external_exports.string().min(1),
+  scorerVerified: external_exports.boolean(),
+  repositoryDigest: external_exports.string().min(1),
+  baseSha: external_exports.string().min(1),
+  executionStatus: external_exports.enum([
+    "completed",
+    "blocked",
+    "failed",
+    "error",
+    "interrupted",
+    "timed_out"
+  ]),
+  attemptCheckpoint: external_exports.enum(["provisional", "settled"]),
+  interruption: external_exports.strictObject({
+    cause: external_exports.enum(["cancellation", "runtime_shutdown", "timeout"]),
+    reason: external_exports.string().min(1),
+    childSettlement: external_exports.enum(["confirmed", "unconfirmed"])
+  }).optional(),
+  recovery: external_exports.strictObject({
+    disposition: external_exports.literal("preserved"),
+    fixtureRepository: external_exports.string().min(1),
+    lastKnownRepository: external_exports.string().min(1),
+    requiredAction: external_exports.literal("reconcile_child_before_cleanup_or_resume")
+  }).optional(),
+  accepted: external_exports.boolean(),
+  acceptance: external_exports.array(BenchmarkAssertionResultSchema),
+  usage: TokenUsageSchema,
+  usageReconciled: external_exports.boolean(),
+  limitations: external_exports.array(external_exports.string()),
+  durationMs: external_exports.number().int().nonnegative(),
+  humanInterventions: external_exports.number().int().nonnegative(),
+  failureTrace: external_exports.array(external_exports.string()),
+  reviewPacket: BenchmarkReviewPacketSchema.optional()
+}).superRefine((result, context) => {
+  const interrupted = ["interrupted", "timed_out"].includes(result.executionStatus);
+  if (interrupted !== (result.interruption !== void 0)) {
+    context.addIssue({
+      code: "custom",
+      path: ["interruption"],
+      message: "Interrupted benchmark results must retain their interruption evidence"
+    });
+  }
+  if (result.executionStatus === "timed_out" && result.interruption?.cause !== "timeout") {
+    context.addIssue({
+      code: "custom",
+      path: ["interruption", "cause"],
+      message: "Timed-out benchmark results must retain a timeout cause"
+    });
+  }
+  if (result.executionStatus === "interrupted" && result.interruption?.cause === "timeout") {
+    context.addIssue({
+      code: "custom",
+      path: ["interruption", "cause"],
+      message: "Timeout interruptions must use the timed_out execution status"
+    });
+  }
+  if (result.attemptCheckpoint === "provisional" && result.accepted) {
+    context.addIssue({
+      code: "custom",
+      path: ["accepted"],
+      message: "A provisional benchmark attempt cannot be accepted"
+    });
+  }
+  if (result.attemptCheckpoint === "provisional" && result.interruption?.childSettlement !== "unconfirmed") {
+    context.addIssue({
+      code: "custom",
+      path: ["interruption"],
+      message: "A provisional benchmark attempt must retain unconfirmed settlement evidence"
+    });
+  }
+  const unconfirmed = result.interruption?.childSettlement === "unconfirmed";
+  if (unconfirmed !== (result.recovery !== void 0)) {
+    context.addIssue({
+      code: "custom",
+      path: ["recovery"],
+      message: "Unconfirmed benchmark calls must retain the preserved workspace recovery receipt"
+    });
+  }
+  if (unconfirmed && result.accepted) {
+    context.addIssue({
+      code: "custom",
+      path: ["accepted"],
+      message: "A benchmark attempt with unconfirmed child settlement cannot be accepted"
+    });
+  }
+  if (result.accepted && (result.reviewPacket?.captureFailures.length ?? 0) > 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["accepted"],
+      message: "A trial with review-packet capture failures cannot be accepted as review-complete"
+    });
+  }
+  if (result.accepted && result.reviewPacket?.patch.truncated) {
+    context.addIssue({
+      code: "custom",
+      path: ["accepted"],
+      message: "A trial with truncated patch evidence cannot be accepted as review-complete"
+    });
+  }
+  if (result.accepted && result.reviewPacket?.transcript.truncated) {
+    context.addIssue({
+      code: "custom",
+      path: ["accepted"],
+      message: "A trial with truncated transcript evidence cannot be accepted as review-complete"
+    });
+  }
+});
+var BenchmarkTrialResultSchema = BenchmarkTrialResultV3Schema;
+var BenchmarkAnyTrialResultSchema = external_exports.union([
+  BenchmarkTrialResultV2Schema,
+  BenchmarkTrialResultV3Schema
+]);
+var BenchmarkHostPreflightCheckpointSchema = external_exports.strictObject({
+  host: external_exports.enum(["codex", "claude"]),
+  phase: external_exports.literal("capability_probe"),
+  attemptCheckpoint: external_exports.enum(["provisional", "settled"]),
+  interruption: external_exports.strictObject({
+    cause: external_exports.enum(["cancellation", "runtime_shutdown", "timeout"]),
+    reason: external_exports.string().min(1),
+    childSettlement: external_exports.literal("unconfirmed")
+  }),
+  requiredAction: external_exports.literal("reconcile_host_child_before_resume")
+});
+var BenchmarkReportV2Schema = external_exports.strictObject({
   schemaVersion: external_exports.literal(2),
   status: external_exports.enum(["running", "complete"]),
   suite: external_exports.strictObject({
@@ -20137,6 +20268,104 @@ var BenchmarkReportSchema = external_exports.strictObject({
   permissionPolicy: BenchmarkPermissionPoliciesSchema,
   scorerPolicy: external_exports.literal("fixture_bound_scorers_plus_suite_assertions"),
   reviewPolicy: external_exports.literal("bounded_redacted_patch_and_transcript_v1").optional(),
+  environment: external_exports.strictObject({
+    platform: external_exports.string().min(1),
+    architecture: external_exports.string().min(1),
+    nodeVersion: external_exports.string().min(1),
+    graphcraftVersion: external_exports.string().trim().min(1),
+    graphcraftSource: BenchmarkSourceIdentitySchema.optional()
+  }),
+  limitations: external_exports.array(external_exports.string()),
+  schedule: external_exports.array(BenchmarkScheduleEntrySchema).min(1),
+  results: external_exports.array(BenchmarkTrialResultV2Schema),
+  summary: external_exports.record(external_exports.string(), external_exports.unknown())
+}).superRefine((report, context) => {
+  if (report.reviewPolicy !== void 0 && report.environment.graphcraftSource === void 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["environment", "graphcraftSource"],
+      message: "Evidence-backed benchmark reports must bind an exact Graphcraft source identity"
+    });
+  }
+  if (report.reviewPolicy !== void 0 && report.environment.graphcraftSource?.dirty) {
+    context.addIssue({
+      code: "custom",
+      path: ["environment", "graphcraftSource", "dirty"],
+      message: "Evidence-backed benchmark reports require a clean Graphcraft source tree"
+    });
+  }
+  const scheduleByTrialId = /* @__PURE__ */ new Map();
+  for (const [index, trial] of report.schedule.entries()) {
+    if (scheduleByTrialId.has(trial.trialId)) {
+      context.addIssue({
+        code: "custom",
+        path: ["schedule", index, "trialId"],
+        message: "Benchmark schedule trial IDs must be unique"
+      });
+    }
+    scheduleByTrialId.set(trial.trialId, trial);
+  }
+  const resultTrialIds = /* @__PURE__ */ new Set();
+  for (const [index, result] of report.results.entries()) {
+    const { trial } = result;
+    if (resultTrialIds.has(trial.trialId)) {
+      context.addIssue({
+        code: "custom",
+        path: ["results", index, "trial", "trialId"],
+        message: "Benchmark result trial IDs must be unique"
+      });
+    }
+    resultTrialIds.add(trial.trialId);
+    const scheduled = scheduleByTrialId.get(trial.trialId);
+    if (scheduled === void 0 || contentHash(scheduled) !== contentHash(trial)) {
+      context.addIssue({
+        code: "custom",
+        path: ["results", index, "trial"],
+        message: "Benchmark result trials must exactly match a scheduled trial"
+      });
+    }
+    if (report.reviewPolicy !== void 0 && result.reviewPacket === void 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["results", index, "reviewPacket"],
+        message: "Every evidence-backed benchmark result must retain a review packet"
+      });
+    }
+  }
+  if (report.status === "complete" && (report.results.length !== report.schedule.length || resultTrialIds.size !== scheduleByTrialId.size || [...scheduleByTrialId].some(([trialId]) => !resultTrialIds.has(trialId)))) {
+    context.addIssue({
+      code: "custom",
+      path: ["status"],
+      message: "The complete benchmark report does not cover the exact current schedule"
+    });
+  }
+  if (contentHash(report.summary) !== contentHash(summarizeBenchmark(report.results, report.schedule))) {
+    context.addIssue({
+      code: "custom",
+      path: ["summary"],
+      message: "The benchmark report summary does not match its trial evidence"
+    });
+  }
+});
+var BenchmarkReportV3Schema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(3),
+  status: external_exports.enum(["running", "complete"]),
+  suite: external_exports.strictObject({
+    id: external_exports.string().min(1),
+    version: external_exports.number().int().positive(),
+    digest: external_exports.string().min(1)
+  }),
+  startedAt: external_exports.iso.datetime(),
+  updatedAt: external_exports.iso.datetime(),
+  seed: external_exports.string().min(1),
+  randomized: external_exports.literal(true),
+  modelPolicy: BenchmarkModelPolicySchema,
+  effortPolicy: BenchmarkEffortPolicySchema,
+  permissionPolicy: BenchmarkPermissionPoliciesSchema,
+  scorerPolicy: external_exports.literal("fixture_bound_scorers_plus_suite_assertions"),
+  reviewPolicy: external_exports.literal("bounded_redacted_patch_and_transcript_v1").optional(),
+  modelCallTimeoutMs: external_exports.number().int().positive().max(MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS),
+  hostPreflightCheckpoint: BenchmarkHostPreflightCheckpointSchema.optional(),
   environment: external_exports.strictObject({
     platform: external_exports.string().min(1),
     architecture: external_exports.string().min(1),
@@ -20208,6 +20437,27 @@ var BenchmarkReportSchema = external_exports.strictObject({
       message: "The complete benchmark report does not cover the exact current schedule"
     });
   }
+  if (report.status === "complete" && report.results.some((result) => result.attemptCheckpoint === "provisional")) {
+    context.addIssue({
+      code: "custom",
+      path: ["status"],
+      message: "A complete benchmark report cannot retain an in-flight provisional attempt"
+    });
+  }
+  if (report.status === "complete" && report.results.some((result) => result.interruption?.childSettlement === "unconfirmed")) {
+    context.addIssue({
+      code: "custom",
+      path: ["status"],
+      message: "A complete benchmark report cannot retain unconfirmed child settlement"
+    });
+  }
+  if (report.status === "complete" && report.hostPreflightCheckpoint !== void 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["status"],
+      message: "A complete benchmark report cannot retain an unfinished host preflight"
+    });
+  }
   if (contentHash(report.summary) !== contentHash(summarizeBenchmark(report.results, report.schedule))) {
     context.addIssue({
       code: "custom",
@@ -20216,6 +20466,10 @@ var BenchmarkReportSchema = external_exports.strictObject({
     });
   }
 });
+var BenchmarkReportSchema = external_exports.discriminatedUnion("schemaVersion", [
+  BenchmarkReportV2Schema,
+  BenchmarkReportV3Schema
+]);
 function seededRandom(seed) {
   let state = Number.parseInt(contentHash(seed).slice(0, 8), 16) >>> 0;
   return () => {
@@ -20344,7 +20598,7 @@ function matchedTrialControls(results) {
   });
 }
 function summarizeBenchmark(results, schedule = results.map(({ trial }) => trial)) {
-  const parsed = results.map((result) => BenchmarkTrialResultSchema.parse(result));
+  const parsed = results.map((result) => BenchmarkAnyTrialResultSchema.parse(result));
   const parsedSchedule = schedule.map((entry) => BenchmarkScheduleEntrySchema.parse(entry));
   return Object.fromEntries(
     ["codex", "claude"].map((host) => {
@@ -23088,15 +23342,19 @@ var CodexAdapter = class {
     const exitPromise = new Promise(
       (resolve18) => child.once("close", (code, closeSignal) => resolve18({ code, signal: closeSignal }))
     );
-    const terminationController = new ChildTerminationController(child, signal);
+    const protocolAbort = new AbortController();
+    const executionSignal2 = AbortSignal.any([signal, protocolAbort.signal]);
+    const terminationController = new ChildTerminationController(child, executionSignal2);
     child.stdin.end(renderWorkerPrompt(request.capsule, request.authorityBoundary));
     let lastMessage = "";
     let lastMessageExceededLimit = false;
     let protocolExceededLimit = false;
     let observedSessionId;
+    let expectedSessionId = request.resumeSessionId;
+    let sessionIdentityMismatch = false;
     let sessionReported = false;
     const stderr = captureStderr(child.stderr);
-    const protocolLines = readBoundedProtocolLines(child.stdout, signal)[Symbol.asyncIterator]();
+    const protocolLines = readBoundedProtocolLines(child.stdout, executionSignal2)[Symbol.asyncIterator]();
     let nextProtocolLine = protocolLines.next();
     yield { type: "started", invocationId: request.invocationId };
     try {
@@ -23116,10 +23374,22 @@ var CodexAdapter = class {
         } catch {
           continue;
         }
+        if (signal.aborted || sessionIdentityMismatch) continue;
         const type = String(event.type ?? "");
         const item = event.item;
-        if (type === "thread.started" && typeof event.thread_id === "string")
+        if (type === "thread.started" && typeof event.thread_id === "string") {
+          expectedSessionId ??= event.thread_id;
+          if (event.thread_id !== expectedSessionId) {
+            sessionIdentityMismatch = true;
+            protocolAbort.abort({
+              cause: "cancellation",
+              reason: "Codex worker reported a different thread identity"
+            });
+            continue;
+          }
           observedSessionId = event.thread_id;
+        }
+        if (!observedSessionId) continue;
         if (!sessionReported && observedSessionId && type.startsWith("item.")) {
           sessionReported = true;
           yield { type: "session", hostSessionId: observedSessionId };
@@ -23144,6 +23414,13 @@ var CodexAdapter = class {
       }
       const exit = await terminationController.waitForExit(exitPromise);
       const termination = terminationController.finish(exit.code, exit.signal);
+      if (sessionIdentityMismatch) {
+        yield {
+          type: "error",
+          message: `Codex ${request.resumeSessionId ? "resumed " : ""}worker reported a different thread identity; result was rejected`
+        };
+        return;
+      }
       if (termination) {
         yield { type: "terminated", termination };
         return;
@@ -23159,8 +23436,23 @@ var CodexAdapter = class {
         };
         return;
       }
+      if (exit.code !== 0) {
+        yield {
+          type: "error",
+          message: stderr.text().trim() || `Codex exited ${exit.code} without a valid structured result`,
+          cause: "host_crash"
+        };
+        return;
+      }
+      if (!observedSessionId) {
+        yield {
+          type: "error",
+          message: `Codex ${request.resumeSessionId ? "resumed " : ""}worker did not report its thread identity; result was rejected`
+        };
+        return;
+      }
       const result = parseJsonResult(lastMessage);
-      if (exit.code !== 0 || !result) {
+      if (!result) {
         yield {
           type: "error",
           message: stderr.text().trim() || `Codex exited ${exit.code ?? 1} without a valid structured result`,
@@ -23682,14 +23974,18 @@ var ClaudeAdapter = class {
     const exitPromise = new Promise(
       (resolve18) => child.once("close", (code, closeSignal) => resolve18({ code, signal: closeSignal }))
     );
-    const terminationController = new ChildTerminationController(child, signal);
+    const protocolAbort = new AbortController();
+    const executionSignal2 = AbortSignal.any([signal, protocolAbort.signal]);
+    const terminationController = new ChildTerminationController(child, executionSignal2);
     let protocolExceededLimit = false;
     let structuredExceededLimit = false;
     let finalResult;
     let observedSessionId;
+    let sessionIdentityFailure;
+    const expectedSessionId = request.resumeSessionId ?? request.invocationId;
     let sessionReported = false;
     const stderr = captureStderr2(child.stderr);
-    const protocolLines = readBoundedProtocolLines2(child.stdout, signal)[Symbol.asyncIterator]();
+    const protocolLines = readBoundedProtocolLines2(child.stdout, executionSignal2)[Symbol.asyncIterator]();
     let nextProtocolLine = protocolLines.next();
     yield { type: "started", invocationId: request.invocationId };
     try {
@@ -23709,8 +24005,20 @@ var ClaudeAdapter = class {
         } catch {
           continue;
         }
+        if (signal.aborted || sessionIdentityFailure) continue;
         const type = String(event.type ?? "");
-        if (typeof event.session_id === "string") observedSessionId = event.session_id;
+        const eventSessionId = typeof event.session_id === "string" ? event.session_id : void 0;
+        const identityFailure = eventSessionId && eventSessionId !== expectedSessionId ? "different" : (type === "assistant" || type === "result") && !eventSessionId ? "missing" : void 0;
+        if (identityFailure) {
+          sessionIdentityFailure = identityFailure;
+          protocolAbort.abort({
+            cause: "cancellation",
+            reason: identityFailure === "different" ? "Claude worker reported a different session identity" : "Claude worker output omitted its session identity"
+          });
+          continue;
+        }
+        if (eventSessionId) observedSessionId = eventSessionId;
+        if (request.resumeSessionId && !observedSessionId) continue;
         if (!sessionReported && observedSessionId && (type === "assistant" || type === "result")) {
           sessionReported = true;
           yield { type: "session", hostSessionId: observedSessionId };
@@ -23738,7 +24046,12 @@ var ClaudeAdapter = class {
       }
       const exit = await terminationController.waitForExit(exitPromise);
       const termination = terminationController.finish(exit.code, exit.signal);
-      if (termination) {
+      if (sessionIdentityFailure) {
+        yield {
+          type: "error",
+          message: sessionIdentityFailure === "different" ? `Claude ${request.resumeSessionId ? "resumed " : ""}worker reported a different session identity; result was rejected` : `Claude ${request.resumeSessionId ? "resumed " : ""}worker output omitted its session identity; result was rejected`
+        };
+      } else if (termination) {
         yield { type: "terminated", termination };
       } else if (protocolExceededLimit) {
         yield { type: "error", message: protocolLineLimitError2("Claude").message };
@@ -23747,7 +24060,18 @@ var ClaudeAdapter = class {
           type: "error",
           message: structuredOutputLimitError2("Claude", "structured result").message
         };
-      } else if (exit.code !== 0 || !finalResult) {
+      } else if (exit.code !== 0) {
+        yield {
+          type: "error",
+          message: stderr.text().trim() || `Claude exited ${exit.code} without a valid structured result`,
+          cause: "host_crash"
+        };
+      } else if (!observedSessionId) {
+        yield {
+          type: "error",
+          message: `Claude ${request.resumeSessionId ? "resumed " : ""}worker did not report its session identity; result was rejected`
+        };
+      } else if (!finalResult) {
         yield {
           type: "error",
           message: stderr.text().trim() || `Claude exited ${exit.code ?? 1} without a valid structured result`,
@@ -28374,7 +28698,7 @@ var RunArtifactStore = class {
 
 // packages/runtime/src/benchmark.ts
 import { randomUUID as randomUUID10 } from "node:crypto";
-import { access as access2, lstat as lstat11, mkdir as mkdir5, mkdtemp as mkdtemp2, readFile as readFile3, rm as rm4, writeFile as writeFile2 } from "node:fs/promises";
+import { access as access2, lstat as lstat11, mkdir as mkdir5, mkdtemp as mkdtemp2, readFile as readFile3, realpath as realpath4, rm as rm4, writeFile as writeFile2 } from "node:fs/promises";
 import { tmpdir as tmpdir2 } from "node:os";
 import { basename as basename4, dirname as dirname11, extname as extname2, isAbsolute as isAbsolute10, join as join13, resolve as resolve13, sep as sep8 } from "node:path";
 
@@ -30627,7 +30951,7 @@ async function decideRunControl(store, input) {
 }
 
 // packages/runtime/src/repository.ts
-import { appendFile, lstat as lstat6, mkdir as mkdir3, readFile, readlink as readlink2 } from "node:fs/promises";
+import { appendFile, lstat as lstat6, mkdir as mkdir3, readFile, readlink as readlink2, realpath as realpath3 } from "node:fs/promises";
 import { basename as basename3, dirname as dirname9, isAbsolute as isAbsolute6, join as join8, resolve as resolve7 } from "node:path";
 
 // packages/runtime/src/side-effect.ts
@@ -31023,31 +31347,246 @@ async function ensureGraphcraftIgnored(repositoryRoot, signal) {
   }
   signal?.throwIfAborted();
   if (!content.split("\n").includes(".graphcraft/"))
-    await appendFile(excludePath, "\n.graphcraft/\n", "utf8");
+    await appendFile(excludePath, "\n.graphcraft/\n", {
+      encoding: "utf8",
+      ...signal ? { signal } : {}
+    });
+  signal?.throwIfAborted();
 }
+var RunWorkspaceReconciliationError = class extends Error {
+  constructor(workspacePath, detail, options) {
+    super(
+      `Graphcraft found unsafe or ambiguous worktree state at ${workspacePath}: ${detail}. Existing Git state was preserved; resolve it before resuming`,
+      options
+    );
+    this.workspacePath = workspacePath;
+    this.name = "RunWorkspaceReconciliationError";
+  }
+  workspacePath;
+};
 function slug(task) {
   return task.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32) || "run";
 }
-async function createRunWorkspace(contract) {
+function comparablePath(path2) {
+  const absolute = resolve7(path2);
+  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+}
+async function canonicalComparablePath(path2, signal) {
+  signal?.throwIfAborted();
+  try {
+    const canonical = await realpath3(path2);
+    signal?.throwIfAborted();
+    return comparablePath(canonical);
+  } catch (error51) {
+    signal?.throwIfAborted();
+    if (error51.code !== "ENOENT") throw error51;
+  }
+  try {
+    const canonicalParent = await realpath3(dirname9(path2));
+    signal?.throwIfAborted();
+    return comparablePath(join8(canonicalParent, basename3(path2)));
+  } catch (error51) {
+    signal?.throwIfAborted();
+    if (error51.code !== "ENOENT") throw error51;
+    return comparablePath(path2);
+  }
+}
+function parseWorktreeRegistrations(output) {
+  const registrations = [];
+  let current;
+  for (const field of output.split("\0")) {
+    if (field.length === 0) {
+      if (current) registrations.push(current);
+      current = void 0;
+      continue;
+    }
+    const separator = field.indexOf(" ");
+    const name = separator === -1 ? field : field.slice(0, separator);
+    const value = separator === -1 ? "" : field.slice(separator + 1);
+    if (name === "worktree") {
+      if (current) throw new Error("Git returned overlapping worktree records");
+      if (!value) throw new Error("Git returned a worktree record without a path");
+      current = { path: value };
+      continue;
+    }
+    if (!current) throw new Error("Git returned a worktree field before its path");
+    if (name === "HEAD") current.head = value;
+    if (name === "branch") current.branch = value;
+  }
+  if (current) registrations.push(current);
+  return registrations;
+}
+async function branchSha(repositoryPath, branch, signal) {
+  const ref = `refs/heads/${branch}`;
+  const output = await gitRaw(
+    repositoryPath,
+    ["for-each-ref", "--format=%(refname)%00%(objectname)", ref],
+    signal
+  );
+  const matches = output.split("\n").filter(Boolean).map((line2) => line2.split("\0")).filter(([candidate]) => candidate === ref);
+  if (matches.length > 1 || matches.some(([, sha]) => !sha))
+    throw new Error(`Git returned an ambiguous ref inventory for ${ref}`);
+  return matches[0]?.[1];
+}
+async function canonicalGitCommonDirectory(repositoryPath, signal) {
+  const value = await git(repositoryPath, ["rev-parse", "--git-common-dir"], signal);
+  signal?.throwIfAborted();
+  const path2 = isAbsolute6(value) ? value : resolve7(repositoryPath, value);
+  const canonical = await realpath3(path2);
+  signal?.throwIfAborted();
+  return comparablePath(canonical);
+}
+function workspaceStateError(path2, detail, cause) {
+  return new RunWorkspaceReconciliationError(path2, detail, cause ? { cause } : void 0);
+}
+async function reconcileRunWorkspaceCreation(contract, path2, branch, signal) {
+  signal?.throwIfAborted();
+  let pathStats;
+  try {
+    pathStats = await lstat6(path2);
+  } catch (error51) {
+    signal?.throwIfAborted();
+    if (error51.code !== "ENOENT")
+      throw workspaceStateError(path2, "the intended path could not be inspected", error51);
+  }
+  signal?.throwIfAborted();
+  let registrations;
+  let expectedBranchSha;
+  try {
+    [registrations, expectedBranchSha] = await Promise.all([
+      gitRaw(contract.repository.root, ["worktree", "list", "--porcelain", "-z"], signal).then(
+        parseWorktreeRegistrations
+      ),
+      branchSha(contract.repository.root, branch, signal)
+    ]);
+  } catch (error51) {
+    signal?.throwIfAborted();
+    throw workspaceStateError(path2, "Git could not inventory the intended path and branch", error51);
+  }
+  signal?.throwIfAborted();
+  let targetPath;
+  try {
+    targetPath = await canonicalComparablePath(path2, signal);
+  } catch (error51) {
+    signal?.throwIfAborted();
+    throw workspaceStateError(path2, "the intended path identity could not be resolved", error51);
+  }
+  const targetRegistrations = registrations.filter(
+    (registration2) => comparablePath(registration2.path) === targetPath
+  );
+  const expectedRef = `refs/heads/${branch}`;
+  const branchRegistrations = registrations.filter(
+    (registration2) => registration2.branch === expectedRef
+  );
+  if (!pathStats && targetRegistrations.length === 0) {
+    if (branchRegistrations.length > 0)
+      throw workspaceStateError(path2, "the intended branch is registered at another worktree");
+    if (!expectedBranchSha) return { status: "absent" };
+    if (expectedBranchSha === contract.repository.baseSha) return { status: "branch_only" };
+    throw workspaceStateError(
+      path2,
+      `the unregistered intended branch does not point to approved base ${contract.repository.baseSha}`
+    );
+  }
+  if (!pathStats)
+    throw workspaceStateError(path2, "Git registers the intended path, but the path is missing");
+  if (!pathStats.isDirectory() || pathStats.isSymbolicLink())
+    throw workspaceStateError(path2, "the intended path is not a plain directory");
+  if (targetRegistrations.length !== 1)
+    throw workspaceStateError(
+      path2,
+      targetRegistrations.length === 0 ? "the intended path exists without an exact Git worktree registration" : "Git reports duplicate registrations for the intended path"
+    );
+  if (branchRegistrations.length !== 1 || branchRegistrations[0] !== targetRegistrations[0])
+    throw workspaceStateError(path2, "the intended branch is missing or registered elsewhere");
+  const registration = targetRegistrations[0];
+  if (registration.branch !== expectedRef)
+    throw workspaceStateError(path2, "the registered worktree is on a different branch");
+  if (registration.head !== contract.repository.baseSha)
+    throw workspaceStateError(path2, "the registered worktree HEAD differs from the approved base");
+  if (expectedBranchSha !== contract.repository.baseSha)
+    throw workspaceStateError(path2, "the intended branch ref differs from the approved base");
+  try {
+    const topLevel = await git(path2, ["rev-parse", "--show-toplevel"], signal);
+    if (await canonicalComparablePath(topLevel, signal) !== targetPath)
+      throw workspaceStateError(path2, "the worktree top level differs from the intended path");
+    const currentBranch = await git(path2, ["symbolic-ref", "--quiet", "--short", "HEAD"], signal);
+    if (currentBranch !== branch)
+      throw workspaceStateError(path2, "the worktree checkout is on a different branch");
+    const head = await git(path2, ["rev-parse", "HEAD"], signal);
+    if (head !== contract.repository.baseSha)
+      throw workspaceStateError(path2, "the worktree checkout differs from the approved base");
+    const status3 = await gitRaw(
+      path2,
+      ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching"],
+      signal
+    );
+    if (status3.length > 0)
+      throw workspaceStateError(
+        path2,
+        "the worktree contains uncommitted or untracked changes, including ignored content"
+      );
+    const [sourceCommonDirectory, worktreeCommonDirectory] = await Promise.all([
+      canonicalGitCommonDirectory(contract.repository.root, signal),
+      canonicalGitCommonDirectory(path2, signal)
+    ]);
+    if (sourceCommonDirectory !== worktreeCommonDirectory)
+      throw workspaceStateError(path2, "the worktree belongs to a different common Git directory");
+  } catch (error51) {
+    signal?.throwIfAborted();
+    if (error51 instanceof RunWorkspaceReconciliationError) throw error51;
+    throw workspaceStateError(path2, "the registered worktree could not be validated", error51);
+  }
+  signal?.throwIfAborted();
+  return { status: "ready" };
+}
+async function crossRunWorkspaceCreationBoundary(options, point) {
+  await options.boundary?.(point);
+  options.signal?.throwIfAborted();
+}
+async function createRunWorkspace(contract, options = {}) {
   const branch = `graphcraft/${contract.runId.slice(0, 8)}-${slug(contract.task)}`;
   const parent = join8(
     dirname9(contract.repository.root),
     `.${basename3(contract.repository.root)}-graphcraft-worktrees`
   );
   const path2 = join8(parent, contract.runId);
+  options.signal?.throwIfAborted();
   await mkdir3(parent, { recursive: true });
-  const registered = await git(contract.repository.root, ["worktree", "list", "--porcelain"]);
-  if (registered.includes(`worktree ${path2}`)) return { path: path2, branch, created: false };
-  const branchExists = await git(contract.repository.root, [
-    "show-ref",
-    "--verify",
-    "--quiet",
-    `refs/heads/${branch}`
-  ]).then(() => true).catch(() => false);
-  await git(
-    contract.repository.root,
-    branchExists ? ["worktree", "add", path2, branch] : ["worktree", "add", "-b", branch, path2, contract.repository.baseSha]
-  );
+  options.signal?.throwIfAborted();
+  let parentStats;
+  try {
+    parentStats = await lstat6(parent);
+  } catch (error51) {
+    options.signal?.throwIfAborted();
+    throw workspaceStateError(path2, "the worktree parent could not be inspected", error51);
+  }
+  if (!parentStats.isDirectory() || parentStats.isSymbolicLink())
+    throw workspaceStateError(path2, "the worktree parent is not a plain directory");
+  await crossRunWorkspaceCreationBoundary(options, "after_parent_prepare");
+  const before = await reconcileRunWorkspaceCreation(contract, path2, branch, options.signal);
+  await crossRunWorkspaceCreationBoundary(options, "after_reconciliation");
+  if (before.status === "ready") return { path: path2, branch, created: false };
+  await crossRunWorkspaceCreationBoundary(options, "before_worktree_add");
+  let commandError;
+  try {
+    await git(
+      contract.repository.root,
+      before.status === "branch_only" ? ["worktree", "add", path2, branch] : ["worktree", "add", "-b", branch, path2, contract.repository.baseSha],
+      options.signal
+    );
+  } catch (error51) {
+    options.signal?.throwIfAborted();
+    commandError = error51;
+  }
+  await crossRunWorkspaceCreationBoundary(options, "after_worktree_add");
+  const after = await reconcileRunWorkspaceCreation(contract, path2, branch, options.signal);
+  if (after.status !== "ready")
+    throw workspaceStateError(
+      path2,
+      `worktree creation stopped in the safe ${after.status.replace("_", "-")} state`,
+      commandError
+    );
   return { path: path2, branch, created: true };
 }
 async function commitContentDigest(repositoryPath) {
@@ -33210,8 +33749,14 @@ import { createReadStream } from "node:fs";
 import { lstat as lstat9, readlink as readlink3 } from "node:fs/promises";
 import { isAbsolute as isAbsolute7, matchesGlob, relative as relative7, resolve as resolve10, sep as sep5 } from "node:path";
 var maximumChangedPaths = 1e4;
-async function gitOutput(repositoryPath, args) {
-  const result = await runProcess("git", args, { cwd: repositoryPath, timeoutMs: 12e4 });
+async function gitOutput(repositoryPath, args, signal) {
+  signal?.throwIfAborted();
+  const result = await runProcess("git", args, {
+    cwd: repositoryPath,
+    timeoutMs: 12e4,
+    ...signal ? { signal } : {}
+  });
+  signal?.throwIfAborted();
   if (result.exitCode !== 0)
     throw new Error(result.stderr.trim() || `git ${args[0] ?? "command"} failed`);
   return result.stdout;
@@ -33227,61 +33772,112 @@ function confinedPath(repositoryPath, path2) {
     throw new Error(`Git reported a path outside the workspace: ${path2}`);
   return absolute;
 }
-async function fileDigest(path2) {
+async function fileDigest(path2, signal) {
+  signal?.throwIfAborted();
   const hash2 = createHash5("sha256");
-  for await (const chunk of createReadStream(path2)) hash2.update(chunk);
+  for await (const chunk of createReadStream(path2, signal ? { signal } : void 0)) {
+    signal?.throwIfAborted();
+    hash2.update(chunk);
+  }
+  signal?.throwIfAborted();
   return hash2.digest("hex");
 }
-async function pathSignature(repositoryPath, path2) {
+async function pathSignature(repositoryPath, path2, signal) {
+  signal?.throwIfAborted();
   const absolute = confinedPath(repositoryPath, path2);
   let status3;
   try {
     status3 = await lstat9(absolute);
   } catch (error51) {
+    signal?.throwIfAborted();
     if (error51.code === "ENOENT") return "missing";
     throw error51;
   }
+  signal?.throwIfAborted();
   const mode = status3.mode & 511;
-  if (status3.isSymbolicLink())
-    return contentHash({ kind: "symlink", mode, target: await readlink3(absolute) });
+  if (status3.isSymbolicLink()) {
+    const target = await readlink3(absolute);
+    signal?.throwIfAborted();
+    return contentHash({ kind: "symlink", mode, target });
+  }
   if (status3.isFile())
     return contentHash({
       kind: "file",
       mode,
       size: status3.size,
-      digest: await fileDigest(absolute)
+      digest: await fileDigest(absolute, signal)
     });
   if (status3.isDirectory()) {
-    const [head, state] = await Promise.all([
-      gitOutput(absolute, ["rev-parse", "HEAD"]).catch(() => "not-a-repository"),
-      gitOutput(absolute, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]).catch(
-        () => "unavailable"
-      )
-    ]);
+    const operations = [
+      gitOutput(absolute, ["rev-parse", "HEAD"], signal).catch(() => {
+        signal?.throwIfAborted();
+        return "not-a-repository";
+      }),
+      gitOutput(
+        absolute,
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        signal
+      ).catch(() => {
+        signal?.throwIfAborted();
+        return "unavailable";
+      })
+    ];
+    let head;
+    let state;
+    try {
+      [head, state] = await Promise.all(operations);
+    } catch (error51) {
+      if (signal?.aborted) await Promise.allSettled(operations);
+      throw error51;
+    }
+    signal?.throwIfAborted();
     return contentHash({ kind: "directory", mode, head: head.trim(), state });
   }
   return contentHash({ kind: "other", mode, size: status3.size });
 }
-async function captureWorkspaceScopeSnapshot(repositoryPath, inspectedIgnoredPatterns = []) {
-  const ignored = inspectedIgnoredPatterns.length > 0 ? gitOutput(repositoryPath, [
-    "ls-files",
-    "--others",
-    "--ignored",
-    "--exclude-standard",
-    "-z",
-    "--",
-    ...inspectedIgnoredPatterns
-  ]) : Promise.resolve("");
-  const [tracked, untracked, excludedIgnored, head, branch, index] = await Promise.all([
-    gitOutput(repositoryPath, ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"]),
-    gitOutput(repositoryPath, ["ls-files", "--others", "--exclude-standard", "-z"]),
+async function captureWorkspaceScopeSnapshot(repositoryPath, inspectedIgnoredPatterns = [], signal) {
+  signal?.throwIfAborted();
+  const ignored = inspectedIgnoredPatterns.length > 0 ? gitOutput(
+    repositoryPath,
+    [
+      "ls-files",
+      "--others",
+      "--ignored",
+      "--exclude-standard",
+      "-z",
+      "--",
+      ...inspectedIgnoredPatterns
+    ],
+    signal
+  ) : Promise.resolve("");
+  const operations = [
+    gitOutput(repositoryPath, ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"], signal),
+    gitOutput(repositoryPath, ["ls-files", "--others", "--exclude-standard", "-z"], signal),
     ignored,
-    gitOutput(repositoryPath, ["rev-parse", "HEAD"]),
-    gitOutput(repositoryPath, ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(
-      () => "(detached)"
-    ),
-    gitOutput(repositoryPath, ["diff", "--cached", "--no-ext-diff", "--binary", "HEAD", "--"])
-  ]);
+    gitOutput(repositoryPath, ["rev-parse", "HEAD"], signal),
+    gitOutput(repositoryPath, ["symbolic-ref", "--quiet", "--short", "HEAD"], signal).catch(() => {
+      signal?.throwIfAborted();
+      return "(detached)";
+    }),
+    gitOutput(
+      repositoryPath,
+      ["diff", "--cached", "--no-ext-diff", "--binary", "HEAD", "--"],
+      signal
+    )
+  ];
+  let tracked;
+  let untracked;
+  let excludedIgnored;
+  let head;
+  let branch;
+  let index;
+  try {
+    [tracked, untracked, excludedIgnored, head, branch, index] = await Promise.all(operations);
+  } catch (error51) {
+    if (signal?.aborted) await Promise.allSettled(operations);
+    throw error51;
+  }
+  signal?.throwIfAborted();
   const paths = [
     .../* @__PURE__ */ new Set([...nulPaths(tracked), ...nulPaths(untracked), ...nulPaths(excludedIgnored)])
   ].sort();
@@ -33290,8 +33886,11 @@ async function captureWorkspaceScopeSnapshot(repositoryPath, inspectedIgnoredPat
       `Workspace scope inspection refused ${paths.length} changed paths; maximum is ${maximumChangedPaths}`
     );
   const changed = {};
-  for (const path2 of paths)
-    changed[path2.replaceAll("\\", "/")] = await pathSignature(repositoryPath, path2);
+  for (const path2 of paths) {
+    signal?.throwIfAborted();
+    changed[path2.replaceAll("\\", "/")] = await pathSignature(repositoryPath, path2, signal);
+  }
+  signal?.throwIfAborted();
   const core = {
     headSha: head.trim(),
     branch: branch.trim(),
@@ -33697,9 +34296,9 @@ async function evaluateWaitNode(input) {
   return { status: "waiting", nextWakeAt: wakeAt, evidence: observation.evidence };
 }
 async function sleepUntilWake(nextWakeAt2, signal) {
-  const delay = Math.max(0, Date.parse(nextWakeAt2) - Date.now());
+  const delay2 = Math.max(0, Date.parse(nextWakeAt2) - Date.now());
   try {
-    await waitForTimeout(delay, void 0, { signal });
+    await waitForTimeout(delay2, void 0, { signal });
     return true;
   } catch (error51) {
     if (signal.aborted || error51.name === "AbortError") return false;
@@ -35572,8 +36171,8 @@ async function deferGitHubLifecycleConsistency(input) {
   const condition = wait.condition;
   const pollIntervalMs = condition.kind === "github_pull_request" ? condition.pollIntervalMs : 3e4;
   const timeoutAt = condition.kind === "github_pull_request" ? condition.timeoutAt : void 0;
-  const delay = githubWaitBackoffMs(pollIntervalMs, wait.observations + 1);
-  const wake = timeoutAt ? Math.min(now2 + delay, Date.parse(timeoutAt)) : now2 + delay;
+  const delay2 = githubWaitBackoffMs(pollIntervalMs, wait.observations + 1);
+  const wake = timeoutAt ? Math.min(now2 + delay2, Date.parse(timeoutAt)) : now2 + delay2;
   const nextWakeAt2 = new Date(wake).toISOString();
   const evidence = [
     input.error.message,
@@ -35838,9 +36437,9 @@ async function evaluateGitHubLifecycleWait(input) {
     return { status: "action_required", evidence, lifecycle };
   }
   const observations = wait.observations + 1;
-  const delay = githubWaitBackoffMs(condition.pollIntervalMs, observations);
+  const delay2 = githubWaitBackoffMs(condition.pollIntervalMs, observations);
   const nextWakeAt2 = new Date(
-    condition.timeoutAt ? Math.min(now2 + delay, Date.parse(condition.timeoutAt)) : now2 + delay
+    condition.timeoutAt ? Math.min(now2 + delay2, Date.parse(condition.timeoutAt)) : now2 + delay2
   ).toISOString();
   const unchangedAtDurableMaximumBackoff = wait.lastSignature === lifecycle.classification.signature && githubWaitBackoffMs(condition.pollIntervalMs, wait.observations) === MAX_GITHUB_WAIT_BACKOFF_MS;
   if (unchangedAtDurableMaximumBackoff) {
@@ -36267,6 +36866,7 @@ async function executeWorker(input) {
   let result;
   let error51;
   let errorCause;
+  let interruptionCause;
   let capabilityDiagnostic;
   let termination;
   let usageReceipts = 0;
@@ -36352,11 +36952,16 @@ async function executeWorker(input) {
       }
       error51 = cause instanceof Error ? cause.message : String(cause);
       const capabilityError = cause instanceof HostCapabilityAdmissionError;
-      if (!capabilityError) errorCause = "host_crash";
+      if (input.signal.aborted) {
+        interruptionCause = interruptionReason(input.signal.reason).cause;
+        if (interruptionCause === "timeout") errorCause = "timeout";
+      } else if (!capabilityError) {
+        errorCause = "host_crash";
+      }
       const event2 = {
         type: "error",
         message: error51,
-        ...errorCause ? { cause: errorCause } : {}
+        ...interruptionCause ? { cause: interruptionCause } : errorCause ? { cause: errorCause } : {}
       };
       artifact = await input.store.appendInvocationEvent(invocationId, event2);
       if (capabilityError) capabilityDiagnostic = cause.diagnostic;
@@ -36405,6 +37010,7 @@ async function executeWorker(input) {
     if (event.type === "error") {
       error51 = event.message;
       if (event.cause === "host_crash" || event.cause === "timeout") errorCause = event.cause;
+      if (event.cause && event.cause !== "host_crash") interruptionCause = event.cause;
     }
   }
   if (hostStarted && usageReceipts === 0 && !capabilityDiagnostic)
@@ -36428,8 +37034,9 @@ async function executeWorker(input) {
       nodeId: input.node.id,
       artifact,
       success: Boolean(result) && !error51 && !termination,
-      interrupted: Boolean(termination),
+      interrupted: Boolean(termination) || Boolean(interruptionCause) || input.signal.aborted,
       ...termination ? { termination } : {},
+      ...interruptionCause ? { interruptionCause } : {},
       ...errorCause ? { errorCause } : {},
       ...capabilityDiagnostic ? { reason: capabilityDiagnostic.detail, capabilityDiagnostic } : {}
     },
@@ -36715,7 +37322,8 @@ async function runSemanticVerification(input) {
     );
     beforeScope = await captureWorkspaceScopeSnapshot(
       input.workspace.path,
-      input.contract.scope.exclude
+      input.contract.scope.exclude,
+      input.signal
     );
   } catch (error51) {
     const failure = error51 instanceof Error ? error51 : new Error(String(error51));
@@ -36873,9 +37481,11 @@ async function runSemanticVerification(input) {
   try {
     afterScope = await captureWorkspaceScopeSnapshot(
       input.workspace.path,
-      input.contract.scope.exclude
+      input.contract.scope.exclude,
+      input.signal
     );
   } catch (error51) {
+    if (input.signal.aborted) throw error51;
     return failVerification(error51);
   }
   const beforeDigest = beforeScope.digest;
@@ -37527,9 +38137,11 @@ async function executeReadOnlyProgressProbes(input) {
     try {
       baseline = await captureWorkspaceScopeSnapshot(
         input.workspace.path,
-        input.contract.scope.exclude
+        input.contract.scope.exclude,
+        input.signal
       );
     } catch (error51) {
+      if (input.signal.aborted) return { status: "interrupted" };
       return {
         status: "failed",
         reason: `Workspace scope inspection failed before progress probes for node ${input.node.id}: ${error51.message}`,
@@ -37592,9 +38204,11 @@ async function executeReadOnlyProgressProbes(input) {
   try {
     current = await captureWorkspaceScopeSnapshot(
       input.workspace.path,
-      input.contract.scope.exclude
+      input.contract.scope.exclude,
+      input.signal
     );
   } catch (error51) {
+    if (input.signal.aborted) return { status: "interrupted" };
     return {
       status: "failed",
       reason: `Workspace scope inspection failed after progress probes for node ${input.node.id}: ${error51.message}`,
@@ -38151,9 +38765,11 @@ async function reconcileProgressProbeScopeCheckpoints(input) {
       try {
         current2 = await captureWorkspaceScopeSnapshot(
           input.workspace.path,
-          input.contract.scope.exclude
+          input.contract.scope.exclude,
+          input.signal
         );
-      } catch {
+      } catch (error51) {
+        if (input.signal.aborted) throw error51;
         await ensureProgressProbeRunBlocker({ store: input.store, blocker });
         return await input.store.loadState();
       }
@@ -38176,9 +38792,11 @@ async function reconcileProgressProbeScopeCheckpoints(input) {
     try {
       current = await captureWorkspaceScopeSnapshot(
         input.workspace.path,
-        input.contract.scope.exclude
+        input.contract.scope.exclude,
+        input.signal
       );
     } catch (error51) {
+      if (input.signal.aborted) throw error51;
       const reason = `Workspace scope inspection failed while recovering progress probes for node ${active.node.id}: ${error51.message}`;
       return await blockProgressProbeRecovery({
         store: input.store,
@@ -38260,8 +38878,13 @@ async function executeWorkNode(input) {
   }
   let scopeBaseline;
   try {
-    scopeBaseline = input.recoveryScopeBaseline ?? observedBaselineScope ?? await captureWorkspaceScopeSnapshot(input.workspace.path, input.contract.scope.exclude);
+    scopeBaseline = input.recoveryScopeBaseline ?? observedBaselineScope ?? await captureWorkspaceScopeSnapshot(
+      input.workspace.path,
+      input.contract.scope.exclude,
+      input.signal
+    );
   } catch (error51) {
+    if (input.signal.aborted) return { status: "interrupted", nodeId: input.node.id, artifact: "" };
     const reason2 = `Workspace scope inspection failed before node ${input.node.id}: ${error51.message}`;
     await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason: reason2 });
     return { status: "failed", nodeId: input.node.id, reason: reason2 };
@@ -38297,7 +38920,8 @@ async function executeWorkNode(input) {
   try {
     currentScope = await captureWorkspaceScopeSnapshot(
       input.workspace.path,
-      input.contract.scope.exclude
+      input.contract.scope.exclude,
+      input.signal
     );
     const audit = auditWorkspaceScope({
       contract: input.contract,
@@ -38326,6 +38950,13 @@ async function executeWorkNode(input) {
       return { status: "failed", nodeId: input.node.id, reason: reason2 };
     }
   } catch (error51) {
+    if (input.signal.aborted)
+      return {
+        status: "interrupted",
+        nodeId: input.node.id,
+        ...worker.termination ? { termination: worker.termination } : {},
+        artifact: worker.artifact
+      };
     const reason2 = `Workspace scope inspection failed after node ${input.node.id}: ${error51.message}`;
     await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason: reason2 });
     return { status: "failed", nodeId: input.node.id, reason: reason2 };
@@ -38679,54 +39310,6 @@ async function executeRun(input) {
     if (["completed", "stopped"].includes(state.status)) return state;
     await recordRunApprovalDecisions(input.store, graph);
     state = await input.store.loadState();
-    let workspace;
-    const pendingScopeStarts = activeProgressProbeScopeStarts(
-      await input.store.loadEvents(),
-      graph,
-      state
-    );
-    if (pendingScopeStarts.length > 0) {
-      try {
-        workspace = await input.store.loadWorkspace();
-      } catch (error51) {
-        const pendingScopeStart = pendingScopeStarts[0];
-        const nodeId = typeof pendingScopeStart.data.nodeId === "string" ? pendingScopeStart.data.nodeId : void 0;
-        const stage = progressProbeStage(pendingScopeStart.data.stage);
-        const checkpointId = typeof pendingScopeStart.data.checkpointId === "string" && pendingScopeStart.data.checkpointId.length > 0 ? pendingScopeStart.data.checkpointId : pendingScopeStart.hash;
-        const reason = `Graphcraft cannot recover progress-probe scope checkpoint ${checkpointId} because its durable workspace is unavailable: ${error51.message}`;
-        return await blockProgressProbeRecovery({
-          store: input.store,
-          ...nodeId && state.nodes[nodeId] ? { nodeId } : {},
-          blocker: progressProbeRecoveryBlocker({
-            reason,
-            checkpointId,
-            ...stage ? { stage } : {}
-          })
-        });
-      }
-      const scopeRecovery = await reconcileProgressProbeScopeCheckpoints({
-        store: input.store,
-        contract,
-        graph,
-        state,
-        workspace
-      });
-      if (scopeRecovery) return scopeRecovery;
-    }
-    const recoveredFailureBlocker = await recoverDurableNodeFailureBlocker(input.store, state);
-    if (recoveredFailureBlocker) return recoveredFailureBlocker;
-    const interruptedNodeIds = Object.entries(state.nodes).filter(([, nodeState]) => nodeState.status === "running").map(([nodeId]) => nodeId);
-    if (state.status === "blocked") {
-      for (const [nodeId, nodeState] of Object.entries(state.nodes)) {
-        if (nodeState.status === "failed") {
-          await input.store.append("runtime", "node.reset", {
-            nodeId,
-            reason: "Resume requested after a blocker or environment change"
-          });
-        }
-      }
-      state = await input.store.loadState();
-    }
     const finishInterruption = async (nodeIds, termination, artifact) => {
       const activeNodeIds = nodeIds ? Array.isArray(nodeIds) ? nodeIds : [nodeIds] : [];
       const request = infrastructureFailure ? void 0 : signal.reason === controlAbort.signal.reason ? controlRequest : void 0;
@@ -38763,6 +39346,63 @@ async function executeRun(input) {
       if (request) await controlChannel.clear(request.requestId);
       return await input.store.loadState();
     };
+    let workspace;
+    const pendingScopeStarts = activeProgressProbeScopeStarts(
+      await input.store.loadEvents(),
+      graph,
+      state
+    );
+    if (pendingScopeStarts.length > 0) {
+      try {
+        workspace = await input.store.loadWorkspace();
+      } catch (error51) {
+        const pendingScopeStart = pendingScopeStarts[0];
+        const nodeId = typeof pendingScopeStart.data.nodeId === "string" ? pendingScopeStart.data.nodeId : void 0;
+        const stage = progressProbeStage(pendingScopeStart.data.stage);
+        const checkpointId = typeof pendingScopeStart.data.checkpointId === "string" && pendingScopeStart.data.checkpointId.length > 0 ? pendingScopeStart.data.checkpointId : pendingScopeStart.hash;
+        const reason = `Graphcraft cannot recover progress-probe scope checkpoint ${checkpointId} because its durable workspace is unavailable: ${error51.message}`;
+        return await blockProgressProbeRecovery({
+          store: input.store,
+          ...nodeId && state.nodes[nodeId] ? { nodeId } : {},
+          blocker: progressProbeRecoveryBlocker({
+            reason,
+            checkpointId,
+            ...stage ? { stage } : {}
+          })
+        });
+      }
+      let scopeRecovery;
+      try {
+        scopeRecovery = await reconcileProgressProbeScopeCheckpoints({
+          store: input.store,
+          contract,
+          graph,
+          state,
+          workspace,
+          signal
+        });
+      } catch (error51) {
+        if (!signal.aborted) throw error51;
+        return await finishInterruption(
+          Object.entries(state.nodes).filter(([, nodeState]) => nodeState.status === "running").map(([nodeId]) => nodeId)
+        );
+      }
+      if (scopeRecovery) return scopeRecovery;
+    }
+    const recoveredFailureBlocker = await recoverDurableNodeFailureBlocker(input.store, state);
+    if (recoveredFailureBlocker) return recoveredFailureBlocker;
+    const interruptedNodeIds = Object.entries(state.nodes).filter(([, nodeState]) => nodeState.status === "running").map(([nodeId]) => nodeId);
+    if (state.status === "blocked") {
+      for (const [nodeId, nodeState] of Object.entries(state.nodes)) {
+        if (nodeState.status === "failed") {
+          await input.store.append("runtime", "node.reset", {
+            nodeId,
+            reason: "Resume requested after a blocker or environment change"
+          });
+        }
+      }
+      state = await input.store.loadState();
+    }
     let adapterReady = false;
     let adapterProbeTermination;
     const ensureAdapterReady = async () => {
@@ -38787,13 +39427,21 @@ async function executeRun(input) {
     const initialBatch = readyBatch(graph, state, input.maxWorkers ?? 1).nodes;
     if (initialBatch.some((candidate) => !["wait", "commit"].includes(candidate.kind)) && !await ensureAdapterReady())
       return signal.aborted ? await finishInterruption(void 0, adapterProbeTermination) : await input.store.loadState();
-    if (!workspace)
+    if (!workspace) {
       try {
         workspace = await input.store.loadWorkspace();
       } catch {
-        workspace = await createRunWorkspace(contract);
-        await input.store.writeWorkspace(workspace);
+        try {
+          workspace = await createRunWorkspace(contract, { signal });
+          await input.store.writeWorkspace(workspace);
+        } catch (error51) {
+          if (signal.aborted) return await finishInterruption();
+          if (!(error51 instanceof RunWorkspaceReconciliationError)) throw error51;
+          await input.store.append("runtime", "run.blocked", { reason: error51.message });
+          return await input.store.loadState();
+        }
       }
+    }
     const deferLifecycleConsistency = async (node2, error51) => {
       const deferred = await deferGitHubLifecycleConsistency({
         store: input.store,
@@ -39452,9 +40100,11 @@ async function executeRun(input) {
           try {
             verificationScopeCurrent = await captureWorkspaceScopeSnapshot(
               workspace.path,
-              contract.scope.exclude
+              contract.scope.exclude,
+              signal
             );
           } catch (error51) {
+            if (signal.aborted) return await finishInterruption(current.id);
             const reason = `Workspace scope inspection failed after held-out integrity verification for node ${current.id}: ${error51.message}`;
             await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
             await input.store.append("runtime", "run.blocked", { reason });
@@ -39993,10 +40643,200 @@ var TRANSCRIPT_OMISSION_MARKER = Buffer.from(
   "utf8"
 );
 var TRANSCRIPT_INCOMPLETE_FAILURE = "transcript review evidence exceeded its retained bound; review is incomplete";
+var DEFAULT_BENCHMARK_MODEL_CALL_TIMEOUT_MS = 15 * 6e4;
+var BENCHMARK_MODEL_CALL_SETTLEMENT_GRACE_MS = 5e3;
+var UNCONFIRMED_CALL_SETTLEMENT_LIMITATION = "model_call_settlement:unconfirmed";
+var PROVISIONAL_ATTEMPT_LIMITATION = "attempt_checkpoint:provisional";
 var reportLimitations = [
   "Stable efficiency claims require at least three jointly accepted reconciled baseline/Graphcraft pairs per task and host.",
-  "Each trial retains a bounded redacted patch and transcript packet; blinded reviewer assignment and defect labels remain external."
+  "Each trial retains a bounded redacted patch and transcript packet; blinded reviewer assignment and defect labels remain external.",
+  "Every model call has a recorded timeout; an interrupted in-flight attempt is retained as unsuccessful evidence instead of being silently retried.",
+  "An unconfirmed model-call settlement blocks all later trials and resume until the child is reconciled outside this harness."
 ];
+var BenchmarkCallInterruptedError = class extends Error {
+  constructor(interruption) {
+    super(interruption.reason);
+    this.interruption = interruption;
+    this.name = "BenchmarkCallInterruptedError";
+  }
+  interruption;
+};
+function benchmarkInterruptionReason(value) {
+  const reason = interruptionReason(value, "runtime_shutdown");
+  return {
+    cause: reason.cause === "timeout" ? "timeout" : reason.cause === "runtime_shutdown" ? "runtime_shutdown" : "cancellation",
+    reason: redactString(reason.reason)
+  };
+}
+function delay(ms) {
+  return new Promise((resolveDelay) => {
+    setTimeout(resolveDelay, ms);
+  });
+}
+function timedCallContext(signal, timeoutMs, label, onInterruption) {
+  const timeout = new AbortController();
+  const timer = setTimeout(() => {
+    timeout.abort({
+      cause: "timeout",
+      reason: `${label} exceeded the ${timeoutMs} ms benchmark model-call timeout`
+    });
+  }, timeoutMs);
+  timer.unref();
+  const combined = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal;
+  let rejectAbort = () => void 0;
+  const aborted2 = new Promise((_resolve, reject) => {
+    rejectAbort = reject;
+  });
+  const abort = () => {
+    const interruption = benchmarkInterruptionReason(combined.reason);
+    onInterruption?.(interruption);
+    rejectAbort(
+      new BenchmarkCallInterruptedError({
+        ...interruption,
+        childSettlement: "unconfirmed"
+      })
+    );
+  };
+  combined.addEventListener("abort", abort, { once: true });
+  if (combined.aborted) abort();
+  return {
+    signal: combined,
+    aborted: aborted2,
+    dispose: () => {
+      clearTimeout(timer);
+      combined.removeEventListener("abort", abort);
+    }
+  };
+}
+async function awaitTimedCall(operation, context) {
+  try {
+    const result = await Promise.race([operation, context.aborted]);
+    if (context.signal.aborted)
+      throw new BenchmarkCallInterruptedError({
+        ...benchmarkInterruptionReason(context.signal.reason),
+        childSettlement: "confirmed"
+      });
+    return result;
+  } catch (error51) {
+    if (!context.signal.aborted) throw error51;
+    const settled = await Promise.race([
+      operation.then(
+        () => true,
+        () => true
+      ),
+      delay(BENCHMARK_MODEL_CALL_SETTLEMENT_GRACE_MS).then(() => false)
+    ]);
+    throw new BenchmarkCallInterruptedError({
+      ...benchmarkInterruptionReason(context.signal.reason),
+      childSettlement: settled ? "confirmed" : "unconfirmed"
+    });
+  }
+}
+async function runTimedCall(input) {
+  const context = timedCallContext(
+    input.signal,
+    input.timeoutMs,
+    input.label,
+    input.onInterruption
+  );
+  try {
+    return await awaitTimedCall(input.operation(context.signal), context);
+  } finally {
+    context.dispose();
+  }
+}
+var TimedBenchmarkAdapter = class {
+  constructor(adapter, timeoutMs, onInterruption) {
+    this.adapter = adapter;
+    this.timeoutMs = timeoutMs;
+    this.onInterruption = onInterruption;
+    this.id = adapter.id;
+  }
+  adapter;
+  timeoutMs;
+  onInterruption;
+  id;
+  lastInterruption;
+  interruptionEvidence() {
+    return this.lastInterruption ? { ...this.lastInterruption } : void 0;
+  }
+  rememberInterruption(error51) {
+    if (error51 instanceof BenchmarkCallInterruptedError) {
+      this.lastInterruption = { ...error51.interruption };
+    }
+  }
+  async probe(signal) {
+    try {
+      return await runTimedCall({
+        ...signal ? { signal } : {},
+        timeoutMs: this.timeoutMs,
+        label: `${this.id} capability probe`,
+        operation: async (callSignal) => await this.adapter.probe(callSignal),
+        ...this.onInterruption ? { onInterruption: this.onInterruption } : {}
+      });
+    } catch (error51) {
+      this.rememberInterruption(error51);
+      throw error51;
+    }
+  }
+  async plan(request, signal) {
+    try {
+      return await runTimedCall({
+        signal,
+        timeoutMs: this.timeoutMs,
+        label: `${this.id} planner call`,
+        operation: async (callSignal) => await this.adapter.plan(request, callSignal),
+        ...this.onInterruption ? { onInterruption: this.onInterruption } : {}
+      });
+    } catch (error51) {
+      this.rememberInterruption(error51);
+      throw error51;
+    }
+  }
+  async *execute(request, signal) {
+    const context = timedCallContext(
+      signal,
+      this.timeoutMs,
+      `${this.id} worker call`,
+      this.onInterruption
+    );
+    const iterator = this.adapter.execute(request, context.signal)[Symbol.asyncIterator]();
+    let completed = false;
+    try {
+      for (; ; ) {
+        const next = await awaitTimedCall(iterator.next(), context);
+        if (next.done) {
+          completed = true;
+          return;
+        }
+        yield next.value;
+      }
+    } catch (error51) {
+      this.rememberInterruption(error51);
+      throw error51;
+    } finally {
+      context.dispose();
+      if (!completed) void iterator.return?.().catch(() => void 0);
+    }
+  }
+  async verify(request, signal) {
+    try {
+      return await runTimedCall({
+        signal,
+        timeoutMs: this.timeoutMs,
+        label: `${this.id} semantic-verifier call`,
+        operation: async (callSignal) => await this.adapter.verify(request, callSignal),
+        ...this.onInterruption ? { onInterruption: this.onInterruption } : {}
+      });
+    } catch (error51) {
+      this.rememberInterruption(error51);
+      throw error51;
+    }
+  }
+  async reconcile(record2) {
+    return await this.adapter.reconcile(record2);
+  }
+};
 function persistedCapabilityAdmissionError(events) {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const parsed = RequiredHostCapabilityDiagnosticSchema.safeParse(
@@ -40283,7 +41123,9 @@ async function loadBenchmarkSuite(path2) {
   return BenchmarkSuiteSchema.parse(JSON.parse(await readFile3(resolve13(path2), "utf8")));
 }
 async function materializeTask(task) {
-  const repository = await mkdtemp2(join13(tmpdir2(), `graphcraft-benchmark-${task.id}-`));
+  const repository = await realpath4(
+    await mkdtemp2(join13(tmpdir2(), `graphcraft-benchmark-${task.id}-`))
+  );
   try {
     for (const [path2, value] of Object.entries(task.initialFiles)) {
       const target = safeFixturePath(repository, path2);
@@ -40488,6 +41330,163 @@ function usageSummary(usages) {
     limitations
   };
 }
+function classifyBenchmarkInterruption(error51, signal) {
+  if (error51 instanceof BenchmarkCallInterruptedError) return error51.interruption;
+  if (error51 instanceof HostTerminationError && error51.termination.cause !== "host_crash") {
+    return {
+      ...benchmarkInterruptionReason({
+        cause: error51.termination.cause,
+        reason: error51.message
+      }),
+      childSettlement: "confirmed"
+    };
+  }
+  if (signal?.aborted) {
+    return {
+      ...benchmarkInterruptionReason(signal.reason),
+      childSettlement: "confirmed"
+    };
+  }
+  return void 0;
+}
+function classifyTimedAdapterInterruption(error51, signal, adapter) {
+  const classified = classifyBenchmarkInterruption(error51, signal);
+  const adapterEvidence = adapter instanceof TimedBenchmarkAdapter ? adapter.interruptionEvidence() : void 0;
+  return adapterEvidence && (!classified || adapterEvidence.cause === classified.cause) ? adapterEvidence : classified;
+}
+function interruptionExecutionStatus(interruption) {
+  return interruption.cause === "timeout" ? "timed_out" : "interrupted";
+}
+function unresolvedAcceptance(task, reason) {
+  return [
+    ...task.checks.map((_check2, index) => ({
+      path: `$check:${index + 1}`,
+      passed: false,
+      summary: reason
+    })),
+    ...task.acceptance.map((assertion) => ({
+      path: assertion.kind === "summary_contains" ? "$summary" : assertion.path,
+      passed: false,
+      summary: reason
+    }))
+  ];
+}
+function preservedWorkspaceRecovery(fixtureRepository, lastKnownRepository) {
+  return {
+    disposition: "preserved",
+    fixtureRepository,
+    lastKnownRepository,
+    requiredAction: "reconcile_child_before_cleanup_or_resume"
+  };
+}
+function provisionalHostPreflightCheckpoint(host) {
+  return {
+    host,
+    phase: "capability_probe",
+    attemptCheckpoint: "provisional",
+    interruption: {
+      cause: "runtime_shutdown",
+      reason: "Host capability probe has not checkpointed a settled result",
+      childSettlement: "unconfirmed"
+    },
+    requiredAction: "reconcile_host_child_before_resume"
+  };
+}
+function settledHostPreflightCheckpoint(host, interruption) {
+  return {
+    host,
+    phase: "capability_probe",
+    attemptCheckpoint: "settled",
+    interruption: {
+      cause: interruption.cause,
+      reason: interruption.reason,
+      childSettlement: "unconfirmed"
+    },
+    requiredAction: "reconcile_host_child_before_resume"
+  };
+}
+function provisionalTrialResult(input) {
+  const reason = "Benchmark attempt started but has not checkpointed a settled result";
+  const reviewPacket = BenchmarkReviewPacketSchema.parse({
+    schemaVersion: 1,
+    patch: boundedReviewEvidence("text/x-diff", ""),
+    transcript: boundedReviewEvidence("application/x-ndjson", ""),
+    captureFailures: ["trial review evidence is unavailable until the attempt settles"]
+  });
+  const tokens = usageSummary([]);
+  return BenchmarkTrialResultSchema.parse({
+    trial: input.trial,
+    hostVersion: input.hostVersion,
+    modelPolicy: input.policy.model,
+    effortPolicy: input.policy.effort,
+    permissionPolicy: benchmarkPermissionPolicy(input.trial.host),
+    acceptanceScorerDigest: scorerDigest(input.task, expectedScorerFiles(input.task)),
+    observedScorerDigest: scorerDigest(input.task, expectedScorerFiles(input.task)),
+    scorerVerified: true,
+    repositoryDigest: input.repositoryDigest,
+    baseSha: input.baseSha,
+    executionStatus: "interrupted",
+    attemptCheckpoint: "provisional",
+    interruption: {
+      cause: "runtime_shutdown",
+      reason,
+      childSettlement: "unconfirmed"
+    },
+    recovery: preservedWorkspaceRecovery(input.repository, input.repository),
+    accepted: false,
+    acceptance: unresolvedAcceptance(input.task, reason),
+    usage: tokens.usage,
+    usageReconciled: false,
+    limitations: [...tokens.limitations, PROVISIONAL_ATTEMPT_LIMITATION],
+    durationMs: 0,
+    humanInterventions: 0,
+    failureTrace: [reason],
+    reviewPacket
+  });
+}
+function settleRecoveredProvisionalAttempt(result) {
+  if (result.attemptCheckpoint !== "provisional") return result;
+  const reason = "Recovered an unfinished benchmark attempt; unknown model usage and missing review evidence make this trial unsuccessful";
+  return BenchmarkTrialResultSchema.parse({
+    ...result,
+    attemptCheckpoint: "settled",
+    interruption: {
+      cause: "runtime_shutdown",
+      reason,
+      childSettlement: "unconfirmed"
+    },
+    limitations: [
+      ...result.limitations.filter((limitation) => limitation !== PROVISIONAL_ATTEMPT_LIMITATION),
+      UNCONFIRMED_CALL_SETTLEMENT_LIMITATION
+    ],
+    failureTrace: [.../* @__PURE__ */ new Set([...result.failureTrace, reason])]
+  });
+}
+function settleFailedAttempt(result, error51, signal, fallbackRecovery, adapter) {
+  const classified = adapter ? classifyTimedAdapterInterruption(error51, signal, adapter) : classifyBenchmarkInterruption(error51, signal);
+  const reason = redactString(error51 instanceof Error ? error51.message : String(error51));
+  const { interruption: _provisionalInterruption, recovery: existingRecovery, ...base } = result;
+  return BenchmarkTrialResultSchema.parse({
+    ...base,
+    executionStatus: classified ? interruptionExecutionStatus(classified) : "error",
+    attemptCheckpoint: "settled",
+    ...classified ? { interruption: classified } : {},
+    ...classified?.childSettlement === "unconfirmed" ? { recovery: existingRecovery ?? fallbackRecovery } : {},
+    accepted: false,
+    limitations: [
+      ...result.limitations.filter((limitation) => limitation !== PROVISIONAL_ATTEMPT_LIMITATION),
+      ...classified?.childSettlement === "unconfirmed" ? [UNCONFIRMED_CALL_SETTLEMENT_LIMITATION] : []
+    ],
+    failureTrace: [.../* @__PURE__ */ new Set([...result.failureTrace, reason])]
+  });
+}
+function assertBenchmarkActive(signal) {
+  if (!signal?.aborted) return;
+  const reason = benchmarkInterruptionReason(signal.reason);
+  const error51 = new Error(reason.reason);
+  error51.name = "BenchmarkInterruptedError";
+  throw error51;
+}
 async function runBaselineTrial(input) {
   const started = performance.now();
   const usages = [];
@@ -40495,6 +41494,7 @@ async function runBaselineTrial(input) {
   const summaryEvidence = [];
   const transcript = new BoundedTranscriptCapture();
   let resultStatus = "error";
+  let interruption;
   const capsule = ContextCapsuleSchema.parse({
     schemaVersion: 1,
     runId: randomUUID10(),
@@ -40527,7 +41527,7 @@ async function runBaselineTrial(input) {
         capsule,
         allowedTools: ["read", "write", "shell"]
       },
-      new AbortController().signal
+      input.signal ?? new AbortController().signal
     )) {
       const event = HostEventSchema.parse(candidate);
       transcript.append({ source: "baseline_host_event", event });
@@ -40547,9 +41547,11 @@ async function runBaselineTrial(input) {
     }
   } catch (error51) {
     if (error51 instanceof HostCapabilityAdmissionError) throw error51;
-    resultStatus = "error";
+    interruption = classifyTimedAdapterInterruption(error51, input.signal, input.adapter);
     failureTrace.push(error51 instanceof Error ? error51.message : String(error51));
   }
+  if (!interruption && input.signal?.aborted)
+    interruption = classifyTimedAdapterInterruption(void 0, input.signal, input.adapter);
   const score = await scoreAcceptance(input.task, input.repository, summaryEvidence.join("\n"));
   failureTrace.push(
     ...score.results.filter(({ passed }) => !passed).map(({ summary }) => `acceptance: ${summary}`)
@@ -40576,12 +41578,19 @@ async function runBaselineTrial(input) {
     scorerVerified: score.scorerVerified,
     repositoryDigest: input.repositoryDigest,
     baseSha: input.baseSha,
-    executionStatus: resultStatus,
-    accepted: resultStatus === "completed" && score.scorerVerified && score.results.every(({ passed }) => passed) && reviewPacket.captureFailures.length === 0,
+    executionStatus: interruption ? interruptionExecutionStatus(interruption) : resultStatus,
+    attemptCheckpoint: "settled",
+    ...interruption ? { interruption } : {},
+    ...interruption?.childSettlement === "unconfirmed" ? { recovery: preservedWorkspaceRecovery(input.repository, input.repository) } : {},
+    accepted: !interruption && resultStatus === "completed" && score.scorerVerified && score.results.every(({ passed }) => passed) && reviewPacket.captureFailures.length === 0,
     acceptance: score.results,
     usage: tokens.usage,
     usageReconciled: tokens.reconciled,
-    limitations: [...tokens.limitations, ...reviewLimitations],
+    limitations: [
+      ...tokens.limitations,
+      ...reviewLimitations,
+      ...interruption?.childSettlement === "unconfirmed" ? [UNCONFIRMED_CALL_SETTLEMENT_LIMITATION] : []
+    ],
     durationMs: Math.round(performance.now() - started),
     humanInterventions: 0,
     failureTrace,
@@ -40598,17 +41607,38 @@ async function runGraphcraftTrial(input) {
   let store;
   const transcript = new BoundedTranscriptCapture();
   const transcriptCaptureFailures = [];
+  let interruption;
   try {
     const created = await createRun(input.task.task, {
       cwd: input.repository,
       planner: input.adapter,
-      finishLine: "local_verified"
+      finishLine: "local_verified",
+      ...input.signal ? { signal: input.signal } : {}
     });
     store = created.store;
-    const state = await executeRun({ store: created.store, adapter: input.adapter, approve: true });
+    const state = await executeRun({
+      store: created.store,
+      adapter: input.adapter,
+      approve: true,
+      ...input.signal ? { signal: input.signal } : {}
+    });
     const events = await created.store.loadEvents();
     const capabilityError = persistedCapabilityAdmissionError(events);
     if (capabilityError) throw capabilityError;
+    const interruptionEvent = events.findLast(
+      ({ type, data }) => (type === "run.paused" || type === "run.stopped") && ["cancellation", "runtime_shutdown", "timeout"].includes(String(data.cause))
+    );
+    if (interruptionEvent) {
+      const callInterruption = input.adapter instanceof TimedBenchmarkAdapter ? input.adapter.interruptionEvidence() : void 0;
+      const eventInterruption = benchmarkInterruptionReason({
+        cause: interruptionEvent.data.cause,
+        reason: interruptionEvent.data.reason
+      });
+      interruption = {
+        ...eventInterruption,
+        childSettlement: callInterruption?.cause === eventInterruption.cause ? callInterruption.childSettlement : "confirmed"
+      };
+    }
     executionStatus = state.status === "completed" ? "completed" : state.status === "blocked" ? "blocked" : "failed";
     const report = usageSummary(state.tokenLedger.map(({ usage }) => usage));
     tokens = report;
@@ -40623,8 +41653,11 @@ async function runGraphcraftTrial(input) {
     );
   } catch (error51) {
     if (error51 instanceof HostCapabilityAdmissionError) throw error51;
+    interruption = classifyTimedAdapterInterruption(error51, input.signal, input.adapter);
     failureTrace.push(error51 instanceof Error ? error51.message : String(error51));
   }
+  if (!interruption && input.signal?.aborted)
+    interruption = classifyTimedAdapterInterruption(void 0, input.signal, input.adapter);
   if (store) {
     try {
       const workspace = await store.loadWorkspace();
@@ -40691,12 +41724,21 @@ async function runGraphcraftTrial(input) {
     scorerVerified: score.scorerVerified,
     repositoryDigest: input.repositoryDigest,
     baseSha: input.baseSha,
-    executionStatus,
-    accepted: executionStatus === "completed" && score.scorerVerified && score.results.every(({ passed }) => passed) && reviewPacket.captureFailures.length === 0,
+    executionStatus: interruption ? interruptionExecutionStatus(interruption) : executionStatus,
+    attemptCheckpoint: "settled",
+    ...interruption ? { interruption } : {},
+    ...interruption?.childSettlement === "unconfirmed" ? {
+      recovery: preservedWorkspaceRecovery(input.repository, acceptanceRepository)
+    } : {},
+    accepted: !interruption && executionStatus === "completed" && score.scorerVerified && score.results.every(({ passed }) => passed) && reviewPacket.captureFailures.length === 0,
     acceptance: score.results,
     usage: tokens.usage,
     usageReconciled: tokens.reconciled,
-    limitations: [...tokens.limitations, ...reviewLimitations],
+    limitations: [
+      ...tokens.limitations,
+      ...reviewLimitations,
+      ...interruption?.childSettlement === "unconfirmed" ? [UNCONFIRMED_CALL_SETTLEMENT_LIMITATION] : []
+    ],
     durationMs: Math.round(performance.now() - started),
     humanInterventions: 0,
     failureTrace,
@@ -40712,8 +41754,14 @@ function appendUniqueString(values, value) {
 }
 function parseBenchmarkReportWithReviewMigration(value) {
   const record2 = objectRecord(value);
+  if (record2?.schemaVersion === 2) {
+    BenchmarkReportV2Schema.parse(value);
+    throw new Error(
+      "Benchmark report schema version 2 predates model-call settlement evidence and cannot be resumed; preserve it and use a new output path"
+    );
+  }
   if (record2?.reviewPolicy !== reviewPolicy || !Array.isArray(record2.results))
-    return { report: BenchmarkReportSchema.parse(value), migrated: false };
+    return { report: BenchmarkReportV3Schema.parse(value), migrated: false };
   let migrated = false;
   const legacyResults = [];
   const results = record2.results.map((candidate) => {
@@ -40742,12 +41790,12 @@ function parseBenchmarkReportWithReviewMigration(value) {
       }
     });
   });
-  if (!migrated) return { report: BenchmarkReportSchema.parse(value), migrated: false };
+  if (!migrated) return { report: BenchmarkReportV3Schema.parse(value), migrated: false };
   const schedule = BenchmarkScheduleEntrySchema.array().parse(record2.schedule);
   if (contentHash(record2.summary) !== contentHash(summarizeBenchmark(legacyResults, schedule)))
     throw new Error("The existing benchmark report summary does not match its trial evidence");
   return {
-    report: BenchmarkReportSchema.parse({
+    report: BenchmarkReportV3Schema.parse({
       ...record2,
       results,
       summary: summarizeBenchmark(results, schedule)
@@ -40757,6 +41805,12 @@ function parseBenchmarkReportWithReviewMigration(value) {
 }
 async function runBenchmark(input) {
   const suite = BenchmarkSuiteSchema.parse(input.suite);
+  const modelCallTimeoutMs = input.modelCallTimeoutMs ?? DEFAULT_BENCHMARK_MODEL_CALL_TIMEOUT_MS;
+  if (!Number.isSafeInteger(modelCallTimeoutMs) || modelCallTimeoutMs <= 0 || modelCallTimeoutMs > MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS)
+    throw new Error(
+      `Benchmark model-call timeout must be an integer between 1 and ${MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS}`
+    );
+  assertBenchmarkActive(input.signal);
   const graphcraftVersion = input.graphcraftVersion?.trim();
   if (!graphcraftVersion) throw new Error("A Graphcraft version identity is required");
   const graphcraftSource = input.graphcraftSource ? BenchmarkSourceIdentitySchema.parse(input.graphcraftSource) : await inspectBenchmarkSourceIdentity(process.cwd());
@@ -40801,6 +41855,7 @@ async function runBenchmark(input) {
   let startedAt = (/* @__PURE__ */ new Date()).toISOString();
   let results = [];
   let existingReport;
+  let hostPreflightCheckpoint;
   let existingReportMigrated = false;
   try {
     const loaded = parseBenchmarkReportWithReviewMigration(
@@ -40814,7 +41869,7 @@ async function runBenchmark(input) {
       );
     const { graphcraftSource: _existingSource, ...existingRuntimeEnvironment } = existing.environment;
     const { graphcraftSource: _currentSource, ...currentRuntimeEnvironment } = environment;
-    if (existing.suite.id !== suite.id || existing.suite.version !== suite.version || existing.suite.digest !== suiteDigest || existing.seed !== input.seed || JSON.stringify(existing.modelPolicy) !== JSON.stringify(modelPolicy) || existing.effortPolicy !== effortPolicy || JSON.stringify(existing.permissionPolicy) !== JSON.stringify(permissionPolicy) || existing.reviewPolicy !== reviewPolicy || JSON.stringify(existingRuntimeEnvironment) !== JSON.stringify(currentRuntimeEnvironment) || JSON.stringify(existing.schedule) !== JSON.stringify(schedule))
+    if (existing.suite.id !== suite.id || existing.suite.version !== suite.version || existing.suite.digest !== suiteDigest || existing.seed !== input.seed || JSON.stringify(existing.modelPolicy) !== JSON.stringify(modelPolicy) || existing.effortPolicy !== effortPolicy || JSON.stringify(existing.permissionPolicy) !== JSON.stringify(permissionPolicy) || existing.reviewPolicy !== reviewPolicy || existing.modelCallTimeoutMs !== modelCallTimeoutMs || JSON.stringify(existingRuntimeEnvironment) !== JSON.stringify(currentRuntimeEnvironment) || JSON.stringify(existing.schedule) !== JSON.stringify(schedule))
       throw new Error("The existing benchmark report does not match this suite and schedule");
     if (contentHash(existing.environment.graphcraftSource) !== contentHash(graphcraftSource))
       throw new Error(
@@ -40822,6 +41877,7 @@ async function runBenchmark(input) {
       );
     startedAt = existing.startedAt;
     results = existing.results;
+    hostPreflightCheckpoint = existing.hostPreflightCheckpoint;
     existingReport = existing;
   } catch (error51) {
     if (error51.code !== "ENOENT") {
@@ -40845,12 +41901,28 @@ async function runBenchmark(input) {
     throw new Error("The existing benchmark report summary does not match its trial evidence");
   if (existingReport && contentHash(existingReport.limitations) !== contentHash(reportLimitations))
     throw new Error("The existing benchmark report limitations do not match this harness");
-  if (existingReportMigrated && existingReport) await writeJsonAtomic(outputPath, existingReport);
-  if (existingReport?.status === "complete") return { outputPath, report: existingReport };
+  const recoveredProvisionalAttempts = results.some(
+    ({ attemptCheckpoint }) => attemptCheckpoint === "provisional"
+  );
+  if (recoveredProvisionalAttempts) results = results.map(settleRecoveredProvisionalAttempt);
+  if (existingReport?.status === "complete") {
+    if (existingReportMigrated) await writeJsonAtomic(outputPath, existingReport);
+    return { outputPath, report: existingReport };
+  }
+  if (hostPreflightCheckpoint)
+    throw new Error(
+      `Benchmark cannot resume because the ${hostPreflightCheckpoint.host} host capability probe may still be active; preserve this report and reconcile the host child before using a new output path`
+    );
+  const adapters = {};
+  for (const host of hosts) {
+    const adapter = input.adapters[host];
+    if (!adapter) throw new Error(`No ${host} benchmark adapter was configured`);
+    adapters[host] = new TimedBenchmarkAdapter(adapter, modelCallTimeoutMs);
+  }
   const persist = async (status3) => {
-    const report2 = BenchmarkReportSchema.parse(
+    const report2 = BenchmarkReportV3Schema.parse(
       redactValue({
-        schemaVersion: 2,
+        schemaVersion: 3,
         status: status3,
         suite: { id: suite.id, version: suite.version, digest: suiteDigest },
         startedAt,
@@ -40862,6 +41934,8 @@ async function runBenchmark(input) {
         permissionPolicy,
         scorerPolicy,
         reviewPolicy,
+        modelCallTimeoutMs,
+        ...hostPreflightCheckpoint ? { hostPreflightCheckpoint } : {},
         environment,
         limitations: reportLimitations,
         schedule,
@@ -40872,58 +41946,181 @@ async function runBenchmark(input) {
     await writeJsonAtomic(outputPath, report2);
     return report2;
   };
+  if (existingReportMigrated || recoveredProvisionalAttempts) await persist("running");
+  const unconfirmedResult = results.find(
+    ({ interruption }) => interruption?.childSettlement === "unconfirmed"
+  );
+  if (unconfirmedResult)
+    throw new Error(
+      `Benchmark cannot continue after trial ${unconfirmedResult.trial.trialId} because model-call settlement is unconfirmed; preserve this report and reconcile the host child before using a new output path. Preserved fixture: ${unconfirmedResult.recovery?.fixtureRepository ?? "unknown"}; last known repository: ${unconfirmedResult.recovery?.lastKnownRepository ?? "unknown"}`
+    );
   for (const host of hosts) {
-    const adapter = input.adapters[host];
-    if (!adapter) throw new Error(`No ${host} benchmark adapter was configured`);
-    const capabilities = await adapter.probe();
+    assertBenchmarkActive(input.signal);
+    hostPreflightCheckpoint = provisionalHostPreflightCheckpoint(host);
+    await persist("running");
+    let capabilities;
+    try {
+      capabilities = await adapters[host].probe(input.signal);
+    } catch (error51) {
+      const interruption = error51 instanceof BenchmarkCallInterruptedError ? error51.interruption : void 0;
+      hostPreflightCheckpoint = interruption?.childSettlement === "unconfirmed" ? settledHostPreflightCheckpoint(host, interruption) : void 0;
+      await persist("running");
+      throw error51;
+    }
+    hostPreflightCheckpoint = void 0;
+    await persist("running");
     assertRequiredHostCapabilities(host, capabilities);
   }
-  await persist("running");
   const completedTrialIds = new Set(results.map(({ trial }) => trial.trialId));
   for (const trial of schedule) {
     if (completedTrialIds.has(trial.trialId)) continue;
+    assertBenchmarkActive(input.signal);
     const task = byTask.get(trial.taskId);
-    const adapter = input.adapters[trial.host];
+    const trialAbort = new AbortController();
+    const trialSignal = input.signal ? AbortSignal.any([input.signal, trialAbort.signal]) : trialAbort.signal;
+    const adapter = new TimedBenchmarkAdapter(
+      input.adapters[trial.host],
+      modelCallTimeoutMs,
+      (interruption) => {
+        if (!trialAbort.signal.aborted) trialAbort.abort(interruption);
+      }
+    );
     input.observer?.(
       `[${trial.order + 1}/${schedule.length}] ${trial.host} ${trial.mode} ${trial.taskId} #${trial.repetition}`
     );
     const fixture = await materializeTask(task);
+    let result;
+    let trialError;
+    let settledResultPersisted = false;
+    let provisional = provisionalTrialResult({
+      trial,
+      task,
+      repository: fixture.repository,
+      repositoryDigest: fixture.repositoryDigest,
+      baseSha: fixture.baseSha,
+      hostVersion: "pending-capability-probe",
+      policy: policies[trial.host]
+    });
+    results.push(provisional);
     try {
-      const capabilities = await adapter.probe();
-      assertRequiredHostCapabilities(trial.host, capabilities);
+      await persist("running");
+      await input.trialBoundary?.("after_provisional_persist", trial);
+      let capabilities;
+      try {
+        capabilities = await adapter.probe(trialSignal);
+        assertRequiredHostCapabilities(trial.host, capabilities);
+      } catch (error51) {
+        const failedProbe = settleFailedAttempt(
+          provisional,
+          error51,
+          trialSignal,
+          preservedWorkspaceRecovery(fixture.repository, fixture.repository),
+          adapter
+        );
+        const provisionalIndex2 = results.findIndex(
+          ({ trial: candidate }) => candidate.trialId === trial.trialId
+        );
+        if (provisionalIndex2 < 0)
+          throw new Error(`Benchmark lost provisional trial ${trial.trialId}`);
+        const settlementUnconfirmed = failedProbe.interruption?.childSettlement === "unconfirmed";
+        if (settlementUnconfirmed) {
+          results[provisionalIndex2] = failedProbe;
+          result = failedProbe;
+        } else {
+          results.splice(provisionalIndex2, 1);
+        }
+        try {
+          await persist("running");
+        } catch (persistError) {
+          if (!settlementUnconfirmed) results.splice(provisionalIndex2, 0, provisional);
+          throw persistError;
+        }
+        settledResultPersisted = true;
+        throw error51;
+      }
       const hostVersion = capabilities.version ?? "unknown";
-      const result = trial.mode === "baseline" ? await runBaselineTrial({
-        trial,
-        task,
-        adapter,
-        repository: fixture.repository,
-        repositoryDigest: fixture.repositoryDigest,
-        baseSha: fixture.baseSha,
-        hostVersion,
-        policy: policies[trial.host]
-      }) : await runGraphcraftTrial({
-        trial,
-        task,
-        adapter,
-        repository: fixture.repository,
-        repositoryDigest: fixture.repositoryDigest,
-        baseSha: fixture.baseSha,
-        hostVersion,
-        policy: policies[trial.host]
+      provisional = BenchmarkTrialResultSchema.parse({
+        ...provisional,
+        hostVersion
       });
-      const finalCapabilities = await adapter.probe();
-      assertRequiredHostCapabilities(trial.host, finalCapabilities);
-      if (finalCapabilities.version !== capabilities.version || finalCapabilities.protocolProfile !== capabilities.protocolProfile) {
-        throw new Error(
-          `${trial.host} protocol identity changed during benchmark trial ${trial.trialId}; refusing stale host-version evidence`
+      const provisionalIndex = results.findIndex(
+        ({ trial: candidate }) => candidate.trialId === trial.trialId
+      );
+      if (provisionalIndex < 0)
+        throw new Error(`Benchmark lost provisional trial ${trial.trialId}`);
+      results[provisionalIndex] = provisional;
+      await persist("running");
+      try {
+        result = trial.mode === "baseline" ? await runBaselineTrial({
+          trial,
+          task,
+          adapter,
+          repository: fixture.repository,
+          repositoryDigest: fixture.repositoryDigest,
+          baseSha: fixture.baseSha,
+          hostVersion,
+          policy: policies[trial.host],
+          signal: trialSignal
+        }) : await runGraphcraftTrial({
+          trial,
+          task,
+          adapter,
+          repository: fixture.repository,
+          repositoryDigest: fixture.repositoryDigest,
+          baseSha: fixture.baseSha,
+          hostVersion,
+          policy: policies[trial.host],
+          signal: trialSignal
+        });
+        if (!trialSignal.aborted && result.interruption?.childSettlement !== "unconfirmed") {
+          const finalCapabilities = await adapter.probe(trialSignal);
+          assertRequiredHostCapabilities(trial.host, finalCapabilities);
+          if (finalCapabilities.version !== capabilities.version || finalCapabilities.protocolProfile !== capabilities.protocolProfile) {
+            throw new Error(
+              `${trial.host} protocol identity changed during benchmark trial ${trial.trialId}; refusing stale host-version evidence`
+            );
+          }
+        }
+      } catch (error51) {
+        trialError = error51;
+        result = settleFailedAttempt(
+          result ?? provisional,
+          error51,
+          trialSignal,
+          preservedWorkspaceRecovery(fixture.repository, fixture.repository),
+          adapter
         );
       }
-      results.push(result);
+      if (!result) throw new Error(`Benchmark trial ${trial.trialId} produced no result`);
+      const resultIndex = results.findIndex(
+        ({ trial: candidate }) => candidate.trialId === trial.trialId
+      );
+      if (resultIndex < 0) throw new Error(`Benchmark lost provisional trial ${trial.trialId}`);
+      results[resultIndex] = result;
+      await persist("running");
+      settledResultPersisted = true;
+      await input.trialBoundary?.("after_settled_persist", trial);
     } finally {
-      await removeBenchmarkFixture(fixture.repository);
+      const checkpoint = results.find(
+        ({ trial: candidate }) => candidate.trialId === trial.trialId
+      );
+      const cleanupIsSafe = checkpoint === void 0 || settledResultPersisted && checkpoint.attemptCheckpoint === "settled" && checkpoint.interruption?.childSettlement !== "unconfirmed";
+      if (cleanupIsSafe) await removeBenchmarkFixture(fixture.repository);
     }
     completedTrialIds.add(trial.trialId);
-    await persist("running");
+    if (trialError) throw trialError;
+    if (input.signal?.aborted) {
+      const reason = benchmarkInterruptionReason(input.signal.reason);
+      const error51 = new Error(
+        `${reason.reason}. The interrupted trial was checkpointed as unsuccessful evidence.`
+      );
+      error51.name = "BenchmarkInterruptedError";
+      throw error51;
+    }
+    if (result?.interruption?.childSettlement === "unconfirmed")
+      throw new Error(
+        `Benchmark stopped after trial ${trial.trialId} because model-call settlement was not confirmed`
+      );
   }
   const report = await persist("complete");
   return { outputPath, report };
@@ -43823,7 +45020,7 @@ var program2 = new Command().name("graphcraft").description("Progress-aware exec
 async function benchmarkSourceIdentity() {
   if (true) {
     return BenchmarkSourceIdentitySchema.parse({
-      commitSha: "0170c7fa45597cb60edca2767109c6e649cc4c4a",
+      commitSha: "0008e2de1edc58c22b76f4b7cebcc0b009bac408",
       dirty: false,
       dirtyStatusDigest: false ? null : null
     });
@@ -43882,7 +45079,11 @@ async function openLocalUrl(url2) {
 }
 program2.command("benchmark").description("Run a randomized matched Graphcraft and baseline evaluation suite").argument("<suite>", "versioned benchmark suite JSON").option("-C, --cwd <path>", "repository used to store local reports", process.cwd()).addOption(
   new Option("--host <host>", "host or hosts to evaluate").choices(["codex", "claude", "both"]).default("both")
-).option("--repetitions <count>", "override repetitions per task, host, and mode").option("--seed <seed>", "deterministic schedule seed", "graphcraft-stable-v1").option("--output <path>", "report path").option("--codex-model <model>", "exact Codex model used for every Codex trial").option("--claude-model <model>", "exact Claude model used for every Claude trial").addOption(
+).option("--repetitions <count>", "override repetitions per task, host, and mode").option("--seed <seed>", "deterministic schedule seed", "graphcraft-stable-v1").option(
+  "--model-call-timeout-ms <milliseconds>",
+  "maximum duration of each benchmark model call",
+  String(DEFAULT_BENCHMARK_MODEL_CALL_TIMEOUT_MS)
+).option("--output <path>", "report path").option("--codex-model <model>", "exact Codex model used for every Codex trial").option("--claude-model <model>", "exact Claude model used for every Claude trial").addOption(
   new Option("--effort <effort>", "shared effort used for every trial").choices([
     "low",
     "medium",
@@ -43918,6 +45119,11 @@ program2.command("benchmark").description("Run a randomized matched Graphcraft a
       return;
     }
     if (!options.effort) throw new Error("--effort is required for benchmark execution");
+    const modelCallTimeoutMs = Number(options.modelCallTimeoutMs);
+    if (!Number.isSafeInteger(modelCallTimeoutMs) || modelCallTimeoutMs <= 0 || modelCallTimeoutMs > MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS)
+      throw new Error(
+        `--model-call-timeout-ms must be an integer between 1 and ${MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS}`
+      );
     const policies = {};
     for (const host of hosts) {
       const model = host === "codex" ? options.codexModel : options.claudeModel;
@@ -43932,18 +45138,26 @@ program2.command("benchmark").description("Run a randomized matched Graphcraft a
       hosts.map((host) => [host, createAdapter(host, policies[host])])
     );
     const graphcraftSource = await benchmarkSourceIdentity();
-    const result = await runBenchmark({
-      suite,
-      hosts,
-      adapters,
-      policies,
-      graphcraftVersion: GRAPHCRAFT_VERSION,
-      graphcraftSource,
-      seed: options.seed,
-      ...repetitions ? { repetitions } : {},
-      outputPath,
-      observer: (message) => console.log(message)
-    });
+    const execution = executionSignal();
+    let result;
+    try {
+      result = await runBenchmark({
+        suite,
+        hosts,
+        adapters,
+        policies,
+        graphcraftVersion: GRAPHCRAFT_VERSION,
+        graphcraftSource,
+        seed: options.seed,
+        ...repetitions ? { repetitions } : {},
+        outputPath,
+        signal: execution.signal,
+        modelCallTimeoutMs,
+        observer: (message) => console.log(message)
+      });
+    } finally {
+      execution.dispose();
+    }
     console.log(
       JSON.stringify({ outputPath: result.outputPath, summary: result.report.summary }, null, 2)
     );

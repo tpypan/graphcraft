@@ -32745,6 +32745,7 @@ function contentHash(value) {
 }
 
 // packages/core/src/benchmark.ts
+var MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS = 2147483647;
 var BenchmarkTaskFamilySchema = external_exports.enum([
   "bug",
   "feature",
@@ -32906,7 +32907,7 @@ var BenchmarkReviewPacketSchema = external_exports.strictObject({
   transcript: BenchmarkReviewEvidenceSchema,
   captureFailures: external_exports.array(external_exports.string().min(1))
 });
-var BenchmarkTrialResultSchema = external_exports.strictObject({
+var BenchmarkTrialResultV2Schema = external_exports.strictObject({
   trial: BenchmarkScheduleEntrySchema,
   hostVersion: external_exports.string().min(1),
   modelPolicy: external_exports.string().min(1),
@@ -32950,7 +32951,137 @@ var BenchmarkTrialResultSchema = external_exports.strictObject({
     });
   }
 });
-var BenchmarkReportSchema = external_exports.strictObject({
+var BenchmarkTrialResultV3Schema = external_exports.strictObject({
+  trial: BenchmarkScheduleEntrySchema,
+  hostVersion: external_exports.string().min(1),
+  modelPolicy: external_exports.string().min(1),
+  effortPolicy: BenchmarkEffortPolicySchema,
+  permissionPolicy: BenchmarkPermissionPolicySchema,
+  acceptanceScorerDigest: external_exports.string().min(1),
+  observedScorerDigest: external_exports.string().min(1),
+  scorerVerified: external_exports.boolean(),
+  repositoryDigest: external_exports.string().min(1),
+  baseSha: external_exports.string().min(1),
+  executionStatus: external_exports.enum([
+    "completed",
+    "blocked",
+    "failed",
+    "error",
+    "interrupted",
+    "timed_out"
+  ]),
+  attemptCheckpoint: external_exports.enum(["provisional", "settled"]),
+  interruption: external_exports.strictObject({
+    cause: external_exports.enum(["cancellation", "runtime_shutdown", "timeout"]),
+    reason: external_exports.string().min(1),
+    childSettlement: external_exports.enum(["confirmed", "unconfirmed"])
+  }).optional(),
+  recovery: external_exports.strictObject({
+    disposition: external_exports.literal("preserved"),
+    fixtureRepository: external_exports.string().min(1),
+    lastKnownRepository: external_exports.string().min(1),
+    requiredAction: external_exports.literal("reconcile_child_before_cleanup_or_resume")
+  }).optional(),
+  accepted: external_exports.boolean(),
+  acceptance: external_exports.array(BenchmarkAssertionResultSchema),
+  usage: TokenUsageSchema,
+  usageReconciled: external_exports.boolean(),
+  limitations: external_exports.array(external_exports.string()),
+  durationMs: external_exports.number().int().nonnegative(),
+  humanInterventions: external_exports.number().int().nonnegative(),
+  failureTrace: external_exports.array(external_exports.string()),
+  reviewPacket: BenchmarkReviewPacketSchema.optional()
+}).superRefine((result, context) => {
+  const interrupted = ["interrupted", "timed_out"].includes(result.executionStatus);
+  if (interrupted !== (result.interruption !== void 0)) {
+    context.addIssue({
+      code: "custom",
+      path: ["interruption"],
+      message: "Interrupted benchmark results must retain their interruption evidence"
+    });
+  }
+  if (result.executionStatus === "timed_out" && result.interruption?.cause !== "timeout") {
+    context.addIssue({
+      code: "custom",
+      path: ["interruption", "cause"],
+      message: "Timed-out benchmark results must retain a timeout cause"
+    });
+  }
+  if (result.executionStatus === "interrupted" && result.interruption?.cause === "timeout") {
+    context.addIssue({
+      code: "custom",
+      path: ["interruption", "cause"],
+      message: "Timeout interruptions must use the timed_out execution status"
+    });
+  }
+  if (result.attemptCheckpoint === "provisional" && result.accepted) {
+    context.addIssue({
+      code: "custom",
+      path: ["accepted"],
+      message: "A provisional benchmark attempt cannot be accepted"
+    });
+  }
+  if (result.attemptCheckpoint === "provisional" && result.interruption?.childSettlement !== "unconfirmed") {
+    context.addIssue({
+      code: "custom",
+      path: ["interruption"],
+      message: "A provisional benchmark attempt must retain unconfirmed settlement evidence"
+    });
+  }
+  const unconfirmed = result.interruption?.childSettlement === "unconfirmed";
+  if (unconfirmed !== (result.recovery !== void 0)) {
+    context.addIssue({
+      code: "custom",
+      path: ["recovery"],
+      message: "Unconfirmed benchmark calls must retain the preserved workspace recovery receipt"
+    });
+  }
+  if (unconfirmed && result.accepted) {
+    context.addIssue({
+      code: "custom",
+      path: ["accepted"],
+      message: "A benchmark attempt with unconfirmed child settlement cannot be accepted"
+    });
+  }
+  if (result.accepted && (result.reviewPacket?.captureFailures.length ?? 0) > 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["accepted"],
+      message: "A trial with review-packet capture failures cannot be accepted as review-complete"
+    });
+  }
+  if (result.accepted && result.reviewPacket?.patch.truncated) {
+    context.addIssue({
+      code: "custom",
+      path: ["accepted"],
+      message: "A trial with truncated patch evidence cannot be accepted as review-complete"
+    });
+  }
+  if (result.accepted && result.reviewPacket?.transcript.truncated) {
+    context.addIssue({
+      code: "custom",
+      path: ["accepted"],
+      message: "A trial with truncated transcript evidence cannot be accepted as review-complete"
+    });
+  }
+});
+var BenchmarkTrialResultSchema = BenchmarkTrialResultV3Schema;
+var BenchmarkAnyTrialResultSchema = external_exports.union([
+  BenchmarkTrialResultV2Schema,
+  BenchmarkTrialResultV3Schema
+]);
+var BenchmarkHostPreflightCheckpointSchema = external_exports.strictObject({
+  host: external_exports.enum(["codex", "claude"]),
+  phase: external_exports.literal("capability_probe"),
+  attemptCheckpoint: external_exports.enum(["provisional", "settled"]),
+  interruption: external_exports.strictObject({
+    cause: external_exports.enum(["cancellation", "runtime_shutdown", "timeout"]),
+    reason: external_exports.string().min(1),
+    childSettlement: external_exports.literal("unconfirmed")
+  }),
+  requiredAction: external_exports.literal("reconcile_host_child_before_resume")
+});
+var BenchmarkReportV2Schema = external_exports.strictObject({
   schemaVersion: external_exports.literal(2),
   status: external_exports.enum(["running", "complete"]),
   suite: external_exports.strictObject({
@@ -32967,6 +33098,104 @@ var BenchmarkReportSchema = external_exports.strictObject({
   permissionPolicy: BenchmarkPermissionPoliciesSchema,
   scorerPolicy: external_exports.literal("fixture_bound_scorers_plus_suite_assertions"),
   reviewPolicy: external_exports.literal("bounded_redacted_patch_and_transcript_v1").optional(),
+  environment: external_exports.strictObject({
+    platform: external_exports.string().min(1),
+    architecture: external_exports.string().min(1),
+    nodeVersion: external_exports.string().min(1),
+    graphcraftVersion: external_exports.string().trim().min(1),
+    graphcraftSource: BenchmarkSourceIdentitySchema.optional()
+  }),
+  limitations: external_exports.array(external_exports.string()),
+  schedule: external_exports.array(BenchmarkScheduleEntrySchema).min(1),
+  results: external_exports.array(BenchmarkTrialResultV2Schema),
+  summary: external_exports.record(external_exports.string(), external_exports.unknown())
+}).superRefine((report, context) => {
+  if (report.reviewPolicy !== void 0 && report.environment.graphcraftSource === void 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["environment", "graphcraftSource"],
+      message: "Evidence-backed benchmark reports must bind an exact Graphcraft source identity"
+    });
+  }
+  if (report.reviewPolicy !== void 0 && report.environment.graphcraftSource?.dirty) {
+    context.addIssue({
+      code: "custom",
+      path: ["environment", "graphcraftSource", "dirty"],
+      message: "Evidence-backed benchmark reports require a clean Graphcraft source tree"
+    });
+  }
+  const scheduleByTrialId = /* @__PURE__ */ new Map();
+  for (const [index, trial] of report.schedule.entries()) {
+    if (scheduleByTrialId.has(trial.trialId)) {
+      context.addIssue({
+        code: "custom",
+        path: ["schedule", index, "trialId"],
+        message: "Benchmark schedule trial IDs must be unique"
+      });
+    }
+    scheduleByTrialId.set(trial.trialId, trial);
+  }
+  const resultTrialIds = /* @__PURE__ */ new Set();
+  for (const [index, result] of report.results.entries()) {
+    const { trial } = result;
+    if (resultTrialIds.has(trial.trialId)) {
+      context.addIssue({
+        code: "custom",
+        path: ["results", index, "trial", "trialId"],
+        message: "Benchmark result trial IDs must be unique"
+      });
+    }
+    resultTrialIds.add(trial.trialId);
+    const scheduled = scheduleByTrialId.get(trial.trialId);
+    if (scheduled === void 0 || contentHash(scheduled) !== contentHash(trial)) {
+      context.addIssue({
+        code: "custom",
+        path: ["results", index, "trial"],
+        message: "Benchmark result trials must exactly match a scheduled trial"
+      });
+    }
+    if (report.reviewPolicy !== void 0 && result.reviewPacket === void 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["results", index, "reviewPacket"],
+        message: "Every evidence-backed benchmark result must retain a review packet"
+      });
+    }
+  }
+  if (report.status === "complete" && (report.results.length !== report.schedule.length || resultTrialIds.size !== scheduleByTrialId.size || [...scheduleByTrialId].some(([trialId]) => !resultTrialIds.has(trialId)))) {
+    context.addIssue({
+      code: "custom",
+      path: ["status"],
+      message: "The complete benchmark report does not cover the exact current schedule"
+    });
+  }
+  if (contentHash(report.summary) !== contentHash(summarizeBenchmark(report.results, report.schedule))) {
+    context.addIssue({
+      code: "custom",
+      path: ["summary"],
+      message: "The benchmark report summary does not match its trial evidence"
+    });
+  }
+});
+var BenchmarkReportV3Schema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(3),
+  status: external_exports.enum(["running", "complete"]),
+  suite: external_exports.strictObject({
+    id: external_exports.string().min(1),
+    version: external_exports.number().int().positive(),
+    digest: external_exports.string().min(1)
+  }),
+  startedAt: external_exports.iso.datetime(),
+  updatedAt: external_exports.iso.datetime(),
+  seed: external_exports.string().min(1),
+  randomized: external_exports.literal(true),
+  modelPolicy: BenchmarkModelPolicySchema,
+  effortPolicy: BenchmarkEffortPolicySchema,
+  permissionPolicy: BenchmarkPermissionPoliciesSchema,
+  scorerPolicy: external_exports.literal("fixture_bound_scorers_plus_suite_assertions"),
+  reviewPolicy: external_exports.literal("bounded_redacted_patch_and_transcript_v1").optional(),
+  modelCallTimeoutMs: external_exports.number().int().positive().max(MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS),
+  hostPreflightCheckpoint: BenchmarkHostPreflightCheckpointSchema.optional(),
   environment: external_exports.strictObject({
     platform: external_exports.string().min(1),
     architecture: external_exports.string().min(1),
@@ -33038,6 +33267,27 @@ var BenchmarkReportSchema = external_exports.strictObject({
       message: "The complete benchmark report does not cover the exact current schedule"
     });
   }
+  if (report.status === "complete" && report.results.some((result) => result.attemptCheckpoint === "provisional")) {
+    context.addIssue({
+      code: "custom",
+      path: ["status"],
+      message: "A complete benchmark report cannot retain an in-flight provisional attempt"
+    });
+  }
+  if (report.status === "complete" && report.results.some((result) => result.interruption?.childSettlement === "unconfirmed")) {
+    context.addIssue({
+      code: "custom",
+      path: ["status"],
+      message: "A complete benchmark report cannot retain unconfirmed child settlement"
+    });
+  }
+  if (report.status === "complete" && report.hostPreflightCheckpoint !== void 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["status"],
+      message: "A complete benchmark report cannot retain an unfinished host preflight"
+    });
+  }
   if (contentHash(report.summary) !== contentHash(summarizeBenchmark(report.results, report.schedule))) {
     context.addIssue({
       code: "custom",
@@ -33046,6 +33296,10 @@ var BenchmarkReportSchema = external_exports.strictObject({
     });
   }
 });
+var BenchmarkReportSchema = external_exports.discriminatedUnion("schemaVersion", [
+  BenchmarkReportV2Schema,
+  BenchmarkReportV3Schema
+]);
 function median(values) {
   if (values.length === 0) return null;
   const sorted = [...values].sort((left, right) => left - right);
@@ -33133,7 +33387,7 @@ function matchedTrialControls(results) {
   });
 }
 function summarizeBenchmark(results, schedule = results.map(({ trial }) => trial)) {
-  const parsed = results.map((result) => BenchmarkTrialResultSchema.parse(result));
+  const parsed = results.map((result) => BenchmarkAnyTrialResultSchema.parse(result));
   const parsedSchedule = schedule.map((entry) => BenchmarkScheduleEntrySchema.parse(entry));
   return Object.fromEntries(
     ["codex", "claude"].map((host) => {
@@ -35877,15 +36131,19 @@ var CodexAdapter = class {
     const exitPromise = new Promise(
       (resolve15) => child.once("close", (code, closeSignal) => resolve15({ code, signal: closeSignal }))
     );
-    const terminationController = new ChildTerminationController(child, signal);
+    const protocolAbort = new AbortController();
+    const executionSignal = AbortSignal.any([signal, protocolAbort.signal]);
+    const terminationController = new ChildTerminationController(child, executionSignal);
     child.stdin.end(renderWorkerPrompt(request.capsule, request.authorityBoundary));
     let lastMessage = "";
     let lastMessageExceededLimit = false;
     let protocolExceededLimit = false;
     let observedSessionId;
+    let expectedSessionId = request.resumeSessionId;
+    let sessionIdentityMismatch = false;
     let sessionReported = false;
     const stderr = captureStderr(child.stderr);
-    const protocolLines = readBoundedProtocolLines(child.stdout, signal)[Symbol.asyncIterator]();
+    const protocolLines = readBoundedProtocolLines(child.stdout, executionSignal)[Symbol.asyncIterator]();
     let nextProtocolLine = protocolLines.next();
     yield { type: "started", invocationId: request.invocationId };
     try {
@@ -35905,10 +36163,22 @@ var CodexAdapter = class {
         } catch {
           continue;
         }
+        if (signal.aborted || sessionIdentityMismatch) continue;
         const type = String(event.type ?? "");
         const item = event.item;
-        if (type === "thread.started" && typeof event.thread_id === "string")
+        if (type === "thread.started" && typeof event.thread_id === "string") {
+          expectedSessionId ??= event.thread_id;
+          if (event.thread_id !== expectedSessionId) {
+            sessionIdentityMismatch = true;
+            protocolAbort.abort({
+              cause: "cancellation",
+              reason: "Codex worker reported a different thread identity"
+            });
+            continue;
+          }
           observedSessionId = event.thread_id;
+        }
+        if (!observedSessionId) continue;
         if (!sessionReported && observedSessionId && type.startsWith("item.")) {
           sessionReported = true;
           yield { type: "session", hostSessionId: observedSessionId };
@@ -35933,6 +36203,13 @@ var CodexAdapter = class {
       }
       const exit = await terminationController.waitForExit(exitPromise);
       const termination = terminationController.finish(exit.code, exit.signal);
+      if (sessionIdentityMismatch) {
+        yield {
+          type: "error",
+          message: `Codex ${request.resumeSessionId ? "resumed " : ""}worker reported a different thread identity; result was rejected`
+        };
+        return;
+      }
       if (termination) {
         yield { type: "terminated", termination };
         return;
@@ -35948,8 +36225,23 @@ var CodexAdapter = class {
         };
         return;
       }
+      if (exit.code !== 0) {
+        yield {
+          type: "error",
+          message: stderr.text().trim() || `Codex exited ${exit.code} without a valid structured result`,
+          cause: "host_crash"
+        };
+        return;
+      }
+      if (!observedSessionId) {
+        yield {
+          type: "error",
+          message: `Codex ${request.resumeSessionId ? "resumed " : ""}worker did not report its thread identity; result was rejected`
+        };
+        return;
+      }
       const result = parseJsonResult(lastMessage);
-      if (exit.code !== 0 || !result) {
+      if (!result) {
         yield {
           type: "error",
           message: stderr.text().trim() || `Codex exited ${exit.code ?? 1} without a valid structured result`,
@@ -36471,14 +36763,18 @@ var ClaudeAdapter = class {
     const exitPromise = new Promise(
       (resolve15) => child.once("close", (code, closeSignal) => resolve15({ code, signal: closeSignal }))
     );
-    const terminationController = new ChildTerminationController(child, signal);
+    const protocolAbort = new AbortController();
+    const executionSignal = AbortSignal.any([signal, protocolAbort.signal]);
+    const terminationController = new ChildTerminationController(child, executionSignal);
     let protocolExceededLimit = false;
     let structuredExceededLimit = false;
     let finalResult;
     let observedSessionId;
+    let sessionIdentityFailure;
+    const expectedSessionId = request.resumeSessionId ?? request.invocationId;
     let sessionReported = false;
     const stderr = captureStderr2(child.stderr);
-    const protocolLines = readBoundedProtocolLines2(child.stdout, signal)[Symbol.asyncIterator]();
+    const protocolLines = readBoundedProtocolLines2(child.stdout, executionSignal)[Symbol.asyncIterator]();
     let nextProtocolLine = protocolLines.next();
     yield { type: "started", invocationId: request.invocationId };
     try {
@@ -36498,8 +36794,20 @@ var ClaudeAdapter = class {
         } catch {
           continue;
         }
+        if (signal.aborted || sessionIdentityFailure) continue;
         const type = String(event.type ?? "");
-        if (typeof event.session_id === "string") observedSessionId = event.session_id;
+        const eventSessionId = typeof event.session_id === "string" ? event.session_id : void 0;
+        const identityFailure = eventSessionId && eventSessionId !== expectedSessionId ? "different" : (type === "assistant" || type === "result") && !eventSessionId ? "missing" : void 0;
+        if (identityFailure) {
+          sessionIdentityFailure = identityFailure;
+          protocolAbort.abort({
+            cause: "cancellation",
+            reason: identityFailure === "different" ? "Claude worker reported a different session identity" : "Claude worker output omitted its session identity"
+          });
+          continue;
+        }
+        if (eventSessionId) observedSessionId = eventSessionId;
+        if (request.resumeSessionId && !observedSessionId) continue;
         if (!sessionReported && observedSessionId && (type === "assistant" || type === "result")) {
           sessionReported = true;
           yield { type: "session", hostSessionId: observedSessionId };
@@ -36527,7 +36835,12 @@ var ClaudeAdapter = class {
       }
       const exit = await terminationController.waitForExit(exitPromise);
       const termination = terminationController.finish(exit.code, exit.signal);
-      if (termination) {
+      if (sessionIdentityFailure) {
+        yield {
+          type: "error",
+          message: sessionIdentityFailure === "different" ? `Claude ${request.resumeSessionId ? "resumed " : ""}worker reported a different session identity; result was rejected` : `Claude ${request.resumeSessionId ? "resumed " : ""}worker output omitted its session identity; result was rejected`
+        };
+      } else if (termination) {
         yield { type: "terminated", termination };
       } else if (protocolExceededLimit) {
         yield { type: "error", message: protocolLineLimitError2("Claude").message };
@@ -36536,7 +36849,18 @@ var ClaudeAdapter = class {
           type: "error",
           message: structuredOutputLimitError2("Claude", "structured result").message
         };
-      } else if (exit.code !== 0 || !finalResult) {
+      } else if (exit.code !== 0) {
+        yield {
+          type: "error",
+          message: stderr.text().trim() || `Claude exited ${exit.code} without a valid structured result`,
+          cause: "host_crash"
+        };
+      } else if (!observedSessionId) {
+        yield {
+          type: "error",
+          message: `Claude ${request.resumeSessionId ? "resumed " : ""}worker did not report its session identity; result was rejected`
+        };
+      } else if (!finalResult) {
         yield {
           type: "error",
           message: stderr.text().trim() || `Claude exited ${exit.code ?? 1} without a valid structured result`,
@@ -43410,7 +43734,7 @@ async function decideRunControl(store, input) {
 }
 
 // packages/runtime/src/repository.ts
-import { appendFile, lstat as lstat6, mkdir as mkdir3, readFile, readlink as readlink2 } from "node:fs/promises";
+import { appendFile, lstat as lstat6, mkdir as mkdir3, readFile, readlink as readlink2, realpath as realpath3 } from "node:fs/promises";
 import { basename as basename3, dirname as dirname9, isAbsolute as isAbsolute6, join as join8, resolve as resolve7 } from "node:path";
 
 // packages/runtime/src/side-effect.ts
@@ -43806,31 +44130,246 @@ async function ensureGraphcraftIgnored(repositoryRoot, signal) {
   }
   signal?.throwIfAborted();
   if (!content.split("\n").includes(".graphcraft/"))
-    await appendFile(excludePath, "\n.graphcraft/\n", "utf8");
+    await appendFile(excludePath, "\n.graphcraft/\n", {
+      encoding: "utf8",
+      ...signal ? { signal } : {}
+    });
+  signal?.throwIfAborted();
 }
+var RunWorkspaceReconciliationError = class extends Error {
+  constructor(workspacePath, detail, options) {
+    super(
+      `Graphcraft found unsafe or ambiguous worktree state at ${workspacePath}: ${detail}. Existing Git state was preserved; resolve it before resuming`,
+      options
+    );
+    this.workspacePath = workspacePath;
+    this.name = "RunWorkspaceReconciliationError";
+  }
+  workspacePath;
+};
 function slug(task) {
   return task.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32) || "run";
 }
-async function createRunWorkspace(contract) {
+function comparablePath(path) {
+  const absolute = resolve7(path);
+  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+}
+async function canonicalComparablePath(path, signal) {
+  signal?.throwIfAborted();
+  try {
+    const canonical = await realpath3(path);
+    signal?.throwIfAborted();
+    return comparablePath(canonical);
+  } catch (error51) {
+    signal?.throwIfAborted();
+    if (error51.code !== "ENOENT") throw error51;
+  }
+  try {
+    const canonicalParent = await realpath3(dirname9(path));
+    signal?.throwIfAborted();
+    return comparablePath(join8(canonicalParent, basename3(path)));
+  } catch (error51) {
+    signal?.throwIfAborted();
+    if (error51.code !== "ENOENT") throw error51;
+    return comparablePath(path);
+  }
+}
+function parseWorktreeRegistrations(output) {
+  const registrations = [];
+  let current;
+  for (const field of output.split("\0")) {
+    if (field.length === 0) {
+      if (current) registrations.push(current);
+      current = void 0;
+      continue;
+    }
+    const separator = field.indexOf(" ");
+    const name = separator === -1 ? field : field.slice(0, separator);
+    const value = separator === -1 ? "" : field.slice(separator + 1);
+    if (name === "worktree") {
+      if (current) throw new Error("Git returned overlapping worktree records");
+      if (!value) throw new Error("Git returned a worktree record without a path");
+      current = { path: value };
+      continue;
+    }
+    if (!current) throw new Error("Git returned a worktree field before its path");
+    if (name === "HEAD") current.head = value;
+    if (name === "branch") current.branch = value;
+  }
+  if (current) registrations.push(current);
+  return registrations;
+}
+async function branchSha(repositoryPath, branch, signal) {
+  const ref = `refs/heads/${branch}`;
+  const output = await gitRaw(
+    repositoryPath,
+    ["for-each-ref", "--format=%(refname)%00%(objectname)", ref],
+    signal
+  );
+  const matches = output.split("\n").filter(Boolean).map((line) => line.split("\0")).filter(([candidate]) => candidate === ref);
+  if (matches.length > 1 || matches.some(([, sha]) => !sha))
+    throw new Error(`Git returned an ambiguous ref inventory for ${ref}`);
+  return matches[0]?.[1];
+}
+async function canonicalGitCommonDirectory(repositoryPath, signal) {
+  const value = await git(repositoryPath, ["rev-parse", "--git-common-dir"], signal);
+  signal?.throwIfAborted();
+  const path = isAbsolute6(value) ? value : resolve7(repositoryPath, value);
+  const canonical = await realpath3(path);
+  signal?.throwIfAborted();
+  return comparablePath(canonical);
+}
+function workspaceStateError(path, detail, cause) {
+  return new RunWorkspaceReconciliationError(path, detail, cause ? { cause } : void 0);
+}
+async function reconcileRunWorkspaceCreation(contract, path, branch, signal) {
+  signal?.throwIfAborted();
+  let pathStats;
+  try {
+    pathStats = await lstat6(path);
+  } catch (error51) {
+    signal?.throwIfAborted();
+    if (error51.code !== "ENOENT")
+      throw workspaceStateError(path, "the intended path could not be inspected", error51);
+  }
+  signal?.throwIfAborted();
+  let registrations;
+  let expectedBranchSha;
+  try {
+    [registrations, expectedBranchSha] = await Promise.all([
+      gitRaw(contract.repository.root, ["worktree", "list", "--porcelain", "-z"], signal).then(
+        parseWorktreeRegistrations
+      ),
+      branchSha(contract.repository.root, branch, signal)
+    ]);
+  } catch (error51) {
+    signal?.throwIfAborted();
+    throw workspaceStateError(path, "Git could not inventory the intended path and branch", error51);
+  }
+  signal?.throwIfAborted();
+  let targetPath;
+  try {
+    targetPath = await canonicalComparablePath(path, signal);
+  } catch (error51) {
+    signal?.throwIfAborted();
+    throw workspaceStateError(path, "the intended path identity could not be resolved", error51);
+  }
+  const targetRegistrations = registrations.filter(
+    (registration2) => comparablePath(registration2.path) === targetPath
+  );
+  const expectedRef = `refs/heads/${branch}`;
+  const branchRegistrations = registrations.filter(
+    (registration2) => registration2.branch === expectedRef
+  );
+  if (!pathStats && targetRegistrations.length === 0) {
+    if (branchRegistrations.length > 0)
+      throw workspaceStateError(path, "the intended branch is registered at another worktree");
+    if (!expectedBranchSha) return { status: "absent" };
+    if (expectedBranchSha === contract.repository.baseSha) return { status: "branch_only" };
+    throw workspaceStateError(
+      path,
+      `the unregistered intended branch does not point to approved base ${contract.repository.baseSha}`
+    );
+  }
+  if (!pathStats)
+    throw workspaceStateError(path, "Git registers the intended path, but the path is missing");
+  if (!pathStats.isDirectory() || pathStats.isSymbolicLink())
+    throw workspaceStateError(path, "the intended path is not a plain directory");
+  if (targetRegistrations.length !== 1)
+    throw workspaceStateError(
+      path,
+      targetRegistrations.length === 0 ? "the intended path exists without an exact Git worktree registration" : "Git reports duplicate registrations for the intended path"
+    );
+  if (branchRegistrations.length !== 1 || branchRegistrations[0] !== targetRegistrations[0])
+    throw workspaceStateError(path, "the intended branch is missing or registered elsewhere");
+  const registration = targetRegistrations[0];
+  if (registration.branch !== expectedRef)
+    throw workspaceStateError(path, "the registered worktree is on a different branch");
+  if (registration.head !== contract.repository.baseSha)
+    throw workspaceStateError(path, "the registered worktree HEAD differs from the approved base");
+  if (expectedBranchSha !== contract.repository.baseSha)
+    throw workspaceStateError(path, "the intended branch ref differs from the approved base");
+  try {
+    const topLevel = await git(path, ["rev-parse", "--show-toplevel"], signal);
+    if (await canonicalComparablePath(topLevel, signal) !== targetPath)
+      throw workspaceStateError(path, "the worktree top level differs from the intended path");
+    const currentBranch = await git(path, ["symbolic-ref", "--quiet", "--short", "HEAD"], signal);
+    if (currentBranch !== branch)
+      throw workspaceStateError(path, "the worktree checkout is on a different branch");
+    const head = await git(path, ["rev-parse", "HEAD"], signal);
+    if (head !== contract.repository.baseSha)
+      throw workspaceStateError(path, "the worktree checkout differs from the approved base");
+    const status3 = await gitRaw(
+      path,
+      ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching"],
+      signal
+    );
+    if (status3.length > 0)
+      throw workspaceStateError(
+        path,
+        "the worktree contains uncommitted or untracked changes, including ignored content"
+      );
+    const [sourceCommonDirectory, worktreeCommonDirectory] = await Promise.all([
+      canonicalGitCommonDirectory(contract.repository.root, signal),
+      canonicalGitCommonDirectory(path, signal)
+    ]);
+    if (sourceCommonDirectory !== worktreeCommonDirectory)
+      throw workspaceStateError(path, "the worktree belongs to a different common Git directory");
+  } catch (error51) {
+    signal?.throwIfAborted();
+    if (error51 instanceof RunWorkspaceReconciliationError) throw error51;
+    throw workspaceStateError(path, "the registered worktree could not be validated", error51);
+  }
+  signal?.throwIfAborted();
+  return { status: "ready" };
+}
+async function crossRunWorkspaceCreationBoundary(options, point) {
+  await options.boundary?.(point);
+  options.signal?.throwIfAborted();
+}
+async function createRunWorkspace(contract, options = {}) {
   const branch = `graphcraft/${contract.runId.slice(0, 8)}-${slug(contract.task)}`;
   const parent = join8(
     dirname9(contract.repository.root),
     `.${basename3(contract.repository.root)}-graphcraft-worktrees`
   );
   const path = join8(parent, contract.runId);
+  options.signal?.throwIfAborted();
   await mkdir3(parent, { recursive: true });
-  const registered = await git(contract.repository.root, ["worktree", "list", "--porcelain"]);
-  if (registered.includes(`worktree ${path}`)) return { path, branch, created: false };
-  const branchExists = await git(contract.repository.root, [
-    "show-ref",
-    "--verify",
-    "--quiet",
-    `refs/heads/${branch}`
-  ]).then(() => true).catch(() => false);
-  await git(
-    contract.repository.root,
-    branchExists ? ["worktree", "add", path, branch] : ["worktree", "add", "-b", branch, path, contract.repository.baseSha]
-  );
+  options.signal?.throwIfAborted();
+  let parentStats;
+  try {
+    parentStats = await lstat6(parent);
+  } catch (error51) {
+    options.signal?.throwIfAborted();
+    throw workspaceStateError(path, "the worktree parent could not be inspected", error51);
+  }
+  if (!parentStats.isDirectory() || parentStats.isSymbolicLink())
+    throw workspaceStateError(path, "the worktree parent is not a plain directory");
+  await crossRunWorkspaceCreationBoundary(options, "after_parent_prepare");
+  const before = await reconcileRunWorkspaceCreation(contract, path, branch, options.signal);
+  await crossRunWorkspaceCreationBoundary(options, "after_reconciliation");
+  if (before.status === "ready") return { path, branch, created: false };
+  await crossRunWorkspaceCreationBoundary(options, "before_worktree_add");
+  let commandError;
+  try {
+    await git(
+      contract.repository.root,
+      before.status === "branch_only" ? ["worktree", "add", path, branch] : ["worktree", "add", "-b", branch, path, contract.repository.baseSha],
+      options.signal
+    );
+  } catch (error51) {
+    options.signal?.throwIfAborted();
+    commandError = error51;
+  }
+  await crossRunWorkspaceCreationBoundary(options, "after_worktree_add");
+  const after = await reconcileRunWorkspaceCreation(contract, path, branch, options.signal);
+  if (after.status !== "ready")
+    throw workspaceStateError(
+      path,
+      `worktree creation stopped in the safe ${after.status.replace("_", "-")} state`,
+      commandError
+    );
   return { path, branch, created: true };
 }
 async function commitContentDigest(repositoryPath) {
@@ -45993,8 +46532,14 @@ import { createReadStream } from "node:fs";
 import { lstat as lstat9, readlink as readlink3 } from "node:fs/promises";
 import { isAbsolute as isAbsolute7, matchesGlob, relative as relative7, resolve as resolve10, sep as sep5 } from "node:path";
 var maximumChangedPaths = 1e4;
-async function gitOutput(repositoryPath, args) {
-  const result = await runProcess("git", args, { cwd: repositoryPath, timeoutMs: 12e4 });
+async function gitOutput(repositoryPath, args, signal) {
+  signal?.throwIfAborted();
+  const result = await runProcess("git", args, {
+    cwd: repositoryPath,
+    timeoutMs: 12e4,
+    ...signal ? { signal } : {}
+  });
+  signal?.throwIfAborted();
   if (result.exitCode !== 0)
     throw new Error(result.stderr.trim() || `git ${args[0] ?? "command"} failed`);
   return result.stdout;
@@ -46010,61 +46555,112 @@ function confinedPath(repositoryPath, path) {
     throw new Error(`Git reported a path outside the workspace: ${path}`);
   return absolute;
 }
-async function fileDigest(path) {
+async function fileDigest(path, signal) {
+  signal?.throwIfAborted();
   const hash2 = createHash5("sha256");
-  for await (const chunk of createReadStream(path)) hash2.update(chunk);
+  for await (const chunk of createReadStream(path, signal ? { signal } : void 0)) {
+    signal?.throwIfAborted();
+    hash2.update(chunk);
+  }
+  signal?.throwIfAborted();
   return hash2.digest("hex");
 }
-async function pathSignature(repositoryPath, path) {
+async function pathSignature(repositoryPath, path, signal) {
+  signal?.throwIfAborted();
   const absolute = confinedPath(repositoryPath, path);
   let status3;
   try {
     status3 = await lstat9(absolute);
   } catch (error51) {
+    signal?.throwIfAborted();
     if (error51.code === "ENOENT") return "missing";
     throw error51;
   }
+  signal?.throwIfAborted();
   const mode = status3.mode & 511;
-  if (status3.isSymbolicLink())
-    return contentHash({ kind: "symlink", mode, target: await readlink3(absolute) });
+  if (status3.isSymbolicLink()) {
+    const target = await readlink3(absolute);
+    signal?.throwIfAborted();
+    return contentHash({ kind: "symlink", mode, target });
+  }
   if (status3.isFile())
     return contentHash({
       kind: "file",
       mode,
       size: status3.size,
-      digest: await fileDigest(absolute)
+      digest: await fileDigest(absolute, signal)
     });
   if (status3.isDirectory()) {
-    const [head, state] = await Promise.all([
-      gitOutput(absolute, ["rev-parse", "HEAD"]).catch(() => "not-a-repository"),
-      gitOutput(absolute, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]).catch(
-        () => "unavailable"
-      )
-    ]);
+    const operations = [
+      gitOutput(absolute, ["rev-parse", "HEAD"], signal).catch(() => {
+        signal?.throwIfAborted();
+        return "not-a-repository";
+      }),
+      gitOutput(
+        absolute,
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        signal
+      ).catch(() => {
+        signal?.throwIfAborted();
+        return "unavailable";
+      })
+    ];
+    let head;
+    let state;
+    try {
+      [head, state] = await Promise.all(operations);
+    } catch (error51) {
+      if (signal?.aborted) await Promise.allSettled(operations);
+      throw error51;
+    }
+    signal?.throwIfAborted();
     return contentHash({ kind: "directory", mode, head: head.trim(), state });
   }
   return contentHash({ kind: "other", mode, size: status3.size });
 }
-async function captureWorkspaceScopeSnapshot(repositoryPath, inspectedIgnoredPatterns = []) {
-  const ignored = inspectedIgnoredPatterns.length > 0 ? gitOutput(repositoryPath, [
-    "ls-files",
-    "--others",
-    "--ignored",
-    "--exclude-standard",
-    "-z",
-    "--",
-    ...inspectedIgnoredPatterns
-  ]) : Promise.resolve("");
-  const [tracked, untracked, excludedIgnored, head, branch, index] = await Promise.all([
-    gitOutput(repositoryPath, ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"]),
-    gitOutput(repositoryPath, ["ls-files", "--others", "--exclude-standard", "-z"]),
+async function captureWorkspaceScopeSnapshot(repositoryPath, inspectedIgnoredPatterns = [], signal) {
+  signal?.throwIfAborted();
+  const ignored = inspectedIgnoredPatterns.length > 0 ? gitOutput(
+    repositoryPath,
+    [
+      "ls-files",
+      "--others",
+      "--ignored",
+      "--exclude-standard",
+      "-z",
+      "--",
+      ...inspectedIgnoredPatterns
+    ],
+    signal
+  ) : Promise.resolve("");
+  const operations = [
+    gitOutput(repositoryPath, ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"], signal),
+    gitOutput(repositoryPath, ["ls-files", "--others", "--exclude-standard", "-z"], signal),
     ignored,
-    gitOutput(repositoryPath, ["rev-parse", "HEAD"]),
-    gitOutput(repositoryPath, ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(
-      () => "(detached)"
-    ),
-    gitOutput(repositoryPath, ["diff", "--cached", "--no-ext-diff", "--binary", "HEAD", "--"])
-  ]);
+    gitOutput(repositoryPath, ["rev-parse", "HEAD"], signal),
+    gitOutput(repositoryPath, ["symbolic-ref", "--quiet", "--short", "HEAD"], signal).catch(() => {
+      signal?.throwIfAborted();
+      return "(detached)";
+    }),
+    gitOutput(
+      repositoryPath,
+      ["diff", "--cached", "--no-ext-diff", "--binary", "HEAD", "--"],
+      signal
+    )
+  ];
+  let tracked;
+  let untracked;
+  let excludedIgnored;
+  let head;
+  let branch;
+  let index;
+  try {
+    [tracked, untracked, excludedIgnored, head, branch, index] = await Promise.all(operations);
+  } catch (error51) {
+    if (signal?.aborted) await Promise.allSettled(operations);
+    throw error51;
+  }
+  signal?.throwIfAborted();
   const paths = [
     .../* @__PURE__ */ new Set([...nulPaths(tracked), ...nulPaths(untracked), ...nulPaths(excludedIgnored)])
   ].sort();
@@ -46073,8 +46669,11 @@ async function captureWorkspaceScopeSnapshot(repositoryPath, inspectedIgnoredPat
       `Workspace scope inspection refused ${paths.length} changed paths; maximum is ${maximumChangedPaths}`
     );
   const changed = {};
-  for (const path of paths)
-    changed[path.replaceAll("\\", "/")] = await pathSignature(repositoryPath, path);
+  for (const path of paths) {
+    signal?.throwIfAborted();
+    changed[path.replaceAll("\\", "/")] = await pathSignature(repositoryPath, path, signal);
+  }
+  signal?.throwIfAborted();
   const core = {
     headSha: head.trim(),
     branch: branch.trim(),
@@ -49050,6 +49649,7 @@ async function executeWorker(input) {
   let result;
   let error51;
   let errorCause;
+  let interruptionCause;
   let capabilityDiagnostic;
   let termination;
   let usageReceipts = 0;
@@ -49135,11 +49735,16 @@ async function executeWorker(input) {
       }
       error51 = cause instanceof Error ? cause.message : String(cause);
       const capabilityError = cause instanceof HostCapabilityAdmissionError;
-      if (!capabilityError) errorCause = "host_crash";
+      if (input.signal.aborted) {
+        interruptionCause = interruptionReason(input.signal.reason).cause;
+        if (interruptionCause === "timeout") errorCause = "timeout";
+      } else if (!capabilityError) {
+        errorCause = "host_crash";
+      }
       const event2 = {
         type: "error",
         message: error51,
-        ...errorCause ? { cause: errorCause } : {}
+        ...interruptionCause ? { cause: interruptionCause } : errorCause ? { cause: errorCause } : {}
       };
       artifact = await input.store.appendInvocationEvent(invocationId, event2);
       if (capabilityError) capabilityDiagnostic = cause.diagnostic;
@@ -49188,6 +49793,7 @@ async function executeWorker(input) {
     if (event.type === "error") {
       error51 = event.message;
       if (event.cause === "host_crash" || event.cause === "timeout") errorCause = event.cause;
+      if (event.cause && event.cause !== "host_crash") interruptionCause = event.cause;
     }
   }
   if (hostStarted && usageReceipts === 0 && !capabilityDiagnostic)
@@ -49211,8 +49817,9 @@ async function executeWorker(input) {
       nodeId: input.node.id,
       artifact,
       success: Boolean(result) && !error51 && !termination,
-      interrupted: Boolean(termination),
+      interrupted: Boolean(termination) || Boolean(interruptionCause) || input.signal.aborted,
       ...termination ? { termination } : {},
+      ...interruptionCause ? { interruptionCause } : {},
       ...errorCause ? { errorCause } : {},
       ...capabilityDiagnostic ? { reason: capabilityDiagnostic.detail, capabilityDiagnostic } : {}
     },
@@ -49498,7 +50105,8 @@ async function runSemanticVerification(input) {
     );
     beforeScope = await captureWorkspaceScopeSnapshot(
       input.workspace.path,
-      input.contract.scope.exclude
+      input.contract.scope.exclude,
+      input.signal
     );
   } catch (error51) {
     const failure = error51 instanceof Error ? error51 : new Error(String(error51));
@@ -49656,9 +50264,11 @@ async function runSemanticVerification(input) {
   try {
     afterScope = await captureWorkspaceScopeSnapshot(
       input.workspace.path,
-      input.contract.scope.exclude
+      input.contract.scope.exclude,
+      input.signal
     );
   } catch (error51) {
+    if (input.signal.aborted) throw error51;
     return failVerification(error51);
   }
   const beforeDigest = beforeScope.digest;
@@ -50310,9 +50920,11 @@ async function executeReadOnlyProgressProbes(input) {
     try {
       baseline = await captureWorkspaceScopeSnapshot(
         input.workspace.path,
-        input.contract.scope.exclude
+        input.contract.scope.exclude,
+        input.signal
       );
     } catch (error51) {
+      if (input.signal.aborted) return { status: "interrupted" };
       return {
         status: "failed",
         reason: `Workspace scope inspection failed before progress probes for node ${input.node.id}: ${error51.message}`,
@@ -50375,9 +50987,11 @@ async function executeReadOnlyProgressProbes(input) {
   try {
     current = await captureWorkspaceScopeSnapshot(
       input.workspace.path,
-      input.contract.scope.exclude
+      input.contract.scope.exclude,
+      input.signal
     );
   } catch (error51) {
+    if (input.signal.aborted) return { status: "interrupted" };
     return {
       status: "failed",
       reason: `Workspace scope inspection failed after progress probes for node ${input.node.id}: ${error51.message}`,
@@ -50934,9 +51548,11 @@ async function reconcileProgressProbeScopeCheckpoints(input) {
       try {
         current2 = await captureWorkspaceScopeSnapshot(
           input.workspace.path,
-          input.contract.scope.exclude
+          input.contract.scope.exclude,
+          input.signal
         );
-      } catch {
+      } catch (error51) {
+        if (input.signal.aborted) throw error51;
         await ensureProgressProbeRunBlocker({ store: input.store, blocker });
         return await input.store.loadState();
       }
@@ -50959,9 +51575,11 @@ async function reconcileProgressProbeScopeCheckpoints(input) {
     try {
       current = await captureWorkspaceScopeSnapshot(
         input.workspace.path,
-        input.contract.scope.exclude
+        input.contract.scope.exclude,
+        input.signal
       );
     } catch (error51) {
+      if (input.signal.aborted) throw error51;
       const reason = `Workspace scope inspection failed while recovering progress probes for node ${active.node.id}: ${error51.message}`;
       return await blockProgressProbeRecovery({
         store: input.store,
@@ -51043,8 +51661,13 @@ async function executeWorkNode(input) {
   }
   let scopeBaseline;
   try {
-    scopeBaseline = input.recoveryScopeBaseline ?? observedBaselineScope ?? await captureWorkspaceScopeSnapshot(input.workspace.path, input.contract.scope.exclude);
+    scopeBaseline = input.recoveryScopeBaseline ?? observedBaselineScope ?? await captureWorkspaceScopeSnapshot(
+      input.workspace.path,
+      input.contract.scope.exclude,
+      input.signal
+    );
   } catch (error51) {
+    if (input.signal.aborted) return { status: "interrupted", nodeId: input.node.id, artifact: "" };
     const reason2 = `Workspace scope inspection failed before node ${input.node.id}: ${error51.message}`;
     await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason: reason2 });
     return { status: "failed", nodeId: input.node.id, reason: reason2 };
@@ -51080,7 +51703,8 @@ async function executeWorkNode(input) {
   try {
     currentScope = await captureWorkspaceScopeSnapshot(
       input.workspace.path,
-      input.contract.scope.exclude
+      input.contract.scope.exclude,
+      input.signal
     );
     const audit = auditWorkspaceScope({
       contract: input.contract,
@@ -51109,6 +51733,13 @@ async function executeWorkNode(input) {
       return { status: "failed", nodeId: input.node.id, reason: reason2 };
     }
   } catch (error51) {
+    if (input.signal.aborted)
+      return {
+        status: "interrupted",
+        nodeId: input.node.id,
+        ...worker.termination ? { termination: worker.termination } : {},
+        artifact: worker.artifact
+      };
     const reason2 = `Workspace scope inspection failed after node ${input.node.id}: ${error51.message}`;
     await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason: reason2 });
     return { status: "failed", nodeId: input.node.id, reason: reason2 };
@@ -51462,54 +52093,6 @@ async function executeRun(input) {
     if (["completed", "stopped"].includes(state.status)) return state;
     await recordRunApprovalDecisions(input.store, graph);
     state = await input.store.loadState();
-    let workspace;
-    const pendingScopeStarts = activeProgressProbeScopeStarts(
-      await input.store.loadEvents(),
-      graph,
-      state
-    );
-    if (pendingScopeStarts.length > 0) {
-      try {
-        workspace = await input.store.loadWorkspace();
-      } catch (error51) {
-        const pendingScopeStart = pendingScopeStarts[0];
-        const nodeId = typeof pendingScopeStart.data.nodeId === "string" ? pendingScopeStart.data.nodeId : void 0;
-        const stage = progressProbeStage(pendingScopeStart.data.stage);
-        const checkpointId = typeof pendingScopeStart.data.checkpointId === "string" && pendingScopeStart.data.checkpointId.length > 0 ? pendingScopeStart.data.checkpointId : pendingScopeStart.hash;
-        const reason = `Graphcraft cannot recover progress-probe scope checkpoint ${checkpointId} because its durable workspace is unavailable: ${error51.message}`;
-        return await blockProgressProbeRecovery({
-          store: input.store,
-          ...nodeId && state.nodes[nodeId] ? { nodeId } : {},
-          blocker: progressProbeRecoveryBlocker({
-            reason,
-            checkpointId,
-            ...stage ? { stage } : {}
-          })
-        });
-      }
-      const scopeRecovery = await reconcileProgressProbeScopeCheckpoints({
-        store: input.store,
-        contract,
-        graph,
-        state,
-        workspace
-      });
-      if (scopeRecovery) return scopeRecovery;
-    }
-    const recoveredFailureBlocker = await recoverDurableNodeFailureBlocker(input.store, state);
-    if (recoveredFailureBlocker) return recoveredFailureBlocker;
-    const interruptedNodeIds = Object.entries(state.nodes).filter(([, nodeState]) => nodeState.status === "running").map(([nodeId]) => nodeId);
-    if (state.status === "blocked") {
-      for (const [nodeId, nodeState] of Object.entries(state.nodes)) {
-        if (nodeState.status === "failed") {
-          await input.store.append("runtime", "node.reset", {
-            nodeId,
-            reason: "Resume requested after a blocker or environment change"
-          });
-        }
-      }
-      state = await input.store.loadState();
-    }
     const finishInterruption = async (nodeIds, termination, artifact) => {
       const activeNodeIds = nodeIds ? Array.isArray(nodeIds) ? nodeIds : [nodeIds] : [];
       const request = infrastructureFailure ? void 0 : signal.reason === controlAbort.signal.reason ? controlRequest : void 0;
@@ -51546,6 +52129,63 @@ async function executeRun(input) {
       if (request) await controlChannel.clear(request.requestId);
       return await input.store.loadState();
     };
+    let workspace;
+    const pendingScopeStarts = activeProgressProbeScopeStarts(
+      await input.store.loadEvents(),
+      graph,
+      state
+    );
+    if (pendingScopeStarts.length > 0) {
+      try {
+        workspace = await input.store.loadWorkspace();
+      } catch (error51) {
+        const pendingScopeStart = pendingScopeStarts[0];
+        const nodeId = typeof pendingScopeStart.data.nodeId === "string" ? pendingScopeStart.data.nodeId : void 0;
+        const stage = progressProbeStage(pendingScopeStart.data.stage);
+        const checkpointId = typeof pendingScopeStart.data.checkpointId === "string" && pendingScopeStart.data.checkpointId.length > 0 ? pendingScopeStart.data.checkpointId : pendingScopeStart.hash;
+        const reason = `Graphcraft cannot recover progress-probe scope checkpoint ${checkpointId} because its durable workspace is unavailable: ${error51.message}`;
+        return await blockProgressProbeRecovery({
+          store: input.store,
+          ...nodeId && state.nodes[nodeId] ? { nodeId } : {},
+          blocker: progressProbeRecoveryBlocker({
+            reason,
+            checkpointId,
+            ...stage ? { stage } : {}
+          })
+        });
+      }
+      let scopeRecovery;
+      try {
+        scopeRecovery = await reconcileProgressProbeScopeCheckpoints({
+          store: input.store,
+          contract,
+          graph,
+          state,
+          workspace,
+          signal
+        });
+      } catch (error51) {
+        if (!signal.aborted) throw error51;
+        return await finishInterruption(
+          Object.entries(state.nodes).filter(([, nodeState]) => nodeState.status === "running").map(([nodeId]) => nodeId)
+        );
+      }
+      if (scopeRecovery) return scopeRecovery;
+    }
+    const recoveredFailureBlocker = await recoverDurableNodeFailureBlocker(input.store, state);
+    if (recoveredFailureBlocker) return recoveredFailureBlocker;
+    const interruptedNodeIds = Object.entries(state.nodes).filter(([, nodeState]) => nodeState.status === "running").map(([nodeId]) => nodeId);
+    if (state.status === "blocked") {
+      for (const [nodeId, nodeState] of Object.entries(state.nodes)) {
+        if (nodeState.status === "failed") {
+          await input.store.append("runtime", "node.reset", {
+            nodeId,
+            reason: "Resume requested after a blocker or environment change"
+          });
+        }
+      }
+      state = await input.store.loadState();
+    }
     let adapterReady = false;
     let adapterProbeTermination;
     const ensureAdapterReady = async () => {
@@ -51570,13 +52210,21 @@ async function executeRun(input) {
     const initialBatch = readyBatch(graph, state, input.maxWorkers ?? 1).nodes;
     if (initialBatch.some((candidate) => !["wait", "commit"].includes(candidate.kind)) && !await ensureAdapterReady())
       return signal.aborted ? await finishInterruption(void 0, adapterProbeTermination) : await input.store.loadState();
-    if (!workspace)
+    if (!workspace) {
       try {
         workspace = await input.store.loadWorkspace();
       } catch {
-        workspace = await createRunWorkspace(contract);
-        await input.store.writeWorkspace(workspace);
+        try {
+          workspace = await createRunWorkspace(contract, { signal });
+          await input.store.writeWorkspace(workspace);
+        } catch (error51) {
+          if (signal.aborted) return await finishInterruption();
+          if (!(error51 instanceof RunWorkspaceReconciliationError)) throw error51;
+          await input.store.append("runtime", "run.blocked", { reason: error51.message });
+          return await input.store.loadState();
+        }
       }
+    }
     const deferLifecycleConsistency = async (node2, error51) => {
       const deferred = await deferGitHubLifecycleConsistency({
         store: input.store,
@@ -52235,9 +52883,11 @@ async function executeRun(input) {
           try {
             verificationScopeCurrent = await captureWorkspaceScopeSnapshot(
               workspace.path,
-              contract.scope.exclude
+              contract.scope.exclude,
+              signal
             );
           } catch (error51) {
+            if (signal.aborted) return await finishInterruption(current.id);
             const reason = `Workspace scope inspection failed after held-out integrity verification for node ${current.id}: ${error51.message}`;
             await input.store.append("runtime", "node.failed", { nodeId: current.id, reason });
             await input.store.append("runtime", "run.blocked", { reason });
@@ -52765,6 +53415,7 @@ var TRANSCRIPT_OMISSION_MARKER = Buffer.from(
   "\n[GRAPHCRAFT REVIEW EVIDENCE MIDDLE OMITTED]\n",
   "utf8"
 );
+var DEFAULT_BENCHMARK_MODEL_CALL_TIMEOUT_MS = 15 * 6e4;
 
 // packages/runtime/src/supervisor.ts
 import { open as open9, readdir as readdir5 } from "node:fs/promises";
