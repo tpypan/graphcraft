@@ -1,6 +1,4 @@
-import { access, readFile, stat } from "node:fs/promises";
-import { constants } from "node:fs";
-import { dirname, join, resolve, sep } from "node:path";
+import { dirname, resolve, sep } from "node:path";
 import {
   ProbePlanSchema,
   classifyTask,
@@ -16,6 +14,26 @@ import {
   type ManagedProcessLifecycle,
   type ProcessResult,
 } from "./process.ts";
+import {
+  assertRepositoryDirectory,
+  assertRepositoryFile,
+  assertRepositoryPath,
+  isRepositoryFileError,
+  readRepositoryFile,
+  readRepositoryTextFile,
+} from "./repository-file.ts";
+
+export {
+  REPOSITORY_FILE_MAX_BYTES,
+  RepositoryFileError,
+  assertRepositoryDirectory,
+  assertRepositoryFile,
+  assertRepositoryPath,
+  isRepositoryFileError,
+  readRepositoryFile,
+  readRepositoryTextFile,
+  type RepositoryFileErrorKind,
+} from "./repository-file.ts";
 
 export type {
   ManagedProcessLifecycle,
@@ -43,6 +61,46 @@ function compactOutput(result: ProcessResult): string {
   return `${prefix}${value.length > available ? "\n…" : ""}\n${note}`;
 }
 
+export async function assertRepositoryInventoryPaths(
+  repositoryPath: string,
+  paths: string[],
+  signal?: AbortSignal,
+): Promise<void> {
+  const inventory = await runProcess("git", ["ls-files", "--stage", "-z", "--", ...paths], {
+    cwd: repositoryPath,
+    timeoutMs: 30_000,
+    ...(signal ? { signal } : {}),
+  });
+  signal?.throwIfAborted();
+  if (inventory.exitCode !== 0)
+    throw new Error("Unable to validate repository-inventory probe paths");
+  const entries = new Map<string, string>();
+  for (const record of inventory.stdout.split("\0").filter(Boolean)) {
+    const separator = record.indexOf("\t");
+    const metadata = separator === -1 ? [] : record.slice(0, separator).split(" ");
+    const path = separator === -1 ? "" : record.slice(separator + 1);
+    if (!metadata[0] || !path) throw new Error("Git returned an invalid repository-inventory path");
+    entries.set(path, metadata[0]);
+  }
+  const values = [...entries.entries()];
+  for (let index = 0; index < values.length; index += 32) {
+    signal?.throwIfAborted();
+    await Promise.all(
+      values.slice(index, index + 32).map(async ([path, mode]) => {
+        try {
+          if (mode === "120000" || mode === "160000")
+            await assertRepositoryPath(repositoryPath, path, signal);
+          else await assertRepositoryFile(repositoryPath, path, signal);
+        } catch (error) {
+          signal?.throwIfAborted();
+          if (isRepositoryFileError(error, "missing")) return;
+          throw error;
+        }
+      }),
+    );
+  }
+}
+
 export async function runProbe(
   spec: ProbeSpec,
   repositoryPath: string,
@@ -53,8 +111,9 @@ export async function runProbe(
   if (spec.kind === "held_out")
     throw new Error(`Held-out probe ${spec.id} must be resolved by the runtime`);
   if (spec.kind === "command") {
+    const cwd = await assertRepositoryDirectory(repositoryPath, spec.cwd ?? ".", signal);
     const processResult = await runProcess(spec.command, spec.args, {
-      cwd: spec.cwd ? resolve(repositoryPath, spec.cwd) : repositoryPath,
+      cwd,
       timeoutMs: spec.timeoutMs,
       maxOutputBytesPerStream: DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM,
       outputOverflow: "truncate",
@@ -84,15 +143,20 @@ export async function runProbe(
   }
 
   if (spec.kind === "file") {
-    const path = resolve(repositoryPath, spec.path);
     let exists = true;
+    let contents: Buffer | undefined;
     try {
-      await access(path, constants.F_OK);
-    } catch {
-      exists = false;
+      if (spec.contains)
+        contents = await readRepositoryFile(repositoryPath, spec.path, {
+          ...(signal ? { signal } : {}),
+        });
+      else await assertRepositoryFile(repositoryPath, spec.path, signal);
+    } catch (error) {
+      if (isRepositoryFileError(error, "missing")) exists = false;
+      else throw error;
     }
     let contains = true;
-    if (exists && spec.contains) contains = (await readFile(path, "utf8")).includes(spec.contains);
+    if (exists && spec.contains) contains = contents!.toString("utf8").includes(spec.contains);
     const passed = exists === spec.shouldExist && contains;
     const summary = `${spec.path} ${exists ? "exists" : "does not exist"}${spec.contains ? ` and ${contains ? "contains" : "does not contain"} the required text` : ""}`;
     return {
@@ -109,6 +173,7 @@ export async function runProbe(
   }
 
   if (spec.kind === "repository_inventory") {
+    await assertRepositoryInventoryPaths(repositoryPath, spec.paths, signal);
     const args = ["grep", "-l", "-I", "-F"];
     for (const term of spec.terms) args.push("-e", term);
     args.push("--", ...spec.paths);
@@ -291,13 +356,6 @@ interface Candidate {
   root: boolean;
 }
 
-async function readUtf8File(path: string, signal?: AbortSignal): Promise<string> {
-  return await readFile(path, {
-    encoding: "utf8",
-    ...(signal ? { signal } : {}),
-  });
-}
-
 async function packageCandidates(
   repositoryPath: string,
   family: ProbePlan["family"],
@@ -316,7 +374,11 @@ async function packageCandidates(
     .filter((path) => path === "package.json" || path.endsWith("/package.json"))
     .slice(0, 100);
   const rootManifest = manifests.includes("package.json")
-    ? (JSON.parse(await readUtf8File(join(repositoryPath, "package.json"), signal)) as {
+    ? (JSON.parse(
+        await readRepositoryTextFile(repositoryPath, "package.json", {
+          ...(signal ? { signal } : {}),
+        }),
+      ) as {
         packageManager?: string;
       })
     : undefined;
@@ -324,7 +386,11 @@ async function packageCandidates(
   const candidates: Candidate[] = [];
   for (const manifestPath of manifests) {
     signal?.throwIfAborted();
-    const manifest = JSON.parse(await readUtf8File(join(repositoryPath, manifestPath), signal)) as {
+    const manifest = JSON.parse(
+      await readRepositoryTextFile(repositoryPath, manifestPath, {
+        ...(signal ? { signal } : {}),
+      }),
+    ) as {
       name?: string;
       packageManager?: string;
       scripts?: Record<string, string>;
@@ -394,12 +460,15 @@ function withinRepository(repositoryPath: string, candidate: string): boolean {
 export async function validateProbePlan(
   input: ProbePlan,
   repositoryPath: string,
+  signal?: AbortSignal,
 ): Promise<ProbePlan> {
+  signal?.throwIfAborted();
   const plan = ProbePlanSchema.parse(input);
   if (!plan.items.some(({ phase }) => phase === "completion"))
     throw new Error("A probe plan must contain at least one completion probe");
   const keys = new Set<string>();
   for (const item of plan.items) {
+    signal?.throwIfAborted();
     const key = `${item.phase}:${item.probe.id}`;
     if (keys.has(key)) throw new Error(`Duplicate ${item.phase} probe ID ${item.probe.id}`);
     keys.add(key);
@@ -415,12 +484,22 @@ export async function validateProbePlan(
       const cwd = item.probe.cwd ?? ".";
       if (!withinRepository(repositoryPath, cwd))
         throw new Error(`Probe ${item.probe.id} escapes the repository working directory`);
-      const directory = await stat(resolve(repositoryPath, cwd)).catch(() => undefined);
-      if (!directory?.isDirectory())
-        throw new Error(`Probe ${item.probe.id} uses missing working directory ${cwd}`);
+      try {
+        await assertRepositoryDirectory(repositoryPath, cwd, signal);
+      } catch (error) {
+        if (isRepositoryFileError(error, "missing", "not_directory"))
+          throw new Error(`Probe ${item.probe.id} uses missing working directory ${cwd}`);
+        throw error;
+      }
     }
-    if (item.probe.kind === "file" && !withinRepository(repositoryPath, item.probe.path)) {
-      throw new Error(`Probe ${item.probe.id} escapes the repository`);
+    if (item.probe.kind === "file") {
+      if (!withinRepository(repositoryPath, item.probe.path))
+        throw new Error(`Probe ${item.probe.id} escapes the repository`);
+      try {
+        await assertRepositoryFile(repositoryPath, item.probe.path, signal);
+      } catch (error) {
+        if (!isRepositoryFileError(error, "missing")) throw error;
+      }
     }
     if (
       item.probe.kind === "repository_inventory" &&
@@ -428,7 +507,10 @@ export async function validateProbePlan(
     ) {
       throw new Error(`Probe ${item.probe.id} escapes the repository inventory scope`);
     }
+    if (item.probe.kind === "repository_inventory")
+      await assertRepositoryInventoryPaths(repositoryPath, item.probe.paths, signal);
   }
+  signal?.throwIfAborted();
   return plan;
 }
 
@@ -497,7 +579,7 @@ export async function discoverProbePlan(
   }
 
   try {
-    await access(join(repositoryPath, "pyproject.toml"));
+    await assertRepositoryFile(repositoryPath, "pyproject.toml", options.signal);
     items.push({
       phase: "completion",
       purpose: "regression",
@@ -512,12 +594,12 @@ export async function discoverProbePlan(
         platforms: ["darwin", "linux", "win32"],
       },
     });
-  } catch {
-    // Not a Python repository.
+  } catch (error) {
+    if (!isRepositoryFileError(error, "missing")) throw error;
   }
 
   try {
-    await access(join(repositoryPath, "go.mod"));
+    await assertRepositoryFile(repositoryPath, "go.mod", options.signal);
     items.push({
       phase: "completion",
       purpose: "regression",
@@ -532,8 +614,8 @@ export async function discoverProbePlan(
         platforms: ["darwin", "linux", "win32"],
       },
     });
-  } catch {
-    // Not a Go repository.
+  } catch (error) {
+    if (!isRepositoryFileError(error, "missing")) throw error;
   }
 
   if (family === "audit" || !items.some(({ phase }) => phase === "completion")) {
@@ -546,7 +628,11 @@ export async function discoverProbePlan(
   }
 
   options.signal?.throwIfAborted();
-  return await validateProbePlan({ schemaVersion: 1, family, items }, repositoryPath);
+  return await validateProbePlan(
+    { schemaVersion: 1, family, items },
+    repositoryPath,
+    options.signal,
+  );
 }
 
 export async function discoverVerificationProbes(repositoryPath: string): Promise<ProbeSpec[]> {

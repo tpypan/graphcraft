@@ -1,6 +1,12 @@
 import { appendFile, lstat, mkdir, readFile, readlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { runProcess } from "@graphcraft/probes";
+import {
+  assertRepositoryFile,
+  assertRepositoryPath,
+  isRepositoryFileError,
+  readRepositoryTextFile,
+  runProcess,
+} from "@graphcraft/probes";
 import {
   SideEffectClaimSchema,
   contentHash,
@@ -151,14 +157,72 @@ function taskSnippet(content: string, terms: string[], maximumCharacters: number
   return snippet.slice(0, maximumCharacters);
 }
 
+interface TrackedPath {
+  mode: string;
+  path: string;
+}
+
+const TRACKED_PATH_VALIDATION_CONCURRENCY = 32;
+
+async function trackedRepositoryPaths(
+  repositoryRoot: string,
+  signal?: AbortSignal,
+): Promise<TrackedPath[]> {
+  const records = await gitRaw(repositoryRoot, ["ls-files", "--stage", "-z"], signal);
+  return records
+    .split("\0")
+    .filter(Boolean)
+    .map((record) => {
+      const separator = record.indexOf("\t");
+      const metadata = separator === -1 ? [] : record.slice(0, separator).split(" ");
+      const path = separator === -1 ? "" : record.slice(separator + 1);
+      if (!metadata[0] || !path) throw new Error("Git returned an invalid tracked-path inventory");
+      return { mode: metadata[0], path };
+    });
+}
+
+async function plannerVisibleTrackedPaths(
+  repositoryRoot: string,
+  tracked: TrackedPath[],
+  signal?: AbortSignal,
+): Promise<TrackedPath[]> {
+  const distinct = [...new Map(tracked.map((entry) => [entry.path, entry])).values()];
+  const visible: TrackedPath[] = [];
+  for (let index = 0; index < distinct.length; index += TRACKED_PATH_VALIDATION_CONCURRENCY) {
+    signal?.throwIfAborted();
+    const batch = await Promise.all(
+      distinct
+        .slice(index, index + TRACKED_PATH_VALIDATION_CONCURRENCY)
+        .map(async (entry): Promise<TrackedPath | undefined> => {
+          try {
+            if (entry.mode === "120000" || entry.mode === "160000")
+              await assertRepositoryPath(repositoryRoot, entry.path, signal);
+            else await assertRepositoryFile(repositoryRoot, entry.path, signal);
+            return entry;
+          } catch (error) {
+            signal?.throwIfAborted();
+            if (isRepositoryFileError(error, "missing")) return undefined;
+            throw error;
+          }
+        }),
+    );
+    visible.push(...batch.filter((entry): entry is TrackedPath => entry !== undefined));
+  }
+  return visible;
+}
+
 export async function discoverPlanningEvidence(
   repositoryRoot: string,
   task: string,
   signal?: AbortSignal,
 ): Promise<RepositoryPlanningEvidence> {
-  const trackedPaths = (await git(repositoryRoot, ["ls-files"], signal))
-    .split("\n")
-    .filter(Boolean);
+  const tracked = await plannerVisibleTrackedPaths(
+    repositoryRoot,
+    await trackedRepositoryPaths(repositoryRoot, signal),
+    signal,
+  );
+  const trackedPaths = tracked.map(({ path }) => path);
+  const trackedPathSet = new Set(trackedPaths);
   const files: RepositoryPlanningEvidence["files"] = [];
   let remainingCharacters = 24_000;
   const searchTerms = planningSearchTerms(task);
@@ -178,6 +242,7 @@ export async function discoverPlanningEvidence(
         .filter(
           (path) =>
             path.length > 0 &&
+            trackedPathSet.has(path) &&
             !path.startsWith("dist/") &&
             !path.endsWith(".map") &&
             !path.endsWith(".lock"),
@@ -186,9 +251,8 @@ export async function discoverPlanningEvidence(
   const taskMatches = await Promise.all(
     matchedPaths.map(async (path) => {
       signal?.throwIfAborted();
-      const content = await readUtf8(join(repositoryRoot, path), signal).catch(() => {
-        signal?.throwIfAborted();
-        return "";
+      const content = await readRepositoryTextFile(repositoryRoot, path, {
+        ...(signal ? { signal } : {}),
       });
       const normalized = content.toLowerCase();
       const score = searchTerms.filter((term) => normalized.includes(term)).length;
@@ -224,9 +288,8 @@ export async function discoverPlanningEvidence(
     signal?.throwIfAborted();
     if (remainingCharacters <= 0 || files.length >= 7) break;
     if (files.some((file) => file.path === path)) continue;
-    const content = await readUtf8(join(repositoryRoot, path), signal).catch(() => {
-      signal?.throwIfAborted();
-      return "";
+    const content = await readRepositoryTextFile(repositoryRoot, path, {
+      ...(signal ? { signal } : {}),
     });
     const limit = Math.min(2_000, remainingCharacters);
     const selected = content.slice(0, limit);

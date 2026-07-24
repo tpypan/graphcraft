@@ -5,7 +5,6 @@ import {
   cp,
   mkdtemp,
   mkdir,
-  open,
   readFile,
   readdir,
   rename,
@@ -52,7 +51,7 @@ import type {
   WorkerRequest,
 } from "@graphcraft/core";
 import { configureRunProbes, createRun, executeRun } from "./runner.ts";
-import { runProbes } from "@graphcraft/probes";
+import { runProbe, runProbes } from "@graphcraft/probes";
 import { requestRunControl, RunControlChannel } from "./control.ts";
 import {
   decideRunControl,
@@ -62,6 +61,7 @@ import {
 } from "./governance.ts";
 import { RunLock } from "./lock.ts";
 import { createRunWorkspace, discoverPlanningEvidence } from "./repository.ts";
+import { createRuntimeHeldOutProbePlan, heldOutIntegrityFailures } from "./held-out.ts";
 import {
   RUN_METADATA_MAX_BYTES,
   RUN_WORKSPACE_MAX_BYTES,
@@ -1993,6 +1993,354 @@ process.stdin.on("end", () => {
       created.graph.nodes.find(({ id }) => id === "implement")?.contextSelector.relevantPaths,
     ).toContain("src/graph.ts");
   });
+
+  it("accepts a tracked directory as planned and runtime-selected context", async () => {
+    const repository = await createRepository("src/implemented.ts");
+    await mkdir(join(repository, "src"));
+    await writeFile(join(repository, "src", "feature.ts"), "export const feature = true;\n");
+    await git(repository, "add", "src/feature.ts");
+    await git(repository, "commit", "-m", "add directory context fixture");
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "src", "implemented.ts"), "implemented\n");
+    });
+    const basePlan = adapter.plan.bind(adapter);
+    adapter.plan = async (request, signal) => {
+      const planned = await basePlan(request, signal);
+      return {
+        ...planned,
+        plan: {
+          ...planned.plan,
+          nodes: planned.plan.nodes.map((node) => ({
+            ...node,
+            contextSelector: {
+              ...node.contextSelector,
+              relevantPaths: node.contextSelector.relevantPaths.length === 0 ? [] : ["src"],
+            },
+          })),
+        },
+      };
+    };
+
+    const created = await createRun("Implement a substantial directory-scoped feature", {
+      cwd: repository,
+      planner: adapter,
+    });
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+
+    expect(state.status, state.stopReason).toBe("completed");
+    expect(adapter.requests.every(({ capsule }) => capsule.relevantPaths.includes("src"))).toBe(
+      true,
+    );
+  });
+
+  it("omits dirty tracked deletions from planner-visible repository paths", async () => {
+    const repository = await createRepository();
+    await writeFile(join(repository, "obsolete.ts"), "export const obsolete = true;\n");
+    await git(repository, "add", "obsolete.ts");
+    await git(repository, "commit", "-m", "add obsolete planning fixture");
+    await rm(join(repository, "obsolete.ts"));
+
+    const evidence = await discoverPlanningEvidence(repository, "Inspect the substantial fixture");
+
+    expect(evidence.trackedPaths).not.toContain("obsolete.ts");
+    expect(evidence.trackedPathCount).toBe(evidence.trackedPaths.length);
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "accepts repository-confined symlinks through planning, probes, context, and held-out proof",
+    async () => {
+      const repository = await createRepository();
+      await mkdir(join(repository, "internal"));
+      await rename(join(repository, "package.json"), join(repository, "internal", "manifest.json"));
+      await rename(join(repository, "verify.mjs"), join(repository, "internal", "scorer.mjs"));
+      await symlink("internal/manifest.json", join(repository, "package.json"), "file");
+      await symlink("internal/scorer.mjs", join(repository, "verify.mjs"), "file");
+      await git(repository, "add", "-A");
+      await git(repository, "commit", "-m", "use internal repository links");
+      const adapter = new FakeAdapter(async (request) => {
+        if (request.capsule.nodeId === "implement")
+          await writeFile(join(request.repositoryPath, "internal", "feature.txt"), "implemented\n");
+      });
+
+      const created = await createRun("Implement a substantial internally linked feature", {
+        cwd: repository,
+        planner: adapter,
+      });
+      const state = await executeRun({ store: created.store, adapter, approve: true });
+
+      expect(state.status, state.stopReason).toBe("completed");
+      expect((await created.store.loadHeldOutProbePlan()).probes).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            integrity: expect.arrayContaining([
+              expect.objectContaining({ kind: "file", path: "verify.mjs" }),
+            ]),
+          }),
+        ]),
+      );
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "turns a post-approval external measurement link into integrity evidence before execution",
+    async () => {
+      const repository = await createRepository();
+      const outside = await mkdtemp(join(tmpdir(), "graphcraft-held-out-outside-"));
+      temporaryRoots.push(outside);
+      const marker = join(outside, "completion-command-ran");
+      const externalScorer = join(outside, "private-scorer.mjs");
+      await writeFile(
+        externalScorer,
+        `import { writeFile } from "node:fs/promises";\nawait writeFile(${JSON.stringify(marker)}, "ran\\n");\n`,
+      );
+      const adapter = new FakeAdapter(async (request) => {
+        if (request.capsule.nodeId === "implement") {
+          await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+          await rm(join(request.repositoryPath, "verify.mjs"));
+          await symlink(externalScorer, join(request.repositoryPath, "verify.mjs"), "file");
+        }
+      });
+      const basePlan = adapter.plan.bind(adapter);
+      adapter.plan = async (request, signal) => {
+        const planned = await basePlan(request, signal);
+        return {
+          ...planned,
+          plan: {
+            ...planned.plan,
+            nodes: planned.plan.nodes.map((node) => ({
+              ...node,
+              contextSelector: {
+                ...node.contextSelector,
+                relevantPaths:
+                  node.contextSelector.relevantPaths.length === 0 ? [] : ["package.json"],
+              },
+            })),
+          },
+        };
+      };
+      const created = await createRun("Implement a substantial integrity boundary feature", {
+        cwd: repository,
+        planner: adapter,
+      });
+
+      const state = await executeRun({ store: created.store, adapter, approve: true });
+      const events = await created.store.loadEvents();
+      const integrityResults = events
+        .filter(({ type }) => type === "held_out.checked")
+        .flatMap(
+          ({ data }) =>
+            data.results as Array<{ probeId: string; passed: boolean; signature: string }>,
+        )
+        .filter(({ probeId }) => probeId.endsWith("-integrity"));
+
+      expect(state.status).not.toBe("completed");
+      expect(integrityResults).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ probeId: expect.stringMatching(/-integrity$/), passed: false }),
+        ]),
+      );
+      expect(JSON.stringify(events)).not.toContain(outside);
+      expect(JSON.stringify(events)).not.toContain("private-scorer");
+      await expect(readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
+  it("turns a post-approval external command-directory link into integrity evidence", async () => {
+    const repository = await createRepository();
+    const safeDirectory = join(repository, "safe-probe-cwd");
+    await mkdir(safeDirectory);
+    await symlink(
+      process.platform === "win32" ? safeDirectory : "safe-probe-cwd",
+      join(repository, "probe-cwd"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const probePlan: ProbePlan = {
+      schemaVersion: 1,
+      family: "feature",
+      items: [
+        {
+          phase: "completion",
+          purpose: "regression",
+          source: "approved command-directory fixture",
+          probe: {
+            id: "directory-bound-command",
+            kind: "command",
+            command: process.execPath,
+            args: ["-e", "process.exit(0)"],
+            cwd: "probe-cwd",
+            expectedExitCode: 0,
+            timeoutMs: 1_000,
+          },
+        },
+      ],
+    };
+    const heldOut = await createRuntimeHeldOutProbePlan(randomUUID(), probePlan, repository);
+    const outside = await mkdtemp(join(tmpdir(), "graphcraft-command-cwd-outside-"));
+    temporaryRoots.push(outside);
+    await rm(join(repository, "probe-cwd"));
+    await symlink(
+      outside,
+      join(repository, "probe-cwd"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+
+    const failures = await heldOutIntegrityFailures(heldOut, repository);
+
+    expect(failures).toEqual([
+      expect.objectContaining({
+        probeId: "directory-bound-command-integrity",
+        passed: false,
+        summary: expect.stringContaining("working directory"),
+      }),
+    ]);
+    expect(JSON.stringify(failures)).not.toContain(outside);
+  });
+
+  it("refuses an external repository-inventory path before held-out execution", async () => {
+    const repository = await createRepository();
+    await mkdir(join(repository, "inventory"));
+    await writeFile(join(repository, "inventory", "tracked.txt"), "ordinary repository text\n");
+    await git(repository, "add", "inventory/tracked.txt");
+    await git(repository, "commit", "-m", "add repository inventory fixture");
+    const probePlan: ProbePlan = {
+      schemaVersion: 1,
+      family: "audit",
+      items: [
+        {
+          phase: "completion",
+          purpose: "acceptance",
+          source: "approved repository inventory fixture",
+          probe: {
+            id: "bounded-inventory",
+            kind: "repository_inventory",
+            paths: ["inventory"],
+            terms: ["OUTSIDE_ONLY_TERM"],
+          },
+        },
+      ],
+    };
+    const heldOut = await createRuntimeHeldOutProbePlan(randomUUID(), probePlan, repository);
+    const outside = await mkdtemp(join(tmpdir(), "graphcraft-inventory-outside-"));
+    temporaryRoots.push(outside);
+    await writeFile(join(outside, "tracked.txt"), "OUTSIDE_ONLY_TERM\n");
+    await rm(join(repository, "inventory"), { recursive: true });
+    await symlink(
+      outside,
+      join(repository, "inventory"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+
+    const failures = await heldOutIntegrityFailures(heldOut, repository);
+
+    expect(failures).toEqual([
+      expect.objectContaining({
+        probeId: "bounded-inventory-integrity",
+        passed: false,
+        summary: expect.stringContaining("repository inventory path boundary"),
+      }),
+    ]);
+    await expect(runProbe(probePlan.items[0]!.probe, repository)).rejects.toMatchObject({
+      kind: "outside_repository",
+    });
+    expect(JSON.stringify(failures)).not.toContain(outside);
+    expect(JSON.stringify(failures)).not.toContain("OUTSIDE_ONLY_TERM");
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "revalidates planned context in the isolated workspace before a worker starts",
+    async () => {
+      const repository = await createRepository();
+      await writeFile(join(repository, "selected-context.ts"), "export const value = 'safe';\n");
+      await git(repository, "add", "selected-context.ts");
+      await git(repository, "commit", "-m", "add selected context");
+      const adapter = new FakeAdapter(async () => undefined);
+      const basePlan = adapter.plan.bind(adapter);
+      adapter.plan = async (request, signal) => {
+        const planned = await basePlan(request, signal);
+        return {
+          ...planned,
+          plan: {
+            ...planned.plan,
+            nodes: planned.plan.nodes.map((node) => ({
+              ...node,
+              contextSelector: {
+                ...node.contextSelector,
+                relevantPaths:
+                  node.contextSelector.relevantPaths.length === 0 ? [] : ["selected-context.ts"],
+              },
+            })),
+          },
+        };
+      };
+      const created = await createRun("Implement a substantial selected context feature", {
+        cwd: repository,
+        planner: adapter,
+      });
+      const workspace = await createRunWorkspace(created.contract);
+      const outside = await mkdtemp(join(tmpdir(), "graphcraft-context-outside-"));
+      temporaryRoots.push(outside);
+      const outsideFile = join(outside, "private-context.ts");
+      await writeFile(outsideFile, "export const privateValue = 'must not be read';\n");
+      await rm(join(workspace.path, "selected-context.ts"));
+      await symlink(outsideFile, join(workspace.path, "selected-context.ts"), "file");
+
+      const state = await executeRun({ store: created.store, adapter, approve: true });
+
+      expect(state.status).toBe("blocked");
+      expect(adapter.calls).toHaveLength(0);
+      expect(state.stopReason).not.toContain(outside);
+      expect(state.stopReason).not.toContain("must not be read");
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "revalidates tracked descendants of planned directory context before model calls",
+    async () => {
+      const repository = await createRepository();
+      await mkdir(join(repository, "src"));
+      await writeFile(join(repository, "src", "input.ts"), "export const value = 'safe';\n");
+      await git(repository, "add", "src/input.ts");
+      await git(repository, "commit", "-m", "add directory-selected context");
+      const adapter = new FakeAdapter(async () => undefined);
+      const basePlan = adapter.plan.bind(adapter);
+      adapter.plan = async (request, signal) => {
+        const planned = await basePlan(request, signal);
+        return {
+          ...planned,
+          plan: {
+            ...planned.plan,
+            nodes: planned.plan.nodes.map((node) => ({
+              ...node,
+              contextSelector: {
+                ...node.contextSelector,
+                relevantPaths: node.contextSelector.relevantPaths.length === 0 ? [] : ["src"],
+              },
+            })),
+          },
+        };
+      };
+      const created = await createRun("Implement a substantial directory context feature", {
+        cwd: repository,
+        planner: adapter,
+      });
+      const workspace = await createRunWorkspace(created.contract);
+      const outside = await mkdtemp(join(tmpdir(), "graphcraft-directory-context-outside-"));
+      temporaryRoots.push(outside);
+      const outsideFile = join(outside, "private-input.ts");
+      await writeFile(outsideFile, "export const privateValue = 'must not be read';\n");
+      await rm(join(workspace.path, "src", "input.ts"));
+      await symlink(outsideFile, join(workspace.path, "src", "input.ts"), "file");
+
+      const state = await executeRun({ store: created.store, adapter, approve: true });
+
+      expect(state.status).toBe("blocked");
+      expect(adapter.calls).toHaveLength(0);
+      expect(adapter.semanticRequests).toHaveLength(0);
+      expect(state.stopReason).not.toContain(outside);
+      expect(state.stopReason).not.toContain("must not be read");
+    },
+  );
 
   it("prioritizes task identifiers and acronyms over incidental planning prose", async () => {
     const repository = await createRepository();
@@ -8712,6 +9060,15 @@ process.stdin.on("end", () => {
   );
 
   it.skipIf(process.platform === "win32")(
+    "cancels final probe-plan validation before durable run creation",
+    () =>
+      expectBoundedRunCreationCancellation(
+        ["ls-files", "--stage", "-z", "--", "."],
+        "SIGINT during final probe-plan validation",
+      ),
+  );
+
+  it.skipIf(process.platform === "win32")(
     "cancels a blocked held-out integrity subprocess before durable run creation",
     () =>
       expectBoundedRunCreationCancellation(
@@ -8721,38 +9078,135 @@ process.stdin.on("end", () => {
   );
 
   it.skipIf(process.platform === "win32")(
-    "cancels a blocked planning-evidence file read before durable run creation",
+    "cancels held-out integrity hashing during verification",
     async () => {
       const repository = await createRepository();
-      const fifo = join(repository, "..", "blocked-package-json");
-      await execFileAsync("mkfifo", [fifo]);
-      await rm(join(repository, "package.json"));
-      await symlink(fifo, join(repository, "package.json"));
-      const cancellation = new AbortController();
-      const creation = createRun("Implement a substantial feature across the fixture", {
-        cwd: repository,
-        signal: cancellation.signal,
+      let fakePath: string | undefined;
+      const adapter = new FakeAdapter(async (request) => {
+        if (request.capsule.nodeId === "implement") {
+          await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+          process.env.PATH = fakePath;
+        }
       });
-      const writer = await open(fifo, "w");
+      const created = await createRun("Implement a substantial cancellable integrity feature", {
+        cwd: repository,
+        planner: adapter,
+      });
+      const originalPath = process.env.PATH;
+      const originalGit = await resolveTrustedExecutable("git", { untrustedCwd: repository });
+      const fakeBin = join(repository, "..", `.held-out-cancellation-bin-${randomUUID()}`);
+      const fakeGit = join(fakeBin, "git");
+      const marker = join(repository, "..", `held-out-hash-started-${randomUUID()}`);
+      await mkdir(fakeBin);
+      await writeFile(
+        fakeGit,
+        `#!/usr/bin/env node
+const fs = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const args = process.argv.slice(2);
+if (args[0] === "hash-object" && args.includes("--stdin")) {
+  fs.writeFileSync(${JSON.stringify(marker)}, "started\\n");
+  process.stdin.resume();
+  setInterval(() => {}, 1_000);
+} else {
+  const result = spawnSync(${JSON.stringify(originalGit)}, args, { stdio: "inherit" });
+  if (result.error) throw result.error;
+  process.exit(result.status ?? 1);
+}
+`,
+      );
+      await chmod(fakeGit, 0o700);
+      fakePath = `${fakeBin}${delimiter}${originalPath ?? ""}`;
+      const cancellation = new AbortController();
 
       try {
+        const execution = executeRun({
+          store: created.store,
+          adapter,
+          approve: true,
+          signal: cancellation.signal,
+        });
+        await waitFor(
+          () =>
+            stat(marker).then(
+              () => true,
+              () => false,
+            ),
+          30_000,
+        );
         const startedAt = performance.now();
         cancellation.abort({
           cause: "cancellation",
-          reason: "SIGINT during planning evidence read",
+          reason: "Cancel during held-out integrity verification",
         });
 
-        await expect(creation).rejects.toMatchObject({
-          name: "RunCreationInterruptedError",
-          message: "SIGINT during planning evidence read",
-        });
+        const state = await execution;
+
         expect(performance.now() - startedAt).toBeLessThan(5_000);
-        await expect(readdir(join(repository, ".graphcraft", "runs"))).rejects.toThrow();
+        expect(state.status).toBe("paused");
+        expect(state.stopReason).toBe("Cancel during held-out integrity verification");
+        expect(
+          (await created.store.loadEvents()).findLast(({ type }) => type === "held_out.checked"),
+        ).toBeUndefined();
       } finally {
-        await writer.close();
+        if (originalPath === undefined) delete process.env.PATH;
+        else process.env.PATH = originalPath;
       }
     },
+    60_000,
   );
+
+  it.skipIf(process.platform === "win32")(
+    "refuses an unstaged external tracked-file replacement without opening its target",
+    async () => {
+      const repository = await createRepository();
+      const trackedPath = "unrelated-planner-input.dat";
+      await writeFile(join(repository, trackedPath), "ordinary tracked bytes\n");
+      await git(repository, "add", trackedPath);
+      await git(repository, "commit", "-m", "add unrelated planning input");
+      const fifo = join(repository, "..", "private-blocked-planning-input");
+      await execFileAsync("mkfifo", [fifo]);
+      await rm(join(repository, trackedPath));
+      await symlink(fifo, join(repository, trackedPath), "file");
+      const planner = new FakeAdapter(async () => undefined);
+
+      const startedAt = performance.now();
+      const error = await createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+        planner,
+      }).catch((failure: unknown) => failure);
+
+      expect(performance.now() - startedAt).toBeLessThan(5_000);
+      expect(error).toMatchObject({ kind: "outside_repository", repositoryPath: trackedPath });
+      expect((error as Error).message).not.toContain(fifo);
+      expect((error as Error).message).not.toContain("private-blocked-planning-input");
+      expect(planner.planningRequests).toHaveLength(0);
+      await expect(readdir(join(repository, ".graphcraft", "runs"))).rejects.toThrow();
+    },
+  );
+
+  it("refuses a tracked regular file replaced by a directory before planning", async () => {
+    const repository = await createRepository();
+    const trackedPath = "planner-input.dat";
+    await writeFile(join(repository, trackedPath), "ordinary tracked bytes\n");
+    await git(repository, "add", trackedPath);
+    await git(repository, "commit", "-m", "add planner input");
+    await rm(join(repository, trackedPath));
+    await mkdir(join(repository, trackedPath));
+    await writeFile(join(repository, trackedPath, "private-context.txt"), "must not be read\n");
+    const planner = new FakeAdapter(async () => undefined);
+
+    const error = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+      planner,
+    }).catch((failure: unknown) => failure);
+
+    expect(error).toMatchObject({ kind: "not_file", repositoryPath: trackedPath });
+    expect((error as Error).message).not.toContain("private-context.txt");
+    expect((error as Error).message).not.toContain("must not be read");
+    expect(planner.planningRequests).toHaveLength(0);
+    await expect(readdir(join(repository, ".graphcraft", "runs"))).rejects.toThrow();
+  });
 
   it.each(REQUIRED_HOST_PROTOCOL_CAPABILITIES)(
     "blocks execution before workspace creation when %s is unavailable",
@@ -8901,6 +9355,95 @@ process.stdin.on("end", () => {
       },
     });
   });
+
+  it.skipIf(process.platform === "win32")(
+    "durably pauses when worker-context inventory is cancelled before model invocation",
+    async () => {
+      const repository = await createRepository();
+      const adapter = new FakeAdapter(async () => undefined);
+      const created = await createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+      });
+      const originalPath = process.env.PATH;
+      const originalGit = await resolveTrustedExecutable("git", { untrustedCwd: repository });
+      const fakeBin = join(repository, "..", `.worker-context-bin-${randomUUID()}`);
+      const fakeGit = join(fakeBin, "git");
+      const marker = join(repository, "..", `worker-context-inventory-started-${randomUUID()}`);
+      await mkdir(fakeBin);
+      await writeFile(
+        fakeGit,
+        `#!/usr/bin/env node
+const fs = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const args = process.argv.slice(2);
+const blocked = ["ls-files", "--cached", "--others", "--exclude-standard"];
+if (args.length === blocked.length && blocked.every((value, index) => args[index] === value)) {
+  fs.writeFileSync(${JSON.stringify(marker)}, "started\\n");
+  setInterval(() => {}, 1_000);
+} else {
+  const result = spawnSync(${JSON.stringify(originalGit)}, args, { stdio: "inherit" });
+  if (result.error) throw result.error;
+  process.exit(result.status ?? 1);
+}
+`,
+      );
+      await chmod(fakeGit, 0o700);
+      process.env.PATH = `${fakeBin}${delimiter}${originalPath ?? ""}`;
+      const cancellation = new AbortController();
+
+      try {
+        const execution = executeRun({
+          store: created.store,
+          adapter,
+          approve: true,
+          signal: cancellation.signal,
+        });
+        await waitFor(
+          () =>
+            stat(marker).then(
+              () => true,
+              () => false,
+            ),
+          30_000,
+        );
+        const startedAt = performance.now();
+        cancellation.abort({
+          cause: "cancellation",
+          reason: "Cancel during worker-context inventory",
+        });
+
+        const state = await execution;
+
+        expect(performance.now() - startedAt).toBeLessThan(5_000);
+        expect(state.status).toBe("paused");
+        expect(state.stopReason).toBe("Cancel during worker-context inventory");
+        expect(await created.store.loadState()).toMatchObject({
+          status: "paused",
+          stopReason: "Cancel during worker-context inventory",
+        });
+        expect(adapter.calls).toEqual([]);
+        expect(adapter.requests).toEqual([]);
+        expect(adapter.semanticRequests).toEqual([]);
+        expect(state.tokenLedger.filter(({ phase }) => phase === "worker")).toEqual([]);
+        const events = await created.store.loadEvents();
+        expect(events.find(({ type }) => type === "context.selected")).toBeUndefined();
+        expect(events.find(({ type }) => type === "invocation.started")).toBeUndefined();
+        expect(events.find(({ type }) => type === "node.failed")).toBeUndefined();
+        expect(events.find(({ type }) => type === "run.blocked")).toBeUndefined();
+        expect(events.findLast(({ type }) => type === "control.applied")).toMatchObject({
+          data: {
+            action: "pause",
+            cause: "cancellation",
+            outcome: "checkpointed",
+          },
+        });
+      } finally {
+        if (originalPath === undefined) delete process.env.PATH;
+        else process.env.PATH = originalPath;
+      }
+    },
+    60_000,
+  );
 
   it("records semantic-admission probe cancellation as an interruption instead of a blocker", async () => {
     const repository = await createRepository();

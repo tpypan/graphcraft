@@ -150,6 +150,11 @@ export const HeldOutProbeIntegritySchema = z.discriminatedUnion("kind", [
     algorithm: z.literal("git_hash_object").optional(),
     valueHash: z.string().regex(/^[a-f0-9]{64}$/),
   }),
+  z.strictObject({
+    kind: z.literal("directory"),
+    path: z.string().min(1),
+    valueHash: z.string().regex(/^[a-f0-9]{64}$/),
+  }),
 ]);
 
 export const HeldOutProbeEntrySchema = z.strictObject({

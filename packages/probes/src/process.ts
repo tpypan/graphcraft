@@ -7,6 +7,7 @@ const MIB = 1024 * 1024;
 
 export const DEFAULT_PROCESS_OUTPUT_BYTES_PER_STREAM = 8 * MIB;
 export const DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM = MIB;
+export const DEFAULT_PROCESS_INPUT_BYTES = 8 * MIB;
 export const PROCESS_TERMINATION_GRACE_MS = 2_000;
 export const PROCESS_SETTLEMENT_GRACE_MS = 2_000;
 
@@ -42,6 +43,7 @@ export interface RunProcessOptions {
   env?: NodeJS.ProcessEnv;
   maxOutputBytesPerStream?: number;
   outputOverflow?: ProcessOutputOverflow;
+  input?: string | Buffer;
   lifecycle?: ManagedProcessLifecycle;
 }
 
@@ -711,6 +713,18 @@ export async function runProcess(
   const outputOverflow = options.outputOverflow ?? "reject";
   if (!Number.isSafeInteger(maxOutputBytesPerStream) || maxOutputBytesPerStream <= 0)
     throw new Error("Subprocess output capture limit must be a positive safe integer");
+  const inputBytes =
+    options.input === undefined
+      ? 0
+      : typeof options.input === "string"
+        ? Buffer.byteLength(options.input)
+        : options.input.length;
+  if (inputBytes > DEFAULT_PROCESS_INPUT_BYTES)
+    throw new Error(
+      `Subprocess input exceeded the ${DEFAULT_PROCESS_INPUT_BYTES}-byte bounded input limit`,
+    );
+  if (options.lifecycle && options.input !== undefined)
+    throw new Error("Managed subprocess input is not supported");
   const environment = { ...process.env, ...options.env, NO_COLOR: "1", FORCE_COLOR: "0" };
   const executable = await resolveTrustedExecutable(command, {
     environment,
@@ -734,12 +748,15 @@ export async function runProcess(
       cwd: options.cwd,
       env: environment,
       shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     });
+    const childStdout = child.stdout!;
+    const childStderr = child.stderr!;
     const stdoutCapture = new BoundedStreamCapture(maxOutputBytesPerStream);
     const stderrCapture = new BoundedStreamCapture(maxOutputBytesPerStream);
     let timedOut = false;
     let overflowStream: "stdout" | "stderr" | undefined;
+    let inputError: Error | undefined;
     let settled = false;
     let terminationStarted = false;
     let escalationTimer: NodeJS.Timeout | undefined;
@@ -777,8 +794,16 @@ export async function runProcess(
         terminateWithEscalation();
       }
     };
-    child.stdout.on("data", (chunk: Buffer) => capture("stdout", stdoutCapture, chunk));
-    child.stderr.on("data", (chunk: Buffer) => capture("stderr", stderrCapture, chunk));
+    childStdout.on("data", (chunk: Buffer) => capture("stdout", stdoutCapture, chunk));
+    childStderr.on("data", (chunk: Buffer) => capture("stderr", stderrCapture, chunk));
+    if (options.input !== undefined && child.stdin) {
+      child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+        if (terminationStarted || settled) return;
+        inputError = error;
+        terminateWithEscalation();
+      });
+      child.stdin.end(options.input);
+    }
 
     const abort = (): void => terminateWithEscalation();
     options.signal?.addEventListener("abort", abort, { once: true });
@@ -801,14 +826,19 @@ export async function runProcess(
       settled = true;
       cleanup();
       try {
-        child.stdout.destroy();
-        child.stderr.destroy();
+        child.stdin?.destroy();
+        childStdout.destroy();
+        childStderr.destroy();
         child.unref();
       } catch {
         // Cleanup must not hide the bounded subprocess outcome.
       }
       if (error) {
         reject(error);
+        return;
+      }
+      if (inputError) {
+        reject(inputError);
         return;
       }
       const stdout = stdoutCapture.finish("stdout");

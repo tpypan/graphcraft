@@ -59,7 +59,10 @@ import {
   type WorkerResult,
 } from "@graphcraft/core";
 import {
+  assertRepositoryInventoryPaths,
+  assertRepositoryPath,
   discoverProbePlan,
+  isRepositoryFileError,
   runProbe,
   runProcess,
   validateProbePlan,
@@ -365,7 +368,19 @@ async function validatePlannedContext(
         throw new Error(
           `Planned node ${node.id} selected nonexistent or untracked context path ${relevantPath}`,
         );
+      try {
+        await assertRepositoryPath(repositoryPath, relevantPath, signal);
+      } catch (error) {
+        throw new Error(
+          `Planned node ${node.id} selected unsafe context path ${relevantPath}: ${(error as Error).message}`,
+        );
+      }
     }
+    await assertRepositoryInventoryPaths(
+      repositoryPath,
+      node.contextSelector.relevantPaths,
+      signal,
+    );
   }
 }
 
@@ -435,7 +450,9 @@ export async function createRun(
       ),
     );
     graph = compilePlannedGraph(contract, planned.plan, completionProbes, approvedProbes);
-    await validatePlannedContext(graph, repository.root, options.signal);
+    await runCreationStep(options.signal, () =>
+      validatePlannedContext(graph, repository.root, options.signal),
+    );
     assertRunCreationActive(options.signal);
     planningUsage = planned.usage;
   } else {
@@ -450,7 +467,9 @@ export async function createRun(
     approvedProbes,
   });
   graph = optimized.graph;
-  await validatePlannedContext(graph, repository.root, options.signal);
+  await runCreationStep(options.signal, () =>
+    validatePlannedContext(graph, repository.root, options.signal),
+  );
   assertRunCreationActive(options.signal);
   const store = await RunStore.create(
     repository.root,
@@ -598,6 +617,7 @@ async function executeWorker(input: {
     repositoryPath: input.workspace.path,
     predecessorEvidence: input.predecessorEvidence ?? [],
     probeResults: input.probeResults ?? [],
+    ...(input.signal ? { signal: input.signal } : {}),
   });
   const authorityInputs: Array<{ source: UntrustedInputSource; location: string }> = [
     {
@@ -1203,6 +1223,14 @@ async function runSemanticVerification(input: {
   let context: SemanticVerifierContext;
   let beforeScope: WorkspaceScopeSnapshot;
   try {
+    for (const repositoryPath of input.node.contextSelector.relevantPaths)
+      await assertRepositoryPath(input.workspace.path, repositoryPath, input.signal);
+    if (input.node.contextSelector.relevantPaths.length > 0)
+      await assertRepositoryInventoryPaths(
+        input.workspace.path,
+        input.node.contextSelector.relevantPaths,
+        input.signal,
+      );
     context = SemanticVerifierContextSchema.parse(
       redactValue({
         schemaVersion: 1,
@@ -3282,24 +3310,33 @@ async function executeWorkNode(input: {
     await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason });
     return { status: "failed", nodeId: input.node.id, reason };
   }
-  const worker = await executeWorker({
-    adapter: input.adapter,
-    store: input.store,
-    contract: input.contract,
-    node: input.node,
-    workspace: input.workspace,
-    predecessorEvidence: input.node.contextSelector.predecessorResults.flatMap((nodeId) => {
-      const predecessor = input.state.nodes[nodeId];
-      return predecessor?.lastSummary ? [`${nodeId}: ${predecessor.lastSummary}`] : [];
-    }),
-    ...(baselineProbeResults.length ? { probeResults: baselineProbeResults } : {}),
-    ...(input.observer ? { observer: input.observer } : {}),
-    signal: input.signal,
-    baseline,
-    scopeBaseline,
-    ...(input.recovery ? { resume: input.recovery } : {}),
-    ...(input.reuseSession ? { reuseSession: input.reuseSession } : {}),
-  });
+  let worker: Awaited<ReturnType<typeof executeWorker>>;
+  try {
+    worker = await executeWorker({
+      adapter: input.adapter,
+      store: input.store,
+      contract: input.contract,
+      node: input.node,
+      workspace: input.workspace,
+      predecessorEvidence: input.node.contextSelector.predecessorResults.flatMap((nodeId) => {
+        const predecessor = input.state.nodes[nodeId];
+        return predecessor?.lastSummary ? [`${nodeId}: ${predecessor.lastSummary}`] : [];
+      }),
+      ...(baselineProbeResults.length ? { probeResults: baselineProbeResults } : {}),
+      ...(input.observer ? { observer: input.observer } : {}),
+      signal: input.signal,
+      baseline,
+      scopeBaseline,
+      ...(input.recovery ? { resume: input.recovery } : {}),
+      ...(input.reuseSession ? { reuseSession: input.reuseSession } : {}),
+    });
+  } catch (error) {
+    if (input.signal.aborted) return { status: "interrupted", nodeId: input.node.id, artifact: "" };
+    if (!isRepositoryFileError(error)) throw error;
+    const reason = `Repository context validation failed before node ${input.node.id}: ${error.message}`;
+    await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason });
+    return { status: "failed", nodeId: input.node.id, reason };
+  }
   let currentScope: WorkspaceScopeSnapshot;
   try {
     currentScope = await captureWorkspaceScopeSnapshot(
@@ -4571,7 +4608,17 @@ export async function executeRun(input: {
           });
           return await input.store.loadState();
         }
-        const integrityFailures = await heldOutIntegrityFailures(heldOutProbePlan, workspace.path);
+        let integrityFailures: ProbeResult[];
+        try {
+          integrityFailures = await heldOutIntegrityFailures(
+            heldOutProbePlan,
+            workspace.path,
+            signal,
+          );
+        } catch (error) {
+          if (signal.aborted) return await finishInterruption(current.id);
+          throw error;
+        }
         let executed: ExecutedProbe[] = [];
         let verificationScopeCurrent: WorkspaceScopeSnapshot;
         if (integrityFailures.length === 0) {

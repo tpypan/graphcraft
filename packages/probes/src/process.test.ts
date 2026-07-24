@@ -7,6 +7,7 @@ import { PassThrough } from "node:stream";
 import crossSpawn from "cross-spawn";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  DEFAULT_PROCESS_INPUT_BYTES,
   PROCESS_SETTLEMENT_GRACE_MS,
   PROCESS_TERMINATION_GRACE_MS,
   runProcess,
@@ -157,6 +158,25 @@ describe("bounded subprocess output capture", () => {
     });
   });
 
+  it("delivers bounded stdin bytes and rejects oversized input before launch", async () => {
+    const result = await runProcess(
+      process.execPath,
+      [
+        "-e",
+        "const chunks = []; process.stdin.on('data', (chunk) => chunks.push(chunk)); process.stdin.on('end', () => process.stdout.write(Buffer.concat(chunks)));",
+      ],
+      { cwd: process.cwd(), input: Buffer.from("validated bytes\n") },
+    );
+
+    expect(result).toMatchObject({ exitCode: 0, stdout: "validated bytes\n" });
+    await expect(
+      runProcess(process.execPath, ["-e", "process.exit(0)"], {
+        cwd: process.cwd(),
+        input: Buffer.alloc(DEFAULT_PROCESS_INPUT_BYTES + 1),
+      }),
+    ).rejects.toThrow(`${DEFAULT_PROCESS_INPUT_BYTES}-byte bounded input limit`);
+  });
+
   it("drains stdout and stderr while retaining bounded valid UTF-8 with exact metadata", async () => {
     const result = await runProcess(
       process.execPath,
@@ -238,6 +258,7 @@ describe("bounded subprocess output capture", () => {
   it("settles after escalation when a timed-out child never emits close", async () => {
     vi.useFakeTimers();
     const child = Object.assign(new EventEmitter(), {
+      stdin: new PassThrough({ highWaterMark: 1 }),
       stdout: new PassThrough(),
       stderr: new PassThrough(),
       kill: vi.fn(() => true),
@@ -248,6 +269,7 @@ describe("bounded subprocess output capture", () => {
     const result = runProcess(process.execPath, [], {
       cwd: process.cwd(),
       timeoutMs: 10,
+      input: Buffer.from("backpressured input"),
     });
     await vi.advanceTimersByTimeAsync(
       10 + PROCESS_TERMINATION_GRACE_MS + PROCESS_SETTLEMENT_GRACE_MS + 1,
@@ -256,6 +278,7 @@ describe("bounded subprocess output capture", () => {
     await expect(result).resolves.toMatchObject({ exitCode: 124, timedOut: true });
     expect(child.kill).toHaveBeenNthCalledWith(1, "SIGTERM");
     expect(child.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
+    expect(child.stdin.destroyed).toBe(true);
     expect(child.stdout.destroyed).toBe(true);
     expect(child.stderr.destroyed).toBe(true);
     expect(child.unref).toHaveBeenCalledOnce();

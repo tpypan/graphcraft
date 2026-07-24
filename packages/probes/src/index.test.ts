@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -103,6 +103,36 @@ describe("task-specific probe planning", () => {
     );
     expect(completionIds(plan)).toContain("package-root-test-unit");
   });
+
+  it.skipIf(process.platform === "win32")(
+    "permits internal package symlinks and refuses external package discovery",
+    async () => {
+      const { root, sha } = await createRepository();
+      await mkdir(join(root, "linked"));
+      await symlink("../package.json", join(root, "linked", "package.json"), "file");
+      await execFileAsync("git", ["add", "linked/package.json"], { cwd: root });
+      await expect(discoverProbePlan(root, "Fix the linked unit regression", sha)).resolves.toEqual(
+        expect.objectContaining({ family: "bug" }),
+      );
+
+      const outside = await mkdtemp(join(tmpdir(), "graphcraft-probes-outside-"));
+      temporaryRoots.push(outside);
+      const outsideManifest = join(outside, "private-package.json");
+      await writeFile(
+        outsideManifest,
+        JSON.stringify({ name: "private-name", scripts: { test: "node private-test.mjs" } }),
+      );
+      await rm(join(root, "linked", "package.json"));
+      await symlink(outsideManifest, join(root, "linked", "package.json"), "file");
+
+      const error = await discoverProbePlan(root, "Fix the linked unit regression", sha).catch(
+        (failure: unknown) => failure,
+      );
+      expect(error).toMatchObject({ kind: "outside_repository" });
+      expect((error as Error).message).not.toContain(outside);
+      expect((error as Error).message).not.toContain("private-name");
+    },
+  );
 
   it("selects distinct focused and regression evidence for every local task family", async () => {
     const { root, sha } = await createRepository();
@@ -307,4 +337,72 @@ describe("task-specific probe planning", () => {
     } as ProbePlan;
     await expect(validateProbePlan(invalid, root)).rejects.toThrow(/working directory/);
   });
+
+  it.skipIf(process.platform === "win32")(
+    "revalidates file probes and command working directories at execution",
+    async () => {
+      const { root } = await createRepository();
+      const outside = await mkdtemp(join(tmpdir(), "graphcraft-probe-boundary-outside-"));
+      temporaryRoots.push(outside);
+      await mkdir(join(root, "safe-cwd"));
+      await symlink("safe-cwd", join(root, "probe-cwd"), "dir");
+      const plan: ProbePlan = {
+        schemaVersion: 1,
+        family: "feature",
+        items: [
+          {
+            phase: "completion",
+            purpose: "regression",
+            source: "validated command",
+            probe: {
+              id: "validated-command",
+              kind: "command",
+              command: process.execPath,
+              args: ["-e", "process.exit(0)"],
+              cwd: "probe-cwd",
+              expectedExitCode: 0,
+              timeoutMs: 1_000,
+            },
+          },
+        ],
+      };
+      await expect(validateProbePlan(plan, root)).resolves.toEqual(plan);
+
+      await rm(join(root, "probe-cwd"));
+      await symlink(outside, join(root, "probe-cwd"), "dir");
+      await expect(runProbe(plan.items[0]!.probe, root)).rejects.toMatchObject({
+        kind: "outside_repository",
+      });
+
+      const outsideFile = join(outside, "private.txt");
+      await writeFile(outsideFile, "private probe value\n");
+      await symlink(outsideFile, join(root, "linked-file.txt"), "file");
+      const fileError = await runProbe(
+        {
+          id: "linked-file",
+          kind: "file",
+          path: "linked-file.txt",
+          shouldExist: true,
+          contains: "private probe value",
+        },
+        root,
+      ).catch((failure: unknown) => failure);
+      expect(fileError).toMatchObject({ kind: "outside_repository" });
+      expect((fileError as Error).message).not.toContain(outside);
+      expect((fileError as Error).message).not.toContain("private probe value");
+
+      await symlink("probe-cwd/missing.txt", join(root, "chained-missing.txt"), "file");
+      await expect(
+        runProbe(
+          {
+            id: "chained-missing",
+            kind: "file",
+            path: "chained-missing.txt",
+            shouldExist: false,
+          },
+          root,
+        ),
+      ).rejects.toMatchObject({ kind: "outside_repository" });
+    },
+  );
 });

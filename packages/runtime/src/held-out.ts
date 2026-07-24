@@ -1,7 +1,4 @@
-import { execFile } from "node:child_process";
-import { readFile, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import { promisify } from "node:util";
 import {
   contentHash,
   createHeldOutProbePlan,
@@ -10,9 +7,14 @@ import {
   type ProbePlan,
   type ProbeResult,
 } from "@graphcraft/core";
-import { runProcess } from "@graphcraft/probes";
-
-const execFileAsync = promisify(execFile);
+import {
+  assertRepositoryDirectory,
+  assertRepositoryInventoryPaths,
+  isRepositoryFileError,
+  readRepositoryFile,
+  readRepositoryTextFile,
+  runProcess,
+} from "@graphcraft/probes";
 
 function relativeRepositoryPath(repositoryRoot: string, candidate: string): string | undefined {
   const root = resolve(repositoryRoot);
@@ -22,38 +24,58 @@ function relativeRepositoryPath(repositoryRoot: string, candidate: string): stri
   return result && !isAbsolute(result) ? result.split(sep).join("/") : undefined;
 }
 
-async function gitObjectValueHash(
+function relativeRepositoryDirectoryPath(
+  repositoryRoot: string,
+  candidate: string,
+): string | undefined {
+  const root = resolve(repositoryRoot);
+  const path = resolve(repositoryRoot, candidate);
+  if (path !== root && !path.startsWith(`${root}${sep}`)) return undefined;
+  const result = relative(root, path);
+  return result && !isAbsolute(result) ? result.split(sep).join("/") : ".";
+}
+
+async function directoryValueHash(
   repositoryRoot: string,
   path: string,
   signal?: AbortSignal,
 ): Promise<string> {
+  const [canonicalRoot, canonicalPath] = await Promise.all([
+    assertRepositoryDirectory(repositoryRoot, ".", signal),
+    assertRepositoryDirectory(repositoryRoot, path, signal),
+  ]);
   signal?.throwIfAborted();
-  const args = [
-    "hash-object",
-    `--path=${path.replaceAll("\\", "/")}`,
-    resolve(repositoryRoot, path),
-  ];
-  const stdout = signal
-    ? await runProcess("git", args, {
-        cwd: repositoryRoot,
-        signal,
-        timeoutMs: 120_000,
-        maxOutputBytesPerStream: 1024 * 1024,
-      }).then((result) => {
-        signal.throwIfAborted();
-        if (result.exitCode !== 0)
-          throw new Error(result.stderr.trim() || `git hash-object failed for ${path}`);
-        return result.stdout;
-      })
-    : (
-        await execFileAsync("git", args, {
-          cwd: repositoryRoot,
-          encoding: "utf8",
-          maxBuffer: 1024 * 1024,
-        })
-      ).stdout;
+  const target = relative(canonicalRoot, canonicalPath);
+  if (isAbsolute(target) || target === ".." || target.startsWith(`..${sep}`))
+    throw new Error(`Completion working directory ${path} escapes the repository`);
+  return contentHash({
+    path,
+    target: target ? target.split(sep).join("/") : ".",
+  });
+}
+
+async function gitObjectValueHash(
+  repositoryRoot: string,
+  path: string,
+  contents: Buffer,
+  signal?: AbortSignal,
+): Promise<string> {
   signal?.throwIfAborted();
-  const objectHash = stdout.trim();
+  const result = await runProcess(
+    "git",
+    ["hash-object", "--stdin", `--path=${path.replaceAll("\\", "/")}`],
+    {
+      cwd: repositoryRoot,
+      input: contents,
+      timeoutMs: 120_000,
+      maxOutputBytesPerStream: 1024 * 1024,
+      ...(signal ? { signal } : {}),
+    },
+  );
+  signal?.throwIfAborted();
+  if (result.exitCode !== 0)
+    throw new Error(result.stderr.trim() || `git hash-object failed for ${path}`);
+  const objectHash = result.stdout.trim();
   if (!/^[a-f0-9]{40,64}$/.test(objectHash))
     throw new Error(`Unable to establish held-out integrity for ${path}`);
   return contentHash({ path, objectHash });
@@ -65,22 +87,20 @@ async function fileValueHash(
   algorithm: "git_hash_object" | undefined,
   signal?: AbortSignal,
 ): Promise<string> {
-  if (algorithm === "git_hash_object") {
-    const details = await stat(resolve(repositoryRoot, path)).catch(() => undefined);
+  let contents: Buffer;
+  try {
+    contents = await readRepositoryFile(repositoryRoot, path, {
+      ...(signal ? { signal } : {}),
+    });
+  } catch (error) {
     signal?.throwIfAborted();
-    return details?.isFile()
-      ? await gitObjectValueHash(repositoryRoot, path, signal)
-      : contentHash({ missing: true, path, algorithm });
+    if (isRepositoryFileError(error, "missing", "not_file"))
+      return contentHash({ missing: true, path, ...(algorithm ? { algorithm } : {}) });
+    throw error;
   }
-  const contents = await readFile(resolve(repositoryRoot, path), {
-    ...(signal ? { signal } : {}),
-  }).catch(() => {
-    signal?.throwIfAborted();
-    return undefined;
-  });
-  return contents
-    ? contentHash({ path, contents: contents.toString("base64") })
-    : contentHash({ missing: true, path });
+  if (algorithm === "git_hash_object")
+    return await gitObjectValueHash(repositoryRoot, path, contents, signal);
+  return contentHash({ path, contents: contents.toString("base64") });
 }
 
 function possibleFileArguments(values: string[]): string[] {
@@ -104,9 +124,15 @@ async function fileIntegrity(
     signal?.throwIfAborted();
     const path = relativeRepositoryPath(repositoryRoot, resolve(repositoryRoot, cwd ?? ".", value));
     if (!path) continue;
-    const details = await stat(resolve(repositoryRoot, path)).catch(() => undefined);
-    signal?.throwIfAborted();
-    if (!details?.isFile()) continue;
+    try {
+      await readRepositoryFile(repositoryRoot, path, {
+        ...(signal ? { signal } : {}),
+      });
+    } catch (error) {
+      signal?.throwIfAborted();
+      if (isRepositoryFileError(error, "missing", "not_file")) continue;
+      throw error;
+    }
     result.push({
       kind: "file",
       path,
@@ -130,10 +156,20 @@ export async function createRuntimeHeldOutProbePlan(
       throw new Error("An approved probe plan cannot contain held-out references");
     const protectedValues: HeldOutProbeIntegrity[] = [];
     if (item.probe.kind === "command") {
+      const cwd = relativeRepositoryDirectoryPath(repositoryRoot, item.probe.cwd ?? ".");
+      if (!cwd)
+        throw new Error(`Completion probe ${item.probe.id} working directory escapes repository`);
+      protectedValues.push({
+        kind: "directory",
+        path: cwd,
+        valueHash: await directoryValueHash(repositoryRoot, cwd, signal),
+      });
       protectedValues.push(
         ...(await fileIntegrity(repositoryRoot, item.probe.cwd, item.probe.args, signal)),
       );
     }
+    if (item.probe.kind === "repository_inventory")
+      await assertRepositoryInventoryPaths(repositoryRoot, item.probe.paths, signal);
     const match = /^(.*package\.json) script (.+)$/.exec(item.source);
     if (!match) {
       integrity[item.probe.id] = protectedValues;
@@ -144,8 +180,7 @@ export async function createRuntimeHeldOutProbePlan(
     const manifestPath = relativeRepositoryPath(repositoryRoot, path);
     if (!manifestPath) throw new Error(`Completion script ${script} escapes the repository`);
     const manifest = JSON.parse(
-      await readFile(resolve(repositoryRoot, manifestPath), {
-        encoding: "utf8",
+      await readRepositoryTextFile(repositoryRoot, manifestPath, {
         ...(signal ? { signal } : {}),
       }),
     ) as { scripts?: Record<string, string> };
@@ -178,28 +213,60 @@ export async function createRuntimeHeldOutProbePlan(
 export async function heldOutIntegrityFailures(
   plan: HeldOutProbePlan,
   repositoryPath: string,
+  signal?: AbortSignal,
 ): Promise<ProbeResult[]> {
   const failures: ProbeResult[] = [];
   for (const entry of plan.probes) {
+    signal?.throwIfAborted();
     const changedKinds = new Set<string>();
     let signature = "";
+    if (entry.probe.kind === "repository_inventory") {
+      try {
+        await assertRepositoryInventoryPaths(repositoryPath, entry.probe.paths, signal);
+      } catch (error) {
+        signal?.throwIfAborted();
+        changedKinds.add("repository_path");
+        signature += contentHash({
+          probeId: entry.probe.id,
+          kind: "repository_path",
+          reason: isRepositoryFileError(error) ? error.kind : "invalid",
+        });
+      }
+    }
     for (const integrity of entry.integrity) {
+      signal?.throwIfAborted();
       let actualHash: string;
-      if (integrity.kind === "package_script") {
-        const manifest = await readFile(resolve(repositoryPath, integrity.path), "utf8")
-          .then(
-            (value) =>
-              JSON.parse(value) as {
-                scripts?: Record<string, string>;
-              },
-          )
-          .catch(() => undefined);
-        const value = manifest?.scripts?.[integrity.script];
-        actualHash = value
-          ? contentHash({ path: integrity.path, script: integrity.script, value })
-          : contentHash({ missing: true, path: integrity.path, script: integrity.script });
-      } else {
-        actualHash = await fileValueHash(repositoryPath, integrity.path, integrity.algorithm);
+      try {
+        if (integrity.kind === "package_script") {
+          const manifest = JSON.parse(
+            await readRepositoryTextFile(repositoryPath, integrity.path, {
+              ...(signal ? { signal } : {}),
+            }),
+          ) as {
+            scripts?: Record<string, string>;
+          };
+          const value = manifest.scripts?.[integrity.script];
+          actualHash = value
+            ? contentHash({ path: integrity.path, script: integrity.script, value })
+            : contentHash({ missing: true, path: integrity.path, script: integrity.script });
+        } else if (integrity.kind === "directory") {
+          actualHash = await directoryValueHash(repositoryPath, integrity.path, signal);
+        } else {
+          actualHash = await fileValueHash(
+            repositoryPath,
+            integrity.path,
+            integrity.algorithm,
+            signal,
+          );
+        }
+      } catch (error) {
+        signal?.throwIfAborted();
+        actualHash = contentHash({
+          unavailable: true,
+          path: integrity.path,
+          kind: integrity.kind,
+          reason: isRepositoryFileError(error) ? error.kind : "invalid",
+        });
       }
       if (actualHash === integrity.valueHash) continue;
       changedKinds.add(integrity.kind);
@@ -209,6 +276,8 @@ export async function heldOutIntegrityFailures(
       const detail = [
         changedKinds.has("package_script") ? "package script definition" : undefined,
         changedKinds.has("file") ? "protected measurement file" : undefined,
+        changedKinds.has("directory") ? "working directory" : undefined,
+        changedKinds.has("repository_path") ? "repository inventory path boundary" : undefined,
       ]
         .filter(Boolean)
         .join(" and ");

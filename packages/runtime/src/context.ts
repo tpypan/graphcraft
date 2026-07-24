@@ -10,7 +10,11 @@ import {
   type ProbeResult,
   type RunContract,
 } from "@graphcraft/core";
-import { runProcess } from "@graphcraft/probes";
+import {
+  assertRepositoryInventoryPaths,
+  assertRepositoryPath,
+  runProcess,
+} from "@graphcraft/probes";
 import { RunStore } from "./store.ts";
 import { redactValue } from "./redaction.ts";
 
@@ -77,6 +81,7 @@ export async function prepareWorkerContext(input: {
   repositoryPath: string;
   predecessorEvidence: string[];
   probeResults: ProbeResult[];
+  signal?: AbortSignal;
 }): Promise<{
   capsule: ContextCapsule;
   capsuleHash: string;
@@ -88,8 +93,10 @@ export async function prepareWorkerContext(input: {
     {
       cwd: input.repositoryPath,
       timeoutMs: 30_000,
+      ...(input.signal ? { signal: input.signal } : {}),
     },
   );
+  input.signal?.throwIfAborted();
   if (tracked.exitCode !== 0) throw new Error("Unable to inventory repository context");
   const repositoryPaths = tracked.stdout.split("\n").filter(Boolean).sort();
   const inventory = await input.store.writeContentAddressedArtifact(
@@ -106,6 +113,10 @@ export async function prepareWorkerContext(input: {
     relevantPaths.length === 0
   )
     throw new Error(`Node ${input.node.id} has no grounded repository context`);
+  for (const repositoryPath of relevantPaths)
+    await assertRepositoryPath(input.repositoryPath, repositoryPath, input.signal);
+  if (relevantPaths.length > 0)
+    await assertRepositoryInventoryPaths(input.repositoryPath, relevantPaths, input.signal);
   const node: GraphNode = {
     ...input.node,
     contextSelector: { ...input.node.contextSelector, relevantPaths },
