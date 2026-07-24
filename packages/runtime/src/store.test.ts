@@ -2,7 +2,15 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { compileGraph, compileRunContract, createRunEvent, type RunEvent } from "@graphcraft/core";
+import {
+  LEGACY_CANONICAL_HASH_ALGORITHM,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
+  compileGraph,
+  compileRunContract,
+  createRunEvent,
+  type CanonicalHashAlgorithm,
+  type RunEvent,
+} from "@graphcraft/core";
 import { createViewerSnapshot } from "./viewer.ts";
 import {
   RUN_BLOCKED_EVENT_RESERVE_BYTES,
@@ -40,6 +48,55 @@ function serializedEvent(event: RunEvent): Buffer {
   return Buffer.from(`${JSON.stringify(event)}\n`);
 }
 
+function eventHashAlgorithm(event: RunEvent): CanonicalHashAlgorithm {
+  return event.schemaVersion === 2
+    ? PORTABLE_CANONICAL_HASH_ALGORITHM
+    : LEGACY_CANONICAL_HASH_ALGORITHM;
+}
+
+describe("storage v3 initialization", () => {
+  it("finalizes an event-complete initializing descriptor concurrently without rewriting events", async () => {
+    const { root, store } = await createStoreFixture();
+    const storagePath = join(store.runRoot, "storage.json");
+    const descriptor = JSON.parse(await readFile(storagePath, "utf8")) as Record<string, unknown>;
+    descriptor.initialization = "initializing";
+    await writeFile(storagePath, `${JSON.stringify(descriptor, null, 2)}\n`);
+    const eventsBefore = await readFile(store.eventsPath());
+
+    await Promise.all([
+      new RunStore(root, store.runId).prepareStorage(),
+      new RunStore(root, store.runId).prepareStorage(),
+    ]);
+
+    expect(JSON.parse(await readFile(storagePath, "utf8"))).toMatchObject({
+      schemaVersion: 3,
+      runId: store.runId,
+      migratedFrom: 3,
+      initialization: "ready",
+      canonicalHashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+      formats: { events: 2 },
+    });
+    expect(await readFile(store.eventsPath())).toEqual(eventsBefore);
+  });
+
+  it("leaves a pre-event initializing descriptor intact with a precise blocker", async () => {
+    const { root, store } = await createStoreFixture();
+    const storagePath = join(store.runRoot, "storage.json");
+    const descriptor = JSON.parse(await readFile(storagePath, "utf8")) as Record<string, unknown>;
+    descriptor.initialization = "initializing";
+    const initializingBytes = Buffer.from(`${JSON.stringify(descriptor, null, 2)}\n`);
+    await writeFile(storagePath, initializingBytes);
+    await writeFile(store.eventsPath(), "");
+
+    await expect(new RunStore(root, store.runId).prepareStorage()).rejects.toThrow(
+      /incomplete schema-v3 initialization before its first durable event/,
+    );
+
+    expect(await readFile(storagePath)).toEqual(initializingBytes);
+    expect(await readFile(store.eventsPath())).toEqual(Buffer.alloc(0));
+  });
+});
+
 describe("durable event log tails", () => {
   it("reads a valid unterminated event without mutation and repays the delimiter on append", async () => {
     const { root, store } = await createStoreFixture();
@@ -72,14 +129,17 @@ describe("durable event log tails", () => {
     const { root, store, event } = await createStoreFixture();
     const eventsPath = store.eventsPath();
     const original = await readFile(eventsPath);
-    const next = createRunEvent({
-      sequence: 2,
-      timestamp: "2026-07-22T00:00:00.000Z",
-      actor: "runtime",
-      causationId: event.causationId,
-      type: "run.paused",
-      data: { reason: "crash after event bytes before delimiter and state" },
-    });
+    const next = createRunEvent(
+      {
+        sequence: 2,
+        timestamp: "2026-07-22T00:00:00.000Z",
+        actor: "runtime",
+        causationId: event.causationId,
+        type: "run.paused",
+        data: { reason: "crash after event bytes before delimiter and state" },
+      },
+      store.canonicalHashAlgorithm,
+    );
     const interrupted = Buffer.concat([original, serializedEvent(next).subarray(0, -1)]);
     await writeFile(eventsPath, interrupted);
 
@@ -142,18 +202,36 @@ describe("durable event log tails", () => {
       bytes: (event: RunEvent) => serializedEvent({ ...event, hash: "0".repeat(64) }),
     },
     {
-      name: "invalid sequence",
-      expected: /invalid event sequence/u,
+      name: "manifest/event format mismatch",
+      expected: /event format that disagrees with its storage manifest/u,
       bytes: (event: RunEvent) =>
         serializedEvent(
           createRunEvent({
-            sequence: 2,
+            sequence: event.sequence,
             timestamp: event.timestamp,
             actor: event.actor,
             causationId: event.causationId,
             type: event.type,
             data: event.data,
           }),
+        ),
+    },
+    {
+      name: "invalid sequence",
+      expected: /invalid event sequence/u,
+      bytes: (event: RunEvent) =>
+        serializedEvent(
+          createRunEvent(
+            {
+              sequence: 2,
+              timestamp: event.timestamp,
+              actor: event.actor,
+              causationId: event.causationId,
+              type: event.type,
+              data: event.data,
+            },
+            eventHashAlgorithm(event),
+          ),
         ),
     },
   ])("fails closed on $name without leaking or changing durable files", async (fixture) => {
@@ -221,14 +299,17 @@ describe("durable event log tails", () => {
     const unterminated = original.subarray(0, -1);
     await writeFile(store.eventsPath(), unterminated);
     const data = { reason: "capacity boundary" };
-    const candidate = createRunEvent({
-      sequence: 2,
-      timestamp: "2026-07-22T00:00:00.000Z",
-      actor: "runtime",
-      causationId: store.runId,
-      type: "run.paused",
-      data,
-    });
+    const candidate = createRunEvent(
+      {
+        sequence: 2,
+        timestamp: "2026-07-22T00:00:00.000Z",
+        actor: "runtime",
+        causationId: store.runId,
+        type: "run.paused",
+        data,
+      },
+      store.canonicalHashAlgorithm,
+    );
     const maxEventLogBytes =
       unterminated.byteLength +
       serializedEvent(candidate).byteLength +

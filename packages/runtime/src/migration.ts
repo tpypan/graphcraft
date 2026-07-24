@@ -4,8 +4,14 @@ import { lstat, mkdir, open, readdir, rename, rm } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
+  LEGACY_CANONICAL_HASH_ALGORITHM,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
+  RunEventSchema,
   RunStorageManifestSchema,
+  verifyRunEvent,
+  type CanonicalHashAlgorithm,
   type ArtifactInventory,
+  type RunEvent,
   type RunStorageManifest,
 } from "@graphcraft/core";
 import {
@@ -24,7 +30,7 @@ import {
   validatePrivatePath,
 } from "./secure-fs.ts";
 
-export const CURRENT_RUN_STORAGE_VERSION = 2;
+export const CURRENT_RUN_STORAGE_VERSION = 3;
 const BACKUP_COMPLETION_FILE = ".backup-complete.json";
 const ARTIFACT_INVENTORY_FILE = "artifact-inventory.json";
 const MIB = 1024 * 1024;
@@ -59,31 +65,38 @@ export const LEGACY_MIGRATION_RESOURCE_LIMITS = Object.freeze({
   maximumEntryCount: 8 * 1024,
 });
 
-type LegacyStorageVersion = 0 | 1;
-type CurrentRunStorageManifest = Extract<RunStorageManifest, { schemaVersion: 2 }>;
+type LegacyStorageVersion = 0 | 1 | 2;
+type CurrentRunStorageManifest = Extract<RunStorageManifest, { schemaVersion: 3 }>;
 
 interface LegacyStorage {
   version: LegacyStorageVersion;
 }
 
 interface CurrentStorage {
-  version: 2;
+  version: 3;
   manifest: CurrentRunStorageManifest;
 }
 
 type StorageInspection = LegacyStorage | CurrentStorage;
 
-function manifest(runId: string, migratedFrom: 0 | 1 | 2): CurrentRunStorageManifest {
+function manifest(
+  runId: string,
+  migratedFrom: 0 | 1 | 2 | 3,
+  canonicalHashAlgorithm: CanonicalHashAlgorithm,
+  initialization: "initializing" | "ready",
+): CurrentRunStorageManifest {
   return RunStorageManifestSchema.parse({
     schemaVersion: CURRENT_RUN_STORAGE_VERSION,
     runId,
     migratedFrom,
+    initialization,
+    canonicalHashAlgorithm,
     formats: {
       contract: 1,
       graph: 1,
       probePlan: 1,
       heldOutProbes: 1,
-      events: 1,
+      events: canonicalHashAlgorithm === PORTABLE_CANONICAL_HASH_ALGORITHM ? 2 : 1,
       state: 1,
       workspace: 1,
       capsules: 1,
@@ -116,10 +129,12 @@ async function validateRunStorageRoot(input: {
 async function persistCurrentRunStorageManifest(
   runRoot: string,
   runId: string,
-  migratedFrom: 0 | 1 | 2,
+  migratedFrom: 0 | 1 | 2 | 3,
+  canonicalHashAlgorithm: CanonicalHashAlgorithm,
+  initialization: "initializing" | "ready",
   lease?: MigrationLeaseContext,
 ): Promise<CurrentRunStorageManifest> {
-  const value = manifest(runId, migratedFrom);
+  const value = manifest(runId, migratedFrom, canonicalHashAlgorithm, initialization);
   await migrationStep(lease, async () => await ensurePrivateDirectory(runRoot));
   const path = runStorageManifestPath(runRoot);
   await migrationStep(lease, async () => await writeJsonAtomic(path, value));
@@ -131,13 +146,32 @@ async function persistCurrentRunStorageManifest(
 export async function writeCurrentRunStorageManifest(
   runRoot: string,
   runId: string,
-  migratedFrom: 0 | 1 | 2,
+  migratedFrom: 0 | 1 | 2 | 3,
 ): Promise<CurrentRunStorageManifest> {
   if (migratedFrom !== CURRENT_RUN_STORAGE_VERSION)
     throw new Error(
       "Legacy storage manifests can only be published after verified backup migration",
     );
-  return await persistCurrentRunStorageManifest(runRoot, runId, migratedFrom);
+  return await persistCurrentRunStorageManifest(
+    runRoot,
+    runId,
+    migratedFrom,
+    PORTABLE_CANONICAL_HASH_ALGORITHM,
+    "ready",
+  );
+}
+
+export async function writeInitializingRunStorageManifest(
+  runRoot: string,
+  runId: string,
+): Promise<CurrentRunStorageManifest> {
+  return await persistCurrentRunStorageManifest(
+    runRoot,
+    runId,
+    CURRENT_RUN_STORAGE_VERSION,
+    PORTABLE_CANONICAL_HASH_ALGORITHM,
+    "initializing",
+  );
 }
 
 async function readRawManifest(runRoot: string, runId: string): Promise<unknown | undefined> {
@@ -170,7 +204,7 @@ async function inspectStorage(runRoot: string, runId: string): Promise<StorageIn
     throw new Error(
       `Run ${runId} uses future storage schema ${version}; this Graphcraft supports through ${CURRENT_RUN_STORAGE_VERSION}. No files were changed.`,
     );
-  if (version !== 1 && version !== CURRENT_RUN_STORAGE_VERSION)
+  if (version !== 1 && version !== 2 && version !== CURRENT_RUN_STORAGE_VERSION)
     throw new Error(
       `Run ${runId} uses unsupported storage schema ${String(version)}; no migration path is available. No files were changed.`,
     );
@@ -187,7 +221,7 @@ async function inspectStorage(runRoot: string, runId: string): Promise<StorageIn
     throw new Error(
       `Run storage manifest belongs to ${parsed.runId}, not ${runId}. No files were changed.`,
     );
-  if (parsed.schemaVersion !== CURRENT_RUN_STORAGE_VERSION) return { version: 1 };
+  if (parsed.schemaVersion === 1) return { version: 1 };
   try {
     await validatePrivatePath(runRoot, ARTIFACT_INVENTORY_FILE);
     const inventory = await readBoundedArtifactInventory(join(runRoot, ARTIFACT_INVENTORY_FILE));
@@ -195,10 +229,20 @@ async function inspectStorage(runRoot: string, runId: string): Promise<StorageIn
       throw new Error(`artifact inventory belongs to ${inventory.runId}`);
   } catch (error) {
     throw new Error(
-      `Run ${runId} has an invalid schema-v2 artifact inventory: ${error instanceof Error ? error.message : String(error)}. No files were changed.`,
+      `Run ${runId} has an invalid schema-v${parsed.schemaVersion} artifact inventory: ${error instanceof Error ? error.message : String(error)}. No files were changed.`,
     );
   }
-  return { version: 2, manifest: parsed };
+  if (parsed.schemaVersion === 2) return { version: 2 };
+  if (
+    (parsed.canonicalHashAlgorithm === LEGACY_CANONICAL_HASH_ALGORITHM &&
+      parsed.formats.events !== 1) ||
+    (parsed.canonicalHashAlgorithm === PORTABLE_CANONICAL_HASH_ALGORITHM &&
+      parsed.formats.events !== 2)
+  )
+    throw new Error(
+      `Run ${runId} has a storage hash algorithm that disagrees with its event format. No files were changed.`,
+    );
+  return { version: 3, manifest: parsed };
 }
 
 function isActiveLockError(error: unknown): boolean {
@@ -337,7 +381,11 @@ async function acquireMigrationLock(input: {
   while (true) {
     await validateRunStorageRoot(input);
     const storage = await inspectStorage(input.runRoot, input.runId);
-    if (storage.version === CURRENT_RUN_STORAGE_VERSION) return { manifest: storage.manifest };
+    if (
+      storage.version === CURRENT_RUN_STORAGE_VERSION &&
+      storage.manifest.initialization === "ready"
+    )
+      return { manifest: storage.manifest };
     const lock = new RunLock(lockPath);
     try {
       await lock.acquire();
@@ -893,7 +941,7 @@ interface BackupCompletion {
   kind: "graphcraft_storage_migration_backup";
   runId: string;
   sourceVersion: LegacyStorageVersion;
-  targetVersion: 2;
+  targetVersion: 3;
   treeDigest: string;
 }
 
@@ -1459,6 +1507,118 @@ async function validateLegacyRun(
       );
     }
   });
+  await migrationStep(lease, async () => {
+    let source: string;
+    try {
+      source = (
+        await readPrivateFileBounded(
+          join(runRoot, "events.jsonl"),
+          LEGACY_MIGRATION_DESTINATION_LIMITS.maximumEventLogBytes,
+          runRoot,
+        )
+      ).toString("utf8");
+    } catch (error) {
+      throw new Error(
+        `Legacy run ${runId} event format could not be inspected safely: ${error instanceof Error ? error.message : String(error)}. No files were changed.`,
+      );
+    }
+    for (const line of source.split("\n")) {
+      if (line.length === 0) continue;
+      let value: unknown;
+      try {
+        value = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (
+        typeof value === "object" &&
+        value !== null &&
+        (value as Record<string, unknown>).schemaVersion === 2
+      )
+        throw new Error(
+          `Run ${runId} contains schema-v2 events without an intact schema-v3 storage manifest. No files were changed.`,
+        );
+    }
+  });
+}
+
+async function validateInitializingRunStorage(
+  runRoot: string,
+  runId: string,
+  lease: MigrationLeaseContext,
+): Promise<void> {
+  for (const relativePath of [
+    "contract.json",
+    "graph.json",
+    "probe-plan.json",
+    "held-out-probes.json",
+    "events.jsonl",
+  ])
+    await migrationStep(lease, async () => {
+      try {
+        await validatePrivatePath(runRoot, relativePath);
+      } catch {
+        throw new Error(
+          `Run ${runId} has an incomplete schema-v3 initialization before its first durable event. No files were changed.`,
+        );
+      }
+    });
+
+  let source: Buffer;
+  try {
+    source = await migrationStep(
+      lease,
+      async () =>
+        await readPrivateFileBounded(
+          join(runRoot, "events.jsonl"),
+          LEGACY_MIGRATION_DESTINATION_LIMITS.maximumEventLogBytes,
+          runRoot,
+        ),
+    );
+  } catch {
+    throw new Error(
+      `Run ${runId} has an incomplete schema-v3 initialization before its first durable event. No files were changed.`,
+    );
+  }
+
+  let decoded: string;
+  try {
+    decoded = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(source);
+  } catch {
+    throw new Error(
+      `Run ${runId} has an invalid event log during schema-v3 initialization. No files were changed.`,
+    );
+  }
+  const events: RunEvent[] = [];
+  for (const line of decoded.split("\n")) {
+    if (line.length === 0) continue;
+    let event;
+    try {
+      event = RunEventSchema.parse(JSON.parse(line));
+      verifyRunEvent(event);
+    } catch {
+      throw new Error(
+        `Run ${runId} has an invalid event log during schema-v3 initialization. No files were changed.`,
+      );
+    }
+    if (event.schemaVersion !== 2 || event.sequence !== events.length + 1)
+      throw new Error(
+        `Run ${runId} has an event format that disagrees with its schema-v3 initialization descriptor. No files were changed.`,
+      );
+    events.push(event);
+  }
+  const first = events[0];
+  const contract = first?.data.contract;
+  if (
+    first?.type !== "run.created" ||
+    first.sequence !== 1 ||
+    typeof contract !== "object" ||
+    contract === null ||
+    (contract as Record<string, unknown>).runId !== runId
+  )
+    throw new Error(
+      `Run ${runId} has an incomplete schema-v3 initialization before its first durable event. No files were changed.`,
+    );
 }
 
 async function assertMigratedInventoryCurrent(
@@ -1485,8 +1645,13 @@ export async function ensureCurrentRunStorage(input: {
 }): Promise<RunStorageManifest> {
   await validateRunStorageRoot(input);
   const initial = await inspectStorage(input.runRoot, input.runId);
-  if (initial.version === CURRENT_RUN_STORAGE_VERSION) return initial.manifest;
-  await validateLegacyRun(input.runRoot, input.runId);
+  if (
+    initial.version === CURRENT_RUN_STORAGE_VERSION &&
+    initial.manifest.initialization === "ready"
+  )
+    return initial.manifest;
+  if (initial.version !== CURRENT_RUN_STORAGE_VERSION)
+    await validateLegacyRun(input.runRoot, input.runId);
 
   const acquisition = await acquireMigrationLock(input);
   if (acquisition.manifest) return acquisition.manifest;
@@ -1509,7 +1674,18 @@ export async function ensureCurrentRunStorage(input: {
       lease,
       async () => await inspectStorage(input.runRoot, input.runId),
     );
-    if (storage.version === CURRENT_RUN_STORAGE_VERSION) return storage.manifest;
+    if (storage.version === CURRENT_RUN_STORAGE_VERSION) {
+      if (storage.manifest.initialization === "ready") return storage.manifest;
+      await validateInitializingRunStorage(input.runRoot, input.runId, lease);
+      return await persistCurrentRunStorageManifest(
+        input.runRoot,
+        input.runId,
+        storage.manifest.migratedFrom,
+        storage.manifest.canonicalHashAlgorithm,
+        "ready",
+        lease,
+      );
+    }
     await validateLegacyRun(input.runRoot, input.runId, lease);
     const sourceSnapshot = await assertLegacyTreeRedactionSafe(input.runRoot, lease);
     if (input.onBoundary)
@@ -1531,9 +1707,8 @@ export async function ensureCurrentRunStorage(input: {
       undefined,
       lease.signal,
     );
-    const migratedInventory = await migrationStep(
-      lease,
-      async () => await artifactStore.migrateLegacy(),
+    const migratedInventory = await migrationStep(lease, async () =>
+      storage.version === 2 ? await artifactStore.inventory() : await artifactStore.migrateLegacy(),
     );
     await assertMigratedInventoryCurrent(artifactStore, migratedInventory, lease);
     await migrationStep(
@@ -1557,6 +1732,8 @@ export async function ensureCurrentRunStorage(input: {
       input.runRoot,
       input.runId,
       storage.version,
+      LEGACY_CANONICAL_HASH_ALGORITHM,
+      "ready",
       lease,
     );
   } catch (error) {

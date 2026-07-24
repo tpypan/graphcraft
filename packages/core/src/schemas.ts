@@ -1,5 +1,10 @@
 import { z } from "zod";
-import { PORTABLE_CANONICAL_HASH_ALGORITHM } from "./canonical.ts";
+import { LEGACY_CANONICAL_HASH_ALGORITHM, PORTABLE_CANONICAL_HASH_ALGORITHM } from "./canonical.ts";
+
+export const CanonicalHashAlgorithmSchema = z.enum([
+  LEGACY_CANONICAL_HASH_ALGORITHM,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
+]);
 
 export const FinishLineSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("local_verified") }),
@@ -1265,7 +1270,12 @@ export const ArtifactInventorySchema = z
       });
   });
 
-export const RunStorageManifestSchema = z.discriminatedUnion("schemaVersion", [
+const RunStorageFormatsV2Schema = RunStorageFormatsV1Schema.extend({
+  artifactInventory: z.literal(1),
+  artifactPolicy: z.literal(1),
+});
+
+export const RunStorageManifestSchema = z.union([
   z.strictObject({
     schemaVersion: z.literal(1),
     runId: z.uuid(),
@@ -1276,9 +1286,16 @@ export const RunStorageManifestSchema = z.discriminatedUnion("schemaVersion", [
     schemaVersion: z.literal(2),
     runId: z.uuid(),
     migratedFrom: z.union([z.literal(0), z.literal(1), z.literal(2)]),
-    formats: RunStorageFormatsV1Schema.extend({
-      artifactInventory: z.literal(1),
-      artifactPolicy: z.literal(1),
+    formats: RunStorageFormatsV2Schema,
+  }),
+  z.strictObject({
+    schemaVersion: z.literal(3),
+    runId: z.uuid(),
+    migratedFrom: z.union([z.literal(0), z.literal(1), z.literal(2), z.literal(3)]),
+    initialization: z.enum(["initializing", "ready"]),
+    canonicalHashAlgorithm: CanonicalHashAlgorithmSchema,
+    formats: RunStorageFormatsV2Schema.extend({
+      events: z.union([z.literal(1), z.literal(2)]),
     }),
   }),
 ]);

@@ -8,6 +8,8 @@ import {
   GraphAmendmentRecordSchema,
   GraphRevisionRecordSchema,
   HeldOutProbePlanSchema,
+  LEGACY_CANONICAL_HASH_ALGORITHM,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
   ProbePlanSchema,
   RunContractSchema,
   RunEventSchema,
@@ -21,6 +23,7 @@ import {
   verifyRunEvent,
   type Graph,
   type ArtifactInventory,
+  type CanonicalHashAlgorithm,
   type GraphRevisionRecord,
   type HostEvent,
   type HeldOutProbePlan,
@@ -28,9 +31,14 @@ import {
   type RunContract,
   type RunEvent,
   type RunState,
+  type RunStorageManifest,
 } from "@graphcraft/core";
 import { syncDirectory } from "./json.ts";
-import { ensureCurrentRunStorage, writeCurrentRunStorageManifest } from "./migration.ts";
+import {
+  ensureCurrentRunStorage,
+  writeCurrentRunStorageManifest,
+  writeInitializingRunStorageManifest,
+} from "./migration.ts";
 import { assertPersistenceSafe, redactTextBytes, redactValue } from "./redaction.ts";
 import { RunArtifactStore, type ArtifactPreview } from "./artifact-policy.ts";
 import {
@@ -80,7 +88,7 @@ export class RunStoreEventLogCorruptionError extends Error {
     readonly record: number,
     readonly offsetBytes: number,
     readonly trailing: boolean,
-    reason: "encoding" | "json" | "schema" | "hash" | "sequence",
+    reason: "encoding" | "json" | "schema" | "hash" | "format" | "sequence",
   ) {
     const location = trailing ? "trailing record" : `record ${record}`;
     const problem =
@@ -92,7 +100,9 @@ export class RunStoreEventLogCorruptionError extends Error {
             ? "an invalid event schema"
             : reason === "hash"
               ? "an invalid event hash"
-              : "an invalid event sequence";
+              : reason === "format"
+                ? "an event format that disagrees with its storage manifest"
+                : "an invalid event sequence";
     super(
       `Run event log has ${problem} in ${location} at byte ${offsetBytes}; event log bytes were left unchanged`,
     );
@@ -167,21 +177,33 @@ export class RunStore {
   private readonly artifactStore: RunArtifactStore;
   private appendTail: Promise<void> = Promise.resolve();
   private initializing = false;
-  private storageReady: Promise<unknown> | undefined;
+  private storageReady: Promise<RunStorageManifest> | undefined;
+  private _canonicalHashAlgorithm: CanonicalHashAlgorithm;
 
-  constructor(repositoryRoot: string, runId: string, limits: Partial<RunStoreLimits> = {}) {
+  constructor(
+    repositoryRoot: string,
+    runId: string,
+    limits: Partial<RunStoreLimits> = {},
+    canonicalHashAlgorithm: CanonicalHashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM,
+  ) {
     this.repositoryRoot = repositoryRoot;
     this.runId = runId;
     this.graphcraftRoot = join(repositoryRoot, ".graphcraft");
     this.runRoot = join(this.graphcraftRoot, "runs", runId);
     this.limits = normalizeLimits(limits);
+    this._canonicalHashAlgorithm = canonicalHashAlgorithm;
     this.artifactStore = new RunArtifactStore(this.runRoot, runId);
-    const blocker = this.createPersistenceLimitBlocker(1, "event_log");
-    const blockerBytes = Buffer.byteLength(serializedEvent(blocker));
-    if (blockerBytes > this.limits.maxEventBytes)
-      throw new Error("RunStore per-event limit cannot fit its durable blocked event");
-    if (blockerBytes > this.limits.blockedEventReserveBytes)
-      throw new Error("RunStore blocked-event reserve cannot fit its durable blocked event");
+    for (const algorithm of [
+      LEGACY_CANONICAL_HASH_ALGORITHM,
+      PORTABLE_CANONICAL_HASH_ALGORITHM,
+    ] as const) {
+      const blocker = this.createPersistenceLimitBlocker(1, "event_log", algorithm);
+      const blockerBytes = Buffer.byteLength(serializedEvent(blocker));
+      if (blockerBytes > this.limits.maxEventBytes)
+        throw new Error("RunStore per-event limit cannot fit its durable blocked event");
+      if (blockerBytes > this.limits.blockedEventReserveBytes)
+        throw new Error("RunStore blocked-event reserve cannot fit its durable blocked event");
+    }
   }
 
   private async validateStorageRoot(): Promise<void> {
@@ -201,7 +223,10 @@ export class RunStore {
       runId: this.runId,
     }));
     try {
-      await ready;
+      const manifest = await ready;
+      if (manifest.schemaVersion !== 3)
+        throw new Error("Run storage preparation did not return the current schema");
+      this._canonicalHashAlgorithm = manifest.canonicalHashAlgorithm;
       await this.validateStorageRoot();
     } catch (error) {
       if (this.storageReady === ready) this.storageReady = undefined;
@@ -211,6 +236,14 @@ export class RunStore {
 
   private async ensureStorage(): Promise<void> {
     await this.prepareStorage();
+  }
+
+  get canonicalHashAlgorithm(): CanonicalHashAlgorithm {
+    return this._canonicalHashAlgorithm;
+  }
+
+  contentHash(value: unknown): string {
+    return contentHash(value, this._canonicalHashAlgorithm);
   }
 
   private assertJsonProjectionFits(value: unknown, maximumBytes: number, label: string): void {
@@ -277,37 +310,20 @@ export class RunStore {
     inputHeldOutProbePlan?: HeldOutProbePlan,
     limits: Partial<RunStoreLimits> = {},
   ): Promise<RunStore> {
-    const store = new RunStore(repositoryRoot, contract.runId, limits);
+    const store = new RunStore(
+      repositoryRoot,
+      contract.runId,
+      limits,
+      PORTABLE_CANONICAL_HASH_ALGORITHM,
+    );
     store.initializing = true;
     const persistedContract = RunContractSchema.parse(redactValue(contract));
     const persistedGraph = GraphSchema.parse(redactValue(graph));
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
-    const heldOutProbePlan = inputHeldOutProbePlan
-      ? validateHeldOutProbePlan(inputHeldOutProbePlan)
-      : createHeldOutProbePlan(contract.runId, probePlan);
     assertPersistenceSafe(probePlan, "Probe plan");
-    assertPersistenceSafe(heldOutProbePlan, "Held-out probe plan");
-    const event = createRunEvent({
-      sequence: 1,
-      actor: "runtime",
-      causationId: contract.runId,
-      type: "run.created",
-      data: {
-        contract: persistedContract,
-        graph: persistedGraph,
-        probePlan,
-        heldOutProbePlan,
-        nodeIds: graph.nodes.map(({ id }) => id),
-      },
-    });
-    const eventLine = serializedEvent(event);
-    store.assertNormalEventCapacity(0, eventLine);
-    const state = RunStateSchema.parse(reduceEvents([event]));
-    store.assertNormalStateCapacity(state, event.sequence + 1);
     store.assertJsonProjectionFits(persistedContract, RUN_METADATA_MAX_BYTES, "Run contract");
     store.assertJsonProjectionFits(persistedGraph, RUN_METADATA_MAX_BYTES, "Run graph");
     store.assertJsonProjectionFits(probePlan, RUN_METADATA_MAX_BYTES, "Probe plan");
-    store.assertJsonProjectionFits(heldOutProbePlan, RUN_METADATA_MAX_BYTES, "Held-out probe plan");
     await ensurePrivateDirectory(store.graphcraftRoot);
     await Promise.all([
       ensurePrivateDirectory(join(store.graphcraftRoot, "runs")),
@@ -320,6 +336,32 @@ export class RunStore {
       ensurePrivateDirectory(join(store.runRoot, "reports")),
     ]);
     await store.artifactStore.initialize();
+    await writeInitializingRunStorageManifest(store.runRoot, store.runId);
+    const heldOutProbePlan = inputHeldOutProbePlan
+      ? validateHeldOutProbePlan(inputHeldOutProbePlan)
+      : createHeldOutProbePlan(contract.runId, probePlan);
+    assertPersistenceSafe(heldOutProbePlan, "Held-out probe plan");
+    const event = createRunEvent(
+      {
+        sequence: 1,
+        actor: "runtime",
+        causationId: contract.runId,
+        type: "run.created",
+        data: {
+          contract: persistedContract,
+          graph: persistedGraph,
+          probePlan,
+          heldOutProbePlan,
+          nodeIds: graph.nodes.map(({ id }) => id),
+        },
+      },
+      store.canonicalHashAlgorithm,
+    );
+    const eventLine = serializedEvent(event);
+    store.assertNormalEventCapacity(0, eventLine);
+    const state = RunStateSchema.parse(reduceEvents([event]));
+    store.assertNormalStateCapacity(state, event.sequence + 1);
+    store.assertJsonProjectionFits(heldOutProbePlan, RUN_METADATA_MAX_BYTES, "Held-out probe plan");
     await Promise.all([
       store.saveContract(persistedContract),
       store.saveGraph(persistedGraph),
@@ -328,7 +370,7 @@ export class RunStore {
     ]);
     await store.appendEventLine(eventLine, 0);
     await store.writeMaterializedState(state);
-    await writeCurrentRunStorageManifest(store.runRoot, store.runId, 2);
+    await writeCurrentRunStorageManifest(store.runRoot, store.runId, 3);
     store.initializing = false;
     return store;
   }
@@ -337,17 +379,24 @@ export class RunStore {
     return join(this.runRoot, "events.jsonl");
   }
 
-  private createPersistenceLimitBlocker(sequence: number, kind: RunStoreLimitKind): RunEvent {
-    return createRunEvent({
-      sequence,
-      actor: "runtime",
-      causationId: this.runId,
-      type: "run.blocked",
-      data: {
-        reason: PERSISTENCE_LIMIT_BLOCK_REASON,
-        persistenceLimit: kind,
+  private createPersistenceLimitBlocker(
+    sequence: number,
+    kind: RunStoreLimitKind,
+    algorithm: CanonicalHashAlgorithm = this.canonicalHashAlgorithm,
+  ): RunEvent {
+    return createRunEvent(
+      {
+        sequence,
+        actor: "runtime",
+        causationId: this.runId,
+        type: "run.blocked",
+        data: {
+          reason: PERSISTENCE_LIMIT_BLOCK_REASON,
+          persistenceLimit: kind,
+        },
       },
-    });
+      algorithm,
+    );
   }
 
   private persistenceBlockedState(state: RunState, blocker: RunEvent): RunState {
@@ -644,6 +693,10 @@ export class RunStore {
         throw new RunStoreEventLogCorruptionError(record, offset, trailing, "hash");
       }
       const event = parsed.data;
+      const expectedEventSchemaVersion =
+        this.canonicalHashAlgorithm === PORTABLE_CANONICAL_HASH_ALGORITHM ? 2 : 1;
+      if (event.schemaVersion !== expectedEventSchemaVersion)
+        throw new RunStoreEventLogCorruptionError(record, offset, trailing, "format");
       if (event.sequence !== record)
         throw new RunStoreEventLogCorruptionError(record, offset, trailing, "sequence");
       events.push(event);
@@ -715,13 +768,16 @@ export class RunStore {
         error.blockerPersisted = true;
         throw error;
       }
-      const event = createRunEvent({
-        sequence: events.length + 1,
-        actor,
-        causationId,
-        type,
-        data: redactValue(data) as Record<string, unknown>,
-      });
+      const event = createRunEvent(
+        {
+          sequence: events.length + 1,
+          actor,
+          causationId,
+          type,
+          data: redactValue(data) as Record<string, unknown>,
+        },
+        this.canonicalHashAlgorithm,
+      );
       const eventLine = serializedEvent(event);
       let state: RunState;
       try {

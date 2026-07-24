@@ -21,8 +21,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ContextSelectionReceiptSchema,
   HostTerminationError,
+  LEGACY_CANONICAL_HASH_ALGORITHM,
   REQUIRED_HOST_PROTOCOL_CAPABILITIES,
   assertRequiredHostCapabilities,
+  createRunEvent,
   evidenceSnapshot,
   hostCapabilitiesFromProtocolProfile,
   interruptionReason,
@@ -8753,7 +8755,7 @@ process.stdin.on("end", () => {
         legacyStore.graphcraftRoot,
         "migration-backups",
         legacyStore.runId,
-        "0-to-2",
+        "0-to-3",
       );
       const [contract, graph, probePlan, events] = await Promise.all([
         legacyStore.loadContract(),
@@ -8763,7 +8765,7 @@ process.stdin.on("end", () => {
       ]);
 
       expect(manifest).toMatchObject({
-        schemaVersion: 2,
+        schemaVersion: 3,
         migratedFrom: 0,
         formats: {
           contract: 1,
@@ -8800,7 +8802,7 @@ process.stdin.on("end", () => {
         kind: "graphcraft_storage_migration_backup",
         runId: fixture.runId,
         sourceVersion: 0,
-        targetVersion: 2,
+        targetVersion: 3,
         treeDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
       });
 
@@ -8825,12 +8827,32 @@ process.stdin.on("end", () => {
       const current = JSON.parse(await readFile(storagePath, "utf8")) as {
         formats: Record<string, number>;
       };
-      const formats = Object.fromEntries(
-        Object.entries(current.formats).filter(
-          ([key]) => key !== "artifactInventory" && key !== "artifactPolicy",
+      const formats = {
+        ...Object.fromEntries(
+          Object.entries(current.formats).filter(
+            ([key]) => key !== "artifactInventory" && key !== "artifactPolicy",
+          ),
+        ),
+        events: 1,
+      };
+      const legacyEvents = (await created.store.loadEvents()).map((event) =>
+        createRunEvent(
+          {
+            sequence: event.sequence,
+            timestamp: event.timestamp,
+            actor: event.actor,
+            causationId: event.causationId,
+            type: event.type,
+            data: event.data,
+          },
+          LEGACY_CANONICAL_HASH_ALGORITHM,
         ),
       );
       await rm(join(created.store.runRoot, "artifact-inventory.json"));
+      await writeFile(
+        created.store.eventsPath(),
+        `${legacyEvents.map((event) => JSON.stringify(event)).join("\n")}\n`,
+      );
       await writeFile(
         storagePath,
         `${JSON.stringify({
@@ -8882,7 +8904,7 @@ process.stdin.on("end", () => {
       }
 
       expect(JSON.parse(await readFile(storagePath, "utf8"))).toMatchObject({
-        schemaVersion: 2,
+        schemaVersion: 3,
         migratedFrom: 1,
       });
       expect(
@@ -8891,7 +8913,7 @@ process.stdin.on("end", () => {
             created.store.graphcraftRoot,
             "migration-backups",
             created.store.runId,
-            "1-to-2",
+            "1-to-3",
             "storage.json",
           ),
           "utf8",
@@ -8925,7 +8947,7 @@ process.stdin.on("end", () => {
           created.store.graphcraftRoot,
           "migration-backups",
           created.store.runId,
-          "0-to-2",
+          "0-to-3",
           "events.jsonl",
         ),
         "utf8",

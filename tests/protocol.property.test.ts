@@ -275,6 +275,13 @@ describe("versioned protocol fixtures", () => {
     expect(events[0]?.data.graph).toEqual(graph);
     expect(reduceEvents(events)).toMatchObject({ status: "completed", lastEventSequence: 9 });
 
+    const portableCompletion = RunEventSchema.parse(
+      JSON.parse((await readFile(join(protocolFixtures, "events.v2.jsonl"), "utf8")).trim()),
+    );
+    verifyRunEvent(portableCompletion);
+    const mixedEvents = [...events.slice(0, -1), portableCompletion];
+    expect(reduceEvents(mixedEvents)).toMatchObject({ status: "completed", lastEventSequence: 9 });
+
     const reports = await Promise.all(
       [2, 3].map(async (version) =>
         BenchmarkReportSchema.parse(
@@ -290,13 +297,13 @@ describe("versioned protocol fixtures", () => {
     }
 
     const manifests = await Promise.all(
-      [1, 2].map(async (version) =>
+      [1, 2, 3].map(async (version) =>
         RunStorageManifestSchema.parse(
           await readJson(join(protocolFixtures, `storage-manifest.v${version}.json`)),
         ),
       ),
     );
-    expect(manifests.map(({ schemaVersion }) => schemaVersion)).toEqual([1, 2]);
+    expect(manifests.map(({ schemaVersion }) => schemaVersion)).toEqual([1, 2, 3]);
   });
 
   it("validates every checked-in signed-release storage fixture through current schemas", async () => {

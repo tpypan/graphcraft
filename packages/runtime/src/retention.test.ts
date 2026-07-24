@@ -110,14 +110,17 @@ async function setStateUpdatedAt(store: RunStore, updatedAt: string): Promise<vo
     .map((line) => RunEventSchema.parse(JSON.parse(line)));
   const previous = events.at(-1);
   if (!previous) throw new Error("Expected a terminal event");
-  events[events.length - 1] = createRunEvent({
-    sequence: previous.sequence,
-    timestamp: updatedAt,
-    actor: previous.actor,
-    causationId: previous.causationId,
-    type: previous.type,
-    data: previous.data,
-  });
+  events[events.length - 1] = createRunEvent(
+    {
+      sequence: previous.sequence,
+      timestamp: updatedAt,
+      actor: previous.actor,
+      causationId: previous.causationId,
+      type: previous.type,
+      data: previous.data,
+    },
+    store.canonicalHashAlgorithm,
+  );
   await writeFile(eventsPath, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`, {
     encoding: "utf8",
     mode: 0o600,
@@ -141,13 +144,16 @@ async function appendUnredactedLegacyBlock(store: RunStore, reason: string): Pro
   const previous = events.at(-1);
   if (!previous) throw new Error("Expected a terminal event");
   events.push(
-    createRunEvent({
-      sequence: previous.sequence + 1,
-      actor: "runtime",
-      causationId: store.runId,
-      type: "run.blocked",
-      data: { reason },
-    }),
+    createRunEvent(
+      {
+        sequence: previous.sequence + 1,
+        actor: "runtime",
+        causationId: store.runId,
+        type: "run.blocked",
+        data: { reason },
+      },
+      store.canonicalHashAlgorithm,
+    ),
   );
   await writeFile(eventsPath, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`, {
     encoding: "utf8",
@@ -768,10 +774,32 @@ describe("run-state retention", () => {
     const currentStorage = JSON.parse(await readFile(storagePath, "utf8")) as {
       formats: Record<string, number>;
     };
-    const formats = Object.fromEntries(
-      Object.entries(currentStorage.formats).filter(
-        ([key]) => key !== "artifactInventory" && key !== "artifactPolicy",
+    const formats = {
+      ...Object.fromEntries(
+        Object.entries(currentStorage.formats).filter(
+          ([key]) => key !== "artifactInventory" && key !== "artifactPolicy",
+        ),
       ),
+      events: 1,
+    };
+    const eventsPath = join(store.runRoot, "events.jsonl");
+    const legacyEvents = (await store.loadEvents()).map((event) =>
+      createRunEvent({
+        sequence: event.sequence,
+        timestamp: event.timestamp,
+        actor: event.actor,
+        causationId: event.causationId,
+        type: event.type,
+        data: event.data,
+      }),
+    );
+    await writeFile(
+      eventsPath,
+      `${legacyEvents.map((event) => JSON.stringify(event)).join("\n")}\n`,
+    );
+    await writeFile(
+      join(store.runRoot, "state.json"),
+      `${JSON.stringify(reduceEvents(legacyEvents), null, 2)}\n`,
     );
     await writeFile(
       storagePath,

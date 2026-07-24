@@ -94,14 +94,17 @@ async function setUpdatedAt(store: RunStore, updatedAt: string): Promise<void> {
     .map((line) => RunEventSchema.parse(JSON.parse(line)));
   const previous = events.at(-1);
   if (!previous) throw new Error("Expected a terminal event");
-  events[events.length - 1] = createRunEvent({
-    sequence: previous.sequence,
-    timestamp: updatedAt,
-    actor: previous.actor,
-    causationId: previous.causationId,
-    type: previous.type,
-    data: previous.data,
-  });
+  events[events.length - 1] = createRunEvent(
+    {
+      sequence: previous.sequence,
+      timestamp: updatedAt,
+      actor: previous.actor,
+      causationId: previous.causationId,
+      type: previous.type,
+      data: previous.data,
+    },
+    store.canonicalHashAlgorithm,
+  );
   await writeFile(eventsPath, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
   await writeFile(
     join(store.runRoot, "state.json"),
@@ -118,13 +121,16 @@ async function appendUnredactedLegacyBlock(store: RunStore, reason: string): Pro
   const previous = events.at(-1);
   if (!previous) throw new Error("Expected a terminal event");
   events.push(
-    createRunEvent({
-      sequence: previous.sequence + 1,
-      actor: "runtime",
-      causationId: store.runId,
-      type: "run.blocked",
-      data: { reason },
-    }),
+    createRunEvent(
+      {
+        sequence: previous.sequence + 1,
+        actor: "runtime",
+        causationId: store.runId,
+        type: "run.blocked",
+        data: { reason },
+      },
+      store.canonicalHashAlgorithm,
+    ),
   );
   await writeFile(eventsPath, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
   await writeFile(

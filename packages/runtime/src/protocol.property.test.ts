@@ -168,12 +168,12 @@ describe("generated migration properties", () => {
       const parsed = RunStorageManifestSchema.parse(
         JSON.parse(await readFile(join(fixture.runRoot, "storage.json"), "utf8")),
       );
-      expect(parsed.schemaVersion).toBe(2);
+      expect(parsed.schemaVersion).toBe(CURRENT_RUN_STORAGE_VERSION);
       const backupRoot = join(
         fixture.graphcraftRoot,
         "migration-backups",
         fixture.runId,
-        `${fixture.version}-to-2`,
+        `${fixture.version}-to-3`,
       );
       expect(await readFile(join(backupRoot, "events.jsonl"), "utf8")).toBe(`{"case":${seed}}\n`);
       expect(await readFile(fixture.artifactPath, "utf8")).toBe(

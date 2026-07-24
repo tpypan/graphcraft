@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 3,
+  "runId": "22222222-2222-4222-8222-222222222222",
+  "migratedFrom": 3,
+  "initialization": "ready",
+  "canonicalHashAlgorithm": "graphcraft-canonical-json-sha256-v2",
+  "formats": {
+    "contract": 1,
+    "graph": 1,
+    "probePlan": 1,
+    "heldOutProbes": 1,
+    "events": 2,
+    "state": 1,
+    "workspace": 1,
+    "capsules": 1,
+    "invocationEvents": 1,
+    "semanticReports": 1,
+    "rawArtifacts": 1,
+    "controlRequests": 1,
+    "locks": 1,
+    "artifactInventory": 1,
+    "artifactPolicy": 1
+  }
+}

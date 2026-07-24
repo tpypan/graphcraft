@@ -17,7 +17,14 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MAX_ARTIFACT_INVENTORY_BYTES, type ArtifactInventory } from "@graphcraft/core";
+import {
+  LEGACY_CANONICAL_HASH_ALGORITHM,
+  MAX_ARTIFACT_INVENTORY_BYTES,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
+  createRunEvent,
+  type ArtifactInventory,
+} from "@graphcraft/core";
+import { RunArtifactStore } from "./artifact-policy.ts";
 import { RunLock } from "./lock.ts";
 import {
   CURRENT_RUN_STORAGE_VERSION,
@@ -69,6 +76,12 @@ const v1Formats = {
   locks: 1,
 } as const;
 
+const v2Formats = {
+  ...v1Formats,
+  artifactInventory: 1,
+  artifactPolicy: 1,
+} as const;
+
 async function createLegacyFixture(runId: string, sourceVersion: 0 | 1): Promise<LegacyFixture> {
   const root = await mkdtemp(join(tmpdir(), "graphcraft-migration-v2-test-"));
   roots.push(root);
@@ -107,6 +120,22 @@ async function createLegacyFixture(runId: string, sourceVersion: 0 | 1): Promise
     await chmod(runRoot, 0o755);
   }
   return { graphcraftRoot, runRoot, runId, largeArtifact };
+}
+
+async function createV2Fixture(runId: string): Promise<LegacyFixture> {
+  const fixture = await createLegacyFixture(runId, 1);
+  await new RunArtifactStore(fixture.runRoot, fixture.runId).migrateLegacy();
+  await writeFile(
+    join(fixture.runRoot, "storage.json"),
+    `${JSON.stringify({
+      schemaVersion: 2,
+      runId: fixture.runId,
+      migratedFrom: 1,
+      formats: v2Formats,
+    })}\n`,
+    { mode: 0o600 },
+  );
+  return fixture;
 }
 
 function digest(value: Buffer): string {
@@ -234,9 +263,9 @@ async function migrationDurableSnapshot(fixture: LegacyFixture): Promise<{
 }> {
   const backupParent = join(fixture.graphcraftRoot, "migration-backups", fixture.runId);
   return {
-    backup: await optionalTreeSnapshot(join(backupParent, "1-to-2")),
+    backup: await optionalTreeSnapshot(join(backupParent, "1-to-3")),
     run: await treeSnapshot(fixture.runRoot),
-    temporary: await optionalTreeSnapshot(join(backupParent, ".1-to-2.tmp")),
+    temporary: await optionalTreeSnapshot(join(backupParent, ".1-to-3.tmp")),
   };
 }
 
@@ -273,7 +302,7 @@ function sampleLegacyRefreshFile(evidence: LegacySnapshotRefreshEvidence) {
   return entry;
 }
 
-describe("run storage schema v2 migration", () => {
+describe("run storage schema v3 migration", () => {
   it("keeps mirrored migration destination limits aligned with RunStore", () => {
     expect(LEGACY_MIGRATION_DESTINATION_LIMITS).toEqual({
       maximumEventBytes: RUN_EVENT_MAX_BYTES,
@@ -379,10 +408,10 @@ describe("run storage schema v2 migration", () => {
       migratedFrom: 0,
       formats: { artifactInventory: 1, artifactPolicy: 1 },
     });
-    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "0-to-2");
+    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "0-to-3");
     expect(await fileSnapshot(backupRoot)).toEqual(before);
     expect(await readdir(join(fixture.graphcraftRoot, "migration-backups", fixture.runId))).toEqual(
-      ["0-to-2"],
+      ["0-to-3"],
     );
 
     const artifactPath = join(fixture.runRoot, "artifacts", "logs", "large.log");
@@ -418,7 +447,7 @@ describe("run storage schema v2 migration", () => {
     expect(await treeSnapshot(fixture.graphcraftRoot)).toEqual(migrated);
   });
 
-  it("migrates validated v1 through a complete 1-to-2 backup and publishes v2 last", async () => {
+  it("migrates validated v1 through a complete 1-to-3 backup and publishes v3 last", async () => {
     const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000002", 1);
     const before = await fileSnapshot(fixture.runRoot);
     const input = {
@@ -433,8 +462,8 @@ describe("run storage schema v2 migration", () => {
     ]);
 
     expect(concurrent).toEqual(migrated);
-    expect(migrated).toMatchObject({ schemaVersion: 2, migratedFrom: 1 });
-    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "1-to-2");
+    expect(migrated).toMatchObject({ schemaVersion: 3, migratedFrom: 1 });
+    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "1-to-3");
     expect(await fileSnapshot(backupRoot)).toEqual(before);
     expect(JSON.parse(await readFile(join(backupRoot, "storage.json"), "utf8"))).toMatchObject({
       schemaVersion: 1,
@@ -443,10 +472,90 @@ describe("run storage schema v2 migration", () => {
     expect(await exists(join(backupRoot, "artifact-inventory.json"))).toBe(false);
     expect(JSON.parse(await readFile(join(fixture.runRoot, "storage.json"), "utf8"))).toMatchObject(
       {
-        schemaVersion: 2,
+        schemaVersion: 3,
         migratedFrom: 1,
-        formats: { artifactInventory: 1, artifactPolicy: 1 },
+        canonicalHashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM,
+        formats: { events: 1, artifactInventory: 1, artifactPolicy: 1 },
       },
+    );
+  });
+
+  it("concurrently migrates v2 through an exact 2-to-3 backup without rewriting durable payloads", async () => {
+    const fixture = await createV2Fixture("20000000-0000-4000-8000-000000000045");
+    const input = {
+      graphcraftRoot: fixture.graphcraftRoot,
+      runRoot: fixture.runRoot,
+      runId: fixture.runId,
+    };
+    const before = await fileSnapshot(fixture.runRoot);
+    const inventoryBefore = await readFile(join(fixture.runRoot, "artifact-inventory.json"));
+    const payloadsBefore = { ...before };
+    delete payloadsBefore["storage.json"];
+
+    const [migrated, concurrent] = await Promise.all([
+      ensureCurrentRunStorage(input),
+      ensureCurrentRunStorage(input),
+    ]);
+
+    expect(concurrent).toEqual(migrated);
+    expect(migrated).toMatchObject({
+      schemaVersion: 3,
+      runId: fixture.runId,
+      migratedFrom: 2,
+      canonicalHashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM,
+      formats: { events: 1, artifactInventory: 1, artifactPolicy: 1 },
+    });
+    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "2-to-3");
+    expect(await fileSnapshot(backupRoot)).toEqual(before);
+    expect(await readdir(join(fixture.graphcraftRoot, "migration-backups", fixture.runId))).toEqual(
+      ["2-to-3"],
+    );
+
+    const payloadsAfter = await fileSnapshot(fixture.runRoot);
+    delete payloadsAfter["storage.json"];
+    expect(payloadsAfter).toEqual(payloadsBefore);
+    expect(await readFile(join(fixture.runRoot, "artifact-inventory.json"))).toEqual(
+      inventoryBefore,
+    );
+    expect(await readFile(join(fixture.runRoot, "artifacts", "logs", "large.log"))).toEqual(
+      fixture.largeArtifact,
+    );
+
+    const stable = await treeSnapshot(fixture.graphcraftRoot);
+    expect(await ensureCurrentRunStorage(input)).toEqual(migrated);
+    expect(await treeSnapshot(fixture.graphcraftRoot)).toEqual(stable);
+  });
+
+  it("refuses to downgrade portable events when the v3 manifest is missing", async () => {
+    const fixture = await createV2Fixture("20000000-0000-4000-8000-000000000046");
+    const portableEvent = createRunEvent(
+      {
+        sequence: 1,
+        timestamp: "2026-07-24T00:00:00.000Z",
+        actor: "runtime",
+        causationId: fixture.runId,
+        type: "run.blocked",
+        data: { reason: "portable event must retain its manifest" },
+      },
+      PORTABLE_CANONICAL_HASH_ALGORITHM,
+    );
+    await writeFile(join(fixture.runRoot, "events.jsonl"), `${JSON.stringify(portableEvent)}\n`, {
+      mode: 0o600,
+    });
+    await rm(join(fixture.runRoot, "storage.json"));
+    const before = await treeSnapshot(fixture.graphcraftRoot);
+
+    await expect(
+      ensureCurrentRunStorage({
+        graphcraftRoot: fixture.graphcraftRoot,
+        runRoot: fixture.runRoot,
+        runId: fixture.runId,
+      }),
+    ).rejects.toThrow(/schema-v2 events without an intact schema-v3 storage manifest/);
+
+    expect(await treeSnapshot(fixture.graphcraftRoot)).toEqual(before);
+    expect(await exists(join(fixture.graphcraftRoot, "migration-backups", fixture.runId))).toBe(
+      false,
     );
   });
 
@@ -801,7 +910,7 @@ describe("run storage schema v2 migration", () => {
       ).rejects.toThrow(/changed after migration preflight|changed during backup copy/);
       expect(applied, mutation.name).toBe(true);
       expect(
-        await exists(join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "0-to-2")),
+        await exists(join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "0-to-3")),
         mutation.name,
       ).toBe(false);
       expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
@@ -860,7 +969,7 @@ describe("run storage schema v2 migration", () => {
       LEGACY_MIGRATION_DESTINATION_LIMITS.maximumWorkspaceBytes + 1,
       /workspace projection exceeds/,
     ],
-  ])("refuses legacy %s beyond the v2 destination cap", async (_label, path, bytes, error) => {
+  ])("refuses legacy %s beyond the current destination cap", async (_label, path, bytes, error) => {
     const suffix = String(31 + roots.length).padStart(12, "0");
     const fixture = await createLegacyFixture(`20000000-0000-4000-8000-${suffix}`, 0);
     const target = join(fixture.runRoot, path);
@@ -889,7 +998,7 @@ describe("run storage schema v2 migration", () => {
       "locks",
       `${fixture.runId}.migration.lock`,
     );
-    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "1-to-2");
+    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "1-to-3");
     const writerLock = new RunLock(runLockPath);
     await writerLock.acquire();
     const migrating = ensureCurrentRunStorage({
@@ -907,7 +1016,7 @@ describe("run storage schema v2 migration", () => {
       await writerLock.release();
     }
 
-    await expect(migrating).resolves.toMatchObject({ schemaVersion: 2, migratedFrom: 1 });
+    await expect(migrating).resolves.toMatchObject({ schemaVersion: 3, migratedFrom: 1 });
     expect(await readFile(join(backupRoot, "events.jsonl"), "utf8")).toContain(
       '{"writer":"final"}',
     );
@@ -935,8 +1044,8 @@ describe("run storage schema v2 migration", () => {
         "small matrix artifact\n",
       );
       const legacySnapshot = await fileSnapshot(fixture.runRoot);
-      const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "1-to-2");
-      const temporaryRoot = join(dirname(backupRoot), ".1-to-2.tmp");
+      const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "1-to-3");
+      const temporaryRoot = join(dirname(backupRoot), ".1-to-3.tmp");
       const inventoryPath = join(fixture.runRoot, "artifact-inventory.json");
       const paths = outerLockPaths(fixture);
       const controllers = {
@@ -1009,7 +1118,7 @@ describe("run storage schema v2 migration", () => {
           runRoot: fixture.runRoot,
           runId: fixture.runId,
         }),
-      ).resolves.toMatchObject({ schemaVersion: 2, migratedFrom: 1 });
+      ).resolves.toMatchObject({ schemaVersion: 3, migratedFrom: 1 });
       expect(await exists(temporaryRoot)).toBe(false);
       expect(await fileSnapshot(backupRoot)).toEqual(legacySnapshot);
       expect(await exists(join(backupRoot, "artifact-inventory.json"))).toBe(false);
@@ -1079,7 +1188,7 @@ describe("run storage schema v2 migration", () => {
           runRoot: fixture.runRoot,
           runId: fixture.runId,
         }),
-      ).resolves.toMatchObject({ schemaVersion: 2, migratedFrom: 1 });
+      ).resolves.toMatchObject({ schemaVersion: 3, migratedFrom: 1 });
     },
     migrationFaultTestTimeout,
   );
@@ -1092,8 +1201,8 @@ describe("run storage schema v2 migration", () => {
       const firstChunk = fixture.largeArtifact.subarray(0, 64 * 1024);
       const legacySnapshot = await fileSnapshot(fixture.runRoot);
       const backupParent = join(fixture.graphcraftRoot, "migration-backups", fixture.runId);
-      const backupRoot = join(backupParent, "1-to-2");
-      const temporaryRoot = join(backupParent, ".1-to-2.tmp");
+      const backupRoot = join(backupParent, "1-to-3");
+      const temporaryRoot = join(backupParent, ".1-to-3.tmp");
       const temporaryArtifact = join(temporaryRoot, "artifacts", "logs", "large.log");
       const paths = outerLockPaths(fixture);
       const migrationLoss = new AbortController();
@@ -1157,7 +1266,7 @@ describe("run storage schema v2 migration", () => {
           runRoot: fixture.runRoot,
           runId: fixture.runId,
         }),
-      ).resolves.toMatchObject({ schemaVersion: 2, migratedFrom: 1 });
+      ).resolves.toMatchObject({ schemaVersion: 3, migratedFrom: 1 });
       expect(await exists(temporaryRoot)).toBe(false);
       expect(await fileSnapshot(backupRoot)).toEqual(legacySnapshot);
       expect(await readFile(join(backupRoot, relative(fixture.runRoot, sourcePath)))).toEqual(
@@ -1230,7 +1339,7 @@ describe("run storage schema v2 migration", () => {
           runRoot: fixture.runRoot,
           runId: fixture.runId,
         }),
-      ).resolves.toMatchObject({ schemaVersion: 2, migratedFrom: 1 });
+      ).resolves.toMatchObject({ schemaVersion: 3, migratedFrom: 1 });
     },
     migrationFaultTestTimeout,
   );
@@ -1280,7 +1389,7 @@ describe("run storage schema v2 migration", () => {
       expect(
         JSON.parse(await readFile(join(fixture.runRoot, "storage.json"), "utf8")),
       ).toMatchObject({
-        schemaVersion: 2,
+        schemaVersion: 3,
         migratedFrom: 1,
       });
       await expect(
@@ -1289,12 +1398,12 @@ describe("run storage schema v2 migration", () => {
           runRoot: fixture.runRoot,
           runId: fixture.runId,
         }),
-      ).resolves.toMatchObject({ schemaVersion: 2, migratedFrom: 1 });
+      ).resolves.toMatchObject({ schemaVersion: 3, migratedFrom: 1 });
     },
     migrationFaultTestTimeout,
   );
 
-  it("publishes the v2 manifest last and safely retries an interrupted migration", async () => {
+  it("publishes the v3 manifest last and safely retries an interrupted migration", async () => {
     const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000008", 1);
     const input = {
       graphcraftRoot: fixture.graphcraftRoot,
@@ -1332,24 +1441,24 @@ describe("run storage schema v2 migration", () => {
     );
 
     await expect(ensureCurrentRunStorage(input)).resolves.toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 3,
       migratedFrom: 1,
     });
     expect(
       await fileSnapshot(
-        join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "1-to-2"),
+        join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "1-to-3"),
       ),
     ).not.toHaveProperty("artifact-inventory.json");
   });
 
-  it("publishes a complete reusable backup before any v2 run projection", async () => {
+  it("publishes a complete reusable backup before any v3 run projection", async () => {
     const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000022", 1);
     const input = {
       graphcraftRoot: fixture.graphcraftRoot,
       runRoot: fixture.runRoot,
       runId: fixture.runId,
     };
-    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "1-to-2");
+    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "1-to-3");
     let observedBoundary = false;
 
     await expect(
@@ -1372,7 +1481,7 @@ describe("run storage schema v2 migration", () => {
     expect(observedBoundary).toBe(true);
     expect(await exists(join(backupRoot, ".backup-complete.json"))).toBe(true);
     await expect(ensureCurrentRunStorage(input)).resolves.toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 3,
       migratedFrom: 1,
     });
   });
@@ -1405,11 +1514,11 @@ describe("run storage schema v2 migration", () => {
       { schemaVersion: 1 },
     );
     expect(
-      await exists(join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "1-to-2")),
+      await exists(join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "1-to-3")),
     ).toBe(true);
 
     await expect(ensureCurrentRunStorage(input)).resolves.toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 3,
       migratedFrom: 1,
     });
   });
@@ -1433,12 +1542,12 @@ describe("run storage schema v2 migration", () => {
       runRoot: fixture.runRoot,
       runId: fixture.runId,
     };
-    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "1-to-2");
+    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "1-to-3");
     const staleBackupRoot = join(
       fixture.graphcraftRoot,
       "migration-backups",
       fixture.runId,
-      "1-to-2.stale",
+      "1-to-3.stale",
     );
 
     await expect(
@@ -1470,7 +1579,7 @@ describe("run storage schema v2 migration", () => {
     await rename(backupRoot, staleBackupRoot);
     await rm(join(fixture.runRoot, "artifact-inventory.json"));
     await expect(ensureCurrentRunStorage(input)).resolves.toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 3,
       migratedFrom: 1,
     });
     expect(await readFile(join(backupRoot, "events.jsonl"), "utf8")).toContain(
@@ -1499,7 +1608,7 @@ describe("run storage schema v2 migration", () => {
     expect(await exists(join(fixture.graphcraftRoot, "migration-backups"))).toBe(false);
   });
 
-  it("refuses an oversized current-v2 artifact inventory without reconstructing it", async () => {
+  it("refuses an oversized current-v3 artifact inventory without reconstructing it", async () => {
     const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000024", 0);
     const input = {
       graphcraftRoot: fixture.graphcraftRoot,
@@ -1514,7 +1623,7 @@ describe("run storage schema v2 migration", () => {
 
     await expect(ensureCurrentRunStorage(input)).rejects.toThrow(
       new RegExp(
-        `invalid schema-v2 artifact inventory.*${MAX_ARTIFACT_INVENTORY_BYTES}-byte read limit`,
+        `invalid schema-v3 artifact inventory.*${MAX_ARTIFACT_INVENTORY_BYTES}-byte read limit`,
       ),
     );
 
@@ -1524,7 +1633,7 @@ describe("run storage schema v2 migration", () => {
 
   it("refuses an oversized backup completion marker without trusting the backup", async () => {
     const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000025", 0);
-    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "0-to-2");
+    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "0-to-3");
     const completionPath = join(backupRoot, ".backup-complete.json");
     await mkdir(backupRoot, { recursive: true });
     await writeFile(completionPath, "{");
@@ -1543,7 +1652,7 @@ describe("run storage schema v2 migration", () => {
     expect(await exists(join(fixture.runRoot, "artifact-inventory.json"))).toBe(false);
   });
 
-  it("accepts a current v2 manifest without changing the owned tree", async () => {
+  it("accepts a current v3 manifest without changing the owned tree", async () => {
     const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000003", 0);
     const input = {
       graphcraftRoot: fixture.graphcraftRoot,
@@ -1594,7 +1703,7 @@ describe("run storage schema v2 migration", () => {
     expect(await readFile(outsideEvents, "utf8")).toBe(before);
   });
 
-  it("fails closed on a corrupt current-v2 inventory without reconstructing it", async () => {
+  it("fails closed on a corrupt current-v3 inventory without reconstructing it", async () => {
     const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000006", 0);
     const input = {
       graphcraftRoot: fixture.graphcraftRoot,
@@ -1606,7 +1715,7 @@ describe("run storage schema v2 migration", () => {
     const before = await treeSnapshot(fixture.graphcraftRoot);
 
     await expect(ensureCurrentRunStorage(input)).rejects.toThrow(
-      /invalid schema-v2 artifact inventory/,
+      /invalid schema-v3 artifact inventory/,
     );
 
     expect(await treeSnapshot(fixture.graphcraftRoot)).toEqual(before);
@@ -1614,7 +1723,7 @@ describe("run storage schema v2 migration", () => {
 
   it("refuses a preseeded backup directory without a valid completion marker and digest", async () => {
     const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000005", 0);
-    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "0-to-2");
+    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "0-to-3");
     await mkdir(backupRoot, { recursive: true });
     await writeFile(join(backupRoot, "untrusted.txt"), "not a complete backup\n");
     const before = await treeSnapshot(fixture.runRoot);
@@ -1634,7 +1743,7 @@ describe("run storage schema v2 migration", () => {
 
   it("allows the same store to retry storage preparation after a repairable failure", async () => {
     const fixture = await createLegacyFixture("20000000-0000-4000-8000-000000000009", 0);
-    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "0-to-2");
+    const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "0-to-3");
     await mkdir(backupRoot, { recursive: true });
     await writeFile(join(backupRoot, "incomplete.txt"), "repairable test fixture\n");
     const store = new RunStore(dirname(fixture.graphcraftRoot), fixture.runId);
@@ -1644,7 +1753,7 @@ describe("run storage schema v2 migration", () => {
 
     await expect(store.prepareStorage()).resolves.toBeUndefined();
     expect(JSON.parse(await readFile(join(fixture.runRoot, "storage.json"), "utf8"))).toMatchObject(
-      { schemaVersion: 2, migratedFrom: 0 },
+      { schemaVersion: 3, migratedFrom: 0 },
     );
   });
 
