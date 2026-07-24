@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "kind": "graphcraft-host-protocol-fixture",
+  "host": "codex",
+  "profileId": "codex-cli@0.144.6",
+  "reportedVersion": "codex-cli 0.144.6",
+  "sessionPlaceholder": "00000000-0000-4000-8000-000000000144",
+  "provenance": {
+    "kind": "synthetic-contract",
+    "liveCapture": false,
+    "basis": "Graphcraft adapter parser and opt-in live qualification protocol contract",
+    "sanitization": "Deterministic placeholder identifiers and repository-relative fixture paths; no user or repository content"
+  },
+  "acceptance": {
+    "qualifiesVersion": false,
+    "mayUpdateAdmission": false
+  },
+  "captures": {
+    "version": "version.txt",
+    "interruptedWorker": "worker-interrupted.jsonl",
+    "resumedWorker": "worker-resumed.jsonl"
+  },
+  "integrity": {
+    "algorithm": "sha256",
+    "files": {
+      "version.txt": "2e68595e1b0647a2fadf9e6e7e1fb7f9a60cce7283052ada0bfece1257dda6f2",
+      "worker-interrupted.jsonl": "5a30337fc15f34f520e5b2576e8a07b206c17ce107f7c87ee47d39e6fffd75e3",
+      "worker-resumed.jsonl": "bc150357fe624ef4433a9fb32ef235374cb01ab943b4c40c51c4f8f4ee955c4f"
+    }
+  },
+  "expected": {
+    "normalizedUsage": {
+      "input": 120,
+      "cachedInput": 40,
+      "uncachedInput": 80,
+      "output": 18,
+      "reasoning": 0,
+      "total": 138
+    },
+    "resultStatus": "completed"
+  }
+}

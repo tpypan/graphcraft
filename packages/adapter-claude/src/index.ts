@@ -395,14 +395,20 @@ export class ClaudeAdapter implements HostAdapter {
       (resolve) =>
         child.once("close", (code, closeSignal) => resolve({ code, signal: closeSignal })),
     );
-    const terminationController = new ChildTerminationController(child, signal);
+    const protocolAbort = new AbortController();
+    const executionSignal = AbortSignal.any([signal, protocolAbort.signal]);
+    const terminationController = new ChildTerminationController(child, executionSignal);
     let protocolExceededLimit = false;
     let structuredExceededLimit = false;
     let finalResult: ReturnType<typeof WorkerResultSchema.parse> | undefined;
     let observedSessionId: string | undefined;
+    let sessionIdentityFailure: "different" | "missing" | undefined;
+    const expectedSessionId = request.resumeSessionId ?? request.invocationId;
     let sessionReported = false;
     const stderr = captureStderr(child.stderr);
-    const protocolLines = readBoundedProtocolLines(child.stdout, signal)[Symbol.asyncIterator]();
+    const protocolLines = readBoundedProtocolLines(child.stdout, executionSignal)[
+      Symbol.asyncIterator
+    ]();
     let nextProtocolLine = protocolLines.next();
 
     yield { type: "started", invocationId: request.invocationId };
@@ -424,8 +430,28 @@ export class ClaudeAdapter implements HostAdapter {
         } catch {
           continue;
         }
+        if (signal.aborted || sessionIdentityFailure) continue;
         const type = String(event.type ?? "");
-        if (typeof event.session_id === "string") observedSessionId = event.session_id;
+        const eventSessionId = typeof event.session_id === "string" ? event.session_id : undefined;
+        const identityFailure =
+          eventSessionId && eventSessionId !== expectedSessionId
+            ? "different"
+            : (type === "assistant" || type === "result") && !eventSessionId
+              ? "missing"
+              : undefined;
+        if (identityFailure) {
+          sessionIdentityFailure = identityFailure;
+          protocolAbort.abort({
+            cause: "cancellation",
+            reason:
+              identityFailure === "different"
+                ? "Claude worker reported a different session identity"
+                : "Claude worker output omitted its session identity",
+          });
+          continue;
+        }
+        if (eventSessionId) observedSessionId = eventSessionId;
+        if (request.resumeSessionId && !observedSessionId) continue;
         if (!sessionReported && observedSessionId && (type === "assistant" || type === "result")) {
           sessionReported = true;
           yield { type: "session", hostSessionId: observedSessionId };
@@ -454,7 +480,15 @@ export class ClaudeAdapter implements HostAdapter {
 
       const exit = await terminationController.waitForExit(exitPromise);
       const termination = terminationController.finish(exit.code, exit.signal);
-      if (termination) {
+      if (sessionIdentityFailure) {
+        yield {
+          type: "error",
+          message:
+            sessionIdentityFailure === "different"
+              ? `Claude ${request.resumeSessionId ? "resumed " : ""}worker reported a different session identity; result was rejected`
+              : `Claude ${request.resumeSessionId ? "resumed " : ""}worker output omitted its session identity; result was rejected`,
+        };
+      } else if (termination) {
         yield { type: "terminated", termination };
       } else if (protocolExceededLimit) {
         yield { type: "error", message: protocolLineLimitError("Claude").message };
@@ -463,7 +497,19 @@ export class ClaudeAdapter implements HostAdapter {
           type: "error",
           message: structuredOutputLimitError("Claude", "structured result").message,
         };
-      } else if (exit.code !== 0 || !finalResult) {
+      } else if (exit.code !== 0) {
+        yield {
+          type: "error",
+          message:
+            stderr.text().trim() || `Claude exited ${exit.code} without a valid structured result`,
+          cause: "host_crash",
+        };
+      } else if (!observedSessionId) {
+        yield {
+          type: "error",
+          message: `Claude ${request.resumeSessionId ? "resumed " : ""}worker did not report its session identity; result was rejected`,
+        };
+      } else if (!finalResult) {
         yield {
           type: "error",
           message:

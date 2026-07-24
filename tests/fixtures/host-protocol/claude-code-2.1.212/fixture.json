@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "kind": "graphcraft-host-protocol-fixture",
+  "host": "claude",
+  "profileId": "claude-code@2.1.212",
+  "reportedVersion": "2.1.212 (Claude Code)",
+  "sessionPlaceholder": "00000000-0000-4000-8000-000000002121",
+  "provenance": {
+    "kind": "synthetic-contract",
+    "liveCapture": false,
+    "basis": "Graphcraft adapter parser and opt-in live qualification protocol contract",
+    "sanitization": "Deterministic placeholder identifiers and repository-relative fixture paths; no user or repository content"
+  },
+  "acceptance": {
+    "qualifiesVersion": false,
+    "mayUpdateAdmission": false
+  },
+  "captures": {
+    "version": "version.txt",
+    "interruptedWorker": "worker-interrupted.jsonl",
+    "resumedWorker": "worker-resumed.jsonl"
+  },
+  "integrity": {
+    "algorithm": "sha256",
+    "files": {
+      "version.txt": "0e431af7cba34fdb4b31af93a3a5e4156b614f6d9e4496ca372cd4734dd7b63a",
+      "worker-interrupted.jsonl": "ce637d28595e95ccc1a1922565e80e505804585b799a05ac4e892c0a7efea1d0",
+      "worker-resumed.jsonl": "9712c203711ed2e4d916d657ce0896c12c1fc74801063820a26bb23213676169"
+    }
+  },
+  "expected": {
+    "normalizedUsage": {
+      "input": 65,
+      "cachedInput": 30,
+      "uncachedInput": 35,
+      "output": 12,
+      "reasoning": 0,
+      "total": 77
+    },
+    "resultStatus": "completed"
+  }
+}

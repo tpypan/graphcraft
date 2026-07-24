@@ -167,6 +167,20 @@ function claudeStructuredEvent(value: unknown, sessionId?: string): string {
   });
 }
 
+function boundWorkerProtocol(
+  fixture: AdapterFixture,
+  request: WorkerRequest,
+  value: unknown,
+): string {
+  const sessionId =
+    fixture.host === "Codex" ? "00000000-0000-4000-8000-000000000001" : request.invocationId;
+  const sessionEvent =
+    fixture.host === "Codex"
+      ? `${JSON.stringify({ type: "thread.started", thread_id: sessionId })}\n`
+      : "";
+  return `${sessionEvent}${fixture.structuredEvent(value, sessionId)}\n`;
+}
+
 type AdapterFixture = {
   host: "Codex" | "Claude";
   adapter: CodexAdapter | ClaudeAdapter;
@@ -959,12 +973,12 @@ describe("bounded adapter streams", () => {
       changedPaths: [],
       evidence: ["focused adapter evidence"],
     };
-    for (const { adapter, structuredEvent } of adapters()) {
+    for (const fixture of adapters()) {
+      const { adapter } = fixture;
+      const request = workerRequest();
       queueReadyCapabilityProbe(adapter.id);
-      queueChild({ stdout: `${structuredEvent(JSON.stringify(result))}\n` });
-      const events = await collectEvents(
-        adapter.execute(workerRequest(), new AbortController().signal),
-      );
+      queueChild({ stdout: boundWorkerProtocol(fixture, request, JSON.stringify(result)) });
+      const events = await collectEvents(adapter.execute(request, new AbortController().signal));
       expect(events.at(-1)).toEqual({ type: "result", result });
     }
   });
@@ -976,11 +990,13 @@ describe("bounded adapter streams", () => {
       changedPaths: [],
       evidence: ["fast structured result"],
     };
-    for (const { adapter, structuredEvent } of adapters()) {
+    for (const fixture of adapters()) {
+      const { adapter } = fixture;
+      const request = workerRequest();
       queueReadyCapabilityProbe(adapter.id);
-      queueChild({ stdout: `${structuredEvent(JSON.stringify(result))}\n` });
+      queueChild({ stdout: boundWorkerProtocol(fixture, request, JSON.stringify(result)) });
       const iterator = adapter
-        .execute(workerRequest(), new AbortController().signal)
+        .execute(request, new AbortController().signal)
         [Symbol.asyncIterator]();
 
       await expect(iterator.next()).resolves.toEqual({

@@ -441,15 +441,21 @@ export class CodexAdapter implements HostAdapter {
       (resolve) =>
         child.once("close", (code, closeSignal) => resolve({ code, signal: closeSignal })),
     );
-    const terminationController = new ChildTerminationController(child, signal);
+    const protocolAbort = new AbortController();
+    const executionSignal = AbortSignal.any([signal, protocolAbort.signal]);
+    const terminationController = new ChildTerminationController(child, executionSignal);
     child.stdin.end(renderWorkerPrompt(request.capsule, request.authorityBoundary));
     let lastMessage = "";
     let lastMessageExceededLimit = false;
     let protocolExceededLimit = false;
     let observedSessionId: string | undefined;
+    let expectedSessionId = request.resumeSessionId;
+    let sessionIdentityMismatch = false;
     let sessionReported = false;
     const stderr = captureStderr(child.stderr);
-    const protocolLines = readBoundedProtocolLines(child.stdout, signal)[Symbol.asyncIterator]();
+    const protocolLines = readBoundedProtocolLines(child.stdout, executionSignal)[
+      Symbol.asyncIterator
+    ]();
     let nextProtocolLine = protocolLines.next();
 
     yield { type: "started", invocationId: request.invocationId };
@@ -471,10 +477,22 @@ export class CodexAdapter implements HostAdapter {
         } catch {
           continue;
         }
+        if (signal.aborted || sessionIdentityMismatch) continue;
         const type = String(event.type ?? "");
         const item = event.item as Record<string, unknown> | undefined;
-        if (type === "thread.started" && typeof event.thread_id === "string")
+        if (type === "thread.started" && typeof event.thread_id === "string") {
+          expectedSessionId ??= event.thread_id;
+          if (event.thread_id !== expectedSessionId) {
+            sessionIdentityMismatch = true;
+            protocolAbort.abort({
+              cause: "cancellation",
+              reason: "Codex worker reported a different thread identity",
+            });
+            continue;
+          }
           observedSessionId = event.thread_id;
+        }
+        if (!observedSessionId) continue;
         if (!sessionReported && observedSessionId && type.startsWith("item.")) {
           sessionReported = true;
           yield { type: "session", hostSessionId: observedSessionId };
@@ -500,6 +518,13 @@ export class CodexAdapter implements HostAdapter {
 
       const exit = await terminationController.waitForExit(exitPromise);
       const termination = terminationController.finish(exit.code, exit.signal);
+      if (sessionIdentityMismatch) {
+        yield {
+          type: "error",
+          message: `Codex ${request.resumeSessionId ? "resumed " : ""}worker reported a different thread identity; result was rejected`,
+        };
+        return;
+      }
       if (termination) {
         yield { type: "terminated", termination };
         return;
@@ -515,8 +540,24 @@ export class CodexAdapter implements HostAdapter {
         };
         return;
       }
+      if (exit.code !== 0) {
+        yield {
+          type: "error",
+          message:
+            stderr.text().trim() || `Codex exited ${exit.code} without a valid structured result`,
+          cause: "host_crash",
+        };
+        return;
+      }
+      if (!observedSessionId) {
+        yield {
+          type: "error",
+          message: `Codex ${request.resumeSessionId ? "resumed " : ""}worker did not report its thread identity; result was rejected`,
+        };
+        return;
+      }
       const result = parseJsonResult(lastMessage);
-      if (exit.code !== 0 || !result) {
+      if (!result) {
         yield {
           type: "error",
           message:
