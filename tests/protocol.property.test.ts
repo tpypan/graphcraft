@@ -311,6 +311,7 @@ describe("versioned protocol fixtures", () => {
         governanceControlIdentities: 1,
         repositorySideEffectIdentities: 1,
         githubMutationLifecycleIdentities: 1,
+        retentionJournalIdentities: 1,
       },
     });
   });

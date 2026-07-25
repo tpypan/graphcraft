@@ -159,6 +159,9 @@ describe("generated migration properties", () => {
         schemaVersion: CURRENT_RUN_STORAGE_VERSION,
         runId: fixture.runId,
         migratedFrom: fixture.version,
+        formats: {
+          retentionJournalIdentities: 1,
+        },
       });
       const afterMigration = await byteSnapshot(fixture.runRoot);
       expect(await ensureCurrentRunStorage(input)).toEqual(first);
@@ -169,6 +172,11 @@ describe("generated migration properties", () => {
         JSON.parse(await readFile(join(fixture.runRoot, "storage.json"), "utf8")),
       );
       expect(parsed.schemaVersion).toBe(CURRENT_RUN_STORAGE_VERSION);
+      expect(parsed).toMatchObject({
+        formats: {
+          retentionJournalIdentities: 1,
+        },
+      });
       const backupRoot = join(
         fixture.graphcraftRoot,
         "migration-backups",

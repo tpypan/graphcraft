@@ -1339,6 +1339,9 @@ export const RunStorageManifestSchema = z.union([
       // GitHub snapshots, lifecycle signatures, and mutation journal identities
       // also predate an independent selector. Omission preserves their v1 domain.
       githubMutationLifecycleIdentities: z.union([z.literal(1), z.literal(2)]).default(1),
+      // Retention plans and journals also predate an independent identity
+      // selector. Omission preserves their legacy v1 identity domain.
+      retentionJournalIdentities: z.union([z.literal(1), z.literal(2)]).default(1),
     }),
   }),
 ]);

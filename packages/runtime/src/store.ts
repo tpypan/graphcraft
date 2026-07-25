@@ -100,7 +100,8 @@ export class RunStoreEventLogCorruptionError extends Error {
       | "checkpoint"
       | "governance"
       | "repository_side_effect"
-      | "github_mutation_lifecycle",
+      | "github_mutation_lifecycle"
+      | "retention_journal",
   ) {
     const location = trailing ? "trailing record" : `record ${record}`;
     const problem =
@@ -124,7 +125,9 @@ export class RunStoreEventLogCorruptionError extends Error {
                         ? "a repository side-effect identity format that disagrees with its storage manifest"
                         : reason === "github_mutation_lifecycle"
                           ? "a GitHub mutation-lifecycle identity format that disagrees with its storage manifest"
-                          : "an invalid event sequence";
+                          : reason === "retention_journal"
+                            ? "a retention-journal identity format that disagrees with its storage manifest"
+                            : "an invalid event sequence";
     super(
       `Run event log has ${problem} in ${location} at byte ${offsetBytes}; event log bytes were left unchanged`,
     );
@@ -252,6 +255,15 @@ function githubMutationLifecycleIdentityUsesDifferentFormat(
   return selected === PORTABLE_CANONICAL_HASH_ALGORITHM ? format !== 2 : format !== undefined;
 }
 
+function retentionJournalIdentityUsesDifferentFormat(
+  event: RunEvent,
+  selected: CanonicalHashAlgorithm,
+): boolean {
+  if (event.type !== "run.created") return false;
+  const format = event.data.retentionJournalIdentityFormat;
+  return selected === PORTABLE_CANONICAL_HASH_ALGORITHM ? format !== 2 : format !== undefined;
+}
+
 export class RunStore {
   readonly repositoryRoot: string;
   readonly runId: string;
@@ -270,6 +282,7 @@ export class RunStore {
   private _governanceControlIdentityHashAlgorithm: CanonicalHashAlgorithm | undefined;
   private _repositorySideEffectIdentityHashAlgorithm: CanonicalHashAlgorithm | undefined;
   private _githubMutationLifecycleIdentityHashAlgorithm: CanonicalHashAlgorithm | undefined;
+  private _retentionJournalIdentityHashAlgorithm: CanonicalHashAlgorithm | undefined;
 
   constructor(
     repositoryRoot: string,
@@ -354,6 +367,11 @@ export class RunStore {
       this.bindGithubMutationLifecycleIdentityHashAlgorithm(
         githubMutationLifecycleIdentityHashAlgorithm,
       );
+      const retentionJournalIdentityHashAlgorithm =
+        manifest.formats.retentionJournalIdentities === 2
+          ? PORTABLE_CANONICAL_HASH_ALGORITHM
+          : LEGACY_CANONICAL_HASH_ALGORITHM;
+      this.bindRetentionJournalIdentityHashAlgorithm(retentionJournalIdentityHashAlgorithm);
       await this.validateStorageRoot();
     } catch (error) {
       if (this.storageReady === ready) this.storageReady = undefined;
@@ -417,6 +435,14 @@ export class RunStore {
     return this._githubMutationLifecycleIdentityHashAlgorithm;
   }
 
+  get retentionJournalIdentityHashAlgorithm(): CanonicalHashAlgorithm {
+    if (!this._retentionJournalIdentityHashAlgorithm)
+      throw new Error(
+        "Retention-journal identity hash policy is unavailable before run storage is prepared",
+      );
+    return this._retentionJournalIdentityHashAlgorithm;
+  }
+
   private bindArtifactHashAlgorithm(algorithm: CanonicalHashAlgorithm): void {
     if (this.artifactStore && this.artifactStore.hashAlgorithm !== algorithm)
       throw new Error("Artifact store was bound before its storage manifest policy was known");
@@ -475,6 +501,17 @@ export class RunStore {
         "GitHub mutation-lifecycle identity hashing was bound before its storage manifest policy was known",
       );
     this._githubMutationLifecycleIdentityHashAlgorithm = algorithm;
+  }
+
+  private bindRetentionJournalIdentityHashAlgorithm(algorithm: CanonicalHashAlgorithm): void {
+    if (
+      this._retentionJournalIdentityHashAlgorithm &&
+      this._retentionJournalIdentityHashAlgorithm !== algorithm
+    )
+      throw new Error(
+        "Retention-journal identity hashing was bound before its storage manifest policy was known",
+      );
+    this._retentionJournalIdentityHashAlgorithm = algorithm;
   }
 
   private artifacts(): RunArtifactStore {
@@ -570,6 +607,7 @@ export class RunStore {
     store.bindGovernanceControlIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     store.bindRepositorySideEffectIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     store.bindGithubMutationLifecycleIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    store.bindRetentionJournalIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     const persistedContract = RunContractSchema.parse(redactValue(contract));
     const persistedGraph = GraphSchema.parse(redactValue(graph));
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
@@ -610,6 +648,7 @@ export class RunStore {
           governanceControlIdentityFormat: 2,
           repositorySideEffectIdentityFormat: 2,
           githubMutationLifecycleIdentityFormat: 2,
+          retentionJournalIdentityFormat: 2,
         },
       },
       store.canonicalHashAlgorithm,
@@ -1002,6 +1041,13 @@ export class RunStore {
           trailing,
           "github_mutation_lifecycle",
         );
+      if (
+        retentionJournalIdentityUsesDifferentFormat(
+          event,
+          this.retentionJournalIdentityHashAlgorithm,
+        )
+      )
+        throw new RunStoreEventLogCorruptionError(record, offset, trailing, "retention_journal");
       const scopeSnapshot = eventWorkspaceScopeSnapshot(event);
       if (
         scopeSnapshot !== undefined &&

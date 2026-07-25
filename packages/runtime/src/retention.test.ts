@@ -19,10 +19,13 @@ import { dirname, join, relative } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  LEGACY_CANONICAL_HASH_ALGORITHM,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
   RunStorageManifestSchema,
   RunEventSchema,
   compileGraph,
   compileRunContract,
+  contentHash,
   createRunEvent,
   reduceEvents,
   type RunContract,
@@ -35,6 +38,7 @@ import {
   planCompletedRunPrune,
   planRunRetention,
   type RunRetentionFaultBoundary,
+  type RunRetentionPlan,
 } from "./retention.ts";
 import { createRunWorkspace, type RunWorkspace } from "./repository.ts";
 import { RunStore } from "./store.ts";
@@ -70,7 +74,7 @@ async function createRepository(): Promise<{ root: string; repository: string }>
 
 async function createCompletedRun(
   repository: string,
-  input: { runId?: string; realWorktree?: boolean } = {},
+  input: { runId?: string; realWorktree?: boolean; nodeIds?: string[] } = {},
 ): Promise<{ store: RunStore; contract: RunContract; workspace: RunWorkspace }> {
   const compiled = compileRunContract(
     `Retain a durable fixture ${input.runId ?? randomUUID()}`,
@@ -100,7 +104,67 @@ async function createCompletedRun(
   }
   await store.writeWorkspace(workspace);
   await store.append("runtime", "run.completed", { workspace });
+  if (input.nodeIds) {
+    const events = await store.loadEvents();
+    const created = events[0];
+    if (!created || created.type !== "run.created")
+      throw new Error("Expected a run.created retention fixture event");
+    events[0] = createRunEvent(
+      {
+        sequence: created.sequence,
+        timestamp: created.timestamp,
+        actor: created.actor,
+        causationId: created.causationId,
+        type: created.type,
+        data: { ...created.data, nodeIds: input.nodeIds },
+      },
+      store.canonicalHashAlgorithm,
+    );
+    await writeFile(
+      join(store.runRoot, "events.jsonl"),
+      `${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+    );
+    await writeFile(
+      join(store.runRoot, "state.json"),
+      `${JSON.stringify(reduceEvents(events), null, 2)}\n`,
+    );
+  }
   return { store, contract, workspace };
+}
+
+async function selectRetentionIdentityFormat(store: RunStore, format: 1 | 2): Promise<void> {
+  const storagePath = join(store.runRoot, "storage.json");
+  const storage = JSON.parse(await readFile(storagePath, "utf8")) as {
+    formats: { retentionJournalIdentities?: number };
+  };
+  if (format === 1) delete storage.formats.retentionJournalIdentities;
+  else storage.formats.retentionJournalIdentities = 2;
+
+  const eventsPath = join(store.runRoot, "events.jsonl");
+  const events = (await readFile(eventsPath, "utf8"))
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => RunEventSchema.parse(JSON.parse(line)));
+  const created = events[0];
+  if (!created || created.type !== "run.created")
+    throw new Error("Expected a run.created retention fixture event");
+  const data = { ...created.data };
+  delete data.retentionJournalIdentityFormat;
+  if (format === 2) data.retentionJournalIdentityFormat = 2;
+  events[0] = createRunEvent(
+    {
+      sequence: created.sequence,
+      timestamp: created.timestamp,
+      actor: created.actor,
+      causationId: created.causationId,
+      type: created.type,
+      data,
+    },
+    store.canonicalHashAlgorithm,
+  );
+
+  await writeFile(eventsPath, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
+  await writeFile(storagePath, `${JSON.stringify(storage, null, 2)}\n`);
 }
 
 async function setStateUpdatedAt(store: RunStore, updatedAt: string): Promise<void> {
@@ -226,6 +290,10 @@ async function seedAuxiliaryState(
 
 describe("run-state retention", () => {
   const retentionLeaseNames = ["retention", "supervisor", "run", "artifact"] as const;
+  const retentionIdentityFormats = [
+    ["legacy v1", 1],
+    ["portable v2", 2],
+  ] as const;
 
   it("builds a read-only plan with durable state and preserved workspace details", async () => {
     const { root, repository } = await createRepository();
@@ -238,7 +306,8 @@ describe("run-state retention", () => {
     });
 
     expect(plan).toMatchObject({
-      schemaVersion: 1,
+      schemaVersion: 2,
+      hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
       action: "delete_run_state",
       runId: store.runId,
       state: { runId: store.runId, status: "completed" },
@@ -307,23 +376,34 @@ describe("run-state retention", () => {
     ).toBe("other\n");
   });
 
-  it.each([
-    "after_journal",
-    "after_auxiliary",
-    "before_run",
-    "during_run",
-    "after_run",
-    "before_journal_cleanup",
-  ] satisfies RunRetentionFaultBoundary[])(
-    "recovers an exact deletion after a fresh process plan at %s",
-    async (boundary) => {
+  it.each(
+    retentionIdentityFormats.flatMap(([formatName, format]) =>
+      (
+        [
+          "after_journal",
+          "after_auxiliary",
+          "before_run",
+          "during_run",
+          "after_run",
+          "before_journal_cleanup",
+        ] satisfies RunRetentionFaultBoundary[]
+      ).map((boundary) => [formatName, boundary, format] as const),
+    ),
+  )(
+    "recovers an exact %s deletion after a fresh process plan at %s",
+    async (_formatName, boundary, format) => {
       const { repository } = await createRepository();
       const { store, workspace } = await createCompletedRun(repository);
+      await selectRetentionIdentityFormat(store, format);
       await seedAuxiliaryState(repository, store.runId, boundary);
       const plan = await planRunRetention({
         repositoryRoot: repository,
         runReference: store.runId,
       });
+      expect(plan.schemaVersion).toBe(format);
+      if (format === 2)
+        expect(plan).toHaveProperty("hashAlgorithm", PORTABLE_CANONICAL_HASH_ALGORITHM);
+      else expect(plan).not.toHaveProperty("hashAlgorithm");
       let injected = false;
 
       await expect(
@@ -345,6 +425,19 @@ describe("run-state retention", () => {
 
       expect(injected).toBe(true);
       expect(await pathExists(journalPath(repository, store.runId))).toBe(true);
+      const journal = JSON.parse(
+        await readFile(journalPath(repository, store.runId), "utf8"),
+      ) as Record<string, unknown>;
+      const { integrityHash, ...journalPayload } = journal;
+      expect(journal.schemaVersion).toBe(format);
+      if (format === 2) expect(journal.hashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
+      else expect(journal).not.toHaveProperty("hashAlgorithm");
+      expect(integrityHash).toBe(
+        contentHash(
+          journalPayload,
+          format === 2 ? PORTABLE_CANONICAL_HASH_ALGORITHM : LEGACY_CANONICAL_HASH_ALGORITHM,
+        ),
+      );
       if (boundary === "during_run") {
         expect(await pathExists(store.runRoot)).toBe(true);
         expect(await pathExists(join(store.runRoot, "state.json"))).toBe(false);
@@ -357,6 +450,7 @@ describe("run-state retention", () => {
         repositoryRoot: repository,
         runReference: store.runId,
       });
+      expect(recoveryPlan.schemaVersion).toBe(format);
       const result = await applyRunRetention({
         plan: recoveryPlan,
         confirmRunId: store.runId,
@@ -498,38 +592,204 @@ describe("run-state retention", () => {
     },
   );
 
-  it("requires an exact ID to recover a journal-only run", async () => {
+  it.each(retentionIdentityFormats)(
+    "requires an exact ID to recover a %s journal-only run",
+    async (_formatName, format) => {
+      const { repository } = await createRepository();
+      const { store } = await createCompletedRun(repository);
+      await selectRetentionIdentityFormat(store, format);
+      const plan = await planRunRetention({
+        repositoryRoot: repository,
+        runReference: store.runId,
+      });
+      expect(plan.schemaVersion).toBe(format);
+
+      await expect(
+        applyRunRetention({
+          plan,
+          confirmRunId: store.runId,
+          onCheckpoint: ({ boundary }) => {
+            if (boundary === "after_run") throw new Error("stop after run deletion");
+          },
+        }),
+      ).rejects.toThrow("stop after run deletion");
+      expect(await pathExists(store.runRoot)).toBe(false);
+
+      await expect(
+        planRunRetention({
+          repositoryRoot: repository,
+          runReference: store.runId.slice(0, 12),
+        }),
+      ).rejects.toThrow(/No Graphcraft runs|matched 0 runs/);
+
+      const recoveryPlan = await planRunRetention({
+        repositoryRoot: repository,
+        runReference: store.runId,
+      });
+      expect(recoveryPlan.schemaVersion).toBe(format);
+      await applyRunRetention({ plan: recoveryPlan, confirmRunId: store.runId });
+      expect(await pathExists(journalPath(repository, store.runId))).toBe(false);
+    },
+  );
+
+  it.each(retentionIdentityFormats)(
+    "rejects an alternate-format digest transplanted into a %s journal",
+    async (_formatName, format) => {
+      const { repository } = await createRepository();
+      const { store } = await createCompletedRun(repository);
+      await selectRetentionIdentityFormat(store, format);
+      const plan = await planRunRetention({
+        repositoryRoot: repository,
+        runReference: store.runId,
+      });
+
+      await expect(
+        applyRunRetention({
+          plan,
+          confirmRunId: store.runId,
+          onCheckpoint: ({ boundary }) => {
+            if (boundary === "after_journal") throw new Error("inspect identity digest");
+          },
+        }),
+      ).rejects.toThrow("inspect identity digest");
+
+      const path = journalPath(repository, store.runId);
+      const journal = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+      const {
+        integrityHash: persistedDigest,
+        schemaVersion: _schemaVersion,
+        hashAlgorithm: _hashAlgorithm,
+        ...fields
+      } = journal;
+      const alternatePayload =
+        format === 2
+          ? { schemaVersion: 1, ...fields }
+          : {
+              schemaVersion: 2,
+              hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+              ...fields,
+            };
+      const alternateDigest = contentHash(
+        alternatePayload,
+        format === 2 ? LEGACY_CANONICAL_HASH_ALGORITHM : PORTABLE_CANONICAL_HASH_ALGORITHM,
+      );
+      expect(alternateDigest).not.toBe(persistedDigest);
+      journal.integrityHash = alternateDigest;
+      await writeFile(path, `${JSON.stringify(journal, null, 2)}\n`, { mode: 0o600 });
+
+      await expect(
+        planRunRetention({ repositoryRoot: repository, runReference: store.runId }),
+      ).rejects.toThrow(/retention journal is invalid or has been modified/);
+      expect(await pathExists(store.runRoot)).toBe(true);
+    },
+  );
+
+  it.each(retentionIdentityFormats)(
+    "refuses a valid %s recovery journal through an opposite-format submitted plan",
+    async (_formatName, format) => {
+      const { repository } = await createRepository();
+      const { store } = await createCompletedRun(repository);
+      await selectRetentionIdentityFormat(store, format);
+      await seedAuxiliaryState(repository, store.runId, `format-${format}`);
+      const plan = await planRunRetention({
+        repositoryRoot: repository,
+        runReference: store.runId,
+      });
+      await expect(
+        applyRunRetention({
+          plan,
+          confirmRunId: store.runId,
+          onCheckpoint: ({ boundary }) => {
+            if (boundary === "after_journal") throw new Error("retain valid journal");
+          },
+        }),
+      ).rejects.toThrow("retain valid journal");
+
+      const graphcraftRoot = join(repository, ".graphcraft");
+      const before = {
+        run: await treeSnapshot(store.runRoot),
+        journal: await readFile(journalPath(repository, store.runId)),
+        control: await readFile(join(graphcraftRoot, "controls", `${store.runId}.json`)),
+        supervisor: await treeSnapshot(join(graphcraftRoot, "supervisors", store.runId)),
+        migration: await treeSnapshot(join(graphcraftRoot, "migration-backups", store.runId)),
+      };
+      const submitted = JSON.parse(JSON.stringify(plan)) as Record<string, unknown>;
+      submitted.schemaVersion = format === 1 ? 2 : 1;
+      if (format === 1) submitted.hashAlgorithm = PORTABLE_CANONICAL_HASH_ALGORITHM;
+      else delete submitted.hashAlgorithm;
+
+      await expect(
+        applyRunRetention({
+          plan: submitted as unknown as RunRetentionPlan,
+          confirmRunId: store.runId,
+        }),
+      ).rejects.toThrow(/retention identity format changed/);
+      expect(await treeSnapshot(store.runRoot)).toEqual(before.run);
+      expect(await readFile(journalPath(repository, store.runId))).toEqual(before.journal);
+      expect(await readFile(join(graphcraftRoot, "controls", `${store.runId}.json`))).toEqual(
+        before.control,
+      );
+      expect(await treeSnapshot(join(graphcraftRoot, "supervisors", store.runId))).toEqual(
+        before.supervisor,
+      );
+      expect(await treeSnapshot(join(graphcraftRoot, "migration-backups", store.runId))).toEqual(
+        before.migration,
+      );
+    },
+  );
+
+  it("keeps portable retention identities locale-independent and rejects a legacy state digest", async () => {
     const { repository } = await createRepository();
-    const { store } = await createCompletedRun(repository);
+    const { store } = await createCompletedRun(repository, { nodeIds: ["Z-node", "a-node"] });
+    const state = JSON.parse(await readFile(join(store.runRoot, "state.json"), "utf8"));
+    const portableDigest = contentHash(state, PORTABLE_CANONICAL_HASH_ALGORITHM);
+    const legacyDigest = contentHash(state, LEGACY_CANONICAL_HASH_ALGORITHM);
+    expect(portableDigest).not.toBe(legacyDigest);
+
     const plan = await planRunRetention({
       repositoryRoot: repository,
       runReference: store.runId,
     });
-
-    await expect(
-      applyRunRetention({
-        plan,
-        confirmRunId: store.runId,
-        onCheckpoint: ({ boundary }) => {
-          if (boundary === "after_run") throw new Error("stop after run deletion");
-        },
-      }),
-    ).rejects.toThrow("stop after run deletion");
-    expect(await pathExists(store.runRoot)).toBe(false);
-
-    await expect(
-      planRunRetention({
-        repositoryRoot: repository,
-        runReference: store.runId.slice(0, 12),
-      }),
-    ).rejects.toThrow(/No Graphcraft runs|matched 0 runs/);
-
-    const recoveryPlan = await planRunRetention({
-      repositoryRoot: repository,
-      runReference: store.runId,
+    expect(plan).toMatchObject({
+      schemaVersion: 2,
+      hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+      state: { hash: portableDigest },
     });
-    await applyRunRetention({ plan: recoveryPlan, confirmRunId: store.runId });
+
+    const localeCompare = vi.spyOn(String.prototype, "localeCompare").mockImplementation(() => {
+      throw new Error("portable retention identity consulted the process locale");
+    });
+    try {
+      await expect(
+        planRunRetention({ repositoryRoot: repository, runReference: store.runId }),
+      ).resolves.toEqual(plan);
+      expect(localeCompare).not.toHaveBeenCalled();
+    } finally {
+      localeCompare.mockRestore();
+    }
+
+    const alternateDigestPlan = {
+      ...plan,
+      state: { ...plan.state, hash: legacyDigest },
+    };
+    await expect(
+      applyRunRetention({ plan: alternateDigestPlan, confirmRunId: store.runId }),
+    ).rejects.toThrow(/state changed; create and confirm a new dry-run plan/);
+    expect(await pathExists(store.runRoot)).toBe(true);
     expect(await pathExists(journalPath(repository, store.runId))).toBe(false);
+  });
+
+  it("refuses schema-v2 events without an intact schema-v3 storage manifest", async () => {
+    const { repository } = await createRepository();
+    const { store } = await createCompletedRun(repository);
+    await selectRetentionIdentityFormat(store, 1);
+    await rm(join(store.runRoot, "storage.json"));
+    const before = await treeSnapshot(store.runRoot);
+
+    await expect(
+      planRunRetention({ repositoryRoot: repository, runReference: store.runId }),
+    ).rejects.toThrow(/schema-v2 events require an intact schema-v3 storage manifest/);
+    expect(await treeSnapshot(store.runRoot)).toEqual(before);
   });
 
   it("persists only bounded, redacted retention metadata and target identifiers", async () => {
@@ -555,8 +815,14 @@ describe("run-state retention", () => {
 
     const source = await readFile(journalPath(repository, store.runId), "utf8");
     const journal = JSON.parse(source) as Record<string, unknown>;
+    const { integrityHash, ...journalPayload } = journal;
     expect(Buffer.byteLength(source)).toBeLessThanOrEqual(64 * 1024);
     expect(source).not.toContain(seededCredential);
+    expect(journal).toMatchObject({
+      schemaVersion: 2,
+      hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+    });
+    expect(integrityHash).toBe(contentHash(journalPayload, PORTABLE_CANONICAL_HASH_ALGORITHM));
     for (const target of plan.deletePaths) expect(source).not.toContain(target);
     expect(journal).not.toHaveProperty("deletePaths");
     expect(journal.existingTargetIds).toEqual(["run", "control", "supervisor", "migration_backup"]);
@@ -768,7 +1034,7 @@ describe("run-state retention", () => {
     },
   );
 
-  it("deletes an explicitly confirmed completed legacy run whose secret-bearing artifact blocks migration", async () => {
+  it("deletes an explicitly confirmed manifestless legacy run after secret-bearing migration refusal", async () => {
     const { repository } = await createRepository();
     const { store, workspace } = await createCompletedRun(repository);
     const storagePath = join(store.runRoot, "storage.json");
@@ -785,7 +1051,8 @@ describe("run-state retention", () => {
             key !== "probeEvidenceCheckpoints" &&
             key !== "governanceControlIdentities" &&
             key !== "repositorySideEffectIdentities" &&
-            key !== "githubMutationLifecycleIdentities",
+            key !== "githubMutationLifecycleIdentities" &&
+            key !== "retentionJournalIdentities",
         ),
       ),
       heldOutProbes: 1,
@@ -806,6 +1073,7 @@ describe("run-state retention", () => {
         delete data.governanceControlIdentityFormat;
         delete data.repositorySideEffectIdentityFormat;
         delete data.githubMutationLifecycleIdentityFormat;
+        delete data.retentionJournalIdentityFormat;
       }
       return createRunEvent({
         sequence: event.sequence,
@@ -837,10 +1105,12 @@ describe("run-state retention", () => {
         runId: store.runId,
       }),
     ).rejects.toThrow(/secret-like material/);
+    await rm(storagePath);
     const plan = await planRunRetention({
       repositoryRoot: repository,
       runReference: store.runId,
     });
+    expect(plan.schemaVersion).toBe(1);
 
     await applyRunRetention({ plan, confirmRunId: store.runId });
 
@@ -1041,6 +1311,71 @@ describe("run-state retention", () => {
     expect(await pathExists(oldest.store.runRoot)).toBe(false);
     expect(await pathExists(newestCandidate.store.runRoot)).toBe(true);
     expect(await pathExists(atCutoff.store.runRoot)).toBe(true);
+  });
+
+  it("orders equal-time mixed v1/v2 prune candidates transitively by identity format", async () => {
+    const { repository } = await createRepository();
+    const legacyFirst = await createCompletedRun(repository, {
+      runId: "e0000000-0000-4000-8000-000000000001",
+    });
+    const legacySecond = await createCompletedRun(repository, {
+      runId: "f0000000-0000-4000-8000-000000000002",
+    });
+    const portableFirst = await createCompletedRun(repository, {
+      runId: "00000000-0000-4000-8000-000000000003",
+    });
+    const portableSecond = await createCompletedRun(repository, {
+      runId: "10000000-0000-4000-8000-000000000004",
+    });
+    await selectRetentionIdentityFormat(legacyFirst.store, 1);
+    await selectRetentionIdentityFormat(legacySecond.store, 1);
+    for (const fixture of [legacyFirst, legacySecond, portableFirst, portableSecond])
+      await setStateUpdatedAt(fixture.store, "2026-01-01T00:00:00.000Z");
+
+    const plan = await planCompletedRunPrune({
+      repositoryRoot: repository,
+      completedBefore: "2026-01-02T00:00:00.000Z",
+      keepNewest: 1,
+    });
+
+    expect(plan.candidateRunIds).toEqual([
+      legacyFirst.store.runId,
+      legacySecond.store.runId,
+      portableFirst.store.runId,
+      portableSecond.store.runId,
+    ]);
+    expect(plan.keptRunIds).toEqual([legacyFirst.store.runId]);
+    expect(plan.deletionPlans.map(({ runId }) => runId)).toEqual([
+      legacySecond.store.runId,
+      portableFirst.store.runId,
+      portableSecond.store.runId,
+    ]);
+    expect(plan.deletionPlans.map(({ schemaVersion }) => schemaVersion)).toEqual([1, 2, 2]);
+  });
+
+  it("refuses a prune plan whose retention identity format was relabelled", async () => {
+    const { repository } = await createRepository();
+    const { store } = await createCompletedRun(repository);
+    await setStateUpdatedAt(store, "2026-01-01T00:00:00.000Z");
+    const plan = await planCompletedRunPrune({
+      repositoryRoot: repository,
+      completedBefore: "2026-01-02T00:00:00.000Z",
+      keepNewest: 0,
+    });
+    const deletionPlan = plan.deletionPlans[0];
+    if (!deletionPlan || deletionPlan.schemaVersion !== 2)
+      throw new Error("Expected a portable prune fixture");
+    const { hashAlgorithm: _hashAlgorithm, ...legacyFields } = deletionPlan;
+    const relabelled = {
+      ...plan,
+      deletionPlans: [{ ...legacyFields, schemaVersion: 1 as const }],
+    };
+    const before = await treeSnapshot(store.runRoot);
+
+    await expect(
+      applyCompletedRunPrune({ plan: relabelled, confirmRunIds: [store.runId] }),
+    ).rejects.toThrow(/Prune retention identity format changed/);
+    expect(await treeSnapshot(store.runRoot)).toEqual(before);
   });
 
   it("reports completed deletions when a later prune target becomes unavailable", async () => {
