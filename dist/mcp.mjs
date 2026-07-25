@@ -32734,7 +32734,10 @@ var RunStorageManifestSchema = external_exports.union([
       governanceControlIdentities: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).default(1),
       // Repository side-effect claims and commit-content preconditions also
       // predate an independent selector. Omission preserves their v1 domain.
-      repositorySideEffectIdentities: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).default(1)
+      repositorySideEffectIdentities: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).default(1),
+      // GitHub snapshots, lifecycle signatures, and mutation journal identities
+      // also predate an independent selector. Omission preserves their v1 domain.
+      githubMutationLifecycleIdentities: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).default(1)
     })
   })
 ]);
@@ -38311,22 +38314,37 @@ async function currentBinding(input) {
     baseSha: response.data.repository.pullRequest.baseRefOid
   };
 }
-function lifecycleFingerprint(input) {
+function compareIdentityStrings(left, right, hashAlgorithm) {
+  if (hashAlgorithm === LEGACY_CANONICAL_HASH_ALGORITHM) return left.localeCompare(right);
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+function lifecycleFingerprint(input, hashAlgorithm) {
   const requiredCheckKey = (check2) => `${check2.context}:${check2.appId ?? ""}`;
-  return contentHash({
-    ...input,
-    binding: { ...input.binding },
-    branchProtection: {
-      ...input.branchProtection,
-      requiredStatusChecks: [...input.branchProtection.requiredStatusChecks].sort(
-        (left, right) => requiredCheckKey(left).localeCompare(requiredCheckKey(right))
+  return contentHash(
+    {
+      ...input,
+      binding: { ...input.binding },
+      branchProtection: {
+        ...input.branchProtection,
+        requiredStatusChecks: [...input.branchProtection.requiredStatusChecks].sort(
+          (left, right) => compareIdentityStrings(requiredCheckKey(left), requiredCheckKey(right), hashAlgorithm)
+        )
+      },
+      requiredChecks: input.requiredChecks.map((check2) => ({ ...check2, matchingCheckIds: [...check2.matchingCheckIds].sort() })).sort(
+        (left, right) => compareIdentityStrings(requiredCheckKey(left), requiredCheckKey(right), hashAlgorithm)
+      ),
+      checks: [...input.checks].sort(
+        (left, right) => compareIdentityStrings(left.id, right.id, hashAlgorithm)
+      ),
+      reviewThreads: [...input.reviewThreads].sort(
+        (left, right) => compareIdentityStrings(left.id, right.id, hashAlgorithm)
+      ),
+      reviews: [...input.reviews].sort(
+        (left, right) => compareIdentityStrings(left.id, right.id, hashAlgorithm)
       )
     },
-    requiredChecks: input.requiredChecks.map((check2) => ({ ...check2, matchingCheckIds: [...check2.matchingCheckIds].sort() })).sort((left, right) => requiredCheckKey(left).localeCompare(requiredCheckKey(right))),
-    checks: [...input.checks].sort((left, right) => left.id.localeCompare(right.id)),
-    reviewThreads: [...input.reviewThreads].sort((left, right) => left.id.localeCompare(right.id)),
-    reviews: [...input.reviews].sort((left, right) => left.id.localeCompare(right.id))
-  });
+    hashAlgorithm
+  );
 }
 function snapshotLifecycleState(snapshot) {
   return {
@@ -38340,7 +38358,7 @@ function snapshotLifecycleState(snapshot) {
     reviews: snapshot.reviews
   };
 }
-async function assertGitHubSnapshotCurrent(options, snapshot) {
+async function assertGitHubSnapshotCurrent(options, snapshot, hashAlgorithm) {
   const parsed = GitHubPullRequestSnapshotSchema.parse(snapshot);
   const { owner, name } = repositoryParts(parsed.repository.nameWithOwner);
   const paginationBudget = new GraphQLPaginationBudget();
@@ -38367,9 +38385,9 @@ async function assertGitHubSnapshotCurrent(options, snapshot) {
     throw new Error(
       `GitHub snapshot ${parsed.snapshotId} is stale: ${parsed.binding.headSha}/${parsed.binding.baseSha} changed during lifecycle revalidation`
     );
-  const expectedFingerprint = lifecycleFingerprint(snapshotLifecycleState(parsed));
-  const firstFingerprint = lifecycleFingerprint(first);
-  const currentFingerprint = lifecycleFingerprint(current);
+  const expectedFingerprint = lifecycleFingerprint(snapshotLifecycleState(parsed), hashAlgorithm);
+  const firstFingerprint = lifecycleFingerprint(first, hashAlgorithm);
+  const currentFingerprint = lifecycleFingerprint(current, hashAlgorithm);
   if (currentFingerprint !== firstFingerprint)
     throw new GitHubLifecycleConsistencyError(
       `GitHub snapshot ${parsed.snapshotId} mutable lifecycle changed during revalidation: ${firstFingerprint} changed to ${currentFingerprint}`
@@ -38394,7 +38412,7 @@ function requiredCheckBucket(required2, checks) {
     return "cancelled";
   return "actionable";
 }
-function latestReviewStates(snapshot) {
+function latestReviewStates(snapshot, hashAlgorithm) {
   const latest = /* @__PURE__ */ new Map();
   for (const review of snapshot.reviews) {
     if (!review.author || review.commitSha !== snapshot.binding.headSha) continue;
@@ -38403,9 +38421,9 @@ function latestReviewStates(snapshot) {
     if (!current || submittedAt > current.submittedAt || submittedAt === current.submittedAt && review.id > current.id)
       latest.set(review.author, { state: review.state, submittedAt, id: review.id });
   }
-  return [...latest.entries()].map(([author, { state }]) => ({ author, state })).sort((left, right) => left.author.localeCompare(right.author));
+  return [...latest.entries()].map(([author, { state }]) => ({ author, state })).sort((left, right) => compareIdentityStrings(left.author, right.author, hashAlgorithm));
 }
-function classifyGitHubPullRequestLifecycle(snapshotInput, expectedInput) {
+function classifyGitHubPullRequestLifecycle(snapshotInput, expectedInput, hashAlgorithm) {
   const snapshot = GitHubPullRequestSnapshotSchema.parse(snapshotInput);
   const expected = GitHubPullRequestBindingExpectationSchema.parse(expectedInput);
   const exactBinding = snapshot.repository.host === expected.host && snapshot.repository.nameWithOwner === expected.nameWithOwner && snapshot.pullRequest.number === expected.number && snapshot.pullRequest.headRefName === expected.headRefName && snapshot.pullRequest.baseRefName === expected.baseRefName && snapshot.binding.headSha === expected.headSha && snapshot.binding.baseSha === expected.baseSha;
@@ -38421,7 +38439,7 @@ function classifyGitHubPullRequestLifecycle(snapshotInput, expectedInput) {
     )
   ].sort();
   const unresolvedThreadIds = snapshot.reviewThreads.filter(({ isResolved, isOutdated }) => !isResolved && !isOutdated).map(({ id }) => id).sort();
-  const latestReviews = latestReviewStates(snapshot);
+  const latestReviews = latestReviewStates(snapshot, hashAlgorithm);
   const currentApprovals = latestReviews.filter(({ state }) => state === "APPROVED").length;
   const requiredApprovals = snapshot.branchProtection.requiresApprovingReviews ? snapshot.branchProtection.requiredApprovingReviewCount ?? 1 : 0;
   const counts = {
@@ -38478,8 +38496,10 @@ function classifyGitHubPullRequestLifecycle(snapshotInput, expectedInput) {
       state,
       matchingCheckIds: [...matchingCheckIds].sort()
     })).sort(
-      (left, right) => `${left.context}:${left.appId ?? ""}`.localeCompare(
-        `${right.context}:${right.appId ?? ""}`
+      (left, right) => compareIdentityStrings(
+        `${left.context}:${left.appId ?? ""}`,
+        `${right.context}:${right.appId ?? ""}`,
+        hashAlgorithm
       )
     ),
     unresolvedThreadIds,
@@ -38497,7 +38517,7 @@ function classifyGitHubPullRequestLifecycle(snapshotInput, expectedInput) {
     counts,
     checkIds,
     unresolvedThreadIds,
-    signature: contentHash(stableEvidence),
+    signature: contentHash(stableEvidence, hashAlgorithm),
     evidence
   });
 }
@@ -38548,7 +38568,7 @@ async function collectSnapshotLifecycle(input) {
     reviews
   };
 }
-async function captureGitHubPullRequestSnapshot(options) {
+async function captureGitHubPullRequestSnapshot(options, hashAlgorithm) {
   const capability = await probeGitHub(options);
   if (!capability.readyForSnapshot || !capability.host || !capability.nameWithOwner)
     throw new Error(`GitHub snapshot preflight failed: ${capability.errors.join("; ")}`);
@@ -38581,8 +38601,8 @@ async function captureGitHubPullRequestSnapshot(options) {
     throw new Error(
       `GitHub snapshot became stale during capture: ${stable.binding.headSha}/${stable.binding.baseSha} changed to ${finalBinding.headSha}/${finalBinding.baseSha}`
     );
-  const firstFingerprint = lifecycleFingerprint(first);
-  const stableFingerprint = lifecycleFingerprint(stable);
+  const firstFingerprint = lifecycleFingerprint(first, hashAlgorithm);
+  const stableFingerprint = lifecycleFingerprint(stable, hashAlgorithm);
   if (stableFingerprint !== firstFingerprint)
     throw new GitHubLifecycleConsistencyError(
       `GitHub snapshot mutable lifecycle changed during capture: ${firstFingerprint} changed to ${stableFingerprint}`
@@ -38597,7 +38617,7 @@ async function captureGitHubPullRequestSnapshot(options) {
   };
   return GitHubPullRequestSnapshotSchema.parse({
     ...value,
-    snapshotId: contentHash(value)
+    snapshotId: contentHash(value, hashAlgorithm)
   });
 }
 
@@ -45473,7 +45493,7 @@ var LEGACY_MIGRATION_RESOURCE_LIMITS = Object.freeze({
   maximumFileCount: 4 * 1024,
   maximumEntryCount: 8 * 1024
 });
-function manifest(runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, probeEvidenceCheckpointFormat, governanceControlIdentityFormat, repositorySideEffectIdentityFormat, initialization) {
+function manifest(runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, probeEvidenceCheckpointFormat, governanceControlIdentityFormat, repositorySideEffectIdentityFormat, githubMutationLifecycleIdentityFormat, initialization) {
   return RunStorageManifestSchema.parse({
     schemaVersion: CURRENT_RUN_STORAGE_VERSION,
     runId,
@@ -45499,7 +45519,8 @@ function manifest(runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeForma
       workspaceScopeSnapshots: workspaceScopeSnapshotFormat,
       probeEvidenceCheckpoints: probeEvidenceCheckpointFormat,
       governanceControlIdentities: governanceControlIdentityFormat,
-      repositorySideEffectIdentities: repositorySideEffectIdentityFormat
+      repositorySideEffectIdentities: repositorySideEffectIdentityFormat,
+      githubMutationLifecycleIdentities: githubMutationLifecycleIdentityFormat
     }
   });
 }
@@ -45513,7 +45534,7 @@ async function validateRunStorageRoot(input) {
   if (validated !== runRoot)
     throw new Error(`Run storage path escaped the Graphcraft state directory: ${input.runRoot}`);
 }
-async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, probeEvidenceCheckpointFormat, governanceControlIdentityFormat, repositorySideEffectIdentityFormat, initialization, lease) {
+async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, probeEvidenceCheckpointFormat, governanceControlIdentityFormat, repositorySideEffectIdentityFormat, githubMutationLifecycleIdentityFormat, initialization, lease) {
   const value = manifest(
     runId,
     migratedFrom,
@@ -45524,6 +45545,7 @@ async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom, ca
     probeEvidenceCheckpointFormat,
     governanceControlIdentityFormat,
     repositorySideEffectIdentityFormat,
+    githubMutationLifecycleIdentityFormat,
     initialization
   );
   await migrationStep(lease, async () => await ensurePrivateDirectory(runRoot));
@@ -45548,6 +45570,7 @@ async function writeCurrentRunStorageManifest(runRoot, runId, migratedFrom) {
     2,
     2,
     2,
+    2,
     "ready"
   );
 }
@@ -45557,6 +45580,7 @@ async function writeInitializingRunStorageManifest(runRoot, runId) {
     runId,
     CURRENT_RUN_STORAGE_VERSION,
     PORTABLE_CANONICAL_HASH_ALGORITHM,
+    2,
     2,
     2,
     2,
@@ -46649,6 +46673,12 @@ async function validateInitializingRunStorage(runRoot, runId, manifest2, lease) 
     throw new Error(
       `Run ${runId} has a repository side-effect identity format that disagrees with its schema-v3 initialization descriptor. No files were changed.`
     );
+  const githubMutationLifecycleFormat = first.data.githubMutationLifecycleIdentityFormat;
+  const githubMutationLifecycleFormatMismatch = manifest2.formats.githubMutationLifecycleIdentities === 2 ? githubMutationLifecycleFormat !== 2 : githubMutationLifecycleFormat !== void 0;
+  if (githubMutationLifecycleFormatMismatch)
+    throw new Error(
+      `Run ${runId} has a GitHub mutation-lifecycle identity format that disagrees with its schema-v3 initialization descriptor. No files were changed.`
+    );
   try {
     validateHeldOutProbePlan(
       HeldOutProbePlanSchema.parse(first.data.heldOutProbePlan),
@@ -46706,6 +46736,7 @@ async function ensureCurrentRunStorage(input) {
         storage.manifest.formats.probeEvidenceCheckpoints,
         storage.manifest.formats.governanceControlIdentities,
         storage.manifest.formats.repositorySideEffectIdentities,
+        storage.manifest.formats.githubMutationLifecycleIdentities,
         "ready",
         lease
       );
@@ -46758,6 +46789,7 @@ async function ensureCurrentRunStorage(input) {
       input.runId,
       storage.version,
       LEGACY_CANONICAL_HASH_ALGORITHM,
+      1,
       1,
       1,
       1,
@@ -47096,7 +47128,7 @@ var RunStoreLimitError = class extends Error {
 var RunStoreEventLogCorruptionError = class extends Error {
   constructor(record2, offsetBytes, trailing, reason) {
     const location = trailing ? "trailing record" : `record ${record2}`;
-    const problem = reason === "encoding" ? "invalid UTF-8" : reason === "json" ? "invalid JSON" : reason === "schema" ? "an invalid event schema" : reason === "hash" ? "an invalid event hash" : reason === "format" ? "an event format that disagrees with its storage manifest" : reason === "scope" ? "a workspace-scope snapshot that disagrees with its storage manifest" : reason === "checkpoint" ? "a probe-evidence checkpoint format that disagrees with its storage manifest" : reason === "governance" ? "a governance/control identity format that disagrees with its storage manifest" : reason === "repository_side_effect" ? "a repository side-effect identity format that disagrees with its storage manifest" : "an invalid event sequence";
+    const problem = reason === "encoding" ? "invalid UTF-8" : reason === "json" ? "invalid JSON" : reason === "schema" ? "an invalid event schema" : reason === "hash" ? "an invalid event hash" : reason === "format" ? "an event format that disagrees with its storage manifest" : reason === "scope" ? "a workspace-scope snapshot that disagrees with its storage manifest" : reason === "checkpoint" ? "a probe-evidence checkpoint format that disagrees with its storage manifest" : reason === "governance" ? "a governance/control identity format that disagrees with its storage manifest" : reason === "repository_side_effect" ? "a repository side-effect identity format that disagrees with its storage manifest" : reason === "github_mutation_lifecycle" ? "a GitHub mutation-lifecycle identity format that disagrees with its storage manifest" : "an invalid event sequence";
     super(
       `Run event log has ${problem} in ${location} at byte ${offsetBytes}; event log bytes were left unchanged`
     );
@@ -47185,6 +47217,11 @@ function repositorySideEffectIdentityUsesDifferentFormat(event, selected) {
   const format = event.data.repositorySideEffectIdentityFormat;
   return selected === PORTABLE_CANONICAL_HASH_ALGORITHM ? format !== 2 : format !== void 0;
 }
+function githubMutationLifecycleIdentityUsesDifferentFormat(event, selected) {
+  if (event.type !== "run.created") return false;
+  const format = event.data.githubMutationLifecycleIdentityFormat;
+  return selected === PORTABLE_CANONICAL_HASH_ALGORITHM ? format !== 2 : format !== void 0;
+}
 var RunStore = class _RunStore {
   repositoryRoot;
   runId;
@@ -47202,6 +47239,7 @@ var RunStore = class _RunStore {
   _probeEvidenceCheckpointHashAlgorithm;
   _governanceControlIdentityHashAlgorithm;
   _repositorySideEffectIdentityHashAlgorithm;
+  _githubMutationLifecycleIdentityHashAlgorithm;
   constructor(repositoryRoot, runId, limits = {}, canonicalHashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
     this.repositoryRoot = repositoryRoot;
     this.runId = runId;
@@ -47253,6 +47291,10 @@ var RunStore = class _RunStore {
       this.bindGovernanceControlIdentityHashAlgorithm(governanceControlIdentityHashAlgorithm);
       const repositorySideEffectIdentityHashAlgorithm = manifest2.formats.repositorySideEffectIdentities === 2 ? PORTABLE_CANONICAL_HASH_ALGORITHM : LEGACY_CANONICAL_HASH_ALGORITHM;
       this.bindRepositorySideEffectIdentityHashAlgorithm(repositorySideEffectIdentityHashAlgorithm);
+      const githubMutationLifecycleIdentityHashAlgorithm = manifest2.formats.githubMutationLifecycleIdentities === 2 ? PORTABLE_CANONICAL_HASH_ALGORITHM : LEGACY_CANONICAL_HASH_ALGORITHM;
+      this.bindGithubMutationLifecycleIdentityHashAlgorithm(
+        githubMutationLifecycleIdentityHashAlgorithm
+      );
       await this.validateStorageRoot();
     } catch (error51) {
       if (this.storageReady === ready) this.storageReady = void 0;
@@ -47299,6 +47341,13 @@ var RunStore = class _RunStore {
       );
     return this._repositorySideEffectIdentityHashAlgorithm;
   }
+  get githubMutationLifecycleIdentityHashAlgorithm() {
+    if (!this._githubMutationLifecycleIdentityHashAlgorithm)
+      throw new Error(
+        "GitHub mutation-lifecycle identity hash policy is unavailable before run storage is prepared"
+      );
+    return this._githubMutationLifecycleIdentityHashAlgorithm;
+  }
   bindArtifactHashAlgorithm(algorithm) {
     if (this.artifactStore && this.artifactStore.hashAlgorithm !== algorithm)
       throw new Error("Artifact store was bound before its storage manifest policy was known");
@@ -47331,6 +47380,13 @@ var RunStore = class _RunStore {
         "Repository side-effect identity hashing was bound before its storage manifest policy was known"
       );
     this._repositorySideEffectIdentityHashAlgorithm = algorithm;
+  }
+  bindGithubMutationLifecycleIdentityHashAlgorithm(algorithm) {
+    if (this._githubMutationLifecycleIdentityHashAlgorithm && this._githubMutationLifecycleIdentityHashAlgorithm !== algorithm)
+      throw new Error(
+        "GitHub mutation-lifecycle identity hashing was bound before its storage manifest policy was known"
+      );
+    this._githubMutationLifecycleIdentityHashAlgorithm = algorithm;
   }
   artifacts() {
     return this.artifactStore ??= new RunArtifactStore(
@@ -47398,6 +47454,7 @@ var RunStore = class _RunStore {
     store.bindProbeEvidenceCheckpointHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     store.bindGovernanceControlIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     store.bindRepositorySideEffectIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    store.bindGithubMutationLifecycleIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     const persistedContract = RunContractSchema.parse(redactValue(contract));
     const persistedGraph = GraphSchema.parse(redactValue(graph));
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
@@ -47434,7 +47491,8 @@ var RunStore = class _RunStore {
           nodeIds: graph.nodes.map(({ id }) => id),
           probeEvidenceCheckpointFormat: 2,
           governanceControlIdentityFormat: 2,
-          repositorySideEffectIdentityFormat: 2
+          repositorySideEffectIdentityFormat: 2,
+          githubMutationLifecycleIdentityFormat: 2
         }
       },
       store.canonicalHashAlgorithm
@@ -47765,6 +47823,16 @@ var RunStore = class _RunStore {
           offset,
           trailing,
           "repository_side_effect"
+        );
+      if (githubMutationLifecycleIdentityUsesDifferentFormat(
+        event,
+        this.githubMutationLifecycleIdentityHashAlgorithm
+      ))
+        throw new RunStoreEventLogCorruptionError(
+          record2,
+          offset,
+          trailing,
+          "github_mutation_lifecycle"
         );
       const scopeSnapshot = eventWorkspaceScopeSnapshot(event);
       if (scopeSnapshot !== void 0 && workspaceScopeSnapshotUsesDifferentHashPolicy(
@@ -49107,6 +49175,10 @@ async function removeProbeProcessJournal(input) {
 }
 
 // packages/runtime/src/github.ts
+function compareGitHubIdentityStrings(left, right, hashAlgorithm) {
+  if (hashAlgorithm === LEGACY_CANONICAL_HASH_ALGORITHM) return left.localeCompare(right);
+  return left < right ? -1 : left > right ? 1 : 0;
+}
 function commandOptions(workspace, options = {}) {
   return { cwd: workspace.path, ...options };
 }
@@ -49212,15 +49284,18 @@ async function confirmCandidate(workspace, expected, candidate, options) {
     throw new Error(`Pull request #${candidate.number} moved before confirmation`);
   return current;
 }
-async function createPullRequestClaim(workspace, contract, nodeId, options = {}) {
+async function createPullRequestClaim(workspace, contract, nodeId, hashAlgorithm, options = {}) {
   if (contract.repository.baseRef === "HEAD")
     throw new Error("A pull-request finish line requires a named base branch");
-  const actionId = contentHash({
-    schemaVersion: 1,
-    runId: contract.runId,
-    nodeId,
-    kind: "github_pr_create"
-  });
+  const actionId = contentHash(
+    {
+      schemaVersion: 1,
+      runId: contract.runId,
+      nodeId,
+      kind: "github_pr_create"
+    },
+    hashAlgorithm
+  );
   const idempotencyKey = `graphcraft-${actionId}`;
   const github = commandOptions(workspace, options);
   const capability = await assertGitHubPushCapability({
@@ -49254,7 +49329,7 @@ async function createPullRequestClaim(workspace, contract, nodeId, options = {})
     headSha,
     baseSha,
     title,
-    bodyHash: contentHash(body),
+    bodyHash: contentHash(body, hashAlgorithm),
     expectedPullRequestNumber: null
   };
   const candidates = await listGitHubPullRequestsForHead(github, {
@@ -49284,7 +49359,7 @@ async function createPullRequestClaim(workspace, contract, nodeId, options = {})
     claimedAt: (/* @__PURE__ */ new Date()).toISOString()
   });
 }
-async function reconcilePullRequest(workspace, claim, options = {}) {
+async function reconcilePullRequest(workspace, claim, hashAlgorithm, options = {}) {
   if (claim.kind !== "github_pr_create")
     throw new Error(`Side effect ${claim.actionId} is not a pull-request creation`);
   const expected = pullRequestPrecondition(claim);
@@ -49347,7 +49422,7 @@ async function reconcilePullRequest(workspace, claim, options = {}) {
       ]
     };
   const current = await confirmCandidate(workspace, expected, matching[0], options);
-  if (contentHash(current.body) !== expected.bodyHash)
+  if (contentHash(current.body, hashAlgorithm) !== expected.bodyHash)
     return {
       status: "unknown",
       evidence: [
@@ -49367,7 +49442,7 @@ async function reconcilePullRequest(workspace, claim, options = {}) {
     evidence: [...bindingEvidence, `Pull request #${current.number} carries the action marker`]
   };
 }
-async function performPullRequestCreation(workspace, claim, options = {}, boundary) {
+async function performPullRequestCreation(workspace, claim, hashAlgorithm, options = {}, boundary) {
   if (claim.kind !== "github_pr_create")
     throw new Error(`Side effect ${claim.actionId} is not a pull-request creation`);
   const expected = pullRequestPrecondition(claim);
@@ -49380,7 +49455,7 @@ async function performPullRequestCreation(workspace, claim, options = {}, bounda
   if (candidates.length > 0)
     throw new Error(`A pull request appeared for ${expected.headRefName} before creation`);
   const body = pullRequestBody(claim.idempotencyKey);
-  if (contentHash(body) !== expected.bodyHash)
+  if (contentHash(body, hashAlgorithm) !== expected.bodyHash)
     throw new Error(`Pull-request body changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
   await createGitHubPullRequest(commandOptions(workspace, options), {
@@ -49508,7 +49583,7 @@ function lifecycleProjection(snapshot, classification) {
     rateLimit: snapshot.rateLimit
   };
 }
-async function capturePullRequestLifecycleProbe(workspace, contract, claim, result, spec, options = {}) {
+async function capturePullRequestLifecycleProbe(workspace, contract, claim, result, spec, hashAlgorithm, options = {}) {
   if (claim.kind !== "github_pr_create")
     throw new Error(`Side effect ${claim.actionId} is not a pull-request creation`);
   const expected = pullRequestPrecondition(claim);
@@ -49522,26 +49597,34 @@ async function capturePullRequestLifecycleProbe(workspace, contract, claim, resu
     number4,
     spec,
     result.headSha === expected.headSha && result.baseSha === expected.baseSha,
+    hashAlgorithm,
     options
   );
 }
-async function captureExpectedPullRequestLifecycle(workspace, contract, expected, number4, spec, resultBindingMatches, options) {
+async function captureExpectedPullRequestLifecycle(workspace, contract, expected, number4, spec, resultBindingMatches, hashAlgorithm, options) {
   const started = performance.now();
   const github = commandOptions(workspace, options);
   await assertCurrentRemoteBinding(workspace, expected);
-  const snapshot = await captureGitHubPullRequestSnapshot({ ...github, pullRequest: number4 });
-  await assertGitHubSnapshotCurrent(github, snapshot);
+  const snapshot = await captureGitHubPullRequestSnapshot(
+    { ...github, pullRequest: number4 },
+    hashAlgorithm
+  );
+  await assertGitHubSnapshotCurrent(github, snapshot, hashAlgorithm);
   const expectedState = spec.expectedState.toUpperCase();
   const actionBindingMatchesContract = (contract.finishLine.kind === "pr_open" || contract.finishLine.kind === "pr_green") && expected.baseRefName === contract.repository.baseRef && resultBindingMatches;
-  const classification = classifyGitHubPullRequestLifecycle(snapshot, {
-    host: expected.host,
-    nameWithOwner: expected.nameWithOwner,
-    number: number4,
-    headRefName: expected.headRefName,
-    baseRefName: expected.baseRefName,
-    headSha: expected.headSha,
-    baseSha: expected.baseSha
-  });
+  const classification = classifyGitHubPullRequestLifecycle(
+    snapshot,
+    {
+      host: expected.host,
+      nameWithOwner: expected.nameWithOwner,
+      number: number4,
+      headRefName: expected.headRefName,
+      baseRefName: expected.baseRefName,
+      headSha: expected.headSha,
+      baseSha: expected.baseSha
+    },
+    hashAlgorithm
+  );
   const counts = classification.counts;
   const stateMatches = snapshot.pullRequest.state.toUpperCase() === expectedState;
   const checksMatch = spec.requiredChecks === "observe" || counts.requiredChecksSucceeded === counts.requiredChecksTotal && counts.requiredChecksPending === 0 && counts.requiredChecksActionableFailure === 0 && counts.requiredChecksInfrastructureFailure === 0 && counts.requiredChecksCancelled === 0 && counts.requiredChecksMissingOrUnknown === 0;
@@ -49558,11 +49641,12 @@ async function captureExpectedPullRequestLifecycle(workspace, contract, expected
       latestComment: latestComment ? {
         id: latestComment.id,
         author: latestComment.author ?? null,
-        bodyHash: contentHash(latestComment.body),
+        bodyHash: contentHash(latestComment.body, hashAlgorithm),
         url: latestComment.url,
         createdAt: latestComment.createdAt
       } : null
-    }))
+    })),
+    hashAlgorithm
   );
   const actionableCheckIds = new Set(classification.checkIds.actionable);
   const ciFailures = snapshot.checks.filter(({ id }) => actionableCheckIds.has(id)).map(({ id, kind, name, status: status3, conclusion, appId, detailsUrl }) => ({
@@ -49575,20 +49659,25 @@ async function captureExpectedPullRequestLifecycle(workspace, contract, expected
     ...appId !== void 0 ? { appId } : {},
     ...detailsUrl ? { detailsUrl } : {}
   }));
-  const ciFailureSignature = contentHash({
-    mergeable: snapshot.pullRequest.mergeable,
-    failures: ciFailures.map(({ kind, name, status: status3, conclusion, appId }) => ({
-      kind,
-      name,
-      status: status3,
-      conclusion: conclusion ?? null,
-      appId: appId ?? null
-    })).sort(
-      (left, right) => `${left.kind}:${left.name}:${left.appId ?? ""}`.localeCompare(
-        `${right.kind}:${right.name}:${right.appId ?? ""}`
+  const ciFailureSignature = contentHash(
+    {
+      mergeable: snapshot.pullRequest.mergeable,
+      failures: ciFailures.map(({ kind, name, status: status3, conclusion, appId }) => ({
+        kind,
+        name,
+        status: status3,
+        conclusion: conclusion ?? null,
+        appId: appId ?? null
+      })).sort(
+        (left, right) => compareGitHubIdentityStrings(
+          `${left.kind}:${left.name}:${left.appId ?? ""}`,
+          `${right.kind}:${right.name}:${right.appId ?? ""}`,
+          hashAlgorithm
+        )
       )
-    )
-  });
+    },
+    hashAlgorithm
+  );
   const rerunnableCheckIds = /* @__PURE__ */ new Set([
     ...classification.checkIds.infrastructure,
     ...classification.checkIds.cancelled
@@ -49703,14 +49792,17 @@ async function assertPullRequestBinding(workspace, expected, number4, options) {
   ];
 }
 function createReviewReplyClaim(input) {
-  const actionId = contentHash({
-    schemaVersion: 1,
-    runId: input.contract.runId,
-    nodeId: input.nodeId,
-    kind: "github_pr_comment",
-    threadId: input.feedback.threadId,
-    headSha: input.binding.expected.headSha
-  });
+  const actionId = contentHash(
+    {
+      schemaVersion: 1,
+      runId: input.contract.runId,
+      nodeId: input.nodeId,
+      kind: "github_pr_comment",
+      threadId: input.feedback.threadId,
+      headSha: input.binding.expected.headSha
+    },
+    input.hashAlgorithm
+  );
   const idempotencyKey = `graphcraft-${actionId}`;
   const body = reviewReplyBody(input.binding.expected.headSha, idempotencyKey);
   return SideEffectClaimSchema.parse({
@@ -49725,13 +49817,13 @@ function createReviewReplyClaim(input) {
       number: input.binding.number,
       threadId: input.feedback.threadId,
       feedbackCommentId: input.feedback.latestComment?.id ?? null,
-      feedbackBodyHash: input.feedback.latestComment ? contentHash(input.feedback.latestComment.body) : null,
-      replyBodyHash: contentHash(body)
+      feedbackBodyHash: input.feedback.latestComment ? contentHash(input.feedback.latestComment.body, input.hashAlgorithm) : null,
+      replyBodyHash: contentHash(body, input.hashAlgorithm)
     },
     claimedAt: (/* @__PURE__ */ new Date()).toISOString()
   });
 }
-async function reconcileReviewReply(workspace, claim, options) {
+async function reconcileReviewReply(workspace, claim, hashAlgorithm, options) {
   if (claim.kind !== "github_pr_comment")
     throw new Error(`Side effect ${claim.actionId} is not a review reply`);
   const expected = reviewReplyPrecondition(claim);
@@ -49750,7 +49842,7 @@ async function reconcileReviewReply(workspace, claim, options) {
   });
   const marker = `<!-- Graphcraft-Action: ${claim.idempotencyKey} -->`;
   const replies = thread.comments.filter(({ body }) => body.includes(marker));
-  if (replies.length === 1 && contentHash(replies[0].body) === expected.replyBodyHash)
+  if (replies.length === 1 && contentHash(replies[0].body, hashAlgorithm) === expected.replyBodyHash)
     return {
       status: "applied",
       result: { threadId: thread.id, commentId: replies[0].id, url: replies[0].url },
@@ -49762,7 +49854,7 @@ async function reconcileReviewReply(workspace, claim, options) {
       evidence: [...evidence, `Review thread ${thread.id} has an ambiguous action reply`]
     };
   const latest = thread.comments.at(-1);
-  const feedbackMatches = (expected.feedbackCommentId === null ? latest === void 0 : latest?.id === expected.feedbackCommentId) && (expected.feedbackBodyHash === null ? latest === void 0 : latest !== void 0 && contentHash(latest.body) === expected.feedbackBodyHash);
+  const feedbackMatches = (expected.feedbackCommentId === null ? latest === void 0 : latest?.id === expected.feedbackCommentId) && (expected.feedbackBodyHash === null ? latest === void 0 : latest !== void 0 && contentHash(latest.body, hashAlgorithm) === expected.feedbackBodyHash);
   if (thread.isResolved || thread.isOutdated || !feedbackMatches)
     return {
       status: "unknown",
@@ -49776,7 +49868,7 @@ async function reconcileReviewReply(workspace, claim, options) {
     evidence: [...evidence, `Review thread ${thread.id} has no action reply yet`]
   };
 }
-async function performReviewReply(workspace, claim, options, boundary) {
+async function performReviewReply(workspace, claim, hashAlgorithm, options, boundary) {
   const expected = reviewReplyPrecondition(claim);
   await assertPullRequestBinding(workspace, expected, expected.number, options);
   const thread = await readGitHubReviewThread(commandOptions(workspace, options), {
@@ -49784,10 +49876,10 @@ async function performReviewReply(workspace, claim, options, boundary) {
     threadId: expected.threadId
   });
   const latest = thread.comments.at(-1);
-  if (thread.isResolved || thread.isOutdated || (expected.feedbackCommentId === null ? latest !== void 0 : latest?.id !== expected.feedbackCommentId) || expected.feedbackBodyHash !== null && (!latest || contentHash(latest.body) !== expected.feedbackBodyHash))
+  if (thread.isResolved || thread.isOutdated || (expected.feedbackCommentId === null ? latest !== void 0 : latest?.id !== expected.feedbackCommentId) || expected.feedbackBodyHash !== null && (!latest || contentHash(latest.body, hashAlgorithm) !== expected.feedbackBodyHash))
     throw new Error(`Review thread ${expected.threadId} moved before reply`);
   const body = reviewReplyBody(expected.headSha, claim.idempotencyKey);
-  if (contentHash(body) !== expected.replyBodyHash)
+  if (contentHash(body, hashAlgorithm) !== expected.replyBodyHash)
     throw new Error(`Review reply body changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
   const reply = await addGitHubReviewThreadReply(commandOptions(workspace, options), {
@@ -49803,14 +49895,17 @@ function createReviewResolutionClaim(input) {
   const commentId = input.replyResult.commentId;
   if (typeof commentId !== "string")
     throw new Error(`Review reply ${input.replyClaim.actionId} has no confirmed comment ID`);
-  const actionId = contentHash({
-    schemaVersion: 1,
-    runId: input.contract.runId,
-    nodeId: input.nodeId,
-    kind: "github_review_thread_resolve",
-    threadId: input.feedback.threadId,
-    headSha: input.binding.expected.headSha
-  });
+  const actionId = contentHash(
+    {
+      schemaVersion: 1,
+      runId: input.contract.runId,
+      nodeId: input.nodeId,
+      kind: "github_review_thread_resolve",
+      threadId: input.feedback.threadId,
+      headSha: input.binding.expected.headSha
+    },
+    input.hashAlgorithm
+  );
   return SideEffectClaimSchema.parse({
     schemaVersion: 1,
     actionId,
@@ -49829,7 +49924,7 @@ function createReviewResolutionClaim(input) {
     claimedAt: (/* @__PURE__ */ new Date()).toISOString()
   });
 }
-async function reconcileReviewResolution(workspace, claim, options) {
+async function reconcileReviewResolution(workspace, claim, hashAlgorithm, options) {
   if (claim.kind !== "github_review_thread_resolve")
     throw new Error(`Side effect ${claim.actionId} is not a review-thread resolution`);
   const expected = reviewResolutionPrecondition(claim);
@@ -49847,7 +49942,7 @@ async function reconcileReviewResolution(workspace, claim, options) {
     threadId: expected.threadId
   });
   const reply = thread.comments.find(
-    ({ id, body }) => id === expected.replyCommentId && body.includes(`<!-- Graphcraft-Action: ${expected.replyIdempotencyKey} -->`) && contentHash(body) === expected.replyBodyHash
+    ({ id, body }) => id === expected.replyCommentId && body.includes(`<!-- Graphcraft-Action: ${expected.replyIdempotencyKey} -->`) && contentHash(body, hashAlgorithm) === expected.replyBodyHash
   );
   if (!reply)
     return {
@@ -49871,7 +49966,7 @@ async function reconcileReviewResolution(workspace, claim, options) {
     evidence: [...evidence, `Review thread ${thread.id} remains unresolved`]
   };
 }
-async function performReviewResolution(workspace, claim, options, boundary) {
+async function performReviewResolution(workspace, claim, hashAlgorithm, options, boundary) {
   const expected = reviewResolutionPrecondition(claim);
   await assertPullRequestBinding(workspace, expected, expected.number, options);
   const thread = await readGitHubReviewThread(commandOptions(workspace, options), {
@@ -49879,7 +49974,7 @@ async function performReviewResolution(workspace, claim, options, boundary) {
     threadId: expected.threadId
   });
   const reply = thread.comments.find(
-    ({ id, body }) => id === expected.replyCommentId && body.includes(`<!-- Graphcraft-Action: ${expected.replyIdempotencyKey} -->`) && contentHash(body) === expected.replyBodyHash
+    ({ id, body }) => id === expected.replyCommentId && body.includes(`<!-- Graphcraft-Action: ${expected.replyIdempotencyKey} -->`) && contentHash(body, hashAlgorithm) === expected.replyBodyHash
   );
   if (!reply || thread.isResolved || thread.comments.at(-1)?.id !== reply.id)
     throw new Error(`Review thread ${expected.threadId} is not ready for resolution`);
@@ -49915,14 +50010,17 @@ function checkRerunPrecondition(claim) {
     throw new Error(`Check-rerun claim ${claim.actionId} has an invalid precondition`);
   return fields;
 }
-async function currentBoundCheck(workspace, expected, options) {
+async function currentBoundCheck(workspace, expected, hashAlgorithm, options) {
   const evidence = await assertPullRequestBinding(workspace, expected, expected.number, options);
   const github = commandOptions(workspace, options);
-  const snapshot = await captureGitHubPullRequestSnapshot({
-    ...github,
-    pullRequest: expected.number
-  });
-  await assertGitHubSnapshotCurrent(github, snapshot);
+  const snapshot = await captureGitHubPullRequestSnapshot(
+    {
+      ...github,
+      pullRequest: expected.number
+    },
+    hashAlgorithm
+  );
+  await assertGitHubSnapshotCurrent(github, snapshot, hashAlgorithm);
   if (snapshot.repository.host !== expected.host || snapshot.repository.nameWithOwner !== expected.nameWithOwner || snapshot.binding.headSha !== expected.headSha || snapshot.binding.baseSha !== expected.baseSha)
     throw new Error(`Check-rerun snapshot moved from ${expected.headSha}/${expected.baseSha}`);
   const check2 = snapshot.checks.find(
@@ -49931,17 +50029,20 @@ async function currentBoundCheck(workspace, expected, options) {
   return { evidence, check: check2 };
 }
 function createCheckRerunClaim(input) {
-  const actionId = contentHash({
-    schemaVersion: 1,
-    runId: input.contract.runId,
-    nodeId: input.nodeId,
-    kind: "github_check_rerun",
-    headSha: input.binding.expected.headSha,
-    checkId: input.check.id,
-    databaseId: input.check.databaseId,
-    status: input.check.status,
-    conclusion: input.check.conclusion ?? null
-  });
+  const actionId = contentHash(
+    {
+      schemaVersion: 1,
+      runId: input.contract.runId,
+      nodeId: input.nodeId,
+      kind: "github_check_rerun",
+      headSha: input.binding.expected.headSha,
+      checkId: input.check.id,
+      databaseId: input.check.databaseId,
+      status: input.check.status,
+      conclusion: input.check.conclusion ?? null
+    },
+    input.hashAlgorithm
+  );
   return SideEffectClaimSchema.parse({
     schemaVersion: 1,
     actionId,
@@ -49962,13 +50063,13 @@ function createCheckRerunClaim(input) {
     claimedAt: (/* @__PURE__ */ new Date()).toISOString()
   });
 }
-async function reconcileCheckRerun(workspace, claim, options) {
+async function reconcileCheckRerun(workspace, claim, hashAlgorithm, options) {
   if (claim.kind !== "github_check_rerun")
     throw new Error(`Side effect ${claim.actionId} is not a check rerun`);
   const expected = checkRerunPrecondition(claim);
   let current;
   try {
-    current = await currentBoundCheck(workspace, expected, options);
+    current = await currentBoundCheck(workspace, expected, hashAlgorithm, options);
   } catch (error51) {
     if (error51 instanceof GitHubLifecycleConsistencyError) throw error51;
     return {
@@ -50009,9 +50110,9 @@ async function reconcileCheckRerun(workspace, claim, options) {
     ]
   };
 }
-async function performCheckRerun(workspace, claim, options, markDispatched, boundary) {
+async function performCheckRerun(workspace, claim, hashAlgorithm, options, markDispatched, boundary) {
   const expected = checkRerunPrecondition(claim);
-  const current = await currentBoundCheck(workspace, expected, options);
+  const current = await currentBoundCheck(workspace, expected, hashAlgorithm, options);
   const check2 = current.check;
   if (!check2 || check2.kind !== "check_run" || check2.name !== expected.checkName || check2.status !== expected.checkStatus || (check2.conclusion ?? null) !== expected.checkConclusion)
     throw new Error(`Check run ${expected.checkId} moved before rerun`);
@@ -50050,21 +50151,26 @@ async function rerunLifecycleChecks(input) {
     );
   const binding = lifecycleBinding(state, input.node);
   const options = input.options ?? {};
+  const hashAlgorithm = input.store.githubMutationLifecycleIdentityHashAlgorithm;
   const evidence = [];
-  for (const check2 of pending.sort((left, right) => left.id.localeCompare(right.id))) {
+  for (const check2 of pending.sort(
+    (left, right) => compareGitHubIdentityStrings(left.id, right.id, hashAlgorithm)
+  )) {
     const claim = createCheckRerunClaim({
       contract: input.contract,
       nodeId: input.node.id,
       binding,
-      check: check2
+      check: check2,
+      hashAlgorithm
     });
     const result = await executeSideEffect({
       store: input.store,
       claim,
-      reconcile: async (currentClaim) => await reconcileCheckRerun(input.workspace, currentClaim, options),
+      reconcile: async (currentClaim) => await reconcileCheckRerun(input.workspace, currentClaim, hashAlgorithm, options),
       act: async (currentClaim, markDispatched) => await performCheckRerun(
         input.workspace,
         currentClaim,
+        hashAlgorithm,
         options,
         markDispatched,
         input.boundary
@@ -50088,9 +50194,11 @@ function hasReviewThreadActions(state, lifecycle) {
 }
 async function reconcileReviewThreadActions(input) {
   const options = input.options ?? {};
+  await input.store.prepareStorage();
+  const hashAlgorithm = input.store.githubMutationLifecycleIdentityHashAlgorithm;
   const evidence = [];
   for (const feedback of [...input.lifecycle.reviewFeedback].sort(
-    (left, right) => left.threadId.localeCompare(right.threadId)
+    (left, right) => compareGitHubIdentityStrings(left.threadId, right.threadId, hashAlgorithm)
   )) {
     let state = await input.store.loadState();
     const binding = lifecycleBinding(state, input.node);
@@ -50101,13 +50209,14 @@ async function reconcileReviewThreadActions(input) {
       contract: input.contract,
       nodeId: input.node.id,
       binding,
-      feedback
+      feedback,
+      hashAlgorithm
     });
     const replyResult = await executeSideEffect({
       store: input.store,
       claim: replyClaim,
-      reconcile: async (claim) => await reconcileReviewReply(input.workspace, claim, options),
-      act: async (claim) => await performReviewReply(input.workspace, claim, options, input.boundary),
+      reconcile: async (claim) => await reconcileReviewReply(input.workspace, claim, hashAlgorithm, options),
+      act: async (claim) => await performReviewReply(input.workspace, claim, hashAlgorithm, options, input.boundary),
       revalidateConfirmed: true,
       ...input.boundary ? { boundary: input.boundary } : {}
     });
@@ -50121,13 +50230,20 @@ async function reconcileReviewThreadActions(input) {
       binding,
       feedback,
       replyClaim,
-      replyResult
+      replyResult,
+      hashAlgorithm
     });
     const resolutionResult = await executeSideEffect({
       store: input.store,
       claim: resolutionClaim,
-      reconcile: async (claim) => await reconcileReviewResolution(input.workspace, claim, options),
-      act: async (claim) => await performReviewResolution(input.workspace, claim, options, input.boundary),
+      reconcile: async (claim) => await reconcileReviewResolution(input.workspace, claim, hashAlgorithm, options),
+      act: async (claim) => await performReviewResolution(
+        input.workspace,
+        claim,
+        hashAlgorithm,
+        options,
+        input.boundary
+      ),
       revalidateConfirmed: true,
       ...input.boundary ? { boundary: input.boundary } : {}
     });
@@ -50141,6 +50257,7 @@ async function reconcileReviewThreadActions(input) {
 async function reconcilePendingGitHubActions(input) {
   const options = input.options ?? {};
   const state = await input.store.loadState();
+  const hashAlgorithm = input.store.githubMutationLifecycleIdentityHashAlgorithm;
   const pending = state.sideEffects.filter(
     ({ claim, status: status3 }) => claim.nodeId === input.node.id && ["github_pr_comment", "github_review_thread_resolve", "github_check_rerun"].includes(
       claim.kind
@@ -50153,19 +50270,32 @@ async function reconcilePendingGitHubActions(input) {
       claim: entry.claim,
       reconcile: async (claim) => {
         if (claim.kind === "github_pr_comment")
-          return await reconcileReviewReply(input.workspace, claim, options);
+          return await reconcileReviewReply(input.workspace, claim, hashAlgorithm, options);
         if (claim.kind === "github_review_thread_resolve")
-          return await reconcileReviewResolution(input.workspace, claim, options);
-        return await reconcileCheckRerun(input.workspace, claim, options);
+          return await reconcileReviewResolution(input.workspace, claim, hashAlgorithm, options);
+        return await reconcileCheckRerun(input.workspace, claim, hashAlgorithm, options);
       },
       act: async (claim, markDispatched) => {
         if (claim.kind === "github_pr_comment")
-          return await performReviewReply(input.workspace, claim, options, input.boundary);
+          return await performReviewReply(
+            input.workspace,
+            claim,
+            hashAlgorithm,
+            options,
+            input.boundary
+          );
         if (claim.kind === "github_review_thread_resolve")
-          return await performReviewResolution(input.workspace, claim, options, input.boundary);
+          return await performReviewResolution(
+            input.workspace,
+            claim,
+            hashAlgorithm,
+            options,
+            input.boundary
+          );
         return await performCheckRerun(
           input.workspace,
           claim,
+          hashAlgorithm,
           options,
           markDispatched,
           input.boundary
@@ -50401,6 +50531,7 @@ async function evaluateGitHubLifecycleWait(input) {
         reviewThreads: "resolved"
       },
       binding.pullRequestResult.baseSha === originalExpected.baseSha && (boundaryNodeId !== binding.pullRequestClaim.nodeId || binding.pullRequestResult.headSha === originalExpected.headSha),
+      input.store.githubMutationLifecycleIdentityHashAlgorithm,
       input.options ?? {}
     );
   } catch (error51) {
@@ -50467,11 +50598,14 @@ async function evaluateGitHubLifecycleWait(input) {
       ...lifecycle.classification.evidence,
       "The earlier human changes-requested decision remains sticky until an explicit approval"
     ];
-    const signature = contentHash({
-      snapshotId: lifecycle.classification.snapshotId,
-      status: "human_decision",
-      stickyHumanDecision: wait.stickyHumanDecision
-    });
+    const signature = contentHash(
+      {
+        snapshotId: lifecycle.classification.snapshotId,
+        status: "human_decision",
+        stickyHumanDecision: wait.stickyHumanDecision
+      },
+      input.store.githubMutationLifecycleIdentityHashAlgorithm
+    );
     const classification = {
       ...lifecycle.classification,
       status: "human_decision",
@@ -51196,6 +51330,7 @@ async function captureProbes(store, specs, workspace, observer, signal, githubLi
           githubLifecycle.claim,
           githubLifecycle.result,
           spec,
+          store.githubMutationLifecycleIdentityHashAlgorithm,
           githubLifecycle.options
         )
       );
@@ -54680,14 +54815,26 @@ async function executeRun(input) {
           const existingClaim = (await input.store.loadState()).sideEffects.find(
             ({ claim }) => claim.nodeId === current.id && claim.kind === "github_pr_create"
           )?.claim;
-          const proposedClaim = existingClaim ?? await createPullRequestClaim(workspace, contract, current.id, input.github);
+          const proposedClaim = existingClaim ?? await createPullRequestClaim(
+            workspace,
+            contract,
+            current.id,
+            input.store.githubMutationLifecycleIdentityHashAlgorithm,
+            input.github
+          );
           const result = await executeSideEffect({
             store: input.store,
             claim: proposedClaim,
-            reconcile: async (claim) => await reconcilePullRequest(workspace, claim, input.github),
+            reconcile: async (claim) => await reconcilePullRequest(
+              workspace,
+              claim,
+              input.store.githubMutationLifecycleIdentityHashAlgorithm,
+              input.github
+            ),
             act: async (claim) => await performPullRequestCreation(
               workspace,
               claim,
+              input.store.githubMutationLifecycleIdentityHashAlgorithm,
               input.github,
               input.sideEffectBoundary
             ),
