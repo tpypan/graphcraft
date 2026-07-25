@@ -32521,6 +32521,7 @@ var ArtifactInventoryReasonSchema = external_exports.enum([
 var MAX_ARTIFACT_PATH_CHARACTERS = 4 * 1024;
 var MAX_ARTIFACT_INVENTORY_BYTES = 8 * 1024 * 1024;
 var MAX_ARTIFACT_INVENTORY_PATH_BYTES = 1024 * 1024;
+var MAX_ARTIFACT_INVENTORY_ENTRIES = 16 * 1024;
 var WINDOWS_INVALID_ARTIFACT_SEGMENT = /[\u0000-\u001f<>:"|?*]/u;
 var WINDOWS_RESERVED_ARTIFACT_SEGMENT = /^(?:aux|clock\$|con|conin\$|conout\$|nul|prn|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/iu;
 var UNPAIRED_SURROGATE = /[\ud800-\udfff]/u;
@@ -32631,7 +32632,7 @@ var ArtifactInventorySchema = external_exports.strictObject({
   sourceBytes: external_exports.number().int().nonnegative(),
   storedBytes: external_exports.number().int().nonnegative(),
   omittedBytes: external_exports.number().int().nonnegative(),
-  entries: external_exports.array(ArtifactInventoryEntrySchema).max(16 * 1024),
+  entries: external_exports.array(ArtifactInventoryEntrySchema).max(MAX_ARTIFACT_INVENTORY_ENTRIES),
   updatedAt: external_exports.iso.datetime()
 }).superRefine((inventory, context) => {
   const paths = /* @__PURE__ */ new Set();
@@ -32721,7 +32722,10 @@ var RunStorageManifestSchema = external_exports.union([
     formats: RunStorageFormatsV2Schema.extend({
       heldOutProbes: external_exports.union([external_exports.literal(1), external_exports.literal(2)]),
       events: external_exports.union([external_exports.literal(1), external_exports.literal(2)]),
-      artifactInventory: external_exports.union([external_exports.literal(1), external_exports.literal(2)])
+      artifactInventory: external_exports.union([external_exports.literal(1), external_exports.literal(2)]),
+      // Schema v3 predates this independent domain selector. An omitted field
+      // is therefore an explicit legacy-v1 declaration, never a v2 inference.
+      workspaceScopeSnapshots: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).default(1)
     })
   })
 ]);
@@ -38889,6 +38893,359 @@ async function replacePathAtomic(temporaryPath, path) {
   if (sourceDirectory !== targetDirectory) await syncDirectory(sourceDirectory);
 }
 
+// packages/runtime/src/windows-acl-helper.ts
+var LEGACY_TREE_TARGET_CAPACITY = 1 + 8 * 1024;
+var CURRENT_TREE_TOPOLOGY_TARGET_CAPACITY = MAX_ARTIFACT_INVENTORY_PATH_BYTES + MAX_ARTIFACT_INVENTORY_ENTRIES;
+var GRAPHCRAFT_OWNED_STATE_TARGET_RESERVE = 1024;
+var WINDOWS_ACL_REQUEST_LIMITS = Object.freeze({
+  // Every unique artifact parent consumes at least one slash byte in inventory
+  // path metadata. Adding the entry count therefore bounds arbitrary parent
+  // depth without assuming one parent per artifact. Legacy and core state get
+  // independent capacity because hardening includes the owned root itself.
+  maximumTargets: LEGACY_TREE_TARGET_CAPACITY + CURRENT_TREE_TOPOLOGY_TARGET_CAPACITY + GRAPHCRAFT_OWNED_STATE_TARGET_RESERVE,
+  // BEGIN/CHUNK/COMMIT streams avoid a giant whole-tree line. Each individual
+  // line remains small enough for bounded Node and PowerShell allocation.
+  maximumLineBytes: 64 * 1024
+});
+function base64EncodedLength(bytes) {
+  return 4 * Math.ceil(bytes / 3);
+}
+function assertRequestLimits(limits) {
+  if (!Number.isSafeInteger(limits.maximumLineBytes) || limits.maximumLineBytes <= 0 || !Number.isSafeInteger(limits.maximumTargets) || limits.maximumTargets <= 0)
+    throw new Error("Windows ACL helper request limits must be positive safe integers");
+}
+function assertWindowsAclTargetCount(count, limits = WINDOWS_ACL_REQUEST_LIMITS) {
+  assertRequestLimits(limits);
+  if (!Number.isSafeInteger(count) || count <= 0)
+    throw new Error("Windows ACL helper request target count must be a positive safe integer");
+  if (count > limits.maximumTargets)
+    throw new Error(`Windows ACL helper request exceeds its ${limits.maximumTargets}-target limit`);
+}
+function decodeCanonicalBase64(value) {
+  if (value.length === 0 || value.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value))
+    throw new Error("Windows ACL helper returned malformed base64 output");
+  const decoded = Buffer.from(value, "base64");
+  if (decoded.toString("base64") !== value)
+    throw new Error("Windows ACL helper returned non-canonical base64 output");
+  return decoded;
+}
+function chunkHeader(requestId, chunkIndex, targetCount) {
+  return `GRAPHCRAFT_ACL_CHUNK	${requestId}	${chunkIndex}	${targetCount}	`;
+}
+function recordBytes(entry, index) {
+  if (entry.kind !== "directory" && entry.kind !== "file" || entry.path.length === 0 || entry.path.includes("\0"))
+    throw new Error(`Windows ACL helper target ${index + 1} is invalid`);
+  return 2 + base64EncodedLength(Buffer.byteLength(entry.path, "utf8"));
+}
+function planWindowsAclRequest(requestId, entries, limits = WINDOWS_ACL_REQUEST_LIMITS) {
+  if (!/^[1-9][0-9]*$/.test(requestId))
+    throw new Error("Windows ACL helper request identifier must be canonical decimal");
+  assertWindowsAclTargetCount(entries.length, limits);
+  const chunks = [];
+  let chunkStart = 0;
+  let chunkTargets = 0;
+  let targetPayloadBytes = 0;
+  for (const [entryIndex, entry] of entries.entries()) {
+    const nextRecordBytes = recordBytes(entry, entryIndex);
+    const nextTargetCount = chunkTargets + 1;
+    const nextPayloadBytes = targetPayloadBytes + (chunkTargets === 0 ? 0 : 1) + nextRecordBytes;
+    const nextLineBytes = Buffer.byteLength(chunkHeader(requestId, chunks.length, nextTargetCount), "utf8") + base64EncodedLength(nextPayloadBytes) + 1;
+    if (nextLineBytes > limits.maximumLineBytes) {
+      if (chunkTargets === 0)
+        throw new Error(
+          `Windows ACL helper target ${entryIndex + 1} exceeds its ${limits.maximumLineBytes}-byte encoded line limit`
+        );
+      const encodedLineBytes2 = Buffer.byteLength(chunkHeader(requestId, chunks.length, chunkTargets), "utf8") + base64EncodedLength(targetPayloadBytes) + 1;
+      chunks.push({
+        index: chunks.length,
+        start: chunkStart,
+        end: entryIndex,
+        targetPayloadBytes,
+        encodedLineBytes: encodedLineBytes2
+      });
+      chunkStart = entryIndex;
+      chunkTargets = 1;
+      targetPayloadBytes = nextRecordBytes;
+      const singleLineBytes = Buffer.byteLength(chunkHeader(requestId, chunks.length, 1), "utf8") + base64EncodedLength(targetPayloadBytes) + 1;
+      if (singleLineBytes > limits.maximumLineBytes)
+        throw new Error(
+          `Windows ACL helper target ${entryIndex + 1} exceeds its ${limits.maximumLineBytes}-byte encoded line limit`
+        );
+    } else {
+      chunkTargets = nextTargetCount;
+      targetPayloadBytes = nextPayloadBytes;
+    }
+  }
+  const encodedLineBytes = Buffer.byteLength(chunkHeader(requestId, chunks.length, chunkTargets), "utf8") + base64EncodedLength(targetPayloadBytes) + 1;
+  chunks.push({
+    index: chunks.length,
+    start: chunkStart,
+    end: entries.length,
+    targetPayloadBytes,
+    encodedLineBytes
+  });
+  const begin = `GRAPHCRAFT_ACL_BEGIN	${requestId}	${entries.length}	${chunks.length}
+`;
+  const commit = `GRAPHCRAFT_ACL_COMMIT	${requestId}	${chunks.length}	${entries.length}
+`;
+  if (Buffer.byteLength(begin, "utf8") > limits.maximumLineBytes || Buffer.byteLength(commit, "utf8") > limits.maximumLineBytes)
+    throw new Error("Windows ACL helper request metadata exceeds its encoded line limit");
+  return { requestId, targetCount: entries.length, chunks, lineCount: chunks.length + 2 };
+}
+function* encodeWindowsAclRequest(plan, entries) {
+  if (entries.length !== plan.targetCount)
+    throw new Error("Windows ACL helper target count changed after request planning");
+  yield `GRAPHCRAFT_ACL_BEGIN	${plan.requestId}	${plan.targetCount}	${plan.chunks.length}
+`;
+  for (const chunk of plan.chunks) {
+    const records = [];
+    for (let index = chunk.start; index < chunk.end; index += 1) {
+      const entry = entries[index];
+      if (entry === void 0)
+        throw new Error("Windows ACL helper target disappeared after request planning");
+      records.push(
+        `${entry.kind === "directory" ? "D" : "F"}	${Buffer.from(entry.path, "utf8").toString("base64")}`
+      );
+    }
+    const targets = records.join("\n");
+    if (Buffer.byteLength(targets, "utf8") !== chunk.targetPayloadBytes)
+      throw new Error("Windows ACL helper target changed after request planning");
+    const line = `${chunkHeader(plan.requestId, chunk.index, chunk.end - chunk.start)}${Buffer.from(targets, "utf8").toString("base64")}
+`;
+    if (Buffer.byteLength(line, "utf8") !== chunk.encodedLineBytes)
+      throw new Error("Windows ACL helper chunk length changed during encoding");
+    yield line;
+  }
+  yield `GRAPHCRAFT_ACL_COMMIT	${plan.requestId}	${plan.chunks.length}	${plan.targetCount}
+`;
+}
+function parseWindowsAclResponse(line, requestId, expectedCount) {
+  const parts = line.split("	");
+  if (parts.length === 3 && parts[0] === "GRAPHCRAFT_ACL_OK" && parts[1] === requestId && parts[2] === `${expectedCount}`)
+    return void 0;
+  if (parts.length === 3 && parts[0] === "GRAPHCRAFT_ACL_ERROR" && parts[1] === requestId) {
+    const diagnostic = new TextDecoder("utf-8", { fatal: true }).decode(
+      decodeCanonicalBase64(parts[2] ?? "")
+    );
+    if (diagnostic.length === 0)
+      throw new Error("Windows ACL helper returned an empty error diagnostic");
+    return new Error(
+      `Unable to enforce owner-only Windows permissions on Graphcraft state: Graphcraft Windows ACL enforcement failed: ${diagnostic}`
+    );
+  }
+  throw new Error("Windows ACL helper response did not match its serialized request");
+}
+var WindowsAclRequestIds = class {
+  #sequence = 0n;
+  next() {
+    this.#sequence += 1n;
+    return this.#sequence.toString(10);
+  }
+};
+async function runWindowsAclVerificationAttempts(work, maximumAttempts, waitForRetry = async (attempt) => await new Promise((resolveRetry) => setTimeout(resolveRetry, attempt * 25))) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await work();
+      return;
+    } catch (error51) {
+      if (attempt >= maximumAttempts || !(error51 instanceof Error) || !error51.message.includes("owner-only ACL verification failed"))
+        throw error51;
+      await waitForRetry(attempt);
+    }
+  }
+}
+function setReferenced(target, referenced) {
+  const operation = referenced ? target.ref : target.unref;
+  operation?.call(target);
+}
+var PersistentWindowsAclHelper = class {
+  #options;
+  #state;
+  constructor(options) {
+    this.#options = options;
+  }
+  async request(request, parseResponse) {
+    if (!Number.isSafeInteger(request.lineCount) || request.lineCount <= 0 || request.lineCount > this.#options.maximumRequestLines)
+      throw new Error("Windows ACL helper request exceeds its bounded line-count limit");
+    const state = this.#state ?? this.#start();
+    if (state.pending !== void 0)
+      throw new Error("Windows ACL helper received concurrent serialized requests");
+    this.#setProcessReferenced(state, true);
+    state.stdout = Buffer.alloc(0);
+    state.stderrBytes = 0;
+    return await new Promise((resolve15, reject) => {
+      const timer = setTimeout(
+        () => this.#stop(state, new Error("Windows ACL enforcement timed out")),
+        this.#options.requestTimeoutMs
+      );
+      timer.unref();
+      state.pending = {
+        parseResponse,
+        resolve: resolve15,
+        reject,
+        timer,
+        allLinesDispatched: false
+      };
+      void this.#writeRequest(state, request);
+    });
+  }
+  close() {
+    const state = this.#state;
+    if (state !== void 0) this.#stop(state);
+  }
+  #start() {
+    let child;
+    try {
+      child = this.#options.spawnProcess();
+    } catch (error51) {
+      throw new Error("Unable to start trusted Windows ACL enforcement", { cause: error51 });
+    }
+    const state = {
+      child,
+      stdout: Buffer.alloc(0),
+      stderrBytes: 0,
+      pending: void 0,
+      stopped: false
+    };
+    this.#state = state;
+    child.stdout.on("data", (chunk) => this.#acceptStdout(state, chunk));
+    child.stderr.on("data", (chunk) => this.#acceptStderr(state, chunk));
+    child.stdin.on("error", (error51) => {
+      if (!state.stopped)
+        this.#stop(
+          state,
+          new Error("Unable to write to trusted Windows ACL enforcement", { cause: error51 })
+        );
+    });
+    child.once("error", (error51) => {
+      if (!state.stopped)
+        this.#stop(
+          state,
+          new Error("Unable to start trusted Windows ACL enforcement", { cause: error51 })
+        );
+    });
+    child.once("close", (code, signal) => {
+      if (state.stopped) return;
+      this.#stop(
+        state,
+        state.pending === void 0 ? void 0 : new Error(
+          `Trusted Windows ACL enforcement exited before completing its request (code=${code === null ? "null" : code}, signal=${signal ?? "null"})`
+        ),
+        false
+      );
+    });
+    return state;
+  }
+  async #writeRequest(state, request) {
+    try {
+      const iterator = request.lines[Symbol.iterator]();
+      for (let lineIndex = 0; lineIndex < request.lineCount; lineIndex += 1) {
+        if (state.stopped) return;
+        const next = iterator.next();
+        if (next.done)
+          throw new Error("Windows ACL helper request line count changed during encoding");
+        const line = next.value;
+        if (!line.endsWith("\n") || line.slice(0, -1).includes("\n") || line.slice(0, -1).includes("\r") || Buffer.byteLength(line, "utf8") > this.#options.requestLineLimitBytes)
+          throw new Error("Windows ACL helper request contains an invalid bounded line");
+        await new Promise((resolveWrite, rejectWrite) => {
+          state.child.stdin.write(line, "utf8", (error51) => {
+            if (error51) rejectWrite(error51);
+            else resolveWrite();
+          });
+        });
+      }
+      if (!iterator.next().done)
+        throw new Error("Windows ACL helper request line count changed during encoding");
+      const pending = state.pending;
+      if (pending !== void 0) pending.allLinesDispatched = true;
+    } catch (error51) {
+      if (!state.stopped)
+        this.#stop(
+          state,
+          new Error("Unable to write bounded request to trusted Windows ACL enforcement", {
+            cause: error51
+          })
+        );
+    }
+  }
+  #acceptStdout(state, chunk) {
+    if (state.stopped) return;
+    if (state.pending === void 0) {
+      this.#stop(state, new Error("Windows ACL helper produced output without a pending request"));
+      return;
+    }
+    const bytes = Buffer.isBuffer(chunk) ? Buffer.from(chunk) : Buffer.from(chunk, "utf8");
+    if (state.stdout.length + bytes.length > this.#options.outputLimitBytes) {
+      this.#stop(state, new Error("Windows ACL helper exceeded its bounded output limit"));
+      return;
+    }
+    state.stdout = Buffer.concat([state.stdout, bytes]);
+    const newline = state.stdout.indexOf(10);
+    if (newline < 0) return;
+    if (newline !== state.stdout.length - 1 || state.stdout.indexOf(10, newline + 1) >= 0) {
+      this.#stop(state, new Error("Windows ACL helper produced malformed multi-line output"));
+      return;
+    }
+    if (!state.pending.allLinesDispatched) {
+      this.#stop(state, new Error("Windows ACL helper responded before request commit"));
+      return;
+    }
+    let lineBytes = state.stdout.subarray(0, newline);
+    if (lineBytes.at(-1) === 13) lineBytes = lineBytes.subarray(0, -1);
+    const line = lineBytes.toString("utf8");
+    let responseError;
+    try {
+      responseError = state.pending.parseResponse(line);
+    } catch (error51) {
+      responseError = new Error("Windows ACL helper produced an invalid response", {
+        cause: error51
+      });
+    }
+    if (responseError !== void 0) {
+      this.#stop(state, responseError);
+      return;
+    }
+    const pending = state.pending;
+    state.pending = void 0;
+    state.stdout = Buffer.alloc(0);
+    clearTimeout(pending.timer);
+    this.#setProcessReferenced(state, false);
+    pending.resolve();
+  }
+  #acceptStderr(state, chunk) {
+    if (state.stopped) return;
+    const bytes = Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk);
+    state.stderrBytes += bytes;
+    this.#stop(
+      state,
+      new Error(
+        state.stderrBytes > this.#options.outputLimitBytes ? "Windows ACL helper exceeded its bounded output limit" : "Windows ACL helper produced unexpected error output"
+      )
+    );
+  }
+  #setProcessReferenced(state, referenced) {
+    setReferenced(state.child, referenced);
+    setReferenced(state.child.stdin, referenced);
+    setReferenced(state.child.stdout, referenced);
+    setReferenced(state.child.stderr, referenced);
+  }
+  #stop(state, error51, kill = true) {
+    if (state.stopped) return;
+    state.stopped = true;
+    if (this.#state === state) this.#state = void 0;
+    const pending = state.pending;
+    state.pending = void 0;
+    if (pending !== void 0) clearTimeout(pending.timer);
+    if (kill) {
+      state.child.stdin.destroy();
+      state.child.kill();
+    }
+    this.#setProcessReferenced(state, false);
+    if (pending !== void 0)
+      pending.reject(error51 ?? new Error("Trusted Windows ACL enforcement stopped"));
+  }
+};
+
 // packages/runtime/src/secure-fs.ts
 var PRIVATE_DIRECTORY_MODE = 448;
 var PRIVATE_FILE_MODE = 384;
@@ -38905,125 +39262,261 @@ var hardenedWindowsIdentities = /* @__PURE__ */ new Map();
 var hardenedDarwinEntries = /* @__PURE__ */ new Map();
 var privatePathMutationTails = /* @__PURE__ */ new Map();
 var windowsAclWorkTail = Promise.resolve();
+var windowsAclRequestIds = new WindowsAclRequestIds();
 var WINDOWS_OWNER_ONLY_ACL_SCRIPT = String.raw`
-$ErrorActionPreference = 'Stop'
-Set-StrictMode -Version 3.0
-[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-
 try {
+  $ErrorActionPreference = 'Stop'
+  Set-StrictMode -Version 3.0
+  [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+  [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
   $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
   if ($null -eq $sid) { throw 'The current Windows identity has no SID' }
-  $targets = [System.Collections.Generic.List[object]]::new()
-  foreach ($rawLine in ([Console]::In.ReadToEnd() -split [char]10)) {
-    $line = $rawLine.TrimEnd([char]13)
-    if ($line.Length -eq 0) { continue }
-    $separator = $line.IndexOf([char]9)
-    if ($separator -ne 1) { throw 'Malformed Graphcraft ACL target record' }
-    $kind = $line.Substring(0, 1)
-    $path = [System.Text.Encoding]::UTF8.GetString(
-      [System.Convert]::FromBase64String($line.Substring($separator + 1))
-    )
-    if ([String]::IsNullOrEmpty($path)) { throw 'Empty Graphcraft ACL target path' }
+  $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+  $activeRequestId = $null
+  $expectedTargetCount = 0
+  $expectedChunkCount = 0
+  $nextChunkIndex = 0
+  $targetPaths = $null
+  $targetDirectoryFlags = $null
 
-    $attributes = [System.IO.File]::GetAttributes($path)
-    if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-      throw 'Graphcraft private tree contains a reparse point'
-    }
-    $isDirectory = ($attributes -band [System.IO.FileAttributes]::Directory) -ne 0
-    if (($kind -eq 'D') -ne $isDirectory) {
-      throw 'Graphcraft ACL target changed filesystem kind'
-    }
-    if ($kind -ne 'D' -and $kind -ne 'F') {
-      throw 'Unsupported Graphcraft ACL target kind'
-    }
-    $targets.Add([pscustomobject]@{ Path = $path; IsDirectory = $isDirectory })
-  }
-  if ($targets.Count -eq 0) { throw 'No Graphcraft ACL targets were supplied' }
-
-  $targetIndex = 0
-  foreach ($target in $targets) {
-    $targetIndex += 1
-    $attributes = [System.IO.File]::GetAttributes($target.Path)
-    if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-      throw 'Graphcraft ACL target became a reparse point'
-    }
-    $isDirectory = ($attributes -band [System.IO.FileAttributes]::Directory) -ne 0
-    if ($isDirectory -ne $target.IsDirectory) {
-      throw 'Graphcraft ACL target changed filesystem kind'
-    }
-
-    if ($isDirectory) {
-      $item = [System.IO.DirectoryInfo]::new($target.Path)
-      $security = [System.Security.AccessControl.DirectorySecurity]::new()
-      $inheritance = ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit)
-    } else {
-      $item = [System.IO.FileInfo]::new($target.Path)
-      $security = [System.Security.AccessControl.FileSecurity]::new()
-      $inheritance = [System.Security.AccessControl.InheritanceFlags]::None
-    }
-    $security.SetAccessRuleProtection($true, $false)
-    $security.SetOwner($sid)
-    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-      $sid,
-      [System.Security.AccessControl.FileSystemRights]::FullControl,
-      $inheritance,
-      [System.Security.AccessControl.PropagationFlags]::None,
-      [System.Security.AccessControl.AccessControlType]::Allow
-    )
-    [void]$security.AddAccessRule($rule)
-    $item.SetAccessControl($security)
-
-    $item.Refresh()
-    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-      throw 'Graphcraft ACL target became a reparse point during enforcement'
-    }
-    $sections = ([System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner)
-    $verified = $item.GetAccessControl($sections)
-    $owner = $verified.GetOwner([System.Security.Principal.SecurityIdentifier])
-    $rules = @($verified.GetAccessRules(
-      $true,
-      $true,
-      [System.Security.Principal.SecurityIdentifier]
-    ))
-    $failures = [System.Collections.Generic.List[string]]::new()
-    if (-not $verified.AreAccessRulesProtected) { [void]$failures.Add('protection') }
-    if ($owner.Value -ne $sid.Value) { [void]$failures.Add('owner') }
-    if ($rules.Count -ne 1) {
-      [void]$failures.Add('rule_count')
-    } else {
-      if ($rules[0].IsInherited) { [void]$failures.Add('inherited') }
-      if ($rules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { [void]$failures.Add('type') }
-      if ($rules[0].FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl) { [void]$failures.Add('rights') }
-      if ($rules[0].InheritanceFlags -ne $inheritance) { [void]$failures.Add('inheritance') }
-      if ($rules[0].PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None) { [void]$failures.Add('propagation') }
-      if ($rules[0].IdentityReference.Value -ne $sid.Value) { [void]$failures.Add('identity') }
-    }
-    if ($failures.Count -gt 0) {
-      $kind = if ($isDirectory) { 'D' } else { 'F' }
-      $ownerClass = if ($owner.Value -eq $sid.Value) { 'current' } else { 'other' }
-      $protection = if ($verified.AreAccessRulesProtected) { 'protected' } else { 'unprotected' }
-      $aceDiagnostics = [System.Collections.Generic.List[string]]::new()
-      foreach ($rule in $rules) {
-        $identityClass = if ($rule.IdentityReference.Value -eq $sid.Value) { 'current' } else { 'other' }
-        $inherited = $rule.IsInherited.ToString().ToLowerInvariant()
-        [void]$aceDiagnostics.Add(
-          "identity=$identityClass,type=$([int]($rule.AccessControlType)),rights=$([int]($rule.FileSystemRights)),inherited=$inherited,inheritance=$([int]($rule.InheritanceFlags)),propagation=$([int]($rule.PropagationFlags))"
-        )
+  while ($null -ne ($requestLine = [Console]::In.ReadLine())) {
+    $responseRequestId = if ($null -eq $activeRequestId) { '0' } else { $activeRequestId }
+    try {
+      if ([System.Text.Encoding]::UTF8.GetByteCount($requestLine) + 1 -gt __GRAPHCRAFT_ACL_MAX_LINE_BYTES__) {
+        throw 'Graphcraft ACL request line exceeds its encoded byte limit'
       }
-      throw "Graphcraft owner-only ACL verification failed for target $targetIndex ($kind): $($failures -join ','); protection=$protection;owner=$ownerClass;aces=[$($aceDiagnostics -join '|')]"
+      $requestParts = @($requestLine -split [char]9)
+      if ($null -eq $activeRequestId) {
+        if ($requestParts.Count -ne 4 -or $requestParts[0] -cne 'GRAPHCRAFT_ACL_BEGIN') {
+          throw 'Malformed Graphcraft ACL BEGIN frame'
+        }
+        if ($requestParts[1] -notmatch '^[1-9][0-9]*$') {
+          throw 'Malformed Graphcraft ACL request identifier'
+        }
+        $responseRequestId = $requestParts[1]
+        $parsedTargetCount = 0
+        $parsedChunkCount = 0
+        if (
+          $requestParts[2] -notmatch '^[1-9][0-9]*$' -or
+          -not [int]::TryParse($requestParts[2], [ref]$parsedTargetCount) -or
+          $parsedTargetCount -gt __GRAPHCRAFT_ACL_MAX_TARGETS__
+        ) { throw 'Malformed Graphcraft ACL target count' }
+        if (
+          $requestParts[3] -notmatch '^[1-9][0-9]*$' -or
+          -not [int]::TryParse($requestParts[3], [ref]$parsedChunkCount) -or
+          $parsedChunkCount -gt $parsedTargetCount
+        ) { throw 'Malformed Graphcraft ACL chunk count' }
+        $activeRequestId = $requestParts[1]
+        $expectedTargetCount = $parsedTargetCount
+        $expectedChunkCount = $parsedChunkCount
+        $nextChunkIndex = 0
+        $targetPaths = [System.Collections.Generic.List[string]]::new($expectedTargetCount)
+        $targetDirectoryFlags = [System.Collections.Generic.List[bool]]::new($expectedTargetCount)
+        continue
+      }
+
+      $responseRequestId = $activeRequestId
+      if ($requestParts.Count -gt 0 -and $requestParts[0] -ceq 'GRAPHCRAFT_ACL_CHUNK') {
+        if ($requestParts.Count -ne 5 -or $requestParts[1] -cne $activeRequestId) {
+          throw 'Malformed Graphcraft ACL CHUNK frame'
+        }
+        $chunkIndex = 0
+        $chunkTargetCount = 0
+        if (
+          $requestParts[2] -notmatch '^(?:0|[1-9][0-9]*)$' -or
+          -not [int]::TryParse($requestParts[2], [ref]$chunkIndex) -or
+          $chunkIndex -ne $nextChunkIndex -or
+          $chunkIndex -ge $expectedChunkCount
+        ) { throw 'Malformed Graphcraft ACL chunk index' }
+        if (
+          $requestParts[3] -notmatch '^[1-9][0-9]*$' -or
+          -not [int]::TryParse($requestParts[3], [ref]$chunkTargetCount) -or
+          $chunkTargetCount -gt ($expectedTargetCount - $targetPaths.Count)
+        ) { throw 'Malformed Graphcraft ACL chunk target count' }
+        $chunkBytes = [System.Convert]::FromBase64String($requestParts[4])
+        if ([System.Convert]::ToBase64String($chunkBytes) -cne $requestParts[4]) {
+          throw 'Non-canonical Graphcraft ACL chunk payload'
+        }
+        $targetLines = @($strictUtf8.GetString($chunkBytes) -split [char]10)
+        if ($targetLines.Count -ne $chunkTargetCount) {
+          throw 'Graphcraft ACL chunk count does not match its payload'
+        }
+        $chunkPaths = [System.Collections.Generic.List[string]]::new($chunkTargetCount)
+        $chunkDirectoryFlags = [System.Collections.Generic.List[bool]]::new($chunkTargetCount)
+        foreach ($targetLine in $targetLines) {
+          $targetParts = @($targetLine -split [char]9)
+          if ($targetParts.Count -ne 2) { throw 'Malformed Graphcraft ACL target record' }
+          $kind = $targetParts[0]
+          if ($kind -cne 'D' -and $kind -cne 'F') {
+            throw 'Unsupported Graphcraft ACL target kind'
+          }
+          $pathBytes = [System.Convert]::FromBase64String($targetParts[1])
+          if ([System.Convert]::ToBase64String($pathBytes) -cne $targetParts[1]) {
+            throw 'Non-canonical Graphcraft ACL target path'
+          }
+          $path = $strictUtf8.GetString($pathBytes)
+          if ([String]::IsNullOrEmpty($path) -or $path.IndexOf([char]0) -ge 0) {
+            throw 'Empty or invalid Graphcraft ACL target path'
+          }
+          $attributes = [System.IO.File]::GetAttributes($path)
+          if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Graphcraft private tree contains a reparse point'
+          }
+          $isDirectory = ($attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+          if (($kind -ceq 'D') -ne $isDirectory) {
+            throw 'Graphcraft ACL target changed filesystem kind'
+          }
+          $chunkPaths.Add($path)
+          $chunkDirectoryFlags.Add($isDirectory)
+        }
+        for ($chunkOffset = 0; $chunkOffset -lt $chunkPaths.Count; $chunkOffset += 1) {
+          $targetPaths.Add($chunkPaths[$chunkOffset])
+          $targetDirectoryFlags.Add($chunkDirectoryFlags[$chunkOffset])
+        }
+        $nextChunkIndex += 1
+        continue
+      }
+
+      if ($requestParts.Count -ne 4 -or $requestParts[0] -cne 'GRAPHCRAFT_ACL_COMMIT' -or $requestParts[1] -cne $activeRequestId) {
+        throw 'Malformed Graphcraft ACL COMMIT frame'
+      }
+      $commitChunkCount = 0
+      $commitTargetCount = 0
+      if (
+        $requestParts[2] -notmatch '^[1-9][0-9]*$' -or
+        -not [int]::TryParse($requestParts[2], [ref]$commitChunkCount) -or
+        $commitChunkCount -ne $expectedChunkCount -or
+        $nextChunkIndex -ne $expectedChunkCount
+      ) { throw 'Graphcraft ACL COMMIT chunk count does not match BEGIN' }
+      if (
+        $requestParts[3] -notmatch '^[1-9][0-9]*$' -or
+        -not [int]::TryParse($requestParts[3], [ref]$commitTargetCount) -or
+        $commitTargetCount -ne $expectedTargetCount -or
+        $targetPaths.Count -ne $expectedTargetCount
+      ) { throw 'Graphcraft ACL COMMIT target count does not match BEGIN' }
+
+      for ($targetIndex = 0; $targetIndex -lt $targetPaths.Count; $targetIndex += 1) {
+        $path = $targetPaths[$targetIndex]
+        $expectedDirectory = $targetDirectoryFlags[$targetIndex]
+        $attributes = [System.IO.File]::GetAttributes($path)
+        if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+          throw 'Graphcraft ACL target became a reparse point'
+        }
+        $isDirectory = ($attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+        if ($isDirectory -ne $expectedDirectory) {
+          throw 'Graphcraft ACL target changed filesystem kind'
+        }
+
+        if ($isDirectory) {
+          $item = [System.IO.DirectoryInfo]::new($path)
+          $security = [System.Security.AccessControl.DirectorySecurity]::new()
+          $inheritance = ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit)
+        } else {
+          $item = [System.IO.FileInfo]::new($path)
+          $security = [System.Security.AccessControl.FileSecurity]::new()
+          $inheritance = [System.Security.AccessControl.InheritanceFlags]::None
+        }
+        $security.SetAccessRuleProtection($true, $false)
+        $security.SetOwner($sid)
+        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+          $sid,
+          [System.Security.AccessControl.FileSystemRights]::FullControl,
+          $inheritance,
+          [System.Security.AccessControl.PropagationFlags]::None,
+          [System.Security.AccessControl.AccessControlType]::Allow
+        )
+        [void]$security.AddAccessRule($rule)
+        $item.SetAccessControl($security)
+
+        $item.Refresh()
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+          throw 'Graphcraft ACL target became a reparse point during enforcement'
+        }
+        $sections = ([System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner)
+        $verified = $item.GetAccessControl($sections)
+        $owner = $verified.GetOwner([System.Security.Principal.SecurityIdentifier])
+        $rules = @($verified.GetAccessRules(
+          $true,
+          $true,
+          [System.Security.Principal.SecurityIdentifier]
+        ))
+        $failures = [System.Collections.Generic.List[string]]::new()
+        if (-not $verified.AreAccessRulesProtected) { [void]$failures.Add('protection') }
+        if ($owner.Value -ne $sid.Value) { [void]$failures.Add('owner') }
+        if ($rules.Count -ne 1) {
+          [void]$failures.Add('rule_count')
+        } else {
+          if ($rules[0].IsInherited) { [void]$failures.Add('inherited') }
+          if ($rules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { [void]$failures.Add('type') }
+          if ($rules[0].FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl) { [void]$failures.Add('rights') }
+          if ($rules[0].InheritanceFlags -ne $inheritance) { [void]$failures.Add('inheritance') }
+          if ($rules[0].PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None) { [void]$failures.Add('propagation') }
+          if ($rules[0].IdentityReference.Value -ne $sid.Value) { [void]$failures.Add('identity') }
+        }
+        if ($failures.Count -gt 0) {
+          $kind = if ($isDirectory) { 'D' } else { 'F' }
+          $ownerClass = if ($owner.Value -eq $sid.Value) { 'current' } else { 'other' }
+          $protection = if ($verified.AreAccessRulesProtected) { 'protected' } else { 'unprotected' }
+          $aceDiagnostics = [System.Collections.Generic.List[string]]::new()
+          foreach ($rule in $rules) {
+            $identityClass = if ($rule.IdentityReference.Value -eq $sid.Value) { 'current' } else { 'other' }
+            $inherited = $rule.IsInherited.ToString().ToLowerInvariant()
+            [void]$aceDiagnostics.Add(
+              "identity=$identityClass,type=$([int]($rule.AccessControlType)),rights=$([int]($rule.FileSystemRights)),inherited=$inherited,inheritance=$([int]($rule.InheritanceFlags)),propagation=$([int]($rule.PropagationFlags))"
+            )
+          }
+          $displayIndex = $targetIndex + 1
+          throw "Graphcraft owner-only ACL verification failed for target $displayIndex ($kind): $($failures -join ','); protection=$protection;owner=$ownerClass;aces=[$($aceDiagnostics -join '|')]"
+        }
+      }
+      $completedRequestId = $activeRequestId
+      $completedTargetCount = $targetPaths.Count
+      $activeRequestId = $null
+      $expectedTargetCount = 0
+      $expectedChunkCount = 0
+      $nextChunkIndex = 0
+      $targetPaths = $null
+      $targetDirectoryFlags = $null
+      [Console]::Out.WriteLine("GRAPHCRAFT_ACL_OK$([char]9)$completedRequestId$([char]9)$completedTargetCount")
+      [Console]::Out.Flush()
+    } catch {
+      $errorBytes = [System.Text.Encoding]::UTF8.GetBytes($_.Exception.Message)
+      $errorPayload = [System.Convert]::ToBase64String($errorBytes)
+      [Console]::Out.WriteLine("GRAPHCRAFT_ACL_ERROR$([char]9)$responseRequestId$([char]9)$errorPayload")
+      [Console]::Out.Flush()
+      exit 1
     }
   }
-  [Console]::Out.WriteLine("GRAPHCRAFT_ACL_OK:$($targets.Count)")
 } catch {
   [Console]::Error.WriteLine("Graphcraft Windows ACL enforcement failed: $($_.Exception.Message)")
   exit 1
 }
-`;
+`.replace("__GRAPHCRAFT_ACL_MAX_LINE_BYTES__", `${WINDOWS_ACL_REQUEST_LIMITS.maximumLineBytes}`).replace("__GRAPHCRAFT_ACL_MAX_TARGETS__", `${WINDOWS_ACL_REQUEST_LIMITS.maximumTargets}`);
 var WINDOWS_OWNER_ONLY_ACL_COMMAND = Buffer.from(
   WINDOWS_OWNER_ONLY_ACL_SCRIPT,
   "utf16le"
 ).toString("base64");
+var windowsAclHelper = new PersistentWindowsAclHelper({
+  requestTimeoutMs: WINDOWS_ACL_TIMEOUT_MS,
+  outputLimitBytes: WINDOWS_ACL_OUTPUT_LIMIT_BYTES,
+  requestLineLimitBytes: WINDOWS_ACL_REQUEST_LIMITS.maximumLineBytes,
+  maximumRequestLines: WINDOWS_ACL_REQUEST_LIMITS.maximumTargets + 2,
+  spawnProcess: () => spawn4(
+    windowsPowerShellExecutable(),
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-EncodedCommand",
+      WINDOWS_OWNER_ONLY_ACL_COMMAND
+    ],
+    {
+      windowsHide: true,
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"]
+    }
+  )
+});
 function isMissing(error51) {
   return error51.code === "ENOENT";
 }
@@ -39102,9 +39595,11 @@ async function inspectPrivateEntry(path) {
     metadataFingerprint
   };
 }
-async function collectPrivateTree(root) {
+async function collectPrivateTree(root, maximumEntries = Number.POSITIVE_INFINITY) {
   const entries = [];
   const visit = async (path) => {
+    if (entries.length >= maximumEntries)
+      throw new Error(`Private tree exceeds its ${maximumEntries}-target Windows ACL limit`);
     const { entry } = await inspectPrivateEntry(path);
     entries.push(entry);
     if (entry.kind === "directory")
@@ -39113,96 +39608,19 @@ async function collectPrivateTree(root) {
   await visit(root);
   return entries;
 }
-async function runWindowsAclBatchOnce(entries) {
-  if (entries.length === 0) return;
-  const payload = `${entries.map(
-    ({ kind, path }) => `${kind === "directory" ? "D" : "F"}	${Buffer.from(path, "utf8").toString("base64")}`
-  ).join("\n")}
-`;
-  const expectedOutput = `GRAPHCRAFT_ACL_OK:${entries.length}`;
-  await new Promise((resolveBatch, rejectBatch) => {
-    const child = spawn4(
-      windowsPowerShellExecutable(),
-      [
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-EncodedCommand",
-        WINDOWS_OWNER_ONLY_ACL_COMMAND
-      ],
-      {
-        windowsHide: true,
-        shell: false,
-        stdio: ["pipe", "pipe", "pipe"]
-      }
-    );
-    const stdout = [];
-    const stderr = [];
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    let settled = false;
-    const reject = (error51) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      child.kill();
-      rejectBatch(error51);
-    };
-    const capture = (target, stream, chunk) => {
-      if (stream === "stdout") stdoutBytes += chunk.length;
-      else stderrBytes += chunk.length;
-      if (stdoutBytes > WINDOWS_ACL_OUTPUT_LIMIT_BYTES || stderrBytes > WINDOWS_ACL_OUTPUT_LIMIT_BYTES) {
-        reject(new Error("Windows ACL helper exceeded its bounded output limit"));
-        return;
-      }
-      target.push(Buffer.from(chunk));
-    };
-    child.stdout.on("data", (chunk) => capture(stdout, "stdout", chunk));
-    child.stderr.on("data", (chunk) => capture(stderr, "stderr", chunk));
-    child.stdin.on("error", () => void 0);
-    child.once(
-      "error",
-      (error51) => reject(
-        new Error("Unable to start trusted Windows ACL enforcement", {
-          cause: error51
-        })
-      )
-    );
-    child.once("close", (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      const output = Buffer.concat(stdout).toString("utf8").trim();
-      const errorOutput = Buffer.concat(stderr).toString("utf8").trim();
-      if (code !== 0 || output !== expectedOutput) {
-        rejectBatch(
-          new Error(
-            `Unable to enforce owner-only Windows permissions on Graphcraft state${errorOutput ? `: ${errorOutput}` : ""}`
-          )
-        );
-        return;
-      }
-      resolveBatch();
-    });
-    const timer = setTimeout(
-      () => reject(new Error("Windows ACL enforcement timed out")),
-      WINDOWS_ACL_TIMEOUT_MS
-    );
-    timer.unref();
-    child.stdin.end(payload, "utf8");
-  });
-}
 async function runWindowsAclBatch(entries) {
-  for (let attempt = 1; ; attempt += 1) {
-    try {
-      await runWindowsAclBatchOnce(entries);
-      return;
-    } catch (error51) {
-      if (attempt >= WINDOWS_ACL_VERIFICATION_ATTEMPTS || !(error51 instanceof Error) || !error51.message.includes("owner-only ACL verification failed"))
-        throw error51;
-      await new Promise((resolveRetry) => setTimeout(resolveRetry, attempt * 25));
-    }
-  }
+  if (entries.length === 0) return;
+  await runWindowsAclVerificationAttempts(async () => {
+    const requestId = windowsAclRequestIds.next();
+    const plan = planWindowsAclRequest(requestId, entries);
+    await windowsAclHelper.request(
+      {
+        lines: encodeWindowsAclRequest(plan, entries),
+        lineCount: plan.lineCount
+      },
+      (line) => parseWindowsAclResponse(line, requestId, entries.length)
+    );
+  }, WINDOWS_ACL_VERIFICATION_ATTEMPTS);
 }
 async function serializeWindowsAclWork(work) {
   if (supportsPosixModes) return await work();
@@ -39705,7 +40123,10 @@ async function finalizePrivateFileMutation(checkpoint, ownedRoot) {
 async function hardenPrivateTree(root, ownedRoot = root) {
   const absoluteRoot = resolve2(root);
   await validatePrivatePath(ownedRoot, relative2(resolve2(ownedRoot), absoluteRoot));
-  const entries = await collectPrivateTree(absoluteRoot);
+  const entries = await collectPrivateTree(
+    absoluteRoot,
+    supportsPosixModes ? Number.POSITIVE_INFINITY : WINDOWS_ACL_REQUEST_LIMITS.maximumTargets
+  );
   if (!supportsPosixModes) {
     await hardenWindowsEntries(entries, true);
     return;
@@ -44872,8 +45293,8 @@ async function reconcileAtomicPush(workspace, claim) {
 
 // packages/runtime/src/store.ts
 import { constants as fsConstants5 } from "node:fs";
-import { lstat as lstat8, open as open7, readdir as readdir4 } from "node:fs/promises";
-import { join as join10, relative as relative6, resolve as resolve9 } from "node:path";
+import { lstat as lstat9, open as open7, readdir as readdir4 } from "node:fs/promises";
+import { join as join10, relative as relative7, resolve as resolve10 } from "node:path";
 import { TextDecoder as TextDecoder2 } from "node:util";
 
 // packages/runtime/src/migration.ts
@@ -44902,7 +45323,7 @@ var LEGACY_MIGRATION_RESOURCE_LIMITS = Object.freeze({
   maximumFileCount: 4 * 1024,
   maximumEntryCount: 8 * 1024
 });
-function manifest(runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, initialization) {
+function manifest(runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, initialization) {
   return RunStorageManifestSchema.parse({
     schemaVersion: CURRENT_RUN_STORAGE_VERSION,
     runId,
@@ -44924,7 +45345,8 @@ function manifest(runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeForma
       controlRequests: 1,
       locks: 1,
       artifactInventory: artifactInventoryFormat,
-      artifactPolicy: 1
+      artifactPolicy: 1,
+      workspaceScopeSnapshots: workspaceScopeSnapshotFormat
     }
   });
 }
@@ -44938,13 +45360,14 @@ async function validateRunStorageRoot(input) {
   if (validated !== runRoot)
     throw new Error(`Run storage path escaped the Graphcraft state directory: ${input.runRoot}`);
 }
-async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, initialization, lease) {
+async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, initialization, lease) {
   const value = manifest(
     runId,
     migratedFrom,
     canonicalHashAlgorithm,
     heldOutProbeFormat,
     artifactInventoryFormat,
+    workspaceScopeSnapshotFormat,
     initialization
   );
   await migrationStep(lease, async () => await ensurePrivateDirectory(runRoot));
@@ -44965,6 +45388,7 @@ async function writeCurrentRunStorageManifest(runRoot, runId, migratedFrom) {
     PORTABLE_CANONICAL_HASH_ALGORITHM,
     2,
     2,
+    2,
     "ready"
   );
 }
@@ -44974,6 +45398,7 @@ async function writeInitializingRunStorageManifest(runRoot, runId) {
     runId,
     CURRENT_RUN_STORAGE_VERSION,
     PORTABLE_CANONICAL_HASH_ALGORITHM,
+    2,
     2,
     2,
     "initializing"
@@ -46094,6 +46519,7 @@ async function ensureCurrentRunStorage(input) {
         storage.manifest.canonicalHashAlgorithm,
         storage.manifest.formats.heldOutProbes,
         storage.manifest.formats.artifactInventory,
+        storage.manifest.formats.workspaceScopeSnapshots,
         "ready",
         lease
       );
@@ -46148,6 +46574,7 @@ async function ensureCurrentRunStorage(input) {
       LEGACY_CANONICAL_HASH_ALGORITHM,
       1,
       1,
+      1,
       "ready",
       lease
     );
@@ -46167,6 +46594,291 @@ async function ensureCurrentRunStorage(input) {
     lease.dispose();
     if (!bodyFailureWasThrown && causalFailure) throw causalFailure.error;
   }
+}
+
+// packages/runtime/src/scope.ts
+import { createHash as createHash5 } from "node:crypto";
+import { createReadStream } from "node:fs";
+import { lstat as lstat8, readlink as readlink3 } from "node:fs/promises";
+import { isAbsolute as isAbsolute7, matchesGlob, relative as relative6, resolve as resolve9, sep as sep5 } from "node:path";
+var maximumChangedPaths = 1e4;
+async function gitOutput(repositoryPath, args, signal) {
+  signal?.throwIfAborted();
+  const result = await runProcess("git", args, {
+    cwd: repositoryPath,
+    timeoutMs: 12e4,
+    ...signal ? { signal } : {}
+  });
+  signal?.throwIfAborted();
+  if (result.exitCode !== 0)
+    throw new Error(result.stderr.trim() || `git ${args[0] ?? "command"} failed`);
+  return result.stdout;
+}
+function nulPaths(value) {
+  return value.split("\0").filter(Boolean);
+}
+function confinedPath(repositoryPath, path) {
+  if (isAbsolute7(path)) throw new Error(`Git reported an absolute workspace path: ${path}`);
+  const absolute = resolve9(repositoryPath, path);
+  const confined = relative6(repositoryPath, absolute);
+  if (confined === ".." || confined.startsWith(`..${sep5}`) || isAbsolute7(confined))
+    throw new Error(`Git reported a path outside the workspace: ${path}`);
+  return absolute;
+}
+async function fileDigest(path, signal) {
+  signal?.throwIfAborted();
+  const hash2 = createHash5("sha256");
+  for await (const chunk of createReadStream(path, signal ? { signal } : void 0)) {
+    signal?.throwIfAborted();
+    hash2.update(chunk);
+  }
+  signal?.throwIfAborted();
+  return hash2.digest("hex");
+}
+async function pathSignature(repositoryPath, path, hashAlgorithm, signal) {
+  signal?.throwIfAborted();
+  const absolute = confinedPath(repositoryPath, path);
+  let status3;
+  try {
+    status3 = await lstat8(absolute);
+  } catch (error51) {
+    signal?.throwIfAborted();
+    if (error51.code === "ENOENT") return "missing";
+    throw error51;
+  }
+  signal?.throwIfAborted();
+  const mode = status3.mode & 511;
+  if (status3.isSymbolicLink()) {
+    const target = await readlink3(absolute);
+    signal?.throwIfAborted();
+    return contentHash({ kind: "symlink", mode, target }, hashAlgorithm);
+  }
+  if (status3.isFile())
+    return contentHash(
+      {
+        kind: "file",
+        mode,
+        size: status3.size,
+        digest: await fileDigest(absolute, signal)
+      },
+      hashAlgorithm
+    );
+  if (status3.isDirectory()) {
+    const operations = [
+      gitOutput(absolute, ["rev-parse", "HEAD"], signal).catch(() => {
+        signal?.throwIfAborted();
+        return "not-a-repository";
+      }),
+      gitOutput(
+        absolute,
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        signal
+      ).catch(() => {
+        signal?.throwIfAborted();
+        return "unavailable";
+      })
+    ];
+    let head;
+    let state;
+    try {
+      [head, state] = await Promise.all(operations);
+    } catch (error51) {
+      if (signal?.aborted) await Promise.allSettled(operations);
+      throw error51;
+    }
+    signal?.throwIfAborted();
+    return contentHash({ kind: "directory", mode, head: head.trim(), state }, hashAlgorithm);
+  }
+  return contentHash({ kind: "other", mode, size: status3.size }, hashAlgorithm);
+}
+async function captureWorkspaceScopeSnapshot(repositoryPath, inspectedIgnoredPatterns, signal, hashAlgorithm) {
+  signal?.throwIfAborted();
+  const ignored = inspectedIgnoredPatterns.length > 0 ? gitOutput(
+    repositoryPath,
+    [
+      "ls-files",
+      "--others",
+      "--ignored",
+      "--exclude-standard",
+      "-z",
+      "--",
+      ...inspectedIgnoredPatterns
+    ],
+    signal
+  ) : Promise.resolve("");
+  const operations = [
+    gitOutput(repositoryPath, ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"], signal),
+    gitOutput(repositoryPath, ["ls-files", "--others", "--exclude-standard", "-z"], signal),
+    ignored,
+    gitOutput(repositoryPath, ["rev-parse", "HEAD"], signal),
+    gitOutput(repositoryPath, ["symbolic-ref", "--quiet", "--short", "HEAD"], signal).catch(() => {
+      signal?.throwIfAborted();
+      return "(detached)";
+    }),
+    gitOutput(
+      repositoryPath,
+      ["diff", "--cached", "--no-ext-diff", "--binary", "HEAD", "--"],
+      signal
+    )
+  ];
+  let tracked;
+  let untracked;
+  let excludedIgnored;
+  let head;
+  let branch;
+  let index;
+  try {
+    [tracked, untracked, excludedIgnored, head, branch, index] = await Promise.all(operations);
+  } catch (error51) {
+    if (signal?.aborted) await Promise.allSettled(operations);
+    throw error51;
+  }
+  signal?.throwIfAborted();
+  const paths = [
+    .../* @__PURE__ */ new Set([...nulPaths(tracked), ...nulPaths(untracked), ...nulPaths(excludedIgnored)])
+  ].sort();
+  if (paths.length > maximumChangedPaths)
+    throw new Error(
+      `Workspace scope inspection refused ${paths.length} changed paths; maximum is ${maximumChangedPaths}`
+    );
+  const changed = {};
+  for (const path of paths) {
+    signal?.throwIfAborted();
+    changed[path.replaceAll("\\", "/")] = await pathSignature(
+      repositoryPath,
+      path,
+      hashAlgorithm,
+      signal
+    );
+  }
+  signal?.throwIfAborted();
+  const core = {
+    headSha: head.trim(),
+    branch: branch.trim(),
+    indexDigest: contentHash(index, hashAlgorithm),
+    changed
+  };
+  return { schemaVersion: 1, digest: contentHash(core, hashAlgorithm), ...core };
+}
+function workspaceScopeSnapshotDigestIsValid(snapshot, hashAlgorithm) {
+  return snapshot.digest === contentHash(
+    {
+      headSha: snapshot.headSha,
+      branch: snapshot.branch,
+      indexDigest: snapshot.indexDigest,
+      changed: snapshot.changed
+    },
+    hashAlgorithm
+  );
+}
+function parseWorkspaceScopeSnapshot(value, hashAlgorithm) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return void 0;
+  const candidate = value;
+  if (candidate.schemaVersion !== 1 || typeof candidate.digest !== "string" || typeof candidate.headSha !== "string" || typeof candidate.branch !== "string" || typeof candidate.indexDigest !== "string" || typeof candidate.changed !== "object" || candidate.changed === null || Array.isArray(candidate.changed) || Object.entries(candidate.changed).some(
+    ([path, signature]) => path.length === 0 || typeof signature !== "string"
+  ))
+    return void 0;
+  const snapshot = candidate;
+  if (hashAlgorithm && !workspaceScopeSnapshotDigestIsValid(snapshot, hashAlgorithm))
+    return void 0;
+  return snapshot;
+}
+function normalizedPattern(value) {
+  return value.replaceAll("\\", "/").replace(/^\.\//, "");
+}
+function pathMatchesScope(path, patterns) {
+  const normalizedPath = normalizedPattern(path);
+  return patterns.some((value) => {
+    const pattern = normalizedPattern(value);
+    if (pattern === "**" || pattern === "**/*") return true;
+    if (normalizedPath === pattern) return true;
+    if (pattern.endsWith("/**") && normalizedPath === pattern.slice(0, -3).replace(/\/$/, ""))
+      return true;
+    return matchesGlob(normalizedPath, pattern);
+  });
+}
+function acceptedWriteScopes(graph, state) {
+  return graph.nodes.filter(
+    (candidate) => candidate.sideEffectClass === "workspace_write" && state.nodes[candidate.id]?.status === "accepted"
+  ).flatMap(({ scope }) => scope);
+}
+function auditWorkspaceScope(input) {
+  const currentPaths = Object.keys(input.current.changed).sort();
+  const touchedPaths = [.../* @__PURE__ */ new Set([...Object.keys(input.baseline.changed), ...currentPaths])].filter((path) => input.baseline.changed[path] !== input.current.changed[path]).sort();
+  const candidatePaths = [.../* @__PURE__ */ new Set([...currentPaths, ...touchedPaths])].sort();
+  const priorScopes = acceptedWriteScopes(input.graph, input.state);
+  const violations = [];
+  for (const path of candidatePaths) {
+    if (!pathMatchesScope(path, input.contract.scope.include))
+      violations.push({
+        kind: "contract_not_included",
+        path,
+        detail: `${path} is outside contract include scope ${input.contract.scope.include.join(", ")}`
+      });
+    if (pathMatchesScope(path, input.contract.scope.exclude))
+      violations.push({
+        kind: "contract_excluded",
+        path,
+        detail: `${path} matches contract exclude scope ${input.contract.scope.exclude.join(", ")}`
+      });
+  }
+  for (const path of touchedPaths) {
+    if (input.node.sideEffectClass === "none")
+      violations.push({
+        kind: "read_only_write",
+        path,
+        detail: `${path} changed during read-only node ${input.node.id}`
+      });
+    else if (!pathMatchesScope(path, input.node.scope))
+      violations.push({
+        kind: "node_scope",
+        path,
+        detail: `${path} changed outside node ${input.node.id} scope ${input.node.scope.join(", ")}`
+      });
+  }
+  for (const path of currentPaths)
+    if (!pathMatchesScope(path, input.node.scope) && !pathMatchesScope(path, priorScopes))
+      violations.push({
+        kind: "unowned_change",
+        path,
+        detail: `${path} is not owned by ${input.node.id} or an accepted write node`
+      });
+  if (input.baseline.headSha !== input.current.headSha)
+    violations.push({
+      kind: "git_head",
+      detail: `HEAD changed from ${input.baseline.headSha} to ${input.current.headSha} outside a commit node`
+    });
+  if (input.baseline.branch !== input.current.branch)
+    violations.push({
+      kind: "git_branch",
+      detail: `branch changed from ${input.baseline.branch} to ${input.current.branch} outside a runtime boundary`
+    });
+  if (input.baseline.indexDigest !== input.current.indexDigest)
+    violations.push({
+      kind: "git_index",
+      detail: "the Git index changed outside a runtime-owned commit boundary"
+    });
+  const uniqueViolations = violations.filter(
+    (violation, index) => violations.findIndex(
+      (candidate) => candidate.kind === violation.kind && candidate.path === violation.path && candidate.detail === violation.detail
+    ) === index
+  );
+  return {
+    schemaVersion: 1,
+    nodeId: input.node.id,
+    allowed: uniqueViolations.length === 0,
+    changedPaths: currentPaths,
+    touchedPaths,
+    reportedChangedPaths: [...new Set(input.reportedChangedPaths ?? [])].sort(),
+    violations: uniqueViolations,
+    baselineDigest: input.baseline.digest,
+    currentDigest: input.current.digest
+  };
+}
+function scopeViolationReason(audit, workspacePath) {
+  const evidence = audit.violations.slice(0, 12).map(({ detail }) => detail).join("; ");
+  const omitted = audit.violations.length > 12 ? `; ${audit.violations.length - 12} more` : "";
+  return `Scope policy rejected node ${audit.nodeId}: ${evidence}${omitted}. Changes were preserved in the isolated workspace at ${workspacePath}`;
 }
 
 // packages/runtime/src/store.ts
@@ -46195,7 +46907,7 @@ var RunStoreLimitError = class extends Error {
 var RunStoreEventLogCorruptionError = class extends Error {
   constructor(record2, offsetBytes, trailing, reason) {
     const location = trailing ? "trailing record" : `record ${record2}`;
-    const problem = reason === "encoding" ? "invalid UTF-8" : reason === "json" ? "invalid JSON" : reason === "schema" ? "an invalid event schema" : reason === "hash" ? "an invalid event hash" : reason === "format" ? "an event format that disagrees with its storage manifest" : "an invalid event sequence";
+    const problem = reason === "encoding" ? "invalid UTF-8" : reason === "json" ? "invalid JSON" : reason === "schema" ? "an invalid event schema" : reason === "hash" ? "an invalid event hash" : reason === "format" ? "an event format that disagrees with its storage manifest" : reason === "scope" ? "a workspace-scope snapshot that disagrees with its storage manifest" : "an invalid event sequence";
     super(
       `Run event log has ${problem} in ${location} at byte ${offsetBytes}; event log bytes were left unchanged`
     );
@@ -46256,6 +46968,19 @@ function optionalHeldOutProbePlan(value, algorithm) {
     return void 0;
   }
 }
+function eventWorkspaceScopeSnapshot(event) {
+  if (event.type === "invocation.started" || event.type === "semantic.started")
+    return event.data.scopeBaseline;
+  if (event.type === "scope.started") return event.data.baseline;
+  if (event.type === "scope.checked") return event.data.current;
+  return void 0;
+}
+function workspaceScopeSnapshotUsesDifferentHashPolicy(value, selected) {
+  const snapshot = parseWorkspaceScopeSnapshot(value);
+  if (!snapshot || parseWorkspaceScopeSnapshot(snapshot, selected)) return false;
+  const other = selected === PORTABLE_CANONICAL_HASH_ALGORITHM ? LEGACY_CANONICAL_HASH_ALGORITHM : PORTABLE_CANONICAL_HASH_ALGORITHM;
+  return parseWorkspaceScopeSnapshot(snapshot, other) !== void 0;
+}
 var RunStore = class _RunStore {
   repositoryRoot;
   runId;
@@ -46269,6 +46994,7 @@ var RunStore = class _RunStore {
   _canonicalHashAlgorithm;
   _heldOutProbePlanHashAlgorithm;
   _artifactHashAlgorithm;
+  _workspaceScopeHashAlgorithm;
   constructor(repositoryRoot, runId, limits = {}, canonicalHashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
     this.repositoryRoot = repositoryRoot;
     this.runId = runId;
@@ -46290,9 +47016,9 @@ var RunStore = class _RunStore {
     }
   }
   async validateStorageRoot() {
-    const graphcraftRoot2 = resolve9(this.graphcraftRoot);
-    const runRoot = resolve9(this.runRoot);
-    const validated = await validatePrivatePath(graphcraftRoot2, relative6(graphcraftRoot2, runRoot));
+    const graphcraftRoot2 = resolve10(this.graphcraftRoot);
+    const runRoot = resolve10(this.runRoot);
+    const validated = await validatePrivatePath(graphcraftRoot2, relative7(graphcraftRoot2, runRoot));
     if (validated !== runRoot)
       throw new Error(`Run storage path escaped the Graphcraft state directory: ${this.runRoot}`);
   }
@@ -46312,6 +47038,8 @@ var RunStore = class _RunStore {
       this._heldOutProbePlanHashAlgorithm = manifest2.formats.heldOutProbes === 2 ? PORTABLE_CANONICAL_HASH_ALGORITHM : LEGACY_CANONICAL_HASH_ALGORITHM;
       const artifactHashAlgorithm = manifest2.formats.artifactInventory === 2 ? PORTABLE_CANONICAL_HASH_ALGORITHM : LEGACY_CANONICAL_HASH_ALGORITHM;
       this.bindArtifactHashAlgorithm(artifactHashAlgorithm);
+      const workspaceScopeHashAlgorithm = manifest2.formats.workspaceScopeSnapshots === 2 ? PORTABLE_CANONICAL_HASH_ALGORITHM : LEGACY_CANONICAL_HASH_ALGORITHM;
+      this.bindWorkspaceScopeHashAlgorithm(workspaceScopeHashAlgorithm);
       await this.validateStorageRoot();
     } catch (error51) {
       if (this.storageReady === ready) this.storageReady = void 0;
@@ -46332,10 +47060,22 @@ var RunStore = class _RunStore {
       throw new Error("Artifact hash policy is unavailable before run storage is prepared");
     return this._artifactHashAlgorithm;
   }
+  get workspaceScopeHashAlgorithm() {
+    if (!this._workspaceScopeHashAlgorithm)
+      throw new Error("Workspace-scope hash policy is unavailable before run storage is prepared");
+    return this._workspaceScopeHashAlgorithm;
+  }
   bindArtifactHashAlgorithm(algorithm) {
     if (this.artifactStore && this.artifactStore.hashAlgorithm !== algorithm)
       throw new Error("Artifact store was bound before its storage manifest policy was known");
     this._artifactHashAlgorithm = algorithm;
+  }
+  bindWorkspaceScopeHashAlgorithm(algorithm) {
+    if (this._workspaceScopeHashAlgorithm && this._workspaceScopeHashAlgorithm !== algorithm)
+      throw new Error(
+        "Workspace-scope hashing was bound before its storage manifest policy was known"
+      );
+    this._workspaceScopeHashAlgorithm = algorithm;
   }
   artifacts() {
     return this.artifactStore ??= new RunArtifactStore(
@@ -46399,6 +47139,7 @@ var RunStore = class _RunStore {
     );
     store.initializing = true;
     store.bindArtifactHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    store.bindWorkspaceScopeHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     const persistedContract = RunContractSchema.parse(redactValue(contract));
     const persistedGraph = GraphSchema.parse(redactValue(graph));
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
@@ -46525,7 +47266,7 @@ var RunStore = class _RunStore {
     } catch (error51) {
       if (error51.code !== "EEXIST") throw error51;
       await validatePrivatePath(this.runRoot, "events.jsonl");
-      observed = await lstat8(this.eventsPath(), { bigint: true });
+      observed = await lstat9(this.eventsPath(), { bigint: true });
       assertEventLogFile(this.eventsPath(), observed);
       handle = await open7(
         this.eventsPath(),
@@ -46538,7 +47279,7 @@ var RunStore = class _RunStore {
       assertEventLogFile(this.eventsPath(), before);
       if (observed && !sameFileIdentity(observed, before))
         throw new Error("Run event log changed before its append descriptor was opened");
-      const pathBefore = await lstat8(this.eventsPath(), { bigint: true });
+      const pathBefore = await lstat9(this.eventsPath(), { bigint: true });
       assertEventLogFile(this.eventsPath(), pathBefore);
       if (!sameFileIdentity(before, pathBefore))
         throw new Error("Run event log path changed before append");
@@ -46547,7 +47288,7 @@ var RunStore = class _RunStore {
       await handle.writeFile(line, "utf8");
       await handle.sync();
       const after = await handle.stat({ bigint: true });
-      const pathAfter = await lstat8(this.eventsPath(), { bigint: true });
+      const pathAfter = await lstat9(this.eventsPath(), { bigint: true });
       assertEventLogFile(this.eventsPath(), after);
       assertEventLogFile(this.eventsPath(), pathAfter);
       if (!sameFileIdentity(after, pathAfter))
@@ -46710,20 +47451,20 @@ var RunStore = class _RunStore {
     while (offset < bytes) {
       const newline = contentBytes.indexOf(10, offset);
       const end = newline === -1 ? bytes : newline;
-      const recordBytes = contentBytes.subarray(offset, end);
-      if (recordBytes.byteLength === 0) {
+      const recordBytes2 = contentBytes.subarray(offset, end);
+      if (recordBytes2.byteLength === 0) {
         if (newline === -1) break;
         offset = newline + 1;
         continue;
       }
       const record2 = events.length + 1;
       const trailing = newline === -1;
-      const lineBytes = recordBytes.byteLength + 1;
+      const lineBytes = recordBytes2.byteLength + 1;
       if (lineBytes > this.limits.maxEventBytes)
         throw new RunStoreLimitError("event", lineBytes, this.limits.maxEventBytes);
       let decoded;
       try {
-        decoded = decoder.decode(recordBytes);
+        decoded = decoder.decode(recordBytes2);
       } catch {
         throw new RunStoreEventLogCorruptionError(record2, offset, trailing, "encoding");
       }
@@ -46747,6 +47488,12 @@ var RunStore = class _RunStore {
         throw new RunStoreEventLogCorruptionError(record2, offset, trailing, "format");
       if (event.sequence !== record2)
         throw new RunStoreEventLogCorruptionError(record2, offset, trailing, "sequence");
+      const scopeSnapshot = eventWorkspaceScopeSnapshot(event);
+      if (scopeSnapshot !== void 0 && workspaceScopeSnapshotUsesDifferentHashPolicy(
+        scopeSnapshot,
+        this.workspaceScopeHashAlgorithm
+      ))
+        throw new RunStoreEventLogCorruptionError(record2, offset, trailing, "scope");
       events.push(event);
       if (newline === -1) break;
       offset = newline + 1;
@@ -47019,269 +47766,6 @@ async function resolveRunId(repositoryRoot, reference) {
   if (matches.length !== 1)
     throw new Error(`Run reference ${reference} matched ${matches.length} runs`);
   return matches[0];
-}
-
-// packages/runtime/src/scope.ts
-import { createHash as createHash5 } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { lstat as lstat9, readlink as readlink3 } from "node:fs/promises";
-import { isAbsolute as isAbsolute7, matchesGlob, relative as relative7, resolve as resolve10, sep as sep5 } from "node:path";
-var maximumChangedPaths = 1e4;
-async function gitOutput(repositoryPath, args, signal) {
-  signal?.throwIfAborted();
-  const result = await runProcess("git", args, {
-    cwd: repositoryPath,
-    timeoutMs: 12e4,
-    ...signal ? { signal } : {}
-  });
-  signal?.throwIfAborted();
-  if (result.exitCode !== 0)
-    throw new Error(result.stderr.trim() || `git ${args[0] ?? "command"} failed`);
-  return result.stdout;
-}
-function nulPaths(value) {
-  return value.split("\0").filter(Boolean);
-}
-function confinedPath(repositoryPath, path) {
-  if (isAbsolute7(path)) throw new Error(`Git reported an absolute workspace path: ${path}`);
-  const absolute = resolve10(repositoryPath, path);
-  const confined = relative7(repositoryPath, absolute);
-  if (confined === ".." || confined.startsWith(`..${sep5}`) || isAbsolute7(confined))
-    throw new Error(`Git reported a path outside the workspace: ${path}`);
-  return absolute;
-}
-async function fileDigest(path, signal) {
-  signal?.throwIfAborted();
-  const hash2 = createHash5("sha256");
-  for await (const chunk of createReadStream(path, signal ? { signal } : void 0)) {
-    signal?.throwIfAborted();
-    hash2.update(chunk);
-  }
-  signal?.throwIfAborted();
-  return hash2.digest("hex");
-}
-async function pathSignature(repositoryPath, path, signal) {
-  signal?.throwIfAborted();
-  const absolute = confinedPath(repositoryPath, path);
-  let status3;
-  try {
-    status3 = await lstat9(absolute);
-  } catch (error51) {
-    signal?.throwIfAborted();
-    if (error51.code === "ENOENT") return "missing";
-    throw error51;
-  }
-  signal?.throwIfAborted();
-  const mode = status3.mode & 511;
-  if (status3.isSymbolicLink()) {
-    const target = await readlink3(absolute);
-    signal?.throwIfAborted();
-    return contentHash({ kind: "symlink", mode, target });
-  }
-  if (status3.isFile())
-    return contentHash({
-      kind: "file",
-      mode,
-      size: status3.size,
-      digest: await fileDigest(absolute, signal)
-    });
-  if (status3.isDirectory()) {
-    const operations = [
-      gitOutput(absolute, ["rev-parse", "HEAD"], signal).catch(() => {
-        signal?.throwIfAborted();
-        return "not-a-repository";
-      }),
-      gitOutput(
-        absolute,
-        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-        signal
-      ).catch(() => {
-        signal?.throwIfAborted();
-        return "unavailable";
-      })
-    ];
-    let head;
-    let state;
-    try {
-      [head, state] = await Promise.all(operations);
-    } catch (error51) {
-      if (signal?.aborted) await Promise.allSettled(operations);
-      throw error51;
-    }
-    signal?.throwIfAborted();
-    return contentHash({ kind: "directory", mode, head: head.trim(), state });
-  }
-  return contentHash({ kind: "other", mode, size: status3.size });
-}
-async function captureWorkspaceScopeSnapshot(repositoryPath, inspectedIgnoredPatterns = [], signal) {
-  signal?.throwIfAborted();
-  const ignored = inspectedIgnoredPatterns.length > 0 ? gitOutput(
-    repositoryPath,
-    [
-      "ls-files",
-      "--others",
-      "--ignored",
-      "--exclude-standard",
-      "-z",
-      "--",
-      ...inspectedIgnoredPatterns
-    ],
-    signal
-  ) : Promise.resolve("");
-  const operations = [
-    gitOutput(repositoryPath, ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"], signal),
-    gitOutput(repositoryPath, ["ls-files", "--others", "--exclude-standard", "-z"], signal),
-    ignored,
-    gitOutput(repositoryPath, ["rev-parse", "HEAD"], signal),
-    gitOutput(repositoryPath, ["symbolic-ref", "--quiet", "--short", "HEAD"], signal).catch(() => {
-      signal?.throwIfAborted();
-      return "(detached)";
-    }),
-    gitOutput(
-      repositoryPath,
-      ["diff", "--cached", "--no-ext-diff", "--binary", "HEAD", "--"],
-      signal
-    )
-  ];
-  let tracked;
-  let untracked;
-  let excludedIgnored;
-  let head;
-  let branch;
-  let index;
-  try {
-    [tracked, untracked, excludedIgnored, head, branch, index] = await Promise.all(operations);
-  } catch (error51) {
-    if (signal?.aborted) await Promise.allSettled(operations);
-    throw error51;
-  }
-  signal?.throwIfAborted();
-  const paths = [
-    .../* @__PURE__ */ new Set([...nulPaths(tracked), ...nulPaths(untracked), ...nulPaths(excludedIgnored)])
-  ].sort();
-  if (paths.length > maximumChangedPaths)
-    throw new Error(
-      `Workspace scope inspection refused ${paths.length} changed paths; maximum is ${maximumChangedPaths}`
-    );
-  const changed = {};
-  for (const path of paths) {
-    signal?.throwIfAborted();
-    changed[path.replaceAll("\\", "/")] = await pathSignature(repositoryPath, path, signal);
-  }
-  signal?.throwIfAborted();
-  const core = {
-    headSha: head.trim(),
-    branch: branch.trim(),
-    indexDigest: contentHash(index),
-    changed
-  };
-  return { schemaVersion: 1, digest: contentHash(core), ...core };
-}
-function parseWorkspaceScopeSnapshot(value) {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return void 0;
-  const candidate = value;
-  if (candidate.schemaVersion !== 1 || typeof candidate.digest !== "string" || typeof candidate.headSha !== "string" || typeof candidate.branch !== "string" || typeof candidate.indexDigest !== "string" || typeof candidate.changed !== "object" || candidate.changed === null || Array.isArray(candidate.changed) || Object.entries(candidate.changed).some(
-    ([path, signature]) => path.length === 0 || typeof signature !== "string"
-  ))
-    return void 0;
-  return candidate;
-}
-function normalizedPattern(value) {
-  return value.replaceAll("\\", "/").replace(/^\.\//, "");
-}
-function pathMatchesScope(path, patterns) {
-  const normalizedPath = normalizedPattern(path);
-  return patterns.some((value) => {
-    const pattern = normalizedPattern(value);
-    if (pattern === "**" || pattern === "**/*") return true;
-    if (normalizedPath === pattern) return true;
-    if (pattern.endsWith("/**") && normalizedPath === pattern.slice(0, -3).replace(/\/$/, ""))
-      return true;
-    return matchesGlob(normalizedPath, pattern);
-  });
-}
-function acceptedWriteScopes(graph, state) {
-  return graph.nodes.filter(
-    (candidate) => candidate.sideEffectClass === "workspace_write" && state.nodes[candidate.id]?.status === "accepted"
-  ).flatMap(({ scope }) => scope);
-}
-function auditWorkspaceScope(input) {
-  const currentPaths = Object.keys(input.current.changed).sort();
-  const touchedPaths = [.../* @__PURE__ */ new Set([...Object.keys(input.baseline.changed), ...currentPaths])].filter((path) => input.baseline.changed[path] !== input.current.changed[path]).sort();
-  const candidatePaths = [.../* @__PURE__ */ new Set([...currentPaths, ...touchedPaths])].sort();
-  const priorScopes = acceptedWriteScopes(input.graph, input.state);
-  const violations = [];
-  for (const path of candidatePaths) {
-    if (!pathMatchesScope(path, input.contract.scope.include))
-      violations.push({
-        kind: "contract_not_included",
-        path,
-        detail: `${path} is outside contract include scope ${input.contract.scope.include.join(", ")}`
-      });
-    if (pathMatchesScope(path, input.contract.scope.exclude))
-      violations.push({
-        kind: "contract_excluded",
-        path,
-        detail: `${path} matches contract exclude scope ${input.contract.scope.exclude.join(", ")}`
-      });
-  }
-  for (const path of touchedPaths) {
-    if (input.node.sideEffectClass === "none")
-      violations.push({
-        kind: "read_only_write",
-        path,
-        detail: `${path} changed during read-only node ${input.node.id}`
-      });
-    else if (!pathMatchesScope(path, input.node.scope))
-      violations.push({
-        kind: "node_scope",
-        path,
-        detail: `${path} changed outside node ${input.node.id} scope ${input.node.scope.join(", ")}`
-      });
-  }
-  for (const path of currentPaths)
-    if (!pathMatchesScope(path, input.node.scope) && !pathMatchesScope(path, priorScopes))
-      violations.push({
-        kind: "unowned_change",
-        path,
-        detail: `${path} is not owned by ${input.node.id} or an accepted write node`
-      });
-  if (input.baseline.headSha !== input.current.headSha)
-    violations.push({
-      kind: "git_head",
-      detail: `HEAD changed from ${input.baseline.headSha} to ${input.current.headSha} outside a commit node`
-    });
-  if (input.baseline.branch !== input.current.branch)
-    violations.push({
-      kind: "git_branch",
-      detail: `branch changed from ${input.baseline.branch} to ${input.current.branch} outside a runtime boundary`
-    });
-  if (input.baseline.indexDigest !== input.current.indexDigest)
-    violations.push({
-      kind: "git_index",
-      detail: "the Git index changed outside a runtime-owned commit boundary"
-    });
-  const uniqueViolations = violations.filter(
-    (violation, index) => violations.findIndex(
-      (candidate) => candidate.kind === violation.kind && candidate.path === violation.path && candidate.detail === violation.detail
-    ) === index
-  );
-  return {
-    schemaVersion: 1,
-    nodeId: input.node.id,
-    allowed: uniqueViolations.length === 0,
-    changedPaths: currentPaths,
-    touchedPaths,
-    reportedChangedPaths: [...new Set(input.reportedChangedPaths ?? [])].sort(),
-    violations: uniqueViolations,
-    baselineDigest: input.baseline.digest,
-    currentDigest: input.current.digest
-  };
-}
-function scopeViolationReason(audit, workspacePath) {
-  const evidence = audit.violations.slice(0, 12).map(({ detail }) => detail).join("; ");
-  const omitted = audit.violations.length > 12 ? `; ${audit.violations.length - 12} more` : "";
-  return `Scope policy rejected node ${audit.nodeId}: ${evidence}${omitted}. Changes were preserved in the isolated workspace at ${workspacePath}`;
 }
 
 // packages/runtime/src/context.ts
@@ -49788,6 +50272,14 @@ async function evaluateGitHubLifecycleWait(input) {
 }
 
 // packages/runtime/src/runner.ts
+async function captureRunWorkspaceScopeSnapshot(store, repositoryPath, inspectedIgnoredPatterns, signal) {
+  return await captureWorkspaceScopeSnapshot(
+    repositoryPath,
+    inspectedIgnoredPatterns,
+    signal,
+    store.workspaceScopeHashAlgorithm
+  );
+}
 function assertRunCreationActive(signal, durableRunId) {
   if (!signal?.aborted) return;
   const reason = interruptionReason(signal.reason);
@@ -49866,7 +50358,10 @@ async function recoverableInvocation(store, nodeId, repositoryPath, family) {
   const transcriptSession = transcript.findLast((event) => event.type === "session");
   const hostSessionId = session ? String(session.data.hostSessionId) : transcriptSession?.type === "session" ? transcriptSession.hostSessionId : typeof started.data.reusedHostSessionId === "string" ? started.data.reusedHostSessionId : void 0;
   const baseline = persistedBaseline(started.data.baseline, family);
-  const scopeBaseline = parseWorkspaceScopeSnapshot(started.data.scopeBaseline);
+  const scopeBaseline = parseWorkspaceScopeSnapshot(
+    started.data.scopeBaseline,
+    store.workspaceScopeHashAlgorithm
+  );
   return {
     adapterId: String(started.data.adapter ?? ""),
     nodeId,
@@ -50509,7 +51004,10 @@ function assertSemanticWorkspaceRecovery(input) {
   );
   if (latestStart) {
     const invocationId = latestStart.data.invocationId;
-    const baseline = parseWorkspaceScopeSnapshot(latestStart.data.scopeBaseline);
+    const baseline = parseWorkspaceScopeSnapshot(
+      latestStart.data.scopeBaseline,
+      input.hashAlgorithm
+    );
     if (typeof invocationId !== "string" || typeof latestStart.data.host !== "string" || typeof latestStart.data.checkpointId !== "string" || typeof latestStart.data.contextHash !== "string" || latestStart.actor !== "runtime" || latestStart.causationId !== invocationId || !baseline || latestStart.data.beforeDigest !== baseline.digest)
       throw new SemanticVerificationFailure(
         "Graphcraft cannot validate the semantic verifier's approved pre-call workspace baseline"
@@ -50586,7 +51084,8 @@ async function recoverSemanticVerification(input) {
     events,
     node: input.node,
     phase: input.phase,
-    current: input.scope
+    current: input.scope,
+    hashAlgorithm: input.store.workspaceScopeHashAlgorithm
   });
   const checkpoint = events.findLast((event) => {
     if (event.type !== "semantic.verdict" || event.data.checkpointId !== input.checkpointId || event.data.nodeId !== input.node.id || event.data.host !== input.host || event.data.phase !== input.phase || event.data.policyViolation !== false || event.data.beforeDigest !== input.scope.digest || event.data.afterDigest !== input.scope.digest)
@@ -50652,7 +51151,8 @@ async function runSemanticVerification(input) {
         currentProbeEvidence: stableSemanticProbeEvidence(input.currentProbeEvidence)
       })
     );
-    beforeScope = await captureWorkspaceScopeSnapshot(
+    beforeScope = await captureRunWorkspaceScopeSnapshot(
+      input.store,
       input.workspace.path,
       input.contract.scope.exclude,
       input.signal
@@ -50811,7 +51311,8 @@ async function runSemanticVerification(input) {
   }
   let afterScope;
   try {
-    afterScope = await captureWorkspaceScopeSnapshot(
+    afterScope = await captureRunWorkspaceScopeSnapshot(
+      input.store,
       input.workspace.path,
       input.contract.scope.exclude,
       input.signal
@@ -51355,14 +51856,6 @@ function durableRunBlocker(failure) {
 function progressProbeStage(value) {
   return value === "progress_baseline" || value === "progress_current" || value === "verification" ? value : void 0;
 }
-function workspaceScopeSnapshotDigestIsValid(snapshot) {
-  return snapshot.digest === contentHash({
-    headSha: snapshot.headSha,
-    branch: snapshot.branch,
-    indexDigest: snapshot.indexDigest,
-    changed: snapshot.changed
-  });
-}
 function progressProbeScopePolicyHash(input) {
   return contentHash({
     schemaVersion: 1,
@@ -51467,7 +51960,8 @@ async function executeReadOnlyProgressProbes(input) {
   let baseline = input.baseline;
   if (!baseline)
     try {
-      baseline = await captureWorkspaceScopeSnapshot(
+      baseline = await captureRunWorkspaceScopeSnapshot(
+        input.store,
         input.workspace.path,
         input.contract.scope.exclude,
         input.signal
@@ -51534,7 +52028,8 @@ async function executeReadOnlyProgressProbes(input) {
     }
   let current;
   try {
-    current = await captureWorkspaceScopeSnapshot(
+    current = await captureRunWorkspaceScopeSnapshot(
+      input.store,
       input.workspace.path,
       input.contract.scope.exclude,
       input.signal
@@ -51579,8 +52074,8 @@ function validatedProgressProbeScopeCheck(input) {
   const { event, checkpoint } = input;
   if (event.type !== "scope.checked" || event.actor !== "runtime" || event.sequence <= checkpoint.start.sequence || event.causationId !== checkpoint.checkpointId || event.data.checkpointId !== checkpoint.checkpointId || event.data.nodeId !== checkpoint.node.id || event.data.stage !== checkpoint.stage || event.data.enforced !== true || typeof event.data.audit !== "object" || event.data.audit === null || Array.isArray(event.data.audit))
     return void 0;
-  const current = parseWorkspaceScopeSnapshot(event.data.current);
-  if (!current || !workspaceScopeSnapshotDigestIsValid(current)) return void 0;
+  const current = parseWorkspaceScopeSnapshot(event.data.current, input.hashAlgorithm);
+  if (!current) return void 0;
   const audit = progressProbeScopeAudit({
     contract: input.contract,
     graph: input.graph,
@@ -52010,7 +52505,10 @@ async function reconcileProgressProbeScopeCheckpoints(input) {
     const active = declaredNodeId ? activeNodes.get(declaredNodeId) : void 0;
     const stage = progressProbeStage(start.data.stage);
     const checkpointId = typeof start.data.checkpointId === "string" && start.data.checkpointId.length > 0 ? start.data.checkpointId : start.hash;
-    const baseline = parseWorkspaceScopeSnapshot(start.data.baseline);
+    const baseline = parseWorkspaceScopeSnapshot(
+      start.data.baseline,
+      input.store.workspaceScopeHashAlgorithm
+    );
     const expectedProbeIds = active ? (stage === "verification" ? active.node.completionProbes : active.node.progressProbes).map(
       ({ id }) => id
     ) : void 0;
@@ -52022,7 +52520,7 @@ async function reconcileProgressProbeScopeCheckpoints(input) {
       node: active.node,
       stage,
       probeIds: expectedProbeIds
-    }) && baseline !== void 0 && workspaceScopeSnapshotDigestIsValid(baseline) && validProbeIds;
+    }) && baseline !== void 0 && validProbeIds;
     if (!valid) {
       const reason = `Graphcraft cannot validate progress-probe scope checkpoint ${checkpointId}`;
       return await blockProgressProbeRecovery({
@@ -52066,7 +52564,8 @@ async function reconcileProgressProbeScopeCheckpoints(input) {
       checkpoint,
       contract: input.contract,
       graph: input.graph,
-      state: input.state
+      state: input.state,
+      hashAlgorithm: input.store.workspaceScopeHashAlgorithm
     }) : void 0;
     if (rawChecks.length === 1 && !checked) {
       const reason = `Graphcraft cannot validate the durable progress-probe scope check for checkpoint ${checkpointId}`;
@@ -52095,7 +52594,8 @@ async function reconcileProgressProbeScopeCheckpoints(input) {
         });
       let current2;
       try {
-        current2 = await captureWorkspaceScopeSnapshot(
+        current2 = await captureRunWorkspaceScopeSnapshot(
+          input.store,
           input.workspace.path,
           input.contract.scope.exclude,
           input.signal
@@ -52122,7 +52622,8 @@ async function reconcileProgressProbeScopeCheckpoints(input) {
     }
     let current;
     try {
-      current = await captureWorkspaceScopeSnapshot(
+      current = await captureRunWorkspaceScopeSnapshot(
+        input.store,
         input.workspace.path,
         input.contract.scope.exclude,
         input.signal
@@ -52210,7 +52711,8 @@ async function executeWorkNode(input) {
   }
   let scopeBaseline;
   try {
-    scopeBaseline = input.recoveryScopeBaseline ?? observedBaselineScope ?? await captureWorkspaceScopeSnapshot(
+    scopeBaseline = input.recoveryScopeBaseline ?? observedBaselineScope ?? await captureRunWorkspaceScopeSnapshot(
+      input.store,
       input.workspace.path,
       input.contract.scope.exclude,
       input.signal
@@ -52250,7 +52752,8 @@ async function executeWorkNode(input) {
   }
   let currentScope;
   try {
-    currentScope = await captureWorkspaceScopeSnapshot(
+    currentScope = await captureRunWorkspaceScopeSnapshot(
+      input.store,
       input.workspace.path,
       input.contract.scope.exclude,
       input.signal
@@ -53430,7 +53933,8 @@ async function executeRun(input) {
           verificationScopeCurrent = verificationExecution.scope;
         } else {
           try {
-            verificationScopeCurrent = await captureWorkspaceScopeSnapshot(
+            verificationScopeCurrent = await captureRunWorkspaceScopeSnapshot(
+              input.store,
               workspace.path,
               contract.scope.exclude,
               signal
