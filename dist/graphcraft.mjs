@@ -29883,7 +29883,10 @@ async function runManagedProcess(executable, args, environment, options, started
         env: environment,
         shell: false,
         stdio: ["ignore", "pipe", "pipe", "ipc", lifecycle.journalFd],
-        detached: process.platform !== "win32",
+        // libuv assigns non-detached Windows children to a kill-on-close job.
+        // The broker must outlive a crashed runtime so it can settle the owned
+        // target tree and fsync the terminal journal record.
+        detached: true,
         windowsHide: true
       }
     );
@@ -47592,7 +47595,7 @@ var program2 = new Command().name("graphcraft").description("Progress-aware exec
 async function benchmarkSourceIdentity() {
   if (true) {
     return BenchmarkSourceIdentitySchema.parse({
-      commitSha: "08c2a76ae349cf7de2f789818c0e90474df9b3d8",
+      commitSha: "19bd24e303bbeac210642a4942e4720d2b412a0e",
       dirty: false,
       dirtyStatusDigest: false ? null : null
     });

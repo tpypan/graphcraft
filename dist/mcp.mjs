@@ -42643,7 +42643,10 @@ async function runManagedProcess(executable, args, environment, options, started
         env: environment,
         shell: false,
         stdio: ["ignore", "pipe", "pipe", "ipc", lifecycle.journalFd],
-        detached: process.platform !== "win32",
+        // libuv assigns non-detached Windows children to a kill-on-close job.
+        // The broker must outlive a crashed runtime so it can settle the owned
+        // target tree and fsync the terminal journal record.
+        detached: true,
         windowsHide: true
       }
     );
