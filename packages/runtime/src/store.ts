@@ -99,7 +99,8 @@ export class RunStoreEventLogCorruptionError extends Error {
       | "scope"
       | "checkpoint"
       | "governance"
-      | "repository_side_effect",
+      | "repository_side_effect"
+      | "github_mutation_lifecycle",
   ) {
     const location = trailing ? "trailing record" : `record ${record}`;
     const problem =
@@ -121,7 +122,9 @@ export class RunStoreEventLogCorruptionError extends Error {
                       ? "a governance/control identity format that disagrees with its storage manifest"
                       : reason === "repository_side_effect"
                         ? "a repository side-effect identity format that disagrees with its storage manifest"
-                        : "an invalid event sequence";
+                        : reason === "github_mutation_lifecycle"
+                          ? "a GitHub mutation-lifecycle identity format that disagrees with its storage manifest"
+                          : "an invalid event sequence";
     super(
       `Run event log has ${problem} in ${location} at byte ${offsetBytes}; event log bytes were left unchanged`,
     );
@@ -240,6 +243,15 @@ function repositorySideEffectIdentityUsesDifferentFormat(
   return selected === PORTABLE_CANONICAL_HASH_ALGORITHM ? format !== 2 : format !== undefined;
 }
 
+function githubMutationLifecycleIdentityUsesDifferentFormat(
+  event: RunEvent,
+  selected: CanonicalHashAlgorithm,
+): boolean {
+  if (event.type !== "run.created") return false;
+  const format = event.data.githubMutationLifecycleIdentityFormat;
+  return selected === PORTABLE_CANONICAL_HASH_ALGORITHM ? format !== 2 : format !== undefined;
+}
+
 export class RunStore {
   readonly repositoryRoot: string;
   readonly runId: string;
@@ -257,6 +269,7 @@ export class RunStore {
   private _probeEvidenceCheckpointHashAlgorithm: CanonicalHashAlgorithm | undefined;
   private _governanceControlIdentityHashAlgorithm: CanonicalHashAlgorithm | undefined;
   private _repositorySideEffectIdentityHashAlgorithm: CanonicalHashAlgorithm | undefined;
+  private _githubMutationLifecycleIdentityHashAlgorithm: CanonicalHashAlgorithm | undefined;
 
   constructor(
     repositoryRoot: string,
@@ -334,6 +347,13 @@ export class RunStore {
           ? PORTABLE_CANONICAL_HASH_ALGORITHM
           : LEGACY_CANONICAL_HASH_ALGORITHM;
       this.bindRepositorySideEffectIdentityHashAlgorithm(repositorySideEffectIdentityHashAlgorithm);
+      const githubMutationLifecycleIdentityHashAlgorithm =
+        manifest.formats.githubMutationLifecycleIdentities === 2
+          ? PORTABLE_CANONICAL_HASH_ALGORITHM
+          : LEGACY_CANONICAL_HASH_ALGORITHM;
+      this.bindGithubMutationLifecycleIdentityHashAlgorithm(
+        githubMutationLifecycleIdentityHashAlgorithm,
+      );
       await this.validateStorageRoot();
     } catch (error) {
       if (this.storageReady === ready) this.storageReady = undefined;
@@ -389,6 +409,14 @@ export class RunStore {
     return this._repositorySideEffectIdentityHashAlgorithm;
   }
 
+  get githubMutationLifecycleIdentityHashAlgorithm(): CanonicalHashAlgorithm {
+    if (!this._githubMutationLifecycleIdentityHashAlgorithm)
+      throw new Error(
+        "GitHub mutation-lifecycle identity hash policy is unavailable before run storage is prepared",
+      );
+    return this._githubMutationLifecycleIdentityHashAlgorithm;
+  }
+
   private bindArtifactHashAlgorithm(algorithm: CanonicalHashAlgorithm): void {
     if (this.artifactStore && this.artifactStore.hashAlgorithm !== algorithm)
       throw new Error("Artifact store was bound before its storage manifest policy was known");
@@ -434,6 +462,19 @@ export class RunStore {
         "Repository side-effect identity hashing was bound before its storage manifest policy was known",
       );
     this._repositorySideEffectIdentityHashAlgorithm = algorithm;
+  }
+
+  private bindGithubMutationLifecycleIdentityHashAlgorithm(
+    algorithm: CanonicalHashAlgorithm,
+  ): void {
+    if (
+      this._githubMutationLifecycleIdentityHashAlgorithm &&
+      this._githubMutationLifecycleIdentityHashAlgorithm !== algorithm
+    )
+      throw new Error(
+        "GitHub mutation-lifecycle identity hashing was bound before its storage manifest policy was known",
+      );
+    this._githubMutationLifecycleIdentityHashAlgorithm = algorithm;
   }
 
   private artifacts(): RunArtifactStore {
@@ -528,6 +569,7 @@ export class RunStore {
     store.bindProbeEvidenceCheckpointHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     store.bindGovernanceControlIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     store.bindRepositorySideEffectIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    store.bindGithubMutationLifecycleIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     const persistedContract = RunContractSchema.parse(redactValue(contract));
     const persistedGraph = GraphSchema.parse(redactValue(graph));
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
@@ -567,6 +609,7 @@ export class RunStore {
           probeEvidenceCheckpointFormat: 2,
           governanceControlIdentityFormat: 2,
           repositorySideEffectIdentityFormat: 2,
+          githubMutationLifecycleIdentityFormat: 2,
         },
       },
       store.canonicalHashAlgorithm,
@@ -946,6 +989,18 @@ export class RunStore {
           offset,
           trailing,
           "repository_side_effect",
+        );
+      if (
+        githubMutationLifecycleIdentityUsesDifferentFormat(
+          event,
+          this.githubMutationLifecycleIdentityHashAlgorithm,
+        )
+      )
+        throw new RunStoreEventLogCorruptionError(
+          record,
+          offset,
+          trailing,
+          "github_mutation_lifecycle",
         );
       const scopeSnapshot = eventWorkspaceScopeSnapshot(event);
       if (

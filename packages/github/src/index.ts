@@ -1,6 +1,12 @@
 import crossSpawn from "cross-spawn";
 import { z } from "zod";
-import { contentHash, resolveTrustedExecutable, terminateChildProcessTree } from "@graphcraft/core";
+import {
+  LEGACY_CANONICAL_HASH_ALGORITHM,
+  contentHash,
+  resolveTrustedExecutable,
+  terminateChildProcessTree,
+  type CanonicalHashAlgorithm,
+} from "@graphcraft/core";
 
 export const GITHUB_COMMAND_TERMINATION_GRACE_MS = 2_000;
 export const GITHUB_COMMAND_SETTLEMENT_GRACE_MS = 2_000;
@@ -1361,25 +1367,48 @@ type GitHubSnapshotLifecycleState = Pick<
   binding: Pick<GitHubPullRequestSnapshot["binding"], "headSha" | "baseSha">;
 };
 
-function lifecycleFingerprint(input: GitHubSnapshotLifecycleState): string {
+function compareIdentityStrings(
+  left: string,
+  right: string,
+  hashAlgorithm: CanonicalHashAlgorithm,
+): number {
+  if (hashAlgorithm === LEGACY_CANONICAL_HASH_ALGORITHM) return left.localeCompare(right);
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function lifecycleFingerprint(
+  input: GitHubSnapshotLifecycleState,
+  hashAlgorithm: CanonicalHashAlgorithm,
+): string {
   const requiredCheckKey = (check: { context: string; appId?: number | undefined }): string =>
     `${check.context}:${check.appId ?? ""}`;
-  return contentHash({
-    ...input,
-    binding: { ...input.binding },
-    branchProtection: {
-      ...input.branchProtection,
-      requiredStatusChecks: [...input.branchProtection.requiredStatusChecks].sort((left, right) =>
-        requiredCheckKey(left).localeCompare(requiredCheckKey(right)),
+  return contentHash(
+    {
+      ...input,
+      binding: { ...input.binding },
+      branchProtection: {
+        ...input.branchProtection,
+        requiredStatusChecks: [...input.branchProtection.requiredStatusChecks].sort((left, right) =>
+          compareIdentityStrings(requiredCheckKey(left), requiredCheckKey(right), hashAlgorithm),
+        ),
+      },
+      requiredChecks: input.requiredChecks
+        .map((check) => ({ ...check, matchingCheckIds: [...check.matchingCheckIds].sort() }))
+        .sort((left, right) =>
+          compareIdentityStrings(requiredCheckKey(left), requiredCheckKey(right), hashAlgorithm),
+        ),
+      checks: [...input.checks].sort((left, right) =>
+        compareIdentityStrings(left.id, right.id, hashAlgorithm),
+      ),
+      reviewThreads: [...input.reviewThreads].sort((left, right) =>
+        compareIdentityStrings(left.id, right.id, hashAlgorithm),
+      ),
+      reviews: [...input.reviews].sort((left, right) =>
+        compareIdentityStrings(left.id, right.id, hashAlgorithm),
       ),
     },
-    requiredChecks: input.requiredChecks
-      .map((check) => ({ ...check, matchingCheckIds: [...check.matchingCheckIds].sort() }))
-      .sort((left, right) => requiredCheckKey(left).localeCompare(requiredCheckKey(right))),
-    checks: [...input.checks].sort((left, right) => left.id.localeCompare(right.id)),
-    reviewThreads: [...input.reviewThreads].sort((left, right) => left.id.localeCompare(right.id)),
-    reviews: [...input.reviews].sort((left, right) => left.id.localeCompare(right.id)),
-  });
+    hashAlgorithm,
+  );
 }
 
 function snapshotLifecycleState(snapshot: GitHubPullRequestSnapshot): GitHubSnapshotLifecycleState {
@@ -1398,6 +1427,7 @@ function snapshotLifecycleState(snapshot: GitHubPullRequestSnapshot): GitHubSnap
 export async function assertGitHubSnapshotCurrent(
   options: GitHubCommandOptions,
   snapshot: GitHubPullRequestSnapshot,
+  hashAlgorithm: CanonicalHashAlgorithm,
 ): Promise<void> {
   const parsed = GitHubPullRequestSnapshotSchema.parse(snapshot);
   const { owner, name } = repositoryParts(parsed.repository.nameWithOwner);
@@ -1434,9 +1464,9 @@ export async function assertGitHubSnapshotCurrent(
     throw new Error(
       `GitHub snapshot ${parsed.snapshotId} is stale: ${parsed.binding.headSha}/${parsed.binding.baseSha} changed during lifecycle revalidation`,
     );
-  const expectedFingerprint = lifecycleFingerprint(snapshotLifecycleState(parsed));
-  const firstFingerprint = lifecycleFingerprint(first);
-  const currentFingerprint = lifecycleFingerprint(current);
+  const expectedFingerprint = lifecycleFingerprint(snapshotLifecycleState(parsed), hashAlgorithm);
+  const firstFingerprint = lifecycleFingerprint(first, hashAlgorithm);
+  const currentFingerprint = lifecycleFingerprint(current, hashAlgorithm);
   if (currentFingerprint !== firstFingerprint)
     throw new GitHubLifecycleConsistencyError(
       `GitHub snapshot ${parsed.snapshotId} mutable lifecycle changed during revalidation: ${firstFingerprint} changed to ${currentFingerprint}`,
@@ -1473,6 +1503,7 @@ function requiredCheckBucket(
 
 function latestReviewStates(
   snapshot: GitHubPullRequestSnapshot,
+  hashAlgorithm: CanonicalHashAlgorithm,
 ): Array<{ author: string; state: string }> {
   const latest = new Map<string, { state: string; submittedAt: string; id: string }>();
   for (const review of snapshot.reviews) {
@@ -1488,12 +1519,13 @@ function latestReviewStates(
   }
   return [...latest.entries()]
     .map(([author, { state }]) => ({ author, state }))
-    .sort((left, right) => left.author.localeCompare(right.author));
+    .sort((left, right) => compareIdentityStrings(left.author, right.author, hashAlgorithm));
 }
 
 export function classifyGitHubPullRequestLifecycle(
   snapshotInput: GitHubPullRequestSnapshot,
   expectedInput: GitHubPullRequestBindingExpectation,
+  hashAlgorithm: CanonicalHashAlgorithm,
 ): GitHubPullRequestLifecycleClassification {
   const snapshot = GitHubPullRequestSnapshotSchema.parse(snapshotInput);
   const expected = GitHubPullRequestBindingExpectationSchema.parse(expectedInput);
@@ -1524,7 +1556,7 @@ export function classifyGitHubPullRequestLifecycle(
     .filter(({ isResolved, isOutdated }) => !isResolved && !isOutdated)
     .map(({ id }) => id)
     .sort();
-  const latestReviews = latestReviewStates(snapshot);
+  const latestReviews = latestReviewStates(snapshot, hashAlgorithm);
   const currentApprovals = latestReviews.filter(({ state }) => state === "APPROVED").length;
   const requiredApprovals = snapshot.branchProtection.requiresApprovingReviews
     ? (snapshot.branchProtection.requiredApprovingReviewCount ?? 1)
@@ -1593,8 +1625,10 @@ export function classifyGitHubPullRequestLifecycle(
         matchingCheckIds: [...matchingCheckIds].sort(),
       }))
       .sort((left, right) =>
-        `${left.context}:${left.appId ?? ""}`.localeCompare(
+        compareIdentityStrings(
+          `${left.context}:${left.appId ?? ""}`,
           `${right.context}:${right.appId ?? ""}`,
+          hashAlgorithm,
         ),
       ),
     unresolvedThreadIds,
@@ -1612,7 +1646,7 @@ export function classifyGitHubPullRequestLifecycle(
     counts,
     checkIds,
     unresolvedThreadIds,
-    signature: contentHash(stableEvidence),
+    signature: contentHash(stableEvidence, hashAlgorithm),
     evidence,
   });
 }
@@ -1678,6 +1712,7 @@ async function collectSnapshotLifecycle(input: {
 
 export async function captureGitHubPullRequestSnapshot(
   options: GitHubCommandOptions & { pullRequest?: string | number },
+  hashAlgorithm: CanonicalHashAlgorithm,
 ): Promise<GitHubPullRequestSnapshot> {
   const capability = await probeGitHub(options);
   if (!capability.readyForSnapshot || !capability.host || !capability.nameWithOwner)
@@ -1714,8 +1749,8 @@ export async function captureGitHubPullRequestSnapshot(
     throw new Error(
       `GitHub snapshot became stale during capture: ${stable.binding.headSha}/${stable.binding.baseSha} changed to ${finalBinding.headSha}/${finalBinding.baseSha}`,
     );
-  const firstFingerprint = lifecycleFingerprint(first);
-  const stableFingerprint = lifecycleFingerprint(stable);
+  const firstFingerprint = lifecycleFingerprint(first, hashAlgorithm);
+  const stableFingerprint = lifecycleFingerprint(stable, hashAlgorithm);
   if (stableFingerprint !== firstFingerprint)
     throw new GitHubLifecycleConsistencyError(
       `GitHub snapshot mutable lifecycle changed during capture: ${firstFingerprint} changed to ${stableFingerprint}`,
@@ -1730,6 +1765,6 @@ export async function captureGitHubPullRequestSnapshot(
   };
   return GitHubPullRequestSnapshotSchema.parse({
     ...value,
-    snapshotId: contentHash(value),
+    snapshotId: contentHash(value, hashAlgorithm),
   });
 }

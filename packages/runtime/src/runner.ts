@@ -924,6 +924,7 @@ async function captureProbes(
           githubLifecycle.claim,
           githubLifecycle.result,
           spec,
+          store.githubMutationLifecycleIdentityHashAlgorithm,
           githubLifecycle.options,
         ),
       );
@@ -5273,15 +5274,28 @@ export async function executeRun(input: {
           )?.claim;
           const proposedClaim =
             existingClaim ??
-            (await createPullRequestClaim(workspace, contract, current.id, input.github));
+            (await createPullRequestClaim(
+              workspace,
+              contract,
+              current.id,
+              input.store.githubMutationLifecycleIdentityHashAlgorithm,
+              input.github,
+            ));
           const result = await executeSideEffect({
             store: input.store,
             claim: proposedClaim,
-            reconcile: async (claim) => await reconcilePullRequest(workspace, claim, input.github),
+            reconcile: async (claim) =>
+              await reconcilePullRequest(
+                workspace,
+                claim,
+                input.store.githubMutationLifecycleIdentityHashAlgorithm,
+                input.github,
+              ),
             act: async (claim) =>
               await performPullRequestCreation(
                 workspace,
                 claim,
+                input.store.githubMutationLifecycleIdentityHashAlgorithm,
                 input.github,
                 input.sideEffectBoundary,
               ),

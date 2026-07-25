@@ -58,6 +58,7 @@ import {
   BenchmarkSuiteSchema,
   BenchmarkSourceIdentitySchema,
   MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
   createBenchmarkSchedule,
   type BenchmarkSourceIdentity,
   type GraphAmendment,
@@ -976,10 +977,13 @@ program
     console.log(
       JSON.stringify(
         redactValue(
-          await captureGitHubPullRequestSnapshot({
-            cwd: options.cwd,
-            ...(pullRequest ? { pullRequest } : {}),
-          }),
+          await captureGitHubPullRequestSnapshot(
+            {
+              cwd: options.cwd,
+              ...(pullRequest ? { pullRequest } : {}),
+            },
+            PORTABLE_CANONICAL_HASH_ALGORITHM,
+          ),
         ),
         null,
         2,

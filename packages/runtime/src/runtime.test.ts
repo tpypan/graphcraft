@@ -55,6 +55,10 @@ import type {
   WaitCondition,
   WorkerRequest,
 } from "@graphcraft/core";
+import {
+  captureGitHubPullRequestSnapshot,
+  classifyGitHubPullRequestLifecycle,
+} from "@graphcraft/github";
 import { configureRunProbes, createRun, executeRun } from "./runner.ts";
 import { runProbe, runProbes } from "@graphcraft/probes";
 import { requestRunControl, RunControlChannel } from "./control.ts";
@@ -82,6 +86,9 @@ import {
   GITHUB_SNAPSHOT_CORE_RATE_LIMIT_BUDGET,
   GITHUB_SNAPSHOT_GRAPHQL_RATE_LIMIT_BUDGET,
   evaluateGitHubLifecycleWait,
+  reconcilePendingGitHubActions,
+  reconcileReviewThreadActions,
+  type CapturedPullRequestLifecycle,
 } from "./github.ts";
 import { evaluateWaitNode } from "./wait.ts";
 import {
@@ -604,6 +611,40 @@ async function readFakeGitHubState(path: string): Promise<FakeGitHubState> {
 
 async function writeFakeGitHubState(path: string, state: FakeGitHubState): Promise<void> {
   await writeFile(path, `${JSON.stringify(state)}\n`);
+}
+
+async function selectFreshGitHubMutationLifecycleIdentityFormat(
+  store: RunStore,
+  format: 1 | 2,
+): Promise<void> {
+  if (format === 2) return;
+  const events = await store.loadEvents();
+  const rewritten = events.map((event) => {
+    if (event.type !== "run.created") return event;
+    const data = { ...event.data };
+    delete data.githubMutationLifecycleIdentityFormat;
+    return createRunEvent(
+      {
+        sequence: event.sequence,
+        timestamp: event.timestamp,
+        actor: event.actor,
+        causationId: event.causationId,
+        type: event.type,
+        data,
+      },
+      PORTABLE_CANONICAL_HASH_ALGORITHM,
+    );
+  });
+  await writeFile(
+    store.eventsPath(),
+    `${rewritten.map((event) => JSON.stringify(event)).join("\n")}\n`,
+  );
+  const storagePath = join(store.runRoot, "storage.json");
+  const descriptor = JSON.parse(await readFile(storagePath, "utf8")) as {
+    formats: { githubMutationLifecycleIdentities?: number };
+  };
+  delete descriptor.formats.githubMutationLifecycleIdentities;
+  await writeFile(storagePath, `${JSON.stringify(descriptor, null, 2)}\n`);
 }
 
 async function fakeGitHubCallCount(path: string): Promise<number> {
@@ -7028,6 +7069,209 @@ process.stdin.on("end", () => {
     expect(lifecycleArtifact).not.toContain("Implement the feature and open a pull request");
   });
 
+  it.each([1, 2] as const)(
+    "prepares cold format-v%s stores before direct GitHub reconciliation",
+    async (format) => {
+      const repository = await createRepository();
+      const created = await createRun("Implement the feature and open a pull request", {
+        cwd: repository,
+        finishLine: "pr_open",
+      });
+      await selectFreshGitHubMutationLifecycleIdentityFormat(created.store, format);
+      const algorithm =
+        format === 1 ? LEGACY_CANONICAL_HASH_ALGORITHM : PORTABLE_CANONICAL_HASH_ALGORITHM;
+      const node = created.graph.nodes.find(({ id }) => id === "pull-request");
+      if (!node) throw new Error("Missing pull-request node fixture");
+      const workspace = { path: repository, branch: "main", created: false };
+      const lifecycle = { reviewFeedback: [] } as unknown as CapturedPullRequestLifecycle;
+
+      const reviewStore = new RunStore(repository, created.contract.runId);
+      expect(() => reviewStore.githubMutationLifecycleIdentityHashAlgorithm).toThrow(
+        /before run storage is prepared/,
+      );
+      await expect(
+        reconcileReviewThreadActions({
+          store: reviewStore,
+          node,
+          workspace,
+          contract: created.contract,
+          lifecycle,
+        }),
+      ).resolves.toEqual([]);
+      expect(reviewStore.githubMutationLifecycleIdentityHashAlgorithm).toBe(algorithm);
+
+      const pendingStore = new RunStore(repository, created.contract.runId);
+      expect(() => pendingStore.githubMutationLifecycleIdentityHashAlgorithm).toThrow(
+        /before run storage is prepared/,
+      );
+      await expect(
+        reconcilePendingGitHubActions({ store: pendingStore, node, workspace }),
+      ).resolves.toEqual([]);
+      expect(pendingStore.githubMutationLifecycleIdentityHashAlgorithm).toBe(algorithm);
+    },
+  );
+
+  it.each([1, 2] as const)(
+    "deduplicates format-v%s GitHub pull-request identities across three cold restarts",
+    async (format) => {
+      const { repository, remote } = await createRepositoryWithRemote();
+      const github = await fakePullRequestGitHub(remote);
+      const adapter = new FakeAdapter(async (request) => {
+        if (request.capsule.nodeId === "implement")
+          await writeFile(join(request.repositoryPath, "feature.txt"), "pull request\n");
+      });
+      const created = await createRun("Implement the feature and open a pull request", {
+        cwd: repository,
+        finishLine: "pr_open",
+      });
+      await selectFreshGitHubMutationLifecycleIdentityFormat(created.store, format);
+
+      const algorithm =
+        format === 1 ? LEGACY_CANONICAL_HASH_ALGORITHM : PORTABLE_CANONICAL_HASH_ALGORITHM;
+      const reopen = async (): Promise<RunStore> => {
+        const store = new RunStore(repository, created.contract.runId);
+        await store.prepareStorage();
+        expect(store.githubMutationLifecycleIdentityHashAlgorithm).toBe(algorithm);
+        return store;
+      };
+      const interrupt = async (store: RunStore, point: SideEffectBoundary): Promise<void> => {
+        let armed = true;
+        await expect(
+          executeRun({
+            store,
+            adapter,
+            approve: true,
+            github,
+            sideEffectBoundary: async (observed) => {
+              const state = await store.loadState();
+              const claimed = state.sideEffects.some(
+                ({ claim }) => claim.kind === "github_pr_create",
+              );
+              const atPullRequest =
+                claimed || (observed === "before_claim" && state.nodes.push?.status === "accepted");
+              if (armed && atPullRequest && observed === point) {
+                armed = false;
+                throw new Error(`Interrupt GitHub pull request at ${point}`);
+              }
+            },
+          }),
+        ).rejects.toThrow(`Side-effect execution interrupted after ${point}`);
+        expect(armed).toBe(false);
+      };
+
+      const localeCompare = vi
+        .spyOn(String.prototype, "localeCompare")
+        .mockImplementation(function (this: string, other: string) {
+          const left = String(this);
+          return left < other ? 1 : left > other ? -1 : 0;
+        });
+      let expectedActionId = "";
+      let expectedBodyHash = "";
+      let expectedLifecycleSignature = "";
+      let completed: Awaited<ReturnType<typeof executeRun>> | undefined;
+      try {
+        expectedActionId = contentHash(
+          {
+            schemaVersion: 1,
+            runId: created.contract.runId,
+            nodeId: "pull-request",
+            kind: "github_pr_create",
+          },
+          algorithm,
+        );
+        expectedBodyHash = contentHash(
+          [
+            "Created by Graphcraft after deterministic verification and an accepted normal push.",
+            "",
+            `<!-- Graphcraft-Action: graphcraft-${expectedActionId} -->`,
+          ].join("\n"),
+          algorithm,
+        );
+        await interrupt(await reopen(), "after_claim");
+        await interrupt(await reopen(), "after_action_command");
+        await interrupt(await reopen(), "after_confirm");
+        completed = await executeRun({
+          store: await reopen(),
+          adapter,
+          approve: true,
+          github,
+        });
+        const workspace = await (
+          await reopen()
+        ).loadWorkspace<{
+          path: string;
+          branch: string;
+        }>();
+        const snapshot = await captureGitHubPullRequestSnapshot(
+          { cwd: workspace.path, ...github, pullRequest: 100 },
+          algorithm,
+        );
+        const { snapshotId, ...snapshotValue } = snapshot;
+        expect(snapshotId).toBe(contentHash(snapshotValue, algorithm));
+        expectedLifecycleSignature = classifyGitHubPullRequestLifecycle(
+          snapshot,
+          {
+            host: snapshot.repository.host,
+            nameWithOwner: snapshot.repository.nameWithOwner,
+            number: snapshot.pullRequest.number,
+            headRefName: snapshot.pullRequest.headRefName,
+            baseRefName: snapshot.pullRequest.baseRefName,
+            headSha: snapshot.binding.headSha,
+            baseSha: snapshot.binding.baseSha,
+          },
+          algorithm,
+        ).signature;
+      } finally {
+        localeCompare.mockRestore();
+      }
+      if (!completed) throw new Error("Expected GitHub pull-request side effect to complete");
+
+      const pullRequest = completed.sideEffects.find(
+        ({ claim }) => claim.kind === "github_pr_create",
+      );
+      const persisted = await readFakeGitHubState(github.statePath);
+      const finalStore = await reopen();
+      const events = await finalStore.loadEvents();
+      const lifecycle = events.findLast(
+        ({ type, data }) => type === "node.progress" && data.nodeId === "pull-request",
+      );
+      const lifecycleResult = (lifecycle?.data.probeResults as ProbeResult[] | undefined)?.[0];
+
+      expect(completed.status, completed.stopReason).toBe("completed");
+      expect(persisted.createCalls).toBe(1);
+      expect(persisted.pullRequests).toHaveLength(1);
+      expect(adapter.calls.filter((nodeId) => nodeId === "implement")).toHaveLength(1);
+      expect(pullRequest).toMatchObject({
+        status: "confirmed",
+        claim: {
+          actionId: expectedActionId,
+          idempotencyKey: `graphcraft-${expectedActionId}`,
+          precondition: { bodyHash: expectedBodyHash },
+        },
+      });
+      expect(lifecycleResult?.signature).toBe(expectedLifecycleSignature);
+      expect(
+        events.filter(
+          ({ type, data }) =>
+            type === "side_effect.claimed" &&
+            (data.claim as { kind?: string } | undefined)?.kind === "github_pr_create",
+        ),
+      ).toHaveLength(1);
+      expect(
+        events.filter(
+          ({ type, data }) =>
+            type === "side_effect.confirmed" && data.actionId === expectedActionId,
+        ),
+      ).toHaveLength(1);
+      expect(
+        events.filter(
+          ({ type, data }) => type === "node.accepted" && data.nodeId === "pull-request",
+        ),
+      ).toHaveLength(1);
+    },
+    pullRequestCreateMatrixTimeout,
+  );
+
   it("durably retries same-SHA pr_open lifecycle churn without model tokens", async () => {
     const { repository, remote } = await createRepositoryWithRemote();
     const github = await fakePullRequestGitHub(remote, {
@@ -8161,55 +8405,124 @@ process.stdin.on("end", () => {
     expect(state.latestProgressEvidence.join("\n")).toContain(repairPushSha);
   }, 60_000);
 
-  it("replies to and resolves unchanged review feedback without a second repair", async () => {
-    const { repository, remote } = await createRepositoryWithRemote();
-    const github = await fakePullRequestGitHub(remote, {
-      syncPullRequestHead: true,
-      reviewThreads: [
+  it.each([1, 2] as const)(
+    "uses exact format-v%s review-reply and resolution identities without a second repair",
+    async (format) => {
+      const { repository, remote } = await createRepositoryWithRemote();
+      const github = await fakePullRequestGitHub(remote, {
+        syncPullRequestHead: true,
+        reviewThreads: [
+          {
+            id: "thread-repeat",
+            isResolved: false,
+            isOutdated: false,
+            path: "feature.txt",
+            line: 1,
+            body: "This same feedback remains unresolved.",
+          },
+        ],
+        reviewDecision: "",
+      });
+      const adapter = new FakeAdapter(async (request) => {
+        if (request.capsule.nodeId === "implement")
+          await writeFile(join(request.repositoryPath, "feature.txt"), "review\n");
+        if (request.capsule.nodeId === "repair-review-1")
+          await writeFile(join(request.repositoryPath, "feature.txt"), "review-fixed\n");
+      });
+      const created = await createRun("Implement the feature and get the PR green", {
+        cwd: repository,
+        finishLine: "pr_green",
+      });
+      await selectFreshGitHubMutationLifecycleIdentityFormat(created.store, format);
+      const algorithm =
+        format === 1 ? LEGACY_CANONICAL_HASH_ALGORITHM : PORTABLE_CANONICAL_HASH_ALGORITHM;
+      const store = new RunStore(repository, created.contract.runId);
+      const localeCompare = vi
+        .spyOn(String.prototype, "localeCompare")
+        .mockImplementation(function (this: string, other: string) {
+          const left = String(this);
+          return left < other ? 1 : left > other ? -1 : 0;
+        });
+
+      const state = await executeRun({
+        store,
+        adapter,
+        approve: true,
+        github,
+      });
+      const graph = await store.loadGraph();
+      const reply = state.sideEffects.find(({ claim }) => claim.kind === "github_pr_comment");
+      const resolution = state.sideEffects.find(
+        ({ claim }) => claim.kind === "github_review_thread_resolve",
+      );
+      if (!reply || !resolution) throw new Error("Missing review mutation claims");
+      const expectedReplyActionId = contentHash(
         {
-          id: "thread-repeat",
-          isResolved: false,
-          isOutdated: false,
-          path: "feature.txt",
-          line: 1,
-          body: "This same feedback remains unresolved.",
+          schemaVersion: 1,
+          runId: created.contract.runId,
+          nodeId: reply.claim.nodeId,
+          kind: "github_pr_comment",
+          threadId: reply.claim.precondition.threadId,
+          headSha: reply.claim.precondition.headSha,
         },
-      ],
-      reviewDecision: "",
-    });
-    const adapter = new FakeAdapter(async (request) => {
-      if (request.capsule.nodeId === "implement")
-        await writeFile(join(request.repositoryPath, "feature.txt"), "review\n");
-      if (request.capsule.nodeId === "repair-review-1")
-        await writeFile(join(request.repositoryPath, "feature.txt"), "review-fixed\n");
-    });
-    const created = await createRun("Implement the feature and get the PR green", {
-      cwd: repository,
-      finishLine: "pr_green",
-    });
+        algorithm,
+      );
+      const expectedReplyBody = [
+        `Addressed in ${String(reply.claim.precondition.headSha)} and reverified against the approved Graphcraft completion checks.`,
+        "",
+        `<!-- Graphcraft-Action: graphcraft-${expectedReplyActionId} -->`,
+      ].join("\n");
+      const expectedResolutionActionId = contentHash(
+        {
+          schemaVersion: 1,
+          runId: created.contract.runId,
+          nodeId: resolution.claim.nodeId,
+          kind: "github_review_thread_resolve",
+          threadId: resolution.claim.precondition.threadId,
+          headSha: resolution.claim.precondition.headSha,
+        },
+        algorithm,
+      );
+      localeCompare.mockRestore();
 
-    const state = await executeRun({
-      store: created.store,
-      adapter,
-      approve: true,
-      github,
-    });
-    const graph = await created.store.loadGraph();
-
-    expect(state.status).toBe("completed");
-    expect(adapter.calls).toEqual(["implement", "repair-review-1"]);
-    expect(graph.nodes.map(({ id }) => id)).toContain("repair-review-1");
-    expect(graph.nodes.map(({ id }) => id)).not.toContain("repair-review-2");
-    expect(state.sideEffects.map(({ claim }) => claim.kind)).toEqual([
-      "git_commit",
-      "git_push",
-      "github_pr_create",
-      "git_commit",
-      "git_push",
-      "github_pr_comment",
-      "github_review_thread_resolve",
-    ]);
-  }, 60_000);
+      expect(state.status).toBe("completed");
+      expect(adapter.calls).toEqual(["implement", "repair-review-1"]);
+      expect(graph.nodes.map(({ id }) => id)).toContain("repair-review-1");
+      expect(graph.nodes.map(({ id }) => id)).not.toContain("repair-review-2");
+      expect(state.sideEffects.map(({ claim }) => claim.kind)).toEqual([
+        "git_commit",
+        "git_push",
+        "github_pr_create",
+        "git_commit",
+        "git_push",
+        "github_pr_comment",
+        "github_review_thread_resolve",
+      ]);
+      expect(reply).toMatchObject({
+        status: "confirmed",
+        claim: {
+          actionId: expectedReplyActionId,
+          idempotencyKey: `graphcraft-${expectedReplyActionId}`,
+          precondition: {
+            feedbackBodyHash: contentHash("This same feedback remains unresolved.", algorithm),
+            replyBodyHash: contentHash(expectedReplyBody, algorithm),
+          },
+        },
+      });
+      expect(resolution).toMatchObject({
+        status: "confirmed",
+        claim: {
+          actionId: expectedResolutionActionId,
+          idempotencyKey: `graphcraft-${expectedResolutionActionId}`,
+          precondition: {
+            replyIdempotencyKey: `graphcraft-${expectedReplyActionId}`,
+            replyBodyHash: contentHash(expectedReplyBody, algorithm),
+          },
+        },
+      });
+    },
+    pullRequestCreateMatrixTimeout,
+  );
 
   it("refuses to resolve a review thread that receives newer feedback after its reply", async () => {
     const { repository, remote } = await createRepositoryWithRemote();
@@ -8874,143 +9187,180 @@ process.stdin.on("end", () => {
     githubRepairTimeout,
   );
 
-  it("durably retries same-SHA check-rerun revalidation before dispatch", async () => {
-    const { repository, remote } = await createRepositoryWithRemote();
-    const github = await fakePullRequestGitHub(remote, {
-      syncPullRequestHead: true,
-      protected: true,
-      requiredStatusChecks: ["tests"],
-      checks: [
-        {
-          kind: "check_run",
-          id: "tests-check",
-          databaseId: 551,
-          name: "tests",
-          status: "COMPLETED",
-          conclusion: "STARTUP_FAILURE",
-        },
-        {
-          kind: "check_run",
-          id: "noise-check",
-          databaseId: 552,
-          name: "noise",
-          status: "IN_PROGRESS",
-          conclusion: null,
-        },
-      ],
-    });
-    const adapter = new FakeAdapter(async (request) => {
-      if (request.capsule.nodeId === "implement")
-        await writeFile(join(request.repositoryPath, "feature.txt"), "rerun churn\n");
-    });
-    const created = await createRun("Implement the feature and get the PR green", {
-      cwd: repository,
-      finishLine: "pr_green",
-    });
-    let injected = false;
-    const injectLifecycleChurn = async (point: SideEffectBoundary): Promise<void> => {
-      if (injected || point !== "before_claim") return;
-      const state = await created.store.loadState();
-      if (
-        state.nodes["pull-request"]?.status !== "accepted" ||
-        state.sideEffects.some(({ claim }) => claim.kind === "github_check_rerun")
-      )
-        return;
-      const remoteState = await readFakeGitHubState(github.statePath);
-      remoteState.mutateLifecycleOnNextCapture = true;
-      remoteState.lifecycleMutationChecks = [
-        {
-          kind: "check_run",
-          id: "tests-check",
-          databaseId: 551,
-          name: "tests",
-          status: "COMPLETED",
-          conclusion: "STARTUP_FAILURE",
-        },
-        {
-          kind: "check_run",
-          id: "noise-check",
-          databaseId: 552,
-          name: "noise",
-          status: "COMPLETED",
-          conclusion: "SUCCESS",
-        },
-      ];
-      await writeFakeGitHubState(github.statePath, remoteState);
-      injected = true;
-    };
+  it.each([1, 2] as const)(
+    "durably retries format-v%s same-SHA check-rerun revalidation across cold restart",
+    async (format) => {
+      const { repository, remote } = await createRepositoryWithRemote();
+      const github = await fakePullRequestGitHub(remote, {
+        syncPullRequestHead: true,
+        protected: true,
+        requiredStatusChecks: ["tests"],
+        checks: [
+          {
+            kind: "check_run",
+            id: "tests-check",
+            databaseId: 551,
+            name: "tests",
+            status: "COMPLETED",
+            conclusion: "STARTUP_FAILURE",
+          },
+          {
+            kind: "check_run",
+            id: "noise-check",
+            databaseId: 552,
+            name: "noise",
+            status: "IN_PROGRESS",
+            conclusion: null,
+          },
+        ],
+      });
+      const adapter = new FakeAdapter(async (request) => {
+        if (request.capsule.nodeId === "implement")
+          await writeFile(join(request.repositoryPath, "feature.txt"), "rerun churn\n");
+      });
+      const created = await createRun("Implement the feature and get the PR green", {
+        cwd: repository,
+        finishLine: "pr_green",
+      });
+      await selectFreshGitHubMutationLifecycleIdentityFormat(created.store, format);
+      const algorithm =
+        format === 1 ? LEGACY_CANONICAL_HASH_ALGORITHM : PORTABLE_CANONICAL_HASH_ALGORITHM;
+      const initialStore = new RunStore(repository, created.contract.runId);
+      const localeCompare = vi
+        .spyOn(String.prototype, "localeCompare")
+        .mockImplementation(function (this: string, other: string) {
+          const left = String(this);
+          return left < other ? 1 : left > other ? -1 : 0;
+        });
+      let injected = false;
+      const injectLifecycleChurn = async (point: SideEffectBoundary): Promise<void> => {
+        if (injected || point !== "before_claim") return;
+        const state = await initialStore.loadState();
+        if (
+          state.nodes["pull-request"]?.status !== "accepted" ||
+          state.sideEffects.some(({ claim }) => claim.kind === "github_check_rerun")
+        )
+          return;
+        const remoteState = await readFakeGitHubState(github.statePath);
+        remoteState.mutateLifecycleOnNextCapture = true;
+        remoteState.lifecycleMutationChecks = [
+          {
+            kind: "check_run",
+            id: "tests-check",
+            databaseId: 551,
+            name: "tests",
+            status: "COMPLETED",
+            conclusion: "STARTUP_FAILURE",
+          },
+          {
+            kind: "check_run",
+            id: "noise-check",
+            databaseId: 552,
+            name: "noise",
+            status: "COMPLETED",
+            conclusion: "SUCCESS",
+          },
+        ];
+        await writeFakeGitHubState(github.statePath, remoteState);
+        injected = true;
+      };
 
-    const waiting = await executeRun({
-      store: created.store,
-      adapter,
-      approve: true,
-      github,
-      sideEffectBoundary: injectLifecycleChurn,
-    });
-    const tokensBeforeRestart = waiting.tokens.total;
-    const adapterCallsBeforeRestart = [...adapter.calls];
-    const rerun = waiting.sideEffects.find(({ claim }) => claim.kind === "github_check_rerun");
-    const eventsBeforeRestart = await created.store.loadEvents();
-    const callsBeforeWake = await fakeGitHubCallCount(github.logPath);
-    const restarted = new RunStore(repository, created.contract.runId);
-    const beforeWake = await executeRun({ store: restarted, adapter, github });
+      const waiting = await executeRun({
+        store: initialStore,
+        adapter,
+        approve: true,
+        github,
+        sideEffectBoundary: injectLifecycleChurn,
+      });
+      const tokensBeforeRestart = waiting.tokens.total;
+      const adapterCallsBeforeRestart = [...adapter.calls];
+      const rerun = waiting.sideEffects.find(({ claim }) => claim.kind === "github_check_rerun");
+      if (!rerun) throw new Error("Missing check-rerun claim fixture");
+      const expectedRerunActionId = contentHash(
+        {
+          schemaVersion: 1,
+          runId: created.contract.runId,
+          nodeId: "pr-green",
+          kind: "github_check_rerun",
+          headSha: rerun.claim.precondition.headSha,
+          checkId: rerun.claim.precondition.checkId,
+          databaseId: rerun.claim.precondition.databaseId,
+          status: rerun.claim.precondition.checkStatus,
+          conclusion: rerun.claim.precondition.checkConclusion,
+        },
+        algorithm,
+      );
+      const eventsBeforeRestart = await initialStore.loadEvents();
+      const callsBeforeWake = await fakeGitHubCallCount(github.logPath);
+      const restarted = new RunStore(repository, created.contract.runId);
+      const beforeWake = await executeRun({ store: restarted, adapter, github });
 
-    expect(injected).toBe(true);
-    expect(waiting.status).toBe("waiting");
-    expect(waiting.nodes["pr-green"]?.status).toBe("waiting");
-    expect(waiting.waits[0]).toMatchObject({
-      nodeId: "pr-green",
-      status: "waiting",
-      evidence: expect.arrayContaining([
-        expect.stringContaining("same bound SHAs"),
-        expect.stringContaining("revalidation will retry"),
-      ]),
-    });
-    expect(rerun).toMatchObject({ status: "claimed" });
-    expect(rerun).not.toHaveProperty("dispatchedAt");
-    expect(eventsBeforeRestart.some(({ type }) => type === "side_effect.failed")).toBe(false);
-    expect(eventsBeforeRestart.some(({ type }) => type === "node.failed")).toBe(false);
-    expect(eventsBeforeRestart.some(({ type }) => type === "run.blocked")).toBe(false);
-    expect(beforeWake.status).toBe("waiting");
-    expect(await fakeGitHubCallCount(github.logPath)).toBe(callsBeforeWake);
-    expect(beforeWake.tokens.total).toBe(tokensBeforeRestart);
-    expect(adapter.calls).toEqual(adapterCallsBeforeRestart);
-
-    await restarted.append(
-      "runtime",
-      "wait.observed",
-      {
+      expect(injected).toBe(true);
+      expect(waiting.status).toBe("waiting");
+      expect(waiting.nodes["pr-green"]?.status).toBe("waiting");
+      expect(waiting.waits[0]).toMatchObject({
         nodeId: "pr-green",
-        nextWakeAt: new Date(0).toISOString(),
-        evidence: ["Advancing the durable rerun-revalidation wake in the restart fixture"],
-      },
-      "pr-green",
-    );
-    const completed = await executeRun({
-      store: new RunStore(repository, created.contract.runId),
-      adapter,
-      github,
-    });
-    const remoteState = await readFakeGitHubState(github.statePath);
-    const confirmedRerun = completed.sideEffects.find(
-      ({ claim }) => claim.kind === "github_check_rerun",
-    );
-    const finalEvents = await created.store.loadEvents();
+        status: "waiting",
+        evidence: expect.arrayContaining([
+          expect.stringContaining("same bound SHAs"),
+          expect.stringContaining("revalidation will retry"),
+        ]),
+      });
+      expect(rerun).toMatchObject({
+        status: "claimed",
+        claim: {
+          actionId: expectedRerunActionId,
+          idempotencyKey: `graphcraft-${expectedRerunActionId}`,
+        },
+      });
+      expect(rerun).not.toHaveProperty("dispatchedAt");
+      expect(eventsBeforeRestart.some(({ type }) => type === "side_effect.failed")).toBe(false);
+      expect(eventsBeforeRestart.some(({ type }) => type === "node.failed")).toBe(false);
+      expect(eventsBeforeRestart.some(({ type }) => type === "run.blocked")).toBe(false);
+      expect(beforeWake.status).toBe("waiting");
+      expect(await fakeGitHubCallCount(github.logPath)).toBe(callsBeforeWake);
+      expect(beforeWake.tokens.total).toBe(tokensBeforeRestart);
+      expect(adapter.calls).toEqual(adapterCallsBeforeRestart);
 
-    expect(completed.status, completed.stopReason).toBe("completed");
-    expect(completed.tokens.total).toBe(tokensBeforeRestart);
-    expect(adapter.calls).toEqual(adapterCallsBeforeRestart);
-    expect(remoteState.rerunCalls).toBe(1);
-    expect(confirmedRerun).toMatchObject({
-      status: "confirmed",
-      dispatchedAt: expect.any(String),
-      result: { status: "COMPLETED", conclusion: "SUCCESS" },
-    });
-    expect(finalEvents.filter(({ type }) => type === "side_effect.dispatched")).toHaveLength(1);
-    expect(finalEvents.some(({ type }) => type === "side_effect.failed")).toBe(false);
-    expect(finalEvents.some(({ type }) => type === "node.failed")).toBe(false);
-    expect(finalEvents.some(({ type }) => type === "run.blocked")).toBe(false);
-  }, 60_000);
+      await restarted.append(
+        "runtime",
+        "wait.observed",
+        {
+          nodeId: "pr-green",
+          nextWakeAt: new Date(0).toISOString(),
+          evidence: ["Advancing the durable rerun-revalidation wake in the restart fixture"],
+        },
+        "pr-green",
+      );
+      const completed = await executeRun({
+        store: new RunStore(repository, created.contract.runId),
+        adapter,
+        github,
+      });
+      const remoteState = await readFakeGitHubState(github.statePath);
+      const confirmedRerun = completed.sideEffects.find(
+        ({ claim }) => claim.kind === "github_check_rerun",
+      );
+      const finalEvents = await new RunStore(repository, created.contract.runId).loadEvents();
+      localeCompare.mockRestore();
+
+      expect(completed.status, completed.stopReason).toBe("completed");
+      expect(completed.tokens.total).toBe(tokensBeforeRestart);
+      expect(adapter.calls).toEqual(adapterCallsBeforeRestart);
+      expect(remoteState.rerunCalls).toBe(1);
+      expect(confirmedRerun).toMatchObject({
+        status: "confirmed",
+        dispatchedAt: expect.any(String),
+        claim: { actionId: expectedRerunActionId },
+        result: { status: "COMPLETED", conclusion: "SUCCESS" },
+      });
+      expect(finalEvents.filter(({ type }) => type === "side_effect.dispatched")).toHaveLength(1);
+      expect(finalEvents.some(({ type }) => type === "side_effect.failed")).toBe(false);
+      expect(finalEvents.some(({ type }) => type === "node.failed")).toBe(false);
+      expect(finalEvents.some(({ type }) => type === "run.blocked")).toBe(false);
+    },
+    checkRerunMatrixTimeout,
+  );
 
   it("times out a deferred same-SHA check rerun before restart reconciliation can dispatch", async () => {
     const { repository, remote } = await createRepositoryWithRemote();

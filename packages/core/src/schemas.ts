@@ -1336,6 +1336,9 @@ export const RunStorageManifestSchema = z.union([
       // Repository side-effect claims and commit-content preconditions also
       // predate an independent selector. Omission preserves their v1 domain.
       repositorySideEffectIdentities: z.union([z.literal(1), z.literal(2)]).default(1),
+      // GitHub snapshots, lifecycle signatures, and mutation journal identities
+      // also predate an independent selector. Omission preserves their v1 domain.
+      githubMutationLifecycleIdentities: z.union([z.literal(1), z.literal(2)]).default(1),
     }),
   }),
 ]);

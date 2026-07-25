@@ -784,7 +784,8 @@ describe("run-state retention", () => {
             key !== "workspaceScopeSnapshots" &&
             key !== "probeEvidenceCheckpoints" &&
             key !== "governanceControlIdentities" &&
-            key !== "repositorySideEffectIdentities",
+            key !== "repositorySideEffectIdentities" &&
+            key !== "githubMutationLifecycleIdentities",
         ),
       ),
       heldOutProbes: 1,
@@ -804,6 +805,7 @@ describe("run-state retention", () => {
         delete data.probeEvidenceCheckpointFormat;
         delete data.governanceControlIdentityFormat;
         delete data.repositorySideEffectIdentityFormat;
+        delete data.githubMutationLifecycleIdentityFormat;
       }
       return createRunEvent({
         sequence: event.sequence,

@@ -310,6 +310,7 @@ describe("versioned protocol fixtures", () => {
         probeEvidenceCheckpoints: 1,
         governanceControlIdentities: 1,
         repositorySideEffectIdentities: 1,
+        githubMutationLifecycleIdentities: 1,
       },
     });
   });

@@ -418,6 +418,7 @@ describe("run storage schema v3 migration", () => {
         probeEvidenceCheckpoints: 1,
         governanceControlIdentities: 1,
         repositorySideEffectIdentities: 1,
+        githubMutationLifecycleIdentities: 1,
       },
     });
     const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "0-to-3");
@@ -496,6 +497,7 @@ describe("run storage schema v3 migration", () => {
           probeEvidenceCheckpoints: 1,
           governanceControlIdentities: 1,
           repositorySideEffectIdentities: 1,
+          githubMutationLifecycleIdentities: 1,
         },
       },
     );
@@ -570,6 +572,7 @@ describe("run storage schema v3 migration", () => {
         probeEvidenceCheckpoints: 1,
         governanceControlIdentities: 1,
         repositorySideEffectIdentities: 1,
+        githubMutationLifecycleIdentities: 1,
       },
     });
     const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "2-to-3");
@@ -1762,6 +1765,7 @@ describe("run storage schema v3 migration", () => {
         probeEvidenceCheckpoints: 1,
         governanceControlIdentities: 1,
         repositorySideEffectIdentities: 1,
+        githubMutationLifecycleIdentities: 1,
       },
     });
 

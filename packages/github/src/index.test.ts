@@ -6,6 +6,11 @@ import { PassThrough } from "node:stream";
 import crossSpawn from "cross-spawn";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  LEGACY_CANONICAL_HASH_ALGORITHM,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
+  contentHash,
+} from "@graphcraft/core";
+import {
   GITHUB_COMMAND_SETTLEMENT_GRACE_MS,
   GITHUB_COMMAND_TERMINATION_GRACE_MS,
   GitHubLifecycleConsistencyError,
@@ -24,6 +29,7 @@ import {
 } from "./index.ts";
 
 const temporaryRoots: string[] = [];
+const GITHUB_IDENTITY_HASH_ALGORITHM = PORTABLE_CANONICAL_HASH_ALGORITHM;
 
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -460,7 +466,10 @@ describe("GitHub capability and snapshot layer", () => {
 
   it("fully paginates one SHA-bound read-only pull request snapshot", async () => {
     const fixture = await fakeGitHub();
-    const snapshot = await captureGitHubPullRequestSnapshot(fixture);
+    const snapshot = await captureGitHubPullRequestSnapshot(
+      fixture,
+      GITHUB_IDENTITY_HASH_ALGORITHM,
+    );
 
     expect(snapshot.contentTrust).toBe("untrusted_external");
     expect(snapshot.binding).toMatchObject({
@@ -509,6 +518,17 @@ describe("GitHub capability and snapshot layer", () => {
   });
 
   it.each([
+    ["legacy-v1", LEGACY_CANONICAL_HASH_ALGORITHM],
+    ["portable-v2", PORTABLE_CANONICAL_HASH_ALGORITHM],
+  ] as const)("binds a %s snapshot ID to its explicit hash algorithm", async (_name, algorithm) => {
+    const fixture = await fakeGitHub();
+    const snapshot = await captureGitHubPullRequestSnapshot(fixture, algorithm);
+    const { snapshotId, ...value } = snapshot;
+
+    expect(snapshotId).toBe(contentHash(value, algorithm));
+  });
+
+  it.each([
     ["review-thread", "mutateThreadOnCollection"],
     ["review", "mutateReviewOnCollection"],
     ["check", "mutateCheckOnCollection"],
@@ -516,7 +536,7 @@ describe("GitHub capability and snapshot layer", () => {
     const fixture = await fakeGitHub({ greenLifecycle: true, [mutationKey]: 2 });
 
     await expectLifecycleConsistency(
-      captureGitHubPullRequestSnapshot(fixture),
+      captureGitHubPullRequestSnapshot(fixture, GITHUB_IDENTITY_HASH_ALGORITHM),
       /mutable lifecycle changed during capture/,
     );
     const state = JSON.parse(await readFile(fixture.statePath, "utf8")) as {
@@ -534,7 +554,10 @@ describe("GitHub capability and snapshot layer", () => {
     "rejects a same-SHA %s mutation before accepting a previously green snapshot",
     async (_kind, versionKey) => {
       const fixture = await fakeGitHub({ greenLifecycle: true });
-      const snapshot = await captureGitHubPullRequestSnapshot(fixture);
+      const snapshot = await captureGitHubPullRequestSnapshot(
+        fixture,
+        GITHUB_IDENTITY_HASH_ALGORITHM,
+      );
       const expected = {
         host: snapshot.repository.host,
         nameWithOwner: snapshot.repository.nameWithOwner,
@@ -544,7 +567,10 @@ describe("GitHub capability and snapshot layer", () => {
         headSha: snapshot.binding.headSha,
         baseSha: snapshot.binding.baseSha,
       };
-      expect(classifyGitHubPullRequestLifecycle(snapshot, expected).status).toBe("green");
+      expect(
+        classifyGitHubPullRequestLifecycle(snapshot, expected, GITHUB_IDENTITY_HASH_ALGORITHM)
+          .status,
+      ).toBe("green");
       const state = JSON.parse(await readFile(fixture.statePath, "utf8")) as Record<
         string,
         unknown
@@ -553,7 +579,7 @@ describe("GitHub capability and snapshot layer", () => {
       await writeFile(fixture.statePath, `${JSON.stringify(state)}\n`);
 
       await expectLifecycleConsistency(
-        assertGitHubSnapshotCurrent(fixture, snapshot),
+        assertGitHubSnapshotCurrent(fixture, snapshot, GITHUB_IDENTITY_HASH_ALGORITHM),
         /lifecycle is stale/,
       );
     },
@@ -561,10 +587,13 @@ describe("GitHub capability and snapshot layer", () => {
 
   it("types a same-SHA mutation between lifecycle revalidation passes as transient", async () => {
     const fixture = await fakeGitHub({ greenLifecycle: true, mutateCheckOnCollection: 4 });
-    const snapshot = await captureGitHubPullRequestSnapshot(fixture);
+    const snapshot = await captureGitHubPullRequestSnapshot(
+      fixture,
+      GITHUB_IDENTITY_HASH_ALGORITHM,
+    );
 
     await expectLifecycleConsistency(
-      assertGitHubSnapshotCurrent(fixture, snapshot),
+      assertGitHubSnapshotCurrent(fixture, snapshot, GITHUB_IDENTITY_HASH_ALGORITHM),
       /mutable lifecycle changed during revalidation/,
     );
   });
@@ -574,20 +603,26 @@ describe("GitHub capability and snapshot layer", () => {
     ["branch protection", "requiredApprovingReviewCount", 2],
   ] as const)("types same-SHA %s drift as transient", async (_kind, key, value) => {
     const fixture = await fakeGitHub({ greenLifecycle: true });
-    const snapshot = await captureGitHubPullRequestSnapshot(fixture);
+    const snapshot = await captureGitHubPullRequestSnapshot(
+      fixture,
+      GITHUB_IDENTITY_HASH_ALGORITHM,
+    );
     const state = JSON.parse(await readFile(fixture.statePath, "utf8")) as Record<string, unknown>;
     state[key] = value;
     await writeFile(fixture.statePath, `${JSON.stringify(state)}\n`);
 
     await expectLifecycleConsistency(
-      assertGitHubSnapshotCurrent(fixture, snapshot),
+      assertGitHubSnapshotCurrent(fixture, snapshot, GITHUB_IDENTITY_HASH_ALGORITHM),
       /lifecycle is stale/,
     );
   });
 
   it("normalizes lifecycle collection order during revalidation", async () => {
     const fixture = await fakeGitHub({ greenLifecycle: true });
-    const snapshot = await captureGitHubPullRequestSnapshot(fixture);
+    const snapshot = await captureGitHubPullRequestSnapshot(
+      fixture,
+      GITHUB_IDENTITY_HASH_ALGORITHM,
+    );
     const reordered = {
       ...snapshot,
       branchProtection: {
@@ -600,7 +635,9 @@ describe("GitHub capability and snapshot layer", () => {
       reviews: [...snapshot.reviews].reverse(),
     };
 
-    await expect(assertGitHubSnapshotCurrent(fixture, reordered)).resolves.toBeUndefined();
+    await expect(
+      assertGitHubSnapshotCurrent(fixture, reordered, GITHUB_IDENTITY_HASH_ALGORITHM),
+    ).resolves.toBeUndefined();
   });
 
   it("rejects repeated cursors in all five GitHub pagination loops", async () => {
@@ -625,9 +662,9 @@ describe("GitHub capability and snapshot layer", () => {
       "repeatSnapshotCheckCursor",
     ]) {
       const snapshot = await fakeGitHub({ [flag]: true });
-      await expect(captureGitHubPullRequestSnapshot(snapshot)).rejects.toThrow(
-        /pagination repeated cursor/,
-      );
+      await expect(
+        captureGitHubPullRequestSnapshot(snapshot, GITHUB_IDENTITY_HASH_ALGORITHM),
+      ).rejects.toThrow(/pagination repeated cursor/);
     }
   });
 
@@ -703,7 +740,10 @@ describe("GitHub capability and snapshot layer", () => {
 
   it("classifies exact-SHA review and CI lifecycle states deterministically", async () => {
     const fixture = await fakeGitHub();
-    const snapshot = await captureGitHubPullRequestSnapshot(fixture);
+    const snapshot = await captureGitHubPullRequestSnapshot(
+      fixture,
+      GITHUB_IDENTITY_HASH_ALGORITHM,
+    );
     const expected = {
       host: snapshot.repository.host,
       nameWithOwner: snapshot.repository.nameWithOwner,
@@ -714,7 +754,11 @@ describe("GitHub capability and snapshot layer", () => {
       baseSha: snapshot.binding.baseSha,
     };
 
-    const reviewFirst = classifyGitHubPullRequestLifecycle(snapshot, expected);
+    const reviewFirst = classifyGitHubPullRequestLifecycle(
+      snapshot,
+      expected,
+      GITHUB_IDENTITY_HASH_ALGORITHM,
+    );
     expect(reviewFirst).toMatchObject({
       status: "review_required",
       counts: {
@@ -739,7 +783,11 @@ describe("GitHub capability and snapshot layer", () => {
         isResolved: true,
       })),
     };
-    const green = classifyGitHubPullRequestLifecycle(greenSnapshot, expected);
+    const green = classifyGitHubPullRequestLifecycle(
+      greenSnapshot,
+      expected,
+      GITHUB_IDENTITY_HASH_ALGORITHM,
+    );
     expect(green.status).toBe("green");
     expect(green.counts).toMatchObject({
       requiredChecksSucceeded: 2,
@@ -766,20 +814,100 @@ describe("GitHub capability and snapshot layer", () => {
         graphql: { ...snapshot.rateLimit.graphql, remaining: 2 },
       },
     };
-    expect(classifyGitHubPullRequestLifecycle(recaptured, expected).signature).toBe(
-      reviewFirst.signature,
-    );
     expect(
-      classifyGitHubPullRequestLifecycle(snapshot, {
-        ...expected,
-        baseSha: "e".repeat(40),
-      }).status,
+      classifyGitHubPullRequestLifecycle(recaptured, expected, GITHUB_IDENTITY_HASH_ALGORITHM)
+        .signature,
+    ).toBe(reviewFirst.signature);
+    expect(
+      classifyGitHubPullRequestLifecycle(
+        snapshot,
+        {
+          ...expected,
+          baseSha: "e".repeat(40),
+        },
+        GITHUB_IDENTITY_HASH_ALGORITHM,
+      ).status,
     ).toBe("stale");
+  });
+
+  it("uses code-unit normalization for portable lifecycle identities only", async () => {
+    const fixture = await fakeGitHub();
+    const snapshot = await captureGitHubPullRequestSnapshot(
+      fixture,
+      PORTABLE_CANONICAL_HASH_ALGORITHM,
+    );
+    const expected = {
+      host: snapshot.repository.host,
+      nameWithOwner: snapshot.repository.nameWithOwner,
+      number: snapshot.pullRequest.number,
+      headRefName: snapshot.pullRequest.headRefName,
+      baseRefName: snapshot.pullRequest.baseRefName,
+      headSha: snapshot.binding.headSha,
+      baseSha: snapshot.binding.baseSha,
+    };
+    const portableBefore = classifyGitHubPullRequestLifecycle(
+      snapshot,
+      expected,
+      PORTABLE_CANONICAL_HASH_ALGORITHM,
+    );
+    const legacyBefore = classifyGitHubPullRequestLifecycle(
+      snapshot,
+      expected,
+      LEGACY_CANONICAL_HASH_ALGORITHM,
+    );
+    let portableAfter!: ReturnType<typeof classifyGitHubPullRequestLifecycle>;
+    let legacyAfter!: ReturnType<typeof classifyGitHubPullRequestLifecycle>;
+    const reversedLocale = vi.spyOn(String.prototype, "localeCompare").mockImplementation(function (
+      this: string,
+      other: string,
+    ) {
+      const left = String(this);
+      return left < other ? 1 : left > other ? -1 : 0;
+    });
+    try {
+      portableAfter = classifyGitHubPullRequestLifecycle(
+        snapshot,
+        expected,
+        PORTABLE_CANONICAL_HASH_ALGORITHM,
+      );
+      legacyAfter = classifyGitHubPullRequestLifecycle(
+        snapshot,
+        expected,
+        LEGACY_CANONICAL_HASH_ALGORITHM,
+      );
+    } finally {
+      reversedLocale.mockRestore();
+    }
+
+    expect(portableAfter.signature).toBe(portableBefore.signature);
+    expect(legacyAfter.signature).not.toBe(legacyBefore.signature);
+
+    const forbiddenLocale = vi.spyOn(String.prototype, "localeCompare").mockImplementation(() => {
+      throw new Error("portable GitHub identity used ambient locale ordering");
+    });
+    try {
+      const recaptured = await captureGitHubPullRequestSnapshot(
+        fixture,
+        PORTABLE_CANONICAL_HASH_ALGORITHM,
+      );
+      await expect(
+        assertGitHubSnapshotCurrent(fixture, recaptured, PORTABLE_CANONICAL_HASH_ALGORITHM),
+      ).resolves.toBeUndefined();
+      expect(
+        classifyGitHubPullRequestLifecycle(recaptured, expected, PORTABLE_CANONICAL_HASH_ALGORITHM)
+          .signature,
+      ).toBe(portableBefore.signature);
+    } finally {
+      forbiddenLocale.mockRestore();
+    }
   });
 
   it("separates actionable, infrastructure, cancelled, and pending required checks", async () => {
     const fixture = await fakeGitHub();
-    const captured = await captureGitHubPullRequestSnapshot(fixture);
+    const captured = await captureGitHubPullRequestSnapshot(
+      fixture,
+      GITHUB_IDENTITY_HASH_ALGORITHM,
+    );
     const expected = {
       host: captured.repository.host,
       nameWithOwner: captured.repository.nameWithOwner,
@@ -824,6 +952,7 @@ describe("GitHub capability and snapshot layer", () => {
           ],
         },
         expected,
+        GITHUB_IDENTITY_HASH_ALGORITHM,
       );
 
     expect(classify("failure", "FAILURE")).toMatchObject({
@@ -846,25 +975,32 @@ describe("GitHub capability and snapshot layer", () => {
 
   it("rejects a snapshot after either bound SHA changes", async () => {
     const fixture = await fakeGitHub();
-    const snapshot = await captureGitHubPullRequestSnapshot(fixture);
+    const snapshot = await captureGitHubPullRequestSnapshot(
+      fixture,
+      GITHUB_IDENTITY_HASH_ALGORITHM,
+    );
     const state = JSON.parse(await readFile(fixture.statePath, "utf8")) as Record<string, unknown>;
     state.headSha = "d".repeat(40);
     await writeFile(fixture.statePath, `${JSON.stringify(state)}\n`);
 
-    await expect(assertGitHubSnapshotCurrent(fixture, snapshot)).rejects.toThrow(/is stale/);
+    await expect(
+      assertGitHubSnapshotCurrent(fixture, snapshot, GITHUB_IDENTITY_HASH_ALGORITHM),
+    ).rejects.toThrow(/is stale/);
 
     state.headSha = "a".repeat(40);
     state.baseSha = "e".repeat(40);
     await writeFile(fixture.statePath, `${JSON.stringify(state)}\n`);
-    await expect(assertGitHubSnapshotCurrent(fixture, snapshot)).rejects.toThrow(/is stale/);
+    await expect(
+      assertGitHubSnapshotCurrent(fixture, snapshot, GITHUB_IDENTITY_HASH_ALGORITHM),
+    ).rejects.toThrow(/is stale/);
   });
 
   it("discards a snapshot if the head changes during pagination", async () => {
     const fixture = await fakeGitHub({ changeOnIdentity: true });
 
-    await expect(captureGitHubPullRequestSnapshot(fixture)).rejects.toThrow(
-      /became stale during capture/,
-    );
+    await expect(
+      captureGitHubPullRequestSnapshot(fixture, GITHUB_IDENTITY_HASH_ALGORITHM),
+    ).rejects.toThrow(/became stale during capture/);
   });
 
   it("explains missing authentication and protected-branch visibility without mutation", async () => {
@@ -875,9 +1011,9 @@ describe("GitHub capability and snapshot layer", () => {
       readyForSnapshot: false,
       errors: [expect.stringMatching(/authentication is unavailable/)],
     });
-    await expect(captureGitHubPullRequestSnapshot(unauthenticated)).rejects.toThrow(
-      /snapshot preflight failed/,
-    );
+    await expect(
+      captureGitHubPullRequestSnapshot(unauthenticated, GITHUB_IDENTITY_HASH_ALGORITHM),
+    ).rejects.toThrow(/snapshot preflight failed/);
 
     const denied = await fakeGitHub({ protectionDenied: true });
     await expect(probeGitHub(denied)).resolves.toMatchObject({

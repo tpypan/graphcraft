@@ -74,6 +74,7 @@ type WorkspaceScopeSnapshotFormat = 1 | 2;
 type ProbeEvidenceCheckpointFormat = 1 | 2;
 type GovernanceControlIdentityFormat = 1 | 2;
 type RepositorySideEffectIdentityFormat = 1 | 2;
+type GithubMutationLifecycleIdentityFormat = 1 | 2;
 type CurrentRunStorageManifest = Extract<RunStorageManifest, { schemaVersion: 3 }>;
 
 interface LegacyStorage {
@@ -97,6 +98,7 @@ function manifest(
   probeEvidenceCheckpointFormat: ProbeEvidenceCheckpointFormat,
   governanceControlIdentityFormat: GovernanceControlIdentityFormat,
   repositorySideEffectIdentityFormat: RepositorySideEffectIdentityFormat,
+  githubMutationLifecycleIdentityFormat: GithubMutationLifecycleIdentityFormat,
   initialization: "initializing" | "ready",
 ): CurrentRunStorageManifest {
   return RunStorageManifestSchema.parse({
@@ -125,6 +127,7 @@ function manifest(
       probeEvidenceCheckpoints: probeEvidenceCheckpointFormat,
       governanceControlIdentities: governanceControlIdentityFormat,
       repositorySideEffectIdentities: repositorySideEffectIdentityFormat,
+      githubMutationLifecycleIdentities: githubMutationLifecycleIdentityFormat,
     },
   }) as CurrentRunStorageManifest;
 }
@@ -155,6 +158,7 @@ async function persistCurrentRunStorageManifest(
   probeEvidenceCheckpointFormat: ProbeEvidenceCheckpointFormat,
   governanceControlIdentityFormat: GovernanceControlIdentityFormat,
   repositorySideEffectIdentityFormat: RepositorySideEffectIdentityFormat,
+  githubMutationLifecycleIdentityFormat: GithubMutationLifecycleIdentityFormat,
   initialization: "initializing" | "ready",
   lease?: MigrationLeaseContext,
 ): Promise<CurrentRunStorageManifest> {
@@ -168,6 +172,7 @@ async function persistCurrentRunStorageManifest(
     probeEvidenceCheckpointFormat,
     governanceControlIdentityFormat,
     repositorySideEffectIdentityFormat,
+    githubMutationLifecycleIdentityFormat,
     initialization,
   );
   await migrationStep(lease, async () => await ensurePrivateDirectory(runRoot));
@@ -198,6 +203,7 @@ export async function writeCurrentRunStorageManifest(
     2,
     2,
     2,
+    2,
     "ready",
   );
 }
@@ -211,6 +217,7 @@ export async function writeInitializingRunStorageManifest(
     runId,
     CURRENT_RUN_STORAGE_VERSION,
     PORTABLE_CANONICAL_HASH_ALGORITHM,
+    2,
     2,
     2,
     2,
@@ -1698,6 +1705,15 @@ async function validateInitializingRunStorage(
     throw new Error(
       `Run ${runId} has a repository side-effect identity format that disagrees with its schema-v3 initialization descriptor. No files were changed.`,
     );
+  const githubMutationLifecycleFormat = first.data.githubMutationLifecycleIdentityFormat;
+  const githubMutationLifecycleFormatMismatch =
+    manifest.formats.githubMutationLifecycleIdentities === 2
+      ? githubMutationLifecycleFormat !== 2
+      : githubMutationLifecycleFormat !== undefined;
+  if (githubMutationLifecycleFormatMismatch)
+    throw new Error(
+      `Run ${runId} has a GitHub mutation-lifecycle identity format that disagrees with its schema-v3 initialization descriptor. No files were changed.`,
+    );
   try {
     validateHeldOutProbePlan(
       HeldOutProbePlanSchema.parse(first.data.heldOutProbePlan),
@@ -1779,6 +1795,7 @@ export async function ensureCurrentRunStorage(input: {
         storage.manifest.formats.probeEvidenceCheckpoints,
         storage.manifest.formats.governanceControlIdentities,
         storage.manifest.formats.repositorySideEffectIdentities,
+        storage.manifest.formats.githubMutationLifecycleIdentities,
         "ready",
         lease,
       );
@@ -1831,6 +1848,7 @@ export async function ensureCurrentRunStorage(input: {
       input.runId,
       storage.version,
       LEGACY_CANONICAL_HASH_ALGORITHM,
+      1,
       1,
       1,
       1,
