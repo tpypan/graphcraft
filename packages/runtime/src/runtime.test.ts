@@ -10084,7 +10084,8 @@ process.stdin.on("end", () => {
               key !== "workspaceScopeSnapshots" &&
               key !== "probeEvidenceCheckpoints" &&
               key !== "governanceControlIdentities" &&
-              key !== "repositorySideEffectIdentities",
+              key !== "repositorySideEffectIdentities" &&
+              key !== "githubMutationLifecycleIdentities",
           ),
         ),
         heldOutProbes: 1,
@@ -10105,6 +10106,7 @@ process.stdin.on("end", () => {
           delete data.probeEvidenceCheckpointFormat;
           delete data.governanceControlIdentityFormat;
           delete data.repositorySideEffectIdentityFormat;
+          delete data.githubMutationLifecycleIdentityFormat;
         }
         return createRunEvent(
           {
