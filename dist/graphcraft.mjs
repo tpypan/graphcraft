@@ -19907,7 +19907,10 @@ var RunStorageManifestSchema = external_exports.union([
       repositorySideEffectIdentities: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).default(1),
       // GitHub snapshots, lifecycle signatures, and mutation journal identities
       // also predate an independent selector. Omission preserves their v1 domain.
-      githubMutationLifecycleIdentities: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).default(1)
+      githubMutationLifecycleIdentities: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).default(1),
+      // Retention plans and journals also predate an independent identity
+      // selector. Omission preserves their legacy v1 identity domain.
+      retentionJournalIdentities: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).default(1)
     })
   })
 ]);
@@ -32846,7 +32849,7 @@ var LEGACY_MIGRATION_RESOURCE_LIMITS = Object.freeze({
   maximumFileCount: 4 * 1024,
   maximumEntryCount: 8 * 1024
 });
-function manifest(runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, probeEvidenceCheckpointFormat, governanceControlIdentityFormat, repositorySideEffectIdentityFormat, githubMutationLifecycleIdentityFormat, initialization) {
+function manifest(runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, probeEvidenceCheckpointFormat, governanceControlIdentityFormat, repositorySideEffectIdentityFormat, githubMutationLifecycleIdentityFormat, retentionJournalIdentityFormat, initialization) {
   return RunStorageManifestSchema.parse({
     schemaVersion: CURRENT_RUN_STORAGE_VERSION,
     runId,
@@ -32873,7 +32876,8 @@ function manifest(runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeForma
       probeEvidenceCheckpoints: probeEvidenceCheckpointFormat,
       governanceControlIdentities: governanceControlIdentityFormat,
       repositorySideEffectIdentities: repositorySideEffectIdentityFormat,
-      githubMutationLifecycleIdentities: githubMutationLifecycleIdentityFormat
+      githubMutationLifecycleIdentities: githubMutationLifecycleIdentityFormat,
+      retentionJournalIdentities: retentionJournalIdentityFormat
     }
   });
 }
@@ -32887,7 +32891,7 @@ async function validateRunStorageRoot(input) {
   if (validated !== runRoot)
     throw new Error(`Run storage path escaped the Graphcraft state directory: ${input.runRoot}`);
 }
-async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, probeEvidenceCheckpointFormat, governanceControlIdentityFormat, repositorySideEffectIdentityFormat, githubMutationLifecycleIdentityFormat, initialization, lease) {
+async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, probeEvidenceCheckpointFormat, governanceControlIdentityFormat, repositorySideEffectIdentityFormat, githubMutationLifecycleIdentityFormat, retentionJournalIdentityFormat, initialization, lease) {
   const value = manifest(
     runId,
     migratedFrom,
@@ -32899,6 +32903,7 @@ async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom, ca
     governanceControlIdentityFormat,
     repositorySideEffectIdentityFormat,
     githubMutationLifecycleIdentityFormat,
+    retentionJournalIdentityFormat,
     initialization
   );
   await migrationStep(lease, async () => await ensurePrivateDirectory(runRoot));
@@ -32924,6 +32929,7 @@ async function writeCurrentRunStorageManifest(runRoot, runId, migratedFrom) {
     2,
     2,
     2,
+    2,
     "ready"
   );
 }
@@ -32933,6 +32939,7 @@ async function writeInitializingRunStorageManifest(runRoot, runId) {
     runId,
     CURRENT_RUN_STORAGE_VERSION,
     PORTABLE_CANONICAL_HASH_ALGORITHM,
+    2,
     2,
     2,
     2,
@@ -34032,6 +34039,12 @@ async function validateInitializingRunStorage(runRoot, runId, manifest2, lease) 
     throw new Error(
       `Run ${runId} has a GitHub mutation-lifecycle identity format that disagrees with its schema-v3 initialization descriptor. No files were changed.`
     );
+  const retentionJournalFormat = first.data.retentionJournalIdentityFormat;
+  const retentionJournalFormatMismatch = manifest2.formats.retentionJournalIdentities === 2 ? retentionJournalFormat !== 2 : retentionJournalFormat !== void 0;
+  if (retentionJournalFormatMismatch)
+    throw new Error(
+      `Run ${runId} has a retention-journal identity format that disagrees with its schema-v3 initialization descriptor. No files were changed.`
+    );
   try {
     validateHeldOutProbePlan(
       HeldOutProbePlanSchema.parse(first.data.heldOutProbePlan),
@@ -34090,6 +34103,7 @@ async function ensureCurrentRunStorage(input) {
         storage.manifest.formats.governanceControlIdentities,
         storage.manifest.formats.repositorySideEffectIdentities,
         storage.manifest.formats.githubMutationLifecycleIdentities,
+        storage.manifest.formats.retentionJournalIdentities,
         "ready",
         lease
       );
@@ -34142,6 +34156,7 @@ async function ensureCurrentRunStorage(input) {
       input.runId,
       storage.version,
       LEGACY_CANONICAL_HASH_ALGORITHM,
+      1,
       1,
       1,
       1,
@@ -34481,7 +34496,7 @@ var RunStoreLimitError = class extends Error {
 var RunStoreEventLogCorruptionError = class extends Error {
   constructor(record2, offsetBytes, trailing, reason) {
     const location = trailing ? "trailing record" : `record ${record2}`;
-    const problem = reason === "encoding" ? "invalid UTF-8" : reason === "json" ? "invalid JSON" : reason === "schema" ? "an invalid event schema" : reason === "hash" ? "an invalid event hash" : reason === "format" ? "an event format that disagrees with its storage manifest" : reason === "scope" ? "a workspace-scope snapshot that disagrees with its storage manifest" : reason === "checkpoint" ? "a probe-evidence checkpoint format that disagrees with its storage manifest" : reason === "governance" ? "a governance/control identity format that disagrees with its storage manifest" : reason === "repository_side_effect" ? "a repository side-effect identity format that disagrees with its storage manifest" : reason === "github_mutation_lifecycle" ? "a GitHub mutation-lifecycle identity format that disagrees with its storage manifest" : "an invalid event sequence";
+    const problem = reason === "encoding" ? "invalid UTF-8" : reason === "json" ? "invalid JSON" : reason === "schema" ? "an invalid event schema" : reason === "hash" ? "an invalid event hash" : reason === "format" ? "an event format that disagrees with its storage manifest" : reason === "scope" ? "a workspace-scope snapshot that disagrees with its storage manifest" : reason === "checkpoint" ? "a probe-evidence checkpoint format that disagrees with its storage manifest" : reason === "governance" ? "a governance/control identity format that disagrees with its storage manifest" : reason === "repository_side_effect" ? "a repository side-effect identity format that disagrees with its storage manifest" : reason === "github_mutation_lifecycle" ? "a GitHub mutation-lifecycle identity format that disagrees with its storage manifest" : reason === "retention_journal" ? "a retention-journal identity format that disagrees with its storage manifest" : "an invalid event sequence";
     super(
       `Run event log has ${problem} in ${location} at byte ${offsetBytes}; event log bytes were left unchanged`
     );
@@ -34575,6 +34590,11 @@ function githubMutationLifecycleIdentityUsesDifferentFormat(event, selected) {
   const format = event.data.githubMutationLifecycleIdentityFormat;
   return selected === PORTABLE_CANONICAL_HASH_ALGORITHM ? format !== 2 : format !== void 0;
 }
+function retentionJournalIdentityUsesDifferentFormat(event, selected) {
+  if (event.type !== "run.created") return false;
+  const format = event.data.retentionJournalIdentityFormat;
+  return selected === PORTABLE_CANONICAL_HASH_ALGORITHM ? format !== 2 : format !== void 0;
+}
 var RunStore = class _RunStore {
   repositoryRoot;
   runId;
@@ -34593,6 +34613,7 @@ var RunStore = class _RunStore {
   _governanceControlIdentityHashAlgorithm;
   _repositorySideEffectIdentityHashAlgorithm;
   _githubMutationLifecycleIdentityHashAlgorithm;
+  _retentionJournalIdentityHashAlgorithm;
   constructor(repositoryRoot, runId, limits = {}, canonicalHashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
     this.repositoryRoot = repositoryRoot;
     this.runId = runId;
@@ -34648,6 +34669,8 @@ var RunStore = class _RunStore {
       this.bindGithubMutationLifecycleIdentityHashAlgorithm(
         githubMutationLifecycleIdentityHashAlgorithm
       );
+      const retentionJournalIdentityHashAlgorithm = manifest2.formats.retentionJournalIdentities === 2 ? PORTABLE_CANONICAL_HASH_ALGORITHM : LEGACY_CANONICAL_HASH_ALGORITHM;
+      this.bindRetentionJournalIdentityHashAlgorithm(retentionJournalIdentityHashAlgorithm);
       await this.validateStorageRoot();
     } catch (error51) {
       if (this.storageReady === ready) this.storageReady = void 0;
@@ -34701,6 +34724,13 @@ var RunStore = class _RunStore {
       );
     return this._githubMutationLifecycleIdentityHashAlgorithm;
   }
+  get retentionJournalIdentityHashAlgorithm() {
+    if (!this._retentionJournalIdentityHashAlgorithm)
+      throw new Error(
+        "Retention-journal identity hash policy is unavailable before run storage is prepared"
+      );
+    return this._retentionJournalIdentityHashAlgorithm;
+  }
   bindArtifactHashAlgorithm(algorithm) {
     if (this.artifactStore && this.artifactStore.hashAlgorithm !== algorithm)
       throw new Error("Artifact store was bound before its storage manifest policy was known");
@@ -34740,6 +34770,13 @@ var RunStore = class _RunStore {
         "GitHub mutation-lifecycle identity hashing was bound before its storage manifest policy was known"
       );
     this._githubMutationLifecycleIdentityHashAlgorithm = algorithm;
+  }
+  bindRetentionJournalIdentityHashAlgorithm(algorithm) {
+    if (this._retentionJournalIdentityHashAlgorithm && this._retentionJournalIdentityHashAlgorithm !== algorithm)
+      throw new Error(
+        "Retention-journal identity hashing was bound before its storage manifest policy was known"
+      );
+    this._retentionJournalIdentityHashAlgorithm = algorithm;
   }
   artifacts() {
     return this.artifactStore ??= new RunArtifactStore(
@@ -34808,6 +34845,7 @@ var RunStore = class _RunStore {
     store.bindGovernanceControlIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     store.bindRepositorySideEffectIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     store.bindGithubMutationLifecycleIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    store.bindRetentionJournalIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     const persistedContract = RunContractSchema.parse(redactValue(contract));
     const persistedGraph = GraphSchema.parse(redactValue(graph));
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
@@ -34845,7 +34883,8 @@ var RunStore = class _RunStore {
           probeEvidenceCheckpointFormat: 2,
           governanceControlIdentityFormat: 2,
           repositorySideEffectIdentityFormat: 2,
-          githubMutationLifecycleIdentityFormat: 2
+          githubMutationLifecycleIdentityFormat: 2,
+          retentionJournalIdentityFormat: 2
         }
       },
       store.canonicalHashAlgorithm
@@ -35187,6 +35226,11 @@ var RunStore = class _RunStore {
           trailing,
           "github_mutation_lifecycle"
         );
+      if (retentionJournalIdentityUsesDifferentFormat(
+        event,
+        this.retentionJournalIdentityHashAlgorithm
+      ))
+        throw new RunStoreEventLogCorruptionError(record2, offset, trailing, "retention_journal");
       const scopeSnapshot = eventWorkspaceScopeSnapshot(event);
       if (scopeSnapshot !== void 0 && workspaceScopeSnapshotUsesDifferentHashPolicy(
         scopeSnapshot,
@@ -45225,6 +45269,7 @@ var RETENTION_JOURNAL_MAX_COUNT = 4096;
 var RETENTION_WORKSPACE_PATH_MAX_CHARACTERS = 16 * 1024;
 var RETENTION_WORKSPACE_BRANCH_MAX_CHARACTERS = 4 * 1024;
 var RETENTION_WORKSPACE_FILE_MAX_BYTES = 64 * 1024;
+var RETENTION_STORAGE_MANIFEST_MAX_BYTES = 64 * 1024;
 var RETENTION_TARGET_IDS = [
   "run",
   "control",
@@ -45243,6 +45288,25 @@ function retentionTargets(repositoryRoot, runId) {
       kind: "directory"
     }
   ];
+}
+function compareCodeUnits2(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+function retentionIdentityFormat(algorithm) {
+  return algorithm === PORTABLE_CANONICAL_HASH_ALGORITHM ? 2 : 1;
+}
+function retentionPlanHashAlgorithm(plan) {
+  return plan.schemaVersion === 2 ? PORTABLE_CANONICAL_HASH_ALGORITHM : LEGACY_CANONICAL_HASH_ALGORITHM;
+}
+function retentionJournalHashAlgorithm(journal) {
+  return journal.schemaVersion === 2 ? PORTABLE_CANONICAL_HASH_ALGORITHM : LEGACY_CANONICAL_HASH_ALGORITHM;
+}
+function createRetentionPlan(algorithm, fields) {
+  return algorithm === PORTABLE_CANONICAL_HASH_ALGORITHM ? {
+    schemaVersion: 2,
+    hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+    ...fields
+  } : { schemaVersion: 1, ...fields };
 }
 function refusal(runId, reason) {
   return new Error(`Retention refused for run ${runId}: ${reason}`);
@@ -45316,8 +45380,7 @@ function parseRetentionStateIdentity(value, expectedRunId) {
   };
 }
 function retentionJournalPayload(journal) {
-  return {
-    schemaVersion: journal.schemaVersion,
+  const fields = {
     kind: journal.kind,
     runId: journal.runId,
     state: journal.state,
@@ -45325,10 +45388,19 @@ function retentionJournalPayload(journal) {
     existingTargetIds: journal.existingTargetIds,
     createdAt: journal.createdAt
   };
+  return journal.schemaVersion === 2 ? {
+    schemaVersion: 2,
+    hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+    ...fields
+  } : { schemaVersion: 1, ...fields };
 }
 function parseRetentionJournal(value, expectedRunId) {
+  const schemaVersion = typeof value === "object" && value !== null && !Array.isArray(value) ? value.schemaVersion : void 0;
+  if (schemaVersion !== 1 && schemaVersion !== 2)
+    throw new Error("retention journal has an unsupported schema");
   const record2 = exactRecord(value, "retention journal", [
     "schemaVersion",
+    ...schemaVersion === 2 ? ["hashAlgorithm"] : [],
     "kind",
     "runId",
     "state",
@@ -45337,7 +45409,7 @@ function parseRetentionJournal(value, expectedRunId) {
     "createdAt",
     "integrityHash"
   ]);
-  if (record2.schemaVersion !== 1 || record2.kind !== "graphcraft_run_retention" || record2.runId !== expectedRunId)
+  if (record2.kind !== "graphcraft_run_retention" || record2.runId !== expectedRunId || schemaVersion === 2 && record2.hashAlgorithm !== PORTABLE_CANONICAL_HASH_ALGORITHM)
     throw new Error("retention journal identity does not match this run");
   if (!Array.isArray(record2.existingTargetIds))
     throw new Error("retention journal target identifiers are invalid");
@@ -45351,17 +45423,21 @@ function parseRetentionJournal(value, expectedRunId) {
   if (typeof record2.integrityHash !== "string" || !HASH_PATTERN.test(record2.integrityHash))
     throw new Error("retention journal integrity hash is invalid");
   const rawWorkspace = safePreservedWorkspace(record2.preservedWorkspace);
-  const journal = {
-    schemaVersion: 1,
+  const fields = {
     kind: "graphcraft_run_retention",
     runId: expectedRunId,
     state: parseRetentionStateIdentity(record2.state, expectedRunId),
     preservedWorkspace: rawWorkspace,
     existingTargetIds,
-    createdAt: validTimestamp(record2.createdAt, "retention journal creation time"),
-    integrityHash: record2.integrityHash
+    createdAt: validTimestamp(record2.createdAt, "retention journal creation time")
   };
-  if (contentHash(retentionJournalPayload(journal)) !== journal.integrityHash)
+  const journal = schemaVersion === 2 ? {
+    schemaVersion: 2,
+    hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+    ...fields,
+    integrityHash: record2.integrityHash
+  } : { schemaVersion: 1, ...fields, integrityHash: record2.integrityHash };
+  if (contentHash(retentionJournalPayload(journal), retentionJournalHashAlgorithm(journal)) !== journal.integrityHash)
     throw new Error("retention journal integrity hash does not match its contents");
   return journal;
 }
@@ -45467,17 +45543,48 @@ async function listRetentionJournals(repositoryRoot) {
   return journals;
 }
 function planFromJournal(repositoryRoot, journal) {
-  return {
-    schemaVersion: 1,
+  return createRetentionPlan(retentionJournalHashAlgorithm(journal), {
     action: "delete_run_state",
     repositoryRoot,
     runId: journal.runId,
     state: journal.state,
     preservedWorkspace: journal.preservedWorkspace,
     deletePaths: retentionTargets(repositoryRoot, journal.runId).map(({ path: path2 }) => path2)
-  };
+  });
 }
-async function readPersistedState(repositoryRoot, runId) {
+async function readRetentionIdentityPolicy(repositoryRoot, runId) {
+  const runRoot = join16(repositoryRoot, ".graphcraft", "runs", runId);
+  let source;
+  try {
+    source = await readPrivateFileBounded(
+      join16(runRoot, "storage.json"),
+      RETENTION_STORAGE_MANIFEST_MAX_BYTES,
+      runRoot
+    );
+  } catch (error51) {
+    if (isMissing3(error51))
+      return { hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM, eventSchemaVersion: 1 };
+    throw refusal(runId, "storage manifest is not a stable private bounded file");
+  }
+  try {
+    const manifest2 = RunStorageManifestSchema.parse(JSON.parse(source.toString("utf8")));
+    if (manifest2.runId !== runId) throw new Error(`storage manifest belongs to ${manifest2.runId}`);
+    if (manifest2.schemaVersion !== 3)
+      return { hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM, eventSchemaVersion: 1 };
+    if (manifest2.canonicalHashAlgorithm === LEGACY_CANONICAL_HASH_ALGORITHM && manifest2.formats.events !== 1 || manifest2.canonicalHashAlgorithm === PORTABLE_CANONICAL_HASH_ALGORITHM && manifest2.formats.events !== 2)
+      throw new Error("storage hash algorithm disagrees with its event format");
+    return {
+      hashAlgorithm: manifest2.formats.retentionJournalIdentities === 2 ? PORTABLE_CANONICAL_HASH_ALGORITHM : LEGACY_CANONICAL_HASH_ALGORITHM,
+      eventSchemaVersion: manifest2.formats.events
+    };
+  } catch (error51) {
+    throw refusal(
+      runId,
+      `storage manifest is invalid or ambiguous (${error51 instanceof Error ? error51.message : String(error51)})`
+    );
+  }
+}
+async function readPersistedState(repositoryRoot, runId, retentionPolicy) {
   try {
     const graphcraftRoot2 = join16(repositoryRoot, ".graphcraft");
     const runRoot = join16(graphcraftRoot2, "runs", runId);
@@ -45505,18 +45612,28 @@ async function readPersistedState(repositoryRoot, runId) {
     if (events.length === 0) throw new Error("authoritative event log is empty");
     for (const [index, event] of events.entries()) {
       verifyRunEvent(event);
+      if (event.schemaVersion !== retentionPolicy.eventSchemaVersion)
+        throw new Error(
+          retentionPolicy.eventSchemaVersion === 1 ? "schema-v2 events require an intact schema-v3 storage manifest" : "authoritative event format disagrees with the storage manifest"
+        );
       if (event.sequence !== index + 1)
         throw new Error(
           `authoritative event sequence expected ${index + 1}, received ${event.sequence}`
         );
     }
+    const created = events[0];
+    if (created?.type !== "run.created")
+      throw new Error("authoritative event log does not begin with run.created");
+    const declaredFormat = created.data.retentionJournalIdentityFormat;
+    if (retentionPolicy.hashAlgorithm === PORTABLE_CANONICAL_HASH_ALGORITHM ? declaredFormat !== 2 : declaredFormat !== void 0)
+      throw new Error("retention-journal identity format disagrees with the storage manifest");
     const authoritative = RunStateSchema.parse(reduceEvents(events));
     if (Buffer.byteLength(`${JSON.stringify(authoritative, null, 2)}
 `) > RUN_STATE_MAX_BYTES)
       throw new Error(`authoritative state exceeds its ${RUN_STATE_MAX_BYTES}-byte bounded size`);
     if (authoritative.runId !== runId)
       throw new Error(`authoritative events belong to run ${authoritative.runId}`);
-    if (contentHash(materialized) !== contentHash(authoritative))
+    if (contentHash(materialized, retentionPolicy.hashAlgorithm) !== contentHash(authoritative, retentionPolicy.hashAlgorithm))
       throw new Error("materialized state does not match the authoritative event log");
     return authoritative;
   } catch (error51) {
@@ -45526,13 +45643,13 @@ async function readPersistedState(repositoryRoot, runId) {
     );
   }
 }
-function retentionStateIdentity(state) {
+function retentionStateIdentity(state, algorithm) {
   return {
     runId: state.runId,
     status: state.status,
     lastEventSequence: state.lastEventSequence,
     updatedAt: state.updatedAt,
-    hash: contentHash(state)
+    hash: contentHash(state, algorithm)
   };
 }
 async function readPreservedWorkspace(repositoryRoot, runId) {
@@ -45597,21 +45714,21 @@ async function assertNoProbeProcessState(repositoryRoot, runId) {
   );
 }
 async function inspectDeletableRun(repositoryRoot, runId) {
-  const state = await readPersistedState(repositoryRoot, runId);
+  const policy = await readRetentionIdentityPolicy(repositoryRoot, runId);
+  const state = await readPersistedState(repositoryRoot, runId, policy);
   if (!DELETABLE_RUN_STATUSES.has(state.status))
     throw refusal(runId, `state ${state.status} is active or has an ambiguous terminal outcome`);
   const preservedWorkspace = await readPreservedWorkspace(repositoryRoot, runId);
   await assertNoLiveSupervisor(repositoryRoot, runId);
   await assertNoProbeProcessState(repositoryRoot, runId);
-  return {
-    schemaVersion: 1,
+  return createRetentionPlan(policy.hashAlgorithm, {
     action: "delete_run_state",
     repositoryRoot,
     runId,
-    state: retentionStateIdentity(state),
+    state: retentionStateIdentity(state, policy.hashAlgorithm),
     preservedWorkspace,
     deletePaths: retentionTargets(repositoryRoot, runId).map(({ path: path2 }) => path2)
-  };
+  });
 }
 async function planRunRetention(input) {
   if (!input.runReference.trim())
@@ -45628,8 +45745,12 @@ async function planRunRetention(input) {
   return await inspectDeletableRun(repositoryRoot, runId);
 }
 function validateRetentionPlan(plan) {
+  const schemaVersion = typeof plan === "object" && plan !== null ? plan.schemaVersion : void 0;
+  if (schemaVersion !== 1 && schemaVersion !== 2)
+    throw new Error("Retention plan has an unsupported schema or action");
   const record2 = exactRecord(plan, "retention plan", [
     "schemaVersion",
+    ...schemaVersion === 2 ? ["hashAlgorithm"] : [],
     "action",
     "repositoryRoot",
     "runId",
@@ -45637,7 +45758,7 @@ function validateRetentionPlan(plan) {
     "preservedWorkspace",
     "deletePaths"
   ]);
-  if (record2.schemaVersion !== 1 || record2.action !== "delete_run_state")
+  if (record2.action !== "delete_run_state" || schemaVersion === 2 && record2.hashAlgorithm !== PORTABLE_CANONICAL_HASH_ALGORITHM)
     throw new Error("Retention plan has an unsupported schema or action");
   if (typeof record2.runId !== "string" || !RUN_ID_PATTERN2.test(record2.runId))
     throw new Error("Retention plan has an invalid run ID");
@@ -45653,6 +45774,9 @@ function validateRetentionPlan(plan) {
   );
   if (!isDeepStrictEqual4(record2.deletePaths, expectedPaths))
     throw refusal(record2.runId, "delete paths do not match the repository and run ID");
+}
+function sameRetentionPlanIdentityFormat(left, right) {
+  return left.schemaVersion === right.schemaVersion && (left.schemaVersion === 1 || right.schemaVersion === 2 && left.hashAlgorithm === right.hashAlgorithm);
 }
 async function validateTarget(graphcraftRoot2, target) {
   const expected = resolve16(target.path);
@@ -45728,8 +45852,7 @@ async function syncRetentionTargetParents(targets, assertLeaseHeld) {
   }
 }
 function createRetentionJournal(plan, existingTargetIds) {
-  const payload = {
-    schemaVersion: 1,
+  const fields = {
     kind: "graphcraft_run_retention",
     runId: plan.runId,
     state: plan.state,
@@ -45737,7 +45860,16 @@ function createRetentionJournal(plan, existingTargetIds) {
     existingTargetIds: RETENTION_TARGET_IDS.filter((id) => existingTargetIds.has(id)),
     createdAt: (/* @__PURE__ */ new Date()).toISOString()
   };
-  return parseRetentionJournal({ ...payload, integrityHash: contentHash(payload) }, plan.runId);
+  const algorithm = retentionPlanHashAlgorithm(plan);
+  const payload = algorithm === PORTABLE_CANONICAL_HASH_ALGORITHM ? {
+    schemaVersion: 2,
+    hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+    ...fields
+  } : { schemaVersion: 1, ...fields };
+  return parseRetentionJournal(
+    { ...payload, integrityHash: contentHash(payload, algorithm) },
+    plan.runId
+  );
 }
 async function applyRetention(plan, confirmRunId, validateEligibility, options = {}) {
   if (confirmRunId !== plan.runId)
@@ -45845,6 +45977,11 @@ async function applyRunRetention(input) {
     input.plan,
     input.confirmRunId,
     (current) => {
+      if (!sameRetentionPlanIdentityFormat(current, input.plan))
+        throw refusal(
+          input.plan.runId,
+          "retention identity format changed; create and confirm a new dry-run plan"
+        );
       if (!isDeepStrictEqual4(current.state, input.plan.state) || !isDeepStrictEqual4(current.preservedWorkspace, input.plan.preservedWorkspace))
         throw refusal(input.plan.runId, "state changed; create and confirm a new dry-run plan");
     },
@@ -45868,9 +46005,12 @@ async function planCompletedRunPrune(input) {
   const liveStates = [];
   for (const runId of await listRunIds(repositoryRoot)) {
     if (journalByRunId.has(runId)) continue;
+    const policy = await readRetentionIdentityPolicy(repositoryRoot, runId);
+    const state = await readPersistedState(repositoryRoot, runId, policy);
     liveStates.push({
       runId,
-      state: retentionStateIdentity(await readPersistedState(repositoryRoot, runId)),
+      state: retentionStateIdentity(state, policy.hashAlgorithm),
+      hashAlgorithm: policy.hashAlgorithm,
       journal: void 0
     });
   }
@@ -45879,11 +46019,17 @@ async function planCompletedRunPrune(input) {
     ...journals.map((journal) => ({
       runId: journal.runId,
       state: journal.state,
+      hashAlgorithm: retentionJournalHashAlgorithm(journal),
       journal
     }))
-  ].filter(({ state }) => state.status === "completed" && Date.parse(state.updatedAt) < cutoff).sort(
-    (left, right) => Date.parse(right.state.updatedAt) - Date.parse(left.state.updatedAt) || left.runId.localeCompare(right.runId)
-  );
+  ].filter(({ state }) => state.status === "completed" && Date.parse(state.updatedAt) < cutoff).sort((left, right) => {
+    const timestampOrder = Date.parse(right.state.updatedAt) - Date.parse(left.state.updatedAt);
+    if (timestampOrder !== 0) return timestampOrder;
+    const leftFormat = retentionIdentityFormat(left.hashAlgorithm);
+    const rightFormat = retentionIdentityFormat(right.hashAlgorithm);
+    if (leftFormat !== rightFormat) return leftFormat - rightFormat;
+    return leftFormat === 1 ? left.runId.localeCompare(right.runId) : compareCodeUnits2(left.runId, right.runId);
+  });
   const kept = candidates.filter(({ journal }) => journal === void 0).slice(0, input.keepNewest);
   const keptRunIds = new Set(kept.map(({ runId }) => runId));
   const selected = candidates.filter(
@@ -45914,6 +46060,7 @@ function sameRunIds(actual, expected) {
 }
 async function applyCompletedRunPrune(input) {
   const plannedRunIds = input.plan.deletionPlans.map(({ runId }) => runId);
+  for (const plan of input.plan.deletionPlans) validateRetentionPlan(plan);
   if (!sameRunIds(input.confirmRunIds, plannedRunIds))
     throw new Error("Prune confirmation must contain every planned run ID exactly once");
   const current = await planCompletedRunPrune({
@@ -45924,10 +46071,20 @@ async function applyCompletedRunPrune(input) {
   const currentRunIds = current.deletionPlans.map(({ runId }) => runId);
   if (!sameRunIds(currentRunIds, plannedRunIds))
     throw new Error("Prune eligibility changed; create and confirm a new dry-run plan");
+  const reviewedPlans = new Map(input.plan.deletionPlans.map((plan) => [plan.runId, plan]));
+  if (current.deletionPlans.some((plan) => {
+    const reviewed = reviewedPlans.get(plan.runId);
+    return !reviewed || !sameRetentionPlanIdentityFormat(plan, reviewed);
+  }))
+    throw new Error(
+      "Prune retention identity format changed; create and confirm a new dry-run plan"
+    );
   const cutoff = isoCutoff(input.plan.completedBefore);
   const validateCompletedEligibility = (plan) => (revalidated) => {
     if (revalidated.state.status !== "completed")
       throw refusal(plan.runId, `state changed to ${revalidated.state.status}`);
+    if (!sameRetentionPlanIdentityFormat(revalidated, plan))
+      throw refusal(plan.runId, "retention identity format changed after prune revalidation");
     if (!isDeepStrictEqual4(revalidated.state, plan.state))
       throw refusal(plan.runId, "completed state changed after prune revalidation");
     if (Date.parse(revalidated.state.updatedAt) >= cutoff)
@@ -47742,7 +47899,7 @@ var program2 = new Command().name("graphcraft").description("Progress-aware exec
 async function benchmarkSourceIdentity() {
   if (true) {
     return BenchmarkSourceIdentitySchema.parse({
-      commitSha: "3b81b0e1507692f03001acc1c08a0f6e7c835e62",
+      commitSha: "bf8dcfdf0448cbebdcd333b5879fd288631dc49e",
       dirty: false,
       dirtyStatusDigest: false ? null : null
     });

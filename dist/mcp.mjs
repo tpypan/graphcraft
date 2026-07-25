@@ -32737,7 +32737,10 @@ var RunStorageManifestSchema = external_exports.union([
       repositorySideEffectIdentities: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).default(1),
       // GitHub snapshots, lifecycle signatures, and mutation journal identities
       // also predate an independent selector. Omission preserves their v1 domain.
-      githubMutationLifecycleIdentities: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).default(1)
+      githubMutationLifecycleIdentities: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).default(1),
+      // Retention plans and journals also predate an independent identity
+      // selector. Omission preserves their legacy v1 identity domain.
+      retentionJournalIdentities: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).default(1)
     })
   })
 ]);
@@ -45493,7 +45496,7 @@ var LEGACY_MIGRATION_RESOURCE_LIMITS = Object.freeze({
   maximumFileCount: 4 * 1024,
   maximumEntryCount: 8 * 1024
 });
-function manifest(runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, probeEvidenceCheckpointFormat, governanceControlIdentityFormat, repositorySideEffectIdentityFormat, githubMutationLifecycleIdentityFormat, initialization) {
+function manifest(runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, probeEvidenceCheckpointFormat, governanceControlIdentityFormat, repositorySideEffectIdentityFormat, githubMutationLifecycleIdentityFormat, retentionJournalIdentityFormat, initialization) {
   return RunStorageManifestSchema.parse({
     schemaVersion: CURRENT_RUN_STORAGE_VERSION,
     runId,
@@ -45520,7 +45523,8 @@ function manifest(runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeForma
       probeEvidenceCheckpoints: probeEvidenceCheckpointFormat,
       governanceControlIdentities: governanceControlIdentityFormat,
       repositorySideEffectIdentities: repositorySideEffectIdentityFormat,
-      githubMutationLifecycleIdentities: githubMutationLifecycleIdentityFormat
+      githubMutationLifecycleIdentities: githubMutationLifecycleIdentityFormat,
+      retentionJournalIdentities: retentionJournalIdentityFormat
     }
   });
 }
@@ -45534,7 +45538,7 @@ async function validateRunStorageRoot(input) {
   if (validated !== runRoot)
     throw new Error(`Run storage path escaped the Graphcraft state directory: ${input.runRoot}`);
 }
-async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, probeEvidenceCheckpointFormat, governanceControlIdentityFormat, repositorySideEffectIdentityFormat, githubMutationLifecycleIdentityFormat, initialization, lease) {
+async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, probeEvidenceCheckpointFormat, governanceControlIdentityFormat, repositorySideEffectIdentityFormat, githubMutationLifecycleIdentityFormat, retentionJournalIdentityFormat, initialization, lease) {
   const value = manifest(
     runId,
     migratedFrom,
@@ -45546,6 +45550,7 @@ async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom, ca
     governanceControlIdentityFormat,
     repositorySideEffectIdentityFormat,
     githubMutationLifecycleIdentityFormat,
+    retentionJournalIdentityFormat,
     initialization
   );
   await migrationStep(lease, async () => await ensurePrivateDirectory(runRoot));
@@ -45571,6 +45576,7 @@ async function writeCurrentRunStorageManifest(runRoot, runId, migratedFrom) {
     2,
     2,
     2,
+    2,
     "ready"
   );
 }
@@ -45580,6 +45586,7 @@ async function writeInitializingRunStorageManifest(runRoot, runId) {
     runId,
     CURRENT_RUN_STORAGE_VERSION,
     PORTABLE_CANONICAL_HASH_ALGORITHM,
+    2,
     2,
     2,
     2,
@@ -46679,6 +46686,12 @@ async function validateInitializingRunStorage(runRoot, runId, manifest2, lease) 
     throw new Error(
       `Run ${runId} has a GitHub mutation-lifecycle identity format that disagrees with its schema-v3 initialization descriptor. No files were changed.`
     );
+  const retentionJournalFormat = first.data.retentionJournalIdentityFormat;
+  const retentionJournalFormatMismatch = manifest2.formats.retentionJournalIdentities === 2 ? retentionJournalFormat !== 2 : retentionJournalFormat !== void 0;
+  if (retentionJournalFormatMismatch)
+    throw new Error(
+      `Run ${runId} has a retention-journal identity format that disagrees with its schema-v3 initialization descriptor. No files were changed.`
+    );
   try {
     validateHeldOutProbePlan(
       HeldOutProbePlanSchema.parse(first.data.heldOutProbePlan),
@@ -46737,6 +46750,7 @@ async function ensureCurrentRunStorage(input) {
         storage.manifest.formats.governanceControlIdentities,
         storage.manifest.formats.repositorySideEffectIdentities,
         storage.manifest.formats.githubMutationLifecycleIdentities,
+        storage.manifest.formats.retentionJournalIdentities,
         "ready",
         lease
       );
@@ -46789,6 +46803,7 @@ async function ensureCurrentRunStorage(input) {
       input.runId,
       storage.version,
       LEGACY_CANONICAL_HASH_ALGORITHM,
+      1,
       1,
       1,
       1,
@@ -47128,7 +47143,7 @@ var RunStoreLimitError = class extends Error {
 var RunStoreEventLogCorruptionError = class extends Error {
   constructor(record2, offsetBytes, trailing, reason) {
     const location = trailing ? "trailing record" : `record ${record2}`;
-    const problem = reason === "encoding" ? "invalid UTF-8" : reason === "json" ? "invalid JSON" : reason === "schema" ? "an invalid event schema" : reason === "hash" ? "an invalid event hash" : reason === "format" ? "an event format that disagrees with its storage manifest" : reason === "scope" ? "a workspace-scope snapshot that disagrees with its storage manifest" : reason === "checkpoint" ? "a probe-evidence checkpoint format that disagrees with its storage manifest" : reason === "governance" ? "a governance/control identity format that disagrees with its storage manifest" : reason === "repository_side_effect" ? "a repository side-effect identity format that disagrees with its storage manifest" : reason === "github_mutation_lifecycle" ? "a GitHub mutation-lifecycle identity format that disagrees with its storage manifest" : "an invalid event sequence";
+    const problem = reason === "encoding" ? "invalid UTF-8" : reason === "json" ? "invalid JSON" : reason === "schema" ? "an invalid event schema" : reason === "hash" ? "an invalid event hash" : reason === "format" ? "an event format that disagrees with its storage manifest" : reason === "scope" ? "a workspace-scope snapshot that disagrees with its storage manifest" : reason === "checkpoint" ? "a probe-evidence checkpoint format that disagrees with its storage manifest" : reason === "governance" ? "a governance/control identity format that disagrees with its storage manifest" : reason === "repository_side_effect" ? "a repository side-effect identity format that disagrees with its storage manifest" : reason === "github_mutation_lifecycle" ? "a GitHub mutation-lifecycle identity format that disagrees with its storage manifest" : reason === "retention_journal" ? "a retention-journal identity format that disagrees with its storage manifest" : "an invalid event sequence";
     super(
       `Run event log has ${problem} in ${location} at byte ${offsetBytes}; event log bytes were left unchanged`
     );
@@ -47222,6 +47237,11 @@ function githubMutationLifecycleIdentityUsesDifferentFormat(event, selected) {
   const format = event.data.githubMutationLifecycleIdentityFormat;
   return selected === PORTABLE_CANONICAL_HASH_ALGORITHM ? format !== 2 : format !== void 0;
 }
+function retentionJournalIdentityUsesDifferentFormat(event, selected) {
+  if (event.type !== "run.created") return false;
+  const format = event.data.retentionJournalIdentityFormat;
+  return selected === PORTABLE_CANONICAL_HASH_ALGORITHM ? format !== 2 : format !== void 0;
+}
 var RunStore = class _RunStore {
   repositoryRoot;
   runId;
@@ -47240,6 +47260,7 @@ var RunStore = class _RunStore {
   _governanceControlIdentityHashAlgorithm;
   _repositorySideEffectIdentityHashAlgorithm;
   _githubMutationLifecycleIdentityHashAlgorithm;
+  _retentionJournalIdentityHashAlgorithm;
   constructor(repositoryRoot, runId, limits = {}, canonicalHashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
     this.repositoryRoot = repositoryRoot;
     this.runId = runId;
@@ -47295,6 +47316,8 @@ var RunStore = class _RunStore {
       this.bindGithubMutationLifecycleIdentityHashAlgorithm(
         githubMutationLifecycleIdentityHashAlgorithm
       );
+      const retentionJournalIdentityHashAlgorithm = manifest2.formats.retentionJournalIdentities === 2 ? PORTABLE_CANONICAL_HASH_ALGORITHM : LEGACY_CANONICAL_HASH_ALGORITHM;
+      this.bindRetentionJournalIdentityHashAlgorithm(retentionJournalIdentityHashAlgorithm);
       await this.validateStorageRoot();
     } catch (error51) {
       if (this.storageReady === ready) this.storageReady = void 0;
@@ -47348,6 +47371,13 @@ var RunStore = class _RunStore {
       );
     return this._githubMutationLifecycleIdentityHashAlgorithm;
   }
+  get retentionJournalIdentityHashAlgorithm() {
+    if (!this._retentionJournalIdentityHashAlgorithm)
+      throw new Error(
+        "Retention-journal identity hash policy is unavailable before run storage is prepared"
+      );
+    return this._retentionJournalIdentityHashAlgorithm;
+  }
   bindArtifactHashAlgorithm(algorithm) {
     if (this.artifactStore && this.artifactStore.hashAlgorithm !== algorithm)
       throw new Error("Artifact store was bound before its storage manifest policy was known");
@@ -47387,6 +47417,13 @@ var RunStore = class _RunStore {
         "GitHub mutation-lifecycle identity hashing was bound before its storage manifest policy was known"
       );
     this._githubMutationLifecycleIdentityHashAlgorithm = algorithm;
+  }
+  bindRetentionJournalIdentityHashAlgorithm(algorithm) {
+    if (this._retentionJournalIdentityHashAlgorithm && this._retentionJournalIdentityHashAlgorithm !== algorithm)
+      throw new Error(
+        "Retention-journal identity hashing was bound before its storage manifest policy was known"
+      );
+    this._retentionJournalIdentityHashAlgorithm = algorithm;
   }
   artifacts() {
     return this.artifactStore ??= new RunArtifactStore(
@@ -47455,6 +47492,7 @@ var RunStore = class _RunStore {
     store.bindGovernanceControlIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     store.bindRepositorySideEffectIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     store.bindGithubMutationLifecycleIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    store.bindRetentionJournalIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     const persistedContract = RunContractSchema.parse(redactValue(contract));
     const persistedGraph = GraphSchema.parse(redactValue(graph));
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
@@ -47492,7 +47530,8 @@ var RunStore = class _RunStore {
           probeEvidenceCheckpointFormat: 2,
           governanceControlIdentityFormat: 2,
           repositorySideEffectIdentityFormat: 2,
-          githubMutationLifecycleIdentityFormat: 2
+          githubMutationLifecycleIdentityFormat: 2,
+          retentionJournalIdentityFormat: 2
         }
       },
       store.canonicalHashAlgorithm
@@ -47834,6 +47873,11 @@ var RunStore = class _RunStore {
           trailing,
           "github_mutation_lifecycle"
         );
+      if (retentionJournalIdentityUsesDifferentFormat(
+        event,
+        this.retentionJournalIdentityHashAlgorithm
+      ))
+        throw new RunStoreEventLogCorruptionError(record2, offset, trailing, "retention_journal");
       const scopeSnapshot = eventWorkspaceScopeSnapshot(event);
       if (scopeSnapshot !== void 0 && workspaceScopeSnapshotUsesDifferentHashPolicy(
         scopeSnapshot,
@@ -55069,6 +55113,7 @@ var RETENTION_JOURNAL_MAX_BYTES = 64 * 1024;
 var RETENTION_WORKSPACE_PATH_MAX_CHARACTERS = 16 * 1024;
 var RETENTION_WORKSPACE_BRANCH_MAX_CHARACTERS = 4 * 1024;
 var RETENTION_WORKSPACE_FILE_MAX_BYTES = 64 * 1024;
+var RETENTION_STORAGE_MANIFEST_MAX_BYTES = 64 * 1024;
 
 // packages/runtime/src/viewer.ts
 var MAX_ARTIFACT_BYTES = 1024 * 1024;
