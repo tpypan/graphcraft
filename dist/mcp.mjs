@@ -32888,7 +32888,7 @@ var BenchmarkSuiteSchema = external_exports.strictObject({
     taskIds.add(task.id);
   }
 });
-var BenchmarkScheduleEntrySchema = external_exports.strictObject({
+var BenchmarkScheduleEntryShape = {
   trialId: external_exports.string().min(1),
   order: external_exports.number().int().nonnegative(),
   taskId: external_exports.string().min(1),
@@ -32897,7 +32897,25 @@ var BenchmarkScheduleEntrySchema = external_exports.strictObject({
   mode: external_exports.enum(["baseline", "graphcraft"]),
   repetition: external_exports.number().int().positive(),
   seed: external_exports.string().min(1)
-});
+};
+var BenchmarkScheduleEntryV2Schema = external_exports.strictObject(BenchmarkScheduleEntryShape);
+var BenchmarkScheduleEntryV3Schema = external_exports.strictObject(BenchmarkScheduleEntryShape);
+var BenchmarkScheduleEntryV4Schema = external_exports.strictObject(BenchmarkScheduleEntryShape);
+var BenchmarkScheduleEntrySchema = BenchmarkScheduleEntryV3Schema;
+var BenchmarkReportIdentityPolicySchema = external_exports.discriminatedUnion("schemaVersion", [
+  external_exports.strictObject({
+    schemaVersion: external_exports.literal(2),
+    hashAlgorithm: external_exports.literal(LEGACY_CANONICAL_HASH_ALGORITHM)
+  }),
+  external_exports.strictObject({
+    schemaVersion: external_exports.literal(3),
+    hashAlgorithm: external_exports.literal(LEGACY_CANONICAL_HASH_ALGORITHM)
+  }),
+  external_exports.strictObject({
+    schemaVersion: external_exports.literal(4),
+    hashAlgorithm: external_exports.literal(PORTABLE_CANONICAL_HASH_ALGORITHM)
+  })
+]);
 var BenchmarkAssertionResultSchema = external_exports.strictObject({
   path: external_exports.string().min(1),
   passed: external_exports.boolean(),
@@ -32935,60 +32953,90 @@ var BenchmarkSourceIdentitySchema = external_exports.strictObject({
 });
 var BENCHMARK_REVIEW_PATCH_LIMIT_BYTES = 128 * 1024;
 var BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES = 64 * 1024;
-var BenchmarkReviewEvidenceSchema = external_exports.strictObject({
-  mediaType: external_exports.enum(["text/x-diff", "application/x-ndjson"]),
-  text: external_exports.string(),
-  observedBytes: external_exports.number().int().nonnegative(),
-  retainedBytes: external_exports.number().int().nonnegative(),
-  omittedBytes: external_exports.number().int().nonnegative(),
-  truncated: external_exports.boolean(),
-  digest: external_exports.string().regex(/^[0-9a-f]{64}$/)
-}).superRefine((evidence, context) => {
-  const retainedBytes = new TextEncoder().encode(evidence.text).byteLength;
-  const limit = evidence.mediaType === "text/x-diff" ? BENCHMARK_REVIEW_PATCH_LIMIT_BYTES : BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES;
-  if (retainedBytes > limit) {
-    context.addIssue({
-      code: "custom",
-      path: ["retainedBytes"],
-      message: `Benchmark review evidence exceeds its ${limit}-byte retained limit`
-    });
-  }
-  if (retainedBytes !== evidence.retainedBytes) {
-    context.addIssue({
-      code: "custom",
-      path: ["retainedBytes"],
-      message: "Benchmark review evidence retained-byte count does not match its text"
-    });
-  }
-  if (evidence.truncated !== evidence.omittedBytes > 0) {
-    context.addIssue({
-      code: "custom",
-      path: ["truncated"],
-      message: "Benchmark review evidence truncation metadata is inconsistent"
-    });
-  }
-  if (evidence.digest !== contentHash({
+function benchmarkReviewEvidenceDigest(evidence, packetSchemaVersion = 1) {
+  const identity = {
     mediaType: evidence.mediaType,
     text: evidence.text,
     observedBytes: evidence.observedBytes,
     omittedBytes: evidence.omittedBytes,
     truncated: evidence.truncated
-  })) {
-    context.addIssue({
-      code: "custom",
-      path: ["digest"],
-      message: "Benchmark review evidence digest does not match its retained content"
-    });
-  }
-});
-var BenchmarkReviewPacketSchema = external_exports.strictObject({
+  };
+  if (packetSchemaVersion === 1) return contentHash(identity, LEGACY_CANONICAL_HASH_ALGORITHM);
+  if (packetSchemaVersion === 2)
+    return contentHash(
+      {
+        namespace: "graphcraft-benchmark-review-evidence-v2",
+        schemaVersion: 2,
+        hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+        ...identity
+      },
+      PORTABLE_CANONICAL_HASH_ALGORITHM
+    );
+  throw new Error(`Unsupported benchmark review packet schema version: ${packetSchemaVersion}`);
+}
+function benchmarkReviewEvidenceSchema(packetSchemaVersion) {
+  return external_exports.strictObject({
+    mediaType: external_exports.enum(["text/x-diff", "application/x-ndjson"]),
+    text: external_exports.string(),
+    observedBytes: external_exports.number().int().nonnegative(),
+    retainedBytes: external_exports.number().int().nonnegative(),
+    omittedBytes: external_exports.number().int().nonnegative(),
+    truncated: external_exports.boolean(),
+    digest: external_exports.string().regex(/^[0-9a-f]{64}$/)
+  }).superRefine((evidence, context) => {
+    const retainedBytes = new TextEncoder().encode(evidence.text).byteLength;
+    const limit = evidence.mediaType === "text/x-diff" ? BENCHMARK_REVIEW_PATCH_LIMIT_BYTES : BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES;
+    if (retainedBytes > limit) {
+      context.addIssue({
+        code: "custom",
+        path: ["retainedBytes"],
+        message: `Benchmark review evidence exceeds its ${limit}-byte retained limit`
+      });
+    }
+    if (retainedBytes !== evidence.retainedBytes) {
+      context.addIssue({
+        code: "custom",
+        path: ["retainedBytes"],
+        message: "Benchmark review evidence retained-byte count does not match its text"
+      });
+    }
+    if (evidence.truncated !== evidence.omittedBytes > 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["truncated"],
+        message: "Benchmark review evidence truncation metadata is inconsistent"
+      });
+    }
+    if (evidence.digest !== benchmarkReviewEvidenceDigest(evidence, packetSchemaVersion)) {
+      context.addIssue({
+        code: "custom",
+        path: ["digest"],
+        message: "Benchmark review evidence digest does not match its retained content"
+      });
+    }
+  });
+}
+var BenchmarkReviewEvidenceV1Schema = benchmarkReviewEvidenceSchema(1);
+var BenchmarkReviewEvidenceV2Schema = benchmarkReviewEvidenceSchema(2);
+var BenchmarkReviewPacketV1Schema = external_exports.strictObject({
   schemaVersion: external_exports.literal(1),
-  patch: BenchmarkReviewEvidenceSchema,
-  transcript: BenchmarkReviewEvidenceSchema,
+  patch: BenchmarkReviewEvidenceV1Schema,
+  transcript: BenchmarkReviewEvidenceV1Schema,
   captureFailures: external_exports.array(external_exports.string().min(1))
 });
+var BenchmarkReviewPacketV2Schema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(2),
+  hashAlgorithm: external_exports.literal(PORTABLE_CANONICAL_HASH_ALGORITHM),
+  patch: BenchmarkReviewEvidenceV2Schema,
+  transcript: BenchmarkReviewEvidenceV2Schema,
+  captureFailures: external_exports.array(external_exports.string().min(1))
+});
+var BenchmarkReviewPacketSchema = external_exports.discriminatedUnion("schemaVersion", [
+  BenchmarkReviewPacketV1Schema,
+  BenchmarkReviewPacketV2Schema
+]);
 var BenchmarkTrialResultV2Schema = external_exports.strictObject({
-  trial: BenchmarkScheduleEntrySchema,
+  trial: BenchmarkScheduleEntryV2Schema,
   hostVersion: external_exports.string().min(1),
   modelPolicy: external_exports.string().min(1),
   effortPolicy: BenchmarkEffortPolicySchema,
@@ -33007,7 +33055,7 @@ var BenchmarkTrialResultV2Schema = external_exports.strictObject({
   durationMs: external_exports.number().int().nonnegative(),
   humanInterventions: external_exports.number().int().nonnegative(),
   failureTrace: external_exports.array(external_exports.string()),
-  reviewPacket: BenchmarkReviewPacketSchema.optional()
+  reviewPacket: BenchmarkReviewPacketV1Schema.optional()
 }).superRefine((result, context) => {
   if (result.accepted && (result.reviewPacket?.captureFailures.length ?? 0) > 0) {
     context.addIssue({
@@ -33031,122 +33079,132 @@ var BenchmarkTrialResultV2Schema = external_exports.strictObject({
     });
   }
 });
-var BenchmarkTrialResultV3Schema = external_exports.strictObject({
-  trial: BenchmarkScheduleEntrySchema,
-  hostVersion: external_exports.string().min(1),
-  modelPolicy: external_exports.string().min(1),
-  effortPolicy: BenchmarkEffortPolicySchema,
-  permissionPolicy: BenchmarkPermissionPolicySchema,
-  acceptanceScorerDigest: external_exports.string().min(1),
-  observedScorerDigest: external_exports.string().min(1),
-  scorerVerified: external_exports.boolean(),
-  repositoryDigest: external_exports.string().min(1),
-  baseSha: external_exports.string().min(1),
-  executionStatus: external_exports.enum([
-    "completed",
-    "blocked",
-    "failed",
-    "error",
-    "interrupted",
-    "timed_out"
-  ]),
-  attemptCheckpoint: external_exports.enum(["provisional", "settled"]),
-  interruption: external_exports.strictObject({
-    cause: external_exports.enum(["cancellation", "runtime_shutdown", "timeout"]),
-    reason: external_exports.string().min(1),
-    childSettlement: external_exports.enum(["confirmed", "unconfirmed"])
-  }).optional(),
-  recovery: external_exports.strictObject({
-    disposition: external_exports.literal("preserved"),
-    fixtureRepository: external_exports.string().min(1),
-    lastKnownRepository: external_exports.string().min(1),
-    requiredAction: external_exports.literal("reconcile_child_before_cleanup_or_resume")
-  }).optional(),
-  accepted: external_exports.boolean(),
-  acceptance: external_exports.array(BenchmarkAssertionResultSchema),
-  usage: TokenUsageSchema,
-  usageReconciled: external_exports.boolean(),
-  limitations: external_exports.array(external_exports.string()),
-  durationMs: external_exports.number().int().nonnegative(),
-  humanInterventions: external_exports.number().int().nonnegative(),
-  failureTrace: external_exports.array(external_exports.string()),
-  reviewPacket: BenchmarkReviewPacketSchema.optional()
-}).superRefine((result, context) => {
-  const interrupted = ["interrupted", "timed_out"].includes(result.executionStatus);
-  if (interrupted !== (result.interruption !== void 0)) {
-    context.addIssue({
-      code: "custom",
-      path: ["interruption"],
-      message: "Interrupted benchmark results must retain their interruption evidence"
-    });
-  }
-  if (result.executionStatus === "timed_out" && result.interruption?.cause !== "timeout") {
-    context.addIssue({
-      code: "custom",
-      path: ["interruption", "cause"],
-      message: "Timed-out benchmark results must retain a timeout cause"
-    });
-  }
-  if (result.executionStatus === "interrupted" && result.interruption?.cause === "timeout") {
-    context.addIssue({
-      code: "custom",
-      path: ["interruption", "cause"],
-      message: "Timeout interruptions must use the timed_out execution status"
-    });
-  }
-  if (result.attemptCheckpoint === "provisional" && result.accepted) {
-    context.addIssue({
-      code: "custom",
-      path: ["accepted"],
-      message: "A provisional benchmark attempt cannot be accepted"
-    });
-  }
-  if (result.attemptCheckpoint === "provisional" && result.interruption?.childSettlement !== "unconfirmed") {
-    context.addIssue({
-      code: "custom",
-      path: ["interruption"],
-      message: "A provisional benchmark attempt must retain unconfirmed settlement evidence"
-    });
-  }
-  const unconfirmed = result.interruption?.childSettlement === "unconfirmed";
-  if (unconfirmed !== (result.recovery !== void 0)) {
-    context.addIssue({
-      code: "custom",
-      path: ["recovery"],
-      message: "Unconfirmed benchmark calls must retain the preserved workspace recovery receipt"
-    });
-  }
-  if (unconfirmed && result.accepted) {
-    context.addIssue({
-      code: "custom",
-      path: ["accepted"],
-      message: "A benchmark attempt with unconfirmed child settlement cannot be accepted"
-    });
-  }
-  if (result.accepted && (result.reviewPacket?.captureFailures.length ?? 0) > 0) {
-    context.addIssue({
-      code: "custom",
-      path: ["accepted"],
-      message: "A trial with review-packet capture failures cannot be accepted as review-complete"
-    });
-  }
-  if (result.accepted && result.reviewPacket?.patch.truncated) {
-    context.addIssue({
-      code: "custom",
-      path: ["accepted"],
-      message: "A trial with truncated patch evidence cannot be accepted as review-complete"
-    });
-  }
-  if (result.accepted && result.reviewPacket?.transcript.truncated) {
-    context.addIssue({
-      code: "custom",
-      path: ["accepted"],
-      message: "A trial with truncated transcript evidence cannot be accepted as review-complete"
-    });
-  }
-});
-var BenchmarkTrialResultSchema = BenchmarkTrialResultV3Schema;
-var BenchmarkAnyTrialResultSchema = external_exports.union([
+function benchmarkSettledTrialResultSchema(trial, reviewPacket) {
+  return external_exports.strictObject({
+    trial,
+    hostVersion: external_exports.string().min(1),
+    modelPolicy: external_exports.string().min(1),
+    effortPolicy: BenchmarkEffortPolicySchema,
+    permissionPolicy: BenchmarkPermissionPolicySchema,
+    acceptanceScorerDigest: external_exports.string().min(1),
+    observedScorerDigest: external_exports.string().min(1),
+    scorerVerified: external_exports.boolean(),
+    repositoryDigest: external_exports.string().min(1),
+    baseSha: external_exports.string().min(1),
+    executionStatus: external_exports.enum([
+      "completed",
+      "blocked",
+      "failed",
+      "error",
+      "interrupted",
+      "timed_out"
+    ]),
+    attemptCheckpoint: external_exports.enum(["provisional", "settled"]),
+    interruption: external_exports.strictObject({
+      cause: external_exports.enum(["cancellation", "runtime_shutdown", "timeout"]),
+      reason: external_exports.string().min(1),
+      childSettlement: external_exports.enum(["confirmed", "unconfirmed"])
+    }).optional(),
+    recovery: external_exports.strictObject({
+      disposition: external_exports.literal("preserved"),
+      fixtureRepository: external_exports.string().min(1),
+      lastKnownRepository: external_exports.string().min(1),
+      requiredAction: external_exports.literal("reconcile_child_before_cleanup_or_resume")
+    }).optional(),
+    accepted: external_exports.boolean(),
+    acceptance: external_exports.array(BenchmarkAssertionResultSchema),
+    usage: TokenUsageSchema,
+    usageReconciled: external_exports.boolean(),
+    limitations: external_exports.array(external_exports.string()),
+    durationMs: external_exports.number().int().nonnegative(),
+    humanInterventions: external_exports.number().int().nonnegative(),
+    failureTrace: external_exports.array(external_exports.string()),
+    reviewPacket
+  }).superRefine((result, context) => {
+    const reviewPacket2 = result.reviewPacket;
+    const interrupted = ["interrupted", "timed_out"].includes(result.executionStatus);
+    if (interrupted !== (result.interruption !== void 0)) {
+      context.addIssue({
+        code: "custom",
+        path: ["interruption"],
+        message: "Interrupted benchmark results must retain their interruption evidence"
+      });
+    }
+    if (result.executionStatus === "timed_out" && result.interruption?.cause !== "timeout") {
+      context.addIssue({
+        code: "custom",
+        path: ["interruption", "cause"],
+        message: "Timed-out benchmark results must retain a timeout cause"
+      });
+    }
+    if (result.executionStatus === "interrupted" && result.interruption?.cause === "timeout") {
+      context.addIssue({
+        code: "custom",
+        path: ["interruption", "cause"],
+        message: "Timeout interruptions must use the timed_out execution status"
+      });
+    }
+    if (result.attemptCheckpoint === "provisional" && result.accepted) {
+      context.addIssue({
+        code: "custom",
+        path: ["accepted"],
+        message: "A provisional benchmark attempt cannot be accepted"
+      });
+    }
+    if (result.attemptCheckpoint === "provisional" && result.interruption?.childSettlement !== "unconfirmed") {
+      context.addIssue({
+        code: "custom",
+        path: ["interruption"],
+        message: "A provisional benchmark attempt must retain unconfirmed settlement evidence"
+      });
+    }
+    const unconfirmed = result.interruption?.childSettlement === "unconfirmed";
+    if (unconfirmed !== (result.recovery !== void 0)) {
+      context.addIssue({
+        code: "custom",
+        path: ["recovery"],
+        message: "Unconfirmed benchmark calls must retain the preserved workspace recovery receipt"
+      });
+    }
+    if (unconfirmed && result.accepted) {
+      context.addIssue({
+        code: "custom",
+        path: ["accepted"],
+        message: "A benchmark attempt with unconfirmed child settlement cannot be accepted"
+      });
+    }
+    if (result.accepted && (reviewPacket2?.captureFailures.length ?? 0) > 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["accepted"],
+        message: "A trial with review-packet capture failures cannot be accepted as review-complete"
+      });
+    }
+    if (result.accepted && reviewPacket2?.patch.truncated) {
+      context.addIssue({
+        code: "custom",
+        path: ["accepted"],
+        message: "A trial with truncated patch evidence cannot be accepted as review-complete"
+      });
+    }
+    if (result.accepted && reviewPacket2?.transcript.truncated) {
+      context.addIssue({
+        code: "custom",
+        path: ["accepted"],
+        message: "A trial with truncated transcript evidence cannot be accepted as review-complete"
+      });
+    }
+  });
+}
+var BenchmarkTrialResultV3Schema = benchmarkSettledTrialResultSchema(
+  BenchmarkScheduleEntryV3Schema,
+  BenchmarkReviewPacketV1Schema.optional()
+);
+var BenchmarkTrialResultV4Schema = benchmarkSettledTrialResultSchema(
+  BenchmarkScheduleEntryV4Schema,
+  BenchmarkReviewPacketV2Schema
+);
+var BenchmarkLegacyTrialResultSchema = external_exports.union([
   BenchmarkTrialResultV2Schema,
   BenchmarkTrialResultV3Schema
 ]);
@@ -33161,6 +33219,131 @@ var BenchmarkHostPreflightCheckpointSchema = external_exports.strictObject({
   }),
   requiredAction: external_exports.literal("reconcile_host_child_before_resume")
 });
+function benchmarkTrialId(suite, seed, trial, identity) {
+  const value = {
+    suite: suite.id,
+    version: suite.version,
+    seed,
+    taskId: trial.taskId,
+    family: trial.family,
+    host: trial.host,
+    mode: trial.mode,
+    repetition: trial.repetition
+  };
+  if (identity.schemaVersion !== 4) return contentHash(value, LEGACY_CANONICAL_HASH_ALGORITHM);
+  return contentHash(
+    {
+      namespace: "graphcraft-benchmark-trial-id-v4",
+      reportSchemaVersion: identity.schemaVersion,
+      hashAlgorithm: identity.hashAlgorithm,
+      ...value
+    },
+    identity.hashAlgorithm
+  );
+}
+function benchmarkSettledReportSchema(schema, identity) {
+  return schema.superRefine((value, context) => {
+    const report = value;
+    const evidenceBacked = identity.schemaVersion === 4 || report.reviewPolicy !== void 0;
+    if (identity.schemaVersion === 3 && evidenceBacked && report.environment.graphcraftSource === void 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["environment", "graphcraftSource"],
+        message: "Evidence-backed benchmark reports must bind an exact Graphcraft source identity"
+      });
+    }
+    if (evidenceBacked && report.environment.graphcraftSource?.dirty) {
+      context.addIssue({
+        code: "custom",
+        path: ["environment", "graphcraftSource", "dirty"],
+        message: "Evidence-backed benchmark reports require a clean Graphcraft source tree"
+      });
+    }
+    const scheduleByTrialId = /* @__PURE__ */ new Map();
+    for (const [index, trial] of report.schedule.entries()) {
+      if (identity.schemaVersion === 4 && (trial.seed !== report.seed || trial.trialId !== benchmarkTrialId(report.suite, report.seed, trial, identity))) {
+        context.addIssue({
+          code: "custom",
+          path: ["schedule", index, "trialId"],
+          message: "Benchmark trial ID does not match the declared report identity"
+        });
+      }
+      if (scheduleByTrialId.has(trial.trialId)) {
+        context.addIssue({
+          code: "custom",
+          path: ["schedule", index, "trialId"],
+          message: "Benchmark schedule trial IDs must be unique"
+        });
+      }
+      scheduleByTrialId.set(trial.trialId, trial);
+    }
+    const resultTrialIds = /* @__PURE__ */ new Set();
+    for (const [index, result] of report.results.entries()) {
+      const { trial } = result;
+      if (resultTrialIds.has(trial.trialId)) {
+        context.addIssue({
+          code: "custom",
+          path: ["results", index, "trial", "trialId"],
+          message: "Benchmark result trial IDs must be unique"
+        });
+      }
+      resultTrialIds.add(trial.trialId);
+      const scheduled = scheduleByTrialId.get(trial.trialId);
+      if (scheduled === void 0 || contentHash(scheduled, identity.hashAlgorithm) !== contentHash(trial, identity.hashAlgorithm)) {
+        context.addIssue({
+          code: "custom",
+          path: ["results", index, "trial"],
+          message: "Benchmark result trials must exactly match a scheduled trial"
+        });
+      }
+      if (identity.schemaVersion === 3 && report.reviewPolicy !== void 0 && result.reviewPacket === void 0) {
+        context.addIssue({
+          code: "custom",
+          path: ["results", index, "reviewPacket"],
+          message: "Every evidence-backed benchmark result must retain a review packet"
+        });
+      }
+    }
+    if (report.status === "complete" && (report.results.length !== report.schedule.length || resultTrialIds.size !== scheduleByTrialId.size || [...scheduleByTrialId].some(([trialId]) => !resultTrialIds.has(trialId)))) {
+      context.addIssue({
+        code: "custom",
+        path: ["status"],
+        message: "The complete benchmark report does not cover the exact current schedule"
+      });
+    }
+    if (report.status === "complete" && report.results.some((result) => result.attemptCheckpoint === "provisional")) {
+      context.addIssue({
+        code: "custom",
+        path: ["status"],
+        message: "A complete benchmark report cannot retain an in-flight provisional attempt"
+      });
+    }
+    if (report.status === "complete" && report.results.some((result) => result.interruption?.childSettlement === "unconfirmed")) {
+      context.addIssue({
+        code: "custom",
+        path: ["status"],
+        message: "A complete benchmark report cannot retain unconfirmed child settlement"
+      });
+    }
+    if (report.status === "complete" && report.hostPreflightCheckpoint !== void 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["status"],
+        message: "A complete benchmark report cannot retain an unfinished host preflight"
+      });
+    }
+    if (contentHash(report.summary, identity.hashAlgorithm) !== contentHash(
+      summarizeBenchmark(report.results, report.schedule, identity),
+      identity.hashAlgorithm
+    )) {
+      context.addIssue({
+        code: "custom",
+        path: ["summary"],
+        message: "The benchmark report summary does not match its trial evidence"
+      });
+    }
+  });
+}
 var BenchmarkReportV2Schema = external_exports.strictObject({
   schemaVersion: external_exports.literal(2),
   status: external_exports.enum(["running", "complete"]),
@@ -33186,7 +33369,7 @@ var BenchmarkReportV2Schema = external_exports.strictObject({
     graphcraftSource: BenchmarkSourceIdentitySchema.optional()
   }),
   limitations: external_exports.array(external_exports.string()),
-  schedule: external_exports.array(BenchmarkScheduleEntrySchema).min(1),
+  schedule: external_exports.array(BenchmarkScheduleEntryV2Schema).min(1),
   results: external_exports.array(BenchmarkTrialResultV2Schema),
   summary: external_exports.record(external_exports.string(), external_exports.unknown())
 }).superRefine((report, context) => {
@@ -33227,7 +33410,7 @@ var BenchmarkReportV2Schema = external_exports.strictObject({
     }
     resultTrialIds.add(trial.trialId);
     const scheduled = scheduleByTrialId.get(trial.trialId);
-    if (scheduled === void 0 || contentHash(scheduled) !== contentHash(trial)) {
+    if (scheduled === void 0 || contentHash(scheduled, LEGACY_CANONICAL_HASH_ALGORITHM) !== contentHash(trial, LEGACY_CANONICAL_HASH_ALGORITHM)) {
       context.addIssue({
         code: "custom",
         path: ["results", index, "trial"],
@@ -33249,7 +33432,13 @@ var BenchmarkReportV2Schema = external_exports.strictObject({
       message: "The complete benchmark report does not cover the exact current schedule"
     });
   }
-  if (contentHash(report.summary) !== contentHash(summarizeBenchmark(report.results, report.schedule))) {
+  if (contentHash(report.summary, LEGACY_CANONICAL_HASH_ALGORITHM) !== contentHash(
+    summarizeBenchmark(report.results, report.schedule, {
+      schemaVersion: 2,
+      hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM
+    }),
+    LEGACY_CANONICAL_HASH_ALGORITHM
+  )) {
     context.addIssue({
       code: "custom",
       path: ["summary"],
@@ -33257,128 +33446,79 @@ var BenchmarkReportV2Schema = external_exports.strictObject({
     });
   }
 });
-var BenchmarkReportV3Schema = external_exports.strictObject({
-  schemaVersion: external_exports.literal(3),
-  status: external_exports.enum(["running", "complete"]),
-  suite: external_exports.strictObject({
-    id: external_exports.string().min(1),
-    version: external_exports.number().int().positive(),
-    digest: external_exports.string().min(1)
+var BenchmarkReportV3Schema = benchmarkSettledReportSchema(
+  external_exports.strictObject({
+    schemaVersion: external_exports.literal(3),
+    status: external_exports.enum(["running", "complete"]),
+    suite: external_exports.strictObject({
+      id: external_exports.string().min(1),
+      version: external_exports.number().int().positive(),
+      digest: external_exports.string().min(1)
+    }),
+    startedAt: external_exports.iso.datetime(),
+    updatedAt: external_exports.iso.datetime(),
+    seed: external_exports.string().min(1),
+    randomized: external_exports.literal(true),
+    modelPolicy: BenchmarkModelPolicySchema,
+    effortPolicy: BenchmarkEffortPolicySchema,
+    permissionPolicy: BenchmarkPermissionPoliciesSchema,
+    scorerPolicy: external_exports.literal("fixture_bound_scorers_plus_suite_assertions"),
+    reviewPolicy: external_exports.literal("bounded_redacted_patch_and_transcript_v1").optional(),
+    modelCallTimeoutMs: external_exports.number().int().positive().max(MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS),
+    hostPreflightCheckpoint: BenchmarkHostPreflightCheckpointSchema.optional(),
+    environment: external_exports.strictObject({
+      platform: external_exports.string().min(1),
+      architecture: external_exports.string().min(1),
+      nodeVersion: external_exports.string().min(1),
+      graphcraftVersion: external_exports.string().trim().min(1),
+      graphcraftSource: BenchmarkSourceIdentitySchema.optional()
+    }),
+    limitations: external_exports.array(external_exports.string()),
+    schedule: external_exports.array(BenchmarkScheduleEntryV3Schema).min(1),
+    results: external_exports.array(BenchmarkTrialResultV3Schema),
+    summary: external_exports.record(external_exports.string(), external_exports.unknown())
   }),
-  startedAt: external_exports.iso.datetime(),
-  updatedAt: external_exports.iso.datetime(),
-  seed: external_exports.string().min(1),
-  randomized: external_exports.literal(true),
-  modelPolicy: BenchmarkModelPolicySchema,
-  effortPolicy: BenchmarkEffortPolicySchema,
-  permissionPolicy: BenchmarkPermissionPoliciesSchema,
-  scorerPolicy: external_exports.literal("fixture_bound_scorers_plus_suite_assertions"),
-  reviewPolicy: external_exports.literal("bounded_redacted_patch_and_transcript_v1").optional(),
-  modelCallTimeoutMs: external_exports.number().int().positive().max(MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS),
-  hostPreflightCheckpoint: BenchmarkHostPreflightCheckpointSchema.optional(),
-  environment: external_exports.strictObject({
-    platform: external_exports.string().min(1),
-    architecture: external_exports.string().min(1),
-    nodeVersion: external_exports.string().min(1),
-    graphcraftVersion: external_exports.string().trim().min(1),
-    graphcraftSource: BenchmarkSourceIdentitySchema.optional()
+  { schemaVersion: 3, hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM }
+);
+var BenchmarkReportV4Schema = benchmarkSettledReportSchema(
+  external_exports.strictObject({
+    schemaVersion: external_exports.literal(4),
+    hashAlgorithm: external_exports.literal(PORTABLE_CANONICAL_HASH_ALGORITHM),
+    status: external_exports.enum(["running", "complete"]),
+    suite: external_exports.strictObject({
+      id: external_exports.string().min(1),
+      version: external_exports.number().int().positive(),
+      digest: external_exports.string().min(1)
+    }),
+    startedAt: external_exports.iso.datetime(),
+    updatedAt: external_exports.iso.datetime(),
+    seed: external_exports.string().min(1),
+    randomized: external_exports.literal(true),
+    modelPolicy: BenchmarkModelPolicySchema,
+    effortPolicy: BenchmarkEffortPolicySchema,
+    permissionPolicy: BenchmarkPermissionPoliciesSchema,
+    scorerPolicy: external_exports.literal("fixture_bound_scorers_plus_suite_assertions"),
+    reviewPolicy: external_exports.literal("bounded_redacted_patch_and_transcript_v2"),
+    modelCallTimeoutMs: external_exports.number().int().positive().max(MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS),
+    hostPreflightCheckpoint: BenchmarkHostPreflightCheckpointSchema.optional(),
+    environment: external_exports.strictObject({
+      platform: external_exports.string().min(1),
+      architecture: external_exports.string().min(1),
+      nodeVersion: external_exports.string().min(1),
+      graphcraftVersion: external_exports.string().trim().min(1),
+      graphcraftSource: BenchmarkSourceIdentitySchema
+    }),
+    limitations: external_exports.array(external_exports.string()),
+    schedule: external_exports.array(BenchmarkScheduleEntryV4Schema).min(1),
+    results: external_exports.array(BenchmarkTrialResultV4Schema),
+    summary: external_exports.record(external_exports.string(), external_exports.unknown())
   }),
-  limitations: external_exports.array(external_exports.string()),
-  schedule: external_exports.array(BenchmarkScheduleEntrySchema).min(1),
-  results: external_exports.array(BenchmarkTrialResultSchema),
-  summary: external_exports.record(external_exports.string(), external_exports.unknown())
-}).superRefine((report, context) => {
-  if (report.reviewPolicy !== void 0 && report.environment.graphcraftSource === void 0) {
-    context.addIssue({
-      code: "custom",
-      path: ["environment", "graphcraftSource"],
-      message: "Evidence-backed benchmark reports must bind an exact Graphcraft source identity"
-    });
-  }
-  if (report.reviewPolicy !== void 0 && report.environment.graphcraftSource?.dirty) {
-    context.addIssue({
-      code: "custom",
-      path: ["environment", "graphcraftSource", "dirty"],
-      message: "Evidence-backed benchmark reports require a clean Graphcraft source tree"
-    });
-  }
-  const scheduleByTrialId = /* @__PURE__ */ new Map();
-  for (const [index, trial] of report.schedule.entries()) {
-    if (scheduleByTrialId.has(trial.trialId)) {
-      context.addIssue({
-        code: "custom",
-        path: ["schedule", index, "trialId"],
-        message: "Benchmark schedule trial IDs must be unique"
-      });
-    }
-    scheduleByTrialId.set(trial.trialId, trial);
-  }
-  const resultTrialIds = /* @__PURE__ */ new Set();
-  for (const [index, result] of report.results.entries()) {
-    const { trial } = result;
-    if (resultTrialIds.has(trial.trialId)) {
-      context.addIssue({
-        code: "custom",
-        path: ["results", index, "trial", "trialId"],
-        message: "Benchmark result trial IDs must be unique"
-      });
-    }
-    resultTrialIds.add(trial.trialId);
-    const scheduled = scheduleByTrialId.get(trial.trialId);
-    if (scheduled === void 0 || contentHash(scheduled) !== contentHash(trial)) {
-      context.addIssue({
-        code: "custom",
-        path: ["results", index, "trial"],
-        message: "Benchmark result trials must exactly match a scheduled trial"
-      });
-    }
-    if (report.reviewPolicy !== void 0 && result.reviewPacket === void 0) {
-      context.addIssue({
-        code: "custom",
-        path: ["results", index, "reviewPacket"],
-        message: "Every evidence-backed benchmark result must retain a review packet"
-      });
-    }
-  }
-  if (report.status === "complete" && (report.results.length !== report.schedule.length || resultTrialIds.size !== scheduleByTrialId.size || [...scheduleByTrialId].some(([trialId]) => !resultTrialIds.has(trialId)))) {
-    context.addIssue({
-      code: "custom",
-      path: ["status"],
-      message: "The complete benchmark report does not cover the exact current schedule"
-    });
-  }
-  if (report.status === "complete" && report.results.some((result) => result.attemptCheckpoint === "provisional")) {
-    context.addIssue({
-      code: "custom",
-      path: ["status"],
-      message: "A complete benchmark report cannot retain an in-flight provisional attempt"
-    });
-  }
-  if (report.status === "complete" && report.results.some((result) => result.interruption?.childSettlement === "unconfirmed")) {
-    context.addIssue({
-      code: "custom",
-      path: ["status"],
-      message: "A complete benchmark report cannot retain unconfirmed child settlement"
-    });
-  }
-  if (report.status === "complete" && report.hostPreflightCheckpoint !== void 0) {
-    context.addIssue({
-      code: "custom",
-      path: ["status"],
-      message: "A complete benchmark report cannot retain an unfinished host preflight"
-    });
-  }
-  if (contentHash(report.summary) !== contentHash(summarizeBenchmark(report.results, report.schedule))) {
-    context.addIssue({
-      code: "custom",
-      path: ["summary"],
-      message: "The benchmark report summary does not match its trial evidence"
-    });
-  }
-});
+  { schemaVersion: 4, hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM }
+);
 var BenchmarkReportSchema = external_exports.discriminatedUnion("schemaVersion", [
   BenchmarkReportV2Schema,
-  BenchmarkReportV3Schema
+  BenchmarkReportV3Schema,
+  BenchmarkReportV4Schema
 ]);
 function median(values) {
   if (values.length === 0) return null;
@@ -33466,9 +33606,12 @@ function matchedTrialControls(results) {
     return first.repositoryDigest === second.repositoryDigest && first.baseSha === second.baseSha && first.hostVersion === second.hostVersion && first.modelPolicy === second.modelPolicy && first.effortPolicy === second.effortPolicy && first.permissionPolicy === second.permissionPolicy && first.acceptanceScorerDigest === second.acceptanceScorerDigest && first.observedScorerDigest === second.observedScorerDigest && first.scorerVerified === second.scorerVerified;
   });
 }
-function summarizeBenchmark(results, schedule = results.map(({ trial }) => trial)) {
-  const parsed = results.map((result) => BenchmarkAnyTrialResultSchema.parse(result));
-  const parsedSchedule = schedule.map((entry) => BenchmarkScheduleEntrySchema.parse(entry));
+function summarizeBenchmark(results, schedule = results.map(({ trial }) => trial), inputIdentity) {
+  const identity = inputIdentity === void 0 ? void 0 : BenchmarkReportIdentityPolicySchema.parse(inputIdentity);
+  const parsed = identity === void 0 ? results.map((result) => BenchmarkLegacyTrialResultSchema.parse(result)) : identity.schemaVersion === 2 ? results.map((result) => BenchmarkTrialResultV2Schema.parse(result)) : identity.schemaVersion === 3 ? results.map((result) => BenchmarkTrialResultV3Schema.parse(result)) : results.map((result) => BenchmarkTrialResultV4Schema.parse(result));
+  const parsedSchedule = schedule.map(
+    (entry) => identity === void 0 ? BenchmarkScheduleEntrySchema.parse(entry) : identity.schemaVersion === 2 ? BenchmarkScheduleEntryV2Schema.parse(entry) : identity.schemaVersion === 3 ? BenchmarkScheduleEntryV3Schema.parse(entry) : BenchmarkScheduleEntryV4Schema.parse(entry)
+  );
   return Object.fromEntries(
     ["codex", "claude"].map((host) => {
       const selected = parsed.filter((result) => result.trial.host === host);
@@ -33521,6 +33664,7 @@ var BENCHMARK_DEFECT_SEVERITIES = ["minor", "major", "critical"];
 var BenchmarkDefectCategorySchema = external_exports.enum(BENCHMARK_DEFECT_CATEGORIES);
 var BenchmarkDefectSeveritySchema = external_exports.enum(BENCHMARK_DEFECT_SEVERITIES);
 var BenchmarkReviewOpaqueIdSchema = external_exports.string().regex(/^packet-[0-9a-f]{32}$/);
+var BenchmarkReviewOpaqueIdV2Schema = external_exports.string().regex(/^packet-[0-9a-f]{32}$/);
 var BenchmarkBlindedInterruptionSchema = external_exports.strictObject({
   cause: external_exports.enum(["cancellation", "runtime_shutdown", "timeout"]),
   reason: external_exports.string().min(1),
@@ -33551,11 +33695,29 @@ var BenchmarkBlindedReviewPacketSchema = external_exports.strictObject({
     limitations: external_exports.array(external_exports.string()),
     failureTrace: external_exports.array(external_exports.string())
   }),
-  reviewPacket: BenchmarkReviewPacketSchema
+  reviewPacket: BenchmarkReviewPacketV1Schema
+});
+var BenchmarkBlindedReviewPacketV2Schema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(2),
+  hashAlgorithm: external_exports.literal(PORTABLE_CANONICAL_HASH_ALGORITHM),
+  opaqueId: BenchmarkReviewOpaqueIdV2Schema,
+  task: BenchmarkBlindedReviewPacketSchema.shape.task,
+  outcome: BenchmarkBlindedReviewPacketSchema.shape.outcome,
+  reviewPacket: BenchmarkReviewPacketV2Schema
 });
 function exactOrderedValues(expected) {
   return external_exports.array(external_exports.string()).superRefine((values, context) => {
     if (contentHash(values) !== contentHash(expected)) {
+      context.addIssue({
+        code: "custom",
+        message: `Expected the exact ordered values: ${expected.join(", ")}`
+      });
+    }
+  });
+}
+function exactPortableOrderedValues(expected) {
+  return external_exports.array(external_exports.string()).superRefine((values, context) => {
+    if (contentHash(values, PORTABLE_CANONICAL_HASH_ALGORITHM) !== contentHash(expected, PORTABLE_CANONICAL_HASH_ALGORITHM)) {
       context.addIssue({
         code: "custom",
         message: `Expected the exact ordered values: ${expected.join(", ")}`
@@ -33579,6 +33741,40 @@ var BenchmarkBlindedReviewExportSchema = external_exports.strictObject({
     severities: exactOrderedValues(BENCHMARK_DEFECT_SEVERITIES)
   }),
   packets: external_exports.array(BenchmarkBlindedReviewPacketSchema).min(1)
+}).superRefine((artifact, context) => {
+  const ids = artifact.packets.map(({ opaqueId }) => opaqueId);
+  if (new Set(ids).size !== ids.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["packets"],
+      message: "Blinded benchmark packet IDs must be unique"
+    });
+  }
+  if (ids.some((id, index) => index > 0 && id < ids[index - 1])) {
+    context.addIssue({
+      code: "custom",
+      path: ["packets"],
+      message: "Blinded benchmark packets must be sorted by opaque ID"
+    });
+  }
+});
+var BenchmarkBlindedReviewExportV2Schema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(2),
+  hashAlgorithm: external_exports.literal(PORTABLE_CANONICAL_HASH_ALGORITHM),
+  reviewPolicy: external_exports.literal("opaque_blinded_review_v2"),
+  rawReportSha256: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  blindingKeyDigest: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  suite: external_exports.strictObject({
+    id: external_exports.string().min(1),
+    version: external_exports.number().int().positive(),
+    digest: external_exports.string().min(1)
+  }),
+  taxonomy: external_exports.strictObject({
+    version: external_exports.literal(1),
+    categories: exactPortableOrderedValues(BENCHMARK_DEFECT_CATEGORIES),
+    severities: exactPortableOrderedValues(BENCHMARK_DEFECT_SEVERITIES)
+  }),
+  packets: external_exports.array(BenchmarkBlindedReviewPacketV2Schema).min(1)
 }).superRefine((artifact, context) => {
   const ids = artifact.packets.map(({ opaqueId }) => opaqueId);
   if (new Set(ids).size !== ids.length) {
@@ -33634,6 +33830,7 @@ var BenchmarkTrialReviewLabelSchema = external_exports.strictObject({
     });
   }
 });
+var BenchmarkTrialReviewLabelV2Schema = BenchmarkTrialReviewLabelSchema;
 var BenchmarkReviewLabelsSchema = external_exports.strictObject({
   schemaVersion: external_exports.literal(1),
   reviewPolicy: external_exports.literal("opaque_blinded_review_v1"),
@@ -33642,6 +33839,25 @@ var BenchmarkReviewLabelsSchema = external_exports.strictObject({
   blindingKeyDigest: external_exports.string().regex(/^[0-9a-f]{64}$/),
   blindedReviewDigest: external_exports.string().regex(/^[0-9a-f]{64}$/),
   labels: external_exports.array(BenchmarkTrialReviewLabelSchema).min(1)
+}).superRefine((artifact, context) => {
+  const ids = artifact.labels.map(({ opaqueId }) => opaqueId);
+  if (new Set(ids).size !== ids.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["labels"],
+      message: "A benchmark review artifact must contain one label per opaque ID"
+    });
+  }
+});
+var BenchmarkReviewLabelsV2Schema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(2),
+  hashAlgorithm: external_exports.literal(PORTABLE_CANONICAL_HASH_ALGORITHM),
+  reviewPolicy: external_exports.literal("opaque_blinded_review_v2"),
+  taxonomyVersion: external_exports.literal(1),
+  rawReportSha256: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  blindingKeyDigest: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  blindedReviewDigest: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  labels: external_exports.array(BenchmarkTrialReviewLabelV2Schema).min(1)
 }).superRefine((artifact, context) => {
   const ids = artifact.labels.map(({ opaqueId }) => opaqueId);
   if (new Set(ids).size !== ids.length) {

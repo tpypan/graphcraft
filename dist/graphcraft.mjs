@@ -20058,7 +20058,7 @@ var BenchmarkSuiteSchema = external_exports.strictObject({
     taskIds.add(task.id);
   }
 });
-var BenchmarkScheduleEntrySchema = external_exports.strictObject({
+var BenchmarkScheduleEntryShape = {
   trialId: external_exports.string().min(1),
   order: external_exports.number().int().nonnegative(),
   taskId: external_exports.string().min(1),
@@ -20067,7 +20067,25 @@ var BenchmarkScheduleEntrySchema = external_exports.strictObject({
   mode: external_exports.enum(["baseline", "graphcraft"]),
   repetition: external_exports.number().int().positive(),
   seed: external_exports.string().min(1)
-});
+};
+var BenchmarkScheduleEntryV2Schema = external_exports.strictObject(BenchmarkScheduleEntryShape);
+var BenchmarkScheduleEntryV3Schema = external_exports.strictObject(BenchmarkScheduleEntryShape);
+var BenchmarkScheduleEntryV4Schema = external_exports.strictObject(BenchmarkScheduleEntryShape);
+var BenchmarkScheduleEntrySchema = BenchmarkScheduleEntryV3Schema;
+var BenchmarkReportIdentityPolicySchema = external_exports.discriminatedUnion("schemaVersion", [
+  external_exports.strictObject({
+    schemaVersion: external_exports.literal(2),
+    hashAlgorithm: external_exports.literal(LEGACY_CANONICAL_HASH_ALGORITHM)
+  }),
+  external_exports.strictObject({
+    schemaVersion: external_exports.literal(3),
+    hashAlgorithm: external_exports.literal(LEGACY_CANONICAL_HASH_ALGORITHM)
+  }),
+  external_exports.strictObject({
+    schemaVersion: external_exports.literal(4),
+    hashAlgorithm: external_exports.literal(PORTABLE_CANONICAL_HASH_ALGORITHM)
+  })
+]);
 var BenchmarkAssertionResultSchema = external_exports.strictObject({
   path: external_exports.string().min(1),
   passed: external_exports.boolean(),
@@ -20105,60 +20123,90 @@ var BenchmarkSourceIdentitySchema = external_exports.strictObject({
 });
 var BENCHMARK_REVIEW_PATCH_LIMIT_BYTES = 128 * 1024;
 var BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES = 64 * 1024;
-var BenchmarkReviewEvidenceSchema = external_exports.strictObject({
-  mediaType: external_exports.enum(["text/x-diff", "application/x-ndjson"]),
-  text: external_exports.string(),
-  observedBytes: external_exports.number().int().nonnegative(),
-  retainedBytes: external_exports.number().int().nonnegative(),
-  omittedBytes: external_exports.number().int().nonnegative(),
-  truncated: external_exports.boolean(),
-  digest: external_exports.string().regex(/^[0-9a-f]{64}$/)
-}).superRefine((evidence, context) => {
-  const retainedBytes = new TextEncoder().encode(evidence.text).byteLength;
-  const limit = evidence.mediaType === "text/x-diff" ? BENCHMARK_REVIEW_PATCH_LIMIT_BYTES : BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES;
-  if (retainedBytes > limit) {
-    context.addIssue({
-      code: "custom",
-      path: ["retainedBytes"],
-      message: `Benchmark review evidence exceeds its ${limit}-byte retained limit`
-    });
-  }
-  if (retainedBytes !== evidence.retainedBytes) {
-    context.addIssue({
-      code: "custom",
-      path: ["retainedBytes"],
-      message: "Benchmark review evidence retained-byte count does not match its text"
-    });
-  }
-  if (evidence.truncated !== evidence.omittedBytes > 0) {
-    context.addIssue({
-      code: "custom",
-      path: ["truncated"],
-      message: "Benchmark review evidence truncation metadata is inconsistent"
-    });
-  }
-  if (evidence.digest !== contentHash({
+function benchmarkReviewEvidenceDigest(evidence, packetSchemaVersion = 1) {
+  const identity = {
     mediaType: evidence.mediaType,
     text: evidence.text,
     observedBytes: evidence.observedBytes,
     omittedBytes: evidence.omittedBytes,
     truncated: evidence.truncated
-  })) {
-    context.addIssue({
-      code: "custom",
-      path: ["digest"],
-      message: "Benchmark review evidence digest does not match its retained content"
-    });
-  }
-});
-var BenchmarkReviewPacketSchema = external_exports.strictObject({
+  };
+  if (packetSchemaVersion === 1) return contentHash(identity, LEGACY_CANONICAL_HASH_ALGORITHM);
+  if (packetSchemaVersion === 2)
+    return contentHash(
+      {
+        namespace: "graphcraft-benchmark-review-evidence-v2",
+        schemaVersion: 2,
+        hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+        ...identity
+      },
+      PORTABLE_CANONICAL_HASH_ALGORITHM
+    );
+  throw new Error(`Unsupported benchmark review packet schema version: ${packetSchemaVersion}`);
+}
+function benchmarkReviewEvidenceSchema(packetSchemaVersion) {
+  return external_exports.strictObject({
+    mediaType: external_exports.enum(["text/x-diff", "application/x-ndjson"]),
+    text: external_exports.string(),
+    observedBytes: external_exports.number().int().nonnegative(),
+    retainedBytes: external_exports.number().int().nonnegative(),
+    omittedBytes: external_exports.number().int().nonnegative(),
+    truncated: external_exports.boolean(),
+    digest: external_exports.string().regex(/^[0-9a-f]{64}$/)
+  }).superRefine((evidence, context) => {
+    const retainedBytes = new TextEncoder().encode(evidence.text).byteLength;
+    const limit = evidence.mediaType === "text/x-diff" ? BENCHMARK_REVIEW_PATCH_LIMIT_BYTES : BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES;
+    if (retainedBytes > limit) {
+      context.addIssue({
+        code: "custom",
+        path: ["retainedBytes"],
+        message: `Benchmark review evidence exceeds its ${limit}-byte retained limit`
+      });
+    }
+    if (retainedBytes !== evidence.retainedBytes) {
+      context.addIssue({
+        code: "custom",
+        path: ["retainedBytes"],
+        message: "Benchmark review evidence retained-byte count does not match its text"
+      });
+    }
+    if (evidence.truncated !== evidence.omittedBytes > 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["truncated"],
+        message: "Benchmark review evidence truncation metadata is inconsistent"
+      });
+    }
+    if (evidence.digest !== benchmarkReviewEvidenceDigest(evidence, packetSchemaVersion)) {
+      context.addIssue({
+        code: "custom",
+        path: ["digest"],
+        message: "Benchmark review evidence digest does not match its retained content"
+      });
+    }
+  });
+}
+var BenchmarkReviewEvidenceV1Schema = benchmarkReviewEvidenceSchema(1);
+var BenchmarkReviewEvidenceV2Schema = benchmarkReviewEvidenceSchema(2);
+var BenchmarkReviewPacketV1Schema = external_exports.strictObject({
   schemaVersion: external_exports.literal(1),
-  patch: BenchmarkReviewEvidenceSchema,
-  transcript: BenchmarkReviewEvidenceSchema,
+  patch: BenchmarkReviewEvidenceV1Schema,
+  transcript: BenchmarkReviewEvidenceV1Schema,
   captureFailures: external_exports.array(external_exports.string().min(1))
 });
+var BenchmarkReviewPacketV2Schema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(2),
+  hashAlgorithm: external_exports.literal(PORTABLE_CANONICAL_HASH_ALGORITHM),
+  patch: BenchmarkReviewEvidenceV2Schema,
+  transcript: BenchmarkReviewEvidenceV2Schema,
+  captureFailures: external_exports.array(external_exports.string().min(1))
+});
+var BenchmarkReviewPacketSchema = external_exports.discriminatedUnion("schemaVersion", [
+  BenchmarkReviewPacketV1Schema,
+  BenchmarkReviewPacketV2Schema
+]);
 var BenchmarkTrialResultV2Schema = external_exports.strictObject({
-  trial: BenchmarkScheduleEntrySchema,
+  trial: BenchmarkScheduleEntryV2Schema,
   hostVersion: external_exports.string().min(1),
   modelPolicy: external_exports.string().min(1),
   effortPolicy: BenchmarkEffortPolicySchema,
@@ -20177,7 +20225,7 @@ var BenchmarkTrialResultV2Schema = external_exports.strictObject({
   durationMs: external_exports.number().int().nonnegative(),
   humanInterventions: external_exports.number().int().nonnegative(),
   failureTrace: external_exports.array(external_exports.string()),
-  reviewPacket: BenchmarkReviewPacketSchema.optional()
+  reviewPacket: BenchmarkReviewPacketV1Schema.optional()
 }).superRefine((result, context) => {
   if (result.accepted && (result.reviewPacket?.captureFailures.length ?? 0) > 0) {
     context.addIssue({
@@ -20201,122 +20249,132 @@ var BenchmarkTrialResultV2Schema = external_exports.strictObject({
     });
   }
 });
-var BenchmarkTrialResultV3Schema = external_exports.strictObject({
-  trial: BenchmarkScheduleEntrySchema,
-  hostVersion: external_exports.string().min(1),
-  modelPolicy: external_exports.string().min(1),
-  effortPolicy: BenchmarkEffortPolicySchema,
-  permissionPolicy: BenchmarkPermissionPolicySchema,
-  acceptanceScorerDigest: external_exports.string().min(1),
-  observedScorerDigest: external_exports.string().min(1),
-  scorerVerified: external_exports.boolean(),
-  repositoryDigest: external_exports.string().min(1),
-  baseSha: external_exports.string().min(1),
-  executionStatus: external_exports.enum([
-    "completed",
-    "blocked",
-    "failed",
-    "error",
-    "interrupted",
-    "timed_out"
-  ]),
-  attemptCheckpoint: external_exports.enum(["provisional", "settled"]),
-  interruption: external_exports.strictObject({
-    cause: external_exports.enum(["cancellation", "runtime_shutdown", "timeout"]),
-    reason: external_exports.string().min(1),
-    childSettlement: external_exports.enum(["confirmed", "unconfirmed"])
-  }).optional(),
-  recovery: external_exports.strictObject({
-    disposition: external_exports.literal("preserved"),
-    fixtureRepository: external_exports.string().min(1),
-    lastKnownRepository: external_exports.string().min(1),
-    requiredAction: external_exports.literal("reconcile_child_before_cleanup_or_resume")
-  }).optional(),
-  accepted: external_exports.boolean(),
-  acceptance: external_exports.array(BenchmarkAssertionResultSchema),
-  usage: TokenUsageSchema,
-  usageReconciled: external_exports.boolean(),
-  limitations: external_exports.array(external_exports.string()),
-  durationMs: external_exports.number().int().nonnegative(),
-  humanInterventions: external_exports.number().int().nonnegative(),
-  failureTrace: external_exports.array(external_exports.string()),
-  reviewPacket: BenchmarkReviewPacketSchema.optional()
-}).superRefine((result, context) => {
-  const interrupted = ["interrupted", "timed_out"].includes(result.executionStatus);
-  if (interrupted !== (result.interruption !== void 0)) {
-    context.addIssue({
-      code: "custom",
-      path: ["interruption"],
-      message: "Interrupted benchmark results must retain their interruption evidence"
-    });
-  }
-  if (result.executionStatus === "timed_out" && result.interruption?.cause !== "timeout") {
-    context.addIssue({
-      code: "custom",
-      path: ["interruption", "cause"],
-      message: "Timed-out benchmark results must retain a timeout cause"
-    });
-  }
-  if (result.executionStatus === "interrupted" && result.interruption?.cause === "timeout") {
-    context.addIssue({
-      code: "custom",
-      path: ["interruption", "cause"],
-      message: "Timeout interruptions must use the timed_out execution status"
-    });
-  }
-  if (result.attemptCheckpoint === "provisional" && result.accepted) {
-    context.addIssue({
-      code: "custom",
-      path: ["accepted"],
-      message: "A provisional benchmark attempt cannot be accepted"
-    });
-  }
-  if (result.attemptCheckpoint === "provisional" && result.interruption?.childSettlement !== "unconfirmed") {
-    context.addIssue({
-      code: "custom",
-      path: ["interruption"],
-      message: "A provisional benchmark attempt must retain unconfirmed settlement evidence"
-    });
-  }
-  const unconfirmed = result.interruption?.childSettlement === "unconfirmed";
-  if (unconfirmed !== (result.recovery !== void 0)) {
-    context.addIssue({
-      code: "custom",
-      path: ["recovery"],
-      message: "Unconfirmed benchmark calls must retain the preserved workspace recovery receipt"
-    });
-  }
-  if (unconfirmed && result.accepted) {
-    context.addIssue({
-      code: "custom",
-      path: ["accepted"],
-      message: "A benchmark attempt with unconfirmed child settlement cannot be accepted"
-    });
-  }
-  if (result.accepted && (result.reviewPacket?.captureFailures.length ?? 0) > 0) {
-    context.addIssue({
-      code: "custom",
-      path: ["accepted"],
-      message: "A trial with review-packet capture failures cannot be accepted as review-complete"
-    });
-  }
-  if (result.accepted && result.reviewPacket?.patch.truncated) {
-    context.addIssue({
-      code: "custom",
-      path: ["accepted"],
-      message: "A trial with truncated patch evidence cannot be accepted as review-complete"
-    });
-  }
-  if (result.accepted && result.reviewPacket?.transcript.truncated) {
-    context.addIssue({
-      code: "custom",
-      path: ["accepted"],
-      message: "A trial with truncated transcript evidence cannot be accepted as review-complete"
-    });
-  }
-});
-var BenchmarkTrialResultSchema = BenchmarkTrialResultV3Schema;
-var BenchmarkAnyTrialResultSchema = external_exports.union([
+function benchmarkSettledTrialResultSchema(trial, reviewPacket) {
+  return external_exports.strictObject({
+    trial,
+    hostVersion: external_exports.string().min(1),
+    modelPolicy: external_exports.string().min(1),
+    effortPolicy: BenchmarkEffortPolicySchema,
+    permissionPolicy: BenchmarkPermissionPolicySchema,
+    acceptanceScorerDigest: external_exports.string().min(1),
+    observedScorerDigest: external_exports.string().min(1),
+    scorerVerified: external_exports.boolean(),
+    repositoryDigest: external_exports.string().min(1),
+    baseSha: external_exports.string().min(1),
+    executionStatus: external_exports.enum([
+      "completed",
+      "blocked",
+      "failed",
+      "error",
+      "interrupted",
+      "timed_out"
+    ]),
+    attemptCheckpoint: external_exports.enum(["provisional", "settled"]),
+    interruption: external_exports.strictObject({
+      cause: external_exports.enum(["cancellation", "runtime_shutdown", "timeout"]),
+      reason: external_exports.string().min(1),
+      childSettlement: external_exports.enum(["confirmed", "unconfirmed"])
+    }).optional(),
+    recovery: external_exports.strictObject({
+      disposition: external_exports.literal("preserved"),
+      fixtureRepository: external_exports.string().min(1),
+      lastKnownRepository: external_exports.string().min(1),
+      requiredAction: external_exports.literal("reconcile_child_before_cleanup_or_resume")
+    }).optional(),
+    accepted: external_exports.boolean(),
+    acceptance: external_exports.array(BenchmarkAssertionResultSchema),
+    usage: TokenUsageSchema,
+    usageReconciled: external_exports.boolean(),
+    limitations: external_exports.array(external_exports.string()),
+    durationMs: external_exports.number().int().nonnegative(),
+    humanInterventions: external_exports.number().int().nonnegative(),
+    failureTrace: external_exports.array(external_exports.string()),
+    reviewPacket
+  }).superRefine((result, context) => {
+    const reviewPacket2 = result.reviewPacket;
+    const interrupted = ["interrupted", "timed_out"].includes(result.executionStatus);
+    if (interrupted !== (result.interruption !== void 0)) {
+      context.addIssue({
+        code: "custom",
+        path: ["interruption"],
+        message: "Interrupted benchmark results must retain their interruption evidence"
+      });
+    }
+    if (result.executionStatus === "timed_out" && result.interruption?.cause !== "timeout") {
+      context.addIssue({
+        code: "custom",
+        path: ["interruption", "cause"],
+        message: "Timed-out benchmark results must retain a timeout cause"
+      });
+    }
+    if (result.executionStatus === "interrupted" && result.interruption?.cause === "timeout") {
+      context.addIssue({
+        code: "custom",
+        path: ["interruption", "cause"],
+        message: "Timeout interruptions must use the timed_out execution status"
+      });
+    }
+    if (result.attemptCheckpoint === "provisional" && result.accepted) {
+      context.addIssue({
+        code: "custom",
+        path: ["accepted"],
+        message: "A provisional benchmark attempt cannot be accepted"
+      });
+    }
+    if (result.attemptCheckpoint === "provisional" && result.interruption?.childSettlement !== "unconfirmed") {
+      context.addIssue({
+        code: "custom",
+        path: ["interruption"],
+        message: "A provisional benchmark attempt must retain unconfirmed settlement evidence"
+      });
+    }
+    const unconfirmed = result.interruption?.childSettlement === "unconfirmed";
+    if (unconfirmed !== (result.recovery !== void 0)) {
+      context.addIssue({
+        code: "custom",
+        path: ["recovery"],
+        message: "Unconfirmed benchmark calls must retain the preserved workspace recovery receipt"
+      });
+    }
+    if (unconfirmed && result.accepted) {
+      context.addIssue({
+        code: "custom",
+        path: ["accepted"],
+        message: "A benchmark attempt with unconfirmed child settlement cannot be accepted"
+      });
+    }
+    if (result.accepted && (reviewPacket2?.captureFailures.length ?? 0) > 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["accepted"],
+        message: "A trial with review-packet capture failures cannot be accepted as review-complete"
+      });
+    }
+    if (result.accepted && reviewPacket2?.patch.truncated) {
+      context.addIssue({
+        code: "custom",
+        path: ["accepted"],
+        message: "A trial with truncated patch evidence cannot be accepted as review-complete"
+      });
+    }
+    if (result.accepted && reviewPacket2?.transcript.truncated) {
+      context.addIssue({
+        code: "custom",
+        path: ["accepted"],
+        message: "A trial with truncated transcript evidence cannot be accepted as review-complete"
+      });
+    }
+  });
+}
+var BenchmarkTrialResultV3Schema = benchmarkSettledTrialResultSchema(
+  BenchmarkScheduleEntryV3Schema,
+  BenchmarkReviewPacketV1Schema.optional()
+);
+var BenchmarkTrialResultV4Schema = benchmarkSettledTrialResultSchema(
+  BenchmarkScheduleEntryV4Schema,
+  BenchmarkReviewPacketV2Schema
+);
+var BenchmarkLegacyTrialResultSchema = external_exports.union([
   BenchmarkTrialResultV2Schema,
   BenchmarkTrialResultV3Schema
 ]);
@@ -20331,6 +20389,131 @@ var BenchmarkHostPreflightCheckpointSchema = external_exports.strictObject({
   }),
   requiredAction: external_exports.literal("reconcile_host_child_before_resume")
 });
+function benchmarkTrialId(suite, seed, trial, identity) {
+  const value = {
+    suite: suite.id,
+    version: suite.version,
+    seed,
+    taskId: trial.taskId,
+    family: trial.family,
+    host: trial.host,
+    mode: trial.mode,
+    repetition: trial.repetition
+  };
+  if (identity.schemaVersion !== 4) return contentHash(value, LEGACY_CANONICAL_HASH_ALGORITHM);
+  return contentHash(
+    {
+      namespace: "graphcraft-benchmark-trial-id-v4",
+      reportSchemaVersion: identity.schemaVersion,
+      hashAlgorithm: identity.hashAlgorithm,
+      ...value
+    },
+    identity.hashAlgorithm
+  );
+}
+function benchmarkSettledReportSchema(schema, identity) {
+  return schema.superRefine((value, context) => {
+    const report = value;
+    const evidenceBacked = identity.schemaVersion === 4 || report.reviewPolicy !== void 0;
+    if (identity.schemaVersion === 3 && evidenceBacked && report.environment.graphcraftSource === void 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["environment", "graphcraftSource"],
+        message: "Evidence-backed benchmark reports must bind an exact Graphcraft source identity"
+      });
+    }
+    if (evidenceBacked && report.environment.graphcraftSource?.dirty) {
+      context.addIssue({
+        code: "custom",
+        path: ["environment", "graphcraftSource", "dirty"],
+        message: "Evidence-backed benchmark reports require a clean Graphcraft source tree"
+      });
+    }
+    const scheduleByTrialId = /* @__PURE__ */ new Map();
+    for (const [index, trial] of report.schedule.entries()) {
+      if (identity.schemaVersion === 4 && (trial.seed !== report.seed || trial.trialId !== benchmarkTrialId(report.suite, report.seed, trial, identity))) {
+        context.addIssue({
+          code: "custom",
+          path: ["schedule", index, "trialId"],
+          message: "Benchmark trial ID does not match the declared report identity"
+        });
+      }
+      if (scheduleByTrialId.has(trial.trialId)) {
+        context.addIssue({
+          code: "custom",
+          path: ["schedule", index, "trialId"],
+          message: "Benchmark schedule trial IDs must be unique"
+        });
+      }
+      scheduleByTrialId.set(trial.trialId, trial);
+    }
+    const resultTrialIds = /* @__PURE__ */ new Set();
+    for (const [index, result] of report.results.entries()) {
+      const { trial } = result;
+      if (resultTrialIds.has(trial.trialId)) {
+        context.addIssue({
+          code: "custom",
+          path: ["results", index, "trial", "trialId"],
+          message: "Benchmark result trial IDs must be unique"
+        });
+      }
+      resultTrialIds.add(trial.trialId);
+      const scheduled = scheduleByTrialId.get(trial.trialId);
+      if (scheduled === void 0 || contentHash(scheduled, identity.hashAlgorithm) !== contentHash(trial, identity.hashAlgorithm)) {
+        context.addIssue({
+          code: "custom",
+          path: ["results", index, "trial"],
+          message: "Benchmark result trials must exactly match a scheduled trial"
+        });
+      }
+      if (identity.schemaVersion === 3 && report.reviewPolicy !== void 0 && result.reviewPacket === void 0) {
+        context.addIssue({
+          code: "custom",
+          path: ["results", index, "reviewPacket"],
+          message: "Every evidence-backed benchmark result must retain a review packet"
+        });
+      }
+    }
+    if (report.status === "complete" && (report.results.length !== report.schedule.length || resultTrialIds.size !== scheduleByTrialId.size || [...scheduleByTrialId].some(([trialId]) => !resultTrialIds.has(trialId)))) {
+      context.addIssue({
+        code: "custom",
+        path: ["status"],
+        message: "The complete benchmark report does not cover the exact current schedule"
+      });
+    }
+    if (report.status === "complete" && report.results.some((result) => result.attemptCheckpoint === "provisional")) {
+      context.addIssue({
+        code: "custom",
+        path: ["status"],
+        message: "A complete benchmark report cannot retain an in-flight provisional attempt"
+      });
+    }
+    if (report.status === "complete" && report.results.some((result) => result.interruption?.childSettlement === "unconfirmed")) {
+      context.addIssue({
+        code: "custom",
+        path: ["status"],
+        message: "A complete benchmark report cannot retain unconfirmed child settlement"
+      });
+    }
+    if (report.status === "complete" && report.hostPreflightCheckpoint !== void 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["status"],
+        message: "A complete benchmark report cannot retain an unfinished host preflight"
+      });
+    }
+    if (contentHash(report.summary, identity.hashAlgorithm) !== contentHash(
+      summarizeBenchmark(report.results, report.schedule, identity),
+      identity.hashAlgorithm
+    )) {
+      context.addIssue({
+        code: "custom",
+        path: ["summary"],
+        message: "The benchmark report summary does not match its trial evidence"
+      });
+    }
+  });
+}
 var BenchmarkReportV2Schema = external_exports.strictObject({
   schemaVersion: external_exports.literal(2),
   status: external_exports.enum(["running", "complete"]),
@@ -20356,7 +20539,7 @@ var BenchmarkReportV2Schema = external_exports.strictObject({
     graphcraftSource: BenchmarkSourceIdentitySchema.optional()
   }),
   limitations: external_exports.array(external_exports.string()),
-  schedule: external_exports.array(BenchmarkScheduleEntrySchema).min(1),
+  schedule: external_exports.array(BenchmarkScheduleEntryV2Schema).min(1),
   results: external_exports.array(BenchmarkTrialResultV2Schema),
   summary: external_exports.record(external_exports.string(), external_exports.unknown())
 }).superRefine((report, context) => {
@@ -20397,7 +20580,7 @@ var BenchmarkReportV2Schema = external_exports.strictObject({
     }
     resultTrialIds.add(trial.trialId);
     const scheduled = scheduleByTrialId.get(trial.trialId);
-    if (scheduled === void 0 || contentHash(scheduled) !== contentHash(trial)) {
+    if (scheduled === void 0 || contentHash(scheduled, LEGACY_CANONICAL_HASH_ALGORITHM) !== contentHash(trial, LEGACY_CANONICAL_HASH_ALGORITHM)) {
       context.addIssue({
         code: "custom",
         path: ["results", index, "trial"],
@@ -20419,7 +20602,13 @@ var BenchmarkReportV2Schema = external_exports.strictObject({
       message: "The complete benchmark report does not cover the exact current schedule"
     });
   }
-  if (contentHash(report.summary) !== contentHash(summarizeBenchmark(report.results, report.schedule))) {
+  if (contentHash(report.summary, LEGACY_CANONICAL_HASH_ALGORITHM) !== contentHash(
+    summarizeBenchmark(report.results, report.schedule, {
+      schemaVersion: 2,
+      hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM
+    }),
+    LEGACY_CANONICAL_HASH_ALGORITHM
+  )) {
     context.addIssue({
       code: "custom",
       path: ["summary"],
@@ -20427,131 +20616,82 @@ var BenchmarkReportV2Schema = external_exports.strictObject({
     });
   }
 });
-var BenchmarkReportV3Schema = external_exports.strictObject({
-  schemaVersion: external_exports.literal(3),
-  status: external_exports.enum(["running", "complete"]),
-  suite: external_exports.strictObject({
-    id: external_exports.string().min(1),
-    version: external_exports.number().int().positive(),
-    digest: external_exports.string().min(1)
+var BenchmarkReportV3Schema = benchmarkSettledReportSchema(
+  external_exports.strictObject({
+    schemaVersion: external_exports.literal(3),
+    status: external_exports.enum(["running", "complete"]),
+    suite: external_exports.strictObject({
+      id: external_exports.string().min(1),
+      version: external_exports.number().int().positive(),
+      digest: external_exports.string().min(1)
+    }),
+    startedAt: external_exports.iso.datetime(),
+    updatedAt: external_exports.iso.datetime(),
+    seed: external_exports.string().min(1),
+    randomized: external_exports.literal(true),
+    modelPolicy: BenchmarkModelPolicySchema,
+    effortPolicy: BenchmarkEffortPolicySchema,
+    permissionPolicy: BenchmarkPermissionPoliciesSchema,
+    scorerPolicy: external_exports.literal("fixture_bound_scorers_plus_suite_assertions"),
+    reviewPolicy: external_exports.literal("bounded_redacted_patch_and_transcript_v1").optional(),
+    modelCallTimeoutMs: external_exports.number().int().positive().max(MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS),
+    hostPreflightCheckpoint: BenchmarkHostPreflightCheckpointSchema.optional(),
+    environment: external_exports.strictObject({
+      platform: external_exports.string().min(1),
+      architecture: external_exports.string().min(1),
+      nodeVersion: external_exports.string().min(1),
+      graphcraftVersion: external_exports.string().trim().min(1),
+      graphcraftSource: BenchmarkSourceIdentitySchema.optional()
+    }),
+    limitations: external_exports.array(external_exports.string()),
+    schedule: external_exports.array(BenchmarkScheduleEntryV3Schema).min(1),
+    results: external_exports.array(BenchmarkTrialResultV3Schema),
+    summary: external_exports.record(external_exports.string(), external_exports.unknown())
   }),
-  startedAt: external_exports.iso.datetime(),
-  updatedAt: external_exports.iso.datetime(),
-  seed: external_exports.string().min(1),
-  randomized: external_exports.literal(true),
-  modelPolicy: BenchmarkModelPolicySchema,
-  effortPolicy: BenchmarkEffortPolicySchema,
-  permissionPolicy: BenchmarkPermissionPoliciesSchema,
-  scorerPolicy: external_exports.literal("fixture_bound_scorers_plus_suite_assertions"),
-  reviewPolicy: external_exports.literal("bounded_redacted_patch_and_transcript_v1").optional(),
-  modelCallTimeoutMs: external_exports.number().int().positive().max(MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS),
-  hostPreflightCheckpoint: BenchmarkHostPreflightCheckpointSchema.optional(),
-  environment: external_exports.strictObject({
-    platform: external_exports.string().min(1),
-    architecture: external_exports.string().min(1),
-    nodeVersion: external_exports.string().min(1),
-    graphcraftVersion: external_exports.string().trim().min(1),
-    graphcraftSource: BenchmarkSourceIdentitySchema.optional()
+  { schemaVersion: 3, hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM }
+);
+var BenchmarkReportV4Schema = benchmarkSettledReportSchema(
+  external_exports.strictObject({
+    schemaVersion: external_exports.literal(4),
+    hashAlgorithm: external_exports.literal(PORTABLE_CANONICAL_HASH_ALGORITHM),
+    status: external_exports.enum(["running", "complete"]),
+    suite: external_exports.strictObject({
+      id: external_exports.string().min(1),
+      version: external_exports.number().int().positive(),
+      digest: external_exports.string().min(1)
+    }),
+    startedAt: external_exports.iso.datetime(),
+    updatedAt: external_exports.iso.datetime(),
+    seed: external_exports.string().min(1),
+    randomized: external_exports.literal(true),
+    modelPolicy: BenchmarkModelPolicySchema,
+    effortPolicy: BenchmarkEffortPolicySchema,
+    permissionPolicy: BenchmarkPermissionPoliciesSchema,
+    scorerPolicy: external_exports.literal("fixture_bound_scorers_plus_suite_assertions"),
+    reviewPolicy: external_exports.literal("bounded_redacted_patch_and_transcript_v2"),
+    modelCallTimeoutMs: external_exports.number().int().positive().max(MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS),
+    hostPreflightCheckpoint: BenchmarkHostPreflightCheckpointSchema.optional(),
+    environment: external_exports.strictObject({
+      platform: external_exports.string().min(1),
+      architecture: external_exports.string().min(1),
+      nodeVersion: external_exports.string().min(1),
+      graphcraftVersion: external_exports.string().trim().min(1),
+      graphcraftSource: BenchmarkSourceIdentitySchema
+    }),
+    limitations: external_exports.array(external_exports.string()),
+    schedule: external_exports.array(BenchmarkScheduleEntryV4Schema).min(1),
+    results: external_exports.array(BenchmarkTrialResultV4Schema),
+    summary: external_exports.record(external_exports.string(), external_exports.unknown())
   }),
-  limitations: external_exports.array(external_exports.string()),
-  schedule: external_exports.array(BenchmarkScheduleEntrySchema).min(1),
-  results: external_exports.array(BenchmarkTrialResultSchema),
-  summary: external_exports.record(external_exports.string(), external_exports.unknown())
-}).superRefine((report, context) => {
-  if (report.reviewPolicy !== void 0 && report.environment.graphcraftSource === void 0) {
-    context.addIssue({
-      code: "custom",
-      path: ["environment", "graphcraftSource"],
-      message: "Evidence-backed benchmark reports must bind an exact Graphcraft source identity"
-    });
-  }
-  if (report.reviewPolicy !== void 0 && report.environment.graphcraftSource?.dirty) {
-    context.addIssue({
-      code: "custom",
-      path: ["environment", "graphcraftSource", "dirty"],
-      message: "Evidence-backed benchmark reports require a clean Graphcraft source tree"
-    });
-  }
-  const scheduleByTrialId = /* @__PURE__ */ new Map();
-  for (const [index, trial] of report.schedule.entries()) {
-    if (scheduleByTrialId.has(trial.trialId)) {
-      context.addIssue({
-        code: "custom",
-        path: ["schedule", index, "trialId"],
-        message: "Benchmark schedule trial IDs must be unique"
-      });
-    }
-    scheduleByTrialId.set(trial.trialId, trial);
-  }
-  const resultTrialIds = /* @__PURE__ */ new Set();
-  for (const [index, result] of report.results.entries()) {
-    const { trial } = result;
-    if (resultTrialIds.has(trial.trialId)) {
-      context.addIssue({
-        code: "custom",
-        path: ["results", index, "trial", "trialId"],
-        message: "Benchmark result trial IDs must be unique"
-      });
-    }
-    resultTrialIds.add(trial.trialId);
-    const scheduled = scheduleByTrialId.get(trial.trialId);
-    if (scheduled === void 0 || contentHash(scheduled) !== contentHash(trial)) {
-      context.addIssue({
-        code: "custom",
-        path: ["results", index, "trial"],
-        message: "Benchmark result trials must exactly match a scheduled trial"
-      });
-    }
-    if (report.reviewPolicy !== void 0 && result.reviewPacket === void 0) {
-      context.addIssue({
-        code: "custom",
-        path: ["results", index, "reviewPacket"],
-        message: "Every evidence-backed benchmark result must retain a review packet"
-      });
-    }
-  }
-  if (report.status === "complete" && (report.results.length !== report.schedule.length || resultTrialIds.size !== scheduleByTrialId.size || [...scheduleByTrialId].some(([trialId]) => !resultTrialIds.has(trialId)))) {
-    context.addIssue({
-      code: "custom",
-      path: ["status"],
-      message: "The complete benchmark report does not cover the exact current schedule"
-    });
-  }
-  if (report.status === "complete" && report.results.some((result) => result.attemptCheckpoint === "provisional")) {
-    context.addIssue({
-      code: "custom",
-      path: ["status"],
-      message: "A complete benchmark report cannot retain an in-flight provisional attempt"
-    });
-  }
-  if (report.status === "complete" && report.results.some((result) => result.interruption?.childSettlement === "unconfirmed")) {
-    context.addIssue({
-      code: "custom",
-      path: ["status"],
-      message: "A complete benchmark report cannot retain unconfirmed child settlement"
-    });
-  }
-  if (report.status === "complete" && report.hostPreflightCheckpoint !== void 0) {
-    context.addIssue({
-      code: "custom",
-      path: ["status"],
-      message: "A complete benchmark report cannot retain an unfinished host preflight"
-    });
-  }
-  if (contentHash(report.summary) !== contentHash(summarizeBenchmark(report.results, report.schedule))) {
-    context.addIssue({
-      code: "custom",
-      path: ["summary"],
-      message: "The benchmark report summary does not match its trial evidence"
-    });
-  }
-});
+  { schemaVersion: 4, hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM }
+);
 var BenchmarkReportSchema = external_exports.discriminatedUnion("schemaVersion", [
   BenchmarkReportV2Schema,
-  BenchmarkReportV3Schema
+  BenchmarkReportV3Schema,
+  BenchmarkReportV4Schema
 ]);
 function seededRandom(seed) {
-  let state = Number.parseInt(contentHash(seed).slice(0, 8), 16) >>> 0;
+  let state = Number.parseInt(contentHash(seed, LEGACY_CANONICAL_HASH_ALGORITHM).slice(0, 8), 16) >>> 0;
   return () => {
     state += 1831565813;
     let value = state;
@@ -20562,6 +20702,12 @@ function seededRandom(seed) {
 }
 function createBenchmarkSchedule(input) {
   const suite = BenchmarkSuiteSchema.parse(input.suite);
+  const identity = BenchmarkReportIdentityPolicySchema.parse(
+    input.identity ?? {
+      schemaVersion: 3,
+      hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM
+    }
+  );
   const hosts = [...new Set(input.hosts)].sort();
   if (hosts.length === 0) throw new Error("A benchmark schedule requires at least one host");
   const entries = suite.tasks.flatMap(
@@ -20587,7 +20733,7 @@ function createBenchmarkSchedule(input) {
       ...entry,
       order,
       seed: input.seed,
-      trialId: contentHash({ suite: suite.id, version: suite.version, seed: input.seed, ...entry })
+      trialId: benchmarkTrialId(suite, input.seed, entry, identity)
     })
   );
 }
@@ -20677,9 +20823,12 @@ function matchedTrialControls(results) {
     return first.repositoryDigest === second.repositoryDigest && first.baseSha === second.baseSha && first.hostVersion === second.hostVersion && first.modelPolicy === second.modelPolicy && first.effortPolicy === second.effortPolicy && first.permissionPolicy === second.permissionPolicy && first.acceptanceScorerDigest === second.acceptanceScorerDigest && first.observedScorerDigest === second.observedScorerDigest && first.scorerVerified === second.scorerVerified;
   });
 }
-function summarizeBenchmark(results, schedule = results.map(({ trial }) => trial)) {
-  const parsed = results.map((result) => BenchmarkAnyTrialResultSchema.parse(result));
-  const parsedSchedule = schedule.map((entry) => BenchmarkScheduleEntrySchema.parse(entry));
+function summarizeBenchmark(results, schedule = results.map(({ trial }) => trial), inputIdentity) {
+  const identity = inputIdentity === void 0 ? void 0 : BenchmarkReportIdentityPolicySchema.parse(inputIdentity);
+  const parsed = identity === void 0 ? results.map((result) => BenchmarkLegacyTrialResultSchema.parse(result)) : identity.schemaVersion === 2 ? results.map((result) => BenchmarkTrialResultV2Schema.parse(result)) : identity.schemaVersion === 3 ? results.map((result) => BenchmarkTrialResultV3Schema.parse(result)) : results.map((result) => BenchmarkTrialResultV4Schema.parse(result));
+  const parsedSchedule = schedule.map(
+    (entry) => identity === void 0 ? BenchmarkScheduleEntrySchema.parse(entry) : identity.schemaVersion === 2 ? BenchmarkScheduleEntryV2Schema.parse(entry) : identity.schemaVersion === 3 ? BenchmarkScheduleEntryV3Schema.parse(entry) : BenchmarkScheduleEntryV4Schema.parse(entry)
+  );
   return Object.fromEntries(
     ["codex", "claude"].map((host) => {
       const selected = parsed.filter((result) => result.trial.host === host);
@@ -20733,6 +20882,7 @@ var BENCHMARK_DEFECT_SEVERITIES = ["minor", "major", "critical"];
 var BenchmarkDefectCategorySchema = external_exports.enum(BENCHMARK_DEFECT_CATEGORIES);
 var BenchmarkDefectSeveritySchema = external_exports.enum(BENCHMARK_DEFECT_SEVERITIES);
 var BenchmarkReviewOpaqueIdSchema = external_exports.string().regex(/^packet-[0-9a-f]{32}$/);
+var BenchmarkReviewOpaqueIdV2Schema = external_exports.string().regex(/^packet-[0-9a-f]{32}$/);
 var BenchmarkBlindedInterruptionSchema = external_exports.strictObject({
   cause: external_exports.enum(["cancellation", "runtime_shutdown", "timeout"]),
   reason: external_exports.string().min(1),
@@ -20763,11 +20913,30 @@ var BenchmarkBlindedReviewPacketSchema = external_exports.strictObject({
     limitations: external_exports.array(external_exports.string()),
     failureTrace: external_exports.array(external_exports.string())
   }),
-  reviewPacket: BenchmarkReviewPacketSchema
+  reviewPacket: BenchmarkReviewPacketV1Schema
+});
+var BenchmarkBlindedReviewPacketV1Schema = BenchmarkBlindedReviewPacketSchema;
+var BenchmarkBlindedReviewPacketV2Schema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(2),
+  hashAlgorithm: external_exports.literal(PORTABLE_CANONICAL_HASH_ALGORITHM),
+  opaqueId: BenchmarkReviewOpaqueIdV2Schema,
+  task: BenchmarkBlindedReviewPacketSchema.shape.task,
+  outcome: BenchmarkBlindedReviewPacketSchema.shape.outcome,
+  reviewPacket: BenchmarkReviewPacketV2Schema
 });
 function exactOrderedValues(expected) {
   return external_exports.array(external_exports.string()).superRefine((values, context) => {
     if (contentHash(values) !== contentHash(expected)) {
+      context.addIssue({
+        code: "custom",
+        message: `Expected the exact ordered values: ${expected.join(", ")}`
+      });
+    }
+  });
+}
+function exactPortableOrderedValues(expected) {
+  return external_exports.array(external_exports.string()).superRefine((values, context) => {
+    if (contentHash(values, PORTABLE_CANONICAL_HASH_ALGORITHM) !== contentHash(expected, PORTABLE_CANONICAL_HASH_ALGORITHM)) {
       context.addIssue({
         code: "custom",
         message: `Expected the exact ordered values: ${expected.join(", ")}`
@@ -20791,6 +20960,41 @@ var BenchmarkBlindedReviewExportSchema = external_exports.strictObject({
     severities: exactOrderedValues(BENCHMARK_DEFECT_SEVERITIES)
   }),
   packets: external_exports.array(BenchmarkBlindedReviewPacketSchema).min(1)
+}).superRefine((artifact, context) => {
+  const ids = artifact.packets.map(({ opaqueId }) => opaqueId);
+  if (new Set(ids).size !== ids.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["packets"],
+      message: "Blinded benchmark packet IDs must be unique"
+    });
+  }
+  if (ids.some((id, index) => index > 0 && id < ids[index - 1])) {
+    context.addIssue({
+      code: "custom",
+      path: ["packets"],
+      message: "Blinded benchmark packets must be sorted by opaque ID"
+    });
+  }
+});
+var BenchmarkBlindedReviewExportV1Schema = BenchmarkBlindedReviewExportSchema;
+var BenchmarkBlindedReviewExportV2Schema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(2),
+  hashAlgorithm: external_exports.literal(PORTABLE_CANONICAL_HASH_ALGORITHM),
+  reviewPolicy: external_exports.literal("opaque_blinded_review_v2"),
+  rawReportSha256: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  blindingKeyDigest: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  suite: external_exports.strictObject({
+    id: external_exports.string().min(1),
+    version: external_exports.number().int().positive(),
+    digest: external_exports.string().min(1)
+  }),
+  taxonomy: external_exports.strictObject({
+    version: external_exports.literal(1),
+    categories: exactPortableOrderedValues(BENCHMARK_DEFECT_CATEGORIES),
+    severities: exactPortableOrderedValues(BENCHMARK_DEFECT_SEVERITIES)
+  }),
+  packets: external_exports.array(BenchmarkBlindedReviewPacketV2Schema).min(1)
 }).superRefine((artifact, context) => {
   const ids = artifact.packets.map(({ opaqueId }) => opaqueId);
   if (new Set(ids).size !== ids.length) {
@@ -20846,6 +21050,7 @@ var BenchmarkTrialReviewLabelSchema = external_exports.strictObject({
     });
   }
 });
+var BenchmarkTrialReviewLabelV2Schema = BenchmarkTrialReviewLabelSchema;
 var BenchmarkReviewLabelsSchema = external_exports.strictObject({
   schemaVersion: external_exports.literal(1),
   reviewPolicy: external_exports.literal("opaque_blinded_review_v1"),
@@ -20854,6 +21059,26 @@ var BenchmarkReviewLabelsSchema = external_exports.strictObject({
   blindingKeyDigest: external_exports.string().regex(/^[0-9a-f]{64}$/),
   blindedReviewDigest: external_exports.string().regex(/^[0-9a-f]{64}$/),
   labels: external_exports.array(BenchmarkTrialReviewLabelSchema).min(1)
+}).superRefine((artifact, context) => {
+  const ids = artifact.labels.map(({ opaqueId }) => opaqueId);
+  if (new Set(ids).size !== ids.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["labels"],
+      message: "A benchmark review artifact must contain one label per opaque ID"
+    });
+  }
+});
+var BenchmarkReviewLabelsV1Schema = BenchmarkReviewLabelsSchema;
+var BenchmarkReviewLabelsV2Schema = external_exports.strictObject({
+  schemaVersion: external_exports.literal(2),
+  hashAlgorithm: external_exports.literal(PORTABLE_CANONICAL_HASH_ALGORITHM),
+  reviewPolicy: external_exports.literal("opaque_blinded_review_v2"),
+  taxonomyVersion: external_exports.literal(1),
+  rawReportSha256: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  blindingKeyDigest: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  blindedReviewDigest: external_exports.string().regex(/^[0-9a-f]{64}$/),
+  labels: external_exports.array(BenchmarkTrialReviewLabelV2Schema).min(1)
 }).superRefine((artifact, context) => {
   const ids = artifact.labels.map(({ opaqueId }) => opaqueId);
   if (new Set(ids).size !== ids.length) {
@@ -20882,6 +21107,25 @@ function benchmarkReviewOpaqueId(rawReportSha256, trialId, blindingKey) {
         rawReportSha256: digest,
         trialId: trial
       }),
+      "utf8"
+    ).digest("hex").slice(0, 32)}`
+  );
+}
+function benchmarkReviewOpaqueIdV2(rawReportSha256, trialId, blindingKey) {
+  const digest = external_exports.string().regex(/^[0-9a-f]{64}$/).parse(rawReportSha256);
+  const trial = external_exports.string().min(1).parse(trialId);
+  return BenchmarkReviewOpaqueIdV2Schema.parse(
+    `packet-${createHmac("sha256", benchmarkBlindingKey(blindingKey)).update(
+      canonicalJson(
+        {
+          namespace: "graphcraft-benchmark-review-packet-v2",
+          schemaVersion: 2,
+          hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+          rawReportSha256: digest,
+          trialId: trial
+        },
+        PORTABLE_CANONICAL_HASH_ALGORITHM
+      ),
       "utf8"
     ).digest("hex").slice(0, 32)}`
   );
@@ -30922,6 +31166,9 @@ async function discoverProbePlan(repositoryPath, task, baseSha, options = {}) {
 }
 
 // packages/runtime/src/benchmark-validation.ts
+function reportIdentity(report) {
+  return report.schemaVersion === 4 ? { schemaVersion: 4, hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM } : { schemaVersion: 3, hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM };
+}
 var BENCHMARK_REPORT_LIMITATIONS = [
   "Stable efficiency claims require at least three jointly accepted reconciled baseline/Graphcraft pairs per task and host.",
   "Each trial retains a bounded redacted patch and transcript packet; blinded reviewer assignment and defect labels remain external.",
@@ -30931,19 +31178,22 @@ var BENCHMARK_REPORT_LIMITATIONS = [
 function benchmarkPermissionPolicy(host) {
   return host === "codex" ? "codex_workspace_write_shell_external_not_graphcraft_enforced" : "claude_accept_edits_bash_external_not_graphcraft_enforced";
 }
-function expectedScorerFiles(task) {
+function expectedScorerFiles(task, hashAlgorithm) {
   return [...new Set(task.checks.map(({ scorerPath }) => scorerPath))].sort().map((path2) => ({
     path: path2,
     kind: "regular_file",
-    digest: contentHash(task.initialFiles[path2])
+    digest: contentHash(task.initialFiles[path2], hashAlgorithm)
   }));
 }
-function expectedBenchmarkScorerDigest(task) {
-  return contentHash({
-    checks: task.checks,
-    acceptance: task.acceptance,
-    files: expectedScorerFiles(task)
-  });
+function expectedBenchmarkScorerDigest(task, hashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
+  return contentHash(
+    {
+      checks: task.checks,
+      acceptance: task.acceptance,
+      files: expectedScorerFiles(task, hashAlgorithm)
+    },
+    hashAlgorithm
+  );
 }
 function expectedAcceptancePaths(task) {
   return [
@@ -30966,11 +31216,12 @@ function validTokenEvidence(result) {
     return false;
   return true;
 }
-function exactSchedule(report, suite, expected) {
+function exactSchedule(report, suite, identity, expected) {
   const hosts = [...new Set(report.schedule.map(({ host }) => host))].sort();
-  const defaults = createBenchmarkSchedule({ suite, hosts, seed: report.seed });
+  const defaults = createBenchmarkSchedule({ suite, hosts, seed: report.seed, identity });
   let derived;
-  if (contentHash(defaults) === contentHash(report.schedule)) derived = defaults;
+  if (contentHash(defaults, identity.hashAlgorithm) === contentHash(report.schedule, identity.hashAlgorithm))
+    derived = defaults;
   if (derived === void 0) {
     const counts = /* @__PURE__ */ new Map();
     for (const trial of report.schedule) {
@@ -30983,14 +31234,16 @@ function exactSchedule(report, suite, expected) {
         suite,
         hosts,
         seed: report.seed,
-        repetitions: repetitions[0]
+        repetitions: repetitions[0],
+        identity
       });
-      if (contentHash(overridden) === contentHash(report.schedule)) derived = overridden;
+      if (contentHash(overridden, identity.hashAlgorithm) === contentHash(report.schedule, identity.hashAlgorithm))
+        derived = overridden;
     }
   }
   if (derived === void 0)
     throw new Error("The benchmark report schedule does not exactly cover its declared suite");
-  if (expected && contentHash(expected) !== contentHash(derived))
+  if (expected && contentHash(expected, identity.hashAlgorithm) !== contentHash(derived, identity.hashAlgorithm))
     throw new Error("The expected benchmark schedule does not match the declared suite");
   return expected ? [...expected] : derived;
 }
@@ -30998,36 +31251,41 @@ function definedPolicyHosts(value) {
   return Object.entries(value).filter(([, policy]) => policy !== void 0).map(([host]) => host).sort();
 }
 function assertBenchmarkReportEvidence(input) {
-  const report = BenchmarkReportV3Schema.parse(input.report);
+  const report = input.report.schemaVersion === 4 ? BenchmarkReportV4Schema.parse(input.report) : BenchmarkReportV3Schema.parse(input.report);
+  const identity = reportIdentity(report);
+  const hashAlgorithm = identity.hashAlgorithm;
   const suite = BenchmarkSuiteSchema.parse(input.suite);
-  if (report.suite.id !== suite.id || report.suite.version !== suite.version || report.suite.digest !== contentHash(suite)) {
+  if (report.suite.id !== suite.id || report.suite.version !== suite.version || report.suite.digest !== contentHash(suite, hashAlgorithm)) {
     throw new Error("The benchmark report does not match its declared suite identity");
   }
-  const schedule = exactSchedule(report, suite, input.expectedSchedule);
-  if (contentHash(schedule) !== contentHash(report.schedule))
+  const schedule = exactSchedule(report, suite, identity, input.expectedSchedule);
+  if (contentHash(schedule, hashAlgorithm) !== contentHash(report.schedule, hashAlgorithm))
     throw new Error("The benchmark report schedule does not match the expected execution");
   const hosts = [...new Set(schedule.map(({ host }) => host))].sort();
-  if (contentHash(definedPolicyHosts(report.modelPolicy)) !== contentHash(hosts) || contentHash(definedPolicyHosts(report.permissionPolicy)) !== contentHash(hosts)) {
+  if (contentHash(definedPolicyHosts(report.modelPolicy), hashAlgorithm) !== contentHash(hosts, hashAlgorithm) || contentHash(definedPolicyHosts(report.permissionPolicy), hashAlgorithm) !== contentHash(hosts, hashAlgorithm)) {
     throw new Error("The benchmark report host policies do not match its schedule");
   }
   for (const host of hosts) {
     if (report.permissionPolicy[host] !== benchmarkPermissionPolicy(host))
       throw new Error("The benchmark report permission policy does not match its host");
   }
-  if (contentHash(report.limitations) !== contentHash(BENCHMARK_REPORT_LIMITATIONS))
+  if (contentHash(report.limitations, hashAlgorithm) !== contentHash(BENCHMARK_REPORT_LIMITATIONS, hashAlgorithm))
     throw new Error("The benchmark report limitations do not match this harness");
   const scheduleById = new Map(schedule.map((trial) => [trial.trialId, trial]));
   const taskById = new Map(suite.tasks.map((task) => [task.id, task]));
   for (const result of report.results) {
     const scheduled = scheduleById.get(result.trial.trialId);
     const task = taskById.get(result.trial.taskId);
-    if (!scheduled || contentHash(scheduled) !== contentHash(result.trial) || !task)
+    if (!scheduled || contentHash(scheduled, hashAlgorithm) !== contentHash(result.trial, hashAlgorithm) || !task)
       throw new Error("The benchmark report contains a result outside its exact suite schedule");
-    const expectedScorerDigest = expectedBenchmarkScorerDigest(task);
+    const expectedScorerDigest = expectedBenchmarkScorerDigest(task, hashAlgorithm);
     const scorerVerified = result.acceptanceScorerDigest === result.observedScorerDigest;
     const reviewComplete = result.reviewPacket !== void 0 && result.reviewPacket.captureFailures.length === 0 && !result.reviewPacket.patch.truncated && !result.reviewPacket.transcript.truncated;
     const accepted = result.executionStatus === "completed" && scorerVerified && result.acceptance.every(({ passed }) => passed) && reviewComplete;
-    if (result.modelPolicy !== report.modelPolicy[result.trial.host] || result.effortPolicy !== report.effortPolicy || result.permissionPolicy !== report.permissionPolicy[result.trial.host] || result.permissionPolicy !== benchmarkPermissionPolicy(result.trial.host) || result.repositoryDigest !== contentHash(task.initialFiles) || result.acceptanceScorerDigest !== expectedScorerDigest || result.scorerVerified !== scorerVerified || !validTokenEvidence(result) || contentHash(result.acceptance.map(({ path: path2 }) => path2)) !== contentHash(expectedAcceptancePaths(task)) || result.accepted !== accepted) {
+    if (result.modelPolicy !== report.modelPolicy[result.trial.host] || result.effortPolicy !== report.effortPolicy || result.permissionPolicy !== report.permissionPolicy[result.trial.host] || result.permissionPolicy !== benchmarkPermissionPolicy(result.trial.host) || result.repositoryDigest !== contentHash(task.initialFiles, hashAlgorithm) || result.acceptanceScorerDigest !== expectedScorerDigest || result.scorerVerified !== scorerVerified || !validTokenEvidence(result) || contentHash(
+      result.acceptance.map(({ path: path2 }) => path2),
+      hashAlgorithm
+    ) !== contentHash(expectedAcceptancePaths(task), hashAlgorithm) || result.accepted !== accepted) {
       throw new Error("The benchmark report contains mismatched trial controls or evidence");
     }
   }
@@ -42395,7 +42653,8 @@ var tokenDimensions = [
   "total"
 ];
 var scorerPolicy = "fixture_bound_scorers_plus_suite_assertions";
-var reviewPolicy = "bounded_redacted_patch_and_transcript_v1";
+var legacyReviewPolicy = "bounded_redacted_patch_and_transcript_v1";
+var portableReviewPolicy = "bounded_redacted_patch_and_transcript_v2";
 var PATCH_PROCESS_CAPTURE_LIMIT_BYTES = 2 * BENCHMARK_REVIEW_PATCH_LIMIT_BYTES;
 var TRANSCRIPT_OMISSION_MARKER = Buffer.from(
   "\n[GRAPHCRAFT REVIEW EVIDENCE MIDDLE OMITTED]\n",
@@ -42407,6 +42666,30 @@ var BENCHMARK_MODEL_CALL_SETTLEMENT_GRACE_MS = 5e3;
 var UNCONFIRMED_CALL_SETTLEMENT_LIMITATION = "model_call_settlement:unconfirmed";
 var PROVISIONAL_ATTEMPT_LIMITATION = "attempt_checkpoint:provisional";
 var BENCHMARK_SUITE_MAX_BYTES = 16 * 1024 * 1024;
+var LEGACY_BENCHMARK_IDENTITY_POLICY = {
+  reportVersion: 3,
+  hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM,
+  reviewPolicy: legacyReviewPolicy,
+  reviewPacketVersion: 1
+};
+var PORTABLE_BENCHMARK_IDENTITY_POLICY = {
+  reportVersion: 4,
+  hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+  reviewPolicy: portableReviewPolicy,
+  reviewPacketVersion: 2
+};
+function parseBenchmarkSchedule(value, identity) {
+  return (identity.reportVersion === 4 ? BenchmarkScheduleEntryV4Schema : BenchmarkScheduleEntryV3Schema).array().parse(value);
+}
+function parseBenchmarkTrialResult(value, identity) {
+  return identity.reportVersion === 4 ? BenchmarkTrialResultV4Schema.parse(value) : BenchmarkTrialResultV3Schema.parse(value);
+}
+function parseBenchmarkReviewPacket(value, identity) {
+  return identity.reportVersion === 4 ? BenchmarkReviewPacketV2Schema.parse(value) : BenchmarkReviewPacketV1Schema.parse(value);
+}
+function parseResumableBenchmarkReport(value, identity) {
+  return identity.reportVersion === 4 ? BenchmarkReportV4Schema.parse(value) : BenchmarkReportV3Schema.parse(value);
+}
 var BenchmarkCallInterruptedError = class extends Error {
   constructor(interruption) {
     super(interruption.reason);
@@ -42608,8 +42891,8 @@ function safeFixturePath(root, path2) {
     throw new Error(`Benchmark fixture path escapes its repository: ${path2}`);
   return resolved;
 }
-function reviewEvidenceDigest(input) {
-  return contentHash(input);
+function reviewEvidenceDigest(input, identity) {
+  return benchmarkReviewEvidenceDigest(input, identity.reviewPacketVersion);
 }
 function utf8Prefix2(buffer, maximumBytes) {
   const candidate = buffer.subarray(0, Math.min(buffer.length, maximumBytes));
@@ -42635,7 +42918,7 @@ function utf8Suffix(buffer, maximumBytes) {
   }
   return candidate;
 }
-function boundedReviewEvidence(mediaType, value, capture = {}) {
+function boundedReviewEvidence(mediaType, value, identity, capture = {}) {
   const redacted = redactString(value);
   const source = Buffer.from(redacted, "utf8");
   const limit = mediaType === "text/x-diff" ? BENCHMARK_REVIEW_PATCH_LIMIT_BYTES : BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES;
@@ -42661,10 +42944,17 @@ function boundedReviewEvidence(mediaType, value, capture = {}) {
     retainedBytes,
     omittedBytes,
     truncated,
-    digest: reviewEvidenceDigest({ mediaType, text, observedBytes, omittedBytes, truncated })
+    digest: reviewEvidenceDigest(
+      { mediaType, text, observedBytes, omittedBytes, truncated },
+      identity
+    )
   };
 }
 var BoundedTranscriptCapture = class {
+  constructor(identity) {
+    this.identity = identity;
+  }
+  identity;
   complete = Buffer.alloc(0);
   head;
   tail = Buffer.alloc(0);
@@ -42701,13 +42991,16 @@ var BoundedTranscriptCapture = class {
         retainedBytes: this.complete.length,
         omittedBytes: 0,
         truncated: false,
-        digest: reviewEvidenceDigest({
-          mediaType: "application/x-ndjson",
-          text: text2,
-          observedBytes: this.observedBytes,
-          omittedBytes: 0,
-          truncated: false
-        })
+        digest: reviewEvidenceDigest(
+          {
+            mediaType: "application/x-ndjson",
+            text: text2,
+            observedBytes: this.observedBytes,
+            omittedBytes: 0,
+            truncated: false
+          },
+          this.identity
+        )
       };
     }
     const retainedContentBytes = BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES - TRANSCRIPT_OMISSION_MARKER.length;
@@ -42722,17 +43015,20 @@ var BoundedTranscriptCapture = class {
       retainedBytes,
       omittedBytes,
       truncated: true,
-      digest: reviewEvidenceDigest({
-        mediaType: "application/x-ndjson",
-        text,
-        observedBytes: this.observedBytes,
-        omittedBytes,
-        truncated: true
-      })
+      digest: reviewEvidenceDigest(
+        {
+          mediaType: "application/x-ndjson",
+          text,
+          observedBytes: this.observedBytes,
+          omittedBytes,
+          truncated: true
+        },
+        this.identity
+      )
     };
   }
 };
-async function capturePatch(repository, baseSha) {
+async function capturePatch(repository, baseSha, identity) {
   const temporaryRoot = await mkdtemp2(join13(tmpdir2(), "graphcraft-benchmark-review-index-"));
   const environment = { GIT_INDEX_FILE: join13(temporaryRoot, "index") };
   try {
@@ -42797,7 +43093,7 @@ async function capturePatch(repository, baseSha) {
       }
     );
     if (diff.exitCode !== 0) throw new Error(`review diff exited ${diff.exitCode}`);
-    const evidence = boundedReviewEvidence("text/x-diff", diff.stdout, {
+    const evidence = boundedReviewEvidence("text/x-diff", diff.stdout, identity, {
       observedBytes: diff.capture.stdout.observedBytes,
       omittedBytes: diff.capture.stdout.omittedBytes
     });
@@ -42821,25 +43117,29 @@ async function captureReviewPacket(input) {
   const captureFailures = [...input.captureFailures ?? []];
   let patch;
   try {
-    const captured = await capturePatch(input.repository, input.baseSha);
+    const captured = await capturePatch(input.repository, input.baseSha, input.identity);
     patch = captured.evidence;
     captureFailures.push(...captured.captureFailures);
   } catch (error51) {
     const failure = `patch capture failed: ${error51 instanceof Error ? error51.message : String(error51)}`;
     captureFailures.push(failure);
     patch = boundedReviewEvidence("text/x-diff", `[GRAPHCRAFT ${failure}]
-`);
+`, input.identity);
   }
   const transcript = input.transcript.evidence();
   if (transcript.truncated) captureFailures.push(TRANSCRIPT_INCOMPLETE_FAILURE);
-  return BenchmarkReviewPacketSchema.parse({
-    schemaVersion: 1,
-    patch,
-    transcript,
-    captureFailures: captureFailures.map((failure) => redactString(failure))
-  });
+  return parseBenchmarkReviewPacket(
+    {
+      schemaVersion: input.identity.reviewPacketVersion,
+      ...input.identity.reportVersion === 4 ? { hashAlgorithm: input.identity.hashAlgorithm } : {},
+      patch,
+      transcript,
+      captureFailures: captureFailures.map((failure) => redactString(failure))
+    },
+    input.identity
+  );
 }
-async function inspectBenchmarkSourceIdentity(repositoryPath) {
+async function inspectBenchmarkSourceIdentity(repositoryPath, hashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
   const repository = resolve13(repositoryPath);
   const head = await runProcess("git", ["rev-parse", "--verify", "HEAD^{commit}"], {
     cwd: repository
@@ -42867,14 +43167,14 @@ async function inspectBenchmarkSourceIdentity(repositoryPath) {
   return BenchmarkSourceIdentitySchema.parse({
     commitSha,
     dirty,
-    dirtyStatusDigest: dirty ? contentHash(status3.stdout) : null
+    dirtyStatusDigest: dirty ? contentHash(status3.stdout, hashAlgorithm) : null
   });
 }
 async function loadBenchmarkSuite(path2) {
   const source = await readRegularFileBounded(resolve13(path2), BENCHMARK_SUITE_MAX_BYTES);
   return BenchmarkSuiteSchema.parse(JSON.parse(source.toString("utf8")));
 }
-async function materializeTask(task) {
+async function materializeTask(task, hashAlgorithm) {
   const repository = await realpath4(
     await mkdtemp2(join13(tmpdir2(), `graphcraft-benchmark-${task.id}-`))
   );
@@ -42920,7 +43220,7 @@ async function materializeTask(task) {
       throw new Error(`Unable to hash fixture ${task.id}`);
     return {
       repository,
-      repositoryDigest: contentHash(task.initialFiles),
+      repositoryDigest: contentHash(task.initialFiles, hashAlgorithm),
       baseSha: head.stdout.trim()
     };
   } catch (error51) {
@@ -42950,14 +43250,14 @@ async function removeBenchmarkFixture(repository) {
   if (failures.length > 0)
     throw new AggregateError(failures, `Unable to remove benchmark fixture ${repository}`);
 }
-function expectedScorerFiles2(task) {
+function expectedScorerFiles2(task, hashAlgorithm) {
   return [...new Set(task.checks.map(({ scorerPath }) => scorerPath))].sort().map((path2) => ({
     path: path2,
     kind: "regular_file",
-    digest: contentHash(task.initialFiles[path2])
+    digest: contentHash(task.initialFiles[path2], hashAlgorithm)
   }));
 }
-async function observedScorerFiles(task, repository) {
+async function observedScorerFiles(task, repository, hashAlgorithm) {
   return await Promise.all(
     [...new Set(task.checks.map(({ scorerPath }) => scorerPath))].sort().map(async (path2) => {
       const target = safeFixturePath(repository, path2);
@@ -42969,7 +43269,7 @@ async function observedScorerFiles(task, repository) {
         return {
           path: path2,
           kind: "regular_file",
-          digest: contentHash(await readFile3(target, "utf8"))
+          digest: contentHash(await readFile3(target, "utf8"), hashAlgorithm)
         };
       } catch (error51) {
         if (error51.code === "ENOENT") return { path: path2, kind: "missing" };
@@ -42978,13 +43278,21 @@ async function observedScorerFiles(task, repository) {
     })
   );
 }
-function scorerDigest(task, files) {
-  return contentHash({ checks: task.checks, acceptance: task.acceptance, files });
+function scorerDigest(task, files, hashAlgorithm) {
+  return contentHash({ checks: task.checks, acceptance: task.acceptance, files }, hashAlgorithm);
 }
-async function scoreAcceptance(task, repository, summaryEvidence = "") {
+async function scoreAcceptance(task, repository, hashAlgorithm, summaryEvidence = "") {
   const results = [];
-  const expectedScorerDigest = scorerDigest(task, expectedScorerFiles2(task));
-  const observedScorerDigest = scorerDigest(task, await observedScorerFiles(task, repository));
+  const expectedScorerDigest = scorerDigest(
+    task,
+    expectedScorerFiles2(task, hashAlgorithm),
+    hashAlgorithm
+  );
+  const observedScorerDigest = scorerDigest(
+    task,
+    await observedScorerFiles(task, repository, hashAlgorithm),
+    hashAlgorithm
+  );
   const scorerVerified = expectedScorerDigest === observedScorerDigest;
   for (const [index, check2] of task.checks.entries()) {
     if (!scorerVerified) {
@@ -43159,78 +43467,99 @@ function settledHostPreflightCheckpoint(host, interruption) {
 }
 function provisionalTrialResult(input) {
   const reason = "Benchmark attempt started but has not checkpointed a settled result";
-  const reviewPacket = BenchmarkReviewPacketSchema.parse({
-    schemaVersion: 1,
-    patch: boundedReviewEvidence("text/x-diff", ""),
-    transcript: boundedReviewEvidence("application/x-ndjson", ""),
-    captureFailures: ["trial review evidence is unavailable until the attempt settles"]
-  });
-  const tokens = usageSummary([]);
-  return BenchmarkTrialResultSchema.parse({
-    trial: input.trial,
-    hostVersion: input.hostVersion,
-    modelPolicy: input.policy.model,
-    effortPolicy: input.policy.effort,
-    permissionPolicy: benchmarkPermissionPolicy(input.trial.host),
-    acceptanceScorerDigest: scorerDigest(input.task, expectedScorerFiles2(input.task)),
-    observedScorerDigest: scorerDigest(input.task, expectedScorerFiles2(input.task)),
-    scorerVerified: true,
-    repositoryDigest: input.repositoryDigest,
-    baseSha: input.baseSha,
-    executionStatus: "interrupted",
-    attemptCheckpoint: "provisional",
-    interruption: {
-      cause: "runtime_shutdown",
-      reason,
-      childSettlement: "unconfirmed"
+  const reviewPacket = parseBenchmarkReviewPacket(
+    {
+      schemaVersion: input.identity.reviewPacketVersion,
+      ...input.identity.reportVersion === 4 ? { hashAlgorithm: input.identity.hashAlgorithm } : {},
+      patch: boundedReviewEvidence("text/x-diff", "", input.identity),
+      transcript: boundedReviewEvidence("application/x-ndjson", "", input.identity),
+      captureFailures: ["trial review evidence is unavailable until the attempt settles"]
     },
-    recovery: preservedWorkspaceRecovery(input.repository, input.repository),
-    accepted: false,
-    acceptance: unresolvedAcceptance(input.task, reason),
-    usage: tokens.usage,
-    usageReconciled: false,
-    limitations: [...tokens.limitations, PROVISIONAL_ATTEMPT_LIMITATION],
-    durationMs: 0,
-    humanInterventions: 0,
-    failureTrace: [reason],
-    reviewPacket
-  });
+    input.identity
+  );
+  const tokens = usageSummary([]);
+  return parseBenchmarkTrialResult(
+    {
+      trial: input.trial,
+      hostVersion: input.hostVersion,
+      modelPolicy: input.policy.model,
+      effortPolicy: input.policy.effort,
+      permissionPolicy: benchmarkPermissionPolicy(input.trial.host),
+      acceptanceScorerDigest: scorerDigest(
+        input.task,
+        expectedScorerFiles2(input.task, input.identity.hashAlgorithm),
+        input.identity.hashAlgorithm
+      ),
+      observedScorerDigest: scorerDigest(
+        input.task,
+        expectedScorerFiles2(input.task, input.identity.hashAlgorithm),
+        input.identity.hashAlgorithm
+      ),
+      scorerVerified: true,
+      repositoryDigest: input.repositoryDigest,
+      baseSha: input.baseSha,
+      executionStatus: "interrupted",
+      attemptCheckpoint: "provisional",
+      interruption: {
+        cause: "runtime_shutdown",
+        reason,
+        childSettlement: "unconfirmed"
+      },
+      recovery: preservedWorkspaceRecovery(input.repository, input.repository),
+      accepted: false,
+      acceptance: unresolvedAcceptance(input.task, reason),
+      usage: tokens.usage,
+      usageReconciled: false,
+      limitations: [...tokens.limitations, PROVISIONAL_ATTEMPT_LIMITATION],
+      durationMs: 0,
+      humanInterventions: 0,
+      failureTrace: [reason],
+      reviewPacket
+    },
+    input.identity
+  );
 }
-function settleRecoveredProvisionalAttempt(result) {
+function settleRecoveredProvisionalAttempt(result, identity) {
   if (result.attemptCheckpoint !== "provisional") return result;
   const reason = "Recovered an unfinished benchmark attempt; unknown model usage and missing review evidence make this trial unsuccessful";
-  return BenchmarkTrialResultSchema.parse({
-    ...result,
-    attemptCheckpoint: "settled",
-    interruption: {
-      cause: "runtime_shutdown",
-      reason,
-      childSettlement: "unconfirmed"
+  return parseBenchmarkTrialResult(
+    {
+      ...result,
+      attemptCheckpoint: "settled",
+      interruption: {
+        cause: "runtime_shutdown",
+        reason,
+        childSettlement: "unconfirmed"
+      },
+      limitations: [
+        ...result.limitations.filter((limitation) => limitation !== PROVISIONAL_ATTEMPT_LIMITATION),
+        UNCONFIRMED_CALL_SETTLEMENT_LIMITATION
+      ],
+      failureTrace: [.../* @__PURE__ */ new Set([...result.failureTrace, reason])]
     },
-    limitations: [
-      ...result.limitations.filter((limitation) => limitation !== PROVISIONAL_ATTEMPT_LIMITATION),
-      UNCONFIRMED_CALL_SETTLEMENT_LIMITATION
-    ],
-    failureTrace: [.../* @__PURE__ */ new Set([...result.failureTrace, reason])]
-  });
+    identity
+  );
 }
-function settleFailedAttempt(result, error51, signal, fallbackRecovery, adapter) {
+function settleFailedAttempt(result, identity, error51, signal, fallbackRecovery, adapter) {
   const classified = adapter ? classifyTimedAdapterInterruption(error51, signal, adapter) : classifyBenchmarkInterruption(error51, signal);
   const reason = redactString(error51 instanceof Error ? error51.message : String(error51));
   const { interruption: _provisionalInterruption, recovery: existingRecovery, ...base } = result;
-  return BenchmarkTrialResultSchema.parse({
-    ...base,
-    executionStatus: classified ? interruptionExecutionStatus(classified) : "error",
-    attemptCheckpoint: "settled",
-    ...classified ? { interruption: classified } : {},
-    ...classified?.childSettlement === "unconfirmed" ? { recovery: existingRecovery ?? fallbackRecovery } : {},
-    accepted: false,
-    limitations: [
-      ...result.limitations.filter((limitation) => limitation !== PROVISIONAL_ATTEMPT_LIMITATION),
-      ...classified?.childSettlement === "unconfirmed" ? [UNCONFIRMED_CALL_SETTLEMENT_LIMITATION] : []
-    ],
-    failureTrace: [.../* @__PURE__ */ new Set([...result.failureTrace, reason])]
-  });
+  return parseBenchmarkTrialResult(
+    {
+      ...base,
+      executionStatus: classified ? interruptionExecutionStatus(classified) : "error",
+      attemptCheckpoint: "settled",
+      ...classified ? { interruption: classified } : {},
+      ...classified?.childSettlement === "unconfirmed" ? { recovery: existingRecovery ?? fallbackRecovery } : {},
+      accepted: false,
+      limitations: [
+        ...result.limitations.filter((limitation) => limitation !== PROVISIONAL_ATTEMPT_LIMITATION),
+        ...classified?.childSettlement === "unconfirmed" ? [UNCONFIRMED_CALL_SETTLEMENT_LIMITATION] : []
+      ],
+      failureTrace: [.../* @__PURE__ */ new Set([...result.failureTrace, reason])]
+    },
+    identity
+  );
 }
 function assertBenchmarkActive(signal) {
   if (!signal?.aborted) return;
@@ -43244,7 +43573,7 @@ async function runBaselineTrial(input) {
   const usages = [];
   const failureTrace = [];
   const summaryEvidence = [];
-  const transcript = new BoundedTranscriptCapture();
+  const transcript = new BoundedTranscriptCapture(input.identity);
   let resultStatus = "error";
   let interruption;
   const capsule = ContextCapsuleSchema.parse({
@@ -43304,7 +43633,12 @@ async function runBaselineTrial(input) {
   }
   if (!interruption && input.signal?.aborted)
     interruption = classifyTimedAdapterInterruption(void 0, input.signal, input.adapter);
-  const score = await scoreAcceptance(input.task, input.repository, summaryEvidence.join("\n"));
+  const score = await scoreAcceptance(
+    input.task,
+    input.repository,
+    input.identity.hashAlgorithm,
+    summaryEvidence.join("\n")
+  );
   failureTrace.push(
     ...score.results.filter(({ passed }) => !passed).map(({ summary }) => `acceptance: ${summary}`)
   );
@@ -43312,42 +43646,46 @@ async function runBaselineTrial(input) {
   const reviewPacket = await captureReviewPacket({
     repository: input.repository,
     baseSha: input.baseSha,
-    transcript
+    transcript,
+    identity: input.identity
   });
   failureTrace.push(...reviewPacket.captureFailures.map((failure) => `review packet: ${failure}`));
   const reviewLimitations = [
     ...reviewPacket.patch.truncated ? ["review_patch:truncated"] : [],
     ...reviewPacket.transcript.truncated ? ["review_transcript:truncated"] : []
   ];
-  return BenchmarkTrialResultSchema.parse({
-    trial: input.trial,
-    hostVersion: input.hostVersion,
-    modelPolicy: input.policy.model,
-    effortPolicy: input.policy.effort,
-    permissionPolicy: benchmarkPermissionPolicy(input.trial.host),
-    acceptanceScorerDigest: score.expectedScorerDigest,
-    observedScorerDigest: score.observedScorerDigest,
-    scorerVerified: score.scorerVerified,
-    repositoryDigest: input.repositoryDigest,
-    baseSha: input.baseSha,
-    executionStatus: interruption ? interruptionExecutionStatus(interruption) : resultStatus,
-    attemptCheckpoint: "settled",
-    ...interruption ? { interruption } : {},
-    ...interruption?.childSettlement === "unconfirmed" ? { recovery: preservedWorkspaceRecovery(input.repository, input.repository) } : {},
-    accepted: !interruption && resultStatus === "completed" && score.scorerVerified && score.results.every(({ passed }) => passed) && reviewPacket.captureFailures.length === 0,
-    acceptance: score.results,
-    usage: tokens.usage,
-    usageReconciled: tokens.reconciled,
-    limitations: [
-      ...tokens.limitations,
-      ...reviewLimitations,
-      ...interruption?.childSettlement === "unconfirmed" ? [UNCONFIRMED_CALL_SETTLEMENT_LIMITATION] : []
-    ],
-    durationMs: Math.round(performance.now() - started),
-    humanInterventions: 0,
-    failureTrace,
-    reviewPacket
-  });
+  return parseBenchmarkTrialResult(
+    {
+      trial: input.trial,
+      hostVersion: input.hostVersion,
+      modelPolicy: input.policy.model,
+      effortPolicy: input.policy.effort,
+      permissionPolicy: benchmarkPermissionPolicy(input.trial.host),
+      acceptanceScorerDigest: score.expectedScorerDigest,
+      observedScorerDigest: score.observedScorerDigest,
+      scorerVerified: score.scorerVerified,
+      repositoryDigest: input.repositoryDigest,
+      baseSha: input.baseSha,
+      executionStatus: interruption ? interruptionExecutionStatus(interruption) : resultStatus,
+      attemptCheckpoint: "settled",
+      ...interruption ? { interruption } : {},
+      ...interruption?.childSettlement === "unconfirmed" ? { recovery: preservedWorkspaceRecovery(input.repository, input.repository) } : {},
+      accepted: !interruption && resultStatus === "completed" && score.scorerVerified && score.results.every(({ passed }) => passed) && reviewPacket.captureFailures.length === 0,
+      acceptance: score.results,
+      usage: tokens.usage,
+      usageReconciled: tokens.reconciled,
+      limitations: [
+        ...tokens.limitations,
+        ...reviewLimitations,
+        ...interruption?.childSettlement === "unconfirmed" ? [UNCONFIRMED_CALL_SETTLEMENT_LIMITATION] : []
+      ],
+      durationMs: Math.round(performance.now() - started),
+      humanInterventions: 0,
+      failureTrace,
+      reviewPacket
+    },
+    input.identity
+  );
 }
 async function runGraphcraftTrial(input) {
   const started = performance.now();
@@ -43357,7 +43695,7 @@ async function runGraphcraftTrial(input) {
   let summaryEvidence = "";
   let tokens = usageSummary([]);
   let store;
-  const transcript = new BoundedTranscriptCapture();
+  const transcript = new BoundedTranscriptCapture(input.identity);
   const transcriptCaptureFailures = [];
   let interruption;
   try {
@@ -43450,7 +43788,12 @@ async function runGraphcraftTrial(input) {
       );
     }
   }
-  const score = await scoreAcceptance(input.task, acceptanceRepository, summaryEvidence);
+  const score = await scoreAcceptance(
+    input.task,
+    acceptanceRepository,
+    input.identity.hashAlgorithm,
+    summaryEvidence
+  );
   failureTrace.push(
     ...score.results.filter(({ passed }) => !passed).map(({ summary }) => `acceptance: ${summary}`)
   );
@@ -43458,6 +43801,7 @@ async function runGraphcraftTrial(input) {
     repository: acceptanceRepository,
     baseSha: input.baseSha,
     transcript,
+    identity: input.identity,
     captureFailures: transcriptCaptureFailures
   });
   failureTrace.push(...reviewPacket.captureFailures.map((failure) => `review packet: ${failure}`));
@@ -43465,37 +43809,40 @@ async function runGraphcraftTrial(input) {
     ...reviewPacket.patch.truncated ? ["review_patch:truncated"] : [],
     ...reviewPacket.transcript.truncated ? ["review_transcript:truncated"] : []
   ];
-  return BenchmarkTrialResultSchema.parse({
-    trial: input.trial,
-    hostVersion: input.hostVersion,
-    modelPolicy: input.policy.model,
-    effortPolicy: input.policy.effort,
-    permissionPolicy: benchmarkPermissionPolicy(input.trial.host),
-    acceptanceScorerDigest: score.expectedScorerDigest,
-    observedScorerDigest: score.observedScorerDigest,
-    scorerVerified: score.scorerVerified,
-    repositoryDigest: input.repositoryDigest,
-    baseSha: input.baseSha,
-    executionStatus: interruption ? interruptionExecutionStatus(interruption) : executionStatus,
-    attemptCheckpoint: "settled",
-    ...interruption ? { interruption } : {},
-    ...interruption?.childSettlement === "unconfirmed" ? {
-      recovery: preservedWorkspaceRecovery(input.repository, acceptanceRepository)
-    } : {},
-    accepted: !interruption && executionStatus === "completed" && score.scorerVerified && score.results.every(({ passed }) => passed) && reviewPacket.captureFailures.length === 0,
-    acceptance: score.results,
-    usage: tokens.usage,
-    usageReconciled: tokens.reconciled,
-    limitations: [
-      ...tokens.limitations,
-      ...reviewLimitations,
-      ...interruption?.childSettlement === "unconfirmed" ? [UNCONFIRMED_CALL_SETTLEMENT_LIMITATION] : []
-    ],
-    durationMs: Math.round(performance.now() - started),
-    humanInterventions: 0,
-    failureTrace,
-    reviewPacket
-  });
+  return parseBenchmarkTrialResult(
+    {
+      trial: input.trial,
+      hostVersion: input.hostVersion,
+      modelPolicy: input.policy.model,
+      effortPolicy: input.policy.effort,
+      permissionPolicy: benchmarkPermissionPolicy(input.trial.host),
+      acceptanceScorerDigest: score.expectedScorerDigest,
+      observedScorerDigest: score.observedScorerDigest,
+      scorerVerified: score.scorerVerified,
+      repositoryDigest: input.repositoryDigest,
+      baseSha: input.baseSha,
+      executionStatus: interruption ? interruptionExecutionStatus(interruption) : executionStatus,
+      attemptCheckpoint: "settled",
+      ...interruption ? { interruption } : {},
+      ...interruption?.childSettlement === "unconfirmed" ? {
+        recovery: preservedWorkspaceRecovery(input.repository, acceptanceRepository)
+      } : {},
+      accepted: !interruption && executionStatus === "completed" && score.scorerVerified && score.results.every(({ passed }) => passed) && reviewPacket.captureFailures.length === 0,
+      acceptance: score.results,
+      usage: tokens.usage,
+      usageReconciled: tokens.reconciled,
+      limitations: [
+        ...tokens.limitations,
+        ...reviewLimitations,
+        ...interruption?.childSettlement === "unconfirmed" ? [UNCONFIRMED_CALL_SETTLEMENT_LIMITATION] : []
+      ],
+      durationMs: Math.round(performance.now() - started),
+      humanInterventions: 0,
+      failureTrace,
+      reviewPacket
+    },
+    input.identity
+  );
 }
 function objectRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : void 0;
@@ -43504,16 +43851,51 @@ function appendUniqueString(values, value) {
   if (!Array.isArray(values) || !values.every((entry) => typeof entry === "string")) return values;
   return values.includes(value) ? values : [...values, value];
 }
-function parseBenchmarkReportWithReviewMigration(value) {
-  const record2 = objectRecord(value);
-  if (record2?.schemaVersion === 2) {
+function reportIdentity2(identity) {
+  return identity.reportVersion === 4 ? {
+    schemaVersion: 4,
+    hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM
+  } : {
+    schemaVersion: 3,
+    hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM
+  };
+}
+async function probeBenchmarkOutput(outputPath) {
+  let source;
+  try {
+    source = await readFile3(outputPath, "utf8");
+  } catch (error51) {
+    if (error51.code === "ENOENT")
+      return { identity: PORTABLE_BENCHMARK_IDENTITY_POLICY };
+    throw error51;
+  }
+  let value;
+  try {
+    value = JSON.parse(source);
+  } catch (error51) {
+    if (error51 instanceof SyntaxError)
+      throw new Error(`Benchmark report is not valid JSON: ${outputPath}`);
+    throw error51;
+  }
+  const schemaVersion = objectRecord(value)?.schemaVersion;
+  if (schemaVersion === 2) {
     BenchmarkReportV2Schema.parse(value);
     throw new Error(
       "Benchmark report schema version 2 predates model-call settlement evidence and cannot be resumed; preserve it and use a new output path"
     );
   }
-  if (record2?.reviewPolicy !== reviewPolicy || !Array.isArray(record2.results))
-    return { report: BenchmarkReportV3Schema.parse(value), migrated: false };
+  if (schemaVersion === 3) return { value, identity: LEGACY_BENCHMARK_IDENTITY_POLICY };
+  if (schemaVersion === 4) return { value, identity: PORTABLE_BENCHMARK_IDENTITY_POLICY };
+  throw new Error(`Unsupported benchmark report schema version: ${String(schemaVersion)}`);
+}
+function parseBenchmarkReportWithReviewMigration(value, identity) {
+  const record2 = objectRecord(value);
+  if (record2?.schemaVersion !== identity.reportVersion)
+    throw new Error("Benchmark report schema changed while selecting its identity policy");
+  if (identity.reportVersion === 4)
+    return { report: BenchmarkReportV4Schema.parse(value), migrated: false };
+  if (record2.reviewPolicy !== identity.reviewPolicy || !Array.isArray(record2.results))
+    return { report: parseResumableBenchmarkReport(value, identity), migrated: false };
   let migrated = false;
   const legacyResults = [];
   const results = record2.results.map((candidate) => {
@@ -43521,37 +43903,44 @@ function parseBenchmarkReportWithReviewMigration(value) {
     const packet2 = objectRecord(result?.reviewPacket);
     const transcript = objectRecord(packet2?.transcript);
     if (result?.accepted !== true || transcript?.truncated !== true || !Array.isArray(packet2?.captureFailures) || packet2.captureFailures.length !== 0) {
-      const parsed = BenchmarkTrialResultSchema.parse(candidate);
+      const parsed = parseBenchmarkTrialResult(candidate, identity);
       legacyResults.push(parsed);
       return parsed;
     }
     migrated = true;
     const { reviewPacket: _reviewPacket, ...legacyResult } = result;
-    legacyResults.push(BenchmarkTrialResultSchema.parse(legacyResult));
-    return BenchmarkTrialResultSchema.parse({
-      ...result,
-      accepted: false,
-      limitations: appendUniqueString(result.limitations, "review_transcript:truncated"),
-      failureTrace: appendUniqueString(
-        result.failureTrace,
-        `review packet: ${TRANSCRIPT_INCOMPLETE_FAILURE}`
-      ),
-      reviewPacket: {
-        ...packet2,
-        captureFailures: [TRANSCRIPT_INCOMPLETE_FAILURE]
-      }
-    });
+    legacyResults.push(parseBenchmarkTrialResult(legacyResult, identity));
+    return parseBenchmarkTrialResult(
+      {
+        ...result,
+        accepted: false,
+        limitations: appendUniqueString(result.limitations, "review_transcript:truncated"),
+        failureTrace: appendUniqueString(
+          result.failureTrace,
+          `review packet: ${TRANSCRIPT_INCOMPLETE_FAILURE}`
+        ),
+        reviewPacket: {
+          ...packet2,
+          captureFailures: [TRANSCRIPT_INCOMPLETE_FAILURE]
+        }
+      },
+      identity
+    );
   });
-  if (!migrated) return { report: BenchmarkReportV3Schema.parse(value), migrated: false };
-  const schedule = BenchmarkScheduleEntrySchema.array().parse(record2.schedule);
-  if (contentHash(record2.summary) !== contentHash(summarizeBenchmark(legacyResults, schedule)))
+  if (!migrated) return { report: parseResumableBenchmarkReport(value, identity), migrated: false };
+  const schedule = parseBenchmarkSchedule(record2.schedule, identity);
+  const legacySummary = summarizeBenchmark(legacyResults, schedule, reportIdentity2(identity));
+  if (contentHash(record2.summary, identity.hashAlgorithm) !== contentHash(legacySummary, identity.hashAlgorithm))
     throw new Error("The existing benchmark report summary does not match its trial evidence");
   return {
-    report: BenchmarkReportV3Schema.parse({
-      ...record2,
-      results,
-      summary: summarizeBenchmark(results, schedule)
-    }),
+    report: parseResumableBenchmarkReport(
+      {
+        ...record2,
+        results,
+        summary: summarizeBenchmark(results, schedule, reportIdentity2(identity))
+      },
+      identity
+    ),
     migrated: true
   };
 }
@@ -43565,7 +43954,11 @@ async function runBenchmark(input) {
   assertBenchmarkActive(input.signal);
   const graphcraftVersion = input.graphcraftVersion?.trim();
   if (!graphcraftVersion) throw new Error("A Graphcraft version identity is required");
-  const graphcraftSource = input.graphcraftSource ? BenchmarkSourceIdentitySchema.parse(input.graphcraftSource) : await inspectBenchmarkSourceIdentity(process.cwd());
+  const outputPath = resolve13(input.outputPath);
+  const output = await probeBenchmarkOutput(outputPath);
+  const identity = output.identity;
+  const loaded = output.value === void 0 ? void 0 : parseBenchmarkReportWithReviewMigration(output.value, identity);
+  const graphcraftSource = input.graphcraftSource ? BenchmarkSourceIdentitySchema.parse(input.graphcraftSource) : await inspectBenchmarkSourceIdentity(process.cwd(), identity.hashAlgorithm);
   if (graphcraftSource.dirty)
     throw new Error(
       "Evidence-backed benchmarks require a clean Graphcraft source tree; dirty source identity is not reproducible"
@@ -43592,10 +43985,10 @@ async function runBenchmark(input) {
     suite,
     hosts,
     seed: input.seed,
-    ...input.repetitions ? { repetitions: input.repetitions } : {}
+    ...input.repetitions ? { repetitions: input.repetitions } : {},
+    identity: reportIdentity2(identity)
   });
-  const outputPath = resolve13(input.outputPath);
-  const suiteDigest = contentHash(suite);
+  const suiteDigest = contentHash(suite, identity.hashAlgorithm);
   const environment = {
     platform: process.platform,
     architecture: process.arch,
@@ -43608,42 +44001,33 @@ async function runBenchmark(input) {
   let results = [];
   let existingReport;
   let hostPreflightCheckpoint;
-  let existingReportMigrated = false;
-  try {
-    const loaded = parseBenchmarkReportWithReviewMigration(
-      JSON.parse(await readFile3(outputPath, "utf8"))
-    );
+  const existingReportMigrated = loaded?.migrated ?? false;
+  if (loaded) {
     const existing = loaded.report;
-    existingReportMigrated = loaded.migrated;
     if (existing.environment.graphcraftVersion !== graphcraftVersion)
       throw new Error(
         "The existing benchmark report Graphcraft version identity does not match this execution"
       );
     const { graphcraftSource: _existingSource, ...existingRuntimeEnvironment } = existing.environment;
     const { graphcraftSource: _currentSource, ...currentRuntimeEnvironment } = environment;
-    if (existing.suite.id !== suite.id || existing.suite.version !== suite.version || existing.suite.digest !== suiteDigest || existing.seed !== input.seed || JSON.stringify(existing.modelPolicy) !== JSON.stringify(modelPolicy) || existing.effortPolicy !== effortPolicy || JSON.stringify(existing.permissionPolicy) !== JSON.stringify(permissionPolicy) || existing.reviewPolicy !== reviewPolicy || existing.modelCallTimeoutMs !== modelCallTimeoutMs || JSON.stringify(existingRuntimeEnvironment) !== JSON.stringify(currentRuntimeEnvironment) || JSON.stringify(existing.schedule) !== JSON.stringify(schedule))
+    if (existing.suite.id !== suite.id || existing.suite.version !== suite.version || existing.suite.digest !== suiteDigest || existing.seed !== input.seed || JSON.stringify(existing.modelPolicy) !== JSON.stringify(modelPolicy) || existing.effortPolicy !== effortPolicy || JSON.stringify(existing.permissionPolicy) !== JSON.stringify(permissionPolicy) || existing.reviewPolicy !== identity.reviewPolicy || existing.modelCallTimeoutMs !== modelCallTimeoutMs || JSON.stringify(existingRuntimeEnvironment) !== JSON.stringify(currentRuntimeEnvironment) || JSON.stringify(existing.schedule) !== JSON.stringify(schedule))
       throw new Error("The existing benchmark report does not match this suite and schedule");
-    if (contentHash(existing.environment.graphcraftSource) !== contentHash(graphcraftSource))
+    if (contentHash(existing.environment.graphcraftSource, identity.hashAlgorithm) !== contentHash(graphcraftSource, identity.hashAlgorithm))
       throw new Error(
         "The existing benchmark report Graphcraft source identity does not match this execution"
       );
     startedAt = existing.startedAt;
-    results = existing.results;
+    results = [...existing.results];
     hostPreflightCheckpoint = existing.hostPreflightCheckpoint;
     existingReport = existing;
-  } catch (error51) {
-    if (error51.code !== "ENOENT") {
-      if (error51 instanceof SyntaxError)
-        throw new Error(`Benchmark report is not valid JSON: ${outputPath}`);
-      if (error51 instanceof Error && !error51.message.includes("ENOENT")) throw error51;
-    }
   }
   if (existingReport)
     assertBenchmarkReportEvidence({ report: existingReport, suite, expectedSchedule: schedule });
   const recoveredProvisionalAttempts = results.some(
     ({ attemptCheckpoint }) => attemptCheckpoint === "provisional"
   );
-  if (recoveredProvisionalAttempts) results = results.map(settleRecoveredProvisionalAttempt);
+  if (recoveredProvisionalAttempts)
+    results = results.map((result) => settleRecoveredProvisionalAttempt(result, identity));
   if (existingReport?.status === "complete") {
     if (existingReportMigrated) await writeJsonAtomic(outputPath, existingReport);
     return { outputPath, report: existingReport };
@@ -43659,9 +44043,10 @@ async function runBenchmark(input) {
     adapters[host] = new TimedBenchmarkAdapter(adapter, modelCallTimeoutMs);
   }
   const persist = async (status3) => {
-    const report2 = BenchmarkReportV3Schema.parse(
+    const report2 = parseResumableBenchmarkReport(
       redactValue({
-        schemaVersion: 3,
+        schemaVersion: identity.reportVersion,
+        ...identity.reportVersion === 4 ? { hashAlgorithm: identity.hashAlgorithm } : {},
         status: status3,
         suite: { id: suite.id, version: suite.version, digest: suiteDigest },
         startedAt,
@@ -43672,15 +44057,16 @@ async function runBenchmark(input) {
         effortPolicy,
         permissionPolicy,
         scorerPolicy,
-        reviewPolicy,
+        reviewPolicy: identity.reviewPolicy,
         modelCallTimeoutMs,
         ...hostPreflightCheckpoint ? { hostPreflightCheckpoint } : {},
         environment,
         limitations: BENCHMARK_REPORT_LIMITATIONS,
         schedule,
         results,
-        summary: summarizeBenchmark(results, schedule)
-      })
+        summary: summarizeBenchmark(results, schedule, reportIdentity2(identity))
+      }),
+      identity
     );
     assertBenchmarkReportEvidence({ report: report2, suite, expectedSchedule: schedule });
     await writeJsonAtomic(outputPath, report2);
@@ -43728,13 +44114,14 @@ async function runBenchmark(input) {
     input.observer?.(
       `[${trial.order + 1}/${schedule.length}] ${trial.host} ${trial.mode} ${trial.taskId} #${trial.repetition}`
     );
-    const fixture = await materializeTask(task);
+    const fixture = await materializeTask(task, identity.hashAlgorithm);
     let result;
     let trialError;
     let settledResultPersisted = false;
     let provisional = provisionalTrialResult({
       trial,
       task,
+      identity,
       repository: fixture.repository,
       repositoryDigest: fixture.repositoryDigest,
       baseSha: fixture.baseSha,
@@ -43752,6 +44139,7 @@ async function runBenchmark(input) {
       } catch (error51) {
         const failedProbe = settleFailedAttempt(
           provisional,
+          identity,
           error51,
           trialSignal,
           preservedWorkspaceRecovery(fixture.repository, fixture.repository),
@@ -43779,10 +44167,13 @@ async function runBenchmark(input) {
         throw error51;
       }
       const hostVersion = capabilities.version ?? "unknown";
-      provisional = BenchmarkTrialResultSchema.parse({
-        ...provisional,
-        hostVersion
-      });
+      provisional = parseBenchmarkTrialResult(
+        {
+          ...provisional,
+          hostVersion
+        },
+        identity
+      );
       const provisionalIndex = results.findIndex(
         ({ trial: candidate }) => candidate.trialId === trial.trialId
       );
@@ -43794,6 +44185,7 @@ async function runBenchmark(input) {
         result = trial.mode === "baseline" ? await runBaselineTrial({
           trial,
           task,
+          identity,
           adapter,
           repository: fixture.repository,
           repositoryDigest: fixture.repositoryDigest,
@@ -43804,6 +44196,7 @@ async function runBenchmark(input) {
         }) : await runGraphcraftTrial({
           trial,
           task,
+          identity,
           adapter,
           repository: fixture.repository,
           repositoryDigest: fixture.repositoryDigest,
@@ -43825,6 +44218,7 @@ async function runBenchmark(input) {
         trialError = error51;
         result = settleFailedAttempt(
           result ?? provisional,
+          identity,
           error51,
           trialSignal,
           preservedWorkspaceRecovery(fixture.repository, fixture.repository),
@@ -43870,8 +44264,10 @@ async function runBenchmark(input) {
 import { createHash as createHash7, randomUUID as randomUUID11 } from "node:crypto";
 import { link, lstat as lstat12, mkdir as mkdir6, open as open9, realpath as realpath5, rm as rm5, unlink as unlink5 } from "node:fs/promises";
 import { basename as basename5, dirname as dirname12, join as join14, resolve as resolve14 } from "node:path";
-var REVIEW_POLICY = "bounded_redacted_patch_and_transcript_v1";
-var BLINDED_REVIEW_POLICY = "opaque_blinded_review_v1";
+var LEGACY_REVIEW_POLICY = "bounded_redacted_patch_and_transcript_v1";
+var PORTABLE_REVIEW_POLICY = "bounded_redacted_patch_and_transcript_v2";
+var LEGACY_BLINDED_REVIEW_POLICY = "opaque_blinded_review_v1";
+var PORTABLE_BLINDED_REVIEW_POLICY = "opaque_blinded_review_v2";
 var WILSON_Z_95 = 1.959963984540054;
 var BENCHMARK_PUBLICATION_REPORT_MAX_BYTES = 64 * 1024 * 1024;
 var BENCHMARK_PUBLICATION_LABELS_MAX_BYTES = 16 * 1024 * 1024;
@@ -43909,20 +44305,62 @@ function parseJson(path2, source) {
     throw new Error(`Benchmark artifact is not valid JSON: ${path2}`);
   }
 }
-async function loadBenchmarkReportForPublication(path2) {
+function declaredSchemaVersion(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value.schemaVersion : void 0;
+}
+async function readBenchmarkReportArtifact(path2) {
   const absolute = resolve14(path2);
   const source = await readPrivateFileBounded(absolute, BENCHMARK_PUBLICATION_REPORT_MAX_BYTES);
-  const report = BenchmarkReportV3Schema.parse(parseJson(absolute, source.toString("utf8")));
-  return { path: absolute, rawReportSha256: rawSha256(source), report };
+  return {
+    path: absolute,
+    rawReportSha256: rawSha256(source),
+    value: parseJson(absolute, source.toString("utf8"))
+  };
 }
-async function loadBenchmarkReviewLabelsArtifact(path2) {
+async function loadVersionedBenchmarkReportForPublication(path2) {
+  const loaded = await readBenchmarkReportArtifact(path2);
+  const schemaVersion = declaredSchemaVersion(loaded.value);
+  if (schemaVersion === 3)
+    return {
+      path: loaded.path,
+      rawReportSha256: loaded.rawReportSha256,
+      report: BenchmarkReportV3Schema.parse(loaded.value)
+    };
+  if (schemaVersion === 4)
+    return {
+      path: loaded.path,
+      rawReportSha256: loaded.rawReportSha256,
+      report: BenchmarkReportV4Schema.parse(loaded.value)
+    };
+  throw new Error("Benchmark publication supports only declared report schema versions 3 and 4");
+}
+async function readBenchmarkReviewLabelsArtifact(path2) {
   const absolute = resolve14(path2);
   const source = await readPrivateFileBounded(absolute, BENCHMARK_PUBLICATION_LABELS_MAX_BYTES);
   return {
     path: absolute,
     labelsSha256: rawSha256(source),
-    labels: BenchmarkReviewLabelsSchema.parse(parseJson(absolute, source.toString("utf8")))
+    value: parseJson(absolute, source.toString("utf8"))
   };
+}
+async function loadVersionedBenchmarkReviewLabelsArtifact(path2) {
+  const loaded = await readBenchmarkReviewLabelsArtifact(path2);
+  const schemaVersion = declaredSchemaVersion(loaded.value);
+  if (schemaVersion === 1)
+    return {
+      path: loaded.path,
+      labelsSha256: loaded.labelsSha256,
+      labels: BenchmarkReviewLabelsV1Schema.parse(loaded.value)
+    };
+  if (schemaVersion === 2)
+    return {
+      path: loaded.path,
+      labelsSha256: loaded.labelsSha256,
+      labels: BenchmarkReviewLabelsV2Schema.parse(loaded.value)
+    };
+  throw new Error(
+    "Benchmark publication supports only declared review-label schema versions 1 and 2"
+  );
 }
 function hexNibble(value) {
   if (value >= 48 && value <= 57) return value - 48;
@@ -43979,10 +44417,23 @@ async function readBenchmarkBlindingKeyFromStdin(input) {
     encoded.fill(0);
   }
 }
+function publicationArtifactVersion(report) {
+  return report.schemaVersion === 4 ? 2 : 1;
+}
+function publicationHashAlgorithm(reportOrVersion) {
+  const version2 = typeof reportOrVersion === "number" ? reportOrVersion : publicationArtifactVersion(reportOrVersion);
+  return version2 === 2 ? PORTABLE_CANONICAL_HASH_ALGORITHM : LEGACY_CANONICAL_HASH_ALGORITHM;
+}
+function publicationOpaqueId(report, rawReportSha256, trialId, blindingKey) {
+  return report.schemaVersion === 4 ? benchmarkReviewOpaqueIdV2(rawReportSha256, trialId, blindingKey) : benchmarkReviewOpaqueId(rawReportSha256, trialId, blindingKey);
+}
 function assertPublicationReady(report) {
   if (report.status !== "complete")
-    throw new Error("Benchmark publication requires a complete schema-3 report");
-  if (report.reviewPolicy !== REVIEW_POLICY)
+    throw new Error(
+      `Benchmark publication requires a complete schema-${report.schemaVersion} report`
+    );
+  const expectedReviewPolicy = report.schemaVersion === 4 ? PORTABLE_REVIEW_POLICY : LEGACY_REVIEW_POLICY;
+  if (report.reviewPolicy !== expectedReviewPolicy)
     throw new Error("Benchmark publication requires bounded review evidence");
   if (report.results.some(({ attemptCheckpoint }) => attemptCheckpoint !== "settled"))
     throw new Error("Benchmark publication cannot include an unsettled trial");
@@ -43990,7 +44441,7 @@ function assertPublicationReady(report) {
     throw new Error("Every settled benchmark trial must retain a review packet");
 }
 function assertSuiteMatchesReport(suite, report) {
-  if (suite.id !== report.suite.id || suite.version !== report.suite.version || contentHash(suite) !== report.suite.digest)
+  if (suite.id !== report.suite.id || suite.version !== report.suite.version || contentHash(suite, publicationHashAlgorithm(report)) !== report.suite.digest)
     throw new Error("The benchmark suite does not match the raw report identity");
 }
 function escapeRegExp(value) {
@@ -44249,7 +44700,7 @@ function utf8Suffix2(value, maximumBytes) {
   }
   return Buffer.alloc(0);
 }
-function blindedEvidence(evidence, replacements) {
+function blindedEvidence(evidence, replacements, packetSchemaVersion) {
   const text = evidence.mediaType === "application/x-ndjson" ? normalizedBlindedTranscript(evidence.text, replacements) : blindedPatch(evidence.text, replacements);
   const limit = evidence.mediaType === "text/x-diff" ? BENCHMARK_REVIEW_PATCH_LIMIT_BYTES : BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES;
   const source = Buffer.from(text, "utf8");
@@ -44268,36 +44719,61 @@ function blindedEvidence(evidence, replacements) {
   const omittedBytes = evidence.omittedBytes + locallyOmittedBytes;
   const observedBytes = retainedBytes + omittedBytes;
   const truncated = omittedBytes > 0;
-  const blinded = {
+  const digestInput = {
     mediaType: evidence.mediaType,
     text: retainedText,
     observedBytes,
-    retainedBytes,
     omittedBytes,
-    truncated,
-    digest: contentHash({
-      mediaType: evidence.mediaType,
-      text: retainedText,
-      observedBytes,
-      omittedBytes,
-      truncated
-    })
+    truncated
   };
-  return BenchmarkReviewPacketSchema.shape.patch.parse(blinded);
+  const blinded = {
+    ...digestInput,
+    retainedBytes,
+    digest: benchmarkReviewEvidenceDigest(digestInput, packetSchemaVersion)
+  };
+  return packetSchemaVersion === 2 ? BenchmarkReviewPacketV2Schema.shape.patch.parse(blinded) : BenchmarkReviewPacketV1Schema.shape.patch.parse(blinded);
 }
-function blindedReviewPacket(reviewPacket, replacements) {
-  return BenchmarkReviewPacketSchema.parse({
-    schemaVersion: 1,
-    patch: blindedEvidence(reviewPacket.patch, replacements),
-    transcript: blindedEvidence(reviewPacket.transcript, replacements),
+function blindedReviewPacket(reviewPacket, replacements, packetSchemaVersion) {
+  const evidence = {
+    patch: blindedEvidence(reviewPacket.patch, replacements, packetSchemaVersion),
+    transcript: blindedEvidence(reviewPacket.transcript, replacements, packetSchemaVersion),
     captureFailures: reviewPacket.captureFailures.map(
       (failure) => blindedPatch(failure, replacements)
     )
-  });
+  };
+  return packetSchemaVersion === 2 ? BenchmarkReviewPacketV2Schema.parse({
+    schemaVersion: 2,
+    hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+    ...evidence
+  }) : BenchmarkReviewPacketV1Schema.parse({ schemaVersion: 1, ...evidence });
+}
+function blindedPacketFields(input) {
+  const { report, result, task, rawReportSha256, blindingKey, replacements } = input;
+  return {
+    opaqueId: publicationOpaqueId(report, rawReportSha256, result.trial.trialId, blindingKey),
+    task: {
+      family: task.family,
+      prompt: blindText(task.task, replacements),
+      checks: blindValue(task.checks, replacements),
+      acceptanceCriteria: blindValue(task.acceptance, replacements)
+    },
+    outcome: {
+      executionStatus: result.executionStatus,
+      accepted: result.accepted,
+      scorerVerified: result.scorerVerified,
+      acceptance: blindValue(result.acceptance, replacements),
+      ...result.interruption ? { interruption: blindValue(result.interruption, replacements) } : {},
+      limitations: blindValue(result.limitations, replacements),
+      failureTrace: blindValue(result.failureTrace, replacements)
+    }
+  };
 }
 function createBlindedBenchmarkReview(input) {
   const suite = BenchmarkSuiteSchema.parse(input.suite);
-  const report = assertBenchmarkReportEvidence({
+  const report = input.report.schemaVersion === 4 ? assertBenchmarkReportEvidence({
+    report: BenchmarkReportV4Schema.parse(input.report),
+    suite
+  }) : assertBenchmarkReportEvidence({
     report: BenchmarkReportV3Schema.parse(input.report),
     suite
   });
@@ -44308,69 +44784,124 @@ function createBlindedBenchmarkReview(input) {
   assertPublicationReady(report);
   assertSuiteMatchesReport(suite, report);
   const byTask = new Map(suite.tasks.map((task) => [task.id, task]));
+  const taxonomy = {
+    version: 1,
+    categories: [...BENCHMARK_DEFECT_CATEGORIES],
+    severities: [...BENCHMARK_DEFECT_SEVERITIES]
+  };
+  if (report.schemaVersion === 4) {
+    const packets2 = report.results.map((result) => {
+      const task = byTask.get(result.trial.taskId);
+      if (!task) throw new Error(`Missing suite task for result ${result.trial.taskId}`);
+      const replacements = identityReplacements(result);
+      return BenchmarkBlindedReviewPacketV2Schema.parse(
+        publicationRedactValue({
+          schemaVersion: 2,
+          hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+          ...blindedPacketFields({
+            report,
+            result,
+            task,
+            rawReportSha256,
+            blindingKey: input.blindingKey,
+            replacements
+          }),
+          reviewPacket: blindedReviewPacket(result.reviewPacket, replacements, 2)
+        })
+      );
+    }).sort((left, right) => compareText(left.opaqueId, right.opaqueId));
+    return BenchmarkBlindedReviewExportV2Schema.parse({
+      schemaVersion: 2,
+      hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+      reviewPolicy: PORTABLE_BLINDED_REVIEW_POLICY,
+      rawReportSha256,
+      blindingKeyDigest,
+      suite: report.suite,
+      taxonomy,
+      packets: packets2
+    });
+  }
   const packets = report.results.map((result) => {
     const task = byTask.get(result.trial.taskId);
     if (!task) throw new Error(`Missing suite task for result ${result.trial.taskId}`);
     const replacements = identityReplacements(result);
-    return BenchmarkBlindedReviewPacketSchema.parse(
+    return BenchmarkBlindedReviewPacketV1Schema.parse(
       publicationRedactValue({
         schemaVersion: 1,
-        opaqueId: benchmarkReviewOpaqueId(
+        ...blindedPacketFields({
+          report,
+          result,
+          task,
           rawReportSha256,
-          result.trial.trialId,
-          input.blindingKey
-        ),
-        task: {
-          family: task.family,
-          prompt: blindText(task.task, replacements),
-          checks: blindValue(task.checks, replacements),
-          acceptanceCriteria: blindValue(task.acceptance, replacements)
-        },
-        outcome: {
-          executionStatus: result.executionStatus,
-          accepted: result.accepted,
-          scorerVerified: result.scorerVerified,
-          acceptance: blindValue(result.acceptance, replacements),
-          ...result.interruption ? { interruption: blindValue(result.interruption, replacements) } : {},
-          limitations: blindValue(result.limitations, replacements),
-          failureTrace: blindValue(result.failureTrace, replacements)
-        },
-        reviewPacket: blindedReviewPacket(result.reviewPacket, replacements)
+          blindingKey: input.blindingKey,
+          replacements
+        }),
+        reviewPacket: blindedReviewPacket(
+          BenchmarkReviewPacketV1Schema.parse(result.reviewPacket),
+          replacements,
+          1
+        )
       })
     );
   }).sort((left, right) => compareText(left.opaqueId, right.opaqueId));
-  return BenchmarkBlindedReviewExportSchema.parse({
+  return BenchmarkBlindedReviewExportV1Schema.parse({
     schemaVersion: 1,
-    reviewPolicy: BLINDED_REVIEW_POLICY,
+    reviewPolicy: LEGACY_BLINDED_REVIEW_POLICY,
     rawReportSha256,
     blindingKeyDigest,
     suite: report.suite,
-    taxonomy: {
-      version: 1,
-      categories: [...BENCHMARK_DEFECT_CATEGORIES],
-      severities: [...BENCHMARK_DEFECT_SEVERITIES]
-    },
+    taxonomy,
     packets
   });
 }
-function validateBenchmarkReviewLabels(input) {
-  const blindedReview = createBlindedBenchmarkReview(input);
-  const labels = BenchmarkReviewLabelsSchema.parse(input.labels);
+function validateParsedBenchmarkReviewLabels(blindedReview, labels, hashAlgorithm) {
   if (labels.rawReportSha256 !== blindedReview.rawReportSha256)
     throw new Error("Review labels do not match the raw benchmark report digest");
   if (labels.blindingKeyDigest !== blindedReview.blindingKeyDigest)
     throw new Error("Review labels do not match the benchmark blinding-key digest");
-  if (labels.blindedReviewDigest !== contentHash(blindedReview))
+  if (labels.blindedReviewDigest !== contentHash(blindedReview, hashAlgorithm))
     throw new Error("Review labels do not match the blinded review artifact digest");
   const packets = new Map(blindedReview.packets.map((packet2) => [packet2.opaqueId, packet2]));
   const labelsByOpaqueId = new Map(labels.labels.map((label) => [label.opaqueId, label]));
   if (labelsByOpaqueId.size !== packets.size || [...packets].some(([opaqueId]) => !labelsByOpaqueId.has(opaqueId)) || [...labelsByOpaqueId].some(([opaqueId]) => !packets.has(opaqueId)))
     throw new Error("Review labels must cover every settled trial exactly once");
   for (const [opaqueId, packet2] of packets) {
-    if (labelsByOpaqueId.get(opaqueId).packetDigest !== contentHash(packet2))
+    if (labelsByOpaqueId.get(opaqueId).packetDigest !== contentHash(packet2, hashAlgorithm))
       throw new Error(`Review label packet digest does not match ${opaqueId}`);
   }
   return { blindedReview, labels, labelsByOpaqueId };
+}
+function validateBenchmarkReviewLabels(input) {
+  if (input.report.schemaVersion === 4) {
+    if (input.labels.schemaVersion !== 2)
+      throw new Error("Schema-4 benchmark reports require schema-2 review labels");
+    const labels2 = BenchmarkReviewLabelsV2Schema.parse(input.labels);
+    const blindedReview2 = createBlindedBenchmarkReview({
+      report: input.report,
+      rawReportSha256: input.rawReportSha256,
+      suite: input.suite,
+      blindingKey: input.blindingKey
+    });
+    return validateParsedBenchmarkReviewLabels(
+      blindedReview2,
+      labels2,
+      PORTABLE_CANONICAL_HASH_ALGORITHM
+    );
+  }
+  if (input.labels.schemaVersion !== 1)
+    throw new Error("Schema-3 benchmark reports require schema-1 review labels");
+  const labels = BenchmarkReviewLabelsV1Schema.parse(input.labels);
+  const blindedReview = createBlindedBenchmarkReview({
+    report: input.report,
+    rawReportSha256: input.rawReportSha256,
+    suite: input.suite,
+    blindingKey: input.blindingKey
+  });
+  return validateParsedBenchmarkReviewLabels(
+    blindedReview,
+    labels,
+    LEGACY_CANONICAL_HASH_ALGORITHM
+  );
 }
 function wilsonScoreInterval(successes, trials) {
   if (!Number.isInteger(successes) || !Number.isInteger(trials) || trials < 0)
@@ -44502,15 +45033,32 @@ function resultKey(result) {
   return `${result.trial.host}/${result.trial.mode}/${result.trial.taskId}#${result.trial.repetition}`;
 }
 function renderBenchmarkPublicationMarkdown(input) {
-  const report = BenchmarkReportV3Schema.parse(input.report);
+  const report = input.report.schemaVersion === 4 ? BenchmarkReportV4Schema.parse(input.report) : BenchmarkReportV3Schema.parse(input.report);
   const suite = BenchmarkSuiteSchema.parse(input.suite);
   if (!/^[0-9a-f]{64}$/u.test(input.labelsSha256))
     throw new Error("The review-label file SHA-256 digest is invalid");
-  const validated = validateBenchmarkReviewLabels({ ...input, report, suite });
-  const summary = summarizeBenchmark(report.results, report.schedule);
+  const validated = report.schemaVersion === 4 ? validateBenchmarkReviewLabels({
+    report,
+    rawReportSha256: input.rawReportSha256,
+    suite,
+    labels: input.labels,
+    blindingKey: input.blindingKey
+  }) : validateBenchmarkReviewLabels({
+    report,
+    rawReportSha256: input.rawReportSha256,
+    suite,
+    labels: input.labels,
+    blindingKey: input.blindingKey
+  });
+  const summary = summarizeBenchmark(
+    report.results,
+    report.schedule,
+    report.schemaVersion === 4 ? { schemaVersion: 4, hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM } : { schemaVersion: 3, hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM }
+  );
   const hosts = [...new Set(report.schedule.map(({ host }) => host))].sort();
   const labelFor = (result) => validated.labelsByOpaqueId.get(
-    benchmarkReviewOpaqueId(
+    publicationOpaqueId(
+      report,
       validated.blindedReview.rawReportSha256,
       result.trial.trialId,
       input.blindingKey
@@ -44521,7 +45069,10 @@ function renderBenchmarkPublicationMarkdown(input) {
   );
   const criticalDefects = allDefects.filter(({ defect }) => defect.severity === "critical");
   const criticalTrials = new Set(criticalDefects.map(({ result }) => result.trial.trialId)).size;
-  const blindedReviewDigest = contentHash(validated.blindedReview);
+  const blindedReviewDigest = contentHash(
+    validated.blindedReview,
+    publicationHashAlgorithm(report)
+  );
   const reviewerIds = [
     ...new Set(validated.labels.labels.map(({ reviewerId }) => reviewerId))
   ].sort();
@@ -44532,6 +45083,10 @@ function renderBenchmarkPublicationMarkdown(input) {
     "",
     "## Provenance",
     "",
+    ...report.schemaVersion === 4 ? [
+      "Publication artifact schema: `2`  ",
+      `Canonical hash algorithm: \`${PORTABLE_CANONICAL_HASH_ALGORITHM}\`  `
+    ] : [],
     `Raw report byte SHA-256: \`${validated.blindedReview.rawReportSha256}\`  `,
     `Blinding-key digest: \`${validated.blindedReview.blindingKeyDigest}\`  `,
     `Blinded review canonical SHA-256: \`${blindedReviewDigest}\`  `,
@@ -44828,32 +45383,38 @@ async function writeTextCreateOnly(path2, text) {
     throw error51;
   }
 }
-async function writeJsonCreateOnly(path2, value) {
+async function writeJsonCreateOnly(path2, value, hashAlgorithm) {
   const redacted = publicationRedactValue(value);
-  if (contentHash(redacted) !== contentHash(value))
+  if (contentHash(redacted, hashAlgorithm) !== contentHash(value, hashAlgorithm))
     throw new Error("Blinded benchmark artifact changed during final redaction");
   await writeTextCreateOnly(path2, `${JSON.stringify(redacted, null, 2)}
 `);
 }
 async function exportBlindedBenchmarkReview(input) {
-  const loaded = await loadBenchmarkReportForPublication(input.reportPath);
+  const loaded = await loadVersionedBenchmarkReportForPublication(input.reportPath);
   const blindingKey = Buffer.from(input.blindingKey);
   try {
     const outputPath = resolve14(input.outputPath);
     await assertDistinctOutput(outputPath, [loaded.path]);
     await assertCreateOnlyOutput(outputPath);
-    const artifact = createBlindedBenchmarkReview({
+    const artifact = loaded.report.schemaVersion === 4 ? createBlindedBenchmarkReview({
+      report: loaded.report,
+      rawReportSha256: loaded.rawReportSha256,
+      suite: input.suite,
+      blindingKey
+    }) : createBlindedBenchmarkReview({
       report: loaded.report,
       rawReportSha256: loaded.rawReportSha256,
       suite: input.suite,
       blindingKey
     });
-    await writeJsonCreateOnly(outputPath, artifact);
+    const hashAlgorithm = publicationHashAlgorithm(loaded.report);
+    await writeJsonCreateOnly(outputPath, artifact, hashAlgorithm);
     return {
       outputPath,
       rawReportSha256: loaded.rawReportSha256,
       blindingKeyDigest: benchmarkBlindingKeyDigest(blindingKey),
-      blindedReviewDigest: contentHash(artifact),
+      blindedReviewDigest: contentHash(artifact, hashAlgorithm),
       packetCount: artifact.packets.length
     };
   } finally {
@@ -44862,19 +45423,30 @@ async function exportBlindedBenchmarkReview(input) {
 }
 async function renderBenchmarkPublicationReport(input) {
   const [loaded, loadedLabels] = await Promise.all([
-    loadBenchmarkReportForPublication(input.reportPath),
-    loadBenchmarkReviewLabelsArtifact(input.labelsPath)
+    loadVersionedBenchmarkReportForPublication(input.reportPath),
+    loadVersionedBenchmarkReviewLabelsArtifact(input.labelsPath)
   ]);
+  if (loaded.report.schemaVersion === 4 && loadedLabels.labels.schemaVersion !== 2)
+    throw new Error("Schema-4 benchmark reports require schema-2 review labels");
+  if (loaded.report.schemaVersion === 3 && loadedLabels.labels.schemaVersion !== 1)
+    throw new Error("Schema-3 benchmark reports require schema-1 review labels");
   const blindingKey = Buffer.from(input.blindingKey);
   try {
     const outputPath = resolve14(input.outputPath);
     await assertDistinctOutput(outputPath, [loaded.path, loadedLabels.path]);
     await assertCreateOnlyOutput(outputPath);
-    const rendered = renderBenchmarkPublicationMarkdown({
+    const rendered = loaded.report.schemaVersion === 4 && loadedLabels.labels.schemaVersion === 2 ? renderBenchmarkPublicationMarkdown({
       report: loaded.report,
       rawReportSha256: loaded.rawReportSha256,
       suite: input.suite,
       labels: loadedLabels.labels,
+      labelsSha256: loadedLabels.labelsSha256,
+      blindingKey
+    }) : renderBenchmarkPublicationMarkdown({
+      report: BenchmarkReportV3Schema.parse(loaded.report),
+      rawReportSha256: loaded.rawReportSha256,
+      suite: input.suite,
+      labels: BenchmarkReviewLabelsV1Schema.parse(loadedLabels.labels),
       labelsSha256: loadedLabels.labelsSha256,
       blindingKey
     });
@@ -47899,7 +48471,7 @@ var program2 = new Command().name("graphcraft").description("Progress-aware exec
 async function benchmarkSourceIdentity() {
   if (true) {
     return BenchmarkSourceIdentitySchema.parse({
-      commitSha: "bf8dcfdf0448cbebdcd333b5879fd288631dc49e",
+      commitSha: "263d73d4c5bf5f19071c675a4453a11ec01119d6",
       dirty: false,
       dirtyStatusDigest: false ? null : null
     });
@@ -47991,7 +48563,11 @@ program2.command("benchmark").description("Run a randomized matched Graphcraft a
       suite,
       hosts,
       seed: options.seed,
-      ...repetitions ? { repetitions } : {}
+      ...repetitions ? { repetitions } : {},
+      identity: {
+        schemaVersion: 4,
+        hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM
+      }
     });
     if (options.dryRun) {
       console.log(
@@ -48053,7 +48629,7 @@ program2.command("benchmark").description("Run a randomized matched Graphcraft a
     );
   }
 );
-program2.command("benchmark-review").description("Export deterministic opaque packets for blinded benchmark defect review").argument("<report>", "complete schema-3 benchmark report").option("--suite <suite>", "exact benchmark suite JSON", "stable-v1").requiredOption(
+program2.command("benchmark-review").description("Export deterministic opaque packets for blinded benchmark defect review").argument("<report>", "complete schema-3 or schema-4 benchmark report").option("--suite <suite>", "exact benchmark suite JSON", "stable-v1").requiredOption(
   "--blinding-key-stdin",
   "read the 32-byte hexadecimal blinding key from standard input"
 ).requiredOption("--output <path>", "separate blinded-review JSON path").action(
@@ -48074,7 +48650,7 @@ program2.command("benchmark-review").description("Export deterministic opaque pa
     );
   }
 );
-program2.command("benchmark-report").description("Render a validated benchmark report from raw evidence and blinded labels").argument("<report>", "complete schema-3 benchmark report").option("--suite <suite>", "exact benchmark suite JSON", "stable-v1").requiredOption(
+program2.command("benchmark-report").description("Render a validated benchmark report from raw evidence and blinded labels").argument("<report>", "complete schema-3 or schema-4 benchmark report").option("--suite <suite>", "exact benchmark suite JSON", "stable-v1").requiredOption(
   "--blinding-key-stdin",
   "read the same 32-byte hexadecimal blinding key from standard input"
 ).requiredOption("--labels <path>", "completed digest-bound review-label JSON").requiredOption("--output <path>", "separate Markdown report path").action(
