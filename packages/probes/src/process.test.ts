@@ -10,6 +10,8 @@ import {
   DEFAULT_PROCESS_INPUT_BYTES,
   PROCESS_SETTLEMENT_GRACE_MS,
   PROCESS_TERMINATION_GRACE_MS,
+  WINDOWS_PROCESS_SETTLEMENT_GRACE_MS,
+  managedProcessSettlementGraceMs,
   runProcess,
 } from "./process.ts";
 
@@ -27,6 +29,14 @@ async function waitFor(check: () => boolean | Promise<boolean>, timeoutMs = 5_00
 }
 
 describe("bounded subprocess output capture", () => {
+  it("allows a bounded Windows tree-settlement window without slowing other platforms", () => {
+    expect(managedProcessSettlementGraceMs("win32")).toBe(WINDOWS_PROCESS_SETTLEMENT_GRACE_MS);
+    expect(WINDOWS_PROCESS_SETTLEMENT_GRACE_MS).toBeGreaterThan(PROCESS_SETTLEMENT_GRACE_MS);
+    expect(PROCESS_TERMINATION_GRACE_MS + managedProcessSettlementGraceMs("win32")).toBe(10_000);
+    expect(managedProcessSettlementGraceMs("linux")).toBe(PROCESS_SETTLEMENT_GRACE_MS);
+    expect(managedProcessSettlementGraceMs("darwin")).toBe(PROCESS_SETTLEMENT_GRACE_MS);
+  });
+
   it("does not start a managed command until its ownership checkpoint is durable", async () => {
     const root = await mkdtemp(join(tmpdir(), "graphcraft-managed-process-"));
     const marker = join(root, "started.txt");

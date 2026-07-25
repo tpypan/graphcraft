@@ -268,6 +268,34 @@ async function probeLaunches(markerPath: string): Promise<ProbeLaunch[]> {
     .map((line) => JSON.parse(line) as ProbeLaunch);
 }
 
+async function probeJournalDiagnostic(path: string): Promise<unknown> {
+  try {
+    return (await readFile(path, "utf8"))
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line, index) => {
+        try {
+          const record = JSON.parse(line) as Record<string, unknown>;
+          return {
+            line: index + 1,
+            status: record.status,
+            brokerPid: record.brokerPid,
+            childPid: record.childPid,
+            outcome: record.outcome,
+            confirmed: record.confirmed,
+            settledAt: record.settledAt,
+          };
+        } catch {
+          return { line: index + 1, status: "invalid_json" };
+        }
+      });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return { status: code === "ENOENT" ? "removed" : "unreadable", code: code ?? "unknown" };
+  }
+}
+
 async function configureProbeScopeCrash(
   created: Awaited<ReturnType<typeof createRun>>,
   markerPath: string,
@@ -585,11 +613,43 @@ describe("cold runtime restart fault recovery", () => {
         const recoveredStore = new RunStore(repository, created.contract.runId);
         const recovered = await recoveredStore.loadState();
         const events = await recoveredStore.loadEvents();
+        const terminalProcessEvents = events.filter(
+          ({ type, data }) =>
+            ["probe.process.finished", "probe.process.reconciled"].includes(type) &&
+            data.executionId === executionId,
+        );
+        const recoveryDiagnostic = JSON.stringify(
+          {
+            recovered: {
+              status: recovered.status,
+              stopReason: recovered.stopReason,
+              node: recovered.nodes[nodeId],
+            },
+            terminalProcessEvents: terminalProcessEvents.map(
+              ({ sequence, actor, type, causationId, data }) => ({
+                sequence,
+                actor,
+                type,
+                causationId,
+                checkpointId: data.checkpointId,
+                executionId: data.executionId,
+                settlement: data.settlement,
+              }),
+            ),
+            journal: await probeJournalDiagnostic(journalPath),
+            recentEventTypes: events.slice(-12).map(({ sequence, type }) => ({ sequence, type })),
+          },
+          null,
+          2,
+        );
         const reconciliation = events.find(
           ({ type, data }) =>
             type === "probe.process.reconciled" && data.executionId === executionId,
         );
-        expect(reconciliation).toMatchObject({
+        expect(
+          reconciliation,
+          `Missing durable probe-process reconciliation:\n${recoveryDiagnostic}`,
+        ).toMatchObject({
           actor: "runtime",
           causationId: executionId,
           data: {

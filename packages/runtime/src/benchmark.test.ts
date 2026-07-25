@@ -1,6 +1,16 @@
-import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   BenchmarkSuiteSchema,
@@ -64,6 +74,11 @@ function usage(input: number, output: number): TokenUsage {
       total: "derived",
     },
   };
+}
+
+async function canonicalPathIdentity(path: string): Promise<string> {
+  const canonical = resolve(await realpath(path));
+  return process.platform === "win32" ? canonical.toLowerCase() : canonical;
 }
 
 class BenchmarkAdapter implements HostAdapter {
@@ -777,7 +792,11 @@ describe("benchmark harness", () => {
     trackPreservedFixture(recovery);
     expect(adapter.planCalls).toBe(1);
     expect(adapter.workerRequests).toHaveLength(0);
-    expect(adapter.activePlannerRepositories.has(recovery.lastKnownRepository)).toBe(true);
+    const activePlannerRepositories = [...adapter.activePlannerRepositories];
+    expect(activePlannerRepositories).toHaveLength(1);
+    expect(await canonicalPathIdentity(activePlannerRepositories[0]!)).toBe(
+      await canonicalPathIdentity(recovery.lastKnownRepository),
+    );
     await expect(access(recovery.fixtureRepository)).resolves.toBeUndefined();
     await expect(access(recovery.lastKnownRepository)).resolves.toBeUndefined();
 

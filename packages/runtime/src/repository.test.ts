@@ -73,9 +73,33 @@ async function branchTarget(repository: string, branch: string): Promise<string 
     .catch(() => undefined);
 }
 
+function comparablePath(path: string): string {
+  const absolute = resolve(path);
+  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+}
+
+async function canonicalComparablePath(path: string): Promise<string> {
+  try {
+    return comparablePath(await realpath(path));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  try {
+    return comparablePath(join(await realpath(dirname(path)), basename(path)));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return comparablePath(path);
+  }
+}
+
 async function registrationCount(repository: string, path: string): Promise<number> {
-  const output = await gitOutput(repository, "worktree", "list", "--porcelain");
-  return output.split("\n").filter((line) => line === `worktree ${path}`).length;
+  const output = await gitOutput(repository, "worktree", "list", "--porcelain", "-z");
+  const target = await canonicalComparablePath(path);
+  return output
+    .split("\0")
+    .filter((field) => field.startsWith("worktree "))
+    .map((field) => field.slice("worktree ".length))
+    .filter((registeredPath) => comparablePath(registeredPath) === target).length;
 }
 
 async function commonGitDirectory(repository: string): Promise<string> {

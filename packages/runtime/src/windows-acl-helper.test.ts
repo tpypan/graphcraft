@@ -332,6 +332,37 @@ describe("persistent Windows ACL helper transport", () => {
     await expect(recovered).resolves.toBeUndefined();
   });
 
+  it("buffers a response observed after COMMIT dispatch until its write callback completes", async () => {
+    const { helper, children } = testHelper();
+    const completed = helper.request(
+      request("begin\n", "chunk\n", "commit\n"),
+      exactResponse("ok"),
+    );
+    children[0]!.onWrite = (_line, count) => {
+      if (count === 3) children[0]!.stdout.write("ok\n");
+    };
+
+    await expect(completed).resolves.toBeUndefined();
+    expect(children[0]!.writes).toEqual(["begin\n", "chunk\n", "commit\n"]);
+    expect(children[0]!.kill).not.toHaveBeenCalled();
+  });
+
+  it("does not accept a buffered response when the COMMIT write later fails", async () => {
+    const { helper, children } = testHelper();
+    const failed = helper.request(request("begin\n", "chunk\n", "commit\n"), exactResponse("ok"));
+    children[0]!.onWrite = (_line, count) => {
+      if (count !== 3) return;
+      children[0]!.stdout.write("ok\n");
+      children[0]!.nextWriteError = new Error("commit callback failed");
+    };
+
+    await expect(failed).rejects.toMatchObject({
+      message: "Unable to write bounded request to trusted Windows ACL enforcement",
+      cause: { message: "commit callback failed" },
+    });
+    expect(children[0]!.kill).toHaveBeenCalledTimes(1);
+  });
+
   it("fails closed and resets after crashes, malformed output, stderr, and write errors", async () => {
     const { helper, children } = testHelper();
 

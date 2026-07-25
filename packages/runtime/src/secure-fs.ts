@@ -30,6 +30,13 @@ interface PrivateEntry {
   path: string;
 }
 
+interface InspectedPrivateEntry {
+  entry: PrivateEntry;
+  identityFingerprint: string | undefined;
+  publicationIdentityFingerprint: string | undefined;
+  metadataFingerprint: string | undefined;
+}
+
 const hardenedWindowsIdentities = new Map<string, string>();
 const hardenedDarwinEntries = new Map<string, string>();
 const privatePathMutationTails = new Map<string, Promise<void>>();
@@ -412,12 +419,7 @@ function rememberDarwinEntry(path: string, fingerprint: string | undefined): voi
   }
 }
 
-async function inspectPrivateEntry(path: string): Promise<{
-  entry: PrivateEntry;
-  identityFingerprint: string | undefined;
-  publicationIdentityFingerprint: string | undefined;
-  metadataFingerprint: string | undefined;
-}> {
+async function inspectPrivateEntry(path: string): Promise<InspectedPrivateEntry> {
   const status = await lstat(path, { bigint: true });
   const identityFingerprint = privateEntryIdentityFingerprint(status);
   const publicationIdentityFingerprint = privatePublicationIdentityFingerprint(status);
@@ -516,35 +518,47 @@ export async function serializePrivatePathMutation<T>(
   }
 }
 
-async function hardenWindowsEntriesLocked(entries: PrivateEntry[], force = false): Promise<void> {
-  if (entries.length === 0) return;
+async function hardenWindowsEntriesLocked(
+  entries: PrivateEntry[],
+  force = false,
+): Promise<InspectedPrivateEntry[]> {
+  if (entries.length === 0) return [];
+  const inspections: InspectedPrivateEntry[] = [];
   const pending: Array<{
     entry: PrivateEntry;
+    index: number;
     identityFingerprint: string | undefined;
   }> = [];
-  for (const entry of entries) {
+  for (const [index, entry] of entries.entries()) {
     const inspected = await inspectPrivateEntry(entry.path);
     if (inspected.entry.kind !== entry.kind)
       throw new Error(`Private ACL target changed filesystem kind: ${entry.path}`);
+    inspections.push(inspected);
     if (
       force ||
       inspected.identityFingerprint === undefined ||
       hardenedWindowsIdentities.get(inspected.identityFingerprint) !== inspected.metadataFingerprint
     )
-      pending.push({ entry, identityFingerprint: inspected.identityFingerprint });
+      pending.push({ entry, index, identityFingerprint: inspected.identityFingerprint });
     else rememberWindowsIdentity(inspected.identityFingerprint, inspected.metadataFingerprint);
   }
-  if (pending.length === 0) return;
-  await runWindowsAclBatch(pending.map(({ entry }) => entry));
-  for (const { entry, identityFingerprint } of pending) {
-    const inspected = await inspectPrivateEntry(entry.path);
-    if (inspected.entry.kind !== entry.kind)
-      throw new Error(`Private ACL target changed filesystem kind: ${entry.path}`);
-    if (identityFingerprint !== undefined && inspected.identityFingerprint !== identityFingerprint)
-      throw new Error(`Private ACL target changed filesystem identity: ${entry.path}`);
-    if (inspected.identityFingerprint === identityFingerprint)
-      rememberWindowsIdentity(identityFingerprint, inspected.metadataFingerprint);
+  if (pending.length > 0) {
+    await runWindowsAclBatch(pending.map(({ entry }) => entry));
+    for (const { entry, index, identityFingerprint } of pending) {
+      const inspected = await inspectPrivateEntry(entry.path);
+      if (inspected.entry.kind !== entry.kind)
+        throw new Error(`Private ACL target changed filesystem kind: ${entry.path}`);
+      if (
+        identityFingerprint !== undefined &&
+        inspected.identityFingerprint !== identityFingerprint
+      )
+        throw new Error(`Private ACL target changed filesystem identity: ${entry.path}`);
+      inspections[index] = inspected;
+      if (inspected.identityFingerprint === identityFingerprint)
+        rememberWindowsIdentity(identityFingerprint, inspected.metadataFingerprint);
+    }
   }
+  return inspections;
 }
 
 async function hardenWindowsEntries(entries: PrivateEntry[], force = false): Promise<void> {
@@ -902,6 +916,82 @@ export async function finalizePrivateDirectoryMutation(
   });
 }
 
+export interface WindowsPublicationParentCheckpoint {
+  readonly boundary: "after_hardening";
+  readonly parentPaths: readonly string[];
+}
+
+/**
+ * Synchronous deterministic Windows publication fault hook. It runs while ACL
+ * work is serialized and must not reenter private-filesystem helpers. @internal
+ */
+export type WindowsPublicationParentCheckpointHook = (
+  checkpoint: WindowsPublicationParentCheckpoint,
+) => void;
+
+async function inspectWindowsPublicationParentsLocked(
+  parentPaths: string[],
+  checkpoint: WindowsPublicationParentCheckpointHook | undefined,
+): Promise<InspectedPrivateEntry[]> {
+  const entries = parentPaths.map((path): PrivateEntry => ({ kind: "directory", path }));
+  const verified = await hardenWindowsEntriesLocked(entries);
+  const expectedIdentities = verified.map(({ identityFingerprint }) => identityFingerprint);
+
+  checkpoint?.({ boundary: "after_hardening", parentPaths });
+  // A concurrent child create or unlink legitimately advances directory ctime
+  // without weakening its ACL. Re-harden that same object, but never convert an
+  // identity replacement into recoverable metadata drift.
+  for (let attempt = 1; attempt <= WINDOWS_ACL_VERIFICATION_ATTEMPTS; attempt += 1) {
+    if (attempt > 1) {
+      const rehardened = await hardenWindowsEntriesLocked(entries, true);
+      for (const [index, inspected] of rehardened.entries()) {
+        const expectedIdentity = expectedIdentities[index];
+        if (
+          expectedIdentity !== undefined &&
+          inspected.identityFingerprint !== undefined &&
+          inspected.identityFingerprint !== expectedIdentity
+        )
+          throw new Error(
+            `Private publication parent changed filesystem identity: ${inspected.entry.path}`,
+          );
+        if (expectedIdentity === undefined && inspected.identityFingerprint !== undefined)
+          expectedIdentities[index] = inspected.identityFingerprint;
+      }
+    }
+
+    const inspectedParents = await Promise.all(parentPaths.map(inspectPrivateEntry));
+    let driftedParent: InspectedPrivateEntry | undefined;
+    for (const [index, inspected] of inspectedParents.entries()) {
+      if (inspected.entry.kind !== "directory")
+        throw new Error(`Private publication parent is not a directory: ${inspected.entry.path}`);
+      const expectedIdentity = expectedIdentities[index];
+      if (
+        expectedIdentity !== undefined &&
+        inspected.identityFingerprint !== undefined &&
+        inspected.identityFingerprint !== expectedIdentity
+      )
+        throw new Error(
+          `Private publication parent changed filesystem identity: ${inspected.entry.path}`,
+        );
+      if (expectedIdentity === undefined && inspected.identityFingerprint !== undefined)
+        expectedIdentities[index] = inspected.identityFingerprint;
+      if (
+        inspected.identityFingerprint !== undefined &&
+        (inspected.metadataFingerprint === undefined ||
+          hardenedWindowsIdentities.get(inspected.identityFingerprint) !==
+            inspected.metadataFingerprint)
+      )
+        driftedParent ??= inspected;
+    }
+    if (driftedParent === undefined) return inspectedParents;
+    if (attempt === WINDOWS_ACL_VERIFICATION_ATTEMPTS)
+      throw new Error(
+        `Unable to verify owner-only publication parent identity: ${driftedParent.entry.path}`,
+      );
+  }
+  throw new Error("Unable to verify owner-only publication parent identity");
+}
+
 /** Publish one descriptor-identified file beneath verified owner-only parents. @internal */
 export async function publishPrivateFileAtomic(input: {
   path: string;
@@ -909,6 +999,8 @@ export async function publishPrivateFileAtomic(input: {
   sourceDirectory: string;
   hardenOnPosix: boolean;
   supersessionPolicy?: "strict" | "reconstructable_projection";
+  /** Runs synchronously while Windows ACL work is serialized. @internal */
+  onWindowsParentCheckpoint?: WindowsPublicationParentCheckpointHook;
   publish: () => Promise<AtomicFilePublication>;
 }): Promise<void> {
   const absolute = resolve(input.path);
@@ -957,26 +1049,10 @@ export async function publishPrivateFileAtomic(input: {
       } catch (error) {
         if (!isMissing(error)) throw error;
       }
-      await hardenWindowsEntriesLocked(
-        parentPaths.map((parent) => ({ kind: "directory", path: parent })),
+      const parentsBefore = await inspectWindowsPublicationParentsLocked(
+        parentPaths,
+        input.onWindowsParentCheckpoint,
       );
-
-      const parentsBefore = await Promise.all(parentPaths.map(inspectPrivateEntry));
-      for (const parentBefore of parentsBefore) {
-        if (parentBefore.entry.kind !== "directory")
-          throw new Error(
-            `Private publication parent is not a directory: ${parentBefore.entry.path}`,
-          );
-        if (
-          parentBefore.identityFingerprint !== undefined &&
-          (parentBefore.metadataFingerprint === undefined ||
-            hardenedWindowsIdentities.get(parentBefore.identityFingerprint) !==
-              parentBefore.metadataFingerprint)
-        )
-          throw new Error(
-            `Unable to verify owner-only publication parent identity: ${parentBefore.entry.path}`,
-          );
-      }
 
       const publication = await input.publish();
       await validatePrivatePath(root, relativePath);

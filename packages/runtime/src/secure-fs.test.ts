@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { lstatSync, mkdirSync, renameSync } from "node:fs";
 import {
   access,
   chmod,
@@ -735,6 +736,72 @@ describe("secure filesystem permissions", () => {
       await ensurePrivateDirectory(directory);
 
       await expectWindowsOwnerOnly(directory);
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "re-hardens a stable Windows publication parent after concurrent metadata drift",
+    async () => {
+      const root = await temporaryRoot();
+      const ownedRoot = join(root, "metadata drift publication");
+      const path = join(ownedRoot, "state.json");
+      const concurrentChild = join(ownedRoot, "concurrent child");
+      await ensurePrivateDirectory(ownedRoot);
+      let checkpoints = 0;
+
+      await publishPrivateFileAtomic({
+        path,
+        ownedRoot,
+        sourceDirectory: ownedRoot,
+        hardenOnPosix: false,
+        onWindowsParentCheckpoint: ({ boundary, parentPaths }) => {
+          checkpoints += 1;
+          expect(boundary).toBe("after_hardening");
+          expect(parentPaths).toEqual([ownedRoot]);
+          const before = lstatSync(ownedRoot, { bigint: true }).ctimeNs;
+          mkdirSync(concurrentChild);
+          expect(lstatSync(ownedRoot, { bigint: true }).ctimeNs).not.toBe(before);
+        },
+        publish: async () => await writeJsonAtomic(path, { recovered: true }),
+      });
+
+      expect(checkpoints).toBe(1);
+      expect(
+        JSON.parse((await readPrivateFileBounded(path, 1024, ownedRoot)).toString("utf8")),
+      ).toEqual({ recovered: true });
+      await expectWindowsOwnerOnly(ownedRoot);
+      await expectWindowsOwnerOnly(path);
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "rejects Windows publication parent replacement while recovering metadata drift",
+    async () => {
+      const root = await temporaryRoot();
+      const ownedRoot = join(root, "replaced publication parent");
+      const displacedRoot = join(root, "displaced publication parent");
+      const path = join(ownedRoot, "state.json");
+      await ensurePrivateDirectory(ownedRoot);
+      expect(privateEntryIdentityFingerprint(lstatSync(ownedRoot, { bigint: true }))).toBeDefined();
+      let published = false;
+
+      await expect(
+        publishPrivateFileAtomic({
+          path,
+          ownedRoot,
+          sourceDirectory: ownedRoot,
+          hardenOnPosix: false,
+          onWindowsParentCheckpoint: () => {
+            renameSync(ownedRoot, displacedRoot);
+            mkdirSync(ownedRoot);
+          },
+          publish: async () => {
+            published = true;
+            return await writeJsonAtomic(path, { unsafe: true });
+          },
+        }),
+      ).rejects.toThrow("Private publication parent changed filesystem identity");
+      expect(published).toBe(false);
     },
   );
 

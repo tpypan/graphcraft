@@ -25,7 +25,9 @@ import {
 } from "./secure-fs.ts";
 
 const PROBE_PROCESS_JOURNAL_MAX_BYTES = 64 * 1024;
-export const PROBE_PROCESS_SETTLEMENT_WAIT_MS = 6_000;
+// The managed broker allows taskkill ten seconds to confirm a Windows process
+// tree under load. Recovery must outlive that bounded broker decision.
+export const PROBE_PROCESS_SETTLEMENT_WAIT_MS = process.platform === "win32" ? 12_000 : 6_000;
 const PROBE_PROCESS_REMOVAL_RETRY_MS = 2_000;
 const WINDOWS_TRANSIENT_REMOVAL_ERRORS = new Set(["EACCES", "EBUSY", "EPERM"]);
 const probeProcessRunMutationTails = new Map<string, Promise<void>>();

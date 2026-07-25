@@ -271,6 +271,7 @@ interface PendingRequest {
   readonly resolve: () => void;
   readonly reject: (error: Error) => void;
   readonly timer: NodeJS.Timeout;
+  commitDispatched: boolean;
   allLinesDispatched: boolean;
 }
 
@@ -343,6 +344,7 @@ export class PersistentWindowsAclHelper {
         resolve,
         reject,
         timer,
+        commitDispatched: false,
         allLinesDispatched: false,
       };
       void this.#writeRequest(state, request);
@@ -416,6 +418,15 @@ export class PersistentWindowsAclHelper {
           Buffer.byteLength(line, "utf8") > this.#options.requestLineLimitBytes
         )
           throw new Error("Windows ACL helper request contains an invalid bounded line");
+        if (lineIndex === request.lineCount - 1) {
+          const pending = state.pending;
+          if (pending === undefined) return;
+          // A real child cannot observe this line before stdin.write is
+          // invoked. Mark that boundary immediately before the call so a
+          // fast helper response can be buffered while libuv's write callback
+          // is still pending.
+          pending.commitDispatched = true;
+        }
         await new Promise<void>((resolveWrite, rejectWrite) => {
           state.child.stdin.write(line, "utf8", (error) => {
             if (error) rejectWrite(error);
@@ -426,7 +437,10 @@ export class PersistentWindowsAclHelper {
       if (!iterator.next().done)
         throw new Error("Windows ACL helper request line count changed during encoding");
       const pending = state.pending;
-      if (pending !== undefined) pending.allLinesDispatched = true;
+      if (pending !== undefined) {
+        pending.allLinesDispatched = true;
+        this.#settleBufferedResponse(state);
+      }
     } catch (error) {
       if (!state.stopped)
         this.#stop(
@@ -444,22 +458,28 @@ export class PersistentWindowsAclHelper {
       this.#stop(state, new Error("Windows ACL helper produced output without a pending request"));
       return;
     }
+    if (!state.pending.commitDispatched) {
+      this.#stop(state, new Error("Windows ACL helper responded before request commit"));
+      return;
+    }
     const bytes = Buffer.isBuffer(chunk) ? Buffer.from(chunk) : Buffer.from(chunk, "utf8");
     if (state.stdout.length + bytes.length > this.#options.outputLimitBytes) {
       this.#stop(state, new Error("Windows ACL helper exceeded its bounded output limit"));
       return;
     }
     state.stdout = Buffer.concat([state.stdout, bytes]);
+    this.#settleBufferedResponse(state);
+  }
+
+  #settleBufferedResponse(state: HelperState): void {
+    if (state.stopped || state.pending === undefined) return;
     const newline = state.stdout.indexOf(0x0a);
     if (newline < 0) return;
     if (newline !== state.stdout.length - 1 || state.stdout.indexOf(0x0a, newline + 1) >= 0) {
       this.#stop(state, new Error("Windows ACL helper produced malformed multi-line output"));
       return;
     }
-    if (!state.pending.allLinesDispatched) {
-      this.#stop(state, new Error("Windows ACL helper responded before request commit"));
-      return;
-    }
+    if (!state.pending.allLinesDispatched) return;
 
     let lineBytes = state.stdout.subarray(0, newline);
     if (lineBytes.at(-1) === 0x0d) lineBytes = lineBytes.subarray(0, -1);

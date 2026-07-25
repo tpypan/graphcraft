@@ -10,6 +10,12 @@ export const DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM = MIB;
 export const DEFAULT_PROCESS_INPUT_BYTES = 8 * MIB;
 export const PROCESS_TERMINATION_GRACE_MS = 2_000;
 export const PROCESS_SETTLEMENT_GRACE_MS = 2_000;
+export const WINDOWS_PROCESS_SETTLEMENT_GRACE_MS = 8_000;
+
+/** Keep Windows tree termination bounded while allowing taskkill to start under load. @internal */
+export function managedProcessSettlementGraceMs(platform: NodeJS.Platform): number {
+  return platform === "win32" ? WINDOWS_PROCESS_SETTLEMENT_GRACE_MS : PROCESS_SETTLEMENT_GRACE_MS;
+}
 
 export type ProcessOutputOverflow = "reject" | "truncate";
 
@@ -160,9 +166,15 @@ const { fsyncSync, writeSync } = require("node:fs");
 
 const executionId = process.argv[1];
 const ownerToken = process.argv[2];
+const gracefulMs = Number(process.argv[3]);
+const settlementMs = Number(process.argv[4]);
 const journalFd = 4;
-const gracefulMs = 2000;
-const settlementMs = 2000;
+if (
+  !Number.isSafeInteger(gracefulMs) ||
+  gracefulMs <= 0 ||
+  !Number.isSafeInteger(settlementMs) ||
+  settlementMs <= 0
+) process.exit(1);
 let target;
 let settled = false;
 let terminating = false;
@@ -514,7 +526,14 @@ async function runManagedProcess(
   return await new Promise<ProcessResult>((resolve, reject) => {
     const broker = crossSpawn.spawn(
       process.execPath,
-      ["-e", MANAGED_PROCESS_BROKER_SOURCE, lifecycle.executionId, lifecycle.ownerToken],
+      [
+        "-e",
+        MANAGED_PROCESS_BROKER_SOURCE,
+        lifecycle.executionId,
+        lifecycle.ownerToken,
+        String(PROCESS_TERMINATION_GRACE_MS),
+        String(managedProcessSettlementGraceMs(process.platform)),
+      ],
       {
         cwd: options.cwd,
         env: environment,
@@ -558,7 +577,7 @@ async function runManagedProcess(
           } catch {
             // Missing confirmed settlement is reported below instead of guessed.
           }
-        }, PROCESS_SETTLEMENT_GRACE_MS);
+        }, managedProcessSettlementGraceMs(process.platform));
         settlementTimer.unref();
       }, PROCESS_TERMINATION_GRACE_MS);
       escalationTimer.unref();
