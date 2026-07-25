@@ -19895,7 +19895,10 @@ var RunStorageManifestSchema = external_exports.union([
       artifactInventory: external_exports.union([external_exports.literal(1), external_exports.literal(2)]),
       // Schema v3 predates this independent domain selector. An omitted field
       // is therefore an explicit legacy-v1 declaration, never a v2 inference.
-      workspaceScopeSnapshots: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).default(1)
+      workspaceScopeSnapshots: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).default(1),
+      // Probe-evidence checkpoints were also persisted before their hashing
+      // domain became independent. Omission therefore selects legacy v1.
+      probeEvidenceCheckpoints: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).default(1)
     })
   })
 ]);
@@ -22173,7 +22176,12 @@ function assertRequiredHostCapabilities(owner, capabilities) {
 }
 
 // packages/core/src/leases.ts
-function progressVector(probeResults, family) {
+import { isDeepStrictEqual } from "node:util";
+function compareStrings(left, right, algorithm) {
+  if (algorithm === LEGACY_CANONICAL_HASH_ALGORITHM) return left.localeCompare(right);
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+function progressVector(probeResults, family, algorithm) {
   const passedProbeIds = probeResults.filter(({ passed }) => passed).map(({ probeId }) => probeId).sort();
   const failingProbeIds = probeResults.filter(({ passed }) => !passed).map(({ probeId }) => probeId).sort();
   const metrics = { failingProbes: failingProbeIds.length };
@@ -22188,28 +22196,40 @@ function progressVector(probeResults, family) {
     passed,
     signature,
     metrics: resultMetrics ?? {}
-  })).sort((left, right) => left.probeId.localeCompare(right.probeId));
+  })).sort((left, right) => compareStrings(left.probeId, right.probeId, algorithm));
   return {
-    digest: contentHash({ probes, metrics }),
+    digest: contentHash({ probes, metrics }, algorithm),
     passedProbeIds,
     failingProbeIds,
     metrics
   };
 }
-function evidenceSnapshot(workspaceDigest, probeResults, family) {
+function evidenceSnapshot(workspaceDigest, probeResults, family, algorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
   const failedResults = probeResults.filter((result) => !result.passed);
-  const vector = progressVector(probeResults, family);
+  const vector = progressVector(probeResults, family, algorithm);
   return {
-    digest: contentHash({ workspaceDigest, vector: vector.digest }),
+    digest: contentHash({ workspaceDigest, vector: vector.digest }, algorithm),
     workspaceDigest,
     passed: probeResults.length - failedResults.length,
     failed: failedResults.length,
     failureSignature: contentHash(
-      failedResults.map(({ probeId, signature }) => ({ probeId, signature })).sort((left, right) => left.probeId.localeCompare(right.probeId))
+      failedResults.map(({ probeId, signature }) => ({ probeId, signature })).sort((left, right) => compareStrings(left.probeId, right.probeId, algorithm)),
+      algorithm
     ),
     probeResults,
     vector
   };
+}
+function parseEvidenceSnapshot(value, family, algorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
+  const parsed = EvidenceSnapshotSchema.safeParse(value);
+  if (!parsed.success) return void 0;
+  const recomputed = evidenceSnapshot(
+    parsed.data.workspaceDigest,
+    parsed.data.probeResults,
+    family,
+    algorithm
+  );
+  return isDeepStrictEqual(parsed.data, recomputed) ? parsed.data : void 0;
 }
 function metricDirection(key) {
   if (/remaining|fail|unresolved|error|missing|todo/i.test(key)) return "lower";
@@ -26318,6 +26338,7 @@ var PersistentWindowsAclHelper = class {
         resolve: resolve19,
         reject,
         timer,
+        commitDispatched: false,
         allLinesDispatched: false
       };
       void this.#writeRequest(state, request);
@@ -26381,6 +26402,11 @@ var PersistentWindowsAclHelper = class {
         const line2 = next.value;
         if (!line2.endsWith("\n") || line2.slice(0, -1).includes("\n") || line2.slice(0, -1).includes("\r") || Buffer.byteLength(line2, "utf8") > this.#options.requestLineLimitBytes)
           throw new Error("Windows ACL helper request contains an invalid bounded line");
+        if (lineIndex === request.lineCount - 1) {
+          const pending2 = state.pending;
+          if (pending2 === void 0) return;
+          pending2.commitDispatched = true;
+        }
         await new Promise((resolveWrite, rejectWrite) => {
           state.child.stdin.write(line2, "utf8", (error51) => {
             if (error51) rejectWrite(error51);
@@ -26391,7 +26417,10 @@ var PersistentWindowsAclHelper = class {
       if (!iterator.next().done)
         throw new Error("Windows ACL helper request line count changed during encoding");
       const pending = state.pending;
-      if (pending !== void 0) pending.allLinesDispatched = true;
+      if (pending !== void 0) {
+        pending.allLinesDispatched = true;
+        this.#settleBufferedResponse(state);
+      }
     } catch (error51) {
       if (!state.stopped)
         this.#stop(
@@ -26408,22 +26437,27 @@ var PersistentWindowsAclHelper = class {
       this.#stop(state, new Error("Windows ACL helper produced output without a pending request"));
       return;
     }
+    if (!state.pending.commitDispatched) {
+      this.#stop(state, new Error("Windows ACL helper responded before request commit"));
+      return;
+    }
     const bytes = Buffer.isBuffer(chunk) ? Buffer.from(chunk) : Buffer.from(chunk, "utf8");
     if (state.stdout.length + bytes.length > this.#options.outputLimitBytes) {
       this.#stop(state, new Error("Windows ACL helper exceeded its bounded output limit"));
       return;
     }
     state.stdout = Buffer.concat([state.stdout, bytes]);
+    this.#settleBufferedResponse(state);
+  }
+  #settleBufferedResponse(state) {
+    if (state.stopped || state.pending === void 0) return;
     const newline = state.stdout.indexOf(10);
     if (newline < 0) return;
     if (newline !== state.stdout.length - 1 || state.stdout.indexOf(10, newline + 1) >= 0) {
       this.#stop(state, new Error("Windows ACL helper produced malformed multi-line output"));
       return;
     }
-    if (!state.pending.allLinesDispatched) {
-      this.#stop(state, new Error("Windows ACL helper responded before request commit"));
-      return;
-    }
+    if (!state.pending.allLinesDispatched) return;
     let lineBytes = state.stdout.subarray(0, newline);
     if (lineBytes.at(-1) === 13) lineBytes = lineBytes.subarray(0, -1);
     const line2 = lineBytes.toString("utf8");
@@ -26887,27 +26921,32 @@ async function serializePrivatePathMutation(path2, work) {
   }
 }
 async function hardenWindowsEntriesLocked(entries, force = false) {
-  if (entries.length === 0) return;
+  if (entries.length === 0) return [];
+  const inspections = [];
   const pending = [];
-  for (const entry of entries) {
+  for (const [index, entry] of entries.entries()) {
     const inspected = await inspectPrivateEntry(entry.path);
     if (inspected.entry.kind !== entry.kind)
       throw new Error(`Private ACL target changed filesystem kind: ${entry.path}`);
+    inspections.push(inspected);
     if (force || inspected.identityFingerprint === void 0 || hardenedWindowsIdentities.get(inspected.identityFingerprint) !== inspected.metadataFingerprint)
-      pending.push({ entry, identityFingerprint: inspected.identityFingerprint });
+      pending.push({ entry, index, identityFingerprint: inspected.identityFingerprint });
     else rememberWindowsIdentity(inspected.identityFingerprint, inspected.metadataFingerprint);
   }
-  if (pending.length === 0) return;
-  await runWindowsAclBatch(pending.map(({ entry }) => entry));
-  for (const { entry, identityFingerprint } of pending) {
-    const inspected = await inspectPrivateEntry(entry.path);
-    if (inspected.entry.kind !== entry.kind)
-      throw new Error(`Private ACL target changed filesystem kind: ${entry.path}`);
-    if (identityFingerprint !== void 0 && inspected.identityFingerprint !== identityFingerprint)
-      throw new Error(`Private ACL target changed filesystem identity: ${entry.path}`);
-    if (inspected.identityFingerprint === identityFingerprint)
-      rememberWindowsIdentity(identityFingerprint, inspected.metadataFingerprint);
+  if (pending.length > 0) {
+    await runWindowsAclBatch(pending.map(({ entry }) => entry));
+    for (const { entry, index, identityFingerprint } of pending) {
+      const inspected = await inspectPrivateEntry(entry.path);
+      if (inspected.entry.kind !== entry.kind)
+        throw new Error(`Private ACL target changed filesystem kind: ${entry.path}`);
+      if (identityFingerprint !== void 0 && inspected.identityFingerprint !== identityFingerprint)
+        throw new Error(`Private ACL target changed filesystem identity: ${entry.path}`);
+      inspections[index] = inspected;
+      if (inspected.identityFingerprint === identityFingerprint)
+        rememberWindowsIdentity(identityFingerprint, inspected.metadataFingerprint);
+    }
   }
+  return inspections;
 }
 async function hardenWindowsEntries(entries, force = false) {
   if (supportsPosixModes || entries.length === 0) return;
@@ -27173,6 +27212,47 @@ async function finalizePrivateDirectoryMutation(checkpoint, ownedRoot = checkpoi
     await hardenWindowsEntriesLocked([inspected.entry]);
   });
 }
+async function inspectWindowsPublicationParentsLocked(parentPaths, checkpoint) {
+  const entries = parentPaths.map((path2) => ({ kind: "directory", path: path2 }));
+  const verified = await hardenWindowsEntriesLocked(entries);
+  const expectedIdentities = verified.map(({ identityFingerprint }) => identityFingerprint);
+  checkpoint?.({ boundary: "after_hardening", parentPaths });
+  for (let attempt = 1; attempt <= WINDOWS_ACL_VERIFICATION_ATTEMPTS; attempt += 1) {
+    if (attempt > 1) {
+      const rehardened = await hardenWindowsEntriesLocked(entries, true);
+      for (const [index, inspected] of rehardened.entries()) {
+        const expectedIdentity = expectedIdentities[index];
+        if (expectedIdentity !== void 0 && inspected.identityFingerprint !== void 0 && inspected.identityFingerprint !== expectedIdentity)
+          throw new Error(
+            `Private publication parent changed filesystem identity: ${inspected.entry.path}`
+          );
+        if (expectedIdentity === void 0 && inspected.identityFingerprint !== void 0)
+          expectedIdentities[index] = inspected.identityFingerprint;
+      }
+    }
+    const inspectedParents = await Promise.all(parentPaths.map(inspectPrivateEntry));
+    let driftedParent;
+    for (const [index, inspected] of inspectedParents.entries()) {
+      if (inspected.entry.kind !== "directory")
+        throw new Error(`Private publication parent is not a directory: ${inspected.entry.path}`);
+      const expectedIdentity = expectedIdentities[index];
+      if (expectedIdentity !== void 0 && inspected.identityFingerprint !== void 0 && inspected.identityFingerprint !== expectedIdentity)
+        throw new Error(
+          `Private publication parent changed filesystem identity: ${inspected.entry.path}`
+        );
+      if (expectedIdentity === void 0 && inspected.identityFingerprint !== void 0)
+        expectedIdentities[index] = inspected.identityFingerprint;
+      if (inspected.identityFingerprint !== void 0 && (inspected.metadataFingerprint === void 0 || hardenedWindowsIdentities.get(inspected.identityFingerprint) !== inspected.metadataFingerprint))
+        driftedParent ??= inspected;
+    }
+    if (driftedParent === void 0) return inspectedParents;
+    if (attempt === WINDOWS_ACL_VERIFICATION_ATTEMPTS)
+      throw new Error(
+        `Unable to verify owner-only publication parent identity: ${driftedParent.entry.path}`
+      );
+  }
+  throw new Error("Unable to verify owner-only publication parent identity");
+}
 async function publishPrivateFileAtomic(input) {
   const absolute = resolve2(input.path);
   const root = resolve2(input.ownedRoot);
@@ -27212,20 +27292,10 @@ async function publishPrivateFileAtomic(input) {
       } catch (error51) {
         if (!isMissing(error51)) throw error51;
       }
-      await hardenWindowsEntriesLocked(
-        parentPaths.map((parent) => ({ kind: "directory", path: parent }))
+      const parentsBefore = await inspectWindowsPublicationParentsLocked(
+        parentPaths,
+        input.onWindowsParentCheckpoint
       );
-      const parentsBefore = await Promise.all(parentPaths.map(inspectPrivateEntry));
-      for (const parentBefore of parentsBefore) {
-        if (parentBefore.entry.kind !== "directory")
-          throw new Error(
-            `Private publication parent is not a directory: ${parentBefore.entry.path}`
-          );
-        if (parentBefore.identityFingerprint !== void 0 && (parentBefore.metadataFingerprint === void 0 || hardenedWindowsIdentities.get(parentBefore.identityFingerprint) !== parentBefore.metadataFingerprint))
-          throw new Error(
-            `Unable to verify owner-only publication parent identity: ${parentBefore.entry.path}`
-          );
-      }
       const publication = await input.publish();
       await validatePrivatePath(root, relativePath);
       const [parentsAfter, fileAfter] = await Promise.all([
@@ -27788,7 +27858,7 @@ import { createHash as createHash3, randomUUID as randomUUID4 } from "node:crypt
 import { constants as fsConstants3 } from "node:fs";
 import { lstat as lstat4, open as open4, readdir as readdir2, rmdir, unlink as unlink2 } from "node:fs/promises";
 import { basename as basename2, dirname as dirname5, isAbsolute as isAbsolute4, join as join5, posix, relative as relative3, resolve as resolve4, win32 as win323 } from "node:path";
-import { isDeepStrictEqual } from "node:util";
+import { isDeepStrictEqual as isDeepStrictEqual2 } from "node:util";
 var MIB3 = 1024 * 1024;
 var ATOMIC_STAGING_DIRECTORY = ".artifact-staging";
 var MUTATION_JOURNAL_PATH = "artifact-mutation.json";
@@ -27809,7 +27879,7 @@ function now() {
 function bytesHash(bytes, algorithm) {
   return contentHash({ contents: Buffer.from(bytes).toString("base64") }, algorithm);
 }
-function compareStrings(left, right, algorithm) {
+function compareStrings2(left, right, algorithm) {
   return algorithm === LEGACY_CANONICAL_HASH_ALGORITHM ? left.localeCompare(right) : left < right ? -1 : left > right ? 1 : 0;
 }
 function formatForPath(path2) {
@@ -28368,7 +28438,7 @@ function boundedRecoveryCheckpoint(checkpoint, limit) {
 }
 function inventoryTotals(inventory, algorithm, updatedAt = now()) {
   const entries = [...inventory.entries].sort(
-    (left, right) => compareStrings(left.path, right.path, algorithm)
+    (left, right) => compareStrings2(left.path, right.path, algorithm)
   );
   return validateArtifactInventory({
     ...inventory,
@@ -28615,7 +28685,7 @@ var RunArtifactStore = class {
       throw new Error("Artifact write mutation does not describe stored target bytes");
     if (journal.action === "delete" && (!previous || next))
       throw new Error("Artifact delete mutation does not describe a stored-to-absent transition");
-    if (journal.action === "unchanged" && !isDeepStrictEqual(previous, next))
+    if (journal.action === "unchanged" && !isDeepStrictEqual2(previous, next))
       throw new Error("Artifact metadata mutation changes target bytes without a write action");
   }
   async readTarget(relativePath, expectedSizes, lease) {
@@ -28678,8 +28748,8 @@ var RunArtifactStore = class {
     lease.assertHeld();
     const inventoryHash = this.hash(inventory);
     const currentEntry = inventory.entries.find(({ path: path2 }) => path2 === journal.path);
-    const currentIsPrevious = inventoryHash === journal.previousInventoryHash && isDeepStrictEqual(currentEntry, journal.previousEntry);
-    const currentIsNext = inventoryHash === journal.nextInventoryHash && isDeepStrictEqual(currentEntry, journal.nextEntry);
+    const currentIsPrevious = inventoryHash === journal.previousInventoryHash && isDeepStrictEqual2(currentEntry, journal.previousEntry);
+    const currentIsNext = inventoryHash === journal.nextInventoryHash && isDeepStrictEqual2(currentEntry, journal.nextEntry);
     if (!currentIsPrevious && !currentIsNext)
       throw new Error(
         `Artifact mutation ${journal.mutationId} does not match an exact durable inventory snapshot; recovery stopped without changing files`
@@ -29420,6 +29490,10 @@ var DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM = MIB4;
 var DEFAULT_PROCESS_INPUT_BYTES = 8 * MIB4;
 var PROCESS_TERMINATION_GRACE_MS = 2e3;
 var PROCESS_SETTLEMENT_GRACE_MS = 2e3;
+var WINDOWS_PROCESS_SETTLEMENT_GRACE_MS = 8e3;
+function managedProcessSettlementGraceMs(platform2) {
+  return platform2 === "win32" ? WINDOWS_PROCESS_SETTLEMENT_GRACE_MS : PROCESS_SETTLEMENT_GRACE_MS;
+}
 var ProcessOutputLimitError = class extends Error {
   stream;
   capture;
@@ -29490,9 +29564,15 @@ const { fsyncSync, writeSync } = require("node:fs");
 
 const executionId = process.argv[1];
 const ownerToken = process.argv[2];
+const gracefulMs = Number(process.argv[3]);
+const settlementMs = Number(process.argv[4]);
 const journalFd = 4;
-const gracefulMs = 2000;
-const settlementMs = 2000;
+if (
+  !Number.isSafeInteger(gracefulMs) ||
+  gracefulMs <= 0 ||
+  !Number.isSafeInteger(settlementMs) ||
+  settlementMs <= 0
+) process.exit(1);
 let target;
 let settled = false;
 let terminating = false;
@@ -29784,7 +29864,14 @@ async function runManagedProcess(executable, args, environment, options, started
   return await new Promise((resolve19, reject) => {
     const broker = import_cross_spawn4.default.spawn(
       process.execPath,
-      ["-e", MANAGED_PROCESS_BROKER_SOURCE, lifecycle.executionId, lifecycle.ownerToken],
+      [
+        "-e",
+        MANAGED_PROCESS_BROKER_SOURCE,
+        lifecycle.executionId,
+        lifecycle.ownerToken,
+        String(PROCESS_TERMINATION_GRACE_MS),
+        String(managedProcessSettlementGraceMs(process.platform))
+      ],
       {
         cwd: options.cwd,
         env: environment,
@@ -29824,7 +29911,7 @@ async function runManagedProcess(executable, args, environment, options, started
             terminateChildProcessTree(broker, "SIGKILL");
           } catch {
           }
-        }, PROCESS_SETTLEMENT_GRACE_MS);
+        }, managedProcessSettlementGraceMs(process.platform));
         settlementTimer.unref();
       }, PROCESS_TERMINATION_GRACE_MS);
       escalationTimer.unref();
@@ -30388,7 +30475,7 @@ async function assertRepositoryInventoryPaths(repositoryPath, paths, signal) {
     );
   }
 }
-async function runProbe(spec, repositoryPath, signal, lifecycle) {
+async function runProbe(spec, repositoryPath, signal, lifecycle, algorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
   const started = performance.now();
   if (spec.kind === "held_out")
     throw new Error(`Held-out probe ${spec.id} must be resolved by the runtime`);
@@ -30409,12 +30496,15 @@ async function runProbe(spec, repositoryPath, signal, lifecycle) {
         probeId: spec.id,
         kind: spec.kind,
         passed: passed2,
-        signature: contentHash({
-          exitCode: processResult.exitCode,
-          output: compactOutput(processResult),
-          stdoutDigest: processResult.capture.stdout.digest,
-          stderrDigest: processResult.capture.stderr.digest
-        }),
+        signature: contentHash(
+          {
+            exitCode: processResult.exitCode,
+            output: compactOutput(processResult),
+            stdoutDigest: processResult.capture.stdout.digest,
+            stderrDigest: processResult.capture.stderr.digest
+          },
+          algorithm
+        ),
         summary: processResult.timedOut ? `Timed out after ${spec.timeoutMs}ms` : `${spec.command} exited ${processResult.exitCode}${compactOutput(processResult) ? `: ${compactOutput(processResult)}` : ""}`,
         durationMs: processResult.durationMs
       },
@@ -30443,7 +30533,7 @@ async function runProbe(spec, repositoryPath, signal, lifecycle) {
         probeId: spec.id,
         kind: spec.kind,
         passed: passed2,
-        signature: contentHash({ exists, contains }),
+        signature: contentHash({ exists, contains }, algorithm),
         summary,
         durationMs: Math.round(performance.now() - started)
       },
@@ -30467,7 +30557,7 @@ async function runProbe(spec, repositoryPath, signal, lifecycle) {
         probeId: spec.id,
         kind: spec.kind,
         passed: passed2,
-        signature: contentHash({ matches, terms: spec.terms }),
+        signature: contentHash({ matches, terms: spec.terms }, algorithm),
         summary,
         durationMs: inventory.durationMs,
         metrics: { inventoryMatches: matches.length }
@@ -30494,7 +30584,7 @@ async function runProbe(spec, repositoryPath, signal, lifecycle) {
       probeId: spec.id,
       kind: spec.kind,
       passed,
-      signature: contentHash(output),
+      signature: contentHash(output, algorithm),
       summary: hasChanges ? output.split("\n").slice(0, 20).join(", ") : "No workspace changes",
       durationMs: Math.round(performance.now() - started)
     },
@@ -32655,7 +32745,7 @@ import { createHash as createHash5 } from "node:crypto";
 import { constants as fsConstants4 } from "node:fs";
 import { lstat as lstat7, mkdir as mkdir4, open as open6, readdir as readdir3, rename as rename2, rm as rm3 } from "node:fs/promises";
 import { join as join9, relative as relative5, resolve as resolve8 } from "node:path";
-import { isDeepStrictEqual as isDeepStrictEqual2 } from "node:util";
+import { isDeepStrictEqual as isDeepStrictEqual3 } from "node:util";
 var CURRENT_RUN_STORAGE_VERSION = 3;
 var BACKUP_COMPLETION_FILE = ".backup-complete.json";
 var ARTIFACT_INVENTORY_FILE = "artifact-inventory.json";
@@ -32676,7 +32766,7 @@ var LEGACY_MIGRATION_RESOURCE_LIMITS = Object.freeze({
   maximumFileCount: 4 * 1024,
   maximumEntryCount: 8 * 1024
 });
-function manifest(runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, initialization) {
+function manifest(runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, probeEvidenceCheckpointFormat, initialization) {
   return RunStorageManifestSchema.parse({
     schemaVersion: CURRENT_RUN_STORAGE_VERSION,
     runId,
@@ -32699,7 +32789,8 @@ function manifest(runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeForma
       locks: 1,
       artifactInventory: artifactInventoryFormat,
       artifactPolicy: 1,
-      workspaceScopeSnapshots: workspaceScopeSnapshotFormat
+      workspaceScopeSnapshots: workspaceScopeSnapshotFormat,
+      probeEvidenceCheckpoints: probeEvidenceCheckpointFormat
     }
   });
 }
@@ -32713,7 +32804,7 @@ async function validateRunStorageRoot(input) {
   if (validated !== runRoot)
     throw new Error(`Run storage path escaped the Graphcraft state directory: ${input.runRoot}`);
 }
-async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, initialization, lease) {
+async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, probeEvidenceCheckpointFormat, initialization, lease) {
   const value = manifest(
     runId,
     migratedFrom,
@@ -32721,6 +32812,7 @@ async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom, ca
     heldOutProbeFormat,
     artifactInventoryFormat,
     workspaceScopeSnapshotFormat,
+    probeEvidenceCheckpointFormat,
     initialization
   );
   await migrationStep(lease, async () => await ensurePrivateDirectory(runRoot));
@@ -32742,6 +32834,7 @@ async function writeCurrentRunStorageManifest(runRoot, runId, migratedFrom) {
     2,
     2,
     2,
+    2,
     "ready"
   );
 }
@@ -32751,6 +32844,7 @@ async function writeInitializingRunStorageManifest(runRoot, runId) {
     runId,
     CURRENT_RUN_STORAGE_VERSION,
     PORTABLE_CANONICAL_HASH_ALGORITHM,
+    2,
     2,
     2,
     2,
@@ -33043,7 +33137,7 @@ function legacySnapshotRefreshInvariantView(snapshot) {
   };
 }
 function assertLegacySnapshotRefreshIsCtimeOnly(preflight, refreshed) {
-  if (!isDeepStrictEqual2(
+  if (!isDeepStrictEqual3(
     legacySnapshotRefreshInvariantView(preflight),
     legacySnapshotRefreshInvariantView(refreshed)
   ))
@@ -33300,7 +33394,7 @@ async function captureLegacyTreeSnapshot(root, lease, options = {}) {
     files.push(file2);
   }
   const after = await scanLegacyTreeMetadata(root, options, lease);
-  if (!isDeepStrictEqual2(legacyMetadataView(metadata), legacyMetadataView(after)))
+  if (!isDeepStrictEqual3(legacyMetadataView(metadata), legacyMetadataView(after)))
     throw new Error("Legacy run tree changed during migration preflight; no backup was created");
   return {
     rootFingerprint: metadata.rootFingerprint,
@@ -33593,10 +33687,10 @@ async function copyLegacySnapshot(sourceRoot, temporaryRoot, snapshot, lease, ch
     rejectBackupMarker: true,
     enforceDestinationLimits: true
   });
-  if (!isDeepStrictEqual2(legacySnapshotView(sourceAfterCopy), legacySnapshotView(snapshot)))
+  if (!isDeepStrictEqual3(legacySnapshotView(sourceAfterCopy), legacySnapshotView(snapshot)))
     throw new Error("Legacy run tree changed during backup copy; no backup was created");
   const copied = await captureLegacyTreeSnapshot(temporaryRoot, lease);
-  if (!isDeepStrictEqual2(legacySnapshotContents(copied), legacySnapshotContents(snapshot)))
+  if (!isDeepStrictEqual3(legacySnapshotContents(copied), legacySnapshotContents(snapshot)))
     throw new Error("Storage migration backup digest does not match the preflight snapshot");
 }
 async function ensureCompleteBackup(input, sourceSnapshot, lease, checkpoint) {
@@ -33604,7 +33698,7 @@ async function ensureCompleteBackup(input, sourceSnapshot, lease, checkpoint) {
     rejectBackupMarker: true,
     enforceDestinationLimits: true
   });
-  if (!isDeepStrictEqual2(legacySnapshotView(verifiedSource), legacySnapshotView(sourceSnapshot)))
+  if (!isDeepStrictEqual3(legacySnapshotView(verifiedSource), legacySnapshotView(sourceSnapshot)))
     throw new Error("Legacy run tree changed after migration preflight; no backup was created");
   await migrationStep(lease, async () => await ensurePrivateDirectory(input.graphcraftRoot));
   await migrationStep(
@@ -33819,6 +33913,15 @@ async function validateInitializingRunStorage(runRoot, runId, manifest2, lease) 
     throw new Error(
       `Run ${runId} has an incomplete schema-v3 initialization before its first durable event. No files were changed.`
     );
+  const probeEvidenceFormatMismatch = events.some((event) => {
+    if (event.type !== "run.created" && event.type !== "scope.started") return false;
+    const declared = event.data.probeEvidenceCheckpointFormat;
+    return manifest2.formats.probeEvidenceCheckpoints === 2 ? declared !== 2 : declared !== void 0;
+  });
+  if (probeEvidenceFormatMismatch)
+    throw new Error(
+      `Run ${runId} has a probe-evidence checkpoint format that disagrees with its schema-v3 initialization descriptor. No files were changed.`
+    );
   try {
     validateHeldOutProbePlan(
       HeldOutProbePlanSchema.parse(first.data.heldOutProbePlan),
@@ -33832,7 +33935,7 @@ async function validateInitializingRunStorage(runRoot, runId, manifest2, lease) 
 }
 async function assertMigratedInventoryCurrent(artifactStore, expected, lease) {
   const current = await migrationStep(lease, async () => await artifactStore.inventory());
-  if (!isDeepStrictEqual2(current, expected))
+  if (!isDeepStrictEqual3(current, expected))
     throw new Error(
       "Storage migration artifact inventory changed after durable migration; refusing manifest publication"
     );
@@ -33873,6 +33976,7 @@ async function ensureCurrentRunStorage(input) {
         storage.manifest.formats.heldOutProbes,
         storage.manifest.formats.artifactInventory,
         storage.manifest.formats.workspaceScopeSnapshots,
+        storage.manifest.formats.probeEvidenceCheckpoints,
         "ready",
         lease
       );
@@ -33925,6 +34029,7 @@ async function ensureCurrentRunStorage(input) {
       input.runId,
       storage.version,
       LEGACY_CANONICAL_HASH_ALGORITHM,
+      1,
       1,
       1,
       1,
@@ -34260,7 +34365,7 @@ var RunStoreLimitError = class extends Error {
 var RunStoreEventLogCorruptionError = class extends Error {
   constructor(record2, offsetBytes, trailing, reason) {
     const location = trailing ? "trailing record" : `record ${record2}`;
-    const problem = reason === "encoding" ? "invalid UTF-8" : reason === "json" ? "invalid JSON" : reason === "schema" ? "an invalid event schema" : reason === "hash" ? "an invalid event hash" : reason === "format" ? "an event format that disagrees with its storage manifest" : reason === "scope" ? "a workspace-scope snapshot that disagrees with its storage manifest" : "an invalid event sequence";
+    const problem = reason === "encoding" ? "invalid UTF-8" : reason === "json" ? "invalid JSON" : reason === "schema" ? "an invalid event schema" : reason === "hash" ? "an invalid event hash" : reason === "format" ? "an event format that disagrees with its storage manifest" : reason === "scope" ? "a workspace-scope snapshot that disagrees with its storage manifest" : reason === "checkpoint" ? "a probe-evidence checkpoint format that disagrees with its storage manifest" : "an invalid event sequence";
     super(
       `Run event log has ${problem} in ${location} at byte ${offsetBytes}; event log bytes were left unchanged`
     );
@@ -34334,6 +34439,11 @@ function workspaceScopeSnapshotUsesDifferentHashPolicy(value, selected) {
   const other = selected === PORTABLE_CANONICAL_HASH_ALGORITHM ? LEGACY_CANONICAL_HASH_ALGORITHM : PORTABLE_CANONICAL_HASH_ALGORITHM;
   return parseWorkspaceScopeSnapshot(snapshot, other) !== void 0;
 }
+function probeEvidenceCheckpointUsesDifferentFormat(event, selected) {
+  if (event.type !== "run.created" && event.type !== "scope.started") return false;
+  const format = event.data.probeEvidenceCheckpointFormat;
+  return selected === PORTABLE_CANONICAL_HASH_ALGORITHM ? format !== 2 : format !== void 0;
+}
 var RunStore = class _RunStore {
   repositoryRoot;
   runId;
@@ -34348,6 +34458,7 @@ var RunStore = class _RunStore {
   _heldOutProbePlanHashAlgorithm;
   _artifactHashAlgorithm;
   _workspaceScopeHashAlgorithm;
+  _probeEvidenceCheckpointHashAlgorithm;
   constructor(repositoryRoot, runId, limits = {}, canonicalHashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
     this.repositoryRoot = repositoryRoot;
     this.runId = runId;
@@ -34393,6 +34504,8 @@ var RunStore = class _RunStore {
       this.bindArtifactHashAlgorithm(artifactHashAlgorithm);
       const workspaceScopeHashAlgorithm = manifest2.formats.workspaceScopeSnapshots === 2 ? PORTABLE_CANONICAL_HASH_ALGORITHM : LEGACY_CANONICAL_HASH_ALGORITHM;
       this.bindWorkspaceScopeHashAlgorithm(workspaceScopeHashAlgorithm);
+      const probeEvidenceCheckpointHashAlgorithm = manifest2.formats.probeEvidenceCheckpoints === 2 ? PORTABLE_CANONICAL_HASH_ALGORITHM : LEGACY_CANONICAL_HASH_ALGORITHM;
+      this.bindProbeEvidenceCheckpointHashAlgorithm(probeEvidenceCheckpointHashAlgorithm);
       await this.validateStorageRoot();
     } catch (error51) {
       if (this.storageReady === ready) this.storageReady = void 0;
@@ -34418,6 +34531,13 @@ var RunStore = class _RunStore {
       throw new Error("Workspace-scope hash policy is unavailable before run storage is prepared");
     return this._workspaceScopeHashAlgorithm;
   }
+  get probeEvidenceCheckpointHashAlgorithm() {
+    if (!this._probeEvidenceCheckpointHashAlgorithm)
+      throw new Error(
+        "Probe-evidence checkpoint hash policy is unavailable before run storage is prepared"
+      );
+    return this._probeEvidenceCheckpointHashAlgorithm;
+  }
   bindArtifactHashAlgorithm(algorithm) {
     if (this.artifactStore && this.artifactStore.hashAlgorithm !== algorithm)
       throw new Error("Artifact store was bound before its storage manifest policy was known");
@@ -34429,6 +34549,13 @@ var RunStore = class _RunStore {
         "Workspace-scope hashing was bound before its storage manifest policy was known"
       );
     this._workspaceScopeHashAlgorithm = algorithm;
+  }
+  bindProbeEvidenceCheckpointHashAlgorithm(algorithm) {
+    if (this._probeEvidenceCheckpointHashAlgorithm && this._probeEvidenceCheckpointHashAlgorithm !== algorithm)
+      throw new Error(
+        "Probe-evidence checkpoint hashing was bound before its storage manifest policy was known"
+      );
+    this._probeEvidenceCheckpointHashAlgorithm = algorithm;
   }
   artifacts() {
     return this.artifactStore ??= new RunArtifactStore(
@@ -34493,6 +34620,7 @@ var RunStore = class _RunStore {
     store.initializing = true;
     store.bindArtifactHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     store.bindWorkspaceScopeHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    store.bindProbeEvidenceCheckpointHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     const persistedContract = RunContractSchema.parse(redactValue(contract));
     const persistedGraph = GraphSchema.parse(redactValue(graph));
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
@@ -34526,7 +34654,8 @@ var RunStore = class _RunStore {
           graph: persistedGraph,
           probePlan,
           heldOutProbePlan,
-          nodeIds: graph.nodes.map(({ id }) => id)
+          nodeIds: graph.nodes.map(({ id }) => id),
+          probeEvidenceCheckpointFormat: 2
         }
       },
       store.canonicalHashAlgorithm
@@ -34841,6 +34970,8 @@ var RunStore = class _RunStore {
         throw new RunStoreEventLogCorruptionError(record2, offset, trailing, "format");
       if (event.sequence !== record2)
         throw new RunStoreEventLogCorruptionError(record2, offset, trailing, "sequence");
+      if (probeEvidenceCheckpointUsesDifferentFormat(event, this.probeEvidenceCheckpointHashAlgorithm))
+        throw new RunStoreEventLogCorruptionError(record2, offset, trailing, "checkpoint");
       const scopeSnapshot = eventWorkspaceScopeSnapshot(event);
       if (scopeSnapshot !== void 0 && workspaceScopeSnapshotUsesDifferentHashPolicy(
         scopeSnapshot,
@@ -35710,20 +35841,34 @@ function concise(value, limit = 240) {
 }
 async function assessRunProgress(input) {
   const state = await input.store.loadState();
-  const existing = state.progressTrajectory.findLast(
-    ({ attemptId }) => attemptId === input.attemptId
-  );
+  const algorithm = input.store.probeEvidenceCheckpointHashAlgorithm;
+  const current = parseEvidenceSnapshot(input.current, input.family, algorithm);
+  if (!current)
+    throw new Error("Graphcraft cannot validate the current progress evidence checkpoint");
+  const requestedBaseline = input.baseline ? parseEvidenceSnapshot(input.baseline, input.family, algorithm) : void 0;
+  if (input.baseline && !requestedBaseline)
+    throw new Error("Graphcraft cannot validate the baseline progress evidence checkpoint");
+  const progressTrajectory = state.progressTrajectory.map((entry) => {
+    const baseline2 = parseEvidenceSnapshot(entry.baseline, entry.family, algorithm);
+    const persistedCurrent = parseEvidenceSnapshot(entry.current, entry.family, algorithm);
+    if (!baseline2 || !persistedCurrent)
+      throw new Error(
+        `Graphcraft cannot validate the durable progress checkpoint for attempt ${entry.attemptId}`
+      );
+    return { ...entry, baseline: baseline2, current: persistedCurrent };
+  });
+  const existing = progressTrajectory.findLast(({ attemptId }) => attemptId === input.attemptId);
   if (existing) return { trajectory: existing, alreadyRecorded: true };
-  const shape = probeShape(input.current);
-  const comparable = state.progressTrajectory.filter(
+  const shape = probeShape(current);
+  const comparable = progressTrajectory.filter(
     (entry) => entry.family === input.family && probeShape(entry.current) === shape
   );
   const previousForNode = comparable.findLast(({ nodeId }) => nodeId === input.nodeId);
-  const baseline = input.baseline ?? previousForNode?.current ?? comparable.at(-1)?.current ?? input.current;
+  const baseline = requestedBaseline ?? previousForNode?.current ?? comparable.at(-1)?.current ?? current;
   const latest = comparable.at(-1);
-  const historicalEntries = latest && latest.nodeId !== input.nodeId && latest.current.vector.digest === input.current.vector.digest ? comparable.slice(0, -1) : comparable;
-  const history = historicalEntries.flatMap(({ baseline: baseline2, current }) => [baseline2, current]);
-  const classification = comparable.length === 0 && input.firstObservation ? input.firstObservation : classifyProgress(baseline, input.current, [...history, input.current]);
+  const historicalEntries = latest && latest.nodeId !== input.nodeId && latest.current.vector.digest === current.vector.digest ? comparable.slice(0, -1) : comparable;
+  const history = historicalEntries.flatMap(({ baseline: baseline2, current: current2 }) => [baseline2, current2]);
+  const classification = comparable.length === 0 && input.firstObservation ? input.firstObservation : classifyProgress(baseline, current, [...history, current]);
   return {
     alreadyRecorded: false,
     trajectory: ProgressTrajectoryEntrySchema.parse({
@@ -35734,7 +35879,7 @@ async function assessRunProgress(input) {
       strategy: concise(input.strategy),
       classification,
       baseline,
-      current: input.current,
+      current,
       recordedAt: (/* @__PURE__ */ new Date()).toISOString()
     })
   };
@@ -35797,35 +35942,41 @@ import { open as open8, rmdir as rmdir2, unlink as unlink4 } from "node:fs/promi
 import { constants as osConstants2 } from "node:os";
 import { dirname as dirname10, join as join11, relative as relative9 } from "node:path";
 var PROBE_PROCESS_JOURNAL_MAX_BYTES = 64 * 1024;
-var PROBE_PROCESS_SETTLEMENT_WAIT_MS = 6e3;
+var PROBE_PROCESS_SETTLEMENT_WAIT_MS = process.platform === "win32" ? 12e3 : 6e3;
 var PROBE_PROCESS_REMOVAL_RETRY_MS = 2e3;
 var WINDOWS_TRANSIENT_REMOVAL_ERRORS = /* @__PURE__ */ new Set(["EACCES", "EBUSY", "EPERM"]);
 var probeProcessRunMutationTails = /* @__PURE__ */ new Map();
-function commandHash(probe) {
-  return contentHash({
-    schemaVersion: 1,
-    command: probe.command,
-    args: probe.args,
-    cwd: probe.cwd ?? ".",
-    expectedExitCode: probe.expectedExitCode,
-    timeoutMs: probe.timeoutMs
-  });
+function commandHash(probe, hashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
+  return contentHash(
+    {
+      schemaVersion: 1,
+      command: probe.command,
+      args: probe.args,
+      cwd: probe.cwd ?? ".",
+      expectedExitCode: probe.expectedExitCode,
+      timeoutMs: probe.timeoutMs
+    },
+    hashAlgorithm
+  );
 }
-function probeProcessDefinitions(checkpointId, probes) {
+function probeProcessDefinitions(checkpointId, probes, hashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
   return probes.flatMap((probe, index) => {
     if (probe.kind !== "command") return [];
-    const digest = commandHash(probe);
+    const digest = commandHash(probe, hashAlgorithm);
     return [
       {
         schemaVersion: 1,
-        executionId: contentHash({
-          schemaVersion: 1,
-          kind: "probe_process",
-          checkpointId,
-          probeId: probe.id,
-          index,
-          commandHash: digest
-        }),
+        executionId: contentHash(
+          {
+            schemaVersion: 1,
+            kind: "probe_process",
+            checkpointId,
+            probeId: probe.id,
+            index,
+            commandHash: digest
+          },
+          hashAlgorithm
+        ),
         probeId: probe.id,
         commandHash: digest
       }
@@ -35944,7 +36095,10 @@ async function createProbeProcessLease(input) {
       await finalizePrivateDirectoryMutation(directoryMutation, input.graphcraftRoot);
       return {
         definition: input.definition,
-        ownerTokenHash: contentHash(ownerToken),
+        ownerTokenHash: contentHash(
+          ownerToken,
+          input.hashAlgorithm ?? LEGACY_CANONICAL_HASH_ALGORITHM
+        ),
         journalPath: path2,
         journalRelativePath: relative9(input.graphcraftRoot, path2).replaceAll("\\", "/"),
         handle,
@@ -36064,7 +36218,7 @@ async function inspectProbeProcessJournal(input) {
   const lines = source.toString("utf8").split("\n").filter((line2) => line2.length > 0);
   if (lines.length === 0) throw new Error("Probe process journal is empty");
   const prepared = parsePrepared(JSON.parse(lines[0]));
-  if (!prepared || prepared.executionId !== input.definition.executionId || prepared.checkpointId !== input.checkpointId || prepared.nodeId !== input.nodeId || prepared.stage !== input.stage || prepared.probeId !== input.definition.probeId || prepared.commandHash !== input.definition.commandHash || input.ownerTokenHash !== void 0 && contentHash(prepared.ownerToken) !== input.ownerTokenHash)
+  if (!prepared || prepared.executionId !== input.definition.executionId || prepared.checkpointId !== input.checkpointId || prepared.nodeId !== input.nodeId || prepared.stage !== input.stage || prepared.probeId !== input.definition.probeId || prepared.commandHash !== input.definition.commandHash || input.ownerTokenHash !== void 0 && contentHash(prepared.ownerToken, input.hashAlgorithm ?? LEGACY_CANONICAL_HASH_ALGORITHM) !== input.ownerTokenHash)
     throw new Error(
       `Probe process ${input.definition.executionId} has ambiguous ownership metadata`
     );
@@ -37681,16 +37835,8 @@ function populateMissingGraphContext(graph, repositoryEvidence) {
     )
   };
 }
-function persistedBaseline(value, family) {
-  if (typeof value !== "object" || value === null) return void 0;
-  const candidate = value;
-  if (typeof candidate.digest !== "string" || typeof candidate.workspaceDigest !== "string" || typeof candidate.passed !== "number" || typeof candidate.failed !== "number" || typeof candidate.failureSignature !== "string" || !Array.isArray(candidate.probeResults))
-    return void 0;
-  return evidenceSnapshot(
-    candidate.workspaceDigest,
-    candidate.probeResults,
-    family
-  );
+function persistedBaseline(value, family, algorithm) {
+  return parseEvidenceSnapshot(value, family, algorithm);
 }
 async function recoverableInvocation(store, nodeId, repositoryPath, family) {
   const events = await store.loadEvents();
@@ -37710,7 +37856,15 @@ async function recoverableInvocation(store, nodeId, repositoryPath, family) {
   const transcript = await store.loadInvocationEvents(invocationId).catch(() => []);
   const transcriptSession = transcript.findLast((event) => event.type === "session");
   const hostSessionId = session ? String(session.data.hostSessionId) : transcriptSession?.type === "session" ? transcriptSession.hostSessionId : typeof started.data.reusedHostSessionId === "string" ? started.data.reusedHostSessionId : void 0;
-  const baseline = persistedBaseline(started.data.baseline, family);
+  const baseline = persistedBaseline(
+    started.data.baseline,
+    family,
+    store.probeEvidenceCheckpointHashAlgorithm
+  );
+  if (started.data.baseline !== void 0 && !baseline)
+    throw new Error(
+      `Graphcraft cannot validate the durable progress baseline for invocation ${invocationId}`
+    );
   const scopeBaseline = parseWorkspaceScopeSnapshot(
     started.data.scopeBaseline,
     store.workspaceScopeHashAlgorithm
@@ -37936,8 +38090,11 @@ async function configureRunProbes(store, input) {
       heldOutProbePlan,
       addedNodeIds: [],
       rationale: "User edited the deterministic probe plan before approval",
-      previousProbePlanHash: contentHash(await store.loadProbePlan()),
-      probePlanHash: contentHash(probePlan)
+      previousProbePlanHash: contentHash(
+        await store.loadProbePlan(),
+        store.probeEvidenceCheckpointHashAlgorithm
+      ),
+      probePlanHash: contentHash(probePlan, store.probeEvidenceCheckpointHashAlgorithm)
     });
     await Promise.all([
       store.saveGraph(graph),
@@ -38258,7 +38415,8 @@ async function captureProbes(store, specs, workspace, observer, signal, githubLi
         checkpointId: processScope.checkpointId,
         nodeId: processScope.nodeId,
         stage: processScope.stage,
-        definition
+        definition,
+        hashAlgorithm: store.probeEvidenceCheckpointHashAlgorithm
       });
       let completed = false;
       try {
@@ -38300,7 +38458,8 @@ async function captureProbes(store, specs, workspace, observer, signal, githubLi
                   definition.executionId
                 );
               }
-            })
+            }),
+            store.probeEvidenceCheckpointHashAlgorithm
           )
         );
         completed = true;
@@ -38314,7 +38473,15 @@ async function captureProbes(store, specs, workspace, observer, signal, githubLi
           });
       }
     } else {
-      executed.push(await runProbe(spec, workspace.path, signal));
+      executed.push(
+        await runProbe(
+          spec,
+          workspace.path,
+          signal,
+          void 0,
+          store.probeEvidenceCheckpointHashAlgorithm
+        )
+      );
     }
   }
   for (const probe of executed) {
@@ -38469,11 +38636,13 @@ function needsSemanticVerification(phase, probes, classification) {
   if (phase === "completion") return true;
   return classification === "stalled" || classification === "done";
 }
-function stableSemanticProbeEvidence(results) {
+function stableSemanticProbeEvidence(results, algorithm) {
   return results.map(({ artifact: _artifact, durationMs: _durationMs, ...result }) => ({
     ...result,
     durationMs: 0
-  })).sort((left, right) => left.probeId.localeCompare(right.probeId));
+  })).sort(
+    (left, right) => algorithm === PORTABLE_CANONICAL_HASH_ALGORITHM ? left.probeId < right.probeId ? -1 : left.probeId > right.probeId ? 1 : 0 : left.probeId.localeCompare(right.probeId)
+  );
 }
 async function runSemanticVerification(input) {
   const invocationId = randomUUID9();
@@ -38500,8 +38669,14 @@ async function runSemanticVerification(input) {
         relevantPaths: input.node.contextSelector.relevantPaths,
         workerSummary: input.workerSummary,
         workerEvidence: input.workerEvidence,
-        baselineProbeEvidence: stableSemanticProbeEvidence(input.baselineProbeEvidence),
-        currentProbeEvidence: stableSemanticProbeEvidence(input.currentProbeEvidence)
+        baselineProbeEvidence: stableSemanticProbeEvidence(
+          input.baselineProbeEvidence,
+          input.store.probeEvidenceCheckpointHashAlgorithm
+        ),
+        currentProbeEvidence: stableSemanticProbeEvidence(
+          input.currentProbeEvidence,
+          input.store.probeEvidenceCheckpointHashAlgorithm
+        )
       })
     );
     beforeScope = await captureRunWorkspaceScopeSnapshot(
@@ -38514,14 +38689,17 @@ async function runSemanticVerification(input) {
     const failure = error51 instanceof Error ? error51 : new Error(String(error51));
     throw new SemanticVerificationFailure(failure.message, { cause: error51 });
   }
-  const contextHash = contentHash(context);
-  const checkpointId = contentHash({
-    schemaVersion: 1,
-    kind: "semantic_verification",
-    host: input.adapter.id,
-    contextHash,
-    scopeDigest: beforeScope.digest
-  });
+  const contextHash = contentHash(context, input.store.probeEvidenceCheckpointHashAlgorithm);
+  const checkpointId = contentHash(
+    {
+      schemaVersion: 1,
+      kind: "semantic_verification",
+      host: input.adapter.id,
+      contextHash,
+      scopeDigest: beforeScope.digest
+    },
+    input.store.probeEvidenceCheckpointHashAlgorithm
+  );
   const recovered = await recoverSemanticVerification({
     store: input.store,
     node: input.node,
@@ -39160,17 +39338,19 @@ async function appendProgressTrajectory(input) {
     input.trajectory.attemptId
   );
 }
-function persistedProgressCheckpoint(events, nodeId, attemptId) {
+function persistedProgressCheckpoint(events, nodeId, attemptId, family, algorithm) {
   const event = events.findLast(
     ({ actor, type, causationId, data }) => actor === "probe" && type === "node.progress" && causationId === attemptId && data.nodeId === nodeId
   );
   if (!event || typeof event.data.summary !== "string" || !Array.isArray(event.data.evidence))
     return void 0;
   const trajectory = ProgressTrajectoryEntrySchema.safeParse(event.data.trajectory);
-  if (!trajectory.success || trajectory.data.attemptId !== attemptId || trajectory.data.nodeId !== nodeId || event.data.classification !== trajectory.data.classification || event.data.evidence.some((value) => typeof value !== "string") || event.data.semanticStopReason !== void 0 && typeof event.data.semanticStopReason !== "string")
+  const baseline = trajectory.success ? parseEvidenceSnapshot(trajectory.data.baseline, family, algorithm) : void 0;
+  const current = trajectory.success ? parseEvidenceSnapshot(trajectory.data.current, family, algorithm) : void 0;
+  if (!trajectory.success || !baseline || !current || trajectory.data.attemptId !== attemptId || trajectory.data.nodeId !== nodeId || event.data.classification !== trajectory.data.classification || event.data.evidence.some((value) => typeof value !== "string") || event.data.semanticStopReason !== void 0 && typeof event.data.semanticStopReason !== "string")
     return void 0;
   return {
-    trajectory: trajectory.data,
+    trajectory: { ...trajectory.data, baseline, current },
     summary: event.data.summary,
     evidence: event.data.evidence,
     ...typeof event.data.semanticStopReason === "string" ? { semanticStopReason: event.data.semanticStopReason } : {}
@@ -39209,18 +39389,21 @@ function durableRunBlocker(failure) {
 function progressProbeStage(value) {
   return value === "progress_baseline" || value === "progress_current" || value === "verification" ? value : void 0;
 }
-function progressProbeScopePolicyHash(input) {
-  return contentHash({
-    schemaVersion: 1,
-    kind: "probe_scope_policy",
-    runId: input.contract.runId,
-    graphRevision: input.graph.revision,
-    contractScope: input.contract.scope,
-    nodeId: input.node.id,
-    nodeScope: input.node.scope,
-    stage: input.stage,
-    probeIds: input.probeIds
-  });
+function progressProbeScopePolicyHash(input, algorithm) {
+  return contentHash(
+    {
+      schemaVersion: 1,
+      kind: "probe_scope_policy",
+      runId: input.contract.runId,
+      graphRevision: input.graph.revision,
+      contractScope: input.contract.scope,
+      nodeId: input.node.id,
+      nodeScope: input.node.scope,
+      stage: input.stage,
+      probeIds: input.probeIds
+    },
+    algorithm
+  );
 }
 function progressProbeScopeAudit(input) {
   return auditWorkspaceScope({
@@ -39327,16 +39510,23 @@ async function executeReadOnlyProgressProbes(input) {
         failurePersisted: false
       };
     }
-  const checkpointId = contentHash({
-    schemaVersion: 1,
-    kind: "progress_probe_scope",
-    runId: input.contract.runId,
-    nodeId: input.node.id,
-    stage: input.stage,
-    baselineDigest: baseline.digest,
-    nonce: randomUUID9()
-  });
-  const processDefinitions = probeProcessDefinitions(checkpointId, input.specs);
+  const checkpointId = contentHash(
+    {
+      schemaVersion: 1,
+      kind: "progress_probe_scope",
+      runId: input.contract.runId,
+      nodeId: input.node.id,
+      stage: input.stage,
+      baselineDigest: baseline.digest,
+      nonce: randomUUID9()
+    },
+    input.store.probeEvidenceCheckpointHashAlgorithm
+  );
+  const processDefinitions = probeProcessDefinitions(
+    checkpointId,
+    input.specs,
+    input.store.probeEvidenceCheckpointHashAlgorithm
+  );
   await input.store.append(
     "runtime",
     "scope.started",
@@ -39344,15 +39534,19 @@ async function executeReadOnlyProgressProbes(input) {
       nodeId: input.node.id,
       stage: input.stage,
       checkpointId,
+      ...input.store.probeEvidenceCheckpointHashAlgorithm === PORTABLE_CANONICAL_HASH_ALGORITHM ? { probeEvidenceCheckpointFormat: 2 } : {},
       baseline,
       graphRevision: input.graph.revision,
-      policyHash: progressProbeScopePolicyHash({
-        contract: input.contract,
-        graph: input.graph,
-        node: input.node,
-        stage: input.stage,
-        probeIds: input.specs.map(({ id }) => id)
-      }),
+      policyHash: progressProbeScopePolicyHash(
+        {
+          contract: input.contract,
+          graph: input.graph,
+          node: input.node,
+          stage: input.stage,
+          probeIds: input.specs.map(({ id }) => id)
+        },
+        input.store.probeEvidenceCheckpointHashAlgorithm
+      ),
       probeIds: input.specs.map(({ id }) => id),
       processDefinitions
     },
@@ -39427,7 +39621,7 @@ function validatedProgressProbeScopeCheck(input) {
   const { event, checkpoint } = input;
   if (event.type !== "scope.checked" || event.actor !== "runtime" || event.sequence <= checkpoint.start.sequence || event.causationId !== checkpoint.checkpointId || event.data.checkpointId !== checkpoint.checkpointId || event.data.nodeId !== checkpoint.node.id || event.data.stage !== checkpoint.stage || event.data.enforced !== true || typeof event.data.audit !== "object" || event.data.audit === null || Array.isArray(event.data.audit))
     return void 0;
-  const current = parseWorkspaceScopeSnapshot(event.data.current, input.hashAlgorithm);
+  const current = parseWorkspaceScopeSnapshot(event.data.current, input.workspaceHashAlgorithm);
   if (!current) return void 0;
   const audit = progressProbeScopeAudit({
     contract: input.contract,
@@ -39437,7 +39631,8 @@ function validatedProgressProbeScopeCheck(input) {
     baseline: checkpoint.baseline,
     current
   });
-  if (contentHash(event.data.audit) !== contentHash(audit)) return void 0;
+  if (contentHash(event.data.audit, input.probeHashAlgorithm) !== contentHash(audit, input.probeHashAlgorithm))
+    return void 0;
   return { audit, current };
 }
 function progressProbeRecoveryBlocker(input) {
@@ -39524,8 +39719,12 @@ async function reconcileProbeProcessesForScope(input) {
       })
     });
   }
-  const expectedDefinitions = probeProcessDefinitions(input.checkpointId, expectedSpecs);
-  if (!definitions || contentHash(definitions) !== contentHash(expectedDefinitions)) {
+  const expectedDefinitions = probeProcessDefinitions(
+    input.checkpointId,
+    expectedSpecs,
+    input.store.probeEvidenceCheckpointHashAlgorithm
+  );
+  if (!definitions || contentHash(definitions, input.store.probeEvidenceCheckpointHashAlgorithm) !== contentHash(expectedDefinitions, input.store.probeEvidenceCheckpointHashAlgorithm)) {
     const reason = `Graphcraft cannot validate probe-process definitions for scope checkpoint ${input.checkpointId}`;
     return await blockProgressProbeRecovery({
       store: input.store,
@@ -39589,7 +39788,7 @@ async function reconcileProbeProcessesForScope(input) {
     const ready = start?.data.ready !== null && typeof start?.data.ready === "object" && !Array.isArray(start.data.ready) ? start.data.ready : void 0;
     const brokerPid = ready?.brokerPid;
     const expectedJournalPath = `locks/probe-processes/${input.store.runId}/${definition.executionId}.jsonl`;
-    const validStart = start === void 0 || start.actor === "probe" && start.causationId === input.checkpointId && start.data.schemaVersion === 1 && start.data.nodeId === input.node.id && start.data.stage === input.stage && start.data.checkpointId === input.checkpointId && contentHash(start.data.definition) === contentHash(definition) && typeof start.data.ownerTokenHash === "string" && /^[a-f0-9]{64}$/.test(start.data.ownerTokenHash) && start.data.journalPath === expectedJournalPath && ready?.type === "ready" && ready?.schemaVersion === 1 && ready.executionId === definition.executionId && Number.isSafeInteger(brokerPid) && Number(brokerPid) > 0 && (ready.processGroupId === null || Number.isSafeInteger(ready.processGroupId) && Number(ready.processGroupId) > 0) && [
+    const validStart = start === void 0 || start.actor === "probe" && start.causationId === input.checkpointId && start.data.schemaVersion === 1 && start.data.nodeId === input.node.id && start.data.stage === input.stage && start.data.checkpointId === input.checkpointId && contentHash(start.data.definition, input.store.probeEvidenceCheckpointHashAlgorithm) === contentHash(definition, input.store.probeEvidenceCheckpointHashAlgorithm) && typeof start.data.ownerTokenHash === "string" && /^[a-f0-9]{64}$/.test(start.data.ownerTokenHash) && start.data.journalPath === expectedJournalPath && ready?.type === "ready" && ready?.schemaVersion === 1 && ready.executionId === definition.executionId && Number.isSafeInteger(brokerPid) && Number(brokerPid) > 0 && (ready.processGroupId === null || Number.isSafeInteger(ready.processGroupId) && Number(ready.processGroupId) > 0) && [
       "aix",
       "android",
       "darwin",
@@ -39714,6 +39913,7 @@ async function reconcileProbeProcessesForScope(input) {
         checkpointId: input.checkpointId,
         nodeId: input.node.id,
         stage: input.stage,
+        hashAlgorithm: input.store.probeEvidenceCheckpointHashAlgorithm,
         ...start ? { ownerTokenHash: start.data.ownerTokenHash } : {},
         ...start ? { expectedBrokerPid: Number(brokerPid) } : {}
       });
@@ -39867,13 +40067,16 @@ async function reconcileProgressProbeScopeCheckpoints(input) {
     ) : void 0;
     const probeIds = start.data.probeIds;
     const validProbeIds = Array.isArray(probeIds) && probeIds.every((value) => typeof value === "string") && new Set(probeIds).size === probeIds.length && expectedProbeIds !== void 0 && probeIds.length === expectedProbeIds.length && probeIds.every((value, index) => value === expectedProbeIds[index]);
-    const valid = active !== void 0 && stage !== void 0 && start.actor === "runtime" && start.causationId === checkpointId && start.data.checkpointId === checkpointId && start.data.graphRevision === input.graph.revision && start.data.policyHash === progressProbeScopePolicyHash({
-      contract: input.contract,
-      graph: input.graph,
-      node: active.node,
-      stage,
-      probeIds: expectedProbeIds
-    }) && baseline !== void 0 && validProbeIds;
+    const valid = active !== void 0 && stage !== void 0 && start.actor === "runtime" && start.causationId === checkpointId && start.data.checkpointId === checkpointId && start.data.graphRevision === input.graph.revision && start.data.policyHash === progressProbeScopePolicyHash(
+      {
+        contract: input.contract,
+        graph: input.graph,
+        node: active.node,
+        stage,
+        probeIds: expectedProbeIds
+      },
+      input.store.probeEvidenceCheckpointHashAlgorithm
+    ) && baseline !== void 0 && validProbeIds;
     if (!valid) {
       const reason = `Graphcraft cannot validate progress-probe scope checkpoint ${checkpointId}`;
       return await blockProgressProbeRecovery({
@@ -39918,7 +40121,8 @@ async function reconcileProgressProbeScopeCheckpoints(input) {
       contract: input.contract,
       graph: input.graph,
       state: input.state,
-      hashAlgorithm: input.store.workspaceScopeHashAlgorithm
+      workspaceHashAlgorithm: input.store.workspaceScopeHashAlgorithm,
+      probeHashAlgorithm: input.store.probeEvidenceCheckpointHashAlgorithm
     }) : void 0;
     if (rawChecks.length === 1 && !checked) {
       const reason = `Graphcraft cannot validate the durable progress-probe scope check for checkpoint ${checkpointId}`;
@@ -40024,7 +40228,8 @@ async function executeWorkNode(input) {
     baseline = evidenceSnapshot(
       input.recoveryScopeBaseline.digest,
       baselineProbeResults,
-      input.graph.family
+      input.graph.family,
+      input.store.probeEvidenceCheckpointHashAlgorithm
     );
   } else {
     const baselineExecution = await executeReadOnlyProgressProbes({
@@ -40059,7 +40264,8 @@ async function executeWorkNode(input) {
     baseline = evidenceSnapshot(
       observedBaselineScope.digest,
       baselineProbeResults,
-      input.graph.family
+      input.graph.family,
+      input.store.probeEvidenceCheckpointHashAlgorithm
     );
   }
   let scopeBaseline;
@@ -40214,7 +40420,8 @@ async function executeWorkNode(input) {
   const currentEvidence = evidenceSnapshot(
     progressScope.digest,
     afterProbes.map(({ result }) => result),
-    input.graph.family
+    input.graph.family,
+    input.store.probeEvidenceCheckpointHashAlgorithm
   );
   const assessed = await assessRunProgress({
     store: input.store,
@@ -40236,9 +40443,11 @@ async function executeWorkNode(input) {
     const recorded = persistedProgressCheckpoint(
       await input.store.loadEvents(),
       input.node.id,
-      worker.invocationId
+      worker.invocationId,
+      input.graph.family,
+      input.store.probeEvidenceCheckpointHashAlgorithm
     );
-    if (!recorded || contentHash(recorded.trajectory) !== contentHash(assessed.trajectory)) {
+    if (!recorded || contentHash(recorded.trajectory, input.store.probeEvidenceCheckpointHashAlgorithm) !== contentHash(assessed.trajectory, input.store.probeEvidenceCheckpointHashAlgorithm)) {
       const reason2 = `Graphcraft cannot recover the durable progress checkpoint for node ${input.node.id} attempt ${worker.invocationId}`;
       await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason: reason2 });
       return { status: "failed", nodeId: input.node.id, reason: reason2 };
@@ -41304,18 +41513,22 @@ async function executeRun(input) {
         const verificationEvidence = evidenceSnapshot(
           verificationScopeCurrent.digest,
           results,
-          graph.family
+          graph.family,
+          input.store.probeEvidenceCheckpointHashAlgorithm
         );
-        const verificationCheckpointId = contentHash({
-          schemaVersion: 1,
-          kind: "held_out_verification",
-          runId: contract.runId,
-          graphRevision: graph.revision,
-          nodeId: current.id,
-          planDigest: heldOutProbePlan.digest,
-          workspaceDigest: verificationEvidence.workspaceDigest,
-          evidenceVector: verificationEvidence.vector
-        });
+        const verificationCheckpointId = contentHash(
+          {
+            schemaVersion: 1,
+            kind: "held_out_verification",
+            runId: contract.runId,
+            graphRevision: graph.revision,
+            nodeId: current.id,
+            planDigest: heldOutProbePlan.digest,
+            workspaceDigest: verificationEvidence.workspaceDigest,
+            evidenceVector: verificationEvidence.vector
+          },
+          input.store.probeEvidenceCheckpointHashAlgorithm
+        );
         const heldOutAlreadyChecked = (await input.store.loadEvents()).some(
           ({ type, data }) => type === "held_out.checked" && data.nodeId === current.id && data.checkpointId === verificationCheckpointId
         );
@@ -44325,7 +44538,7 @@ async function renderBenchmarkPublicationReport(input) {
 // packages/runtime/src/retention.ts
 import { lstat as lstat13, readdir as readdir6, rm as rm6, unlink as unlink6 } from "node:fs/promises";
 import { dirname as dirname14, join as join16, relative as relative11, resolve as resolve16 } from "node:path";
-import { isDeepStrictEqual as isDeepStrictEqual3 } from "node:util";
+import { isDeepStrictEqual as isDeepStrictEqual4 } from "node:util";
 
 // packages/runtime/src/supervisor.ts
 import { spawn as spawn5 } from "node:child_process";
@@ -44730,7 +44943,7 @@ function exactRecord(value, label, keys) {
   const record2 = value;
   const actual = Object.keys(record2).sort();
   const expected = [...keys].sort();
-  if (!isDeepStrictEqual3(actual, expected)) throw new Error(`${label} has unexpected fields`);
+  if (!isDeepStrictEqual4(actual, expected)) throw new Error(`${label} has unexpected fields`);
   return record2;
 }
 function safeRetentionString(value, label, maximum) {
@@ -44877,7 +45090,7 @@ async function writeRetentionJournal(repositoryRoot, journal) {
   if (!rootExisted) await syncDirectory(graphcraftRoot2);
   const existing = await readRetentionJournal(repositoryRoot, journal.runId);
   if (existing) {
-    if (!isDeepStrictEqual3(existing, journal))
+    if (!isDeepStrictEqual4(existing, journal))
       throw refusal(journal.runId, "a different retention journal already exists");
     return;
   }
@@ -44897,7 +45110,7 @@ async function writeRetentionJournal(repositoryRoot, journal) {
   await writeJsonAtomic(path2, journal);
   await hardenPrivateFile(path2, graphcraftRoot2);
   const persisted = await readRetentionJournal(repositoryRoot, journal.runId);
-  if (!persisted || !isDeepStrictEqual3(persisted, journal))
+  if (!persisted || !isDeepStrictEqual4(persisted, journal))
     throw refusal(journal.runId, "retention journal was not persisted exactly");
 }
 async function removeRetentionJournal(repositoryRoot, runId, assertLeaseHeld) {
@@ -45119,13 +45332,13 @@ function validateRetentionPlan(plan) {
     throw refusal(record2.runId, "repository root is not an absolute normalized path");
   parseRetentionStateIdentity(record2.state, record2.runId);
   const workspace = safePreservedWorkspace(record2.preservedWorkspace);
-  if (!isDeepStrictEqual3(workspace, record2.preservedWorkspace))
+  if (!isDeepStrictEqual4(workspace, record2.preservedWorkspace))
     throw refusal(record2.runId, "workspace metadata contains sensitive material");
   if (!Array.isArray(record2.deletePaths)) throw refusal(record2.runId, "delete paths are missing");
   const expectedPaths = retentionTargets(record2.repositoryRoot, record2.runId).map(
     ({ path: path2 }) => path2
   );
-  if (!isDeepStrictEqual3(record2.deletePaths, expectedPaths))
+  if (!isDeepStrictEqual4(record2.deletePaths, expectedPaths))
     throw refusal(record2.runId, "delete paths do not match the repository and run ID");
 }
 async function validateTarget(graphcraftRoot2, target) {
@@ -45319,7 +45532,7 @@ async function applyRunRetention(input) {
     input.plan,
     input.confirmRunId,
     (current) => {
-      if (!isDeepStrictEqual3(current.state, input.plan.state) || !isDeepStrictEqual3(current.preservedWorkspace, input.plan.preservedWorkspace))
+      if (!isDeepStrictEqual4(current.state, input.plan.state) || !isDeepStrictEqual4(current.preservedWorkspace, input.plan.preservedWorkspace))
         throw refusal(input.plan.runId, "state changed; create and confirm a new dry-run plan");
     },
     { onCheckpoint: input.onCheckpoint }
@@ -45402,7 +45615,7 @@ async function applyCompletedRunPrune(input) {
   const validateCompletedEligibility = (plan) => (revalidated) => {
     if (revalidated.state.status !== "completed")
       throw refusal(plan.runId, `state changed to ${revalidated.state.status}`);
-    if (!isDeepStrictEqual3(revalidated.state, plan.state))
+    if (!isDeepStrictEqual4(revalidated.state, plan.state))
       throw refusal(plan.runId, "completed state changed after prune revalidation");
     if (Date.parse(revalidated.state.updatedAt) >= cutoff)
       throw refusal(plan.runId, "completion is no longer strictly before the prune cutoff");
@@ -47216,7 +47429,7 @@ var program2 = new Command().name("graphcraft").description("Progress-aware exec
 async function benchmarkSourceIdentity() {
   if (true) {
     return BenchmarkSourceIdentitySchema.parse({
-      commitSha: "98d5d678f86bfcbe17b951ec04d1a8a47876f6ef",
+      commitSha: "f5b9adcae6af5aad060c0af9a1ff871ff8861c0f",
       dirty: false,
       dirtyStatusDigest: false ? null : null
     });
