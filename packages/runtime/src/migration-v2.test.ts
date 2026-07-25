@@ -411,7 +411,11 @@ describe("run storage schema v3 migration", () => {
       schemaVersion: CURRENT_RUN_STORAGE_VERSION,
       runId: fixture.runId,
       migratedFrom: 0,
-      formats: { artifactInventory: 1, artifactPolicy: 1 },
+      formats: {
+        artifactInventory: 1,
+        artifactPolicy: 1,
+        workspaceScopeSnapshots: 1,
+      },
     });
     const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "0-to-3");
     expect(await fileSnapshot(backupRoot)).toEqual(before);
@@ -485,6 +489,7 @@ describe("run storage schema v3 migration", () => {
           events: 1,
           artifactInventory: 1,
           artifactPolicy: 1,
+          workspaceScopeSnapshots: 1,
         },
       },
     );
@@ -501,6 +506,7 @@ describe("run storage schema v3 migration", () => {
     await store.prepareStorage();
     expect(store.canonicalHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
     expect(store.artifactHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
+    expect(store.workspaceScopeHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
 
     const localeCompare = vi.spyOn(String.prototype, "localeCompare").mockImplementation(function (
       this: string,
@@ -553,6 +559,7 @@ describe("run storage schema v3 migration", () => {
         events: 1,
         artifactInventory: 1,
         artifactPolicy: 1,
+        workspaceScopeSnapshots: 1,
       },
     });
     const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "2-to-3");
@@ -1737,7 +1744,12 @@ describe("run storage schema v3 migration", () => {
     await expect(ensureCurrentRunStorage(input)).resolves.toMatchObject({
       schemaVersion: 3,
       canonicalHashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM,
-      formats: { heldOutProbes: 2, events: 1, artifactInventory: 1 },
+      formats: {
+        heldOutProbes: 2,
+        events: 1,
+        artifactInventory: 1,
+        workspaceScopeSnapshots: 1,
+      },
     });
 
     expect(await treeSnapshot(fixture.graphcraftRoot)).toEqual(before);

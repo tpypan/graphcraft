@@ -78,7 +78,12 @@ describe("storage v3 initialization", () => {
       migratedFrom: 3,
       initialization: "ready",
       canonicalHashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
-      formats: { heldOutProbes: 2, events: 2, artifactInventory: 2 },
+      formats: {
+        heldOutProbes: 2,
+        events: 2,
+        artifactInventory: 2,
+        workspaceScopeSnapshots: 2,
+      },
     });
     expect(await readFile(store.eventsPath())).toEqual(eventsBefore);
   });
@@ -87,6 +92,7 @@ describe("storage v3 initialization", () => {
     const { root, store } = await createStoreFixture();
     const reopened = new RunStore(root, store.runId);
     expect(() => reopened.artifactHashAlgorithm).toThrow(/before run storage is prepared/);
+    expect(() => reopened.workspaceScopeHashAlgorithm).toThrow(/before run storage is prepared/);
     expect(() => reopened.artifactContentHash({ pending: true })).toThrow(
       /before run storage is prepared/,
     );
@@ -94,8 +100,10 @@ describe("storage v3 initialization", () => {
 
     expect(store.artifactHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
     expect(reopened.artifactHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    expect(store.workspaceScopeHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    expect(reopened.workspaceScopeHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
     expect(JSON.parse(await readFile(join(store.runRoot, "storage.json"), "utf8"))).toMatchObject({
-      formats: { artifactInventory: 2 },
+      formats: { artifactInventory: 2, workspaceScopeSnapshots: 2 },
     });
 
     const capsule = { z: { a: 1 }, A: { b: 2 } };
@@ -121,6 +129,24 @@ describe("storage v3 initialization", () => {
         "artifacts/Zulu.txt",
       ]),
     );
+  });
+
+  it("keeps a prior ready v3 scope policy legacy without rewriting its descriptor", async () => {
+    const { root, store } = await createStoreFixture();
+    const storagePath = join(store.runRoot, "storage.json");
+    const descriptor = JSON.parse(await readFile(storagePath, "utf8")) as {
+      formats: { workspaceScopeSnapshots?: number };
+    };
+    delete descriptor.formats.workspaceScopeSnapshots;
+    await writeFile(storagePath, `${JSON.stringify(descriptor, null, 2)}\n`);
+    const descriptorBefore = await readFile(storagePath);
+
+    const reopened = new RunStore(root, store.runId);
+    await reopened.prepareStorage();
+
+    expect(reopened.canonicalHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    expect(reopened.workspaceScopeHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
+    expect(await readFile(storagePath)).toEqual(descriptorBefore);
   });
 
   it("replays and repairs only portable-v2 held-out plans for fresh storage", async () => {
@@ -174,11 +200,16 @@ describe("storage v3 initialization", () => {
     await writeFile(heldOutPath, `${JSON.stringify(legacy, null, 2)}\n`);
     const descriptor = JSON.parse(await readFile(storagePath, "utf8")) as {
       initialization: string;
-      formats: { heldOutProbes: number; artifactInventory: number };
+      formats: {
+        heldOutProbes: number;
+        artifactInventory: number;
+        workspaceScopeSnapshots?: number;
+      };
     };
     descriptor.initialization = "initializing";
     descriptor.formats.heldOutProbes = 1;
     descriptor.formats.artifactInventory = 1;
+    delete descriptor.formats.workspaceScopeSnapshots;
     await writeFile(storagePath, `${JSON.stringify(descriptor, null, 2)}\n`);
     const eventsBeforeRecovery = await readFile(store.eventsPath());
 
@@ -188,10 +219,16 @@ describe("storage v3 initialization", () => {
     expect(reopened.canonicalHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
     expect(reopened.heldOutProbePlanHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
     expect(reopened.artifactHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
+    expect(reopened.workspaceScopeHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
     expect(JSON.parse(await readFile(storagePath, "utf8"))).toMatchObject({
       initialization: "ready",
       canonicalHashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
-      formats: { heldOutProbes: 1, events: 2, artifactInventory: 1 },
+      formats: {
+        heldOutProbes: 1,
+        events: 2,
+        artifactInventory: 1,
+        workspaceScopeSnapshots: 1,
+      },
     });
     expect(await readFile(store.eventsPath())).toEqual(eventsBeforeRecovery);
     expect(await reopened.loadHeldOutProbePlan()).toEqual(legacy);

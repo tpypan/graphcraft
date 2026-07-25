@@ -4,6 +4,7 @@ import { lstat, readlink } from "node:fs/promises";
 import { isAbsolute, matchesGlob, relative, resolve, sep } from "node:path";
 import {
   contentHash,
+  type CanonicalHashAlgorithm,
   type Graph,
   type GraphNode,
   type RunContract,
@@ -94,6 +95,7 @@ async function fileDigest(path: string, signal?: AbortSignal): Promise<string> {
 async function pathSignature(
   repositoryPath: string,
   path: string,
+  hashAlgorithm: CanonicalHashAlgorithm,
   signal?: AbortSignal,
 ): Promise<string> {
   signal?.throwIfAborted();
@@ -111,15 +113,18 @@ async function pathSignature(
   if (status.isSymbolicLink()) {
     const target = await readlink(absolute);
     signal?.throwIfAborted();
-    return contentHash({ kind: "symlink", mode, target });
+    return contentHash({ kind: "symlink", mode, target }, hashAlgorithm);
   }
   if (status.isFile())
-    return contentHash({
-      kind: "file",
-      mode,
-      size: status.size,
-      digest: await fileDigest(absolute, signal),
-    });
+    return contentHash(
+      {
+        kind: "file",
+        mode,
+        size: status.size,
+        digest: await fileDigest(absolute, signal),
+      },
+      hashAlgorithm,
+    );
   if (status.isDirectory()) {
     const operations = [
       gitOutput(absolute, ["rev-parse", "HEAD"], signal).catch(() => {
@@ -144,15 +149,16 @@ async function pathSignature(
       throw error;
     }
     signal?.throwIfAborted();
-    return contentHash({ kind: "directory", mode, head: head.trim(), state });
+    return contentHash({ kind: "directory", mode, head: head.trim(), state }, hashAlgorithm);
   }
-  return contentHash({ kind: "other", mode, size: status.size });
+  return contentHash({ kind: "other", mode, size: status.size }, hashAlgorithm);
 }
 
 export async function captureWorkspaceScopeSnapshot(
   repositoryPath: string,
-  inspectedIgnoredPatterns: string[] = [],
-  signal?: AbortSignal,
+  inspectedIgnoredPatterns: string[],
+  signal: AbortSignal | undefined,
+  hashAlgorithm: CanonicalHashAlgorithm,
 ): Promise<WorkspaceScopeSnapshot> {
   signal?.throwIfAborted();
   const ignored =
@@ -209,19 +215,45 @@ export async function captureWorkspaceScopeSnapshot(
   const changed: Record<string, string> = {};
   for (const path of paths) {
     signal?.throwIfAborted();
-    changed[path.replaceAll("\\", "/")] = await pathSignature(repositoryPath, path, signal);
+    changed[path.replaceAll("\\", "/")] = await pathSignature(
+      repositoryPath,
+      path,
+      hashAlgorithm,
+      signal,
+    );
   }
   signal?.throwIfAborted();
   const core = {
     headSha: head.trim(),
     branch: branch.trim(),
-    indexDigest: contentHash(index),
+    indexDigest: contentHash(index, hashAlgorithm),
     changed,
   };
-  return { schemaVersion: 1, digest: contentHash(core), ...core };
+  return { schemaVersion: 1, digest: contentHash(core, hashAlgorithm), ...core };
 }
 
-export function parseWorkspaceScopeSnapshot(value: unknown): WorkspaceScopeSnapshot | undefined {
+export function workspaceScopeSnapshotDigestIsValid(
+  snapshot: WorkspaceScopeSnapshot,
+  hashAlgorithm: CanonicalHashAlgorithm,
+): boolean {
+  return (
+    snapshot.digest ===
+    contentHash(
+      {
+        headSha: snapshot.headSha,
+        branch: snapshot.branch,
+        indexDigest: snapshot.indexDigest,
+        changed: snapshot.changed,
+      },
+      hashAlgorithm,
+    )
+  );
+}
+
+export function parseWorkspaceScopeSnapshot(
+  value: unknown,
+  hashAlgorithm?: CanonicalHashAlgorithm,
+): WorkspaceScopeSnapshot | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   const candidate = value as Partial<WorkspaceScopeSnapshot>;
   if (
@@ -238,7 +270,10 @@ export function parseWorkspaceScopeSnapshot(value: unknown): WorkspaceScopeSnaps
     )
   )
     return undefined;
-  return candidate as WorkspaceScopeSnapshot;
+  const snapshot = candidate as WorkspaceScopeSnapshot;
+  if (hashAlgorithm && !workspaceScopeSnapshotDigestIsValid(snapshot, hashAlgorithm))
+    return undefined;
+  return snapshot;
 }
 
 function normalizedPattern(value: string): string {

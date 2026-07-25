@@ -30,6 +30,7 @@ import {
   workerVisibleProbePlan,
   type EvidenceSnapshot,
   type ExecutableProbe,
+  type CanonicalHashAlgorithm,
   type Graph,
   type GraphAmendment,
   type GraphPlanner,
@@ -162,6 +163,20 @@ export interface RunObserverEvent {
 
 export type RunObserver = (event: RunObserverEvent) => void;
 
+async function captureRunWorkspaceScopeSnapshot(
+  store: RunStore,
+  repositoryPath: string,
+  inspectedIgnoredPatterns: string[],
+  signal?: AbortSignal,
+): Promise<WorkspaceScopeSnapshot> {
+  return await captureWorkspaceScopeSnapshot(
+    repositoryPath,
+    inspectedIgnoredPatterns,
+    signal,
+    store.workspaceScopeHashAlgorithm,
+  );
+}
+
 function assertRunCreationActive(signal?: AbortSignal, durableRunId?: string): void {
   if (!signal?.aborted) return;
   const reason = interruptionReason(signal.reason);
@@ -289,7 +304,10 @@ async function recoverableInvocation(
         ? started.data.reusedHostSessionId
         : undefined;
   const baseline = persistedBaseline(started.data.baseline, family);
-  const scopeBaseline = parseWorkspaceScopeSnapshot(started.data.scopeBaseline);
+  const scopeBaseline = parseWorkspaceScopeSnapshot(
+    started.data.scopeBaseline,
+    store.workspaceScopeHashAlgorithm,
+  );
   return {
     adapterId: String(started.data.adapter ?? ""),
     nodeId,
@@ -1059,6 +1077,7 @@ function assertSemanticWorkspaceRecovery(input: {
   node: GraphNode;
   phase: "progress" | "completion";
   current: WorkspaceScopeSnapshot;
+  hashAlgorithm: CanonicalHashAlgorithm;
 }): void {
   const latestStart = input.events.findLast(
     (event) =>
@@ -1066,7 +1085,10 @@ function assertSemanticWorkspaceRecovery(input: {
   );
   if (latestStart) {
     const invocationId = latestStart.data.invocationId;
-    const baseline = parseWorkspaceScopeSnapshot(latestStart.data.scopeBaseline);
+    const baseline = parseWorkspaceScopeSnapshot(
+      latestStart.data.scopeBaseline,
+      input.hashAlgorithm,
+    );
     if (
       typeof invocationId !== "string" ||
       typeof latestStart.data.host !== "string" ||
@@ -1178,6 +1200,7 @@ async function recoverSemanticVerification(input: {
     node: input.node,
     phase: input.phase,
     current: input.scope,
+    hashAlgorithm: input.store.workspaceScopeHashAlgorithm,
   });
   const checkpoint = events.findLast((event) => {
     if (
@@ -1278,7 +1301,8 @@ async function runSemanticVerification(input: {
         currentProbeEvidence: stableSemanticProbeEvidence(input.currentProbeEvidence),
       }),
     );
-    beforeScope = await captureWorkspaceScopeSnapshot(
+    beforeScope = await captureRunWorkspaceScopeSnapshot(
+      input.store,
       input.workspace.path,
       input.contract.scope.exclude,
       input.signal,
@@ -1438,7 +1462,8 @@ async function runSemanticVerification(input: {
 
   let afterScope: WorkspaceScopeSnapshot;
   try {
-    afterScope = await captureWorkspaceScopeSnapshot(
+    afterScope = await captureRunWorkspaceScopeSnapshot(
+      input.store,
       input.workspace.path,
       input.contract.scope.exclude,
       input.signal,
@@ -2226,18 +2251,6 @@ function progressProbeStage(value: unknown): ProgressProbeStage | undefined {
     : undefined;
 }
 
-function workspaceScopeSnapshotDigestIsValid(snapshot: WorkspaceScopeSnapshot): boolean {
-  return (
-    snapshot.digest ===
-    contentHash({
-      headSha: snapshot.headSha,
-      branch: snapshot.branch,
-      indexDigest: snapshot.indexDigest,
-      changed: snapshot.changed,
-    })
-  );
-}
-
 function progressProbeScopePolicyHash(input: {
   contract: RunContract;
   graph: Graph;
@@ -2414,7 +2427,8 @@ async function executeReadOnlyProgressProbes(input: {
   let baseline = input.baseline;
   if (!baseline)
     try {
-      baseline = await captureWorkspaceScopeSnapshot(
+      baseline = await captureRunWorkspaceScopeSnapshot(
+        input.store,
         input.workspace.path,
         input.contract.scope.exclude,
         input.signal,
@@ -2481,7 +2495,8 @@ async function executeReadOnlyProgressProbes(input: {
     }
   let current: WorkspaceScopeSnapshot;
   try {
-    current = await captureWorkspaceScopeSnapshot(
+    current = await captureRunWorkspaceScopeSnapshot(
+      input.store,
       input.workspace.path,
       input.contract.scope.exclude,
       input.signal,
@@ -2537,6 +2552,7 @@ function validatedProgressProbeScopeCheck(input: {
   contract: RunContract;
   graph: Graph;
   state: RunState;
+  hashAlgorithm: CanonicalHashAlgorithm;
 }): { audit: WorkspaceScopeAudit; current: WorkspaceScopeSnapshot } | undefined {
   const { event, checkpoint } = input;
   if (
@@ -2553,8 +2569,8 @@ function validatedProgressProbeScopeCheck(input: {
     Array.isArray(event.data.audit)
   )
     return undefined;
-  const current = parseWorkspaceScopeSnapshot(event.data.current);
-  if (!current || !workspaceScopeSnapshotDigestIsValid(current)) return undefined;
+  const current = parseWorkspaceScopeSnapshot(event.data.current, input.hashAlgorithm);
+  if (!current) return undefined;
   const audit = progressProbeScopeAudit({
     contract: input.contract,
     graph: input.graph,
@@ -3101,7 +3117,10 @@ async function reconcileProgressProbeScopeCheckpoints(input: {
       typeof start.data.checkpointId === "string" && start.data.checkpointId.length > 0
         ? start.data.checkpointId
         : start.hash;
-    const baseline = parseWorkspaceScopeSnapshot(start.data.baseline);
+    const baseline = parseWorkspaceScopeSnapshot(
+      start.data.baseline,
+      input.store.workspaceScopeHashAlgorithm,
+    );
     const expectedProbeIds = active
       ? (stage === "verification" ? active.node.completionProbes : active.node.progressProbes).map(
           ({ id }) => id,
@@ -3131,7 +3150,6 @@ async function reconcileProgressProbeScopeCheckpoints(input: {
           probeIds: expectedProbeIds!,
         }) &&
       baseline !== undefined &&
-      workspaceScopeSnapshotDigestIsValid(baseline) &&
       validProbeIds;
     if (!valid) {
       const reason = `Graphcraft cannot validate progress-probe scope checkpoint ${checkpointId}`;
@@ -3182,6 +3200,7 @@ async function reconcileProgressProbeScopeCheckpoints(input: {
           contract: input.contract,
           graph: input.graph,
           state: input.state,
+          hashAlgorithm: input.store.workspaceScopeHashAlgorithm,
         })
       : undefined;
     if (rawChecks.length === 1 && !checked) {
@@ -3214,7 +3233,8 @@ async function reconcileProgressProbeScopeCheckpoints(input: {
         });
       let current: WorkspaceScopeSnapshot;
       try {
-        current = await captureWorkspaceScopeSnapshot(
+        current = await captureRunWorkspaceScopeSnapshot(
+          input.store,
           input.workspace.path,
           input.contract.scope.exclude,
           input.signal,
@@ -3242,7 +3262,8 @@ async function reconcileProgressProbeScopeCheckpoints(input: {
 
     let current: WorkspaceScopeSnapshot;
     try {
-      current = await captureWorkspaceScopeSnapshot(
+      current = await captureRunWorkspaceScopeSnapshot(
+        input.store,
         input.workspace.path,
         input.contract.scope.exclude,
         input.signal,
@@ -3347,7 +3368,8 @@ async function executeWorkNode(input: {
     scopeBaseline =
       input.recoveryScopeBaseline ??
       observedBaselineScope ??
-      (await captureWorkspaceScopeSnapshot(
+      (await captureRunWorkspaceScopeSnapshot(
+        input.store,
         input.workspace.path,
         input.contract.scope.exclude,
         input.signal,
@@ -3387,7 +3409,8 @@ async function executeWorkNode(input: {
   }
   let currentScope: WorkspaceScopeSnapshot;
   try {
-    currentScope = await captureWorkspaceScopeSnapshot(
+    currentScope = await captureRunWorkspaceScopeSnapshot(
+      input.store,
       input.workspace.path,
       input.contract.scope.exclude,
       input.signal,
@@ -4732,7 +4755,8 @@ export async function executeRun(input: {
           verificationScopeCurrent = verificationExecution.scope;
         } else {
           try {
-            verificationScopeCurrent = await captureWorkspaceScopeSnapshot(
+            verificationScopeCurrent = await captureRunWorkspaceScopeSnapshot(
+              input.store,
               workspace.path,
               contract.scope.exclude,
               signal,

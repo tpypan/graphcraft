@@ -10279,7 +10279,12 @@ if (args.length === blocked.length && blocked.every((value, index) => args[index
     const invocationId = randomUUID();
     const hostSessionId = randomUUID();
     const baseline = evidenceSnapshot("before-interruption", []);
-    const scopeBaseline = await captureWorkspaceScopeSnapshot(workspace.path);
+    const scopeBaseline = await captureWorkspaceScopeSnapshot(
+      workspace.path,
+      [],
+      undefined,
+      created.store.workspaceScopeHashAlgorithm,
+    );
     await created.store.append("runtime", "invocation.started", {
       invocationId,
       nodeId: "implement",
@@ -10320,7 +10325,12 @@ if (args.length === blocked.length && blocked.every((value, index) => args[index
     const invocationId = randomUUID();
     const hostSessionId = randomUUID();
     const baseline = evidenceSnapshot("before-interruption", []);
-    const scopeBaseline = await captureWorkspaceScopeSnapshot(workspace.path);
+    const scopeBaseline = await captureWorkspaceScopeSnapshot(
+      workspace.path,
+      [],
+      undefined,
+      created.store.workspaceScopeHashAlgorithm,
+    );
     await created.store.append("runtime", "invocation.started", {
       invocationId,
       nodeId: "implement",
@@ -10388,7 +10398,12 @@ if (args.length === blocked.length && blocked.every((value, index) => args[index
     const baselineProbeResults = (await runProbes(implement.progressProbes, workspace.path)).map(
       ({ result }) => result,
     );
-    const scopeBaseline = await captureWorkspaceScopeSnapshot(workspace.path);
+    const scopeBaseline = await captureWorkspaceScopeSnapshot(
+      workspace.path,
+      [],
+      undefined,
+      created.store.workspaceScopeHashAlgorithm,
+    );
     const invocationId = randomUUID();
     await created.store.append("runtime", "invocation.started", {
       invocationId,

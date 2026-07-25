@@ -41,6 +41,7 @@ import {
 } from "./migration.ts";
 import { assertPersistenceSafe, redactTextBytes, redactValue } from "./redaction.ts";
 import { RunArtifactStore, type ArtifactPreview } from "./artifact-policy.ts";
+import { parseWorkspaceScopeSnapshot } from "./scope.ts";
 import {
   ensurePrivateDirectory,
   finalizePrivateFileMutation,
@@ -88,7 +89,7 @@ export class RunStoreEventLogCorruptionError extends Error {
     readonly record: number,
     readonly offsetBytes: number,
     readonly trailing: boolean,
-    reason: "encoding" | "json" | "schema" | "hash" | "format" | "sequence",
+    reason: "encoding" | "json" | "schema" | "hash" | "format" | "sequence" | "scope",
   ) {
     const location = trailing ? "trailing record" : `record ${record}`;
     const problem =
@@ -102,7 +103,9 @@ export class RunStoreEventLogCorruptionError extends Error {
               ? "an invalid event hash"
               : reason === "format"
                 ? "an event format that disagrees with its storage manifest"
-                : "an invalid event sequence";
+                : reason === "scope"
+                  ? "a workspace-scope snapshot that disagrees with its storage manifest"
+                  : "an invalid event sequence";
     super(
       `Run event log has ${problem} in ${location} at byte ${offsetBytes}; event log bytes were left unchanged`,
     );
@@ -171,6 +174,29 @@ function optionalHeldOutProbePlan(
   }
 }
 
+function eventWorkspaceScopeSnapshot(event: RunEvent): unknown | undefined {
+  if (event.type === "invocation.started" || event.type === "semantic.started")
+    return event.data.scopeBaseline;
+  if (event.type === "scope.started") return event.data.baseline;
+  if (event.type === "scope.checked") return event.data.current;
+  return undefined;
+}
+
+function workspaceScopeSnapshotUsesDifferentHashPolicy(
+  value: unknown,
+  selected: CanonicalHashAlgorithm,
+): boolean {
+  const snapshot = parseWorkspaceScopeSnapshot(value);
+  if (!snapshot || parseWorkspaceScopeSnapshot(snapshot, selected)) return false;
+  // The alternate policy is only a rejection classifier. It is never used to
+  // accept or relabel a snapshot that fails the manifest-selected policy.
+  const other =
+    selected === PORTABLE_CANONICAL_HASH_ALGORITHM
+      ? LEGACY_CANONICAL_HASH_ALGORITHM
+      : PORTABLE_CANONICAL_HASH_ALGORITHM;
+  return parseWorkspaceScopeSnapshot(snapshot, other) !== undefined;
+}
+
 export class RunStore {
   readonly repositoryRoot: string;
   readonly runId: string;
@@ -184,6 +210,7 @@ export class RunStore {
   private _canonicalHashAlgorithm: CanonicalHashAlgorithm;
   private _heldOutProbePlanHashAlgorithm: CanonicalHashAlgorithm;
   private _artifactHashAlgorithm: CanonicalHashAlgorithm | undefined;
+  private _workspaceScopeHashAlgorithm: CanonicalHashAlgorithm | undefined;
 
   constructor(
     repositoryRoot: string,
@@ -241,6 +268,11 @@ export class RunStore {
           ? PORTABLE_CANONICAL_HASH_ALGORITHM
           : LEGACY_CANONICAL_HASH_ALGORITHM;
       this.bindArtifactHashAlgorithm(artifactHashAlgorithm);
+      const workspaceScopeHashAlgorithm =
+        manifest.formats.workspaceScopeSnapshots === 2
+          ? PORTABLE_CANONICAL_HASH_ALGORITHM
+          : LEGACY_CANONICAL_HASH_ALGORITHM;
+      this.bindWorkspaceScopeHashAlgorithm(workspaceScopeHashAlgorithm);
       await this.validateStorageRoot();
     } catch (error) {
       if (this.storageReady === ready) this.storageReady = undefined;
@@ -266,10 +298,24 @@ export class RunStore {
     return this._artifactHashAlgorithm;
   }
 
+  get workspaceScopeHashAlgorithm(): CanonicalHashAlgorithm {
+    if (!this._workspaceScopeHashAlgorithm)
+      throw new Error("Workspace-scope hash policy is unavailable before run storage is prepared");
+    return this._workspaceScopeHashAlgorithm;
+  }
+
   private bindArtifactHashAlgorithm(algorithm: CanonicalHashAlgorithm): void {
     if (this.artifactStore && this.artifactStore.hashAlgorithm !== algorithm)
       throw new Error("Artifact store was bound before its storage manifest policy was known");
     this._artifactHashAlgorithm = algorithm;
+  }
+
+  private bindWorkspaceScopeHashAlgorithm(algorithm: CanonicalHashAlgorithm): void {
+    if (this._workspaceScopeHashAlgorithm && this._workspaceScopeHashAlgorithm !== algorithm)
+      throw new Error(
+        "Workspace-scope hashing was bound before its storage manifest policy was known",
+      );
+    this._workspaceScopeHashAlgorithm = algorithm;
   }
 
   private artifacts(): RunArtifactStore {
@@ -360,6 +406,7 @@ export class RunStore {
     );
     store.initializing = true;
     store.bindArtifactHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    store.bindWorkspaceScopeHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     const persistedContract = RunContractSchema.parse(redactValue(contract));
     const persistedGraph = GraphSchema.parse(redactValue(graph));
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
@@ -753,6 +800,15 @@ export class RunStore {
         throw new RunStoreEventLogCorruptionError(record, offset, trailing, "format");
       if (event.sequence !== record)
         throw new RunStoreEventLogCorruptionError(record, offset, trailing, "sequence");
+      const scopeSnapshot = eventWorkspaceScopeSnapshot(event);
+      if (
+        scopeSnapshot !== undefined &&
+        workspaceScopeSnapshotUsesDifferentHashPolicy(
+          scopeSnapshot,
+          this.workspaceScopeHashAlgorithm,
+        )
+      )
+        throw new RunStoreEventLogCorruptionError(record, offset, trailing, "scope");
       events.push(event);
       if (newline === -1) break;
       offset = newline + 1;

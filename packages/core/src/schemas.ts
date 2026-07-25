@@ -1323,6 +1323,9 @@ export const RunStorageManifestSchema = z.union([
       heldOutProbes: z.union([z.literal(1), z.literal(2)]),
       events: z.union([z.literal(1), z.literal(2)]),
       artifactInventory: z.union([z.literal(1), z.literal(2)]),
+      // Schema v3 predates this independent domain selector. An omitted field
+      // is therefore an explicit legacy-v1 declaration, never a v2 inference.
+      workspaceScopeSnapshots: z.union([z.literal(1), z.literal(2)]).default(1),
     }),
   }),
 ]);

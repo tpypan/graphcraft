@@ -70,6 +70,7 @@ export const LEGACY_MIGRATION_RESOURCE_LIMITS = Object.freeze({
 type LegacyStorageVersion = 0 | 1 | 2;
 type HeldOutProbeFormat = 1 | 2;
 type ArtifactInventoryFormat = 1 | 2;
+type WorkspaceScopeSnapshotFormat = 1 | 2;
 type CurrentRunStorageManifest = Extract<RunStorageManifest, { schemaVersion: 3 }>;
 
 interface LegacyStorage {
@@ -89,6 +90,7 @@ function manifest(
   canonicalHashAlgorithm: CanonicalHashAlgorithm,
   heldOutProbeFormat: HeldOutProbeFormat,
   artifactInventoryFormat: ArtifactInventoryFormat,
+  workspaceScopeSnapshotFormat: WorkspaceScopeSnapshotFormat,
   initialization: "initializing" | "ready",
 ): CurrentRunStorageManifest {
   return RunStorageManifestSchema.parse({
@@ -113,6 +115,7 @@ function manifest(
       locks: 1,
       artifactInventory: artifactInventoryFormat,
       artifactPolicy: 1,
+      workspaceScopeSnapshots: workspaceScopeSnapshotFormat,
     },
   }) as CurrentRunStorageManifest;
 }
@@ -139,6 +142,7 @@ async function persistCurrentRunStorageManifest(
   canonicalHashAlgorithm: CanonicalHashAlgorithm,
   heldOutProbeFormat: HeldOutProbeFormat,
   artifactInventoryFormat: ArtifactInventoryFormat,
+  workspaceScopeSnapshotFormat: WorkspaceScopeSnapshotFormat,
   initialization: "initializing" | "ready",
   lease?: MigrationLeaseContext,
 ): Promise<CurrentRunStorageManifest> {
@@ -148,6 +152,7 @@ async function persistCurrentRunStorageManifest(
     canonicalHashAlgorithm,
     heldOutProbeFormat,
     artifactInventoryFormat,
+    workspaceScopeSnapshotFormat,
     initialization,
   );
   await migrationStep(lease, async () => await ensurePrivateDirectory(runRoot));
@@ -174,6 +179,7 @@ export async function writeCurrentRunStorageManifest(
     PORTABLE_CANONICAL_HASH_ALGORITHM,
     2,
     2,
+    2,
     "ready",
   );
 }
@@ -187,6 +193,7 @@ export async function writeInitializingRunStorageManifest(
     runId,
     CURRENT_RUN_STORAGE_VERSION,
     PORTABLE_CANONICAL_HASH_ALGORITHM,
+    2,
     2,
     2,
     "initializing",
@@ -1718,6 +1725,7 @@ export async function ensureCurrentRunStorage(input: {
         storage.manifest.canonicalHashAlgorithm,
         storage.manifest.formats.heldOutProbes,
         storage.manifest.formats.artifactInventory,
+        storage.manifest.formats.workspaceScopeSnapshots,
         "ready",
         lease,
       );
@@ -1770,6 +1778,7 @@ export async function ensureCurrentRunStorage(input: {
       input.runId,
       storage.version,
       LEGACY_CANONICAL_HASH_ALGORITHM,
+      1,
       1,
       1,
       "ready",
