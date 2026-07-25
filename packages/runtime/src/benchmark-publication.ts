@@ -6,30 +6,47 @@ import {
   BENCHMARK_DEFECT_SEVERITIES,
   BENCHMARK_REVIEW_PATCH_LIMIT_BYTES,
   BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES,
-  BenchmarkBlindedReviewExportSchema,
-  BenchmarkBlindedReviewPacketSchema,
+  BenchmarkBlindedReviewExportV1Schema,
+  BenchmarkBlindedReviewExportV2Schema,
+  BenchmarkBlindedReviewPacketV1Schema,
+  BenchmarkBlindedReviewPacketV2Schema,
   BenchmarkReportV3Schema,
-  BenchmarkReviewLabelsSchema,
+  BenchmarkReportV4Schema,
+  BenchmarkReviewLabelsV1Schema,
+  BenchmarkReviewLabelsV2Schema,
   BenchmarkReviewPacketV1Schema,
+  BenchmarkReviewPacketV2Schema,
   BenchmarkSuiteSchema,
+  LEGACY_CANONICAL_HASH_ALGORITHM,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
   benchmarkBlindingKeyDigest,
+  benchmarkReviewEvidenceDigest,
   benchmarkReviewOpaqueId,
+  benchmarkReviewOpaqueIdV2,
   contentHash,
   summarizeBenchmark,
-  type BenchmarkBlindedReviewExport,
+  type BenchmarkBlindedReviewExportV1,
+  type BenchmarkBlindedReviewExportV2,
   type BenchmarkReportV3,
-  type BenchmarkReviewLabels,
+  type BenchmarkReportV4,
+  type BenchmarkReviewLabelsV1,
+  type BenchmarkReviewLabelsV2,
   type BenchmarkReviewPacketV1,
+  type BenchmarkReviewPacketV2,
   type BenchmarkSuite,
-  type BenchmarkTrialResult,
+  type BenchmarkTrialResultV3,
+  type BenchmarkTrialResultV4,
+  type CanonicalHashAlgorithm,
 } from "@graphcraft/core";
 import { syncDirectory } from "./json.ts";
 import { redactString } from "./redaction.ts";
 import { readPrivateFileBounded } from "./secure-fs.ts";
 import { assertBenchmarkReportEvidence } from "./benchmark-validation.ts";
 
-const REVIEW_POLICY = "bounded_redacted_patch_and_transcript_v1" as const;
-const BLINDED_REVIEW_POLICY = "opaque_blinded_review_v1" as const;
+const LEGACY_REVIEW_POLICY = "bounded_redacted_patch_and_transcript_v1" as const;
+const PORTABLE_REVIEW_POLICY = "bounded_redacted_patch_and_transcript_v2" as const;
+const LEGACY_BLINDED_REVIEW_POLICY = "opaque_blinded_review_v1" as const;
+const PORTABLE_BLINDED_REVIEW_POLICY = "opaque_blinded_review_v2" as const;
 const WILSON_Z_95 = 1.959963984540054;
 export const BENCHMARK_PUBLICATION_REPORT_MAX_BYTES = 64 * 1024 * 1024;
 export const BENCHMARK_PUBLICATION_LABELS_MAX_BYTES = 16 * 1024 * 1024;
@@ -41,11 +58,34 @@ export interface LoadedBenchmarkReport {
   report: BenchmarkReportV3;
 }
 
-interface LoadedBenchmarkReviewLabels {
+export interface LoadedBenchmarkReportV4 {
+  path: string;
+  rawReportSha256: string;
+  report: BenchmarkReportV4;
+}
+
+export type LoadedVersionedBenchmarkReport = LoadedBenchmarkReport | LoadedBenchmarkReportV4;
+
+interface LoadedBenchmarkReviewLabelsV1 {
   path: string;
   labelsSha256: string;
-  labels: BenchmarkReviewLabels;
+  labels: BenchmarkReviewLabelsV1;
 }
+
+interface LoadedBenchmarkReviewLabelsV2 {
+  path: string;
+  labelsSha256: string;
+  labels: BenchmarkReviewLabelsV2;
+}
+
+type LoadedVersionedBenchmarkReviewLabels =
+  LoadedBenchmarkReviewLabelsV1 | LoadedBenchmarkReviewLabelsV2;
+
+type BenchmarkPublicationReport = BenchmarkReportV3 | BenchmarkReportV4;
+type BenchmarkPublicationResult = BenchmarkTrialResultV3 | BenchmarkTrialResultV4;
+type BenchmarkPublicationReviewPacket = BenchmarkReviewPacketV1 | BenchmarkReviewPacketV2;
+type BenchmarkPublicationExport = BenchmarkBlindedReviewExportV1 | BenchmarkBlindedReviewExportV2;
+type BenchmarkPublicationLabels = BenchmarkReviewLabelsV1 | BenchmarkReviewLabelsV2;
 
 export interface WilsonScoreInterval {
   method: "wilson_score";
@@ -107,29 +147,138 @@ function parseJson(path: string, source: string): unknown {
   }
 }
 
+function declaredSchemaVersion(value: unknown): unknown {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as { schemaVersion?: unknown }).schemaVersion
+    : undefined;
+}
+
+async function readBenchmarkReportArtifact(path: string): Promise<{
+  path: string;
+  rawReportSha256: string;
+  value: unknown;
+}> {
+  const absolute = resolve(path);
+  const source = await readPrivateFileBounded(absolute, BENCHMARK_PUBLICATION_REPORT_MAX_BYTES);
+  return {
+    path: absolute,
+    rawReportSha256: rawSha256(source),
+    value: parseJson(absolute, source.toString("utf8")),
+  };
+}
+
 export async function loadBenchmarkReportForPublication(
   path: string,
 ): Promise<LoadedBenchmarkReport> {
-  const absolute = resolve(path);
-  const source = await readPrivateFileBounded(absolute, BENCHMARK_PUBLICATION_REPORT_MAX_BYTES);
-  const report = BenchmarkReportV3Schema.parse(parseJson(absolute, source.toString("utf8")));
-  return { path: absolute, rawReportSha256: rawSha256(source), report };
+  const loaded = await readBenchmarkReportArtifact(path);
+  return {
+    path: loaded.path,
+    rawReportSha256: loaded.rawReportSha256,
+    report: BenchmarkReportV3Schema.parse(loaded.value),
+  };
 }
 
-export async function loadBenchmarkReviewLabels(path: string): Promise<BenchmarkReviewLabels> {
-  return (await loadBenchmarkReviewLabelsArtifact(path)).labels;
-}
-
-async function loadBenchmarkReviewLabelsArtifact(
+export async function loadBenchmarkReportForPublicationV4(
   path: string,
-): Promise<LoadedBenchmarkReviewLabels> {
+): Promise<LoadedBenchmarkReportV4> {
+  const loaded = await readBenchmarkReportArtifact(path);
+  return {
+    path: loaded.path,
+    rawReportSha256: loaded.rawReportSha256,
+    report: BenchmarkReportV4Schema.parse(loaded.value),
+  };
+}
+
+export async function loadVersionedBenchmarkReportForPublication(
+  path: string,
+): Promise<LoadedVersionedBenchmarkReport> {
+  const loaded = await readBenchmarkReportArtifact(path);
+  const schemaVersion = declaredSchemaVersion(loaded.value);
+  if (schemaVersion === 3)
+    return {
+      path: loaded.path,
+      rawReportSha256: loaded.rawReportSha256,
+      report: BenchmarkReportV3Schema.parse(loaded.value),
+    };
+  if (schemaVersion === 4)
+    return {
+      path: loaded.path,
+      rawReportSha256: loaded.rawReportSha256,
+      report: BenchmarkReportV4Schema.parse(loaded.value),
+    };
+  throw new Error("Benchmark publication supports only declared report schema versions 3 and 4");
+}
+
+async function readBenchmarkReviewLabelsArtifact(path: string): Promise<{
+  path: string;
+  labelsSha256: string;
+  value: unknown;
+}> {
   const absolute = resolve(path);
   const source = await readPrivateFileBounded(absolute, BENCHMARK_PUBLICATION_LABELS_MAX_BYTES);
   return {
     path: absolute,
     labelsSha256: rawSha256(source),
-    labels: BenchmarkReviewLabelsSchema.parse(parseJson(absolute, source.toString("utf8"))),
+    value: parseJson(absolute, source.toString("utf8")),
   };
+}
+
+async function loadBenchmarkReviewLabelsArtifact(
+  path: string,
+): Promise<LoadedBenchmarkReviewLabelsV1> {
+  const loaded = await readBenchmarkReviewLabelsArtifact(path);
+  return {
+    path: loaded.path,
+    labelsSha256: loaded.labelsSha256,
+    labels: BenchmarkReviewLabelsV1Schema.parse(loaded.value),
+  };
+}
+
+async function loadBenchmarkReviewLabelsArtifactV2(
+  path: string,
+): Promise<LoadedBenchmarkReviewLabelsV2> {
+  const loaded = await readBenchmarkReviewLabelsArtifact(path);
+  return {
+    path: loaded.path,
+    labelsSha256: loaded.labelsSha256,
+    labels: BenchmarkReviewLabelsV2Schema.parse(loaded.value),
+  };
+}
+
+async function loadVersionedBenchmarkReviewLabelsArtifact(
+  path: string,
+): Promise<LoadedVersionedBenchmarkReviewLabels> {
+  const loaded = await readBenchmarkReviewLabelsArtifact(path);
+  const schemaVersion = declaredSchemaVersion(loaded.value);
+  if (schemaVersion === 1)
+    return {
+      path: loaded.path,
+      labelsSha256: loaded.labelsSha256,
+      labels: BenchmarkReviewLabelsV1Schema.parse(loaded.value),
+    };
+  if (schemaVersion === 2)
+    return {
+      path: loaded.path,
+      labelsSha256: loaded.labelsSha256,
+      labels: BenchmarkReviewLabelsV2Schema.parse(loaded.value),
+    };
+  throw new Error(
+    "Benchmark publication supports only declared review-label schema versions 1 and 2",
+  );
+}
+
+export async function loadBenchmarkReviewLabels(path: string): Promise<BenchmarkReviewLabelsV1> {
+  return (await loadBenchmarkReviewLabelsArtifact(path)).labels;
+}
+
+export async function loadBenchmarkReviewLabelsV2(path: string): Promise<BenchmarkReviewLabelsV2> {
+  return (await loadBenchmarkReviewLabelsArtifactV2(path)).labels;
+}
+
+export async function loadVersionedBenchmarkReviewLabels(
+  path: string,
+): Promise<BenchmarkPublicationLabels> {
+  return (await loadVersionedBenchmarkReviewLabelsArtifact(path)).labels;
 }
 
 function hexNibble(value: number): number | undefined {
@@ -199,10 +348,39 @@ export async function readBenchmarkBlindingKeyFromStdin(
   }
 }
 
-function assertPublicationReady(report: BenchmarkReportV3): void {
+function publicationArtifactVersion(report: BenchmarkPublicationReport): 1 | 2 {
+  return report.schemaVersion === 4 ? 2 : 1;
+}
+
+function publicationHashAlgorithm(
+  reportOrVersion: BenchmarkPublicationReport | 1 | 2,
+): CanonicalHashAlgorithm {
+  const version =
+    typeof reportOrVersion === "number"
+      ? reportOrVersion
+      : publicationArtifactVersion(reportOrVersion);
+  return version === 2 ? PORTABLE_CANONICAL_HASH_ALGORITHM : LEGACY_CANONICAL_HASH_ALGORITHM;
+}
+
+function publicationOpaqueId(
+  report: BenchmarkPublicationReport,
+  rawReportSha256: string,
+  trialId: string,
+  blindingKey: Uint8Array,
+): string {
+  return report.schemaVersion === 4
+    ? benchmarkReviewOpaqueIdV2(rawReportSha256, trialId, blindingKey)
+    : benchmarkReviewOpaqueId(rawReportSha256, trialId, blindingKey);
+}
+
+function assertPublicationReady(report: BenchmarkPublicationReport): void {
   if (report.status !== "complete")
-    throw new Error("Benchmark publication requires a complete schema-3 report");
-  if (report.reviewPolicy !== REVIEW_POLICY)
+    throw new Error(
+      `Benchmark publication requires a complete schema-${report.schemaVersion} report`,
+    );
+  const expectedReviewPolicy =
+    report.schemaVersion === 4 ? PORTABLE_REVIEW_POLICY : LEGACY_REVIEW_POLICY;
+  if (report.reviewPolicy !== expectedReviewPolicy)
     throw new Error("Benchmark publication requires bounded review evidence");
   if (report.results.some(({ attemptCheckpoint }) => attemptCheckpoint !== "settled"))
     throw new Error("Benchmark publication cannot include an unsettled trial");
@@ -210,11 +388,11 @@ function assertPublicationReady(report: BenchmarkReportV3): void {
     throw new Error("Every settled benchmark trial must retain a review packet");
 }
 
-function assertSuiteMatchesReport(suite: BenchmarkSuite, report: BenchmarkReportV3): void {
+function assertSuiteMatchesReport(suite: BenchmarkSuite, report: BenchmarkPublicationReport): void {
   if (
     suite.id !== report.suite.id ||
     suite.version !== report.suite.version ||
-    contentHash(suite) !== report.suite.digest
+    contentHash(suite, publicationHashAlgorithm(report)) !== report.suite.digest
   )
     throw new Error("The benchmark suite does not match the raw report identity");
 }
@@ -318,7 +496,7 @@ function transcriptIdentityStrings(text: string): Set<string> {
   return identities;
 }
 
-function identityReplacements(result: BenchmarkTrialResult): IdentityReplacement[] {
+function identityReplacements(result: BenchmarkPublicationResult): IdentityReplacement[] {
   const distinctive = (value: string): boolean =>
     value.length >= MINIMUM_DISCOVERED_IDENTITY_LENGTH;
   const candidates: IdentityReplacement[] = [
@@ -535,9 +713,10 @@ function utf8Suffix(value: Buffer, maximumBytes: number): Buffer {
 }
 
 function blindedEvidence(
-  evidence: BenchmarkReviewPacketV1["patch"],
+  evidence: BenchmarkPublicationReviewPacket["patch"],
   replacements: IdentityReplacement[],
-): BenchmarkReviewPacketV1["patch"] {
+  packetSchemaVersion: 1 | 2,
+): BenchmarkPublicationReviewPacket["patch"] {
   const text =
     evidence.mediaType === "application/x-ndjson"
       ? normalizedBlindedTranscript(evidence.text, replacements)
@@ -562,49 +741,122 @@ function blindedEvidence(
   const omittedBytes = evidence.omittedBytes + locallyOmittedBytes;
   const observedBytes = retainedBytes + omittedBytes;
   const truncated = omittedBytes > 0;
-  const blinded = {
+  const digestInput = {
     mediaType: evidence.mediaType,
     text: retainedText,
     observedBytes,
-    retainedBytes,
     omittedBytes,
     truncated,
-    digest: contentHash({
-      mediaType: evidence.mediaType,
-      text: retainedText,
-      observedBytes,
-      omittedBytes,
-      truncated,
-    }),
   };
-  return BenchmarkReviewPacketV1Schema.shape.patch.parse(blinded);
+  const blinded = {
+    ...digestInput,
+    retainedBytes,
+    digest: benchmarkReviewEvidenceDigest(digestInput, packetSchemaVersion),
+  };
+  return packetSchemaVersion === 2
+    ? BenchmarkReviewPacketV2Schema.shape.patch.parse(blinded)
+    : BenchmarkReviewPacketV1Schema.shape.patch.parse(blinded);
 }
 
 function blindedReviewPacket(
   reviewPacket: BenchmarkReviewPacketV1,
   replacements: IdentityReplacement[],
-): BenchmarkReviewPacketV1 {
-  return BenchmarkReviewPacketV1Schema.parse({
-    schemaVersion: 1,
-    patch: blindedEvidence(reviewPacket.patch, replacements),
-    transcript: blindedEvidence(reviewPacket.transcript, replacements),
+  packetSchemaVersion: 1,
+): BenchmarkReviewPacketV1;
+function blindedReviewPacket(
+  reviewPacket: BenchmarkReviewPacketV2,
+  replacements: IdentityReplacement[],
+  packetSchemaVersion: 2,
+): BenchmarkReviewPacketV2;
+function blindedReviewPacket(
+  reviewPacket: BenchmarkPublicationReviewPacket,
+  replacements: IdentityReplacement[],
+  packetSchemaVersion: 1 | 2,
+): BenchmarkPublicationReviewPacket {
+  const evidence = {
+    patch: blindedEvidence(reviewPacket.patch, replacements, packetSchemaVersion),
+    transcript: blindedEvidence(reviewPacket.transcript, replacements, packetSchemaVersion),
     captureFailures: reviewPacket.captureFailures.map((failure) =>
       blindedPatch(failure, replacements),
     ),
-  });
+  };
+  return packetSchemaVersion === 2
+    ? BenchmarkReviewPacketV2Schema.parse({
+        schemaVersion: 2,
+        hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+        ...evidence,
+      })
+    : BenchmarkReviewPacketV1Schema.parse({ schemaVersion: 1, ...evidence });
 }
 
-export function createBlindedBenchmarkReview(input: {
+type CreateBlindedBenchmarkReviewV1Input = {
   report: BenchmarkReportV3;
   rawReportSha256: string;
   suite: BenchmarkSuite;
   blindingKey: Uint8Array;
-}): BenchmarkBlindedReviewExport {
+};
+
+type CreateBlindedBenchmarkReviewV2Input = {
+  report: BenchmarkReportV4;
+  rawReportSha256: string;
+  suite: BenchmarkSuite;
+  blindingKey: Uint8Array;
+};
+
+type CreateBlindedBenchmarkReviewInput =
+  CreateBlindedBenchmarkReviewV1Input | CreateBlindedBenchmarkReviewV2Input;
+
+function blindedPacketFields(input: {
+  report: BenchmarkPublicationReport;
+  result: BenchmarkPublicationResult;
+  task: BenchmarkSuite["tasks"][number];
+  rawReportSha256: string;
+  blindingKey: Uint8Array;
+  replacements: IdentityReplacement[];
+}) {
+  const { report, result, task, rawReportSha256, blindingKey, replacements } = input;
+  return {
+    opaqueId: publicationOpaqueId(report, rawReportSha256, result.trial.trialId, blindingKey),
+    task: {
+      family: task.family,
+      prompt: blindText(task.task, replacements),
+      checks: blindValue(task.checks, replacements),
+      acceptanceCriteria: blindValue(task.acceptance, replacements),
+    },
+    outcome: {
+      executionStatus: result.executionStatus,
+      accepted: result.accepted,
+      scorerVerified: result.scorerVerified,
+      acceptance: blindValue(result.acceptance, replacements),
+      ...(result.interruption
+        ? { interruption: blindValue(result.interruption, replacements) }
+        : {}),
+      limitations: blindValue(result.limitations, replacements),
+      failureTrace: blindValue(result.failureTrace, replacements),
+    },
+  };
+}
+
+export function createBlindedBenchmarkReview(
+  input: CreateBlindedBenchmarkReviewV2Input,
+): BenchmarkBlindedReviewExportV2;
+export function createBlindedBenchmarkReview(
+  input: CreateBlindedBenchmarkReviewV1Input,
+): BenchmarkBlindedReviewExportV1;
+export function createBlindedBenchmarkReview(
+  input: CreateBlindedBenchmarkReviewInput,
+): BenchmarkPublicationExport {
   const suite = BenchmarkSuiteSchema.parse(input.suite);
-  const report = assertBenchmarkReportEvidence({
-    report: BenchmarkReportV3Schema.parse(input.report),
-    suite,
-  });
+  const report: BenchmarkPublicationReport =
+    input.report.schemaVersion === 4
+      ? assertBenchmarkReportEvidence({
+          report: BenchmarkReportV4Schema.parse(input.report),
+          suite,
+        })
+      : assertBenchmarkReportEvidence({
+          report: BenchmarkReportV3Schema.parse(input.report),
+          suite,
+        });
   const rawReportSha256 = input.rawReportSha256.toLowerCase();
   if (!/^[0-9a-f]{64}$/u.test(rawReportSha256))
     throw new Error("The raw benchmark report SHA-256 digest is invalid");
@@ -612,74 +864,120 @@ export function createBlindedBenchmarkReview(input: {
   assertPublicationReady(report);
   assertSuiteMatchesReport(suite, report);
   const byTask = new Map(suite.tasks.map((task) => [task.id, task]));
+  const taxonomy = {
+    version: 1 as const,
+    categories: [...BENCHMARK_DEFECT_CATEGORIES],
+    severities: [...BENCHMARK_DEFECT_SEVERITIES],
+  };
+  if (report.schemaVersion === 4) {
+    const packets = report.results
+      .map((result) => {
+        const task = byTask.get(result.trial.taskId);
+        if (!task) throw new Error(`Missing suite task for result ${result.trial.taskId}`);
+        const replacements = identityReplacements(result);
+        return BenchmarkBlindedReviewPacketV2Schema.parse(
+          publicationRedactValue({
+            schemaVersion: 2,
+            hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+            ...blindedPacketFields({
+              report,
+              result,
+              task,
+              rawReportSha256,
+              blindingKey: input.blindingKey,
+              replacements,
+            }),
+            reviewPacket: blindedReviewPacket(result.reviewPacket, replacements, 2),
+          }),
+        );
+      })
+      .sort((left, right) => compareText(left.opaqueId, right.opaqueId));
+    return BenchmarkBlindedReviewExportV2Schema.parse({
+      schemaVersion: 2,
+      hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+      reviewPolicy: PORTABLE_BLINDED_REVIEW_POLICY,
+      rawReportSha256,
+      blindingKeyDigest,
+      suite: report.suite,
+      taxonomy,
+      packets,
+    });
+  }
   const packets = report.results
     .map((result) => {
       const task = byTask.get(result.trial.taskId);
       if (!task) throw new Error(`Missing suite task for result ${result.trial.taskId}`);
       const replacements = identityReplacements(result);
-      return BenchmarkBlindedReviewPacketSchema.parse(
+      return BenchmarkBlindedReviewPacketV1Schema.parse(
         publicationRedactValue({
           schemaVersion: 1,
-          opaqueId: benchmarkReviewOpaqueId(
+          ...blindedPacketFields({
+            report,
+            result,
+            task,
             rawReportSha256,
-            result.trial.trialId,
-            input.blindingKey,
+            blindingKey: input.blindingKey,
+            replacements,
+          }),
+          reviewPacket: blindedReviewPacket(
+            BenchmarkReviewPacketV1Schema.parse(result.reviewPacket),
+            replacements,
+            1,
           ),
-          task: {
-            family: task.family,
-            prompt: blindText(task.task, replacements),
-            checks: blindValue(task.checks, replacements),
-            acceptanceCriteria: blindValue(task.acceptance, replacements),
-          },
-          outcome: {
-            executionStatus: result.executionStatus,
-            accepted: result.accepted,
-            scorerVerified: result.scorerVerified,
-            acceptance: blindValue(result.acceptance, replacements),
-            ...(result.interruption
-              ? { interruption: blindValue(result.interruption, replacements) }
-              : {}),
-            limitations: blindValue(result.limitations, replacements),
-            failureTrace: blindValue(result.failureTrace, replacements),
-          },
-          reviewPacket: blindedReviewPacket(result.reviewPacket!, replacements),
         }),
       );
     })
     .sort((left, right) => compareText(left.opaqueId, right.opaqueId));
-  return BenchmarkBlindedReviewExportSchema.parse({
+  return BenchmarkBlindedReviewExportV1Schema.parse({
     schemaVersion: 1,
-    reviewPolicy: BLINDED_REVIEW_POLICY,
+    reviewPolicy: LEGACY_BLINDED_REVIEW_POLICY,
     rawReportSha256,
     blindingKeyDigest,
     suite: report.suite,
-    taxonomy: {
-      version: 1,
-      categories: [...BENCHMARK_DEFECT_CATEGORIES],
-      severities: [...BENCHMARK_DEFECT_SEVERITIES],
-    },
+    taxonomy,
     packets,
   });
 }
 
-export function validateBenchmarkReviewLabels(input: {
-  report: BenchmarkReportV3;
-  rawReportSha256: string;
-  suite: BenchmarkSuite;
-  labels: BenchmarkReviewLabels;
-  blindingKey: Uint8Array;
-}): {
-  blindedReview: BenchmarkBlindedReviewExport;
-  labels: BenchmarkReviewLabels;
-  labelsByOpaqueId: Map<string, BenchmarkReviewLabels["labels"][number]>;
+type ValidateBenchmarkReviewLabelsV1Input = CreateBlindedBenchmarkReviewV1Input & {
+  labels: BenchmarkReviewLabelsV1;
+};
+
+type ValidateBenchmarkReviewLabelsV2Input = CreateBlindedBenchmarkReviewV2Input & {
+  labels: BenchmarkReviewLabelsV2;
+};
+
+type ValidateBenchmarkReviewLabelsInput =
+  ValidateBenchmarkReviewLabelsV1Input | ValidateBenchmarkReviewLabelsV2Input;
+
+type BenchmarkReviewLabel = BenchmarkPublicationLabels["labels"][number];
+
+type ValidatedBenchmarkReviewLabelsV1 = {
+  blindedReview: BenchmarkBlindedReviewExportV1;
+  labels: BenchmarkReviewLabelsV1;
+  labelsByOpaqueId: Map<string, BenchmarkReviewLabelsV1["labels"][number]>;
+};
+
+type ValidatedBenchmarkReviewLabelsV2 = {
+  blindedReview: BenchmarkBlindedReviewExportV2;
+  labels: BenchmarkReviewLabelsV2;
+  labelsByOpaqueId: Map<string, BenchmarkReviewLabelsV2["labels"][number]>;
+};
+
+function validateParsedBenchmarkReviewLabels(
+  blindedReview: BenchmarkPublicationExport,
+  labels: BenchmarkPublicationLabels,
+  hashAlgorithm: CanonicalHashAlgorithm,
+): {
+  blindedReview: BenchmarkPublicationExport;
+  labels: BenchmarkPublicationLabels;
+  labelsByOpaqueId: Map<string, BenchmarkReviewLabel>;
 } {
-  const blindedReview = createBlindedBenchmarkReview(input);
-  const labels = BenchmarkReviewLabelsSchema.parse(input.labels);
   if (labels.rawReportSha256 !== blindedReview.rawReportSha256)
     throw new Error("Review labels do not match the raw benchmark report digest");
   if (labels.blindingKeyDigest !== blindedReview.blindingKeyDigest)
     throw new Error("Review labels do not match the benchmark blinding-key digest");
-  if (labels.blindedReviewDigest !== contentHash(blindedReview))
+  if (labels.blindedReviewDigest !== contentHash(blindedReview, hashAlgorithm))
     throw new Error("Review labels do not match the blinded review artifact digest");
   const packets = new Map(blindedReview.packets.map((packet) => [packet.opaqueId, packet]));
   const labelsByOpaqueId = new Map(labels.labels.map((label) => [label.opaqueId, label]));
@@ -690,10 +988,51 @@ export function validateBenchmarkReviewLabels(input: {
   )
     throw new Error("Review labels must cover every settled trial exactly once");
   for (const [opaqueId, packet] of packets) {
-    if (labelsByOpaqueId.get(opaqueId)!.packetDigest !== contentHash(packet))
+    if (labelsByOpaqueId.get(opaqueId)!.packetDigest !== contentHash(packet, hashAlgorithm))
       throw new Error(`Review label packet digest does not match ${opaqueId}`);
   }
   return { blindedReview, labels, labelsByOpaqueId };
+}
+
+export function validateBenchmarkReviewLabels(
+  input: ValidateBenchmarkReviewLabelsV2Input,
+): ValidatedBenchmarkReviewLabelsV2;
+export function validateBenchmarkReviewLabels(
+  input: ValidateBenchmarkReviewLabelsV1Input,
+): ValidatedBenchmarkReviewLabelsV1;
+export function validateBenchmarkReviewLabels(
+  input: ValidateBenchmarkReviewLabelsInput,
+): ValidatedBenchmarkReviewLabelsV1 | ValidatedBenchmarkReviewLabelsV2 {
+  if (input.report.schemaVersion === 4) {
+    if (input.labels.schemaVersion !== 2)
+      throw new Error("Schema-4 benchmark reports require schema-2 review labels");
+    const labels = BenchmarkReviewLabelsV2Schema.parse(input.labels);
+    const blindedReview = createBlindedBenchmarkReview({
+      report: input.report,
+      rawReportSha256: input.rawReportSha256,
+      suite: input.suite,
+      blindingKey: input.blindingKey,
+    });
+    return validateParsedBenchmarkReviewLabels(
+      blindedReview,
+      labels,
+      PORTABLE_CANONICAL_HASH_ALGORITHM,
+    ) as ValidatedBenchmarkReviewLabelsV2;
+  }
+  if (input.labels.schemaVersion !== 1)
+    throw new Error("Schema-3 benchmark reports require schema-1 review labels");
+  const labels = BenchmarkReviewLabelsV1Schema.parse(input.labels);
+  const blindedReview = createBlindedBenchmarkReview({
+    report: input.report,
+    rawReportSha256: input.rawReportSha256,
+    suite: input.suite,
+    blindingKey: input.blindingKey,
+  });
+  return validateParsedBenchmarkReviewLabels(
+    blindedReview,
+    labels,
+    LEGACY_CANONICAL_HASH_ALGORITHM,
+  ) as ValidatedBenchmarkReviewLabelsV1;
 }
 
 export function wilsonScoreInterval(successes: number, trials: number): WilsonScoreInterval | null {
@@ -829,7 +1168,7 @@ const TOKEN_DIMENSIONS = [
 ] as const;
 
 function tokenDimension(
-  results: BenchmarkTrialResult[],
+  results: BenchmarkPublicationResult[],
   dimension: (typeof TOKEN_DIMENSIONS)[number],
 ): string {
   const reconciled = results.filter(({ usageReconciled }) => usageReconciled);
@@ -843,36 +1182,73 @@ function tokenDimension(
     : `${total} (${available.length}/${reconciled.length} available)`;
 }
 
-function reconciledTokenTotal(results: BenchmarkTrialResult[]): string {
+function reconciledTokenTotal(results: BenchmarkPublicationResult[]): string {
   const reconciled = results.filter(({ usageReconciled }) => usageReconciled);
   const total = reconciled.reduce((sum, { usage }) => sum + usage.total, 0);
   return `${total} (${reconciled.length}/${results.length} trials)`;
 }
 
-function resultKey(result: BenchmarkTrialResult): string {
+function resultKey(result: BenchmarkPublicationResult): string {
   return `${result.trial.host}/${result.trial.mode}/${result.trial.taskId}#${result.trial.repetition}`;
 }
 
-export function renderBenchmarkPublicationMarkdown(input: {
-  report: BenchmarkReportV3;
-  rawReportSha256: string;
-  suite: BenchmarkSuite;
-  labels: BenchmarkReviewLabels;
+type RenderBenchmarkPublicationMarkdownV1Input = ValidateBenchmarkReviewLabelsV1Input & {
   labelsSha256: string;
-  blindingKey: Uint8Array;
-}): string {
-  const report = BenchmarkReportV3Schema.parse(input.report);
+};
+
+type RenderBenchmarkPublicationMarkdownV2Input = ValidateBenchmarkReviewLabelsV2Input & {
+  labelsSha256: string;
+};
+
+type RenderBenchmarkPublicationMarkdownInput =
+  RenderBenchmarkPublicationMarkdownV1Input | RenderBenchmarkPublicationMarkdownV2Input;
+
+export function renderBenchmarkPublicationMarkdown(
+  input: RenderBenchmarkPublicationMarkdownV2Input,
+): string;
+export function renderBenchmarkPublicationMarkdown(
+  input: RenderBenchmarkPublicationMarkdownV1Input,
+): string;
+export function renderBenchmarkPublicationMarkdown(
+  input: RenderBenchmarkPublicationMarkdownInput,
+): string {
+  const report: BenchmarkPublicationReport =
+    input.report.schemaVersion === 4
+      ? BenchmarkReportV4Schema.parse(input.report)
+      : BenchmarkReportV3Schema.parse(input.report);
   const suite = BenchmarkSuiteSchema.parse(input.suite);
   if (!/^[0-9a-f]{64}$/u.test(input.labelsSha256))
     throw new Error("The review-label file SHA-256 digest is invalid");
-  const validated = validateBenchmarkReviewLabels({ ...input, report, suite });
-  const summary = summarizeBenchmark(report.results, report.schedule);
+  const validated =
+    report.schemaVersion === 4
+      ? validateBenchmarkReviewLabels({
+          report,
+          rawReportSha256: input.rawReportSha256,
+          suite,
+          labels: input.labels,
+          blindingKey: input.blindingKey,
+        } as ValidateBenchmarkReviewLabelsV2Input)
+      : validateBenchmarkReviewLabels({
+          report,
+          rawReportSha256: input.rawReportSha256,
+          suite,
+          labels: input.labels,
+          blindingKey: input.blindingKey,
+        } as ValidateBenchmarkReviewLabelsV1Input);
+  const summary = summarizeBenchmark(
+    report.results,
+    report.schedule,
+    report.schemaVersion === 4
+      ? { schemaVersion: 4, hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM }
+      : { schemaVersion: 3, hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM },
+  );
   const hosts = [...new Set(report.schedule.map(({ host }) => host))].sort() as Array<
     "claude" | "codex"
   >;
-  const labelFor = (result: BenchmarkTrialResult) =>
+  const labelFor = (result: BenchmarkPublicationResult) =>
     validated.labelsByOpaqueId.get(
-      benchmarkReviewOpaqueId(
+      publicationOpaqueId(
+        report,
         validated.blindedReview.rawReportSha256,
         result.trial.trialId,
         input.blindingKey,
@@ -883,7 +1259,10 @@ export function renderBenchmarkPublicationMarkdown(input: {
   );
   const criticalDefects = allDefects.filter(({ defect }) => defect.severity === "critical");
   const criticalTrials = new Set(criticalDefects.map(({ result }) => result.trial.trialId)).size;
-  const blindedReviewDigest = contentHash(validated.blindedReview);
+  const blindedReviewDigest = contentHash(
+    validated.blindedReview,
+    publicationHashAlgorithm(report),
+  );
   const reviewerIds = [
     ...new Set(validated.labels.labels.map(({ reviewerId }) => reviewerId)),
   ].sort();
@@ -894,6 +1273,12 @@ export function renderBenchmarkPublicationMarkdown(input: {
     "",
     "## Provenance",
     "",
+    ...(report.schemaVersion === 4
+      ? [
+          "Publication artifact schema: `2`  ",
+          `Canonical hash algorithm: \`${PORTABLE_CANONICAL_HASH_ALGORITHM}\`  `,
+        ]
+      : []),
     `Raw report byte SHA-256: \`${validated.blindedReview.rawReportSha256}\`  `,
     `Blinding-key digest: \`${validated.blindedReview.blindingKeyDigest}\`  `,
     `Blinded review canonical SHA-256: \`${blindedReviewDigest}\`  `,
@@ -1255,9 +1640,13 @@ async function writeTextCreateOnly(path: string, text: string): Promise<void> {
   }
 }
 
-async function writeJsonCreateOnly(path: string, value: unknown): Promise<void> {
+async function writeJsonCreateOnly(
+  path: string,
+  value: unknown,
+  hashAlgorithm: CanonicalHashAlgorithm,
+): Promise<void> {
   const redacted = publicationRedactValue(value);
-  if (contentHash(redacted) !== contentHash(value))
+  if (contentHash(redacted, hashAlgorithm) !== contentHash(value, hashAlgorithm))
     throw new Error("Blinded benchmark artifact changed during final redaction");
   await writeTextCreateOnly(path, `${JSON.stringify(redacted, null, 2)}\n`);
 }
@@ -1274,24 +1663,33 @@ export async function exportBlindedBenchmarkReview(input: {
   blindedReviewDigest: string;
   packetCount: number;
 }> {
-  const loaded = await loadBenchmarkReportForPublication(input.reportPath);
+  const loaded = await loadVersionedBenchmarkReportForPublication(input.reportPath);
   const blindingKey = Buffer.from(input.blindingKey);
   try {
     const outputPath = resolve(input.outputPath);
     await assertDistinctOutput(outputPath, [loaded.path]);
     await assertCreateOnlyOutput(outputPath);
-    const artifact = createBlindedBenchmarkReview({
-      report: loaded.report,
-      rawReportSha256: loaded.rawReportSha256,
-      suite: input.suite,
-      blindingKey,
-    });
-    await writeJsonCreateOnly(outputPath, artifact);
+    const artifact =
+      loaded.report.schemaVersion === 4
+        ? createBlindedBenchmarkReview({
+            report: loaded.report,
+            rawReportSha256: loaded.rawReportSha256,
+            suite: input.suite,
+            blindingKey,
+          })
+        : createBlindedBenchmarkReview({
+            report: loaded.report,
+            rawReportSha256: loaded.rawReportSha256,
+            suite: input.suite,
+            blindingKey,
+          });
+    const hashAlgorithm = publicationHashAlgorithm(loaded.report);
+    await writeJsonCreateOnly(outputPath, artifact, hashAlgorithm);
     return {
       outputPath,
       rawReportSha256: loaded.rawReportSha256,
       blindingKeyDigest: benchmarkBlindingKeyDigest(blindingKey),
-      blindedReviewDigest: contentHash(artifact),
+      blindedReviewDigest: contentHash(artifact, hashAlgorithm),
       packetCount: artifact.packets.length,
     };
   } finally {
@@ -1314,22 +1712,36 @@ export async function renderBenchmarkPublicationReport(input: {
   reportSha256: string;
 }> {
   const [loaded, loadedLabels] = await Promise.all([
-    loadBenchmarkReportForPublication(input.reportPath),
-    loadBenchmarkReviewLabelsArtifact(input.labelsPath),
+    loadVersionedBenchmarkReportForPublication(input.reportPath),
+    loadVersionedBenchmarkReviewLabelsArtifact(input.labelsPath),
   ]);
+  if (loaded.report.schemaVersion === 4 && loadedLabels.labels.schemaVersion !== 2)
+    throw new Error("Schema-4 benchmark reports require schema-2 review labels");
+  if (loaded.report.schemaVersion === 3 && loadedLabels.labels.schemaVersion !== 1)
+    throw new Error("Schema-3 benchmark reports require schema-1 review labels");
   const blindingKey = Buffer.from(input.blindingKey);
   try {
     const outputPath = resolve(input.outputPath);
     await assertDistinctOutput(outputPath, [loaded.path, loadedLabels.path]);
     await assertCreateOnlyOutput(outputPath);
-    const rendered = renderBenchmarkPublicationMarkdown({
-      report: loaded.report,
-      rawReportSha256: loaded.rawReportSha256,
-      suite: input.suite,
-      labels: loadedLabels.labels,
-      labelsSha256: loadedLabels.labelsSha256,
-      blindingKey,
-    });
+    const rendered =
+      loaded.report.schemaVersion === 4 && loadedLabels.labels.schemaVersion === 2
+        ? renderBenchmarkPublicationMarkdown({
+            report: loaded.report,
+            rawReportSha256: loaded.rawReportSha256,
+            suite: input.suite,
+            labels: loadedLabels.labels,
+            labelsSha256: loadedLabels.labelsSha256,
+            blindingKey,
+          })
+        : renderBenchmarkPublicationMarkdown({
+            report: BenchmarkReportV3Schema.parse(loaded.report),
+            rawReportSha256: loaded.rawReportSha256,
+            suite: input.suite,
+            labels: BenchmarkReviewLabelsV1Schema.parse(loadedLabels.labels),
+            labelsSha256: loadedLabels.labelsSha256,
+            blindingKey,
+          });
     await writeTextCreateOnly(outputPath, rendered);
     return {
       outputPath,

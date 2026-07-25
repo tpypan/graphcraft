@@ -5,9 +5,10 @@ import {
   BenchmarkAssertionSchema,
   BenchmarkCheckSchema,
   BenchmarkReviewPacketV1Schema,
+  BenchmarkReviewPacketV2Schema,
   BenchmarkTaskFamilySchema,
 } from "./benchmark.ts";
-import { canonicalJson, contentHash } from "./canonical.ts";
+import { PORTABLE_CANONICAL_HASH_ALGORITHM, canonicalJson, contentHash } from "./canonical.ts";
 
 export const BENCHMARK_DEFECT_CATEGORIES = [
   "correctness",
@@ -26,6 +27,8 @@ export const BenchmarkDefectCategorySchema = z.enum(BENCHMARK_DEFECT_CATEGORIES)
 export const BenchmarkDefectSeveritySchema = z.enum(BENCHMARK_DEFECT_SEVERITIES);
 
 export const BenchmarkReviewOpaqueIdSchema = z.string().regex(/^packet-[0-9a-f]{32}$/);
+export const BenchmarkReviewOpaqueIdV1Schema = BenchmarkReviewOpaqueIdSchema;
+export const BenchmarkReviewOpaqueIdV2Schema = z.string().regex(/^packet-[0-9a-f]{32}$/);
 
 const BenchmarkBlindedInterruptionSchema = z.strictObject({
   cause: z.enum(["cancellation", "runtime_shutdown", "timeout"]),
@@ -60,10 +63,34 @@ export const BenchmarkBlindedReviewPacketSchema = z.strictObject({
   }),
   reviewPacket: BenchmarkReviewPacketV1Schema,
 });
+export const BenchmarkBlindedReviewPacketV1Schema = BenchmarkBlindedReviewPacketSchema;
+
+export const BenchmarkBlindedReviewPacketV2Schema = z.strictObject({
+  schemaVersion: z.literal(2),
+  hashAlgorithm: z.literal(PORTABLE_CANONICAL_HASH_ALGORITHM),
+  opaqueId: BenchmarkReviewOpaqueIdV2Schema,
+  task: BenchmarkBlindedReviewPacketSchema.shape.task,
+  outcome: BenchmarkBlindedReviewPacketSchema.shape.outcome,
+  reviewPacket: BenchmarkReviewPacketV2Schema,
+});
 
 function exactOrderedValues<T extends string>(expected: readonly T[]) {
   return z.array(z.string()).superRefine((values, context) => {
     if (contentHash(values) !== contentHash(expected)) {
+      context.addIssue({
+        code: "custom",
+        message: `Expected the exact ordered values: ${expected.join(", ")}`,
+      });
+    }
+  });
+}
+
+function exactPortableOrderedValues<T extends string>(expected: readonly T[]) {
+  return z.array(z.string()).superRefine((values, context) => {
+    if (
+      contentHash(values, PORTABLE_CANONICAL_HASH_ALGORITHM) !==
+      contentHash(expected, PORTABLE_CANONICAL_HASH_ALGORITHM)
+    ) {
       context.addIssue({
         code: "custom",
         message: `Expected the exact ordered values: ${expected.join(", ")}`,
@@ -89,6 +116,44 @@ export const BenchmarkBlindedReviewExportSchema = z
       severities: exactOrderedValues(BENCHMARK_DEFECT_SEVERITIES),
     }),
     packets: z.array(BenchmarkBlindedReviewPacketSchema).min(1),
+  })
+  .superRefine((artifact, context) => {
+    const ids = artifact.packets.map(({ opaqueId }) => opaqueId);
+    if (new Set(ids).size !== ids.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["packets"],
+        message: "Blinded benchmark packet IDs must be unique",
+      });
+    }
+    if (ids.some((id, index) => index > 0 && id < ids[index - 1]!)) {
+      context.addIssue({
+        code: "custom",
+        path: ["packets"],
+        message: "Blinded benchmark packets must be sorted by opaque ID",
+      });
+    }
+  });
+export const BenchmarkBlindedReviewExportV1Schema = BenchmarkBlindedReviewExportSchema;
+
+export const BenchmarkBlindedReviewExportV2Schema = z
+  .strictObject({
+    schemaVersion: z.literal(2),
+    hashAlgorithm: z.literal(PORTABLE_CANONICAL_HASH_ALGORITHM),
+    reviewPolicy: z.literal("opaque_blinded_review_v2"),
+    rawReportSha256: z.string().regex(/^[0-9a-f]{64}$/),
+    blindingKeyDigest: z.string().regex(/^[0-9a-f]{64}$/),
+    suite: z.strictObject({
+      id: z.string().min(1),
+      version: z.number().int().positive(),
+      digest: z.string().min(1),
+    }),
+    taxonomy: z.strictObject({
+      version: z.literal(1),
+      categories: exactPortableOrderedValues(BENCHMARK_DEFECT_CATEGORIES),
+      severities: exactPortableOrderedValues(BENCHMARK_DEFECT_SEVERITIES),
+    }),
+    packets: z.array(BenchmarkBlindedReviewPacketV2Schema).min(1),
   })
   .superRefine((artifact, context) => {
     const ids = artifact.packets.map(({ opaqueId }) => opaqueId);
@@ -149,6 +214,8 @@ export const BenchmarkTrialReviewLabelSchema = z
       });
     }
   });
+export const BenchmarkTrialReviewLabelV1Schema = BenchmarkTrialReviewLabelSchema;
+export const BenchmarkTrialReviewLabelV2Schema = BenchmarkTrialReviewLabelSchema;
 
 export const BenchmarkReviewLabelsSchema = z
   .strictObject({
@@ -159,6 +226,29 @@ export const BenchmarkReviewLabelsSchema = z
     blindingKeyDigest: z.string().regex(/^[0-9a-f]{64}$/),
     blindedReviewDigest: z.string().regex(/^[0-9a-f]{64}$/),
     labels: z.array(BenchmarkTrialReviewLabelSchema).min(1),
+  })
+  .superRefine((artifact, context) => {
+    const ids = artifact.labels.map(({ opaqueId }) => opaqueId);
+    if (new Set(ids).size !== ids.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["labels"],
+        message: "A benchmark review artifact must contain one label per opaque ID",
+      });
+    }
+  });
+export const BenchmarkReviewLabelsV1Schema = BenchmarkReviewLabelsSchema;
+
+export const BenchmarkReviewLabelsV2Schema = z
+  .strictObject({
+    schemaVersion: z.literal(2),
+    hashAlgorithm: z.literal(PORTABLE_CANONICAL_HASH_ALGORITHM),
+    reviewPolicy: z.literal("opaque_blinded_review_v2"),
+    taxonomyVersion: z.literal(1),
+    rawReportSha256: z.string().regex(/^[0-9a-f]{64}$/),
+    blindingKeyDigest: z.string().regex(/^[0-9a-f]{64}$/),
+    blindedReviewDigest: z.string().regex(/^[0-9a-f]{64}$/),
+    labels: z.array(BenchmarkTrialReviewLabelV2Schema).min(1),
   })
   .superRefine((artifact, context) => {
     const ids = artifact.labels.map(({ opaqueId }) => opaqueId);
@@ -209,8 +299,48 @@ export function benchmarkReviewOpaqueId(
   );
 }
 
+export const benchmarkReviewOpaqueIdV1 = benchmarkReviewOpaqueId;
+
+export function benchmarkReviewOpaqueIdV2(
+  rawReportSha256: string,
+  trialId: string,
+  blindingKey: Uint8Array,
+): string {
+  const digest = z
+    .string()
+    .regex(/^[0-9a-f]{64}$/)
+    .parse(rawReportSha256);
+  const trial = z.string().min(1).parse(trialId);
+  return BenchmarkReviewOpaqueIdV2Schema.parse(
+    `packet-${createHmac("sha256", benchmarkBlindingKey(blindingKey))
+      .update(
+        canonicalJson(
+          {
+            namespace: "graphcraft-benchmark-review-packet-v2",
+            schemaVersion: 2,
+            hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+            rawReportSha256: digest,
+            trialId: trial,
+          },
+          PORTABLE_CANONICAL_HASH_ALGORITHM,
+        ),
+        "utf8",
+      )
+      .digest("hex")
+      .slice(0, 32)}`,
+  );
+}
+
 export type BenchmarkBlindedReviewPacket = z.infer<typeof BenchmarkBlindedReviewPacketSchema>;
+export type BenchmarkBlindedReviewPacketV1 = z.infer<typeof BenchmarkBlindedReviewPacketV1Schema>;
+export type BenchmarkBlindedReviewPacketV2 = z.infer<typeof BenchmarkBlindedReviewPacketV2Schema>;
 export type BenchmarkBlindedReviewExport = z.infer<typeof BenchmarkBlindedReviewExportSchema>;
+export type BenchmarkBlindedReviewExportV1 = z.infer<typeof BenchmarkBlindedReviewExportV1Schema>;
+export type BenchmarkBlindedReviewExportV2 = z.infer<typeof BenchmarkBlindedReviewExportV2Schema>;
 export type BenchmarkDefect = z.infer<typeof BenchmarkDefectSchema>;
 export type BenchmarkTrialReviewLabel = z.infer<typeof BenchmarkTrialReviewLabelSchema>;
+export type BenchmarkTrialReviewLabelV1 = z.infer<typeof BenchmarkTrialReviewLabelV1Schema>;
+export type BenchmarkTrialReviewLabelV2 = z.infer<typeof BenchmarkTrialReviewLabelV2Schema>;
 export type BenchmarkReviewLabels = z.infer<typeof BenchmarkReviewLabelsSchema>;
+export type BenchmarkReviewLabelsV1 = z.infer<typeof BenchmarkReviewLabelsV1Schema>;
+export type BenchmarkReviewLabelsV2 = z.infer<typeof BenchmarkReviewLabelsV2Schema>;

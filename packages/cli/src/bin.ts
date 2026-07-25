@@ -302,7 +302,7 @@ program
 program
   .command("benchmark-review")
   .description("Export deterministic opaque packets for blinded benchmark defect review")
-  .argument("<report>", "complete schema-3 benchmark report")
+  .argument("<report>", "complete schema-3 or schema-4 benchmark report")
   .option("--suite <suite>", "exact benchmark suite JSON", "stable-v1")
   .requiredOption(
     "--blinding-key-stdin",
@@ -339,7 +339,7 @@ program
 program
   .command("benchmark-report")
   .description("Render a validated benchmark report from raw evidence and blinded labels")
-  .argument("<report>", "complete schema-3 benchmark report")
+  .argument("<report>", "complete schema-3 or schema-4 benchmark report")
   .option("--suite <suite>", "exact benchmark suite JSON", "stable-v1")
   .requiredOption(
     "--blinding-key-stdin",

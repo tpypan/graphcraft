@@ -4,19 +4,31 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import {
+  BenchmarkBlindedReviewExportV2Schema,
   BenchmarkReportV3Schema,
   BenchmarkReportV4Schema,
   BenchmarkReviewLabelsSchema,
+  BenchmarkReviewLabelsV2Schema,
   BenchmarkSuiteSchema,
   BenchmarkTrialResultSchema,
+  BenchmarkTrialResultV4Schema,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
   benchmarkBlindingKeyDigest,
+  benchmarkReviewEvidenceDigest,
+  benchmarkReviewOpaqueId,
+  benchmarkReviewOpaqueIdV2,
   contentHash,
   createBenchmarkSchedule,
   summarizeBenchmark,
+  type BenchmarkBlindedReviewExportV1,
+  type BenchmarkBlindedReviewExportV2,
   type BenchmarkReportV3,
+  type BenchmarkReportV4,
   type BenchmarkReviewLabels,
+  type BenchmarkReviewLabelsV1,
+  type BenchmarkReviewLabelsV2,
   type BenchmarkScheduleEntry,
   type BenchmarkSuite,
 } from "@graphcraft/core";
@@ -28,7 +40,11 @@ import {
   exactMedianInterval,
   exportBlindedBenchmarkReview,
   loadBenchmarkReportForPublication,
+  loadBenchmarkReportForPublicationV4,
   loadBenchmarkReviewLabels,
+  loadBenchmarkReviewLabelsV2,
+  loadVersionedBenchmarkReportForPublication,
+  loadVersionedBenchmarkReviewLabels,
   parseBenchmarkBlindingKeyInput,
   readBenchmarkBlindingKeyFromStdin,
   renderBenchmarkPublicationMarkdown,
@@ -69,16 +85,17 @@ const suite: BenchmarkSuite = BenchmarkSuiteSchema.parse({
   ],
 });
 
-function reviewEvidence(mediaType: "text/x-diff" | "application/x-ndjson", text: string) {
+function reviewEvidence(
+  mediaType: "text/x-diff" | "application/x-ndjson",
+  text: string,
+  packetSchemaVersion: 1 | 2 = 1,
+) {
   const observedBytes = Buffer.byteLength(text);
+  const identity = { mediaType, text, observedBytes, omittedBytes: 0, truncated: false };
   return {
-    mediaType,
-    text,
-    observedBytes,
+    ...identity,
     retainedBytes: observedBytes,
-    omittedBytes: 0,
-    truncated: false,
-    digest: contentHash({ mediaType, text, observedBytes, omittedBytes: 0, truncated: false }),
+    digest: benchmarkReviewEvidenceDigest(identity, packetSchemaVersion),
   };
 }
 
@@ -276,6 +293,69 @@ function reportFixture(
   });
 }
 
+function portableReportFixture(
+  options: {
+    graphcraftTokens?: number;
+    host?: "codex" | "claude";
+    modelPolicy?: string;
+    unsuccessfulTrialId?: string;
+  } = {},
+): BenchmarkReportV4 {
+  const legacy = reportFixture(options);
+  const identity = {
+    schemaVersion: 4 as const,
+    hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+  };
+  const schedule = createBenchmarkSchedule({
+    suite,
+    hosts: [options.host ?? "codex"],
+    repetitions: 3,
+    seed: "publication-seed",
+    identity,
+  });
+  const sourceByOrder = new Map(legacy.results.map((result) => [result.trial.order, result]));
+  const task = suite.tasks[0]!;
+  const scorerDigest = expectedBenchmarkScorerDigest(task, PORTABLE_CANONICAL_HASH_ALGORITHM);
+  const results = schedule.map((trial) => {
+    const source = sourceByOrder.get(trial.order)!;
+    const sourcePacket = source.reviewPacket!;
+    return BenchmarkTrialResultV4Schema.parse({
+      ...source,
+      trial,
+      acceptanceScorerDigest: scorerDigest,
+      observedScorerDigest: scorerDigest,
+      repositoryDigest: contentHash(task.initialFiles, PORTABLE_CANONICAL_HASH_ALGORITHM),
+      reviewPacket: {
+        schemaVersion: 2,
+        hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+        patch: {
+          ...sourcePacket.patch,
+          digest: benchmarkReviewEvidenceDigest(sourcePacket.patch, 2),
+        },
+        transcript: {
+          ...sourcePacket.transcript,
+          digest: benchmarkReviewEvidenceDigest(sourcePacket.transcript, 2),
+        },
+        captureFailures: sourcePacket.captureFailures,
+      },
+    });
+  });
+  return BenchmarkReportV4Schema.parse({
+    ...legacy,
+    schemaVersion: 4,
+    hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+    suite: {
+      id: suite.id,
+      version: suite.version,
+      digest: contentHash(suite, PORTABLE_CANONICAL_HASH_ALGORITHM),
+    },
+    reviewPolicy: "bounded_redacted_patch_and_transcript_v2",
+    schedule,
+    results,
+    summary: summarizeBenchmark(results, schedule, identity),
+  });
+}
+
 function reviewLabels(
   report: BenchmarkReportV3,
   rawReportSha256: string,
@@ -315,11 +395,145 @@ function reviewLabels(
   });
 }
 
+function portableReviewLabels(
+  report: BenchmarkReportV4,
+  rawReportSha256: string,
+  critical = false,
+  key: Uint8Array = blindingKey,
+): BenchmarkReviewLabelsV2 {
+  const blinded = createBlindedBenchmarkReview({
+    report,
+    rawReportSha256,
+    suite,
+    blindingKey: key,
+  });
+  return BenchmarkReviewLabelsV2Schema.parse({
+    schemaVersion: 2,
+    hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+    reviewPolicy: "opaque_blinded_review_v2",
+    taxonomyVersion: 1,
+    rawReportSha256,
+    blindingKeyDigest: benchmarkBlindingKeyDigest(key),
+    blindedReviewDigest: contentHash(blinded, PORTABLE_CANONICAL_HASH_ALGORITHM),
+    labels: blinded.packets.map((packet, index) => ({
+      opaqueId: packet.opaqueId,
+      packetDigest: contentHash(packet, PORTABLE_CANONICAL_HASH_ALGORITHM),
+      reviewed: true,
+      reviewerId: index % 2 === 0 ? "reviewer-a" : "reviewer-b",
+      verdict: critical && index === 0 ? "defect" : "no_defect",
+      defects:
+        critical && index === 0
+          ? [
+              {
+                category: "correctness",
+                severity: "critical",
+                summary: "The retained implementation is incorrect",
+              },
+            ]
+          : [],
+    })),
+  });
+}
+
 function sha256(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function alternateLocaleLegacyContentHash(value: unknown): string {
+  const localeCompare = vi.spyOn(String.prototype, "localeCompare").mockImplementation(function (
+    this: string,
+    other: string,
+  ) {
+    const left = String(this);
+    return left < other ? 1 : left > other ? -1 : 0;
+  });
+  try {
+    return contentHash(value);
+  } finally {
+    localeCompare.mockRestore();
+  }
+}
+
 describe("benchmark blinded review", () => {
+  it("preserves legacy utility types while narrowing direct v1 and v2 overloads", () => {
+    expectTypeOf<
+      Parameters<typeof createBlindedBenchmarkReview>[0]["report"]
+    >().toEqualTypeOf<BenchmarkReportV3>();
+    expectTypeOf<
+      ReturnType<typeof createBlindedBenchmarkReview>
+    >().toEqualTypeOf<BenchmarkBlindedReviewExportV1>();
+    expectTypeOf<
+      Parameters<typeof validateBenchmarkReviewLabels>[0]["report"]
+    >().toEqualTypeOf<BenchmarkReportV3>();
+    expectTypeOf<
+      Parameters<typeof validateBenchmarkReviewLabels>[0]["labels"]
+    >().toEqualTypeOf<BenchmarkReviewLabelsV1>();
+    expectTypeOf<
+      ReturnType<typeof validateBenchmarkReviewLabels>["blindedReview"]
+    >().toEqualTypeOf<BenchmarkBlindedReviewExportV1>();
+    expectTypeOf<
+      Parameters<typeof renderBenchmarkPublicationMarkdown>[0]["report"]
+    >().toEqualTypeOf<BenchmarkReportV3>();
+    expectTypeOf<
+      Parameters<typeof renderBenchmarkPublicationMarkdown>[0]["labels"]
+    >().toEqualTypeOf<BenchmarkReviewLabelsV1>();
+
+    if (false) {
+      const legacyReport = reportFixture();
+      const portableReport = portableReportFixture();
+      const rawReportSha256 = "1".repeat(64);
+      const legacyLabels = reviewLabels(legacyReport, rawReportSha256);
+      const portableLabels = portableReviewLabels(portableReport, rawReportSha256);
+      const legacyExport: BenchmarkBlindedReviewExportV1 = createBlindedBenchmarkReview({
+        report: legacyReport,
+        rawReportSha256,
+        suite,
+        blindingKey,
+      });
+      const portableExport: BenchmarkBlindedReviewExportV2 = createBlindedBenchmarkReview({
+        report: portableReport,
+        rawReportSha256,
+        suite,
+        blindingKey,
+      });
+      const legacyValidated = validateBenchmarkReviewLabels({
+        report: legacyReport,
+        rawReportSha256,
+        suite,
+        labels: legacyLabels,
+        blindingKey,
+      });
+      const portableValidated = validateBenchmarkReviewLabels({
+        report: portableReport,
+        rawReportSha256,
+        suite,
+        labels: portableLabels,
+        blindingKey,
+      });
+      expectTypeOf(legacyExport).toEqualTypeOf<BenchmarkBlindedReviewExportV1>();
+      expectTypeOf(portableExport).toEqualTypeOf<BenchmarkBlindedReviewExportV2>();
+      expectTypeOf(legacyValidated.blindedReview).toEqualTypeOf<BenchmarkBlindedReviewExportV1>();
+      expectTypeOf(portableValidated.blindedReview).toEqualTypeOf<BenchmarkBlindedReviewExportV2>();
+
+      validateBenchmarkReviewLabels({
+        // @ts-expect-error schema-4 reports require schema-2 review labels
+        report: portableReport,
+        rawReportSha256,
+        suite,
+        labels: legacyLabels,
+        blindingKey,
+      });
+      validateBenchmarkReviewLabels({
+        report: legacyReport,
+        rawReportSha256,
+        suite,
+        // @ts-expect-error schema-3 reports require schema-1 review labels
+        labels: portableLabels,
+        blindingKey,
+      });
+    }
+  });
+
   it("is deterministic and removes explicit host, mode, model, session, usage, and control metadata", () => {
     const report = reportFixture();
     const rawReportSha256 = "b".repeat(64);
@@ -337,6 +551,9 @@ describe("benchmark blinded review", () => {
     });
 
     expect(second).toEqual(first);
+    expect(contentHash(first)).toBe(
+      "3689a7fbef6387b5962cbac8cad7b8aba603ea512191807e600b94fef1a19836",
+    );
     expect(first.packets.map(({ opaqueId }) => opaqueId)).toEqual(
       [...first.packets.map(({ opaqueId }) => opaqueId)].sort(),
     );
@@ -411,6 +628,59 @@ describe("benchmark blinded review", () => {
     expect(
       first.packets.every(({ opaqueId }) => !publiclyReconstructibleOldIds.has(opaqueId)),
     ).toBe(true);
+  });
+
+  it("emits portable v2 packets with redigested evidence and locale-independent identities", () => {
+    const report = portableReportFixture();
+    const rawReportSha256 = "4".repeat(64);
+    const first = createBlindedBenchmarkReview({ report, rawReportSha256, suite, blindingKey });
+
+    expect(first).toMatchObject({
+      schemaVersion: 2,
+      hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+      reviewPolicy: "opaque_blinded_review_v2",
+      rawReportSha256,
+      blindingKeyDigest: benchmarkBlindingKeyDigest(blindingKey),
+    });
+    for (const result of report.results) {
+      const opaqueId = benchmarkReviewOpaqueIdV2(
+        rawReportSha256,
+        result.trial.trialId,
+        blindingKey,
+      );
+      const packet = first.packets.find((candidate) => candidate.opaqueId === opaqueId)!;
+      expect(packet).toMatchObject({
+        schemaVersion: 2,
+        hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+        reviewPacket: {
+          schemaVersion: 2,
+          hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+        },
+      });
+      expect(packet.reviewPacket.patch.digest).toBe(
+        benchmarkReviewEvidenceDigest(packet.reviewPacket.patch, 2),
+      );
+      expect(packet.reviewPacket.transcript.digest).toBe(
+        benchmarkReviewEvidenceDigest(packet.reviewPacket.transcript, 2),
+      );
+      expect(packet.reviewPacket.patch.digest).not.toBe(result.reviewPacket.patch.digest);
+      expect(opaqueId).not.toBe(
+        benchmarkReviewOpaqueId(rawReportSha256, result.trial.trialId, blindingKey),
+      );
+    }
+
+    const digest = contentHash(first, PORTABLE_CANONICAL_HASH_ALGORITHM);
+    expect(digest).toBe("763b22042f3af171d97ac0b29fd34ca7a085fce1b756faa17d140b3b2bf9c108");
+    const localeCompare = vi.spyOn(String.prototype, "localeCompare").mockImplementation(() => {
+      throw new Error("portable publication used ambient locale ordering");
+    });
+    try {
+      const second = createBlindedBenchmarkReview({ report, rawReportSha256, suite, blindingKey });
+      expect(second).toEqual(first);
+      expect(contentHash(second, PORTABLE_CANONICAL_HASH_ALGORITHM)).toBe(digest);
+    } finally {
+      localeCompare.mockRestore();
+    }
   });
 
   it("projects host-specific tool vocabularies to the same review evidence", () => {
@@ -574,6 +844,91 @@ describe("benchmark blinded review", () => {
       }),
     ).toThrow(/blinded review artifact digest/u);
   });
+
+  it("validates portable labels with v2 digests and refuses cross-version labels", () => {
+    const portable = portableReportFixture();
+    const legacy = reportFixture();
+    const rawReportSha256 = "a".repeat(64);
+    const portableLabels = portableReviewLabels(portable, rawReportSha256);
+    const legacyLabels = reviewLabels(legacy, rawReportSha256);
+    const portableBlinded = createBlindedBenchmarkReview({
+      report: portable,
+      rawReportSha256,
+      suite,
+      blindingKey,
+    });
+
+    expect(
+      validateBenchmarkReviewLabels({
+        report: portable,
+        rawReportSha256,
+        suite,
+        labels: portableLabels,
+        blindingKey,
+      }).labelsByOpaqueId.size,
+    ).toBe(portable.results.length);
+    expect(() =>
+      validateBenchmarkReviewLabels({
+        report: portable,
+        rawReportSha256,
+        suite,
+        labels: {
+          ...portableLabels,
+          labels: [
+            { ...portableLabels.labels[0]!, packetDigest: "f".repeat(64) },
+            ...portableLabels.labels.slice(1),
+          ],
+        },
+        blindingKey,
+      }),
+    ).toThrow(/packet digest does not match/u);
+    const legacyPacketDigest = alternateLocaleLegacyContentHash(portableBlinded.packets[0]);
+    expect(legacyPacketDigest).not.toBe(portableLabels.labels[0]!.packetDigest);
+    expect(() =>
+      validateBenchmarkReviewLabels({
+        report: portable,
+        rawReportSha256,
+        suite,
+        labels: {
+          ...portableLabels,
+          labels: [
+            { ...portableLabels.labels[0]!, packetDigest: legacyPacketDigest },
+            ...portableLabels.labels.slice(1),
+          ],
+        },
+        blindingKey,
+      }),
+    ).toThrow(/packet digest does not match/u);
+    const legacyBlindedReviewDigest = alternateLocaleLegacyContentHash(portableBlinded);
+    expect(legacyBlindedReviewDigest).not.toBe(portableLabels.blindedReviewDigest);
+    expect(() =>
+      validateBenchmarkReviewLabels({
+        report: portable,
+        rawReportSha256,
+        suite,
+        labels: { ...portableLabels, blindedReviewDigest: legacyBlindedReviewDigest },
+        blindingKey,
+      }),
+    ).toThrow(/blinded review artifact digest/u);
+    expect(() =>
+      validateBenchmarkReviewLabels({
+        report: portable,
+        rawReportSha256,
+        suite,
+        labels: legacyLabels,
+        blindingKey,
+      } as never),
+    ).toThrow(/schema-2 review labels/iu);
+    expect(() =>
+      validateBenchmarkReviewLabels({
+        report: legacy,
+        rawReportSha256,
+        suite,
+        labels: portableLabels,
+        blindingKey,
+      } as never),
+    ).toThrow(/schema-1 review labels/iu);
+  });
 });
 
 describe("benchmark publication report", () => {
@@ -614,6 +969,37 @@ describe("benchmark publication report", () => {
     expect(markdown).toContain("95% Wilson interval");
     expect(markdown).toContain("exact coverage");
     expect(markdown).not.toContain(blindingKeyHex);
+    expect(sha256(markdown)).toBe(
+      "a8da8504e6116d8f562bac225dbbc835dbc5e21cf612e42df66ff03aae7149f1",
+    );
+  });
+
+  it("renders portable v2 provenance and the portable blinded-review digest", () => {
+    const report = portableReportFixture();
+    const rawReportSha256 = "6".repeat(64);
+    const labels = portableReviewLabels(report, rawReportSha256, true);
+    const markdown = renderBenchmarkPublicationMarkdown({
+      report,
+      rawReportSha256,
+      suite,
+      labels,
+      labelsSha256: "7".repeat(64),
+      blindingKey,
+    });
+
+    expect(markdown).toContain("Publication artifact schema: `2`");
+    expect(markdown).toContain(
+      `Canonical hash algorithm: \`${PORTABLE_CANONICAL_HASH_ALGORITHM}\``,
+    );
+    expect(markdown).toContain(
+      `Blinded review canonical SHA-256: \`${labels.blindedReviewDigest}\``,
+    );
+    expect(markdown).toContain("PASS for every evaluated host");
+    expect(markdown).toContain("Critical blinded defects:** 1 across 1 trial(s)");
+    expect(markdown).not.toContain(blindingKeyHex);
+    expect(sha256(markdown)).toBe(
+      "36c892839b6c5361137fd0e10ca0a0a39a9068ab2ea2238d29f8ff22e759221f",
+    );
   });
 
   it("retains unsuccessful trials in denominators and suppresses the passing claim", () => {
@@ -764,6 +1150,7 @@ describe("benchmark publication files", () => {
     const markdownPath = join(root, "report.md");
     const raw = `${JSON.stringify(reportFixture(), null, 2)}\n`;
     await writeFile(reportPath, raw, { mode: 0o600 });
+    await expect(loadBenchmarkReportForPublicationV4(reportPath)).rejects.toThrow(/expected 4/u);
 
     const exported = await exportBlindedBenchmarkReview({
       reportPath,
@@ -780,6 +1167,7 @@ describe("benchmark publication files", () => {
     const labels = reviewLabels(reportFixture(), exported.rawReportSha256);
     const labelsSource = `${JSON.stringify(labels, null, 2)}\n`;
     await writeFile(labelsPath, labelsSource, { mode: 0o600 });
+    await expect(loadBenchmarkReviewLabelsV2(labelsPath)).rejects.toThrow(/expected 2/u);
 
     const rendered = await renderBenchmarkPublicationReport({
       reportPath,
@@ -814,6 +1202,118 @@ describe("benchmark publication files", () => {
       }),
     ).rejects.toThrow(/must not replace an input artifact/u);
     expect(await readFile(reportPath, "utf8")).toBe(raw);
+  });
+
+  it("publishes schema-4 reports as portable v2 artifacts without changing raw byte identities", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-publication-v2-"));
+    roots.push(root);
+    const reportPath = join(root, "raw-v4.json");
+    const blindedPath = join(root, "blinded-v2.json");
+    const labelsPath = join(root, "labels-v2.json");
+    const markdownPath = join(root, "report-v2.md");
+    const report = portableReportFixture();
+    const raw = `${JSON.stringify(report, null, 2)}\n`;
+    await writeFile(reportPath, raw, { mode: 0o600 });
+
+    await expect(loadBenchmarkReportForPublication(reportPath)).rejects.toThrow(/expected 3/u);
+    expect((await loadBenchmarkReportForPublicationV4(reportPath)).report).toEqual(report);
+    expect((await loadVersionedBenchmarkReportForPublication(reportPath)).report).toEqual(report);
+
+    const exported = await exportBlindedBenchmarkReview({
+      reportPath,
+      suite,
+      blindingKey,
+      outputPath: blindedPath,
+    });
+    const blindedArtifact = BenchmarkBlindedReviewExportV2Schema.parse(
+      JSON.parse(await readFile(blindedPath, "utf8")),
+    );
+    expect(blindedArtifact).toMatchObject({
+      schemaVersion: 2,
+      hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+      reviewPolicy: "opaque_blinded_review_v2",
+    });
+    expect(exported.rawReportSha256).toBe(sha256(raw));
+    expect(exported.blindedReviewDigest).toBe(
+      contentHash(blindedArtifact, PORTABLE_CANONICAL_HASH_ALGORITHM),
+    );
+    expect(await readFile(reportPath, "utf8")).toBe(raw);
+
+    const labels = portableReviewLabels(report, exported.rawReportSha256);
+    const labelsSource = `${JSON.stringify(labels, null, 2)}\n`;
+    await writeFile(labelsPath, labelsSource, { mode: 0o600 });
+    await expect(loadBenchmarkReviewLabels(labelsPath)).rejects.toThrow(/expected 1/u);
+    expect(await loadBenchmarkReviewLabelsV2(labelsPath)).toEqual(labels);
+    expect(await loadVersionedBenchmarkReviewLabels(labelsPath)).toEqual(labels);
+
+    const rendered = await renderBenchmarkPublicationReport({
+      reportPath,
+      suite,
+      blindingKey,
+      labelsPath,
+      outputPath: markdownPath,
+    });
+    expect(rendered.rawReportSha256).toBe(sha256(raw));
+    expect(rendered.labelsSha256).toBe(sha256(labelsSource));
+    expect(rendered.blindedReviewDigest).toBe(exported.blindedReviewDigest);
+    expect(await readFile(markdownPath, "utf8")).toContain("Publication artifact schema: `2`");
+    expect(await readFile(reportPath, "utf8")).toBe(raw);
+  });
+
+  it("refuses cross-version relabelling and report-label mismatches before output creation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-publication-versions-"));
+    roots.push(root);
+    const portable = portableReportFixture();
+    const portablePath = join(root, "portable.json");
+    const legacyPath = join(root, "legacy.json");
+    const relabelledPath = join(root, "relabelled.json");
+    const legacyLabelsPath = join(root, "legacy-labels.json");
+    const portableLabelsPath = join(root, "portable-labels.json");
+    const relabelledLabelsPath = join(root, "relabelled-labels.json");
+    const outputPath = join(root, "must-not-exist.md");
+    const oppositeOutputPath = join(root, "must-also-not-exist.md");
+    const portableSource = `${JSON.stringify(portable, null, 2)}\n`;
+    const legacySource = `${JSON.stringify(reportFixture(), null, 2)}\n`;
+    await writeFile(portablePath, portableSource, { mode: 0o600 });
+    await writeFile(legacyPath, legacySource, { mode: 0o600 });
+
+    const relabelled = { ...portable, schemaVersion: 3 };
+    await writeFile(relabelledPath, `${JSON.stringify(relabelled)}\n`, { mode: 0o600 });
+    await expect(loadVersionedBenchmarkReportForPublication(relabelledPath)).rejects.toThrow();
+
+    const rawReportSha256 = sha256(portableSource);
+    const legacyLabels = reviewLabels(reportFixture(), rawReportSha256);
+    await writeFile(legacyLabelsPath, `${JSON.stringify(legacyLabels)}\n`, { mode: 0o600 });
+    const portableLabels = portableReviewLabels(portable, rawReportSha256);
+    await writeFile(portableLabelsPath, `${JSON.stringify(portableLabels)}\n`, { mode: 0o600 });
+    await writeFile(
+      relabelledLabelsPath,
+      `${JSON.stringify({ ...portableLabels, schemaVersion: 1 })}\n`,
+      { mode: 0o600 },
+    );
+    await expect(loadVersionedBenchmarkReviewLabels(relabelledLabelsPath)).rejects.toThrow();
+    await expect(
+      renderBenchmarkPublicationReport({
+        reportPath: portablePath,
+        suite,
+        blindingKey,
+        labelsPath: legacyLabelsPath,
+        outputPath,
+      }),
+    ).rejects.toThrow(/schema-2 review labels/iu);
+    await expect(readFile(outputPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(
+      renderBenchmarkPublicationReport({
+        reportPath: legacyPath,
+        suite,
+        blindingKey,
+        labelsPath: portableLabelsPath,
+        outputPath: oppositeOutputPath,
+      }),
+    ).rejects.toThrow(/schema-1 review labels/iu);
+    await expect(readFile(oppositeOutputPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(portablePath, "utf8")).toBe(portableSource);
+    expect(await readFile(legacyPath, "utf8")).toBe(legacySource);
   });
 
   it("refuses oversized or multiply-linked input and preserves an existing output", async () => {
