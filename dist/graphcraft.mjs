@@ -19898,7 +19898,13 @@ var RunStorageManifestSchema = external_exports.union([
       workspaceScopeSnapshots: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).default(1),
       // Probe-evidence checkpoints were also persisted before their hashing
       // domain became independent. Omission therefore selects legacy v1.
-      probeEvidenceCheckpoints: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).default(1)
+      probeEvidenceCheckpoints: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).default(1),
+      // Governance/control checkpoint identities predate their independent
+      // selector. Omission therefore preserves the legacy v1 identity domain.
+      governanceControlIdentities: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).default(1),
+      // Repository side-effect claims and commit-content preconditions also
+      // predate an independent selector. Omission preserves their v1 domain.
+      repositorySideEffectIdentities: external_exports.union([external_exports.literal(1), external_exports.literal(2)]).default(1)
     })
   })
 ]);
@@ -31173,7 +31179,7 @@ async function requestRunControl(store, action, reason = action === "pause" ? "P
 // packages/runtime/src/governance.ts
 import { randomUUID as randomUUID6 } from "node:crypto";
 import { join as join7 } from "node:path";
-function decisionFor(state, sourceId, targetId) {
+function decisionFor(state, sourceId, targetId, algorithm) {
   const explicit = state.controlDecisions.findLast(
     (decision) => decision.sourceId === sourceId && decision.targetId === targetId
   );
@@ -31194,7 +31200,7 @@ function decisionFor(state, sourceId, targetId) {
       acceptedAt: sourceState.acceptedAt ?? null
     }
   };
-  const hash2 = contentHash(identity);
+  const hash2 = contentHash(identity, algorithm);
   return ControlDecisionSchema.parse({
     schemaVersion: 1,
     decisionId: `${hash2.slice(0, 8)}-${hash2.slice(8, 12)}-5${hash2.slice(13, 16)}-8${hash2.slice(17, 20)}-${hash2.slice(20, 32)}`,
@@ -31208,7 +31214,7 @@ function decisionFor(state, sourceId, targetId) {
     decidedAt: state.updatedAt
   });
 }
-function controlSourceGenerationIdentity(state, sourceId, targetId) {
+function controlSourceGenerationIdentity(state, sourceId, targetId, algorithm) {
   const explicit = state.controlDecisions.findLast(
     (decision) => decision.sourceId === sourceId && decision.targetId === targetId
   );
@@ -31220,7 +31226,7 @@ function controlSourceGenerationIdentity(state, sourceId, targetId) {
       decisionId: explicit.decisionId
     };
   const sourceState = state.nodes[sourceId];
-  const projected = decisionFor(state, sourceId, targetId);
+  const projected = decisionFor(state, sourceId, targetId, algorithm);
   return projected ? {
     sourceId,
     targetId,
@@ -31242,13 +31248,16 @@ function controlSourceGenerationIdentity(state, sourceId, targetId) {
 async function appendCheckpointedControlEvent(input) {
   if (!input.checkpointId)
     return await input.store.append(input.actor, input.type, input.data, input.causationId);
-  const operationId = contentHash({
-    schemaVersion: 1,
-    kind: input.type,
-    checkpointId: input.checkpointId,
-    controlGenerationId: input.controlGenerationId ?? null,
-    identity: redactValue(input.identity ?? input.data)
-  });
+  const operationId = contentHash(
+    {
+      schemaVersion: 1,
+      kind: input.type,
+      checkpointId: input.checkpointId,
+      controlGenerationId: input.controlGenerationId ?? null,
+      identity: redactValue(input.identity ?? input.data)
+    },
+    input.store.governanceControlIdentityHashAlgorithm
+  );
   const existing = (await input.store.loadEvents()).find(
     ({ type, data }) => type === input.type && data.operationId === operationId
   );
@@ -31339,7 +31348,7 @@ async function recordRunApprovalDecisions(store, graph) {
   const state = await store.loadState();
   const anchors = new Map(graph.anchors.map((anchor) => [anchor.id, anchor]));
   for (const edge of graph.controlEdges.filter(({ relation }) => relation === "owns_target")) {
-    if (anchors.get(edge.from)?.owner !== "user" || decisionFor(state, edge.from, edge.to))
+    if (anchors.get(edge.from)?.owner !== "user" || decisionFor(state, edge.from, edge.to, store.governanceControlIdentityHashAlgorithm))
       continue;
     await appendDecision(
       store,
@@ -31398,8 +31407,8 @@ async function requireDecision(store, targetId, conflict, evidence, requiredSour
     packet: ControlDecisionPacketSchema.parse(event.data.packet)
   };
 }
-function decisionsFor(state, edges, targetId) {
-  return edges.map((edge) => decisionFor(state, edge.from, targetId)).filter((decision) => decision !== void 0);
+function decisionsFor(state, edges, targetId, algorithm) {
+  return edges.map((edge) => decisionFor(state, edge.from, targetId, algorithm)).filter((decision) => decision !== void 0);
 }
 function unanimousDecision(decisions) {
   if (decisions.length === 0) return void 0;
@@ -31448,14 +31457,29 @@ async function evaluateControlScheduling(store, graph, state, targetId, checkpoi
     (edge) => edge.to === targetId && edge.relation === "owns_target"
   );
   if (owners.length === 0) return { allowed: true };
-  const controlGenerationId = checkpointId ? contentHash({
-    schemaVersion: 1,
-    kind: "control_scheduling_generation",
-    checkpointId,
+  const controlGenerationId = checkpointId ? contentHash(
+    {
+      schemaVersion: 1,
+      kind: "control_scheduling_generation",
+      checkpointId,
+      targetId,
+      sources: [...new Set(incoming.map(({ from }) => from))].sort().map(
+        (sourceId) => controlSourceGenerationIdentity(
+          state,
+          sourceId,
+          targetId,
+          store.governanceControlIdentityHashAlgorithm
+        )
+      )
+    },
+    store.governanceControlIdentityHashAlgorithm
+  ) : void 0;
+  const ownerDecisions = decisionsFor(
+    state,
+    owners,
     targetId,
-    sources: [...new Set(incoming.map(({ from }) => from))].sort().map((sourceId) => controlSourceGenerationIdentity(state, sourceId, targetId))
-  }) : void 0;
-  const ownerDecisions = decisionsFor(state, owners, targetId);
+    store.governanceControlIdentityHashAlgorithm
+  );
   const ownerApprovals = ownerDecisions.filter(({ verdict }) => verdict === "approve");
   const ownerVetoes = ownerDecisions.filter(({ verdict }) => verdict === "veto");
   const missing = owners.filter(
@@ -31464,7 +31488,12 @@ async function evaluateControlScheduling(store, graph, state, targetId, checkpoi
   const arbitratorEdges = graph.controlEdges.filter(
     (edge) => edge.to === targetId && edge.relation === "arbitrates"
   );
-  const arbitrators = decisionsFor(state, arbitratorEdges, targetId);
+  const arbitrators = decisionsFor(
+    state,
+    arbitratorEdges,
+    targetId,
+    store.governanceControlIdentityHashAlgorithm
+  );
   const arbitrator = unanimousDecision(arbitrators);
   if (arbitrator === "conflict") {
     return await requireDecision(
@@ -31609,13 +31638,23 @@ async function evaluateControlScheduling(store, graph, state, targetId, checkpoi
 }
 async function evaluateControlAcceptance(store, graph, state, targetId, evidence, checkpointId) {
   const incoming = graph.controlEdges.filter((edge) => edge.to === targetId);
-  const controlGenerationId = checkpointId ? contentHash({
-    schemaVersion: 1,
-    kind: "control_acceptance_generation",
-    checkpointId,
-    targetId,
-    sources: [...new Set(incoming.map(({ from }) => from))].sort().map((sourceId) => controlSourceGenerationIdentity(state, sourceId, targetId))
-  }) : void 0;
+  const controlGenerationId = checkpointId ? contentHash(
+    {
+      schemaVersion: 1,
+      kind: "control_acceptance_generation",
+      checkpointId,
+      targetId,
+      sources: [...new Set(incoming.map(({ from }) => from))].sort().map(
+        (sourceId) => controlSourceGenerationIdentity(
+          state,
+          sourceId,
+          targetId,
+          store.governanceControlIdentityHashAlgorithm
+        )
+      )
+    },
+    store.governanceControlIdentityHashAlgorithm
+  ) : void 0;
   for (const edge of incoming.filter(({ relation }) => relation === "observes")) {
     await appendCheckpointedControlEvent({
       store,
@@ -31627,14 +31666,24 @@ async function evaluateControlAcceptance(store, graph, state, targetId, evidence
     });
   }
   const owners = incoming.filter(({ relation }) => relation === "owns_target");
-  const ownerDecisions = decisionsFor(state, owners, targetId);
+  const ownerDecisions = decisionsFor(
+    state,
+    owners,
+    targetId,
+    store.governanceControlIdentityHashAlgorithm
+  );
   const missingOwners = owners.filter(
     (edge) => !ownerDecisions.some(({ sourceId }) => sourceId === edge.from)
   );
   let ownerApprovals = ownerDecisions.filter(({ verdict }) => verdict === "approve");
   let ownerVetoes = ownerDecisions.filter(({ verdict }) => verdict === "veto");
   const arbitratorEdges = incoming.filter(({ relation }) => relation === "arbitrates");
-  const arbitrators = decisionsFor(state, arbitratorEdges, targetId);
+  const arbitrators = decisionsFor(
+    state,
+    arbitratorEdges,
+    targetId,
+    store.governanceControlIdentityHashAlgorithm
+  );
   const arbitrator = unanimousDecision(arbitrators);
   if (arbitrator === "conflict") {
     return await requireDecision(
@@ -31756,7 +31805,9 @@ async function evaluateControlAcceptance(store, graph, state, targetId, evidence
     );
     return { allowed: false, reason };
   }
-  const vetoes = incoming.filter(({ relation }) => relation === "vetoes").map((edge) => decisionFor(state, edge.from, targetId)).filter((decision) => decision?.verdict === "veto");
+  const vetoes = incoming.filter(({ relation }) => relation === "vetoes").map(
+    (edge) => decisionFor(state, edge.from, targetId, store.governanceControlIdentityHashAlgorithm)
+  ).filter((decision) => decision?.verdict === "veto");
   if (vetoes.length > 0) {
     if (arbitrator?.verdict === "approve") {
       await recordOverride(
@@ -32497,7 +32548,7 @@ async function createRunWorkspace(contract, options = {}) {
     );
   return { path: path2, branch, created: true };
 }
-async function commitContentDigest(repositoryPath) {
+async function commitContentDigest(repositoryPath, hashAlgorithm) {
   const [changedOutput, untrackedOutput] = await Promise.all([
     gitRaw(repositoryPath, ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"]),
     gitRaw(repositoryPath, ["ls-files", "--others", "--exclude-standard", "-z"])
@@ -32524,13 +32575,13 @@ async function commitContentDigest(repositoryPath) {
       return { path: path2, kind: "other" };
     })
   );
-  return contentHash(changes);
+  return contentHash(changes, hashAlgorithm);
 }
-async function captureCommitPrecondition(workspace) {
+async function captureCommitPrecondition(workspace, hashAlgorithm) {
   const [expectedHead, branch, contentDigest] = await Promise.all([
     git(workspace.path, ["rev-parse", "HEAD"]),
     git(workspace.path, ["branch", "--show-current"]),
-    commitContentDigest(workspace.path)
+    commitContentDigest(workspace.path, hashAlgorithm)
   ]);
   if (!branch) throw new Error("The Graphcraft worktree is not on a named branch");
   return { expectedHead, branch, contentDigest };
@@ -32543,9 +32594,12 @@ function commitPrecondition(claim) {
     throw new Error(`Commit claim ${claim.actionId} has an invalid precondition`);
   return { expectedHead, branch, contentDigest };
 }
-async function createAtomicCommitClaim(workspace, runId, nodeId) {
-  const precondition = await captureCommitPrecondition(workspace);
-  const actionId = contentHash({ schemaVersion: 1, runId, nodeId, kind: "git_commit" });
+async function createAtomicCommitClaim(workspace, runId, nodeId, hashAlgorithm) {
+  const precondition = await captureCommitPrecondition(workspace, hashAlgorithm);
+  const actionId = contentHash(
+    { schemaVersion: 1, runId, nodeId, kind: "git_commit" },
+    hashAlgorithm
+  );
   return SideEffectClaimSchema.parse({
     schemaVersion: 1,
     actionId,
@@ -32557,10 +32611,10 @@ async function createAtomicCommitClaim(workspace, runId, nodeId) {
     claimedAt: (/* @__PURE__ */ new Date()).toISOString()
   });
 }
-async function performAtomicCommit(workspace, claim, task, boundary) {
+async function performAtomicCommit(workspace, claim, task, hashAlgorithm, boundary) {
   if (claim.kind !== "git_commit") throw new Error(`Side effect ${claim.actionId} is not a commit`);
   const expected = commitPrecondition(claim);
-  const current = await captureCommitPrecondition(workspace);
+  const current = await captureCommitPrecondition(workspace, hashAlgorithm);
   if (current.expectedHead !== expected.expectedHead || current.branch !== expected.branch || current.contentDigest !== expected.contentDigest)
     throw new Error(`Commit precondition changed for side effect ${claim.actionId}`);
   const status3 = await git(workspace.path, ["status", "--porcelain=v1"]);
@@ -32578,7 +32632,7 @@ async function performAtomicCommit(workspace, claim, task, boundary) {
   await crossSideEffectBoundary(boundary, "after_action_command");
   return { sha: await git(workspace.path, ["rev-parse", "HEAD"]), branch: expected.branch };
 }
-async function reconcileAtomicCommit(workspace, claim) {
+async function reconcileAtomicCommit(workspace, claim, hashAlgorithm) {
   if (claim.kind !== "git_commit") throw new Error(`Side effect ${claim.actionId} is not a commit`);
   const expected = commitPrecondition(claim);
   const [currentHead, currentBranch] = await Promise.all([
@@ -32593,7 +32647,7 @@ async function reconcileAtomicCommit(workspace, claim) {
       ]
     };
   if (currentHead === expected.expectedHead) {
-    const currentDigest = await commitContentDigest(workspace.path);
+    const currentDigest = await commitContentDigest(workspace.path, hashAlgorithm);
     return currentDigest === expected.contentDigest ? {
       status: "not_applied",
       evidence: [`HEAD remains ${currentHead} and the claimed content digest is unchanged`]
@@ -32655,9 +32709,12 @@ function pushPrecondition(claim) {
     throw new Error(`Push claim ${claim.actionId} has an invalid precondition`);
   return { remote, remoteUrl, branch, localSha, expectedRemoteSha };
 }
-async function createAtomicPushClaim(workspace, runId, nodeId) {
+async function createAtomicPushClaim(workspace, runId, nodeId, hashAlgorithm) {
   const precondition = await capturePushPrecondition(workspace);
-  const actionId = contentHash({ schemaVersion: 1, runId, nodeId, kind: "git_push" });
+  const actionId = contentHash(
+    { schemaVersion: 1, runId, nodeId, kind: "git_push" },
+    hashAlgorithm
+  );
   return SideEffectClaimSchema.parse({
     schemaVersion: 1,
     actionId,
@@ -32766,7 +32823,7 @@ var LEGACY_MIGRATION_RESOURCE_LIMITS = Object.freeze({
   maximumFileCount: 4 * 1024,
   maximumEntryCount: 8 * 1024
 });
-function manifest(runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, probeEvidenceCheckpointFormat, initialization) {
+function manifest(runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, probeEvidenceCheckpointFormat, governanceControlIdentityFormat, repositorySideEffectIdentityFormat, initialization) {
   return RunStorageManifestSchema.parse({
     schemaVersion: CURRENT_RUN_STORAGE_VERSION,
     runId,
@@ -32790,7 +32847,9 @@ function manifest(runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeForma
       artifactInventory: artifactInventoryFormat,
       artifactPolicy: 1,
       workspaceScopeSnapshots: workspaceScopeSnapshotFormat,
-      probeEvidenceCheckpoints: probeEvidenceCheckpointFormat
+      probeEvidenceCheckpoints: probeEvidenceCheckpointFormat,
+      governanceControlIdentities: governanceControlIdentityFormat,
+      repositorySideEffectIdentities: repositorySideEffectIdentityFormat
     }
   });
 }
@@ -32804,7 +32863,7 @@ async function validateRunStorageRoot(input) {
   if (validated !== runRoot)
     throw new Error(`Run storage path escaped the Graphcraft state directory: ${input.runRoot}`);
 }
-async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, probeEvidenceCheckpointFormat, initialization, lease) {
+async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeFormat, artifactInventoryFormat, workspaceScopeSnapshotFormat, probeEvidenceCheckpointFormat, governanceControlIdentityFormat, repositorySideEffectIdentityFormat, initialization, lease) {
   const value = manifest(
     runId,
     migratedFrom,
@@ -32813,6 +32872,8 @@ async function persistCurrentRunStorageManifest(runRoot, runId, migratedFrom, ca
     artifactInventoryFormat,
     workspaceScopeSnapshotFormat,
     probeEvidenceCheckpointFormat,
+    governanceControlIdentityFormat,
+    repositorySideEffectIdentityFormat,
     initialization
   );
   await migrationStep(lease, async () => await ensurePrivateDirectory(runRoot));
@@ -32835,6 +32896,8 @@ async function writeCurrentRunStorageManifest(runRoot, runId, migratedFrom) {
     2,
     2,
     2,
+    2,
+    2,
     "ready"
   );
 }
@@ -32844,6 +32907,8 @@ async function writeInitializingRunStorageManifest(runRoot, runId) {
     runId,
     CURRENT_RUN_STORAGE_VERSION,
     PORTABLE_CANONICAL_HASH_ALGORITHM,
+    2,
+    2,
     2,
     2,
     2,
@@ -33922,6 +33987,18 @@ async function validateInitializingRunStorage(runRoot, runId, manifest2, lease) 
     throw new Error(
       `Run ${runId} has a probe-evidence checkpoint format that disagrees with its schema-v3 initialization descriptor. No files were changed.`
     );
+  const governanceControlFormat = first.data.governanceControlIdentityFormat;
+  const governanceControlFormatMismatch = manifest2.formats.governanceControlIdentities === 2 ? governanceControlFormat !== 2 : governanceControlFormat !== void 0;
+  if (governanceControlFormatMismatch)
+    throw new Error(
+      `Run ${runId} has a governance/control identity format that disagrees with its schema-v3 initialization descriptor. No files were changed.`
+    );
+  const repositorySideEffectFormat = first.data.repositorySideEffectIdentityFormat;
+  const repositorySideEffectFormatMismatch = manifest2.formats.repositorySideEffectIdentities === 2 ? repositorySideEffectFormat !== 2 : repositorySideEffectFormat !== void 0;
+  if (repositorySideEffectFormatMismatch)
+    throw new Error(
+      `Run ${runId} has a repository side-effect identity format that disagrees with its schema-v3 initialization descriptor. No files were changed.`
+    );
   try {
     validateHeldOutProbePlan(
       HeldOutProbePlanSchema.parse(first.data.heldOutProbePlan),
@@ -33977,6 +34054,8 @@ async function ensureCurrentRunStorage(input) {
         storage.manifest.formats.artifactInventory,
         storage.manifest.formats.workspaceScopeSnapshots,
         storage.manifest.formats.probeEvidenceCheckpoints,
+        storage.manifest.formats.governanceControlIdentities,
+        storage.manifest.formats.repositorySideEffectIdentities,
         "ready",
         lease
       );
@@ -34029,6 +34108,8 @@ async function ensureCurrentRunStorage(input) {
       input.runId,
       storage.version,
       LEGACY_CANONICAL_HASH_ALGORITHM,
+      1,
+      1,
       1,
       1,
       1,
@@ -34365,7 +34446,7 @@ var RunStoreLimitError = class extends Error {
 var RunStoreEventLogCorruptionError = class extends Error {
   constructor(record2, offsetBytes, trailing, reason) {
     const location = trailing ? "trailing record" : `record ${record2}`;
-    const problem = reason === "encoding" ? "invalid UTF-8" : reason === "json" ? "invalid JSON" : reason === "schema" ? "an invalid event schema" : reason === "hash" ? "an invalid event hash" : reason === "format" ? "an event format that disagrees with its storage manifest" : reason === "scope" ? "a workspace-scope snapshot that disagrees with its storage manifest" : reason === "checkpoint" ? "a probe-evidence checkpoint format that disagrees with its storage manifest" : "an invalid event sequence";
+    const problem = reason === "encoding" ? "invalid UTF-8" : reason === "json" ? "invalid JSON" : reason === "schema" ? "an invalid event schema" : reason === "hash" ? "an invalid event hash" : reason === "format" ? "an event format that disagrees with its storage manifest" : reason === "scope" ? "a workspace-scope snapshot that disagrees with its storage manifest" : reason === "checkpoint" ? "a probe-evidence checkpoint format that disagrees with its storage manifest" : reason === "governance" ? "a governance/control identity format that disagrees with its storage manifest" : reason === "repository_side_effect" ? "a repository side-effect identity format that disagrees with its storage manifest" : "an invalid event sequence";
     super(
       `Run event log has ${problem} in ${location} at byte ${offsetBytes}; event log bytes were left unchanged`
     );
@@ -34444,6 +34525,16 @@ function probeEvidenceCheckpointUsesDifferentFormat(event, selected) {
   const format = event.data.probeEvidenceCheckpointFormat;
   return selected === PORTABLE_CANONICAL_HASH_ALGORITHM ? format !== 2 : format !== void 0;
 }
+function governanceControlIdentityUsesDifferentFormat(event, selected) {
+  if (event.type !== "run.created") return false;
+  const format = event.data.governanceControlIdentityFormat;
+  return selected === PORTABLE_CANONICAL_HASH_ALGORITHM ? format !== 2 : format !== void 0;
+}
+function repositorySideEffectIdentityUsesDifferentFormat(event, selected) {
+  if (event.type !== "run.created") return false;
+  const format = event.data.repositorySideEffectIdentityFormat;
+  return selected === PORTABLE_CANONICAL_HASH_ALGORITHM ? format !== 2 : format !== void 0;
+}
 var RunStore = class _RunStore {
   repositoryRoot;
   runId;
@@ -34459,6 +34550,8 @@ var RunStore = class _RunStore {
   _artifactHashAlgorithm;
   _workspaceScopeHashAlgorithm;
   _probeEvidenceCheckpointHashAlgorithm;
+  _governanceControlIdentityHashAlgorithm;
+  _repositorySideEffectIdentityHashAlgorithm;
   constructor(repositoryRoot, runId, limits = {}, canonicalHashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
     this.repositoryRoot = repositoryRoot;
     this.runId = runId;
@@ -34506,6 +34599,10 @@ var RunStore = class _RunStore {
       this.bindWorkspaceScopeHashAlgorithm(workspaceScopeHashAlgorithm);
       const probeEvidenceCheckpointHashAlgorithm = manifest2.formats.probeEvidenceCheckpoints === 2 ? PORTABLE_CANONICAL_HASH_ALGORITHM : LEGACY_CANONICAL_HASH_ALGORITHM;
       this.bindProbeEvidenceCheckpointHashAlgorithm(probeEvidenceCheckpointHashAlgorithm);
+      const governanceControlIdentityHashAlgorithm = manifest2.formats.governanceControlIdentities === 2 ? PORTABLE_CANONICAL_HASH_ALGORITHM : LEGACY_CANONICAL_HASH_ALGORITHM;
+      this.bindGovernanceControlIdentityHashAlgorithm(governanceControlIdentityHashAlgorithm);
+      const repositorySideEffectIdentityHashAlgorithm = manifest2.formats.repositorySideEffectIdentities === 2 ? PORTABLE_CANONICAL_HASH_ALGORITHM : LEGACY_CANONICAL_HASH_ALGORITHM;
+      this.bindRepositorySideEffectIdentityHashAlgorithm(repositorySideEffectIdentityHashAlgorithm);
       await this.validateStorageRoot();
     } catch (error51) {
       if (this.storageReady === ready) this.storageReady = void 0;
@@ -34538,6 +34635,20 @@ var RunStore = class _RunStore {
       );
     return this._probeEvidenceCheckpointHashAlgorithm;
   }
+  get governanceControlIdentityHashAlgorithm() {
+    if (!this._governanceControlIdentityHashAlgorithm)
+      throw new Error(
+        "Governance/control identity hash policy is unavailable before run storage is prepared"
+      );
+    return this._governanceControlIdentityHashAlgorithm;
+  }
+  get repositorySideEffectIdentityHashAlgorithm() {
+    if (!this._repositorySideEffectIdentityHashAlgorithm)
+      throw new Error(
+        "Repository side-effect identity hash policy is unavailable before run storage is prepared"
+      );
+    return this._repositorySideEffectIdentityHashAlgorithm;
+  }
   bindArtifactHashAlgorithm(algorithm) {
     if (this.artifactStore && this.artifactStore.hashAlgorithm !== algorithm)
       throw new Error("Artifact store was bound before its storage manifest policy was known");
@@ -34556,6 +34667,20 @@ var RunStore = class _RunStore {
         "Probe-evidence checkpoint hashing was bound before its storage manifest policy was known"
       );
     this._probeEvidenceCheckpointHashAlgorithm = algorithm;
+  }
+  bindGovernanceControlIdentityHashAlgorithm(algorithm) {
+    if (this._governanceControlIdentityHashAlgorithm && this._governanceControlIdentityHashAlgorithm !== algorithm)
+      throw new Error(
+        "Governance/control identity hashing was bound before its storage manifest policy was known"
+      );
+    this._governanceControlIdentityHashAlgorithm = algorithm;
+  }
+  bindRepositorySideEffectIdentityHashAlgorithm(algorithm) {
+    if (this._repositorySideEffectIdentityHashAlgorithm && this._repositorySideEffectIdentityHashAlgorithm !== algorithm)
+      throw new Error(
+        "Repository side-effect identity hashing was bound before its storage manifest policy was known"
+      );
+    this._repositorySideEffectIdentityHashAlgorithm = algorithm;
   }
   artifacts() {
     return this.artifactStore ??= new RunArtifactStore(
@@ -34621,6 +34746,8 @@ var RunStore = class _RunStore {
     store.bindArtifactHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     store.bindWorkspaceScopeHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     store.bindProbeEvidenceCheckpointHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    store.bindGovernanceControlIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    store.bindRepositorySideEffectIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     const persistedContract = RunContractSchema.parse(redactValue(contract));
     const persistedGraph = GraphSchema.parse(redactValue(graph));
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
@@ -34655,7 +34782,9 @@ var RunStore = class _RunStore {
           probePlan,
           heldOutProbePlan,
           nodeIds: graph.nodes.map(({ id }) => id),
-          probeEvidenceCheckpointFormat: 2
+          probeEvidenceCheckpointFormat: 2,
+          governanceControlIdentityFormat: 2,
+          repositorySideEffectIdentityFormat: 2
         }
       },
       store.canonicalHashAlgorithm
@@ -34972,6 +35101,21 @@ var RunStore = class _RunStore {
         throw new RunStoreEventLogCorruptionError(record2, offset, trailing, "sequence");
       if (probeEvidenceCheckpointUsesDifferentFormat(event, this.probeEvidenceCheckpointHashAlgorithm))
         throw new RunStoreEventLogCorruptionError(record2, offset, trailing, "checkpoint");
+      if (governanceControlIdentityUsesDifferentFormat(
+        event,
+        this.governanceControlIdentityHashAlgorithm
+      ))
+        throw new RunStoreEventLogCorruptionError(record2, offset, trailing, "governance");
+      if (repositorySideEffectIdentityUsesDifferentFormat(
+        event,
+        this.repositorySideEffectIdentityHashAlgorithm
+      ))
+        throw new RunStoreEventLogCorruptionError(
+          record2,
+          offset,
+          trailing,
+          "repository_side_effect"
+        );
       const scopeSnapshot = eventWorkspaceScopeSnapshot(event);
       if (scopeSnapshot !== void 0 && workspaceScopeSnapshotUsesDifferentHashPolicy(
         scopeSnapshot,
@@ -40945,14 +41089,17 @@ async function executeRun(input) {
           batchSelection.decision.decisionId
         );
       for (const candidate of batch) {
-        const schedulingCheckpointId = contentHash({
-          schemaVersion: 1,
-          kind: "control_scheduling_checkpoint",
-          runId: contract.runId,
-          graphRevision: graph.revision,
-          targetId: candidate.id,
-          nextAttempt: (state.nodes[candidate.id]?.attempts ?? 0) + 1
-        });
+        const schedulingCheckpointId = contentHash(
+          {
+            schemaVersion: 1,
+            kind: "control_scheduling_checkpoint",
+            runId: contract.runId,
+            graphRevision: graph.revision,
+            targetId: candidate.id,
+            nextAttempt: (state.nodes[candidate.id]?.attempts ?? 0) + 1
+          },
+          input.store.governanceControlIdentityHashAlgorithm
+        );
         const scheduling = await evaluateControlScheduling(
           input.store,
           graph,
@@ -41766,13 +41913,24 @@ async function executeRun(input) {
           const proposedClaim = await createAtomicCommitClaim(
             workspace,
             contract.runId,
-            current.id
+            current.id,
+            input.store.repositorySideEffectIdentityHashAlgorithm
           );
           const result = await executeSideEffect({
             store: input.store,
             claim: proposedClaim,
-            reconcile: async (claim) => await reconcileAtomicCommit(workspace, claim),
-            act: async (claim) => await performAtomicCommit(workspace, claim, contract.task, input.sideEffectBoundary),
+            reconcile: async (claim) => await reconcileAtomicCommit(
+              workspace,
+              claim,
+              input.store.repositorySideEffectIdentityHashAlgorithm
+            ),
+            act: async (claim) => await performAtomicCommit(
+              workspace,
+              claim,
+              contract.task,
+              input.store.repositorySideEffectIdentityHashAlgorithm,
+              input.sideEffectBoundary
+            ),
             ...input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}
           });
           await input.store.append("runtime", "node.accepted", {
@@ -41814,7 +41972,12 @@ async function executeRun(input) {
           return await input.store.loadState();
         }
         try {
-          const proposedClaim = await createAtomicPushClaim(workspace, contract.runId, current.id);
+          const proposedClaim = await createAtomicPushClaim(
+            workspace,
+            contract.runId,
+            current.id,
+            input.store.repositorySideEffectIdentityHashAlgorithm
+          );
           const result = await executeSideEffect({
             store: input.store,
             claim: proposedClaim,
@@ -47429,7 +47592,7 @@ var program2 = new Command().name("graphcraft").description("Progress-aware exec
 async function benchmarkSourceIdentity() {
   if (true) {
     return BenchmarkSourceIdentitySchema.parse({
-      commitSha: "f5b9adcae6af5aad060c0af9a1ff871ff8861c0f",
+      commitSha: "08c2a76ae349cf7de2f789818c0e90474df9b3d8",
       dirty: false,
       dirtyStatusDigest: false ? null : null
     });
