@@ -24,6 +24,7 @@ import {
   LEGACY_CANONICAL_HASH_ALGORITHM,
   PORTABLE_CANONICAL_HASH_ALGORITHM,
   REQUIRED_HOST_PROTOCOL_CAPABILITIES,
+  RunStorageManifestSchema,
   assertRequiredHostCapabilities,
   contentHash,
   createRunEvent,
@@ -8994,12 +8995,22 @@ process.stdin.on("end", () => {
       const formats = {
         ...Object.fromEntries(
           Object.entries(current.formats).filter(
-            ([key]) => key !== "artifactInventory" && key !== "artifactPolicy",
+            ([key]) =>
+              key !== "artifactInventory" &&
+              key !== "artifactPolicy" &&
+              key !== "workspaceScopeSnapshots",
           ),
         ),
         heldOutProbes: 1,
         events: 1,
       };
+      const legacyStorage = {
+        schemaVersion: 1 as const,
+        runId: created.store.runId,
+        migratedFrom: 1 as const,
+        formats,
+      };
+      expect(RunStorageManifestSchema.parse(legacyStorage)).toEqual(legacyStorage);
       const legacyEvents = (await created.store.loadEvents()).map((event) =>
         createRunEvent(
           {
@@ -9024,15 +9035,7 @@ process.stdin.on("end", () => {
         join(created.store.runRoot, "held-out-probes.json"),
         `${JSON.stringify(legacyHeldOutProbePlan, null, 2)}\n`,
       );
-      await writeFile(
-        storagePath,
-        `${JSON.stringify({
-          schemaVersion: 1,
-          runId: created.store.runId,
-          migratedFrom: 1,
-          formats,
-        })}\n`,
-      );
+      await writeFile(storagePath, `${JSON.stringify(legacyStorage)}\n`);
       const reopened = new RunStore(repository, created.store.runId);
 
       if (operation === "configure probes") {
@@ -9075,6 +9078,7 @@ process.stdin.on("end", () => {
       }
 
       expect(reopened.canonicalHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
+      expect(reopened.workspaceScopeHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
       const heldOutPath = join(created.store.runRoot, "held-out-probes.json");
       await writeFile(heldOutPath, `${JSON.stringify(freshHeldOutProbePlan, null, 2)}\n`);
       expect(await reopened.loadHeldOutProbePlan()).toMatchObject({ schemaVersion: 1 });
@@ -9083,7 +9087,7 @@ process.stdin.on("end", () => {
         schemaVersion: 3,
         migratedFrom: 1,
         canonicalHashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM,
-        formats: { heldOutProbes: 1, events: 1 },
+        formats: { heldOutProbes: 1, events: 1, workspaceScopeSnapshots: 1 },
       });
       if (operation === "configure probes") {
         const amended = (await reopened.loadEvents()).findLast(

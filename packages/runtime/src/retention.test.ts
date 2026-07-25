@@ -19,6 +19,7 @@ import { dirname, join, relative } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  RunStorageManifestSchema,
   RunEventSchema,
   compileGraph,
   compileRunContract,
@@ -777,12 +778,22 @@ describe("run-state retention", () => {
     const formats = {
       ...Object.fromEntries(
         Object.entries(currentStorage.formats).filter(
-          ([key]) => key !== "artifactInventory" && key !== "artifactPolicy",
+          ([key]) =>
+            key !== "artifactInventory" &&
+            key !== "artifactPolicy" &&
+            key !== "workspaceScopeSnapshots",
         ),
       ),
       heldOutProbes: 1,
       events: 1,
     };
+    const legacyStorage = {
+      schemaVersion: 1 as const,
+      runId: store.runId,
+      migratedFrom: 1 as const,
+      formats,
+    };
+    expect(RunStorageManifestSchema.parse(legacyStorage)).toEqual(legacyStorage);
     const eventsPath = join(store.runRoot, "events.jsonl");
     const legacyEvents = (await store.loadEvents()).map((event) =>
       createRunEvent({
@@ -802,15 +813,7 @@ describe("run-state retention", () => {
       join(store.runRoot, "state.json"),
       `${JSON.stringify(reduceEvents(legacyEvents), null, 2)}\n`,
     );
-    await writeFile(
-      storagePath,
-      `${JSON.stringify({
-        schemaVersion: 1,
-        runId: store.runId,
-        migratedFrom: 1,
-        formats,
-      })}\n`,
-    );
+    await writeFile(storagePath, `${JSON.stringify(legacyStorage)}\n`);
     await rm(join(store.runRoot, "artifact-inventory.json"));
     const secretPath = join(store.runRoot, "artifacts", "legacy-secret.json");
     await mkdir(dirname(secretPath), { recursive: true });
