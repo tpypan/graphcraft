@@ -304,7 +304,9 @@ describe("versioned protocol fixtures", () => {
       ),
     );
     expect(manifests.map(({ schemaVersion }) => schemaVersion)).toEqual([1, 2, 3]);
-    expect(manifests[2]).toMatchObject({ formats: { workspaceScopeSnapshots: 1 } });
+    expect(manifests[2]).toMatchObject({
+      formats: { workspaceScopeSnapshots: 1, probeEvidenceCheckpoints: 1 },
+    });
   });
 
   it("validates every checked-in signed-release storage fixture through current schemas", async () => {

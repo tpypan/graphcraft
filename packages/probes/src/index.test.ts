@@ -3,19 +3,27 @@ import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
-import type { ProbePlan } from "@graphcraft/core";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  LEGACY_CANONICAL_HASH_ALGORITHM,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
+  type ProbePlan,
+  type ProbeSpec,
+} from "@graphcraft/core";
 import {
   discoverProbePlan,
   resolvePackageScriptCommand,
   runProbe,
+  runProbes,
   validateProbePlan,
+  workspaceDigest,
 } from "./index.ts";
 
 const execFileAsync = promisify(execFile);
 const temporaryRoots: string[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(
     temporaryRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })),
   );
@@ -212,6 +220,66 @@ describe("task-specific probe planning", () => {
     );
     expect(second.result.signature).not.toBe(first.result.signature);
     expect(second.result.summary).toContain("No tracked files match");
+  });
+
+  it("versions probe and workspace signatures without ambient collation in v2", async () => {
+    const { root, sha } = await createRepository();
+    const specs: ProbeSpec[] = [
+      {
+        id: "command-check",
+        kind: "command",
+        command: process.execPath,
+        args: ["-e", 'process.stdout.write("portable probe\\n")'],
+        expectedExitCode: 0,
+        timeoutMs: 1_000,
+      },
+      {
+        id: "file-check",
+        kind: "file",
+        path: "package.json",
+        shouldExist: true,
+        contains: "probe-fixture",
+      },
+      {
+        id: "inventory-check",
+        kind: "repository_inventory",
+        paths: ["."],
+        terms: ["apiVersion"],
+      },
+      {
+        id: "diff-check",
+        kind: "git_diff",
+        baseSha: sha,
+        requireChanges: false,
+      },
+    ];
+    const legacyCompare = vi.spyOn(String.prototype, "localeCompare").mockImplementation(function (
+      this: string,
+      other: string,
+    ) {
+      const left = String(this);
+      return left < other ? 1 : left > other ? -1 : 0;
+    });
+    const legacy = await runProbes(specs, root, undefined, LEGACY_CANONICAL_HASH_ALGORITHM);
+    const defaultLegacy = await runProbe(specs[1]!, root);
+    const legacyWorkspace = await workspaceDigest(root);
+    expect(legacyCompare).toHaveBeenCalled();
+    expect(defaultLegacy.result.signature).toBe(legacy[1]?.result.signature);
+    legacyCompare.mockRestore();
+
+    const portableCompare = vi.spyOn(String.prototype, "localeCompare").mockImplementation(() => {
+      throw new Error("portable probe hashing used ambient locale ordering");
+    });
+    const portable = await runProbes(specs, root, undefined, PORTABLE_CANONICAL_HASH_ALGORITHM);
+    const portableWorkspace = await workspaceDigest(root, PORTABLE_CANONICAL_HASH_ALGORITHM);
+
+    expect(portableCompare).not.toHaveBeenCalled();
+    expect(portable.map(({ result }) => result.passed)).toEqual([true, true, true, true]);
+    expect(portable.slice(0, 3).map(({ result }) => result.signature)).not.toEqual(
+      legacy.slice(0, 3).map(({ result }) => result.signature),
+    );
+    expect(portable[3]?.result.signature).toBe(legacy[3]?.result.signature);
+    expect(portableWorkspace).not.toBe(legacyWorkspace);
   });
 
   it("adds a runtime-owned GitHub lifecycle probe only for a PR finish line", async () => {

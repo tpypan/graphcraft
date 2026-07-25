@@ -3,7 +3,13 @@ import { constants as fsConstants } from "node:fs";
 import { open, rmdir, unlink, type FileHandle } from "node:fs/promises";
 import { constants as osConstants } from "node:os";
 import { dirname, join, relative } from "node:path";
-import { contentHash, type ProbeSpec, type RunEvent } from "@graphcraft/core";
+import {
+  LEGACY_CANONICAL_HASH_ALGORITHM,
+  contentHash,
+  type CanonicalHashAlgorithm,
+  type ProbeSpec,
+  type RunEvent,
+} from "@graphcraft/core";
 import type {
   ManagedProcessLifecycle,
   ManagedProcessReady,
@@ -81,35 +87,45 @@ export interface ProbeProcessJournalInspection {
   settlement?: ManagedProcessSettlement;
 }
 
-function commandHash(probe: Extract<ProbeSpec, { kind: "command" }>): string {
-  return contentHash({
-    schemaVersion: 1,
-    command: probe.command,
-    args: probe.args,
-    cwd: probe.cwd ?? ".",
-    expectedExitCode: probe.expectedExitCode,
-    timeoutMs: probe.timeoutMs,
-  });
+function commandHash(
+  probe: Extract<ProbeSpec, { kind: "command" }>,
+  hashAlgorithm: CanonicalHashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM,
+): string {
+  return contentHash(
+    {
+      schemaVersion: 1,
+      command: probe.command,
+      args: probe.args,
+      cwd: probe.cwd ?? ".",
+      expectedExitCode: probe.expectedExitCode,
+      timeoutMs: probe.timeoutMs,
+    },
+    hashAlgorithm,
+  );
 }
 
 export function probeProcessDefinitions(
   checkpointId: string,
   probes: readonly ProbeSpec[],
+  hashAlgorithm: CanonicalHashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM,
 ): ProbeProcessDefinition[] {
   return probes.flatMap((probe, index) => {
     if (probe.kind !== "command") return [];
-    const digest = commandHash(probe);
+    const digest = commandHash(probe, hashAlgorithm);
     return [
       {
         schemaVersion: 1 as const,
-        executionId: contentHash({
-          schemaVersion: 1,
-          kind: "probe_process",
-          checkpointId,
-          probeId: probe.id,
-          index,
-          commandHash: digest,
-        }),
+        executionId: contentHash(
+          {
+            schemaVersion: 1,
+            kind: "probe_process",
+            checkpointId,
+            probeId: probe.id,
+            index,
+            commandHash: digest,
+          },
+          hashAlgorithm,
+        ),
         probeId: probe.id,
         commandHash: digest,
       },
@@ -262,6 +278,7 @@ export async function createProbeProcessLease(input: {
   nodeId: string;
   stage: ProbeScopeStage;
   definition: ProbeProcessDefinition;
+  hashAlgorithm?: CanonicalHashAlgorithm;
 }): Promise<ProbeProcessLease> {
   const root = join(input.graphcraftRoot, "locks", "probe-processes", input.runId);
   return await withProbeProcessRunMutation(root, async () => {
@@ -303,7 +320,10 @@ export async function createProbeProcessLease(input: {
       await finalizePrivateDirectoryMutation(directoryMutation, input.graphcraftRoot);
       return {
         definition: input.definition,
-        ownerTokenHash: contentHash(ownerToken),
+        ownerTokenHash: contentHash(
+          ownerToken,
+          input.hashAlgorithm ?? LEGACY_CANONICAL_HASH_ALGORITHM,
+        ),
         journalPath: path,
         journalRelativePath: relative(input.graphcraftRoot, path).replaceAll("\\", "/"),
         handle,
@@ -484,6 +504,7 @@ export async function inspectProbeProcessJournal(input: {
   stage: ProbeScopeStage;
   ownerTokenHash?: string;
   expectedBrokerPid?: number;
+  hashAlgorithm?: CanonicalHashAlgorithm;
 }): Promise<ProbeProcessJournalInspection | undefined> {
   const path = journalPath(input.graphcraftRoot, input.runId, input.definition.executionId);
   let source: Buffer;
@@ -512,7 +533,8 @@ export async function inspectProbeProcessJournal(input: {
     prepared.probeId !== input.definition.probeId ||
     prepared.commandHash !== input.definition.commandHash ||
     (input.ownerTokenHash !== undefined &&
-      contentHash(prepared.ownerToken) !== input.ownerTokenHash)
+      contentHash(prepared.ownerToken, input.hashAlgorithm ?? LEGACY_CANONICAL_HASH_ALGORITHM) !==
+        input.ownerTokenHash)
   )
     throw new Error(
       `Probe process ${input.definition.executionId} has ambiguous ownership metadata`,

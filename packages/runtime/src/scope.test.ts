@@ -208,7 +208,10 @@ describe("workspace-scope snapshot hashing", () => {
               : LEGACY_CANONICAL_HASH_ALGORITHM,
           ),
         ).toBe(false);
-        await selectedStore.append("runtime", eventType, { [snapshotField]: snapshot });
+        await selectedStore.append("runtime", eventType, {
+          [snapshotField]: snapshot,
+          ...(eventType === "scope.started" ? { probeEvidenceCheckpointFormat: 2 } : {}),
+        });
         const eventsBeforeRestart = await readFile(selectedStore.eventsPath());
         const statePath = join(selectedStore.runRoot, "state.json");
         const stateBeforeRestart = await readFile(statePath);

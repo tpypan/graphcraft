@@ -3,6 +3,7 @@ import {
   ProgressDecisionPacketSchema,
   ProgressTrajectoryEntrySchema,
   classifyProgress,
+  parseEvidenceSnapshot,
   type EvidenceSnapshot,
   type Graph,
   type ProgressClassification,
@@ -35,30 +36,46 @@ export async function assessRunProgress(input: {
   firstObservation?: ProgressClassification;
 }): Promise<{ trajectory: ProgressTrajectoryEntry; alreadyRecorded: boolean }> {
   const state = await input.store.loadState();
-  const existing = state.progressTrajectory.findLast(
-    ({ attemptId }) => attemptId === input.attemptId,
-  );
+  const algorithm = input.store.probeEvidenceCheckpointHashAlgorithm;
+  const current = parseEvidenceSnapshot(input.current, input.family, algorithm);
+  if (!current)
+    throw new Error("Graphcraft cannot validate the current progress evidence checkpoint");
+  const requestedBaseline = input.baseline
+    ? parseEvidenceSnapshot(input.baseline, input.family, algorithm)
+    : undefined;
+  if (input.baseline && !requestedBaseline)
+    throw new Error("Graphcraft cannot validate the baseline progress evidence checkpoint");
+  const progressTrajectory = state.progressTrajectory.map((entry) => {
+    const baseline = parseEvidenceSnapshot(entry.baseline, entry.family, algorithm);
+    const persistedCurrent = parseEvidenceSnapshot(entry.current, entry.family, algorithm);
+    if (!baseline || !persistedCurrent)
+      throw new Error(
+        `Graphcraft cannot validate the durable progress checkpoint for attempt ${entry.attemptId}`,
+      );
+    return { ...entry, baseline, current: persistedCurrent };
+  });
+  const existing = progressTrajectory.findLast(({ attemptId }) => attemptId === input.attemptId);
   if (existing) return { trajectory: existing, alreadyRecorded: true };
 
-  const shape = probeShape(input.current);
-  const comparable = state.progressTrajectory.filter(
+  const shape = probeShape(current);
+  const comparable = progressTrajectory.filter(
     (entry) => entry.family === input.family && probeShape(entry.current) === shape,
   );
   const previousForNode = comparable.findLast(({ nodeId }) => nodeId === input.nodeId);
   const baseline =
-    input.baseline ?? previousForNode?.current ?? comparable.at(-1)?.current ?? input.current;
+    requestedBaseline ?? previousForNode?.current ?? comparable.at(-1)?.current ?? current;
   const latest = comparable.at(-1);
   const historicalEntries =
     latest &&
     latest.nodeId !== input.nodeId &&
-    latest.current.vector.digest === input.current.vector.digest
+    latest.current.vector.digest === current.vector.digest
       ? comparable.slice(0, -1)
       : comparable;
   const history = historicalEntries.flatMap(({ baseline, current }) => [baseline, current]);
   const classification =
     comparable.length === 0 && input.firstObservation
       ? input.firstObservation
-      : classifyProgress(baseline, input.current, [...history, input.current]);
+      : classifyProgress(baseline, current, [...history, current]);
   return {
     alreadyRecorded: false,
     trajectory: ProgressTrajectoryEntrySchema.parse({
@@ -69,7 +86,7 @@ export async function assessRunProgress(input: {
       strategy: concise(input.strategy),
       classification,
       baseline,
-      current: input.current,
+      current,
       recordedAt: new Date().toISOString(),
     }),
   };

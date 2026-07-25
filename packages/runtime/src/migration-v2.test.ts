@@ -415,6 +415,7 @@ describe("run storage schema v3 migration", () => {
         artifactInventory: 1,
         artifactPolicy: 1,
         workspaceScopeSnapshots: 1,
+        probeEvidenceCheckpoints: 1,
       },
     });
     const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "0-to-3");
@@ -490,6 +491,7 @@ describe("run storage schema v3 migration", () => {
           artifactInventory: 1,
           artifactPolicy: 1,
           workspaceScopeSnapshots: 1,
+          probeEvidenceCheckpoints: 1,
         },
       },
     );
@@ -507,6 +509,7 @@ describe("run storage schema v3 migration", () => {
     expect(store.canonicalHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
     expect(store.artifactHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
     expect(store.workspaceScopeHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
+    expect(store.probeEvidenceCheckpointHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
 
     const localeCompare = vi.spyOn(String.prototype, "localeCompare").mockImplementation(function (
       this: string,
@@ -560,6 +563,7 @@ describe("run storage schema v3 migration", () => {
         artifactInventory: 1,
         artifactPolicy: 1,
         workspaceScopeSnapshots: 1,
+        probeEvidenceCheckpoints: 1,
       },
     });
     const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "2-to-3");
@@ -1749,6 +1753,7 @@ describe("run storage schema v3 migration", () => {
         events: 1,
         artifactInventory: 1,
         workspaceScopeSnapshots: 1,
+        probeEvidenceCheckpoints: 1,
       },
     });
 

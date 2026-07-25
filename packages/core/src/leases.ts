@@ -1,13 +1,28 @@
-import { contentHash } from "./canonical.ts";
-import type {
-  EvidenceSnapshot,
-  Graph,
-  ProbeResult,
-  ProgressClassification,
-  ProgressVector,
+import { isDeepStrictEqual } from "node:util";
+import {
+  LEGACY_CANONICAL_HASH_ALGORITHM,
+  contentHash,
+  type CanonicalHashAlgorithm,
+} from "./canonical.ts";
+import {
+  EvidenceSnapshotSchema,
+  type EvidenceSnapshot,
+  type Graph,
+  type ProbeResult,
+  type ProgressClassification,
+  type ProgressVector,
 } from "./schemas.ts";
 
-function progressVector(probeResults: ProbeResult[], family?: Graph["family"]): ProgressVector {
+function compareStrings(left: string, right: string, algorithm: CanonicalHashAlgorithm): number {
+  if (algorithm === LEGACY_CANONICAL_HASH_ALGORITHM) return left.localeCompare(right);
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function progressVector(
+  probeResults: ProbeResult[],
+  family: Graph["family"] | undefined,
+  algorithm: CanonicalHashAlgorithm,
+): ProgressVector {
   const passedProbeIds = probeResults
     .filter(({ passed }) => passed)
     .map(({ probeId }) => probeId)
@@ -30,9 +45,9 @@ function progressVector(probeResults: ProbeResult[], family?: Graph["family"]): 
       signature,
       metrics: resultMetrics ?? {},
     }))
-    .sort((left, right) => left.probeId.localeCompare(right.probeId));
+    .sort((left, right) => compareStrings(left.probeId, right.probeId, algorithm));
   return {
-    digest: contentHash({ probes, metrics }),
+    digest: contentHash({ probes, metrics }, algorithm),
     passedProbeIds,
     failingProbeIds,
     metrics,
@@ -43,22 +58,40 @@ export function evidenceSnapshot(
   workspaceDigest: string,
   probeResults: ProbeResult[],
   family?: Graph["family"],
+  algorithm: CanonicalHashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM,
 ): EvidenceSnapshot {
   const failedResults = probeResults.filter((result) => !result.passed);
-  const vector = progressVector(probeResults, family);
+  const vector = progressVector(probeResults, family, algorithm);
   return {
-    digest: contentHash({ workspaceDigest, vector: vector.digest }),
+    digest: contentHash({ workspaceDigest, vector: vector.digest }, algorithm),
     workspaceDigest,
     passed: probeResults.length - failedResults.length,
     failed: failedResults.length,
     failureSignature: contentHash(
       failedResults
         .map(({ probeId, signature }) => ({ probeId, signature }))
-        .sort((left, right) => left.probeId.localeCompare(right.probeId)),
+        .sort((left, right) => compareStrings(left.probeId, right.probeId, algorithm)),
+      algorithm,
     ),
     probeResults,
     vector,
   };
+}
+
+export function parseEvidenceSnapshot(
+  value: unknown,
+  family?: Graph["family"],
+  algorithm: CanonicalHashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM,
+): EvidenceSnapshot | undefined {
+  const parsed = EvidenceSnapshotSchema.safeParse(value);
+  if (!parsed.success) return undefined;
+  const recomputed = evidenceSnapshot(
+    parsed.data.workspaceDigest,
+    parsed.data.probeResults,
+    family,
+    algorithm,
+  );
+  return isDeepStrictEqual(parsed.data, recomputed) ? parsed.data : undefined;
 }
 
 function metricDirection(key: string): "higher" | "lower" | undefined {

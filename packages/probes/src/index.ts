@@ -1,8 +1,10 @@
 import { dirname, resolve, sep } from "node:path";
 import {
+  LEGACY_CANONICAL_HASH_ALGORITHM,
   ProbePlanSchema,
   classifyTask,
   contentHash,
+  type CanonicalHashAlgorithm,
   type ProbePlan,
   type ProbePlanItem,
   type ProbeResult,
@@ -106,6 +108,7 @@ export async function runProbe(
   repositoryPath: string,
   signal?: AbortSignal,
   lifecycle?: ManagedProcessLifecycle,
+  algorithm: CanonicalHashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM,
 ): Promise<ExecutedProbe> {
   const started = performance.now();
   if (spec.kind === "held_out")
@@ -127,12 +130,15 @@ export async function runProbe(
         probeId: spec.id,
         kind: spec.kind,
         passed,
-        signature: contentHash({
-          exitCode: processResult.exitCode,
-          output: compactOutput(processResult),
-          stdoutDigest: processResult.capture.stdout.digest,
-          stderrDigest: processResult.capture.stderr.digest,
-        }),
+        signature: contentHash(
+          {
+            exitCode: processResult.exitCode,
+            output: compactOutput(processResult),
+            stdoutDigest: processResult.capture.stdout.digest,
+            stderrDigest: processResult.capture.stderr.digest,
+          },
+          algorithm,
+        ),
         summary: processResult.timedOut
           ? `Timed out after ${spec.timeoutMs}ms`
           : `${spec.command} exited ${processResult.exitCode}${compactOutput(processResult) ? `: ${compactOutput(processResult)}` : ""}`,
@@ -164,7 +170,7 @@ export async function runProbe(
         probeId: spec.id,
         kind: spec.kind,
         passed,
-        signature: contentHash({ exists, contains }),
+        signature: contentHash({ exists, contains }, algorithm),
         summary,
         durationMs: Math.round(performance.now() - started),
       },
@@ -191,7 +197,7 @@ export async function runProbe(
         probeId: spec.id,
         kind: spec.kind,
         passed,
-        signature: contentHash({ matches, terms: spec.terms }),
+        signature: contentHash({ matches, terms: spec.terms }, algorithm),
         summary,
         durationMs: inventory.durationMs,
         metrics: { inventoryMatches: matches.length },
@@ -221,7 +227,7 @@ export async function runProbe(
       probeId: spec.id,
       kind: spec.kind,
       passed,
-      signature: contentHash(output),
+      signature: contentHash(output, algorithm),
       summary: hasChanges ? output.split("\n").slice(0, 20).join(", ") : "No workspace changes",
       durationMs: Math.round(performance.now() - started),
     },
@@ -233,13 +239,18 @@ export async function runProbes(
   specs: ProbeSpec[],
   repositoryPath: string,
   signal?: AbortSignal,
+  algorithm: CanonicalHashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM,
 ): Promise<ExecutedProbe[]> {
   const results: ExecutedProbe[] = [];
-  for (const spec of specs) results.push(await runProbe(spec, repositoryPath, signal));
+  for (const spec of specs)
+    results.push(await runProbe(spec, repositoryPath, signal, undefined, algorithm));
   return results;
 }
 
-export async function workspaceDigest(repositoryPath: string): Promise<string> {
+export async function workspaceDigest(
+  repositoryPath: string,
+  algorithm: CanonicalHashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM,
+): Promise<string> {
   const [status, diff] = await Promise.all([
     runProcess("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
       cwd: repositoryPath,
@@ -248,7 +259,7 @@ export async function workspaceDigest(repositoryPath: string): Promise<string> {
   ]);
   if (status.exitCode !== 0 || diff.exitCode !== 0)
     throw new Error("Unable to capture repository state");
-  return contentHash({ status: status.stdout, diff: diff.stdout });
+  return contentHash({ status: status.stdout, diff: diff.stdout }, algorithm);
 }
 
 const probeStopWords = new Set([

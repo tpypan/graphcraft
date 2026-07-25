@@ -1468,6 +1468,33 @@ class ProgressScopeCheckFaultStore extends RunStore {
   }
 }
 
+class ProgressScopeStartFaultStore extends RunStore {
+  private armed = true;
+
+  constructor(store: RunStore) {
+    super(store.repositoryRoot, store.runId);
+  }
+
+  override async append(
+    actor: RunEvent["actor"],
+    type: RunEvent["type"],
+    data: Record<string, unknown>,
+    causationId = this.runId,
+  ): Promise<RunEvent> {
+    const event = await super.append(actor, type, data, causationId);
+    if (
+      this.armed &&
+      type === "scope.started" &&
+      data.nodeId === "implement" &&
+      data.stage === "progress_baseline"
+    ) {
+      this.armed = false;
+      throw new Error("Injected process termination after progress scope start");
+    }
+    return event;
+  }
+}
+
 type ProgressScopeProtocolFault =
   "baseline_digest" | "policy_linkage" | "malformed_check" | "duplicate_check";
 
@@ -2954,6 +2981,106 @@ process.stdin.on("end", () => {
     );
   });
 
+  it("uses portable ordering and hashing for semantic progress checkpoints", async () => {
+    const repository = await createRepository();
+    let localeCompare: ReturnType<typeof vi.spyOn> | undefined;
+    const adapter = new FakeAdapter(
+      async (request) => {
+        if (request.capsule.nodeId === "investigate") {
+          localeCompare = vi.spyOn(String.prototype, "localeCompare").mockImplementation(() => {
+            throw new Error("portable semantic checkpoints used ambient locale ordering");
+          });
+        } else if (request.capsule.nodeId === "implement") {
+          await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+        }
+      },
+      true,
+      undefined,
+      async (request) => {
+        expect(localeCompare).toBeDefined();
+        expect(localeCompare).not.toHaveBeenCalled();
+        expect(request.context.baselineProbeEvidence.map(({ probeId }) => probeId)).toEqual([
+          "Z-portable-inventory",
+          "a-portable-inventory",
+        ]);
+        expect(request.context.currentProbeEvidence.map(({ probeId }) => probeId)).toEqual([
+          "Z-portable-inventory",
+          "a-portable-inventory",
+        ]);
+        localeCompare?.mockRestore();
+        return {
+          verdict: {
+            verdict: "supported",
+            evidence: ["Portable evidence ordering remains stable"],
+            rationale: "Both deterministic inventory checkpoints retain the same evidence",
+            uncertainty: 0.05,
+          },
+          usage: reportedUsage(2, 0, 1),
+        };
+      },
+    );
+    const created = await createRun("Implement a substantial portable semantic feature", {
+      cwd: repository,
+      planner: adapter,
+    });
+    await configureRunProbes(created.store, {
+      ...created.probePlan,
+      items: [
+        {
+          phase: "progress",
+          purpose: "inventory",
+          source: "Portable semantic ordering fixture Z",
+          probe: {
+            id: "Z-portable-inventory",
+            kind: "repository_inventory",
+            paths: ["."],
+            terms: ["portable-Z-does-not-exist"],
+          },
+        },
+        {
+          phase: "progress",
+          purpose: "inventory",
+          source: "Portable semantic ordering fixture a",
+          probe: {
+            id: "a-portable-inventory",
+            kind: "repository_inventory",
+            paths: ["."],
+            terms: ["portable-a-does-not-exist"],
+          },
+        },
+        ...created.probePlan.items.filter(({ phase }) => phase === "completion"),
+      ],
+    });
+
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+    const semantic = (await created.store.loadEvents()).find(
+      ({ type, data }) =>
+        type === "semantic.started" && data.nodeId === "investigate" && data.phase === "progress",
+    );
+    const request = adapter.semanticRequests[0]!;
+
+    expect(state.status).toBe("completed");
+    expect(created.store.probeEvidenceCheckpointHashAlgorithm).toBe(
+      PORTABLE_CANONICAL_HASH_ALGORITHM,
+    );
+    expect(adapter.semanticRequests).toHaveLength(1);
+    expect(semantic?.data.contextHash).toBe(
+      contentHash(request.context, PORTABLE_CANONICAL_HASH_ALGORITHM),
+    );
+    expect(semantic?.data.checkpointId).toBe(
+      contentHash(
+        {
+          schemaVersion: 1,
+          kind: "semantic_verification",
+          host: adapter.id,
+          contextHash: semantic?.data.contextHash,
+          scopeDigest: semantic?.data.beforeDigest,
+        },
+        PORTABLE_CANONICAL_HASH_ALGORITHM,
+      ),
+    );
+  });
+
   it("runs a fresh verifier when resuming from a successful legacy semantic verdict", async () => {
     const repository = await createRepository();
     const adapter = new FakeAdapter(async (request) => {
@@ -3970,6 +4097,164 @@ process.stdin.on("end", () => {
       });
     }
   }, 60_000);
+
+  it.each([
+    { name: "legacy v1", format: 1 as const },
+    { name: "portable v2", format: 2 as const },
+  ])(
+    "cold-restarts real $name probe checkpoints and rejects manifest relabelling",
+    async ({ format }) => {
+      const repository = await createRepository();
+      const adapter = new FakeAdapter(async (request) => {
+        if (request.capsule.nodeId === "implement")
+          await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+      });
+      const created = await createRun("Implement a substantial checkpoint-format feature", {
+        cwd: repository,
+      });
+      const focused = created.probePlan.items.find(
+        ({ phase, purpose }) => phase === "progress" && purpose === "focused",
+      )!;
+      const configuredProbePlan: ProbePlan = {
+        ...created.probePlan,
+        items: created.probePlan.items.map((item) =>
+          item === focused
+            ? {
+                ...item,
+                source: "Probe-checkpoint cold-restart acceptance fixture",
+                probe: {
+                  id: `checkpoint-command-v${format}`,
+                  kind: "command" as const,
+                  command: process.execPath,
+                  args: ["-e", "process.exit(0)"],
+                  expectedExitCode: 0,
+                  timeoutMs: 30_000,
+                  platforms: [process.platform] as Array<"darwin" | "linux" | "win32">,
+                },
+              }
+            : item,
+        ),
+      };
+      const storagePath = join(created.store.runRoot, "storage.json");
+      const descriptor = JSON.parse(await readFile(storagePath, "utf8")) as {
+        formats: { probeEvidenceCheckpoints?: number };
+      };
+      if (format === 1) {
+        const legacyEvents = (await created.store.loadEvents()).map((event) => {
+          const data = { ...event.data };
+          if (event.type === "run.created") delete data.probeEvidenceCheckpointFormat;
+          return createRunEvent(
+            {
+              sequence: event.sequence,
+              timestamp: event.timestamp,
+              actor: event.actor,
+              causationId: event.causationId,
+              type: event.type,
+              data,
+            },
+            PORTABLE_CANONICAL_HASH_ALGORITHM,
+          );
+        });
+        await writeFile(
+          created.store.eventsPath(),
+          `${legacyEvents.map((event) => JSON.stringify(event)).join("\n")}\n`,
+        );
+        delete descriptor.formats.probeEvidenceCheckpoints;
+      } else descriptor.formats.probeEvidenceCheckpoints = 2;
+      await writeFile(storagePath, `${JSON.stringify(descriptor, null, 2)}\n`);
+
+      const selectedStore = new RunStore(repository, created.store.runId);
+      await selectedStore.prepareStorage();
+      expect(selectedStore.probeEvidenceCheckpointHashAlgorithm).toBe(
+        format === 1 ? LEGACY_CANONICAL_HASH_ALGORITHM : PORTABLE_CANONICAL_HASH_ALGORITHM,
+      );
+      await configureRunProbes(selectedStore, configuredProbePlan);
+      await expect(
+        executeRun({
+          store: new ProgressScopeStartFaultStore(selectedStore),
+          adapter,
+          approve: true,
+        }),
+      ).rejects.toThrow("Injected process termination after progress scope start");
+
+      const crashEvents = await selectedStore.loadEvents();
+      const started = crashEvents.findLast(
+        ({ type, data }) =>
+          type === "scope.started" &&
+          data.nodeId === "implement" &&
+          data.stage === "progress_baseline",
+      );
+      expect(started?.data, `format v${format}`).toMatchObject({
+        checkpointId: expect.any(String),
+        processDefinitions: [
+          expect.objectContaining({
+            probeId: `checkpoint-command-v${format}`,
+            commandHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+            executionId: expect.stringMatching(/^[a-f0-9]{64}$/),
+          }),
+        ],
+        ...(format === 2 ? { probeEvidenceCheckpointFormat: 2 } : {}),
+      });
+      if (format === 1) expect(started?.data).not.toHaveProperty("probeEvidenceCheckpointFormat");
+      expect(
+        crashEvents.some(
+          ({ type, data }) =>
+            type === "probe.process.started" && data.checkpointId === started?.data.checkpointId,
+        ),
+      ).toBe(false);
+
+      const resumedStore = new RunStore(repository, created.store.runId);
+      const completed = await executeRun({ store: resumedStore, adapter });
+      const completedEvents = await resumedStore.loadEvents();
+      const persistedStarts = completedEvents.filter(
+        ({ type, data }) =>
+          type === "scope.started" &&
+          data.nodeId === "implement" &&
+          data.stage === "progress_baseline",
+      );
+      expect(completed.status).toBe("completed");
+      expect(adapter.calls).toEqual(["implement"]);
+      expect(
+        persistedStarts.filter(({ data }) => data.checkpointId === started?.data.checkpointId),
+      ).toHaveLength(1);
+      if (format === 2)
+        expect(persistedStarts.every(({ data }) => data.probeEvidenceCheckpointFormat === 2)).toBe(
+          true,
+        );
+      else
+        expect(
+          persistedStarts.every(({ data }) => !("probeEvidenceCheckpointFormat" in data)),
+        ).toBe(true);
+
+      const relabelled = JSON.parse(await readFile(storagePath, "utf8")) as {
+        formats: { probeEvidenceCheckpoints?: number };
+      };
+      if (format === 1) relabelled.formats.probeEvidenceCheckpoints = 2;
+      else delete relabelled.formats.probeEvidenceCheckpoints;
+      await writeFile(storagePath, `${JSON.stringify(relabelled, null, 2)}\n`);
+      const probeJournalRoot = join(
+        created.store.graphcraftRoot,
+        "locks",
+        "probe-processes",
+        created.store.runId,
+      );
+      await mkdir(probeJournalRoot, { recursive: true });
+      const sentinelPath = join(probeJournalRoot, "preserved-sentinel.json");
+      await writeFile(sentinelPath, '{"preserved":true}\n');
+      const beforeRejection = await snapshotFiles(created.store.runRoot);
+      const callsBeforeRejection = [...adapter.calls];
+
+      await expect(
+        executeRun({ store: new RunStore(repository, created.store.runId), adapter }),
+      ).rejects.toThrow(
+        /probe-evidence checkpoint format that disagrees with its storage manifest/,
+      );
+      expect(await snapshotFiles(created.store.runRoot)).toEqual(beforeRejection);
+      expect(await readFile(sentinelPath, "utf8")).toBe('{"preserved":true}\n');
+      expect(adapter.calls).toEqual(callsBeforeRejection);
+    },
+    60_000,
+  );
 
   it("completes a local run in an isolated worktree and records tokens", async () => {
     const repository = await createRepository();
@@ -8938,6 +9223,8 @@ process.stdin.on("end", () => {
           locks: 1,
           artifactInventory: 1,
           artifactPolicy: 1,
+          workspaceScopeSnapshots: 1,
+          probeEvidenceCheckpoints: 1,
         },
       });
       expect(contract.runId).toBe(fixture.runId);
@@ -8997,7 +9284,8 @@ process.stdin.on("end", () => {
             ([key]) =>
               key !== "artifactInventory" &&
               key !== "artifactPolicy" &&
-              key !== "workspaceScopeSnapshots",
+              key !== "workspaceScopeSnapshots" &&
+              key !== "probeEvidenceCheckpoints",
           ),
         ),
         heldOutProbes: 1,
@@ -9010,21 +9298,23 @@ process.stdin.on("end", () => {
         formats,
       };
       expect(RunStorageManifestSchema.parse(legacyStorage)).toEqual(legacyStorage);
-      const legacyEvents = (await created.store.loadEvents()).map((event) =>
-        createRunEvent(
+      const legacyEvents = (await created.store.loadEvents()).map((event) => {
+        const data: Record<string, unknown> = event.data.heldOutProbePlan
+          ? { ...event.data, heldOutProbePlan: legacyHeldOutProbePlan }
+          : { ...event.data };
+        if (event.type === "run.created") delete data.probeEvidenceCheckpointFormat;
+        return createRunEvent(
           {
             sequence: event.sequence,
             timestamp: event.timestamp,
             actor: event.actor,
             causationId: event.causationId,
             type: event.type,
-            data: event.data.heldOutProbePlan
-              ? { ...event.data, heldOutProbePlan: legacyHeldOutProbePlan }
-              : event.data,
+            data,
           },
           LEGACY_CANONICAL_HASH_ALGORITHM,
-        ),
-      );
+        );
+      });
       await rm(join(created.store.runRoot, "artifact-inventory.json"));
       await writeFile(
         created.store.eventsPath(),
@@ -9078,6 +9368,7 @@ process.stdin.on("end", () => {
 
       expect(reopened.canonicalHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
       expect(reopened.workspaceScopeHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
+      expect(reopened.probeEvidenceCheckpointHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
       const heldOutPath = join(created.store.runRoot, "held-out-probes.json");
       await writeFile(heldOutPath, `${JSON.stringify(freshHeldOutProbePlan, null, 2)}\n`);
       expect(await reopened.loadHeldOutProbePlan()).toMatchObject({ schemaVersion: 1 });
@@ -9086,7 +9377,12 @@ process.stdin.on("end", () => {
         schemaVersion: 3,
         migratedFrom: 1,
         canonicalHashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM,
-        formats: { heldOutProbes: 1, events: 1, workspaceScopeSnapshots: 1 },
+        formats: {
+          heldOutProbes: 1,
+          events: 1,
+          workspaceScopeSnapshots: 1,
+          probeEvidenceCheckpoints: 1,
+        },
       });
       if (operation === "configure probes") {
         const amended = (await reopened.loadEvents()).findLast(

@@ -25,6 +25,7 @@ import {
   evidenceSnapshot,
   interruptionReason,
   optimizeGraph,
+  parseEvidenceSnapshot,
   resolveHeldOutProbes,
   unavailableTokenUsage,
   workerVisibleProbePlan,
@@ -249,23 +250,12 @@ interface RecoverableInvocation {
   scopeBaseline?: WorkspaceScopeSnapshot;
 }
 
-function persistedBaseline(value: unknown, family: Graph["family"]): EvidenceSnapshot | undefined {
-  if (typeof value !== "object" || value === null) return undefined;
-  const candidate = value as Partial<EvidenceSnapshot>;
-  if (
-    typeof candidate.digest !== "string" ||
-    typeof candidate.workspaceDigest !== "string" ||
-    typeof candidate.passed !== "number" ||
-    typeof candidate.failed !== "number" ||
-    typeof candidate.failureSignature !== "string" ||
-    !Array.isArray(candidate.probeResults)
-  )
-    return undefined;
-  return evidenceSnapshot(
-    candidate.workspaceDigest,
-    candidate.probeResults as ProbeResult[],
-    family,
-  );
+function persistedBaseline(
+  value: unknown,
+  family: Graph["family"],
+  algorithm: CanonicalHashAlgorithm,
+): EvidenceSnapshot | undefined {
+  return parseEvidenceSnapshot(value, family, algorithm);
 }
 
 async function recoverableInvocation(
@@ -303,7 +293,15 @@ async function recoverableInvocation(
       : typeof started.data.reusedHostSessionId === "string"
         ? started.data.reusedHostSessionId
         : undefined;
-  const baseline = persistedBaseline(started.data.baseline, family);
+  const baseline = persistedBaseline(
+    started.data.baseline,
+    family,
+    store.probeEvidenceCheckpointHashAlgorithm,
+  );
+  if (started.data.baseline !== undefined && !baseline)
+    throw new Error(
+      `Graphcraft cannot validate the durable progress baseline for invocation ${invocationId}`,
+    );
   const scopeBaseline = parseWorkspaceScopeSnapshot(
     started.data.scopeBaseline,
     store.workspaceScopeHashAlgorithm,
@@ -562,8 +560,11 @@ export async function configureRunProbes(
       heldOutProbePlan,
       addedNodeIds: [],
       rationale: "User edited the deterministic probe plan before approval",
-      previousProbePlanHash: contentHash(await store.loadProbePlan()),
-      probePlanHash: contentHash(probePlan),
+      previousProbePlanHash: contentHash(
+        await store.loadProbePlan(),
+        store.probeEvidenceCheckpointHashAlgorithm,
+      ),
+      probePlanHash: contentHash(probePlan, store.probeEvidenceCheckpointHashAlgorithm),
     });
     await Promise.all([
       store.saveGraph(graph),
@@ -937,6 +938,7 @@ async function captureProbes(
         nodeId: processScope.nodeId,
         stage: processScope.stage,
         definition,
+        hashAlgorithm: store.probeEvidenceCheckpointHashAlgorithm,
       });
       let completed = false;
       try {
@@ -979,6 +981,7 @@ async function captureProbes(
                 );
               },
             }),
+            store.probeEvidenceCheckpointHashAlgorithm,
           ),
         );
         completed = true;
@@ -992,7 +995,15 @@ async function captureProbes(
           });
       }
     } else {
-      executed.push(await runProbe(spec, workspace.path, signal));
+      executed.push(
+        await runProbe(
+          spec,
+          workspace.path,
+          signal,
+          undefined,
+          store.probeEvidenceCheckpointHashAlgorithm,
+        ),
+      );
     }
   }
   for (const probe of executed) {
@@ -1251,13 +1262,24 @@ function needsSemanticVerification(
   return classification === "stalled" || classification === "done";
 }
 
-function stableSemanticProbeEvidence(results: ProbeResult[]): ProbeResult[] {
+function stableSemanticProbeEvidence(
+  results: ProbeResult[],
+  algorithm: CanonicalHashAlgorithm,
+): ProbeResult[] {
   return results
     .map(({ artifact: _artifact, durationMs: _durationMs, ...result }) => ({
       ...result,
       durationMs: 0,
     }))
-    .sort((left, right) => left.probeId.localeCompare(right.probeId));
+    .sort((left, right) =>
+      algorithm === PORTABLE_CANONICAL_HASH_ALGORITHM
+        ? left.probeId < right.probeId
+          ? -1
+          : left.probeId > right.probeId
+            ? 1
+            : 0
+        : left.probeId.localeCompare(right.probeId),
+    );
 }
 
 async function runSemanticVerification(input: {
@@ -1297,8 +1319,14 @@ async function runSemanticVerification(input: {
         relevantPaths: input.node.contextSelector.relevantPaths,
         workerSummary: input.workerSummary,
         workerEvidence: input.workerEvidence,
-        baselineProbeEvidence: stableSemanticProbeEvidence(input.baselineProbeEvidence),
-        currentProbeEvidence: stableSemanticProbeEvidence(input.currentProbeEvidence),
+        baselineProbeEvidence: stableSemanticProbeEvidence(
+          input.baselineProbeEvidence,
+          input.store.probeEvidenceCheckpointHashAlgorithm,
+        ),
+        currentProbeEvidence: stableSemanticProbeEvidence(
+          input.currentProbeEvidence,
+          input.store.probeEvidenceCheckpointHashAlgorithm,
+        ),
       }),
     );
     beforeScope = await captureRunWorkspaceScopeSnapshot(
@@ -1311,14 +1339,17 @@ async function runSemanticVerification(input: {
     const failure = error instanceof Error ? error : new Error(String(error));
     throw new SemanticVerificationFailure(failure.message, { cause: error });
   }
-  const contextHash = contentHash(context);
-  const checkpointId = contentHash({
-    schemaVersion: 1,
-    kind: "semantic_verification",
-    host: input.adapter.id,
-    contextHash,
-    scopeDigest: beforeScope.digest,
-  });
+  const contextHash = contentHash(context, input.store.probeEvidenceCheckpointHashAlgorithm);
+  const checkpointId = contentHash(
+    {
+      schemaVersion: 1,
+      kind: "semantic_verification",
+      host: input.adapter.id,
+      contextHash,
+      scopeDigest: beforeScope.digest,
+    },
+    input.store.probeEvidenceCheckpointHashAlgorithm,
+  );
   const recovered = await recoverSemanticVerification({
     store: input.store,
     node: input.node,
@@ -2134,6 +2165,8 @@ function persistedProgressCheckpoint(
   events: RunEvent[],
   nodeId: string,
   attemptId: string,
+  family: Graph["family"],
+  algorithm: CanonicalHashAlgorithm,
 ):
   | {
       trajectory: ProgressTrajectoryEntry;
@@ -2152,8 +2185,16 @@ function persistedProgressCheckpoint(
   if (!event || typeof event.data.summary !== "string" || !Array.isArray(event.data.evidence))
     return undefined;
   const trajectory = ProgressTrajectoryEntrySchema.safeParse(event.data.trajectory);
+  const baseline = trajectory.success
+    ? parseEvidenceSnapshot(trajectory.data.baseline, family, algorithm)
+    : undefined;
+  const current = trajectory.success
+    ? parseEvidenceSnapshot(trajectory.data.current, family, algorithm)
+    : undefined;
   if (
     !trajectory.success ||
+    !baseline ||
+    !current ||
     trajectory.data.attemptId !== attemptId ||
     trajectory.data.nodeId !== nodeId ||
     event.data.classification !== trajectory.data.classification ||
@@ -2163,7 +2204,7 @@ function persistedProgressCheckpoint(
   )
     return undefined;
   return {
-    trajectory: trajectory.data,
+    trajectory: { ...trajectory.data, baseline, current },
     summary: event.data.summary,
     evidence: event.data.evidence as string[],
     ...(typeof event.data.semanticStopReason === "string"
@@ -2251,24 +2292,30 @@ function progressProbeStage(value: unknown): ProgressProbeStage | undefined {
     : undefined;
 }
 
-function progressProbeScopePolicyHash(input: {
-  contract: RunContract;
-  graph: Graph;
-  node: GraphNode;
-  stage: ProgressProbeStage;
-  probeIds: string[];
-}): string {
-  return contentHash({
-    schemaVersion: 1,
-    kind: "probe_scope_policy",
-    runId: input.contract.runId,
-    graphRevision: input.graph.revision,
-    contractScope: input.contract.scope,
-    nodeId: input.node.id,
-    nodeScope: input.node.scope,
-    stage: input.stage,
-    probeIds: input.probeIds,
-  });
+function progressProbeScopePolicyHash(
+  input: {
+    contract: RunContract;
+    graph: Graph;
+    node: GraphNode;
+    stage: ProgressProbeStage;
+    probeIds: string[];
+  },
+  algorithm: CanonicalHashAlgorithm,
+): string {
+  return contentHash(
+    {
+      schemaVersion: 1,
+      kind: "probe_scope_policy",
+      runId: input.contract.runId,
+      graphRevision: input.graph.revision,
+      contractScope: input.contract.scope,
+      nodeId: input.node.id,
+      nodeScope: input.node.scope,
+      stage: input.stage,
+      probeIds: input.probeIds,
+    },
+    algorithm,
+  );
 }
 
 function progressProbeScopeAudit(input: {
@@ -2441,16 +2488,23 @@ async function executeReadOnlyProgressProbes(input: {
         failurePersisted: false,
       };
     }
-  const checkpointId = contentHash({
-    schemaVersion: 1,
-    kind: "progress_probe_scope",
-    runId: input.contract.runId,
-    nodeId: input.node.id,
-    stage: input.stage,
-    baselineDigest: baseline.digest,
-    nonce: randomUUID(),
-  });
-  const processDefinitions = probeProcessDefinitions(checkpointId, input.specs);
+  const checkpointId = contentHash(
+    {
+      schemaVersion: 1,
+      kind: "progress_probe_scope",
+      runId: input.contract.runId,
+      nodeId: input.node.id,
+      stage: input.stage,
+      baselineDigest: baseline.digest,
+      nonce: randomUUID(),
+    },
+    input.store.probeEvidenceCheckpointHashAlgorithm,
+  );
+  const processDefinitions = probeProcessDefinitions(
+    checkpointId,
+    input.specs,
+    input.store.probeEvidenceCheckpointHashAlgorithm,
+  );
   await input.store.append(
     "runtime",
     "scope.started",
@@ -2458,15 +2512,21 @@ async function executeReadOnlyProgressProbes(input: {
       nodeId: input.node.id,
       stage: input.stage,
       checkpointId,
+      ...(input.store.probeEvidenceCheckpointHashAlgorithm === PORTABLE_CANONICAL_HASH_ALGORITHM
+        ? { probeEvidenceCheckpointFormat: 2 }
+        : {}),
       baseline,
       graphRevision: input.graph.revision,
-      policyHash: progressProbeScopePolicyHash({
-        contract: input.contract,
-        graph: input.graph,
-        node: input.node,
-        stage: input.stage,
-        probeIds: input.specs.map(({ id }) => id),
-      }),
+      policyHash: progressProbeScopePolicyHash(
+        {
+          contract: input.contract,
+          graph: input.graph,
+          node: input.node,
+          stage: input.stage,
+          probeIds: input.specs.map(({ id }) => id),
+        },
+        input.store.probeEvidenceCheckpointHashAlgorithm,
+      ),
       probeIds: input.specs.map(({ id }) => id),
       processDefinitions,
     },
@@ -2552,7 +2612,8 @@ function validatedProgressProbeScopeCheck(input: {
   contract: RunContract;
   graph: Graph;
   state: RunState;
-  hashAlgorithm: CanonicalHashAlgorithm;
+  workspaceHashAlgorithm: CanonicalHashAlgorithm;
+  probeHashAlgorithm: CanonicalHashAlgorithm;
 }): { audit: WorkspaceScopeAudit; current: WorkspaceScopeSnapshot } | undefined {
   const { event, checkpoint } = input;
   if (
@@ -2569,7 +2630,7 @@ function validatedProgressProbeScopeCheck(input: {
     Array.isArray(event.data.audit)
   )
     return undefined;
-  const current = parseWorkspaceScopeSnapshot(event.data.current, input.hashAlgorithm);
+  const current = parseWorkspaceScopeSnapshot(event.data.current, input.workspaceHashAlgorithm);
   if (!current) return undefined;
   const audit = progressProbeScopeAudit({
     contract: input.contract,
@@ -2579,7 +2640,11 @@ function validatedProgressProbeScopeCheck(input: {
     baseline: checkpoint.baseline,
     current,
   });
-  if (contentHash(event.data.audit) !== contentHash(audit)) return undefined;
+  if (
+    contentHash(event.data.audit, input.probeHashAlgorithm) !==
+    contentHash(audit, input.probeHashAlgorithm)
+  )
+    return undefined;
   return { audit, current };
 }
 
@@ -2702,8 +2767,16 @@ async function reconcileProbeProcessesForScope(input: {
       }),
     });
   }
-  const expectedDefinitions = probeProcessDefinitions(input.checkpointId, expectedSpecs);
-  if (!definitions || contentHash(definitions) !== contentHash(expectedDefinitions)) {
+  const expectedDefinitions = probeProcessDefinitions(
+    input.checkpointId,
+    expectedSpecs,
+    input.store.probeEvidenceCheckpointHashAlgorithm,
+  );
+  if (
+    !definitions ||
+    contentHash(definitions, input.store.probeEvidenceCheckpointHashAlgorithm) !==
+      contentHash(expectedDefinitions, input.store.probeEvidenceCheckpointHashAlgorithm)
+  ) {
     const reason = `Graphcraft cannot validate probe-process definitions for scope checkpoint ${input.checkpointId}`;
     return await blockProgressProbeRecovery({
       store: input.store,
@@ -2798,7 +2871,8 @@ async function reconcileProbeProcessesForScope(input: {
         start.data.nodeId === input.node.id &&
         start.data.stage === input.stage &&
         start.data.checkpointId === input.checkpointId &&
-        contentHash(start.data.definition) === contentHash(definition) &&
+        contentHash(start.data.definition, input.store.probeEvidenceCheckpointHashAlgorithm) ===
+          contentHash(definition, input.store.probeEvidenceCheckpointHashAlgorithm) &&
         typeof start.data.ownerTokenHash === "string" &&
         /^[a-f0-9]{64}$/.test(start.data.ownerTokenHash) &&
         start.data.journalPath === expectedJournalPath &&
@@ -2938,6 +3012,7 @@ async function reconcileProbeProcessesForScope(input: {
         checkpointId: input.checkpointId,
         nodeId: input.node.id,
         stage: input.stage,
+        hashAlgorithm: input.store.probeEvidenceCheckpointHashAlgorithm,
         ...(start ? { ownerTokenHash: start.data.ownerTokenHash as string } : {}),
         ...(start ? { expectedBrokerPid: Number(brokerPid) } : {}),
       });
@@ -3142,13 +3217,16 @@ async function reconcileProgressProbeScopeCheckpoints(input: {
       start.data.checkpointId === checkpointId &&
       start.data.graphRevision === input.graph.revision &&
       start.data.policyHash ===
-        progressProbeScopePolicyHash({
-          contract: input.contract,
-          graph: input.graph,
-          node: active.node,
-          stage,
-          probeIds: expectedProbeIds!,
-        }) &&
+        progressProbeScopePolicyHash(
+          {
+            contract: input.contract,
+            graph: input.graph,
+            node: active.node,
+            stage,
+            probeIds: expectedProbeIds!,
+          },
+          input.store.probeEvidenceCheckpointHashAlgorithm,
+        ) &&
       baseline !== undefined &&
       validProbeIds;
     if (!valid) {
@@ -3200,7 +3278,8 @@ async function reconcileProgressProbeScopeCheckpoints(input: {
           contract: input.contract,
           graph: input.graph,
           state: input.state,
-          hashAlgorithm: input.store.workspaceScopeHashAlgorithm,
+          workspaceHashAlgorithm: input.store.workspaceScopeHashAlgorithm,
+          probeHashAlgorithm: input.store.probeEvidenceCheckpointHashAlgorithm,
         })
       : undefined;
     if (rawChecks.length === 1 && !checked) {
@@ -3326,6 +3405,7 @@ async function executeWorkNode(input: {
       input.recoveryScopeBaseline.digest,
       baselineProbeResults,
       input.graph.family,
+      input.store.probeEvidenceCheckpointHashAlgorithm,
     );
   } else {
     const baselineExecution = await executeReadOnlyProgressProbes({
@@ -3361,6 +3441,7 @@ async function executeWorkNode(input: {
       observedBaselineScope.digest,
       baselineProbeResults,
       input.graph.family,
+      input.store.probeEvidenceCheckpointHashAlgorithm,
     );
   }
   let scopeBaseline: WorkspaceScopeSnapshot;
@@ -3520,6 +3601,7 @@ async function executeWorkNode(input: {
     progressScope.digest,
     afterProbes.map(({ result }) => result),
     input.graph.family,
+    input.store.probeEvidenceCheckpointHashAlgorithm,
   );
   const assessed = await assessRunProgress({
     store: input.store,
@@ -3542,8 +3624,14 @@ async function executeWorkNode(input: {
       await input.store.loadEvents(),
       input.node.id,
       worker.invocationId,
+      input.graph.family,
+      input.store.probeEvidenceCheckpointHashAlgorithm,
     );
-    if (!recorded || contentHash(recorded.trajectory) !== contentHash(assessed.trajectory)) {
+    if (
+      !recorded ||
+      contentHash(recorded.trajectory, input.store.probeEvidenceCheckpointHashAlgorithm) !==
+        contentHash(assessed.trajectory, input.store.probeEvidenceCheckpointHashAlgorithm)
+    ) {
       const reason = `Graphcraft cannot recover the durable progress checkpoint for node ${input.node.id} attempt ${worker.invocationId}`;
       await input.store.append("runtime", "node.failed", { nodeId: input.node.id, reason });
       return { status: "failed", nodeId: input.node.id, reason };
@@ -4776,17 +4864,21 @@ export async function executeRun(input: {
           verificationScopeCurrent.digest,
           results,
           graph.family,
+          input.store.probeEvidenceCheckpointHashAlgorithm,
         );
-        const verificationCheckpointId = contentHash({
-          schemaVersion: 1,
-          kind: "held_out_verification",
-          runId: contract.runId,
-          graphRevision: graph.revision,
-          nodeId: current.id,
-          planDigest: heldOutProbePlan.digest,
-          workspaceDigest: verificationEvidence.workspaceDigest,
-          evidenceVector: verificationEvidence.vector,
-        });
+        const verificationCheckpointId = contentHash(
+          {
+            schemaVersion: 1,
+            kind: "held_out_verification",
+            runId: contract.runId,
+            graphRevision: graph.revision,
+            nodeId: current.id,
+            planDigest: heldOutProbePlan.digest,
+            workspaceDigest: verificationEvidence.workspaceDigest,
+            evidenceVector: verificationEvidence.vector,
+          },
+          input.store.probeEvidenceCheckpointHashAlgorithm,
+        );
         const heldOutAlreadyChecked = (await input.store.loadEvents()).some(
           ({ type, data }) =>
             type === "held_out.checked" &&

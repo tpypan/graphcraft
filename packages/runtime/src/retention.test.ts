@@ -781,7 +781,8 @@ describe("run-state retention", () => {
           ([key]) =>
             key !== "artifactInventory" &&
             key !== "artifactPolicy" &&
-            key !== "workspaceScopeSnapshots",
+            key !== "workspaceScopeSnapshots" &&
+            key !== "probeEvidenceCheckpoints",
         ),
       ),
       heldOutProbes: 1,
@@ -795,16 +796,18 @@ describe("run-state retention", () => {
     };
     expect(RunStorageManifestSchema.parse(legacyStorage)).toEqual(legacyStorage);
     const eventsPath = join(store.runRoot, "events.jsonl");
-    const legacyEvents = (await store.loadEvents()).map((event) =>
-      createRunEvent({
+    const legacyEvents = (await store.loadEvents()).map((event) => {
+      const data = { ...event.data };
+      if (event.type === "run.created") delete data.probeEvidenceCheckpointFormat;
+      return createRunEvent({
         sequence: event.sequence,
         timestamp: event.timestamp,
         actor: event.actor,
         causationId: event.causationId,
         type: event.type,
-        data: event.data,
-      }),
-    );
+        data,
+      });
+    });
     await writeFile(
       eventsPath,
       `${legacyEvents.map((event) => JSON.stringify(event)).join("\n")}\n`,

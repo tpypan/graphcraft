@@ -89,7 +89,8 @@ export class RunStoreEventLogCorruptionError extends Error {
     readonly record: number,
     readonly offsetBytes: number,
     readonly trailing: boolean,
-    reason: "encoding" | "json" | "schema" | "hash" | "format" | "sequence" | "scope",
+    reason:
+      "encoding" | "json" | "schema" | "hash" | "format" | "sequence" | "scope" | "checkpoint",
   ) {
     const location = trailing ? "trailing record" : `record ${record}`;
     const problem =
@@ -105,7 +106,9 @@ export class RunStoreEventLogCorruptionError extends Error {
                 ? "an event format that disagrees with its storage manifest"
                 : reason === "scope"
                   ? "a workspace-scope snapshot that disagrees with its storage manifest"
-                  : "an invalid event sequence";
+                  : reason === "checkpoint"
+                    ? "a probe-evidence checkpoint format that disagrees with its storage manifest"
+                    : "an invalid event sequence";
     super(
       `Run event log has ${problem} in ${location} at byte ${offsetBytes}; event log bytes were left unchanged`,
     );
@@ -197,6 +200,15 @@ function workspaceScopeSnapshotUsesDifferentHashPolicy(
   return parseWorkspaceScopeSnapshot(snapshot, other) !== undefined;
 }
 
+function probeEvidenceCheckpointUsesDifferentFormat(
+  event: RunEvent,
+  selected: CanonicalHashAlgorithm,
+): boolean {
+  if (event.type !== "run.created" && event.type !== "scope.started") return false;
+  const format = event.data.probeEvidenceCheckpointFormat;
+  return selected === PORTABLE_CANONICAL_HASH_ALGORITHM ? format !== 2 : format !== undefined;
+}
+
 export class RunStore {
   readonly repositoryRoot: string;
   readonly runId: string;
@@ -211,6 +223,7 @@ export class RunStore {
   private _heldOutProbePlanHashAlgorithm: CanonicalHashAlgorithm;
   private _artifactHashAlgorithm: CanonicalHashAlgorithm | undefined;
   private _workspaceScopeHashAlgorithm: CanonicalHashAlgorithm | undefined;
+  private _probeEvidenceCheckpointHashAlgorithm: CanonicalHashAlgorithm | undefined;
 
   constructor(
     repositoryRoot: string,
@@ -273,6 +286,11 @@ export class RunStore {
           ? PORTABLE_CANONICAL_HASH_ALGORITHM
           : LEGACY_CANONICAL_HASH_ALGORITHM;
       this.bindWorkspaceScopeHashAlgorithm(workspaceScopeHashAlgorithm);
+      const probeEvidenceCheckpointHashAlgorithm =
+        manifest.formats.probeEvidenceCheckpoints === 2
+          ? PORTABLE_CANONICAL_HASH_ALGORITHM
+          : LEGACY_CANONICAL_HASH_ALGORITHM;
+      this.bindProbeEvidenceCheckpointHashAlgorithm(probeEvidenceCheckpointHashAlgorithm);
       await this.validateStorageRoot();
     } catch (error) {
       if (this.storageReady === ready) this.storageReady = undefined;
@@ -304,6 +322,14 @@ export class RunStore {
     return this._workspaceScopeHashAlgorithm;
   }
 
+  get probeEvidenceCheckpointHashAlgorithm(): CanonicalHashAlgorithm {
+    if (!this._probeEvidenceCheckpointHashAlgorithm)
+      throw new Error(
+        "Probe-evidence checkpoint hash policy is unavailable before run storage is prepared",
+      );
+    return this._probeEvidenceCheckpointHashAlgorithm;
+  }
+
   private bindArtifactHashAlgorithm(algorithm: CanonicalHashAlgorithm): void {
     if (this.artifactStore && this.artifactStore.hashAlgorithm !== algorithm)
       throw new Error("Artifact store was bound before its storage manifest policy was known");
@@ -316,6 +342,17 @@ export class RunStore {
         "Workspace-scope hashing was bound before its storage manifest policy was known",
       );
     this._workspaceScopeHashAlgorithm = algorithm;
+  }
+
+  private bindProbeEvidenceCheckpointHashAlgorithm(algorithm: CanonicalHashAlgorithm): void {
+    if (
+      this._probeEvidenceCheckpointHashAlgorithm &&
+      this._probeEvidenceCheckpointHashAlgorithm !== algorithm
+    )
+      throw new Error(
+        "Probe-evidence checkpoint hashing was bound before its storage manifest policy was known",
+      );
+    this._probeEvidenceCheckpointHashAlgorithm = algorithm;
   }
 
   private artifacts(): RunArtifactStore {
@@ -407,6 +444,7 @@ export class RunStore {
     store.initializing = true;
     store.bindArtifactHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     store.bindWorkspaceScopeHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    store.bindProbeEvidenceCheckpointHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     const persistedContract = RunContractSchema.parse(redactValue(contract));
     const persistedGraph = GraphSchema.parse(redactValue(graph));
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
@@ -443,6 +481,7 @@ export class RunStore {
           probePlan,
           heldOutProbePlan,
           nodeIds: graph.nodes.map(({ id }) => id),
+          probeEvidenceCheckpointFormat: 2,
         },
       },
       store.canonicalHashAlgorithm,
@@ -800,6 +839,10 @@ export class RunStore {
         throw new RunStoreEventLogCorruptionError(record, offset, trailing, "format");
       if (event.sequence !== record)
         throw new RunStoreEventLogCorruptionError(record, offset, trailing, "sequence");
+      if (
+        probeEvidenceCheckpointUsesDifferentFormat(event, this.probeEvidenceCheckpointHashAlgorithm)
+      )
+        throw new RunStoreEventLogCorruptionError(record, offset, trailing, "checkpoint");
       const scopeSnapshot = eventWorkspaceScopeSnapshot(event);
       if (
         scopeSnapshot !== undefined &&

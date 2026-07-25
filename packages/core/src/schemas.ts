@@ -1327,6 +1327,9 @@ export const RunStorageManifestSchema = z.union([
       // Schema v3 predates this independent domain selector. An omitted field
       // is therefore an explicit legacy-v1 declaration, never a v2 inference.
       workspaceScopeSnapshots: z.union([z.literal(1), z.literal(2)]).default(1),
+      // Probe-evidence checkpoints were also persisted before their hashing
+      // domain became independent. Omission therefore selects legacy v1.
+      probeEvidenceCheckpoints: z.union([z.literal(1), z.literal(2)]).default(1),
     }),
   }),
 ]);

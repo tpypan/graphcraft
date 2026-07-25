@@ -71,6 +71,7 @@ type LegacyStorageVersion = 0 | 1 | 2;
 type HeldOutProbeFormat = 1 | 2;
 type ArtifactInventoryFormat = 1 | 2;
 type WorkspaceScopeSnapshotFormat = 1 | 2;
+type ProbeEvidenceCheckpointFormat = 1 | 2;
 type CurrentRunStorageManifest = Extract<RunStorageManifest, { schemaVersion: 3 }>;
 
 interface LegacyStorage {
@@ -91,6 +92,7 @@ function manifest(
   heldOutProbeFormat: HeldOutProbeFormat,
   artifactInventoryFormat: ArtifactInventoryFormat,
   workspaceScopeSnapshotFormat: WorkspaceScopeSnapshotFormat,
+  probeEvidenceCheckpointFormat: ProbeEvidenceCheckpointFormat,
   initialization: "initializing" | "ready",
 ): CurrentRunStorageManifest {
   return RunStorageManifestSchema.parse({
@@ -116,6 +118,7 @@ function manifest(
       artifactInventory: artifactInventoryFormat,
       artifactPolicy: 1,
       workspaceScopeSnapshots: workspaceScopeSnapshotFormat,
+      probeEvidenceCheckpoints: probeEvidenceCheckpointFormat,
     },
   }) as CurrentRunStorageManifest;
 }
@@ -143,6 +146,7 @@ async function persistCurrentRunStorageManifest(
   heldOutProbeFormat: HeldOutProbeFormat,
   artifactInventoryFormat: ArtifactInventoryFormat,
   workspaceScopeSnapshotFormat: WorkspaceScopeSnapshotFormat,
+  probeEvidenceCheckpointFormat: ProbeEvidenceCheckpointFormat,
   initialization: "initializing" | "ready",
   lease?: MigrationLeaseContext,
 ): Promise<CurrentRunStorageManifest> {
@@ -153,6 +157,7 @@ async function persistCurrentRunStorageManifest(
     heldOutProbeFormat,
     artifactInventoryFormat,
     workspaceScopeSnapshotFormat,
+    probeEvidenceCheckpointFormat,
     initialization,
   );
   await migrationStep(lease, async () => await ensurePrivateDirectory(runRoot));
@@ -180,6 +185,7 @@ export async function writeCurrentRunStorageManifest(
     2,
     2,
     2,
+    2,
     "ready",
   );
 }
@@ -193,6 +199,7 @@ export async function writeInitializingRunStorageManifest(
     runId,
     CURRENT_RUN_STORAGE_VERSION,
     PORTABLE_CANONICAL_HASH_ALGORITHM,
+    2,
     2,
     2,
     2,
@@ -1648,6 +1655,17 @@ async function validateInitializingRunStorage(
     throw new Error(
       `Run ${runId} has an incomplete schema-v3 initialization before its first durable event. No files were changed.`,
     );
+  const probeEvidenceFormatMismatch = events.some((event) => {
+    if (event.type !== "run.created" && event.type !== "scope.started") return false;
+    const declared = event.data.probeEvidenceCheckpointFormat;
+    return manifest.formats.probeEvidenceCheckpoints === 2
+      ? declared !== 2
+      : declared !== undefined;
+  });
+  if (probeEvidenceFormatMismatch)
+    throw new Error(
+      `Run ${runId} has a probe-evidence checkpoint format that disagrees with its schema-v3 initialization descriptor. No files were changed.`,
+    );
   try {
     validateHeldOutProbePlan(
       HeldOutProbePlanSchema.parse(first.data.heldOutProbePlan),
@@ -1726,6 +1744,7 @@ export async function ensureCurrentRunStorage(input: {
         storage.manifest.formats.heldOutProbes,
         storage.manifest.formats.artifactInventory,
         storage.manifest.formats.workspaceScopeSnapshots,
+        storage.manifest.formats.probeEvidenceCheckpoints,
         "ready",
         lease,
       );
@@ -1778,6 +1797,7 @@ export async function ensureCurrentRunStorage(input: {
       input.runId,
       storage.version,
       LEGACY_CANONICAL_HASH_ALGORITHM,
+      1,
       1,
       1,
       1,
