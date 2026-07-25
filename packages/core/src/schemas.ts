@@ -1053,6 +1053,7 @@ export const ArtifactInventoryReasonSchema = z.enum([
 const MAX_ARTIFACT_PATH_CHARACTERS = 4 * 1024;
 export const MAX_ARTIFACT_INVENTORY_BYTES = 8 * 1024 * 1024;
 export const MAX_ARTIFACT_INVENTORY_PATH_BYTES = 1024 * 1024;
+export const MAX_ARTIFACT_INVENTORY_ENTRIES = 16 * 1024;
 const WINDOWS_INVALID_ARTIFACT_SEGMENT = /[\u0000-\u001f<>:"|?*]/u;
 const WINDOWS_RESERVED_ARTIFACT_SEGMENT =
   /^(?:aux|clock\$|con|conin\$|conout\$|nul|prn|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/iu;
@@ -1203,7 +1204,7 @@ export const ArtifactInventorySchema = z
     sourceBytes: z.number().int().nonnegative(),
     storedBytes: z.number().int().nonnegative(),
     omittedBytes: z.number().int().nonnegative(),
-    entries: z.array(ArtifactInventoryEntrySchema).max(16 * 1024),
+    entries: z.array(ArtifactInventoryEntrySchema).max(MAX_ARTIFACT_INVENTORY_ENTRIES),
     updatedAt: z.iso.datetime(),
   })
   .superRefine((inventory, context) => {

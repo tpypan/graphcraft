@@ -3,6 +3,15 @@ import { constants as fsConstants, type BigIntStats } from "node:fs";
 import { chmod, lstat, mkdir, open, readdir } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep, win32 } from "node:path";
 import { syncDirectory, writeJsonAtomic, type AtomicFilePublication } from "./json.ts";
+import {
+  encodeWindowsAclRequest,
+  parseWindowsAclResponse,
+  PersistentWindowsAclHelper,
+  planWindowsAclRequest,
+  runWindowsAclVerificationAttempts,
+  WINDOWS_ACL_REQUEST_LIMITS,
+  WindowsAclRequestIds,
+} from "./windows-acl-helper.ts";
 
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
@@ -25,133 +34,273 @@ const hardenedWindowsIdentities = new Map<string, string>();
 const hardenedDarwinEntries = new Map<string, string>();
 const privatePathMutationTails = new Map<string, Promise<void>>();
 let windowsAclWorkTail = Promise.resolve();
+const windowsAclRequestIds = new WindowsAclRequestIds();
 
 /*
- * Paths are base64-encoded on stdin rather than interpolated into this script.
- * The first pass validates every target before the second pass mutates an ACL,
- * so a reparse point cannot redirect an earlier tree entry outside the owned
- * root after only part of the tree has been hardened.
+ * Requests and paths are base64-encoded on stdin rather than interpolated into
+ * this script. One trusted helper serves a serialized sequence of transactions.
+ * Every bounded chunk is validated and retained before COMMIT can mutate an
+ * ACL, preserving whole-request preflight without one giant request line.
  */
 const WINDOWS_OWNER_ONLY_ACL_SCRIPT = String.raw`
-$ErrorActionPreference = 'Stop'
-Set-StrictMode -Version 3.0
-[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-
 try {
+  $ErrorActionPreference = 'Stop'
+  Set-StrictMode -Version 3.0
+  [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+  [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
   $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
   if ($null -eq $sid) { throw 'The current Windows identity has no SID' }
-  $targets = [System.Collections.Generic.List[object]]::new()
-  foreach ($rawLine in ([Console]::In.ReadToEnd() -split [char]10)) {
-    $line = $rawLine.TrimEnd([char]13)
-    if ($line.Length -eq 0) { continue }
-    $separator = $line.IndexOf([char]9)
-    if ($separator -ne 1) { throw 'Malformed Graphcraft ACL target record' }
-    $kind = $line.Substring(0, 1)
-    $path = [System.Text.Encoding]::UTF8.GetString(
-      [System.Convert]::FromBase64String($line.Substring($separator + 1))
-    )
-    if ([String]::IsNullOrEmpty($path)) { throw 'Empty Graphcraft ACL target path' }
+  $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+  $activeRequestId = $null
+  $expectedTargetCount = 0
+  $expectedChunkCount = 0
+  $nextChunkIndex = 0
+  $targetPaths = $null
+  $targetDirectoryFlags = $null
 
-    $attributes = [System.IO.File]::GetAttributes($path)
-    if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-      throw 'Graphcraft private tree contains a reparse point'
-    }
-    $isDirectory = ($attributes -band [System.IO.FileAttributes]::Directory) -ne 0
-    if (($kind -eq 'D') -ne $isDirectory) {
-      throw 'Graphcraft ACL target changed filesystem kind'
-    }
-    if ($kind -ne 'D' -and $kind -ne 'F') {
-      throw 'Unsupported Graphcraft ACL target kind'
-    }
-    $targets.Add([pscustomobject]@{ Path = $path; IsDirectory = $isDirectory })
-  }
-  if ($targets.Count -eq 0) { throw 'No Graphcraft ACL targets were supplied' }
-
-  $targetIndex = 0
-  foreach ($target in $targets) {
-    $targetIndex += 1
-    $attributes = [System.IO.File]::GetAttributes($target.Path)
-    if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-      throw 'Graphcraft ACL target became a reparse point'
-    }
-    $isDirectory = ($attributes -band [System.IO.FileAttributes]::Directory) -ne 0
-    if ($isDirectory -ne $target.IsDirectory) {
-      throw 'Graphcraft ACL target changed filesystem kind'
-    }
-
-    if ($isDirectory) {
-      $item = [System.IO.DirectoryInfo]::new($target.Path)
-      $security = [System.Security.AccessControl.DirectorySecurity]::new()
-      $inheritance = ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit)
-    } else {
-      $item = [System.IO.FileInfo]::new($target.Path)
-      $security = [System.Security.AccessControl.FileSecurity]::new()
-      $inheritance = [System.Security.AccessControl.InheritanceFlags]::None
-    }
-    $security.SetAccessRuleProtection($true, $false)
-    $security.SetOwner($sid)
-    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-      $sid,
-      [System.Security.AccessControl.FileSystemRights]::FullControl,
-      $inheritance,
-      [System.Security.AccessControl.PropagationFlags]::None,
-      [System.Security.AccessControl.AccessControlType]::Allow
-    )
-    [void]$security.AddAccessRule($rule)
-    $item.SetAccessControl($security)
-
-    $item.Refresh()
-    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-      throw 'Graphcraft ACL target became a reparse point during enforcement'
-    }
-    $sections = ([System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner)
-    $verified = $item.GetAccessControl($sections)
-    $owner = $verified.GetOwner([System.Security.Principal.SecurityIdentifier])
-    $rules = @($verified.GetAccessRules(
-      $true,
-      $true,
-      [System.Security.Principal.SecurityIdentifier]
-    ))
-    $failures = [System.Collections.Generic.List[string]]::new()
-    if (-not $verified.AreAccessRulesProtected) { [void]$failures.Add('protection') }
-    if ($owner.Value -ne $sid.Value) { [void]$failures.Add('owner') }
-    if ($rules.Count -ne 1) {
-      [void]$failures.Add('rule_count')
-    } else {
-      if ($rules[0].IsInherited) { [void]$failures.Add('inherited') }
-      if ($rules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { [void]$failures.Add('type') }
-      if ($rules[0].FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl) { [void]$failures.Add('rights') }
-      if ($rules[0].InheritanceFlags -ne $inheritance) { [void]$failures.Add('inheritance') }
-      if ($rules[0].PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None) { [void]$failures.Add('propagation') }
-      if ($rules[0].IdentityReference.Value -ne $sid.Value) { [void]$failures.Add('identity') }
-    }
-    if ($failures.Count -gt 0) {
-      $kind = if ($isDirectory) { 'D' } else { 'F' }
-      $ownerClass = if ($owner.Value -eq $sid.Value) { 'current' } else { 'other' }
-      $protection = if ($verified.AreAccessRulesProtected) { 'protected' } else { 'unprotected' }
-      $aceDiagnostics = [System.Collections.Generic.List[string]]::new()
-      foreach ($rule in $rules) {
-        $identityClass = if ($rule.IdentityReference.Value -eq $sid.Value) { 'current' } else { 'other' }
-        $inherited = $rule.IsInherited.ToString().ToLowerInvariant()
-        [void]$aceDiagnostics.Add(
-          "identity=$identityClass,type=$([int]($rule.AccessControlType)),rights=$([int]($rule.FileSystemRights)),inherited=$inherited,inheritance=$([int]($rule.InheritanceFlags)),propagation=$([int]($rule.PropagationFlags))"
-        )
+  while ($null -ne ($requestLine = [Console]::In.ReadLine())) {
+    $responseRequestId = if ($null -eq $activeRequestId) { '0' } else { $activeRequestId }
+    try {
+      if ([System.Text.Encoding]::UTF8.GetByteCount($requestLine) + 1 -gt __GRAPHCRAFT_ACL_MAX_LINE_BYTES__) {
+        throw 'Graphcraft ACL request line exceeds its encoded byte limit'
       }
-      throw "Graphcraft owner-only ACL verification failed for target $targetIndex ($kind): $($failures -join ','); protection=$protection;owner=$ownerClass;aces=[$($aceDiagnostics -join '|')]"
+      $requestParts = @($requestLine -split [char]9)
+      if ($null -eq $activeRequestId) {
+        if ($requestParts.Count -ne 4 -or $requestParts[0] -cne 'GRAPHCRAFT_ACL_BEGIN') {
+          throw 'Malformed Graphcraft ACL BEGIN frame'
+        }
+        if ($requestParts[1] -notmatch '^[1-9][0-9]*$') {
+          throw 'Malformed Graphcraft ACL request identifier'
+        }
+        $responseRequestId = $requestParts[1]
+        $parsedTargetCount = 0
+        $parsedChunkCount = 0
+        if (
+          $requestParts[2] -notmatch '^[1-9][0-9]*$' -or
+          -not [int]::TryParse($requestParts[2], [ref]$parsedTargetCount) -or
+          $parsedTargetCount -gt __GRAPHCRAFT_ACL_MAX_TARGETS__
+        ) { throw 'Malformed Graphcraft ACL target count' }
+        if (
+          $requestParts[3] -notmatch '^[1-9][0-9]*$' -or
+          -not [int]::TryParse($requestParts[3], [ref]$parsedChunkCount) -or
+          $parsedChunkCount -gt $parsedTargetCount
+        ) { throw 'Malformed Graphcraft ACL chunk count' }
+        $activeRequestId = $requestParts[1]
+        $expectedTargetCount = $parsedTargetCount
+        $expectedChunkCount = $parsedChunkCount
+        $nextChunkIndex = 0
+        $targetPaths = [System.Collections.Generic.List[string]]::new($expectedTargetCount)
+        $targetDirectoryFlags = [System.Collections.Generic.List[bool]]::new($expectedTargetCount)
+        continue
+      }
+
+      $responseRequestId = $activeRequestId
+      if ($requestParts.Count -gt 0 -and $requestParts[0] -ceq 'GRAPHCRAFT_ACL_CHUNK') {
+        if ($requestParts.Count -ne 5 -or $requestParts[1] -cne $activeRequestId) {
+          throw 'Malformed Graphcraft ACL CHUNK frame'
+        }
+        $chunkIndex = 0
+        $chunkTargetCount = 0
+        if (
+          $requestParts[2] -notmatch '^(?:0|[1-9][0-9]*)$' -or
+          -not [int]::TryParse($requestParts[2], [ref]$chunkIndex) -or
+          $chunkIndex -ne $nextChunkIndex -or
+          $chunkIndex -ge $expectedChunkCount
+        ) { throw 'Malformed Graphcraft ACL chunk index' }
+        if (
+          $requestParts[3] -notmatch '^[1-9][0-9]*$' -or
+          -not [int]::TryParse($requestParts[3], [ref]$chunkTargetCount) -or
+          $chunkTargetCount -gt ($expectedTargetCount - $targetPaths.Count)
+        ) { throw 'Malformed Graphcraft ACL chunk target count' }
+        $chunkBytes = [System.Convert]::FromBase64String($requestParts[4])
+        if ([System.Convert]::ToBase64String($chunkBytes) -cne $requestParts[4]) {
+          throw 'Non-canonical Graphcraft ACL chunk payload'
+        }
+        $targetLines = @($strictUtf8.GetString($chunkBytes) -split [char]10)
+        if ($targetLines.Count -ne $chunkTargetCount) {
+          throw 'Graphcraft ACL chunk count does not match its payload'
+        }
+        $chunkPaths = [System.Collections.Generic.List[string]]::new($chunkTargetCount)
+        $chunkDirectoryFlags = [System.Collections.Generic.List[bool]]::new($chunkTargetCount)
+        foreach ($targetLine in $targetLines) {
+          $targetParts = @($targetLine -split [char]9)
+          if ($targetParts.Count -ne 2) { throw 'Malformed Graphcraft ACL target record' }
+          $kind = $targetParts[0]
+          if ($kind -cne 'D' -and $kind -cne 'F') {
+            throw 'Unsupported Graphcraft ACL target kind'
+          }
+          $pathBytes = [System.Convert]::FromBase64String($targetParts[1])
+          if ([System.Convert]::ToBase64String($pathBytes) -cne $targetParts[1]) {
+            throw 'Non-canonical Graphcraft ACL target path'
+          }
+          $path = $strictUtf8.GetString($pathBytes)
+          if ([String]::IsNullOrEmpty($path) -or $path.IndexOf([char]0) -ge 0) {
+            throw 'Empty or invalid Graphcraft ACL target path'
+          }
+          $attributes = [System.IO.File]::GetAttributes($path)
+          if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Graphcraft private tree contains a reparse point'
+          }
+          $isDirectory = ($attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+          if (($kind -ceq 'D') -ne $isDirectory) {
+            throw 'Graphcraft ACL target changed filesystem kind'
+          }
+          $chunkPaths.Add($path)
+          $chunkDirectoryFlags.Add($isDirectory)
+        }
+        for ($chunkOffset = 0; $chunkOffset -lt $chunkPaths.Count; $chunkOffset += 1) {
+          $targetPaths.Add($chunkPaths[$chunkOffset])
+          $targetDirectoryFlags.Add($chunkDirectoryFlags[$chunkOffset])
+        }
+        $nextChunkIndex += 1
+        continue
+      }
+
+      if ($requestParts.Count -ne 4 -or $requestParts[0] -cne 'GRAPHCRAFT_ACL_COMMIT' -or $requestParts[1] -cne $activeRequestId) {
+        throw 'Malformed Graphcraft ACL COMMIT frame'
+      }
+      $commitChunkCount = 0
+      $commitTargetCount = 0
+      if (
+        $requestParts[2] -notmatch '^[1-9][0-9]*$' -or
+        -not [int]::TryParse($requestParts[2], [ref]$commitChunkCount) -or
+        $commitChunkCount -ne $expectedChunkCount -or
+        $nextChunkIndex -ne $expectedChunkCount
+      ) { throw 'Graphcraft ACL COMMIT chunk count does not match BEGIN' }
+      if (
+        $requestParts[3] -notmatch '^[1-9][0-9]*$' -or
+        -not [int]::TryParse($requestParts[3], [ref]$commitTargetCount) -or
+        $commitTargetCount -ne $expectedTargetCount -or
+        $targetPaths.Count -ne $expectedTargetCount
+      ) { throw 'Graphcraft ACL COMMIT target count does not match BEGIN' }
+
+      for ($targetIndex = 0; $targetIndex -lt $targetPaths.Count; $targetIndex += 1) {
+        $path = $targetPaths[$targetIndex]
+        $expectedDirectory = $targetDirectoryFlags[$targetIndex]
+        $attributes = [System.IO.File]::GetAttributes($path)
+        if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+          throw 'Graphcraft ACL target became a reparse point'
+        }
+        $isDirectory = ($attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+        if ($isDirectory -ne $expectedDirectory) {
+          throw 'Graphcraft ACL target changed filesystem kind'
+        }
+
+        if ($isDirectory) {
+          $item = [System.IO.DirectoryInfo]::new($path)
+          $security = [System.Security.AccessControl.DirectorySecurity]::new()
+          $inheritance = ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit)
+        } else {
+          $item = [System.IO.FileInfo]::new($path)
+          $security = [System.Security.AccessControl.FileSecurity]::new()
+          $inheritance = [System.Security.AccessControl.InheritanceFlags]::None
+        }
+        $security.SetAccessRuleProtection($true, $false)
+        $security.SetOwner($sid)
+        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+          $sid,
+          [System.Security.AccessControl.FileSystemRights]::FullControl,
+          $inheritance,
+          [System.Security.AccessControl.PropagationFlags]::None,
+          [System.Security.AccessControl.AccessControlType]::Allow
+        )
+        [void]$security.AddAccessRule($rule)
+        $item.SetAccessControl($security)
+
+        $item.Refresh()
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+          throw 'Graphcraft ACL target became a reparse point during enforcement'
+        }
+        $sections = ([System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner)
+        $verified = $item.GetAccessControl($sections)
+        $owner = $verified.GetOwner([System.Security.Principal.SecurityIdentifier])
+        $rules = @($verified.GetAccessRules(
+          $true,
+          $true,
+          [System.Security.Principal.SecurityIdentifier]
+        ))
+        $failures = [System.Collections.Generic.List[string]]::new()
+        if (-not $verified.AreAccessRulesProtected) { [void]$failures.Add('protection') }
+        if ($owner.Value -ne $sid.Value) { [void]$failures.Add('owner') }
+        if ($rules.Count -ne 1) {
+          [void]$failures.Add('rule_count')
+        } else {
+          if ($rules[0].IsInherited) { [void]$failures.Add('inherited') }
+          if ($rules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { [void]$failures.Add('type') }
+          if ($rules[0].FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl) { [void]$failures.Add('rights') }
+          if ($rules[0].InheritanceFlags -ne $inheritance) { [void]$failures.Add('inheritance') }
+          if ($rules[0].PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None) { [void]$failures.Add('propagation') }
+          if ($rules[0].IdentityReference.Value -ne $sid.Value) { [void]$failures.Add('identity') }
+        }
+        if ($failures.Count -gt 0) {
+          $kind = if ($isDirectory) { 'D' } else { 'F' }
+          $ownerClass = if ($owner.Value -eq $sid.Value) { 'current' } else { 'other' }
+          $protection = if ($verified.AreAccessRulesProtected) { 'protected' } else { 'unprotected' }
+          $aceDiagnostics = [System.Collections.Generic.List[string]]::new()
+          foreach ($rule in $rules) {
+            $identityClass = if ($rule.IdentityReference.Value -eq $sid.Value) { 'current' } else { 'other' }
+            $inherited = $rule.IsInherited.ToString().ToLowerInvariant()
+            [void]$aceDiagnostics.Add(
+              "identity=$identityClass,type=$([int]($rule.AccessControlType)),rights=$([int]($rule.FileSystemRights)),inherited=$inherited,inheritance=$([int]($rule.InheritanceFlags)),propagation=$([int]($rule.PropagationFlags))"
+            )
+          }
+          $displayIndex = $targetIndex + 1
+          throw "Graphcraft owner-only ACL verification failed for target $displayIndex ($kind): $($failures -join ','); protection=$protection;owner=$ownerClass;aces=[$($aceDiagnostics -join '|')]"
+        }
+      }
+      $completedRequestId = $activeRequestId
+      $completedTargetCount = $targetPaths.Count
+      $activeRequestId = $null
+      $expectedTargetCount = 0
+      $expectedChunkCount = 0
+      $nextChunkIndex = 0
+      $targetPaths = $null
+      $targetDirectoryFlags = $null
+      [Console]::Out.WriteLine("GRAPHCRAFT_ACL_OK$([char]9)$completedRequestId$([char]9)$completedTargetCount")
+      [Console]::Out.Flush()
+    } catch {
+      $errorBytes = [System.Text.Encoding]::UTF8.GetBytes($_.Exception.Message)
+      $errorPayload = [System.Convert]::ToBase64String($errorBytes)
+      [Console]::Out.WriteLine("GRAPHCRAFT_ACL_ERROR$([char]9)$responseRequestId$([char]9)$errorPayload")
+      [Console]::Out.Flush()
+      exit 1
     }
   }
-  [Console]::Out.WriteLine("GRAPHCRAFT_ACL_OK:$($targets.Count)")
 } catch {
   [Console]::Error.WriteLine("Graphcraft Windows ACL enforcement failed: $($_.Exception.Message)")
   exit 1
 }
-`;
+`
+  .replace("__GRAPHCRAFT_ACL_MAX_LINE_BYTES__", `${WINDOWS_ACL_REQUEST_LIMITS.maximumLineBytes}`)
+  .replace("__GRAPHCRAFT_ACL_MAX_TARGETS__", `${WINDOWS_ACL_REQUEST_LIMITS.maximumTargets}`);
 
 const WINDOWS_OWNER_ONLY_ACL_COMMAND = Buffer.from(
   WINDOWS_OWNER_ONLY_ACL_SCRIPT,
   "utf16le",
 ).toString("base64");
+
+const windowsAclHelper = new PersistentWindowsAclHelper({
+  requestTimeoutMs: WINDOWS_ACL_TIMEOUT_MS,
+  outputLimitBytes: WINDOWS_ACL_OUTPUT_LIMIT_BYTES,
+  requestLineLimitBytes: WINDOWS_ACL_REQUEST_LIMITS.maximumLineBytes,
+  maximumRequestLines: WINDOWS_ACL_REQUEST_LIMITS.maximumTargets + 2,
+  spawnProcess: () =>
+    spawn(
+      windowsPowerShellExecutable(),
+      [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+        WINDOWS_OWNER_ONLY_ACL_COMMAND,
+      ],
+      {
+        windowsHide: true,
+        shell: false,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    ),
+});
 
 function isMissing(error: unknown): boolean {
   return (error as NodeJS.ErrnoException).code === "ENOENT";
@@ -294,9 +443,14 @@ async function inspectPrivateEntry(path: string): Promise<{
   };
 }
 
-async function collectPrivateTree(root: string): Promise<PrivateEntry[]> {
+async function collectPrivateTree(
+  root: string,
+  maximumEntries = Number.POSITIVE_INFINITY,
+): Promise<PrivateEntry[]> {
   const entries: PrivateEntry[] = [];
   const visit = async (path: string): Promise<void> => {
+    if (entries.length >= maximumEntries)
+      throw new Error(`Private tree exceeds its ${maximumEntries}-target Windows ACL limit`);
     const { entry } = await inspectPrivateEntry(path);
     entries.push(entry);
     if (entry.kind === "directory")
@@ -306,108 +460,21 @@ async function collectPrivateTree(root: string): Promise<PrivateEntry[]> {
   return entries;
 }
 
-async function runWindowsAclBatchOnce(entries: PrivateEntry[]): Promise<void> {
-  if (entries.length === 0) return;
-  const payload = `${entries
-    .map(
-      ({ kind, path }) =>
-        `${kind === "directory" ? "D" : "F"}\t${Buffer.from(path, "utf8").toString("base64")}`,
-    )
-    .join("\n")}\n`;
-  const expectedOutput = `GRAPHCRAFT_ACL_OK:${entries.length}`;
-  await new Promise<void>((resolveBatch, rejectBatch) => {
-    const child = spawn(
-      windowsPowerShellExecutable(),
-      [
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-EncodedCommand",
-        WINDOWS_OWNER_ONLY_ACL_COMMAND,
-      ],
-      {
-        windowsHide: true,
-        shell: false,
-        stdio: ["pipe", "pipe", "pipe"],
-      },
-    );
-    const stdout: Buffer[] = [];
-    const stderr: Buffer[] = [];
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    let settled = false;
-
-    const reject = (error: Error): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      child.kill();
-      rejectBatch(error);
-    };
-    const capture = (target: Buffer[], stream: "stdout" | "stderr", chunk: Buffer): void => {
-      if (stream === "stdout") stdoutBytes += chunk.length;
-      else stderrBytes += chunk.length;
-      if (
-        stdoutBytes > WINDOWS_ACL_OUTPUT_LIMIT_BYTES ||
-        stderrBytes > WINDOWS_ACL_OUTPUT_LIMIT_BYTES
-      ) {
-        reject(new Error("Windows ACL helper exceeded its bounded output limit"));
-        return;
-      }
-      target.push(Buffer.from(chunk));
-    };
-    child.stdout.on("data", (chunk: Buffer) => capture(stdout, "stdout", chunk));
-    child.stderr.on("data", (chunk: Buffer) => capture(stderr, "stderr", chunk));
-    child.stdin.on("error", () => undefined);
-    child.once("error", (error) =>
-      reject(
-        new Error("Unable to start trusted Windows ACL enforcement", {
-          cause: error,
-        }),
-      ),
-    );
-    child.once("close", (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      const output = Buffer.concat(stdout).toString("utf8").trim();
-      const errorOutput = Buffer.concat(stderr).toString("utf8").trim();
-      if (code !== 0 || output !== expectedOutput) {
-        rejectBatch(
-          new Error(
-            `Unable to enforce owner-only Windows permissions on Graphcraft state${
-              errorOutput ? `: ${errorOutput}` : ""
-            }`,
-          ),
-        );
-        return;
-      }
-      resolveBatch();
-    });
-    const timer = setTimeout(
-      () => reject(new Error("Windows ACL enforcement timed out")),
-      WINDOWS_ACL_TIMEOUT_MS,
-    );
-    timer.unref();
-    child.stdin.end(payload, "utf8");
-  });
-}
-
 async function runWindowsAclBatch(entries: PrivateEntry[]): Promise<void> {
-  for (let attempt = 1; ; attempt += 1) {
-    try {
-      await runWindowsAclBatchOnce(entries);
-      return;
-    } catch (error) {
-      if (
-        attempt >= WINDOWS_ACL_VERIFICATION_ATTEMPTS ||
-        !(error instanceof Error) ||
-        !error.message.includes("owner-only ACL verification failed")
-      )
-        throw error;
-      await new Promise<void>((resolveRetry) => setTimeout(resolveRetry, attempt * 25));
-    }
-  }
+  if (entries.length === 0) return;
+  await runWindowsAclVerificationAttempts(async () => {
+    // Plan every line before BEGIN reaches PowerShell. Encoding stays lazy and
+    // bounded, while the helper still preflights all chunks before COMMIT.
+    const requestId = windowsAclRequestIds.next();
+    const plan = planWindowsAclRequest(requestId, entries);
+    await windowsAclHelper.request(
+      {
+        lines: encodeWindowsAclRequest(plan, entries),
+        lineCount: plan.lineCount,
+      },
+      (line) => parseWindowsAclResponse(line, requestId, entries.length),
+    );
+  }, WINDOWS_ACL_VERIFICATION_ATTEMPTS);
 }
 
 async function serializeWindowsAclWork<T>(work: () => Promise<T>): Promise<T> {
@@ -1114,7 +1181,10 @@ export async function finalizePrivateFileMutation(
 export async function hardenPrivateTree(root: string, ownedRoot = root): Promise<void> {
   const absoluteRoot = resolve(root);
   await validatePrivatePath(ownedRoot, relative(resolve(ownedRoot), absoluteRoot));
-  const entries = await collectPrivateTree(absoluteRoot);
+  const entries = await collectPrivateTree(
+    absoluteRoot,
+    supportsPosixModes ? Number.POSITIVE_INFINITY : WINDOWS_ACL_REQUEST_LIMITS.maximumTargets,
+  );
   if (!supportsPosixModes) {
     await hardenWindowsEntries(entries, true);
     return;
