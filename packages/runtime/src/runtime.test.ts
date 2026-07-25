@@ -4527,6 +4527,278 @@ process.stdin.on("end", () => {
     expect(secondDirect.decisionId).not.toBe(firstDirect.decisionId);
   });
 
+  it("uses portable governance/control identities without ambient locale ordering", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+    });
+    await created.store.append("runtime", "node.started", {
+      nodeId: "implement",
+      attempt: 1,
+    });
+    await created.store.append("runtime", "node.accepted", {
+      nodeId: "implement",
+      summary: "Implementation source accepted",
+    });
+    const graph: Graph = {
+      ...created.graph,
+      controlEdges: [
+        ...created.graph.controlEdges.filter(({ to }) => to !== "verify"),
+        { from: "implement", to: "verify", relation: "owns_target" },
+        { from: "implement", to: "verify", relation: "observes" },
+      ],
+    };
+    const checkpointId = "f".repeat(64);
+    const localeCompare = vi.spyOn(String.prototype, "localeCompare").mockImplementation(() => {
+      throw new Error("portable governance/control identity used ambient locale ordering");
+    });
+    try {
+      const outcome = await evaluateControlAcceptance(
+        created.store,
+        graph,
+        await created.store.loadState(),
+        "verify",
+        ["portable-control-evidence"],
+        checkpointId,
+      );
+      expect(outcome.allowed).toBe(true);
+    } finally {
+      localeCompare.mockRestore();
+    }
+
+    const events = (await created.store.loadEvents()).filter(
+      ({ type, data }) =>
+        ["control.observed", "control.resolved"].includes(type) &&
+        data.checkpointId === checkpointId,
+    );
+    expect(events).toHaveLength(2);
+    expect(new Set(events.map(({ data }) => data.controlGenerationId)).size).toBe(1);
+    expect(events.every(({ data }) => /^[a-f0-9]{64}$/.test(String(data.operationId)))).toBe(true);
+  });
+
+  it.each([1, 2] as const)(
+    "deduplicates format-v%s governance/control identities across cold restart",
+    async (format) => {
+      const repository = await createRepository();
+      const created = await createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+      });
+      await created.store.append("runtime", "node.started", {
+        nodeId: "implement",
+        attempt: 1,
+      });
+      await created.store.append("runtime", "node.accepted", {
+        nodeId: "implement",
+        summary: "Implementation source accepted",
+      });
+      if (format === 1) {
+        const events = await created.store.loadEvents();
+        const rewritten = events.map((event) => {
+          if (event.type !== "run.created") return event;
+          const data = { ...event.data };
+          delete data.governanceControlIdentityFormat;
+          return createRunEvent(
+            {
+              sequence: event.sequence,
+              timestamp: event.timestamp,
+              actor: event.actor,
+              causationId: event.causationId,
+              type: event.type,
+              data,
+            },
+            PORTABLE_CANONICAL_HASH_ALGORITHM,
+          );
+        });
+        await writeFile(
+          created.store.eventsPath(),
+          `${rewritten.map((event) => JSON.stringify(event)).join("\n")}\n`,
+        );
+        const storagePath = join(created.store.runRoot, "storage.json");
+        const descriptor = JSON.parse(await readFile(storagePath, "utf8")) as {
+          formats: { governanceControlIdentities?: number };
+        };
+        delete descriptor.formats.governanceControlIdentities;
+        await writeFile(storagePath, `${JSON.stringify(descriptor, null, 2)}\n`);
+      }
+
+      const graph: Graph = {
+        ...created.graph,
+        controlEdges: [
+          ...created.graph.controlEdges.filter(({ to }) => to !== "verify"),
+          { from: "runtime-verifier", to: "verify", relation: "owns_target" },
+          { from: "runtime-verifier", to: "verify", relation: "observes" },
+          { from: "implement", to: "verify", relation: "vetoes" },
+        ],
+      };
+      const checkpointId = "e".repeat(64);
+      const exercise = async (store: RunStore) => {
+        const decision = await recordRuntimeControlDecision({
+          store,
+          graph,
+          sourceId: "runtime-verifier",
+          targetId: "verify",
+          verdict: "approve",
+          rationale: "Stable verifier approval",
+          evidence: ["stable-governance-evidence"],
+          actor: "verifier",
+          checkpointId,
+        });
+        const outcome = await evaluateControlAcceptance(
+          store,
+          graph,
+          await store.loadState(),
+          "verify",
+          ["stable-governance-evidence"],
+          checkpointId,
+        );
+        return { decision, outcome };
+      };
+
+      const restarts = Array.from(
+        { length: 3 },
+        () => new RunStore(repository, created.store.runId),
+      );
+      const localeCompare = vi
+        .spyOn(String.prototype, "localeCompare")
+        .mockImplementation(function (this: string, other: string) {
+          const left = String(this);
+          return left < other ? 1 : left > other ? -1 : 0;
+        });
+      let first: Awaited<ReturnType<typeof exercise>> | undefined;
+      try {
+        for (const reopened of restarts) {
+          await reopened.prepareStorage();
+          expect(reopened.governanceControlIdentityHashAlgorithm).toBe(
+            format === 1 ? LEGACY_CANONICAL_HASH_ALGORITHM : PORTABLE_CANONICAL_HASH_ALGORITHM,
+          );
+          const result = await exercise(reopened);
+          first ??= result;
+          expect(result.outcome.allowed).toBe(true);
+        }
+        if (!first) throw new Error("Expected governance/control evaluation evidence");
+        const state = await restarts.at(-1)!.loadState();
+        const sourceState = state.nodes.implement!;
+        const algorithm =
+          format === 1 ? LEGACY_CANONICAL_HASH_ALGORITHM : PORTABLE_CANONICAL_HASH_ALGORITHM;
+        const nodeDecisionHash = contentHash(
+          {
+            schemaVersion: 1,
+            kind: "node_control_decision",
+            sourceId: "implement",
+            targetId: "verify",
+            state: {
+              status: sourceState.status,
+              attempts: sourceState.attempts,
+              lastSummary: sourceState.lastSummary ?? null,
+              lastProgress: sourceState.lastProgress ?? null,
+              acceptedAt: sourceState.acceptedAt ?? null,
+            },
+          },
+          algorithm,
+        );
+        const nodeDecisionId = `${nodeDecisionHash.slice(0, 8)}-${nodeDecisionHash.slice(8, 12)}-5${nodeDecisionHash.slice(13, 16)}-8${nodeDecisionHash.slice(17, 20)}-${nodeDecisionHash.slice(20, 32)}`;
+        const controlGenerationId = contentHash(
+          {
+            schemaVersion: 1,
+            kind: "control_acceptance_generation",
+            checkpointId,
+            targetId: "verify",
+            sources: [
+              {
+                sourceId: "implement",
+                targetId: "verify",
+                kind: "node",
+                decisionId: nodeDecisionId,
+              },
+              {
+                sourceId: "runtime-verifier",
+                targetId: "verify",
+                kind: "explicit",
+                decisionId: first.decision.decisionId,
+              },
+            ],
+          },
+          algorithm,
+        );
+        const operationId = (kind: string, identity: unknown, generation: string | null) =>
+          contentHash(
+            {
+              schemaVersion: 1,
+              kind,
+              checkpointId,
+              controlGenerationId: generation,
+              identity,
+            },
+            algorithm,
+          );
+        const expectedOperationIds = {
+          "control.decision": operationId(
+            "control.decision",
+            {
+              sourceId: "runtime-verifier",
+              targetId: "verify",
+              verdict: "approve",
+              rationale: "Stable verifier approval",
+              evidence: ["stable-governance-evidence"],
+              actor: "verifier",
+              sticky: false,
+              predecessorDecisionId: null,
+            },
+            null,
+          ),
+          "control.observed": operationId(
+            "control.observed",
+            {
+              observer: "runtime-verifier",
+              targetId: "verify",
+              evidence: ["stable-governance-evidence"],
+            },
+            controlGenerationId,
+          ),
+          "control.resolved": operationId(
+            "control.resolved",
+            {
+              targetId: "verify",
+              outcome: "approved",
+              owners: ["runtime-verifier"],
+              ownerDecisionIds: [first.decision.decisionId],
+              evidence: ["stable-governance-evidence"],
+            },
+            controlGenerationId,
+          ),
+        };
+        const exactEvents = (await restarts.at(-1)!.loadEvents()).filter(
+          ({ type, data }) => type.startsWith("control.") && data.checkpointId === checkpointId,
+        );
+        expect(
+          Object.fromEntries(exactEvents.map(({ type, data }) => [type, data.operationId])),
+        ).toEqual(expectedOperationIds);
+        expect(
+          exactEvents
+            .filter(({ type }) => type !== "control.decision")
+            .map(({ data }) => data.controlGenerationId),
+        ).toEqual([controlGenerationId, controlGenerationId]);
+        if (format === 1) expect(localeCompare).toHaveBeenCalled();
+        else expect(localeCompare).not.toHaveBeenCalled();
+      } finally {
+        localeCompare.mockRestore();
+      }
+
+      const controlEvents = (
+        await new RunStore(repository, created.store.runId).loadEvents()
+      ).filter(
+        ({ type, data }) => type.startsWith("control.") && data.checkpointId === checkpointId,
+      );
+      expect(controlEvents.filter(({ type }) => type === "control.decision")).toHaveLength(1);
+      expect(controlEvents.filter(({ type }) => type === "control.observed")).toHaveLength(1);
+      expect(controlEvents.filter(({ type }) => type === "control.resolved")).toHaveLength(1);
+      expect(
+        new Set(controlEvents.map(({ data }) => data.controlGenerationId).filter(Boolean)).size,
+      ).toBe(1);
+      expect(new Set(controlEvents.map(({ data }) => data.operationId)).size).toBe(3);
+    },
+  );
+
   it("reapplies recurring checkpoint conflicts and resolutions in new control generations", async () => {
     const repository = await createRepository();
     const created = await createRun("Implement a substantial feature across the fixture", {
@@ -9225,6 +9497,7 @@ process.stdin.on("end", () => {
           artifactPolicy: 1,
           workspaceScopeSnapshots: 1,
           probeEvidenceCheckpoints: 1,
+          governanceControlIdentities: 1,
         },
       });
       expect(contract.runId).toBe(fixture.runId);
@@ -9285,7 +9558,8 @@ process.stdin.on("end", () => {
               key !== "artifactInventory" &&
               key !== "artifactPolicy" &&
               key !== "workspaceScopeSnapshots" &&
-              key !== "probeEvidenceCheckpoints",
+              key !== "probeEvidenceCheckpoints" &&
+              key !== "governanceControlIdentities",
           ),
         ),
         heldOutProbes: 1,
@@ -9302,7 +9576,10 @@ process.stdin.on("end", () => {
         const data: Record<string, unknown> = event.data.heldOutProbePlan
           ? { ...event.data, heldOutProbePlan: legacyHeldOutProbePlan }
           : { ...event.data };
-        if (event.type === "run.created") delete data.probeEvidenceCheckpointFormat;
+        if (event.type === "run.created") {
+          delete data.probeEvidenceCheckpointFormat;
+          delete data.governanceControlIdentityFormat;
+        }
         return createRunEvent(
           {
             sequence: event.sequence,
@@ -9369,6 +9646,7 @@ process.stdin.on("end", () => {
       expect(reopened.canonicalHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
       expect(reopened.workspaceScopeHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
       expect(reopened.probeEvidenceCheckpointHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
+      expect(reopened.governanceControlIdentityHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
       const heldOutPath = join(created.store.runRoot, "held-out-probes.json");
       await writeFile(heldOutPath, `${JSON.stringify(freshHeldOutProbePlan, null, 2)}\n`);
       expect(await reopened.loadHeldOutProbePlan()).toMatchObject({ schemaVersion: 1 });
@@ -9382,6 +9660,7 @@ process.stdin.on("end", () => {
           events: 1,
           workspaceScopeSnapshots: 1,
           probeEvidenceCheckpoints: 1,
+          governanceControlIdentities: 1,
         },
       });
       if (operation === "configure probes") {

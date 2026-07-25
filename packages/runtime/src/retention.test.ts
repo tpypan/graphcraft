@@ -782,7 +782,8 @@ describe("run-state retention", () => {
             key !== "artifactInventory" &&
             key !== "artifactPolicy" &&
             key !== "workspaceScopeSnapshots" &&
-            key !== "probeEvidenceCheckpoints",
+            key !== "probeEvidenceCheckpoints" &&
+            key !== "governanceControlIdentities",
         ),
       ),
       heldOutProbes: 1,
@@ -798,7 +799,10 @@ describe("run-state retention", () => {
     const eventsPath = join(store.runRoot, "events.jsonl");
     const legacyEvents = (await store.loadEvents()).map((event) => {
       const data = { ...event.data };
-      if (event.type === "run.created") delete data.probeEvidenceCheckpointFormat;
+      if (event.type === "run.created") {
+        delete data.probeEvidenceCheckpointFormat;
+        delete data.governanceControlIdentityFormat;
+      }
       return createRunEvent({
         sequence: event.sequence,
         timestamp: event.timestamp,

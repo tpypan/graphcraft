@@ -4,6 +4,7 @@ import {
   ControlDecisionPacketSchema,
   ControlDecisionSchema,
   contentHash,
+  type CanonicalHashAlgorithm,
   type ControlDecision,
   type ControlDecisionPacket,
   type Graph,
@@ -33,6 +34,7 @@ function decisionFor(
   state: RunState,
   sourceId: string,
   targetId: string,
+  algorithm: CanonicalHashAlgorithm,
 ): ControlDecision | undefined {
   const explicit = state.controlDecisions.findLast(
     (decision) => decision.sourceId === sourceId && decision.targetId === targetId,
@@ -54,7 +56,7 @@ function decisionFor(
       acceptedAt: sourceState.acceptedAt ?? null,
     },
   };
-  const hash = contentHash(identity);
+  const hash = contentHash(identity, algorithm);
   return ControlDecisionSchema.parse({
     schemaVersion: 1,
     decisionId: `${hash.slice(0, 8)}-${hash.slice(8, 12)}-5${hash.slice(13, 16)}-8${hash.slice(17, 20)}-${hash.slice(20, 32)}`,
@@ -73,6 +75,7 @@ function controlSourceGenerationIdentity(
   state: RunState,
   sourceId: string,
   targetId: string,
+  algorithm: CanonicalHashAlgorithm,
 ): Record<string, unknown> {
   const explicit = state.controlDecisions.findLast(
     (decision) => decision.sourceId === sourceId && decision.targetId === targetId,
@@ -85,7 +88,7 @@ function controlSourceGenerationIdentity(
       decisionId: explicit.decisionId,
     };
   const sourceState = state.nodes[sourceId];
-  const projected = decisionFor(state, sourceId, targetId);
+  const projected = decisionFor(state, sourceId, targetId, algorithm);
   return projected
     ? {
         sourceId,
@@ -128,13 +131,16 @@ async function appendCheckpointedControlEvent(input: {
 }): Promise<RunEvent> {
   if (!input.checkpointId)
     return await input.store.append(input.actor, input.type, input.data, input.causationId);
-  const operationId = contentHash({
-    schemaVersion: 1,
-    kind: input.type,
-    checkpointId: input.checkpointId,
-    controlGenerationId: input.controlGenerationId ?? null,
-    identity: redactValue(input.identity ?? input.data),
-  });
+  const operationId = contentHash(
+    {
+      schemaVersion: 1,
+      kind: input.type,
+      checkpointId: input.checkpointId,
+      controlGenerationId: input.controlGenerationId ?? null,
+      identity: redactValue(input.identity ?? input.data),
+    },
+    input.store.governanceControlIdentityHashAlgorithm,
+  );
   const existing = (await input.store.loadEvents()).find(
     ({ type, data }) => type === input.type && data.operationId === operationId,
   );
@@ -261,7 +267,10 @@ export async function recordRunApprovalDecisions(store: RunStore, graph: Graph):
   const state = await store.loadState();
   const anchors = new Map(graph.anchors.map((anchor) => [anchor.id, anchor]));
   for (const edge of graph.controlEdges.filter(({ relation }) => relation === "owns_target")) {
-    if (anchors.get(edge.from)?.owner !== "user" || decisionFor(state, edge.from, edge.to))
+    if (
+      anchors.get(edge.from)?.owner !== "user" ||
+      decisionFor(state, edge.from, edge.to, store.governanceControlIdentityHashAlgorithm)
+    )
       continue;
     await appendDecision(
       store,
@@ -351,9 +360,10 @@ function decisionsFor(
   state: RunState,
   edges: Graph["controlEdges"],
   targetId: string,
+  algorithm: CanonicalHashAlgorithm,
 ): ControlDecision[] {
   return edges
-    .map((edge) => decisionFor(state, edge.from, targetId))
+    .map((edge) => decisionFor(state, edge.from, targetId, algorithm))
     .filter((decision): decision is ControlDecision => decision !== undefined);
 }
 
@@ -430,17 +440,32 @@ export async function evaluateControlScheduling(
   );
   if (owners.length === 0) return { allowed: true };
   const controlGenerationId = checkpointId
-    ? contentHash({
-        schemaVersion: 1,
-        kind: "control_scheduling_generation",
-        checkpointId,
-        targetId,
-        sources: [...new Set(incoming.map(({ from }) => from))]
-          .sort()
-          .map((sourceId) => controlSourceGenerationIdentity(state, sourceId, targetId)),
-      })
+    ? contentHash(
+        {
+          schemaVersion: 1,
+          kind: "control_scheduling_generation",
+          checkpointId,
+          targetId,
+          sources: [...new Set(incoming.map(({ from }) => from))]
+            .sort()
+            .map((sourceId) =>
+              controlSourceGenerationIdentity(
+                state,
+                sourceId,
+                targetId,
+                store.governanceControlIdentityHashAlgorithm,
+              ),
+            ),
+        },
+        store.governanceControlIdentityHashAlgorithm,
+      )
     : undefined;
-  const ownerDecisions = decisionsFor(state, owners, targetId);
+  const ownerDecisions = decisionsFor(
+    state,
+    owners,
+    targetId,
+    store.governanceControlIdentityHashAlgorithm,
+  );
   const ownerApprovals = ownerDecisions.filter(({ verdict }) => verdict === "approve");
   const ownerVetoes = ownerDecisions.filter(({ verdict }) => verdict === "veto");
   const missing = owners.filter(
@@ -449,7 +474,12 @@ export async function evaluateControlScheduling(
   const arbitratorEdges = graph.controlEdges.filter(
     (edge) => edge.to === targetId && edge.relation === "arbitrates",
   );
-  const arbitrators = decisionsFor(state, arbitratorEdges, targetId);
+  const arbitrators = decisionsFor(
+    state,
+    arbitratorEdges,
+    targetId,
+    store.governanceControlIdentityHashAlgorithm,
+  );
   const arbitrator = unanimousDecision(arbitrators);
 
   if (arbitrator === "conflict") {
@@ -613,15 +643,25 @@ export async function evaluateControlAcceptance(
 ): Promise<ControlEvaluation> {
   const incoming = graph.controlEdges.filter((edge) => edge.to === targetId);
   const controlGenerationId = checkpointId
-    ? contentHash({
-        schemaVersion: 1,
-        kind: "control_acceptance_generation",
-        checkpointId,
-        targetId,
-        sources: [...new Set(incoming.map(({ from }) => from))]
-          .sort()
-          .map((sourceId) => controlSourceGenerationIdentity(state, sourceId, targetId)),
-      })
+    ? contentHash(
+        {
+          schemaVersion: 1,
+          kind: "control_acceptance_generation",
+          checkpointId,
+          targetId,
+          sources: [...new Set(incoming.map(({ from }) => from))]
+            .sort()
+            .map((sourceId) =>
+              controlSourceGenerationIdentity(
+                state,
+                sourceId,
+                targetId,
+                store.governanceControlIdentityHashAlgorithm,
+              ),
+            ),
+        },
+        store.governanceControlIdentityHashAlgorithm,
+      )
     : undefined;
   for (const edge of incoming.filter(({ relation }) => relation === "observes")) {
     await appendCheckpointedControlEvent({
@@ -635,14 +675,24 @@ export async function evaluateControlAcceptance(
   }
 
   const owners = incoming.filter(({ relation }) => relation === "owns_target");
-  const ownerDecisions = decisionsFor(state, owners, targetId);
+  const ownerDecisions = decisionsFor(
+    state,
+    owners,
+    targetId,
+    store.governanceControlIdentityHashAlgorithm,
+  );
   const missingOwners = owners.filter(
     (edge) => !ownerDecisions.some(({ sourceId }) => sourceId === edge.from),
   );
   let ownerApprovals = ownerDecisions.filter(({ verdict }) => verdict === "approve");
   let ownerVetoes = ownerDecisions.filter(({ verdict }) => verdict === "veto");
   const arbitratorEdges = incoming.filter(({ relation }) => relation === "arbitrates");
-  const arbitrators = decisionsFor(state, arbitratorEdges, targetId);
+  const arbitrators = decisionsFor(
+    state,
+    arbitratorEdges,
+    targetId,
+    store.governanceControlIdentityHashAlgorithm,
+  );
   const arbitrator = unanimousDecision(arbitrators);
 
   if (arbitrator === "conflict") {
@@ -774,7 +824,9 @@ export async function evaluateControlAcceptance(
 
   const vetoes = incoming
     .filter(({ relation }) => relation === "vetoes")
-    .map((edge) => decisionFor(state, edge.from, targetId))
+    .map((edge) =>
+      decisionFor(state, edge.from, targetId, store.governanceControlIdentityHashAlgorithm),
+    )
     .filter((decision): decision is ControlDecision => decision?.verdict === "veto");
   if (vetoes.length > 0) {
     if (arbitrator?.verdict === "approve") {

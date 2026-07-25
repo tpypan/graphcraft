@@ -83,6 +83,34 @@ async function rewriteProbeEvidenceCheckpointFormat(store: RunStore, format: 1 |
   );
 }
 
+async function rewriteGovernanceControlIdentityFormat(
+  store: RunStore,
+  format: 1 | 2,
+): Promise<void> {
+  const events = await store.loadEvents();
+  const created = events[0];
+  if (!created || created.type !== "run.created")
+    throw new Error("Expected a run.created fixture event");
+  const data = { ...created.data };
+  delete data.governanceControlIdentityFormat;
+  if (format === 2) data.governanceControlIdentityFormat = 2;
+  const rewritten = createRunEvent(
+    {
+      sequence: created.sequence,
+      timestamp: created.timestamp,
+      actor: created.actor,
+      causationId: created.causationId,
+      type: created.type,
+      data,
+    },
+    eventHashAlgorithm(created),
+  );
+  await writeFile(
+    store.eventsPath(),
+    Buffer.concat([serializedEvent(rewritten), ...events.slice(1).map(serializedEvent)]),
+  );
+}
+
 describe("storage v3 initialization", () => {
   it("finalizes an event-complete initializing descriptor concurrently without rewriting events", async () => {
     const { root, store } = await createStoreFixture();
@@ -109,6 +137,7 @@ describe("storage v3 initialization", () => {
         artifactInventory: 2,
         workspaceScopeSnapshots: 2,
         probeEvidenceCheckpoints: 2,
+        governanceControlIdentities: 2,
       },
     });
     expect(await readFile(store.eventsPath())).toEqual(eventsBefore);
@@ -122,6 +151,9 @@ describe("storage v3 initialization", () => {
     expect(() => reopened.probeEvidenceCheckpointHashAlgorithm).toThrow(
       /before run storage is prepared/,
     );
+    expect(() => reopened.governanceControlIdentityHashAlgorithm).toThrow(
+      /before run storage is prepared/,
+    );
     expect(() => reopened.artifactContentHash({ pending: true })).toThrow(
       /before run storage is prepared/,
     );
@@ -133,11 +165,14 @@ describe("storage v3 initialization", () => {
     expect(reopened.workspaceScopeHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
     expect(store.probeEvidenceCheckpointHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
     expect(reopened.probeEvidenceCheckpointHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    expect(store.governanceControlIdentityHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    expect(reopened.governanceControlIdentityHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
     expect(JSON.parse(await readFile(join(store.runRoot, "storage.json"), "utf8"))).toMatchObject({
       formats: {
         artifactInventory: 2,
         workspaceScopeSnapshots: 2,
         probeEvidenceCheckpoints: 2,
+        governanceControlIdentities: 2,
       },
     });
 
@@ -200,6 +235,26 @@ describe("storage v3 initialization", () => {
 
     expect(reopened.canonicalHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
     expect(reopened.probeEvidenceCheckpointHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
+    await expect(reopened.loadEvents()).resolves.toHaveLength(1);
+    expect(await readFile(storagePath)).toEqual(descriptorBefore);
+  });
+
+  it("keeps a prior ready v3 governance/control identity policy legacy", async () => {
+    const { root, store } = await createStoreFixture();
+    const storagePath = join(store.runRoot, "storage.json");
+    await rewriteGovernanceControlIdentityFormat(store, 1);
+    const descriptor = JSON.parse(await readFile(storagePath, "utf8")) as {
+      formats: { governanceControlIdentities?: number };
+    };
+    delete descriptor.formats.governanceControlIdentities;
+    await writeFile(storagePath, `${JSON.stringify(descriptor, null, 2)}\n`);
+    const descriptorBefore = await readFile(storagePath);
+
+    const reopened = new RunStore(root, store.runId);
+    await reopened.prepareStorage();
+
+    expect(reopened.canonicalHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    expect(reopened.governanceControlIdentityHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
     await expect(reopened.loadEvents()).resolves.toHaveLength(1);
     expect(await readFile(storagePath)).toEqual(descriptorBefore);
   });
@@ -269,6 +324,70 @@ describe("storage v3 initialization", () => {
     },
   );
 
+  it.each(
+    [
+      {
+        name: "legacy v1 identities relabelled as portable v2",
+        sourceFormat: 1 as const,
+        relabelledFormat: 2 as const,
+      },
+      {
+        name: "portable v2 identities relabelled as legacy v1",
+        sourceFormat: 2 as const,
+        relabelledFormat: 1 as const,
+      },
+    ].flatMap((fixture) =>
+      (["ready", "initializing"] as const).map((initialization) => ({
+        ...fixture,
+        initialization,
+      })),
+    ),
+  )(
+    "rejects governance/control $name from an $initialization descriptor without changing durable bytes",
+    async (fixture) => {
+      const { root, store } = await createStoreFixture();
+      const storagePath = join(store.runRoot, "storage.json");
+      const statePath = join(store.runRoot, "state.json");
+      await rewriteGovernanceControlIdentityFormat(store, fixture.sourceFormat);
+      const descriptor = JSON.parse(await readFile(storagePath, "utf8")) as {
+        formats: { governanceControlIdentities?: number };
+      };
+      if (fixture.sourceFormat === 1) delete descriptor.formats.governanceControlIdentities;
+      else descriptor.formats.governanceControlIdentities = 2;
+      await writeFile(storagePath, `${JSON.stringify(descriptor, null, 2)}\n`);
+
+      const selected = new RunStore(root, store.runId);
+      await selected.prepareStorage();
+      expect(selected.governanceControlIdentityHashAlgorithm).toBe(
+        fixture.sourceFormat === 2
+          ? PORTABLE_CANONICAL_HASH_ALGORITHM
+          : LEGACY_CANONICAL_HASH_ALGORITHM,
+      );
+      await expect(selected.loadEvents()).resolves.toHaveLength(1);
+
+      const relabelled = JSON.parse(await readFile(storagePath, "utf8")) as {
+        initialization: string;
+        formats: { governanceControlIdentities?: number };
+      };
+      if (fixture.relabelledFormat === 1) delete relabelled.formats.governanceControlIdentities;
+      else relabelled.formats.governanceControlIdentities = 2;
+      relabelled.initialization = fixture.initialization;
+      await writeFile(storagePath, `${JSON.stringify(relabelled, null, 2)}\n`);
+      const beforeRejection = {
+        events: await readFile(store.eventsPath()),
+        state: await readFile(statePath),
+        storage: await readFile(storagePath),
+      };
+
+      await expect(new RunStore(root, store.runId).loadEvents()).rejects.toThrow(
+        /governance\/control identity format that disagrees/,
+      );
+      expect(await readFile(store.eventsPath())).toEqual(beforeRejection.events);
+      expect(await readFile(statePath)).toEqual(beforeRejection.state);
+      expect(await readFile(storagePath)).toEqual(beforeRejection.storage);
+    },
+  );
+
   it("replays and repairs only portable-v2 held-out plans for fresh storage", async () => {
     const { store, event } = await createStoreFixture();
     const heldOutPath = join(store.runRoot, "held-out-probes.json");
@@ -307,6 +426,7 @@ describe("storage v3 initialization", () => {
     const legacy = createHeldOutProbePlan(store.runId, await store.loadProbePlan());
     const priorData: Record<string, unknown> = { ...event.data, heldOutProbePlan: legacy };
     delete priorData.probeEvidenceCheckpointFormat;
+    delete priorData.governanceControlIdentityFormat;
     const priorEvent = createRunEvent(
       {
         sequence: event.sequence,
@@ -327,6 +447,7 @@ describe("storage v3 initialization", () => {
         artifactInventory: number;
         workspaceScopeSnapshots?: number;
         probeEvidenceCheckpoints?: number;
+        governanceControlIdentities?: number;
       };
     };
     descriptor.initialization = "initializing";
@@ -334,6 +455,7 @@ describe("storage v3 initialization", () => {
     descriptor.formats.artifactInventory = 1;
     delete descriptor.formats.workspaceScopeSnapshots;
     delete descriptor.formats.probeEvidenceCheckpoints;
+    delete descriptor.formats.governanceControlIdentities;
     await writeFile(storagePath, `${JSON.stringify(descriptor, null, 2)}\n`);
     const eventsBeforeRecovery = await readFile(store.eventsPath());
 
@@ -345,6 +467,7 @@ describe("storage v3 initialization", () => {
     expect(reopened.artifactHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
     expect(reopened.workspaceScopeHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
     expect(reopened.probeEvidenceCheckpointHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
+    expect(reopened.governanceControlIdentityHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
     expect(JSON.parse(await readFile(storagePath, "utf8"))).toMatchObject({
       initialization: "ready",
       canonicalHashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
@@ -354,6 +477,7 @@ describe("storage v3 initialization", () => {
         artifactInventory: 1,
         workspaceScopeSnapshots: 1,
         probeEvidenceCheckpoints: 1,
+        governanceControlIdentities: 1,
       },
     });
     expect(await readFile(store.eventsPath())).toEqual(eventsBeforeRecovery);

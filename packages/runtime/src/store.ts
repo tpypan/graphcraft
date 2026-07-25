@@ -90,7 +90,15 @@ export class RunStoreEventLogCorruptionError extends Error {
     readonly offsetBytes: number,
     readonly trailing: boolean,
     reason:
-      "encoding" | "json" | "schema" | "hash" | "format" | "sequence" | "scope" | "checkpoint",
+      | "encoding"
+      | "json"
+      | "schema"
+      | "hash"
+      | "format"
+      | "sequence"
+      | "scope"
+      | "checkpoint"
+      | "governance",
   ) {
     const location = trailing ? "trailing record" : `record ${record}`;
     const problem =
@@ -108,7 +116,9 @@ export class RunStoreEventLogCorruptionError extends Error {
                   ? "a workspace-scope snapshot that disagrees with its storage manifest"
                   : reason === "checkpoint"
                     ? "a probe-evidence checkpoint format that disagrees with its storage manifest"
-                    : "an invalid event sequence";
+                    : reason === "governance"
+                      ? "a governance/control identity format that disagrees with its storage manifest"
+                      : "an invalid event sequence";
     super(
       `Run event log has ${problem} in ${location} at byte ${offsetBytes}; event log bytes were left unchanged`,
     );
@@ -209,6 +219,15 @@ function probeEvidenceCheckpointUsesDifferentFormat(
   return selected === PORTABLE_CANONICAL_HASH_ALGORITHM ? format !== 2 : format !== undefined;
 }
 
+function governanceControlIdentityUsesDifferentFormat(
+  event: RunEvent,
+  selected: CanonicalHashAlgorithm,
+): boolean {
+  if (event.type !== "run.created") return false;
+  const format = event.data.governanceControlIdentityFormat;
+  return selected === PORTABLE_CANONICAL_HASH_ALGORITHM ? format !== 2 : format !== undefined;
+}
+
 export class RunStore {
   readonly repositoryRoot: string;
   readonly runId: string;
@@ -224,6 +243,7 @@ export class RunStore {
   private _artifactHashAlgorithm: CanonicalHashAlgorithm | undefined;
   private _workspaceScopeHashAlgorithm: CanonicalHashAlgorithm | undefined;
   private _probeEvidenceCheckpointHashAlgorithm: CanonicalHashAlgorithm | undefined;
+  private _governanceControlIdentityHashAlgorithm: CanonicalHashAlgorithm | undefined;
 
   constructor(
     repositoryRoot: string,
@@ -291,6 +311,11 @@ export class RunStore {
           ? PORTABLE_CANONICAL_HASH_ALGORITHM
           : LEGACY_CANONICAL_HASH_ALGORITHM;
       this.bindProbeEvidenceCheckpointHashAlgorithm(probeEvidenceCheckpointHashAlgorithm);
+      const governanceControlIdentityHashAlgorithm =
+        manifest.formats.governanceControlIdentities === 2
+          ? PORTABLE_CANONICAL_HASH_ALGORITHM
+          : LEGACY_CANONICAL_HASH_ALGORITHM;
+      this.bindGovernanceControlIdentityHashAlgorithm(governanceControlIdentityHashAlgorithm);
       await this.validateStorageRoot();
     } catch (error) {
       if (this.storageReady === ready) this.storageReady = undefined;
@@ -330,6 +355,14 @@ export class RunStore {
     return this._probeEvidenceCheckpointHashAlgorithm;
   }
 
+  get governanceControlIdentityHashAlgorithm(): CanonicalHashAlgorithm {
+    if (!this._governanceControlIdentityHashAlgorithm)
+      throw new Error(
+        "Governance/control identity hash policy is unavailable before run storage is prepared",
+      );
+    return this._governanceControlIdentityHashAlgorithm;
+  }
+
   private bindArtifactHashAlgorithm(algorithm: CanonicalHashAlgorithm): void {
     if (this.artifactStore && this.artifactStore.hashAlgorithm !== algorithm)
       throw new Error("Artifact store was bound before its storage manifest policy was known");
@@ -353,6 +386,17 @@ export class RunStore {
         "Probe-evidence checkpoint hashing was bound before its storage manifest policy was known",
       );
     this._probeEvidenceCheckpointHashAlgorithm = algorithm;
+  }
+
+  private bindGovernanceControlIdentityHashAlgorithm(algorithm: CanonicalHashAlgorithm): void {
+    if (
+      this._governanceControlIdentityHashAlgorithm &&
+      this._governanceControlIdentityHashAlgorithm !== algorithm
+    )
+      throw new Error(
+        "Governance/control identity hashing was bound before its storage manifest policy was known",
+      );
+    this._governanceControlIdentityHashAlgorithm = algorithm;
   }
 
   private artifacts(): RunArtifactStore {
@@ -445,6 +489,7 @@ export class RunStore {
     store.bindArtifactHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     store.bindWorkspaceScopeHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     store.bindProbeEvidenceCheckpointHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    store.bindGovernanceControlIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     const persistedContract = RunContractSchema.parse(redactValue(contract));
     const persistedGraph = GraphSchema.parse(redactValue(graph));
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
@@ -482,6 +527,7 @@ export class RunStore {
           heldOutProbePlan,
           nodeIds: graph.nodes.map(({ id }) => id),
           probeEvidenceCheckpointFormat: 2,
+          governanceControlIdentityFormat: 2,
         },
       },
       store.canonicalHashAlgorithm,
@@ -843,6 +889,13 @@ export class RunStore {
         probeEvidenceCheckpointUsesDifferentFormat(event, this.probeEvidenceCheckpointHashAlgorithm)
       )
         throw new RunStoreEventLogCorruptionError(record, offset, trailing, "checkpoint");
+      if (
+        governanceControlIdentityUsesDifferentFormat(
+          event,
+          this.governanceControlIdentityHashAlgorithm,
+        )
+      )
+        throw new RunStoreEventLogCorruptionError(record, offset, trailing, "governance");
       const scopeSnapshot = eventWorkspaceScopeSnapshot(event);
       if (
         scopeSnapshot !== undefined &&

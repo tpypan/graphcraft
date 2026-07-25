@@ -72,6 +72,7 @@ type HeldOutProbeFormat = 1 | 2;
 type ArtifactInventoryFormat = 1 | 2;
 type WorkspaceScopeSnapshotFormat = 1 | 2;
 type ProbeEvidenceCheckpointFormat = 1 | 2;
+type GovernanceControlIdentityFormat = 1 | 2;
 type CurrentRunStorageManifest = Extract<RunStorageManifest, { schemaVersion: 3 }>;
 
 interface LegacyStorage {
@@ -93,6 +94,7 @@ function manifest(
   artifactInventoryFormat: ArtifactInventoryFormat,
   workspaceScopeSnapshotFormat: WorkspaceScopeSnapshotFormat,
   probeEvidenceCheckpointFormat: ProbeEvidenceCheckpointFormat,
+  governanceControlIdentityFormat: GovernanceControlIdentityFormat,
   initialization: "initializing" | "ready",
 ): CurrentRunStorageManifest {
   return RunStorageManifestSchema.parse({
@@ -119,6 +121,7 @@ function manifest(
       artifactPolicy: 1,
       workspaceScopeSnapshots: workspaceScopeSnapshotFormat,
       probeEvidenceCheckpoints: probeEvidenceCheckpointFormat,
+      governanceControlIdentities: governanceControlIdentityFormat,
     },
   }) as CurrentRunStorageManifest;
 }
@@ -147,6 +150,7 @@ async function persistCurrentRunStorageManifest(
   artifactInventoryFormat: ArtifactInventoryFormat,
   workspaceScopeSnapshotFormat: WorkspaceScopeSnapshotFormat,
   probeEvidenceCheckpointFormat: ProbeEvidenceCheckpointFormat,
+  governanceControlIdentityFormat: GovernanceControlIdentityFormat,
   initialization: "initializing" | "ready",
   lease?: MigrationLeaseContext,
 ): Promise<CurrentRunStorageManifest> {
@@ -158,6 +162,7 @@ async function persistCurrentRunStorageManifest(
     artifactInventoryFormat,
     workspaceScopeSnapshotFormat,
     probeEvidenceCheckpointFormat,
+    governanceControlIdentityFormat,
     initialization,
   );
   await migrationStep(lease, async () => await ensurePrivateDirectory(runRoot));
@@ -186,6 +191,7 @@ export async function writeCurrentRunStorageManifest(
     2,
     2,
     2,
+    2,
     "ready",
   );
 }
@@ -199,6 +205,7 @@ export async function writeInitializingRunStorageManifest(
     runId,
     CURRENT_RUN_STORAGE_VERSION,
     PORTABLE_CANONICAL_HASH_ALGORITHM,
+    2,
     2,
     2,
     2,
@@ -1666,6 +1673,15 @@ async function validateInitializingRunStorage(
     throw new Error(
       `Run ${runId} has a probe-evidence checkpoint format that disagrees with its schema-v3 initialization descriptor. No files were changed.`,
     );
+  const governanceControlFormat = first.data.governanceControlIdentityFormat;
+  const governanceControlFormatMismatch =
+    manifest.formats.governanceControlIdentities === 2
+      ? governanceControlFormat !== 2
+      : governanceControlFormat !== undefined;
+  if (governanceControlFormatMismatch)
+    throw new Error(
+      `Run ${runId} has a governance/control identity format that disagrees with its schema-v3 initialization descriptor. No files were changed.`,
+    );
   try {
     validateHeldOutProbePlan(
       HeldOutProbePlanSchema.parse(first.data.heldOutProbePlan),
@@ -1745,6 +1761,7 @@ export async function ensureCurrentRunStorage(input: {
         storage.manifest.formats.artifactInventory,
         storage.manifest.formats.workspaceScopeSnapshots,
         storage.manifest.formats.probeEvidenceCheckpoints,
+        storage.manifest.formats.governanceControlIdentities,
         "ready",
         lease,
       );
@@ -1797,6 +1814,7 @@ export async function ensureCurrentRunStorage(input: {
       input.runId,
       storage.version,
       LEGACY_CANONICAL_HASH_ALGORITHM,
+      1,
       1,
       1,
       1,

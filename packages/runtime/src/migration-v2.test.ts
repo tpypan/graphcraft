@@ -416,6 +416,7 @@ describe("run storage schema v3 migration", () => {
         artifactPolicy: 1,
         workspaceScopeSnapshots: 1,
         probeEvidenceCheckpoints: 1,
+        governanceControlIdentities: 1,
       },
     });
     const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "0-to-3");
@@ -492,6 +493,7 @@ describe("run storage schema v3 migration", () => {
           artifactPolicy: 1,
           workspaceScopeSnapshots: 1,
           probeEvidenceCheckpoints: 1,
+          governanceControlIdentities: 1,
         },
       },
     );
@@ -564,6 +566,7 @@ describe("run storage schema v3 migration", () => {
         artifactPolicy: 1,
         workspaceScopeSnapshots: 1,
         probeEvidenceCheckpoints: 1,
+        governanceControlIdentities: 1,
       },
     });
     const backupRoot = join(fixture.graphcraftRoot, "migration-backups", fixture.runId, "2-to-3");
@@ -1754,6 +1757,7 @@ describe("run storage schema v3 migration", () => {
         artifactInventory: 1,
         workspaceScopeSnapshots: 1,
         probeEvidenceCheckpoints: 1,
+        governanceControlIdentities: 1,
       },
     });
 

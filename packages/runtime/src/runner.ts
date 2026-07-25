@@ -4239,14 +4239,17 @@ export async function executeRun(input: {
         );
 
       for (const candidate of batch) {
-        const schedulingCheckpointId = contentHash({
-          schemaVersion: 1,
-          kind: "control_scheduling_checkpoint",
-          runId: contract.runId,
-          graphRevision: graph.revision,
-          targetId: candidate.id,
-          nextAttempt: (state.nodes[candidate.id]?.attempts ?? 0) + 1,
-        });
+        const schedulingCheckpointId = contentHash(
+          {
+            schemaVersion: 1,
+            kind: "control_scheduling_checkpoint",
+            runId: contract.runId,
+            graphRevision: graph.revision,
+            targetId: candidate.id,
+            nextAttempt: (state.nodes[candidate.id]?.attempts ?? 0) + 1,
+          },
+          input.store.governanceControlIdentityHashAlgorithm,
+        );
         const scheduling = await evaluateControlScheduling(
           input.store,
           graph,

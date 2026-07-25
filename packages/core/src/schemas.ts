@@ -1330,6 +1330,9 @@ export const RunStorageManifestSchema = z.union([
       // Probe-evidence checkpoints were also persisted before their hashing
       // domain became independent. Omission therefore selects legacy v1.
       probeEvidenceCheckpoints: z.union([z.literal(1), z.literal(2)]).default(1),
+      // Governance/control checkpoint identities predate their independent
+      // selector. Omission therefore preserves the legacy v1 identity domain.
+      governanceControlIdentities: z.union([z.literal(1), z.literal(2)]).default(1),
     }),
   }),
 ]);
