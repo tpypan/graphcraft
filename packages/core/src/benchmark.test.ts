@@ -6,9 +6,18 @@ import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import {
   BenchmarkReportSchema,
+  BenchmarkReportV4Schema,
+  BenchmarkReviewPacketSchema,
+  BenchmarkReviewPacketV1Schema,
+  BenchmarkReviewPacketV2Schema,
   BenchmarkSuiteSchema,
   BenchmarkTrialResultSchema,
+  BenchmarkTrialResultV2Schema,
+  BenchmarkTrialResultV4Schema,
+  LEGACY_CANONICAL_HASH_ALGORITHM,
   MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
+  benchmarkReviewEvidenceDigest,
   contentHash,
   createBenchmarkSchedule,
   summarizeBenchmark,
@@ -18,6 +27,15 @@ import {
 } from "./index.ts";
 
 const execFileAsync = promisify(execFile);
+
+const legacyReportIdentity = {
+  schemaVersion: 3,
+  hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM,
+} as const;
+const portableReportIdentity = {
+  schemaVersion: 4,
+  hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+} as const;
 
 const suite = BenchmarkSuiteSchema.parse({
   schemaVersion: 2,
@@ -114,6 +132,25 @@ function reportValue(
   };
 }
 
+function reviewEvidence(
+  packetSchemaVersion: 1 | 2,
+  mediaType: "text/x-diff" | "application/x-ndjson",
+  text: string,
+) {
+  const identity = {
+    mediaType,
+    text,
+    observedBytes: Buffer.byteLength(text),
+    omittedBytes: 0,
+    truncated: false,
+  };
+  return {
+    ...identity,
+    retainedBytes: Buffer.byteLength(text),
+    digest: benchmarkReviewEvidenceDigest(identity, packetSchemaVersion),
+  };
+}
+
 describe("matched benchmark protocol", () => {
   it("ships ten versioned public tasks across every required family", async () => {
     const publicSuite = BenchmarkSuiteSchema.parse(
@@ -174,6 +211,50 @@ describe("matched benchmark protocol", () => {
     expect(new Set(first.map(({ mode }) => mode))).toEqual(new Set(["baseline", "graphcraft"]));
     expect(new Set(first.map(({ host }) => host))).toEqual(new Set(["codex", "claude"]));
     expect(new Set(first.map(({ trialId }) => trialId)).size).toBe(first.length);
+    expect(first.map(({ trialId }) => trialId)).toEqual([
+      "90cb75ce260094d224577a1af3a1057fafe9df3dfc81f17996823ef1f84d4ba9",
+      "04dfc82e498e1a23325972641386a77d67d6baef2c5f9803224e7480a20741a2",
+      "99b302bcbb5069c78240cd8ea903136709d2576ee285dd7fcd83236bbc93b34e",
+      "a7e5f77fb321a61ab3ed24274c11ef2b1ad8bf0436d416769d6491238a00c5e3",
+      "2f266724c4cac00e56cd5d999f697556ac762dacb9edcb81c8262ac57284c14c",
+      "4ed74843acde3bcc5fa8655290a03cbdf5543e39993fab49192df90852c130ec",
+      "60eb22d4bad517be3c44fdaeb95048a4ab8affe2a5247b60eb6b3610086439ff",
+      "492c0ab6207205bcb8cdeadb1c3da07536752cc43250496c07e4187ac80e9d08",
+    ]);
+  });
+
+  it("keeps the legacy shuffle order while giving portable reports distinct trial IDs", () => {
+    const legacy = createBenchmarkSchedule({
+      suite,
+      hosts: ["claude", "codex"],
+      seed: "fixture-seed",
+      identity: legacyReportIdentity,
+    });
+    const portable = createBenchmarkSchedule({
+      suite,
+      hosts: ["claude", "codex"],
+      seed: "fixture-seed",
+      identity: portableReportIdentity,
+    });
+    const withoutTrialIds = (schedule: BenchmarkScheduleEntry[]) =>
+      schedule.map(({ trialId: _trialId, ...entry }) => entry);
+
+    expect(withoutTrialIds(portable)).toEqual(withoutTrialIds(legacy));
+    expect(portable.map(({ trialId }) => trialId)).not.toEqual(
+      legacy.map(({ trialId }) => trialId),
+    );
+    expect(portable.every((trial, index) => trial.trialId !== legacy[index]!.trialId)).toBe(true);
+    expect(() =>
+      createBenchmarkSchedule({
+        suite,
+        hosts: ["codex"],
+        seed: "fixture-seed",
+        identity: {
+          schemaVersion: 4,
+          hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM,
+        } as never,
+      }),
+    ).toThrow();
   });
 
   it("rejects duplicate task IDs before they can alias schedule entries", () => {
@@ -320,6 +401,43 @@ describe("matched benchmark protocol", () => {
     );
     expect(() => BenchmarkReportSchema.parse({ ...valid, summary: { fixture: true } })).toThrow(
       /summary does not match its trial evidence/,
+    );
+  });
+
+  it("preserves the checked legacy v2 and v3 report fixtures byte-for-byte", async () => {
+    for (const version of [2, 3] as const) {
+      const source = await readFile(
+        new URL(
+          `../../../tests/fixtures/protocol/benchmark-report.v${version}.json`,
+          import.meta.url,
+        ),
+        "utf8",
+      );
+      const value = JSON.parse(source) as unknown;
+      expect(BenchmarkReportSchema.parse(value)).toEqual(value);
+    }
+  });
+
+  it("keeps the default summary parser backward-compatible with v2 trials", () => {
+    const schedule = createBenchmarkSchedule({
+      suite,
+      hosts: ["codex"],
+      seed: "legacy-v2-summary-seed",
+      repetitions: 1,
+    });
+    const {
+      attemptCheckpoint: _attemptCheckpoint,
+      interruption: _interruption,
+      recovery: _recovery,
+      ...legacyValue
+    } = reportedTrial(schedule[0]!, 100);
+    const result = BenchmarkTrialResultV2Schema.parse(legacyValue);
+
+    expect(summarizeBenchmark([result], schedule)).toEqual(
+      summarizeBenchmark([result], schedule, {
+        schemaVersion: 2,
+        hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM,
+      }),
     );
   });
 
@@ -508,6 +626,147 @@ describe("matched benchmark protocol", () => {
         },
       }),
     ).toThrow(/capture failures cannot be accepted as review-complete/);
+  });
+
+  it("versions review-packet evidence without accepting alternate digest fallbacks", () => {
+    const legacyPatch = reviewEvidence(1, "text/x-diff", "diff --git a/result.js b/result.js\n");
+    const legacyTranscript = reviewEvidence(1, "application/x-ndjson", '{"type":"result"}\n');
+    const portablePatch = reviewEvidence(2, "text/x-diff", "diff --git a/result.js b/result.js\n");
+    const portableTranscript = reviewEvidence(2, "application/x-ndjson", '{"type":"result"}\n');
+    const legacyPacket = {
+      schemaVersion: 1 as const,
+      patch: legacyPatch,
+      transcript: legacyTranscript,
+      captureFailures: [],
+    };
+    const portablePacket = {
+      schemaVersion: 2 as const,
+      hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+      patch: portablePatch,
+      transcript: portableTranscript,
+      captureFailures: [],
+    };
+
+    expect(legacyPatch.digest).toBe(
+      "359dba22ad09afd749caa2b5ea13796414c365e2be292f33d122a9f9943f0d8b",
+    );
+    expect(portablePatch.digest).not.toBe(legacyPatch.digest);
+    expect(BenchmarkReviewPacketV1Schema.parse(legacyPacket)).toEqual(legacyPacket);
+    expect(BenchmarkReviewPacketV2Schema.parse(portablePacket)).toEqual(portablePacket);
+    expect(BenchmarkReviewPacketSchema.parse(legacyPacket)).toEqual(legacyPacket);
+    expect(BenchmarkReviewPacketSchema.parse(portablePacket)).toEqual(portablePacket);
+    expect(() =>
+      BenchmarkReviewPacketV2Schema.parse({
+        ...portablePacket,
+        patch: { ...portablePatch, digest: legacyPatch.digest },
+      }),
+    ).toThrow(/digest does not match/);
+    expect(() =>
+      BenchmarkReviewPacketV1Schema.parse({
+        ...legacyPacket,
+        patch: { ...legacyPatch, digest: portablePatch.digest },
+      }),
+    ).toThrow(/digest does not match/);
+    expect(() => benchmarkReviewEvidenceDigest(legacyPatch, 3 as never)).toThrow(
+      /unsupported benchmark review packet schema version/i,
+    );
+  });
+
+  it("accepts only self-identified portable v4 reports and refuses legacy relabelling", () => {
+    const schedule = createBenchmarkSchedule({
+      suite,
+      hosts: ["codex"],
+      seed: "portable-report-seed",
+      identity: portableReportIdentity,
+    });
+    const reviewPacket = BenchmarkReviewPacketV2Schema.parse({
+      schemaVersion: 2,
+      hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+      patch: reviewEvidence(2, "text/x-diff", "diff --git a/result.js b/result.js\n"),
+      transcript: reviewEvidence(2, "application/x-ndjson", '{"type":"result"}\n'),
+      captureFailures: [],
+    });
+    expect(() =>
+      BenchmarkTrialResultV4Schema.parse({
+        ...reportedTrial(schedule[0]!, 100),
+        reviewPacket: {
+          schemaVersion: 1,
+          patch: reviewEvidence(1, "text/x-diff", "diff --git a/result.js b/result.js\n"),
+          transcript: reviewEvidence(1, "application/x-ndjson", '{"type":"result"}\n'),
+          captureFailures: [],
+        },
+      }),
+    ).toThrow();
+    const result = BenchmarkTrialResultV4Schema.parse({
+      ...reportedTrial(schedule[0]!, 100),
+      reviewPacket,
+    });
+    expect(() => summarizeBenchmark([result], schedule)).toThrow();
+    const report = {
+      schemaVersion: 4 as const,
+      hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+      status: "running" as const,
+      suite: {
+        id: suite.id,
+        version: suite.version,
+        digest: contentHash(suite, PORTABLE_CANONICAL_HASH_ALGORITHM),
+      },
+      startedAt: "2026-07-25T12:00:00.000Z",
+      updatedAt: "2026-07-25T12:00:00.000Z",
+      seed: "portable-report-seed",
+      randomized: true as const,
+      modelPolicy: { codex: "gpt-benchmark-fixture" },
+      effortPolicy: "high" as const,
+      permissionPolicy: {
+        codex: "codex_workspace_write_shell_external_not_graphcraft_enforced" as const,
+      },
+      scorerPolicy: "fixture_bound_scorers_plus_suite_assertions" as const,
+      reviewPolicy: "bounded_redacted_patch_and_transcript_v2" as const,
+      modelCallTimeoutMs: 15 * 60_000,
+      environment: {
+        platform: "fixture",
+        architecture: "fixture",
+        nodeVersion: "fixture",
+        graphcraftVersion: "0.1.2-fixture",
+        graphcraftSource: {
+          commitSha: "a".repeat(40),
+          dirty: false,
+          dirtyStatusDigest: null,
+        },
+      },
+      limitations: [],
+      schedule,
+      results: [result],
+      summary: summarizeBenchmark([result], schedule, portableReportIdentity),
+    };
+
+    expect(BenchmarkReportV4Schema.parse(report)).toEqual(report);
+    expect(BenchmarkReportSchema.parse(report)).toEqual(report);
+
+    const legacySchedule = createBenchmarkSchedule({
+      suite,
+      hosts: ["codex"],
+      seed: report.seed,
+      identity: legacyReportIdentity,
+    });
+    expect(() =>
+      BenchmarkReportV4Schema.parse({
+        ...report,
+        schedule: legacySchedule,
+        results: [],
+        summary: summarizeBenchmark([], legacySchedule, portableReportIdentity),
+      }),
+    ).toThrow(/trial ID does not match the declared report identity/);
+    expect(() =>
+      BenchmarkReportV4Schema.parse({
+        ...report,
+        hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM,
+      }),
+    ).toThrow();
+    const { graphcraftSource: _graphcraftSource, ...identitylessEnvironment } = report.environment;
+    expect(() =>
+      BenchmarkReportV4Schema.parse({ ...report, environment: identitylessEnvironment }),
+    ).toThrow(/graphcraftSource/);
   });
 
   it("keeps unsuccessful and unreconciled trials visible and refuses an incomplete gate", () => {

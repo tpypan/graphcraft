@@ -4,7 +4,7 @@ import {
   BenchmarkAssertionResultSchema,
   BenchmarkAssertionSchema,
   BenchmarkCheckSchema,
-  BenchmarkReviewPacketSchema,
+  BenchmarkReviewPacketV1Schema,
   BenchmarkTaskFamilySchema,
 } from "./benchmark.ts";
 import { canonicalJson, contentHash } from "./canonical.ts";
@@ -58,7 +58,7 @@ export const BenchmarkBlindedReviewPacketSchema = z.strictObject({
     limitations: z.array(z.string()),
     failureTrace: z.array(z.string()),
   }),
-  reviewPacket: BenchmarkReviewPacketSchema,
+  reviewPacket: BenchmarkReviewPacketV1Schema,
 });
 
 function exactOrderedValues<T extends string>(expected: readonly T[]) {

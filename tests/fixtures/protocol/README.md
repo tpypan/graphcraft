@@ -3,7 +3,8 @@
 These fixtures are stable examples of Graphcraft's persisted protocol boundaries.
 
 - `contract.v1.json`, `graph.v1.json`, and `events.v1.jsonl` exercise the version 1 run protocol.
-- `benchmark-report.v2.json` exercises the version 2 persisted benchmark report.
+- `benchmark-report.v2.json`, `benchmark-report.v3.json`, and `benchmark-report.v4.json` exercise
+  the legacy and portable persisted benchmark-report versions.
 - `storage-manifest.v1.json` and `storage-manifest.v2.json` exercise every explicit storage manifest version.
 
 The signed `v0.1.0` and `v0.1.1` pre-manifest storage fixtures remain under

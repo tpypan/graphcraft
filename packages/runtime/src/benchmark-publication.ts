@@ -10,7 +10,7 @@ import {
   BenchmarkBlindedReviewPacketSchema,
   BenchmarkReportV3Schema,
   BenchmarkReviewLabelsSchema,
-  BenchmarkReviewPacketSchema,
+  BenchmarkReviewPacketV1Schema,
   BenchmarkSuiteSchema,
   benchmarkBlindingKeyDigest,
   benchmarkReviewOpaqueId,
@@ -19,7 +19,7 @@ import {
   type BenchmarkBlindedReviewExport,
   type BenchmarkReportV3,
   type BenchmarkReviewLabels,
-  type BenchmarkReviewPacket,
+  type BenchmarkReviewPacketV1,
   type BenchmarkSuite,
   type BenchmarkTrialResult,
 } from "@graphcraft/core";
@@ -535,9 +535,9 @@ function utf8Suffix(value: Buffer, maximumBytes: number): Buffer {
 }
 
 function blindedEvidence(
-  evidence: BenchmarkReviewPacket["patch"],
+  evidence: BenchmarkReviewPacketV1["patch"],
   replacements: IdentityReplacement[],
-): BenchmarkReviewPacket["patch"] {
+): BenchmarkReviewPacketV1["patch"] {
   const text =
     evidence.mediaType === "application/x-ndjson"
       ? normalizedBlindedTranscript(evidence.text, replacements)
@@ -577,14 +577,14 @@ function blindedEvidence(
       truncated,
     }),
   };
-  return BenchmarkReviewPacketSchema.shape.patch.parse(blinded);
+  return BenchmarkReviewPacketV1Schema.shape.patch.parse(blinded);
 }
 
 function blindedReviewPacket(
-  reviewPacket: BenchmarkReviewPacket,
+  reviewPacket: BenchmarkReviewPacketV1,
   replacements: IdentityReplacement[],
-): BenchmarkReviewPacket {
-  return BenchmarkReviewPacketSchema.parse({
+): BenchmarkReviewPacketV1 {
+  return BenchmarkReviewPacketV1Schema.parse({
     schemaVersion: 1,
     patch: blindedEvidence(reviewPacket.patch, replacements),
     transcript: blindedEvidence(reviewPacket.transcript, replacements),

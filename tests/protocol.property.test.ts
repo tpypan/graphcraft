@@ -4,6 +4,7 @@ import { join } from "node:path";
 import {
   BenchmarkReportSchema,
   GraphSchema,
+  LEGACY_CANONICAL_HASH_ALGORITHM,
   RunContractSchema,
   RunEventSchema,
   RunStorageManifestSchema,
@@ -283,16 +284,27 @@ describe("versioned protocol fixtures", () => {
     expect(reduceEvents(mixedEvents)).toMatchObject({ status: "completed", lastEventSequence: 9 });
 
     const reports = await Promise.all(
-      [2, 3].map(async (version) =>
+      [2, 3, 4].map(async (version) =>
         BenchmarkReportSchema.parse(
           await readJson(join(protocolFixtures, `benchmark-report.v${version}.json`)),
         ),
       ),
     );
-    expect(reports.map(({ schemaVersion }) => schemaVersion)).toEqual([2, 3]);
+    expect(reports.map(({ schemaVersion }) => schemaVersion)).toEqual([2, 3, 4]);
     for (const report of reports) {
       expect(report.environment.graphcraftVersion).toBe("0.1.2");
-      expect(report.summary).toEqual(summarizeBenchmark(report.results, report.schedule));
+      expect(report.summary).toEqual(
+        summarizeBenchmark(
+          report.results,
+          report.schedule,
+          report.schemaVersion === 4
+            ? { schemaVersion: 4, hashAlgorithm: report.hashAlgorithm }
+            : {
+                schemaVersion: report.schemaVersion,
+                hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM,
+              },
+        ),
+      );
       expect(BenchmarkReportSchema.parse(JSON.parse(JSON.stringify(report)))).toEqual(report);
     }
 

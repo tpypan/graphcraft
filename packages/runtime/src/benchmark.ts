@@ -4,22 +4,29 @@ import { tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve, sep } from "node:path";
 import {
   BenchmarkSuiteSchema,
-  BenchmarkScheduleEntrySchema,
+  BenchmarkScheduleEntryV3Schema,
+  BenchmarkScheduleEntryV4Schema,
   BenchmarkReportV3Schema,
+  BenchmarkReportV4Schema,
   BenchmarkReportV2Schema,
-  BenchmarkReviewPacketSchema,
+  BenchmarkReviewPacketV1Schema,
+  BenchmarkReviewPacketV2Schema,
   BenchmarkSourceIdentitySchema,
-  BenchmarkTrialResultSchema,
+  BenchmarkTrialResultV3Schema,
+  BenchmarkTrialResultV4Schema,
   BENCHMARK_REVIEW_PATCH_LIMIT_BYTES,
   BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES,
   ContextCapsuleSchema,
   HostCapabilityAdmissionError,
   HostEventSchema,
   HostTerminationError,
+  LEGACY_CANONICAL_HASH_ALGORITHM,
   MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
   RequiredHostCapabilityDiagnosticSchema,
   aggregateTokenUsage,
   assertRequiredHostCapabilities,
+  benchmarkReviewEvidenceDigest,
   contentHash,
   createBenchmarkSchedule,
   interruptionReason,
@@ -28,12 +35,16 @@ import {
   type BenchmarkScheduleEntry,
   type BenchmarkHostPreflightCheckpoint,
   type BenchmarkReportV3,
+  type BenchmarkReportV4,
   type BenchmarkPermissionPolicy,
-  type BenchmarkReviewPacket,
+  type BenchmarkReviewPacketV1,
+  type BenchmarkReviewPacketV2,
   type BenchmarkSourceIdentity,
   type BenchmarkSuite,
   type BenchmarkTask,
-  type BenchmarkTrialResult,
+  type BenchmarkTrialResultV3,
+  type BenchmarkTrialResultV4,
+  type CanonicalHashAlgorithm,
   type HostAdapter,
   type HostCapabilities,
   type HostExecutionPolicy,
@@ -61,7 +72,8 @@ const tokenDimensions = [
   "total",
 ] as const;
 const scorerPolicy = "fixture_bound_scorers_plus_suite_assertions" as const;
-const reviewPolicy = "bounded_redacted_patch_and_transcript_v1" as const;
+const legacyReviewPolicy = "bounded_redacted_patch_and_transcript_v1" as const;
+const portableReviewPolicy = "bounded_redacted_patch_and_transcript_v2" as const;
 const PATCH_PROCESS_CAPTURE_LIMIT_BYTES = 2 * BENCHMARK_REVIEW_PATCH_LIMIT_BYTES;
 const TRANSCRIPT_OMISSION_MARKER = Buffer.from(
   "\n[GRAPHCRAFT REVIEW EVIDENCE MIDDLE OMITTED]\n",
@@ -74,6 +86,76 @@ const BENCHMARK_MODEL_CALL_SETTLEMENT_GRACE_MS = 5_000;
 const UNCONFIRMED_CALL_SETTLEMENT_LIMITATION = "model_call_settlement:unconfirmed";
 const PROVISIONAL_ATTEMPT_LIMITATION = "attempt_checkpoint:provisional";
 export const BENCHMARK_SUITE_MAX_BYTES = 16 * 1024 * 1024;
+
+type ResumableBenchmarkReport = BenchmarkReportV3 | BenchmarkReportV4;
+type ResumableBenchmarkTrialResult = BenchmarkTrialResultV3 | BenchmarkTrialResultV4;
+type ResumableBenchmarkReviewPacket = BenchmarkReviewPacketV1 | BenchmarkReviewPacketV2;
+
+type BenchmarkIdentityPolicy =
+  | {
+      reportVersion: 3;
+      hashAlgorithm: typeof LEGACY_CANONICAL_HASH_ALGORITHM;
+      reviewPolicy: typeof legacyReviewPolicy;
+      reviewPacketVersion: 1;
+    }
+  | {
+      reportVersion: 4;
+      hashAlgorithm: typeof PORTABLE_CANONICAL_HASH_ALGORITHM;
+      reviewPolicy: typeof portableReviewPolicy;
+      reviewPacketVersion: 2;
+    };
+
+const LEGACY_BENCHMARK_IDENTITY_POLICY: BenchmarkIdentityPolicy = {
+  reportVersion: 3,
+  hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM,
+  reviewPolicy: legacyReviewPolicy,
+  reviewPacketVersion: 1,
+};
+
+const PORTABLE_BENCHMARK_IDENTITY_POLICY: BenchmarkIdentityPolicy = {
+  reportVersion: 4,
+  hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+  reviewPolicy: portableReviewPolicy,
+  reviewPacketVersion: 2,
+};
+
+function parseBenchmarkSchedule(
+  value: unknown,
+  identity: BenchmarkIdentityPolicy,
+): BenchmarkScheduleEntry[] {
+  return (
+    identity.reportVersion === 4 ? BenchmarkScheduleEntryV4Schema : BenchmarkScheduleEntryV3Schema
+  )
+    .array()
+    .parse(value);
+}
+
+function parseBenchmarkTrialResult(
+  value: unknown,
+  identity: BenchmarkIdentityPolicy,
+): ResumableBenchmarkTrialResult {
+  return identity.reportVersion === 4
+    ? BenchmarkTrialResultV4Schema.parse(value)
+    : BenchmarkTrialResultV3Schema.parse(value);
+}
+
+function parseBenchmarkReviewPacket(
+  value: unknown,
+  identity: BenchmarkIdentityPolicy,
+): ResumableBenchmarkReviewPacket {
+  return identity.reportVersion === 4
+    ? BenchmarkReviewPacketV2Schema.parse(value)
+    : BenchmarkReviewPacketV1Schema.parse(value);
+}
+
+function parseResumableBenchmarkReport(
+  value: unknown,
+  identity: BenchmarkIdentityPolicy,
+): ResumableBenchmarkReport {
+  return identity.reportVersion === 4
+    ? BenchmarkReportV4Schema.parse(value)
+    : BenchmarkReportV3Schema.parse(value);
+}
 
 type BenchmarkInterruption = {
   cause: "cancellation" | "runtime_shutdown" | "timeout";
@@ -323,14 +405,17 @@ function safeFixturePath(root: string, path: string): string {
   return resolved;
 }
 
-function reviewEvidenceDigest(input: {
-  mediaType: "text/x-diff" | "application/x-ndjson";
-  text: string;
-  observedBytes: number;
-  omittedBytes: number;
-  truncated: boolean;
-}): string {
-  return contentHash(input);
+function reviewEvidenceDigest(
+  input: {
+    mediaType: "text/x-diff" | "application/x-ndjson";
+    text: string;
+    observedBytes: number;
+    omittedBytes: number;
+    truncated: boolean;
+  },
+  identity: BenchmarkIdentityPolicy,
+): string {
+  return benchmarkReviewEvidenceDigest(input, identity.reviewPacketVersion);
 }
 
 function utf8Prefix(buffer: Buffer, maximumBytes: number): Buffer {
@@ -364,6 +449,7 @@ function utf8Suffix(buffer: Buffer, maximumBytes: number): Buffer {
 function boundedReviewEvidence(
   mediaType: "text/x-diff" | "application/x-ndjson",
   value: string,
+  identity: BenchmarkIdentityPolicy,
   capture: { observedBytes?: number; omittedBytes?: number } = {},
 ) {
   const redacted = redactString(value);
@@ -394,7 +480,10 @@ function boundedReviewEvidence(
     retainedBytes,
     omittedBytes,
     truncated,
-    digest: reviewEvidenceDigest({ mediaType, text, observedBytes, omittedBytes, truncated }),
+    digest: reviewEvidenceDigest(
+      { mediaType, text, observedBytes, omittedBytes, truncated },
+      identity,
+    ),
   };
 }
 
@@ -403,6 +492,8 @@ class BoundedTranscriptCapture {
   private head: Buffer | undefined;
   private tail = Buffer.alloc(0);
   private observedBytes = 0;
+
+  constructor(private readonly identity: BenchmarkIdentityPolicy) {}
 
   append(entry: unknown): void {
     const serialized = JSON.stringify(redactValue(entry)) ?? "null";
@@ -449,13 +540,16 @@ class BoundedTranscriptCapture {
         retainedBytes: this.complete.length,
         omittedBytes: 0,
         truncated: false,
-        digest: reviewEvidenceDigest({
-          mediaType: "application/x-ndjson",
-          text,
-          observedBytes: this.observedBytes,
-          omittedBytes: 0,
-          truncated: false,
-        }),
+        digest: reviewEvidenceDigest(
+          {
+            mediaType: "application/x-ndjson",
+            text,
+            observedBytes: this.observedBytes,
+            omittedBytes: 0,
+            truncated: false,
+          },
+          this.identity,
+        ),
       };
     }
     const retainedContentBytes =
@@ -471,18 +565,25 @@ class BoundedTranscriptCapture {
       retainedBytes,
       omittedBytes,
       truncated: true,
-      digest: reviewEvidenceDigest({
-        mediaType: "application/x-ndjson",
-        text,
-        observedBytes: this.observedBytes,
-        omittedBytes,
-        truncated: true,
-      }),
+      digest: reviewEvidenceDigest(
+        {
+          mediaType: "application/x-ndjson",
+          text,
+          observedBytes: this.observedBytes,
+          omittedBytes,
+          truncated: true,
+        },
+        this.identity,
+      ),
     };
   }
 }
 
-async function capturePatch(repository: string, baseSha: string) {
+async function capturePatch(
+  repository: string,
+  baseSha: string,
+  identity: BenchmarkIdentityPolicy,
+) {
   const temporaryRoot = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-review-index-"));
   const environment = { GIT_INDEX_FILE: join(temporaryRoot, "index") };
   try {
@@ -549,7 +650,7 @@ async function capturePatch(repository: string, baseSha: string) {
       },
     );
     if (diff.exitCode !== 0) throw new Error(`review diff exited ${diff.exitCode}`);
-    const evidence = boundedReviewEvidence("text/x-diff", diff.stdout, {
+    const evidence = boundedReviewEvidence("text/x-diff", diff.stdout, identity, {
       observedBytes: diff.capture.stdout.observedBytes,
       omittedBytes: diff.capture.stdout.omittedBytes,
     });
@@ -582,31 +683,39 @@ async function captureReviewPacket(input: {
   repository: string;
   baseSha: string;
   transcript: BoundedTranscriptCapture;
+  identity: BenchmarkIdentityPolicy;
   captureFailures?: string[];
-}): Promise<BenchmarkReviewPacket> {
+}): Promise<ResumableBenchmarkReviewPacket> {
   const captureFailures = [...(input.captureFailures ?? [])];
   let patch;
   try {
-    const captured = await capturePatch(input.repository, input.baseSha);
+    const captured = await capturePatch(input.repository, input.baseSha, input.identity);
     patch = captured.evidence;
     captureFailures.push(...captured.captureFailures);
   } catch (error) {
     const failure = `patch capture failed: ${error instanceof Error ? error.message : String(error)}`;
     captureFailures.push(failure);
-    patch = boundedReviewEvidence("text/x-diff", `[GRAPHCRAFT ${failure}]\n`);
+    patch = boundedReviewEvidence("text/x-diff", `[GRAPHCRAFT ${failure}]\n`, input.identity);
   }
   const transcript = input.transcript.evidence();
   if (transcript.truncated) captureFailures.push(TRANSCRIPT_INCOMPLETE_FAILURE);
-  return BenchmarkReviewPacketSchema.parse({
-    schemaVersion: 1,
-    patch,
-    transcript,
-    captureFailures: captureFailures.map((failure) => redactString(failure)),
-  });
+  return parseBenchmarkReviewPacket(
+    {
+      schemaVersion: input.identity.reviewPacketVersion,
+      ...(input.identity.reportVersion === 4
+        ? { hashAlgorithm: input.identity.hashAlgorithm }
+        : {}),
+      patch,
+      transcript,
+      captureFailures: captureFailures.map((failure) => redactString(failure)),
+    },
+    input.identity,
+  );
 }
 
 export async function inspectBenchmarkSourceIdentity(
   repositoryPath: string,
+  hashAlgorithm: CanonicalHashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM,
 ): Promise<BenchmarkSourceIdentity> {
   const repository = resolve(repositoryPath);
   const head = await runProcess("git", ["rev-parse", "--verify", "HEAD^{commit}"], {
@@ -635,7 +744,7 @@ export async function inspectBenchmarkSourceIdentity(
   return BenchmarkSourceIdentitySchema.parse({
     commitSha,
     dirty,
-    dirtyStatusDigest: dirty ? contentHash(status.stdout) : null,
+    dirtyStatusDigest: dirty ? contentHash(status.stdout, hashAlgorithm) : null,
   });
 }
 
@@ -644,7 +753,10 @@ export async function loadBenchmarkSuite(path: string): Promise<BenchmarkSuite> 
   return BenchmarkSuiteSchema.parse(JSON.parse(source.toString("utf8")));
 }
 
-async function materializeTask(task: BenchmarkTask): Promise<{
+async function materializeTask(
+  task: BenchmarkTask,
+  hashAlgorithm: CanonicalHashAlgorithm,
+): Promise<{
   repository: string;
   repositoryDigest: string;
   baseSha: string;
@@ -694,7 +806,7 @@ async function materializeTask(task: BenchmarkTask): Promise<{
       throw new Error(`Unable to hash fixture ${task.id}`);
     return {
       repository,
-      repositoryDigest: contentHash(task.initialFiles),
+      repositoryDigest: contentHash(task.initialFiles, hashAlgorithm),
       baseSha: head.stdout.trim(),
     };
   } catch (error) {
@@ -727,15 +839,19 @@ async function removeBenchmarkFixture(repository: string): Promise<void> {
     throw new AggregateError(failures, `Unable to remove benchmark fixture ${repository}`);
 }
 
-function expectedScorerFiles(task: BenchmarkTask) {
+function expectedScorerFiles(task: BenchmarkTask, hashAlgorithm: CanonicalHashAlgorithm) {
   return [...new Set(task.checks.map(({ scorerPath }) => scorerPath))].sort().map((path) => ({
     path,
     kind: "regular_file" as const,
-    digest: contentHash(task.initialFiles[path]),
+    digest: contentHash(task.initialFiles[path], hashAlgorithm),
   }));
 }
 
-async function observedScorerFiles(task: BenchmarkTask, repository: string) {
+async function observedScorerFiles(
+  task: BenchmarkTask,
+  repository: string,
+  hashAlgorithm: CanonicalHashAlgorithm,
+) {
   return await Promise.all(
     [...new Set(task.checks.map(({ scorerPath }) => scorerPath))].sort().map(async (path) => {
       const target = safeFixturePath(repository, path);
@@ -747,7 +863,7 @@ async function observedScorerFiles(task: BenchmarkTask, repository: string) {
         return {
           path,
           kind: "regular_file" as const,
-          digest: contentHash(await readFile(target, "utf8")),
+          digest: contentHash(await readFile(target, "utf8"), hashAlgorithm),
         };
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") return { path, kind: "missing" };
@@ -760,13 +876,15 @@ async function observedScorerFiles(task: BenchmarkTask, repository: string) {
 function scorerDigest(
   task: BenchmarkTask,
   files: Awaited<ReturnType<typeof observedScorerFiles>> | ReturnType<typeof expectedScorerFiles>,
+  hashAlgorithm: CanonicalHashAlgorithm,
 ): string {
-  return contentHash({ checks: task.checks, acceptance: task.acceptance, files });
+  return contentHash({ checks: task.checks, acceptance: task.acceptance, files }, hashAlgorithm);
 }
 
 async function scoreAcceptance(
   task: BenchmarkTask,
   repository: string,
+  hashAlgorithm: CanonicalHashAlgorithm,
   summaryEvidence = "",
 ): Promise<{
   results: Array<{ path: string; passed: boolean; summary: string }>;
@@ -775,8 +893,16 @@ async function scoreAcceptance(
   scorerVerified: boolean;
 }> {
   const results: Array<{ path: string; passed: boolean; summary: string }> = [];
-  const expectedScorerDigest = scorerDigest(task, expectedScorerFiles(task));
-  const observedScorerDigest = scorerDigest(task, await observedScorerFiles(task, repository));
+  const expectedScorerDigest = scorerDigest(
+    task,
+    expectedScorerFiles(task, hashAlgorithm),
+    hashAlgorithm,
+  );
+  const observedScorerDigest = scorerDigest(
+    task,
+    await observedScorerFiles(task, repository, hashAlgorithm),
+    hashAlgorithm,
+  );
   const scorerVerified = expectedScorerDigest === observedScorerDigest;
   for (const [index, check] of task.checks.entries()) {
     if (!scorerVerified) {
@@ -950,7 +1076,7 @@ function unresolvedAcceptance(task: BenchmarkTask, reason: string) {
 function preservedWorkspaceRecovery(
   fixtureRepository: string,
   lastKnownRepository: string,
-): NonNullable<BenchmarkTrialResult["recovery"]> {
+): NonNullable<ResumableBenchmarkTrialResult["recovery"]> {
   return {
     disposition: "preserved",
     fixtureRepository,
@@ -995,100 +1121,128 @@ function settledHostPreflightCheckpoint(
 function provisionalTrialResult(input: {
   trial: BenchmarkScheduleEntry;
   task: BenchmarkTask;
+  identity: BenchmarkIdentityPolicy;
   repository: string;
   repositoryDigest: string;
   baseSha: string;
   hostVersion: string;
   policy: HostExecutionPolicy;
-}): BenchmarkTrialResult {
+}): ResumableBenchmarkTrialResult {
   const reason = "Benchmark attempt started but has not checkpointed a settled result";
-  const reviewPacket = BenchmarkReviewPacketSchema.parse({
-    schemaVersion: 1,
-    patch: boundedReviewEvidence("text/x-diff", ""),
-    transcript: boundedReviewEvidence("application/x-ndjson", ""),
-    captureFailures: ["trial review evidence is unavailable until the attempt settles"],
-  });
-  const tokens = usageSummary([]);
-  return BenchmarkTrialResultSchema.parse({
-    trial: input.trial,
-    hostVersion: input.hostVersion,
-    modelPolicy: input.policy.model,
-    effortPolicy: input.policy.effort,
-    permissionPolicy: benchmarkPermissionPolicy(input.trial.host),
-    acceptanceScorerDigest: scorerDigest(input.task, expectedScorerFiles(input.task)),
-    observedScorerDigest: scorerDigest(input.task, expectedScorerFiles(input.task)),
-    scorerVerified: true,
-    repositoryDigest: input.repositoryDigest,
-    baseSha: input.baseSha,
-    executionStatus: "interrupted",
-    attemptCheckpoint: "provisional",
-    interruption: {
-      cause: "runtime_shutdown",
-      reason,
-      childSettlement: "unconfirmed",
+  const reviewPacket = parseBenchmarkReviewPacket(
+    {
+      schemaVersion: input.identity.reviewPacketVersion,
+      ...(input.identity.reportVersion === 4
+        ? { hashAlgorithm: input.identity.hashAlgorithm }
+        : {}),
+      patch: boundedReviewEvidence("text/x-diff", "", input.identity),
+      transcript: boundedReviewEvidence("application/x-ndjson", "", input.identity),
+      captureFailures: ["trial review evidence is unavailable until the attempt settles"],
     },
-    recovery: preservedWorkspaceRecovery(input.repository, input.repository),
-    accepted: false,
-    acceptance: unresolvedAcceptance(input.task, reason),
-    usage: tokens.usage,
-    usageReconciled: false,
-    limitations: [...tokens.limitations, PROVISIONAL_ATTEMPT_LIMITATION],
-    durationMs: 0,
-    humanInterventions: 0,
-    failureTrace: [reason],
-    reviewPacket,
-  });
+    input.identity,
+  );
+  const tokens = usageSummary([]);
+  return parseBenchmarkTrialResult(
+    {
+      trial: input.trial,
+      hostVersion: input.hostVersion,
+      modelPolicy: input.policy.model,
+      effortPolicy: input.policy.effort,
+      permissionPolicy: benchmarkPermissionPolicy(input.trial.host),
+      acceptanceScorerDigest: scorerDigest(
+        input.task,
+        expectedScorerFiles(input.task, input.identity.hashAlgorithm),
+        input.identity.hashAlgorithm,
+      ),
+      observedScorerDigest: scorerDigest(
+        input.task,
+        expectedScorerFiles(input.task, input.identity.hashAlgorithm),
+        input.identity.hashAlgorithm,
+      ),
+      scorerVerified: true,
+      repositoryDigest: input.repositoryDigest,
+      baseSha: input.baseSha,
+      executionStatus: "interrupted",
+      attemptCheckpoint: "provisional",
+      interruption: {
+        cause: "runtime_shutdown",
+        reason,
+        childSettlement: "unconfirmed",
+      },
+      recovery: preservedWorkspaceRecovery(input.repository, input.repository),
+      accepted: false,
+      acceptance: unresolvedAcceptance(input.task, reason),
+      usage: tokens.usage,
+      usageReconciled: false,
+      limitations: [...tokens.limitations, PROVISIONAL_ATTEMPT_LIMITATION],
+      durationMs: 0,
+      humanInterventions: 0,
+      failureTrace: [reason],
+      reviewPacket,
+    },
+    input.identity,
+  );
 }
 
-function settleRecoveredProvisionalAttempt(result: BenchmarkTrialResult): BenchmarkTrialResult {
+function settleRecoveredProvisionalAttempt(
+  result: ResumableBenchmarkTrialResult,
+  identity: BenchmarkIdentityPolicy,
+): ResumableBenchmarkTrialResult {
   if (result.attemptCheckpoint !== "provisional") return result;
   const reason =
     "Recovered an unfinished benchmark attempt; unknown model usage and missing review evidence make this trial unsuccessful";
-  return BenchmarkTrialResultSchema.parse({
-    ...result,
-    attemptCheckpoint: "settled",
-    interruption: {
-      cause: "runtime_shutdown",
-      reason,
-      childSettlement: "unconfirmed",
+  return parseBenchmarkTrialResult(
+    {
+      ...result,
+      attemptCheckpoint: "settled",
+      interruption: {
+        cause: "runtime_shutdown",
+        reason,
+        childSettlement: "unconfirmed",
+      },
+      limitations: [
+        ...result.limitations.filter((limitation) => limitation !== PROVISIONAL_ATTEMPT_LIMITATION),
+        UNCONFIRMED_CALL_SETTLEMENT_LIMITATION,
+      ],
+      failureTrace: [...new Set([...result.failureTrace, reason])],
     },
-    limitations: [
-      ...result.limitations.filter((limitation) => limitation !== PROVISIONAL_ATTEMPT_LIMITATION),
-      UNCONFIRMED_CALL_SETTLEMENT_LIMITATION,
-    ],
-    failureTrace: [...new Set([...result.failureTrace, reason])],
-  });
+    identity,
+  );
 }
 
 function settleFailedAttempt(
-  result: BenchmarkTrialResult,
+  result: ResumableBenchmarkTrialResult,
+  identity: BenchmarkIdentityPolicy,
   error: unknown,
   signal?: AbortSignal,
-  fallbackRecovery?: NonNullable<BenchmarkTrialResult["recovery"]>,
+  fallbackRecovery?: NonNullable<ResumableBenchmarkTrialResult["recovery"]>,
   adapter?: HostAdapter,
-): BenchmarkTrialResult {
+): ResumableBenchmarkTrialResult {
   const classified = adapter
     ? classifyTimedAdapterInterruption(error, signal, adapter)
     : classifyBenchmarkInterruption(error, signal);
   const reason = redactString(error instanceof Error ? error.message : String(error));
   const { interruption: _provisionalInterruption, recovery: existingRecovery, ...base } = result;
-  return BenchmarkTrialResultSchema.parse({
-    ...base,
-    executionStatus: classified ? interruptionExecutionStatus(classified) : "error",
-    attemptCheckpoint: "settled",
-    ...(classified ? { interruption: classified } : {}),
-    ...(classified?.childSettlement === "unconfirmed"
-      ? { recovery: existingRecovery ?? fallbackRecovery }
-      : {}),
-    accepted: false,
-    limitations: [
-      ...result.limitations.filter((limitation) => limitation !== PROVISIONAL_ATTEMPT_LIMITATION),
+  return parseBenchmarkTrialResult(
+    {
+      ...base,
+      executionStatus: classified ? interruptionExecutionStatus(classified) : "error",
+      attemptCheckpoint: "settled",
+      ...(classified ? { interruption: classified } : {}),
       ...(classified?.childSettlement === "unconfirmed"
-        ? [UNCONFIRMED_CALL_SETTLEMENT_LIMITATION]
-        : []),
-    ],
-    failureTrace: [...new Set([...result.failureTrace, reason])],
-  });
+        ? { recovery: existingRecovery ?? fallbackRecovery }
+        : {}),
+      accepted: false,
+      limitations: [
+        ...result.limitations.filter((limitation) => limitation !== PROVISIONAL_ATTEMPT_LIMITATION),
+        ...(classified?.childSettlement === "unconfirmed"
+          ? [UNCONFIRMED_CALL_SETTLEMENT_LIMITATION]
+          : []),
+      ],
+      failureTrace: [...new Set([...result.failureTrace, reason])],
+    },
+    identity,
+  );
 }
 
 function assertBenchmarkActive(signal?: AbortSignal): void {
@@ -1102,6 +1256,7 @@ function assertBenchmarkActive(signal?: AbortSignal): void {
 async function runBaselineTrial(input: {
   trial: BenchmarkScheduleEntry;
   task: BenchmarkTask;
+  identity: BenchmarkIdentityPolicy;
   adapter: HostAdapter;
   repository: string;
   repositoryDigest: string;
@@ -1109,12 +1264,12 @@ async function runBaselineTrial(input: {
   hostVersion: string;
   policy: HostExecutionPolicy;
   signal?: AbortSignal;
-}): Promise<BenchmarkTrialResult> {
+}): Promise<ResumableBenchmarkTrialResult> {
   const started = performance.now();
   const usages: TokenUsage[] = [];
   const failureTrace: string[] = [];
   const summaryEvidence: string[] = [];
-  const transcript = new BoundedTranscriptCapture();
+  const transcript = new BoundedTranscriptCapture(input.identity);
   let resultStatus: "completed" | "blocked" | "failed" | "error" = "error";
   let interruption: BenchmarkInterruption | undefined;
   const capsule = ContextCapsuleSchema.parse({
@@ -1174,7 +1329,12 @@ async function runBaselineTrial(input: {
   }
   if (!interruption && input.signal?.aborted)
     interruption = classifyTimedAdapterInterruption(undefined, input.signal, input.adapter);
-  const score = await scoreAcceptance(input.task, input.repository, summaryEvidence.join("\n"));
+  const score = await scoreAcceptance(
+    input.task,
+    input.repository,
+    input.identity.hashAlgorithm,
+    summaryEvidence.join("\n"),
+  );
   failureTrace.push(
     ...score.results.filter(({ passed }) => !passed).map(({ summary }) => `acceptance: ${summary}`),
   );
@@ -1183,55 +1343,60 @@ async function runBaselineTrial(input: {
     repository: input.repository,
     baseSha: input.baseSha,
     transcript,
+    identity: input.identity,
   });
   failureTrace.push(...reviewPacket.captureFailures.map((failure) => `review packet: ${failure}`));
   const reviewLimitations = [
     ...(reviewPacket.patch.truncated ? ["review_patch:truncated"] : []),
     ...(reviewPacket.transcript.truncated ? ["review_transcript:truncated"] : []),
   ];
-  return BenchmarkTrialResultSchema.parse({
-    trial: input.trial,
-    hostVersion: input.hostVersion,
-    modelPolicy: input.policy.model,
-    effortPolicy: input.policy.effort,
-    permissionPolicy: benchmarkPermissionPolicy(input.trial.host),
-    acceptanceScorerDigest: score.expectedScorerDigest,
-    observedScorerDigest: score.observedScorerDigest,
-    scorerVerified: score.scorerVerified,
-    repositoryDigest: input.repositoryDigest,
-    baseSha: input.baseSha,
-    executionStatus: interruption ? interruptionExecutionStatus(interruption) : resultStatus,
-    attemptCheckpoint: "settled",
-    ...(interruption ? { interruption } : {}),
-    ...(interruption?.childSettlement === "unconfirmed"
-      ? { recovery: preservedWorkspaceRecovery(input.repository, input.repository) }
-      : {}),
-    accepted:
-      !interruption &&
-      resultStatus === "completed" &&
-      score.scorerVerified &&
-      score.results.every(({ passed }) => passed) &&
-      reviewPacket.captureFailures.length === 0,
-    acceptance: score.results,
-    usage: tokens.usage,
-    usageReconciled: tokens.reconciled,
-    limitations: [
-      ...tokens.limitations,
-      ...reviewLimitations,
+  return parseBenchmarkTrialResult(
+    {
+      trial: input.trial,
+      hostVersion: input.hostVersion,
+      modelPolicy: input.policy.model,
+      effortPolicy: input.policy.effort,
+      permissionPolicy: benchmarkPermissionPolicy(input.trial.host),
+      acceptanceScorerDigest: score.expectedScorerDigest,
+      observedScorerDigest: score.observedScorerDigest,
+      scorerVerified: score.scorerVerified,
+      repositoryDigest: input.repositoryDigest,
+      baseSha: input.baseSha,
+      executionStatus: interruption ? interruptionExecutionStatus(interruption) : resultStatus,
+      attemptCheckpoint: "settled",
+      ...(interruption ? { interruption } : {}),
       ...(interruption?.childSettlement === "unconfirmed"
-        ? [UNCONFIRMED_CALL_SETTLEMENT_LIMITATION]
-        : []),
-    ],
-    durationMs: Math.round(performance.now() - started),
-    humanInterventions: 0,
-    failureTrace,
-    reviewPacket,
-  });
+        ? { recovery: preservedWorkspaceRecovery(input.repository, input.repository) }
+        : {}),
+      accepted:
+        !interruption &&
+        resultStatus === "completed" &&
+        score.scorerVerified &&
+        score.results.every(({ passed }) => passed) &&
+        reviewPacket.captureFailures.length === 0,
+      acceptance: score.results,
+      usage: tokens.usage,
+      usageReconciled: tokens.reconciled,
+      limitations: [
+        ...tokens.limitations,
+        ...reviewLimitations,
+        ...(interruption?.childSettlement === "unconfirmed"
+          ? [UNCONFIRMED_CALL_SETTLEMENT_LIMITATION]
+          : []),
+      ],
+      durationMs: Math.round(performance.now() - started),
+      humanInterventions: 0,
+      failureTrace,
+      reviewPacket,
+    },
+    input.identity,
+  );
 }
 
 async function runGraphcraftTrial(input: {
   trial: BenchmarkScheduleEntry;
   task: BenchmarkTask;
+  identity: BenchmarkIdentityPolicy;
   adapter: HostAdapter;
   repository: string;
   repositoryDigest: string;
@@ -1239,7 +1404,7 @@ async function runGraphcraftTrial(input: {
   hostVersion: string;
   policy: HostExecutionPolicy;
   signal?: AbortSignal;
-}): Promise<BenchmarkTrialResult> {
+}): Promise<ResumableBenchmarkTrialResult> {
   const started = performance.now();
   const failureTrace: string[] = [];
   let executionStatus: "completed" | "blocked" | "failed" | "error" = "error";
@@ -1247,7 +1412,7 @@ async function runGraphcraftTrial(input: {
   let summaryEvidence = "";
   let tokens = usageSummary([]);
   let store: Awaited<ReturnType<typeof createRun>>["store"] | undefined;
-  const transcript = new BoundedTranscriptCapture();
+  const transcript = new BoundedTranscriptCapture(input.identity);
   const transcriptCaptureFailures: string[] = [];
   let interruption: BenchmarkInterruption | undefined;
   try {
@@ -1359,7 +1524,12 @@ async function runGraphcraftTrial(input: {
       );
     }
   }
-  const score = await scoreAcceptance(input.task, acceptanceRepository, summaryEvidence);
+  const score = await scoreAcceptance(
+    input.task,
+    acceptanceRepository,
+    input.identity.hashAlgorithm,
+    summaryEvidence,
+  );
   failureTrace.push(
     ...score.results.filter(({ passed }) => !passed).map(({ summary }) => `acceptance: ${summary}`),
   );
@@ -1367,6 +1537,7 @@ async function runGraphcraftTrial(input: {
     repository: acceptanceRepository,
     baseSha: input.baseSha,
     transcript,
+    identity: input.identity,
     captureFailures: transcriptCaptureFailures,
   });
   failureTrace.push(...reviewPacket.captureFailures.map((failure) => `review packet: ${failure}`));
@@ -1374,46 +1545,49 @@ async function runGraphcraftTrial(input: {
     ...(reviewPacket.patch.truncated ? ["review_patch:truncated"] : []),
     ...(reviewPacket.transcript.truncated ? ["review_transcript:truncated"] : []),
   ];
-  return BenchmarkTrialResultSchema.parse({
-    trial: input.trial,
-    hostVersion: input.hostVersion,
-    modelPolicy: input.policy.model,
-    effortPolicy: input.policy.effort,
-    permissionPolicy: benchmarkPermissionPolicy(input.trial.host),
-    acceptanceScorerDigest: score.expectedScorerDigest,
-    observedScorerDigest: score.observedScorerDigest,
-    scorerVerified: score.scorerVerified,
-    repositoryDigest: input.repositoryDigest,
-    baseSha: input.baseSha,
-    executionStatus: interruption ? interruptionExecutionStatus(interruption) : executionStatus,
-    attemptCheckpoint: "settled",
-    ...(interruption ? { interruption } : {}),
-    ...(interruption?.childSettlement === "unconfirmed"
-      ? {
-          recovery: preservedWorkspaceRecovery(input.repository, acceptanceRepository),
-        }
-      : {}),
-    accepted:
-      !interruption &&
-      executionStatus === "completed" &&
-      score.scorerVerified &&
-      score.results.every(({ passed }) => passed) &&
-      reviewPacket.captureFailures.length === 0,
-    acceptance: score.results,
-    usage: tokens.usage,
-    usageReconciled: tokens.reconciled,
-    limitations: [
-      ...tokens.limitations,
-      ...reviewLimitations,
+  return parseBenchmarkTrialResult(
+    {
+      trial: input.trial,
+      hostVersion: input.hostVersion,
+      modelPolicy: input.policy.model,
+      effortPolicy: input.policy.effort,
+      permissionPolicy: benchmarkPermissionPolicy(input.trial.host),
+      acceptanceScorerDigest: score.expectedScorerDigest,
+      observedScorerDigest: score.observedScorerDigest,
+      scorerVerified: score.scorerVerified,
+      repositoryDigest: input.repositoryDigest,
+      baseSha: input.baseSha,
+      executionStatus: interruption ? interruptionExecutionStatus(interruption) : executionStatus,
+      attemptCheckpoint: "settled",
+      ...(interruption ? { interruption } : {}),
       ...(interruption?.childSettlement === "unconfirmed"
-        ? [UNCONFIRMED_CALL_SETTLEMENT_LIMITATION]
-        : []),
-    ],
-    durationMs: Math.round(performance.now() - started),
-    humanInterventions: 0,
-    failureTrace,
-    reviewPacket,
-  });
+        ? {
+            recovery: preservedWorkspaceRecovery(input.repository, acceptanceRepository),
+          }
+        : {}),
+      accepted:
+        !interruption &&
+        executionStatus === "completed" &&
+        score.scorerVerified &&
+        score.results.every(({ passed }) => passed) &&
+        reviewPacket.captureFailures.length === 0,
+      acceptance: score.results,
+      usage: tokens.usage,
+      usageReconciled: tokens.reconciled,
+      limitations: [
+        ...tokens.limitations,
+        ...reviewLimitations,
+        ...(interruption?.childSettlement === "unconfirmed"
+          ? [UNCONFIRMED_CALL_SETTLEMENT_LIMITATION]
+          : []),
+      ],
+      durationMs: Math.round(performance.now() - started),
+      humanInterventions: 0,
+      failureTrace,
+      reviewPacket,
+    },
+    input.identity,
+  );
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
@@ -1427,22 +1601,68 @@ function appendUniqueString(values: unknown, value: string): unknown {
   return values.includes(value) ? values : [...values, value];
 }
 
-function parseBenchmarkReportWithReviewMigration(value: unknown): {
-  report: BenchmarkReportV3;
-  migrated: boolean;
-} {
-  const record = objectRecord(value);
-  if (record?.schemaVersion === 2) {
+function reportIdentity(identity: BenchmarkIdentityPolicy) {
+  return identity.reportVersion === 4
+    ? {
+        schemaVersion: 4 as const,
+        hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+      }
+    : {
+        schemaVersion: 3 as const,
+        hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM,
+      };
+}
+
+async function probeBenchmarkOutput(outputPath: string): Promise<{
+  value?: unknown;
+  identity: BenchmarkIdentityPolicy;
+}> {
+  let source: string;
+  try {
+    source = await readFile(outputPath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT")
+      return { identity: PORTABLE_BENCHMARK_IDENTITY_POLICY };
+    throw error;
+  }
+
+  let value: unknown;
+  try {
+    value = JSON.parse(source);
+  } catch (error) {
+    if (error instanceof SyntaxError)
+      throw new Error(`Benchmark report is not valid JSON: ${outputPath}`);
+    throw error;
+  }
+  const schemaVersion = objectRecord(value)?.schemaVersion;
+  if (schemaVersion === 2) {
     BenchmarkReportV2Schema.parse(value);
     throw new Error(
       "Benchmark report schema version 2 predates model-call settlement evidence and cannot be resumed; preserve it and use a new output path",
     );
   }
-  if (record?.reviewPolicy !== reviewPolicy || !Array.isArray(record.results))
-    return { report: BenchmarkReportV3Schema.parse(value), migrated: false };
+  if (schemaVersion === 3) return { value, identity: LEGACY_BENCHMARK_IDENTITY_POLICY };
+  if (schemaVersion === 4) return { value, identity: PORTABLE_BENCHMARK_IDENTITY_POLICY };
+  throw new Error(`Unsupported benchmark report schema version: ${String(schemaVersion)}`);
+}
+
+function parseBenchmarkReportWithReviewMigration(
+  value: unknown,
+  identity: BenchmarkIdentityPolicy,
+): {
+  report: ResumableBenchmarkReport;
+  migrated: boolean;
+} {
+  const record = objectRecord(value);
+  if (record?.schemaVersion !== identity.reportVersion)
+    throw new Error("Benchmark report schema changed while selecting its identity policy");
+  if (identity.reportVersion === 4)
+    return { report: BenchmarkReportV4Schema.parse(value), migrated: false };
+  if (record.reviewPolicy !== identity.reviewPolicy || !Array.isArray(record.results))
+    return { report: parseResumableBenchmarkReport(value, identity), migrated: false };
 
   let migrated = false;
-  const legacyResults: BenchmarkTrialResult[] = [];
+  const legacyResults: ResumableBenchmarkTrialResult[] = [];
   const results = record.results.map((candidate) => {
     const result = objectRecord(candidate);
     const packet = objectRecord(result?.reviewPacket);
@@ -1453,38 +1673,48 @@ function parseBenchmarkReportWithReviewMigration(value: unknown): {
       !Array.isArray(packet?.captureFailures) ||
       packet.captureFailures.length !== 0
     ) {
-      const parsed = BenchmarkTrialResultSchema.parse(candidate);
+      const parsed = parseBenchmarkTrialResult(candidate, identity);
       legacyResults.push(parsed);
       return parsed;
     }
 
     migrated = true;
     const { reviewPacket: _reviewPacket, ...legacyResult } = result;
-    legacyResults.push(BenchmarkTrialResultSchema.parse(legacyResult));
-    return BenchmarkTrialResultSchema.parse({
-      ...result,
-      accepted: false,
-      limitations: appendUniqueString(result.limitations, "review_transcript:truncated"),
-      failureTrace: appendUniqueString(
-        result.failureTrace,
-        `review packet: ${TRANSCRIPT_INCOMPLETE_FAILURE}`,
-      ),
-      reviewPacket: {
-        ...packet,
-        captureFailures: [TRANSCRIPT_INCOMPLETE_FAILURE],
+    legacyResults.push(parseBenchmarkTrialResult(legacyResult, identity));
+    return parseBenchmarkTrialResult(
+      {
+        ...result,
+        accepted: false,
+        limitations: appendUniqueString(result.limitations, "review_transcript:truncated"),
+        failureTrace: appendUniqueString(
+          result.failureTrace,
+          `review packet: ${TRANSCRIPT_INCOMPLETE_FAILURE}`,
+        ),
+        reviewPacket: {
+          ...packet,
+          captureFailures: [TRANSCRIPT_INCOMPLETE_FAILURE],
+        },
       },
-    });
+      identity,
+    );
   });
-  if (!migrated) return { report: BenchmarkReportV3Schema.parse(value), migrated: false };
-  const schedule = BenchmarkScheduleEntrySchema.array().parse(record.schedule);
-  if (contentHash(record.summary) !== contentHash(summarizeBenchmark(legacyResults, schedule)))
+  if (!migrated) return { report: parseResumableBenchmarkReport(value, identity), migrated: false };
+  const schedule = parseBenchmarkSchedule(record.schedule, identity);
+  const legacySummary = summarizeBenchmark(legacyResults, schedule, reportIdentity(identity));
+  if (
+    contentHash(record.summary, identity.hashAlgorithm) !==
+    contentHash(legacySummary, identity.hashAlgorithm)
+  )
     throw new Error("The existing benchmark report summary does not match its trial evidence");
   return {
-    report: BenchmarkReportV3Schema.parse({
-      ...record,
-      results,
-      summary: summarizeBenchmark(results, schedule),
-    }),
+    report: parseResumableBenchmarkReport(
+      {
+        ...record,
+        results,
+        summary: summarizeBenchmark(results, schedule, reportIdentity(identity)),
+      },
+      identity,
+    ),
     migrated: true,
   };
 }
@@ -1506,7 +1736,7 @@ export async function runBenchmark(input: {
     point: "after_provisional_persist" | "after_settled_persist",
     trial: BenchmarkScheduleEntry,
   ) => void | Promise<void>;
-}): Promise<{ outputPath: string; report: BenchmarkReportV3 }> {
+}): Promise<{ outputPath: string; report: ResumableBenchmarkReport }> {
   const suite = BenchmarkSuiteSchema.parse(input.suite);
   const modelCallTimeoutMs = input.modelCallTimeoutMs ?? DEFAULT_BENCHMARK_MODEL_CALL_TIMEOUT_MS;
   if (
@@ -1520,9 +1750,16 @@ export async function runBenchmark(input: {
   assertBenchmarkActive(input.signal);
   const graphcraftVersion = input.graphcraftVersion?.trim();
   if (!graphcraftVersion) throw new Error("A Graphcraft version identity is required");
+  const outputPath = resolve(input.outputPath);
+  const output = await probeBenchmarkOutput(outputPath);
+  const identity = output.identity;
+  const loaded =
+    output.value === undefined
+      ? undefined
+      : parseBenchmarkReportWithReviewMigration(output.value, identity);
   const graphcraftSource = input.graphcraftSource
     ? BenchmarkSourceIdentitySchema.parse(input.graphcraftSource)
-    : await inspectBenchmarkSourceIdentity(process.cwd());
+    : await inspectBenchmarkSourceIdentity(process.cwd(), identity.hashAlgorithm);
   if (graphcraftSource.dirty)
     throw new Error(
       "Evidence-backed benchmarks require a clean Graphcraft source tree; dirty source identity is not reproducible",
@@ -1550,9 +1787,9 @@ export async function runBenchmark(input: {
     hosts,
     seed: input.seed,
     ...(input.repetitions ? { repetitions: input.repetitions } : {}),
+    identity: reportIdentity(identity),
   });
-  const outputPath = resolve(input.outputPath);
-  const suiteDigest = contentHash(suite);
+  const suiteDigest = contentHash(suite, identity.hashAlgorithm);
   const environment = {
     platform: process.platform,
     architecture: process.arch,
@@ -1562,16 +1799,12 @@ export async function runBenchmark(input: {
   };
   const byTask = new Map(suite.tasks.map((task) => [task.id, task]));
   let startedAt = new Date().toISOString();
-  let results: BenchmarkTrialResult[] = [];
-  let existingReport: BenchmarkReportV3 | undefined;
+  let results: ResumableBenchmarkTrialResult[] = [];
+  let existingReport: ResumableBenchmarkReport | undefined;
   let hostPreflightCheckpoint: BenchmarkHostPreflightCheckpoint | undefined;
-  let existingReportMigrated = false;
-  try {
-    const loaded = parseBenchmarkReportWithReviewMigration(
-      JSON.parse(await readFile(outputPath, "utf8")),
-    );
+  const existingReportMigrated = loaded?.migrated ?? false;
+  if (loaded) {
     const existing = loaded.report;
-    existingReportMigrated = loaded.migrated;
     if (existing.environment.graphcraftVersion !== graphcraftVersion)
       throw new Error(
         "The existing benchmark report Graphcraft version identity does not match this execution",
@@ -1587,33 +1820,31 @@ export async function runBenchmark(input: {
       JSON.stringify(existing.modelPolicy) !== JSON.stringify(modelPolicy) ||
       existing.effortPolicy !== effortPolicy ||
       JSON.stringify(existing.permissionPolicy) !== JSON.stringify(permissionPolicy) ||
-      existing.reviewPolicy !== reviewPolicy ||
+      existing.reviewPolicy !== identity.reviewPolicy ||
       existing.modelCallTimeoutMs !== modelCallTimeoutMs ||
       JSON.stringify(existingRuntimeEnvironment) !== JSON.stringify(currentRuntimeEnvironment) ||
       JSON.stringify(existing.schedule) !== JSON.stringify(schedule)
     )
       throw new Error("The existing benchmark report does not match this suite and schedule");
-    if (contentHash(existing.environment.graphcraftSource) !== contentHash(graphcraftSource))
+    if (
+      contentHash(existing.environment.graphcraftSource, identity.hashAlgorithm) !==
+      contentHash(graphcraftSource, identity.hashAlgorithm)
+    )
       throw new Error(
         "The existing benchmark report Graphcraft source identity does not match this execution",
       );
     startedAt = existing.startedAt;
-    results = existing.results;
+    results = [...existing.results];
     hostPreflightCheckpoint = existing.hostPreflightCheckpoint;
     existingReport = existing;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      if (error instanceof SyntaxError)
-        throw new Error(`Benchmark report is not valid JSON: ${outputPath}`);
-      if (error instanceof Error && !error.message.includes("ENOENT")) throw error;
-    }
   }
   if (existingReport)
     assertBenchmarkReportEvidence({ report: existingReport, suite, expectedSchedule: schedule });
   const recoveredProvisionalAttempts = results.some(
     ({ attemptCheckpoint }) => attemptCheckpoint === "provisional",
   );
-  if (recoveredProvisionalAttempts) results = results.map(settleRecoveredProvisionalAttempt);
+  if (recoveredProvisionalAttempts)
+    results = results.map((result) => settleRecoveredProvisionalAttempt(result, identity));
   if (existingReport?.status === "complete") {
     if (existingReportMigrated) await writeJsonAtomic(outputPath, existingReport);
     return { outputPath, report: existingReport };
@@ -1628,10 +1859,11 @@ export async function runBenchmark(input: {
     if (!adapter) throw new Error(`No ${host} benchmark adapter was configured`);
     adapters[host] = new TimedBenchmarkAdapter(adapter, modelCallTimeoutMs);
   }
-  const persist = async (status: "running" | "complete"): Promise<BenchmarkReportV3> => {
-    const report = BenchmarkReportV3Schema.parse(
+  const persist = async (status: "running" | "complete"): Promise<ResumableBenchmarkReport> => {
+    const report = parseResumableBenchmarkReport(
       redactValue({
-        schemaVersion: 3,
+        schemaVersion: identity.reportVersion,
+        ...(identity.reportVersion === 4 ? { hashAlgorithm: identity.hashAlgorithm } : {}),
         status,
         suite: { id: suite.id, version: suite.version, digest: suiteDigest },
         startedAt,
@@ -1642,15 +1874,16 @@ export async function runBenchmark(input: {
         effortPolicy,
         permissionPolicy,
         scorerPolicy,
-        reviewPolicy,
+        reviewPolicy: identity.reviewPolicy,
         modelCallTimeoutMs,
         ...(hostPreflightCheckpoint ? { hostPreflightCheckpoint } : {}),
         environment,
         limitations: BENCHMARK_REPORT_LIMITATIONS,
         schedule,
         results,
-        summary: summarizeBenchmark(results, schedule),
+        summary: summarizeBenchmark(results, schedule, reportIdentity(identity)),
       }),
+      identity,
     );
     assertBenchmarkReportEvidence({ report, suite, expectedSchedule: schedule });
     await writeJsonAtomic(outputPath, report);
@@ -1704,13 +1937,14 @@ export async function runBenchmark(input: {
     input.observer?.(
       `[${trial.order + 1}/${schedule.length}] ${trial.host} ${trial.mode} ${trial.taskId} #${trial.repetition}`,
     );
-    const fixture = await materializeTask(task);
-    let result: BenchmarkTrialResult | undefined;
+    const fixture = await materializeTask(task, identity.hashAlgorithm);
+    let result: ResumableBenchmarkTrialResult | undefined;
     let trialError: unknown;
     let settledResultPersisted = false;
     let provisional = provisionalTrialResult({
       trial,
       task,
+      identity,
       repository: fixture.repository,
       repositoryDigest: fixture.repositoryDigest,
       baseSha: fixture.baseSha,
@@ -1728,6 +1962,7 @@ export async function runBenchmark(input: {
       } catch (error) {
         const failedProbe = settleFailedAttempt(
           provisional,
+          identity,
           error,
           trialSignal,
           preservedWorkspaceRecovery(fixture.repository, fixture.repository),
@@ -1755,10 +1990,13 @@ export async function runBenchmark(input: {
         throw error;
       }
       const hostVersion = capabilities.version ?? "unknown";
-      provisional = BenchmarkTrialResultSchema.parse({
-        ...provisional,
-        hostVersion,
-      });
+      provisional = parseBenchmarkTrialResult(
+        {
+          ...provisional,
+          hostVersion,
+        },
+        identity,
+      );
       const provisionalIndex = results.findIndex(
         ({ trial: candidate }) => candidate.trialId === trial.trialId,
       );
@@ -1772,6 +2010,7 @@ export async function runBenchmark(input: {
             ? await runBaselineTrial({
                 trial,
                 task,
+                identity,
                 adapter,
                 repository: fixture.repository,
                 repositoryDigest: fixture.repositoryDigest,
@@ -1783,6 +2022,7 @@ export async function runBenchmark(input: {
             : await runGraphcraftTrial({
                 trial,
                 task,
+                identity,
                 adapter,
                 repository: fixture.repository,
                 repositoryDigest: fixture.repositoryDigest,
@@ -1807,6 +2047,7 @@ export async function runBenchmark(input: {
         trialError = error;
         result = settleFailedAttempt(
           result ?? provisional,
+          identity,
           error,
           trialSignal,
           preservedWorkspaceRecovery(fixture.repository, fixture.repository),

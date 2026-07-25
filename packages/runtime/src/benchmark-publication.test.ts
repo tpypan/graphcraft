@@ -3,9 +3,11 @@ import { link, mkdtemp, readFile, rm, symlink, truncate, writeFile } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   BenchmarkReportV3Schema,
+  BenchmarkReportV4Schema,
   BenchmarkReviewLabelsSchema,
   BenchmarkSuiteSchema,
   BenchmarkTrialResultSchema,
@@ -838,6 +840,18 @@ describe("benchmark publication files", () => {
     await truncate(oversized, BENCHMARK_PUBLICATION_REPORT_MAX_BYTES + 1);
     await expect(loadBenchmarkReportForPublication(oversized)).rejects.toThrow(
       /bounded read limit/u,
+    );
+  });
+
+  it("keeps publication v1 restricted to legacy schema-v3 reports", async () => {
+    const portableReportPath = fileURLToPath(
+      new URL("../../../tests/fixtures/protocol/benchmark-report.v4.json", import.meta.url),
+    );
+    const portableReport = JSON.parse(await readFile(portableReportPath, "utf8")) as unknown;
+
+    expect(BenchmarkReportV4Schema.parse(portableReport)).toEqual(portableReport);
+    await expect(loadBenchmarkReportForPublication(portableReportPath)).rejects.toThrow(
+      /expected 3/u,
     );
   });
 

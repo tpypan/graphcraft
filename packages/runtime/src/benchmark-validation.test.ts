@@ -1,13 +1,19 @@
 import {
   BenchmarkReportV3Schema,
+  BenchmarkReportV4Schema,
   BenchmarkReviewLabelsSchema,
   BenchmarkSuiteSchema,
   BenchmarkTrialResultSchema,
+  BenchmarkTrialResultV4Schema,
+  LEGACY_CANONICAL_HASH_ALGORITHM,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
+  benchmarkReviewEvidenceDigest,
   benchmarkBlindingKeyDigest,
   contentHash,
   createBenchmarkSchedule,
   summarizeBenchmark,
   type BenchmarkReportV3,
+  type BenchmarkReportV4,
   type BenchmarkScheduleEntry,
   type BenchmarkSuite,
   type BenchmarkTask,
@@ -38,7 +44,11 @@ const suite: BenchmarkSuite = BenchmarkSuiteSchema.parse({
       id: "favorable-feature",
       family: "feature",
       task: "Implement the favorable feature",
-      initialFiles: { "score.mjs": "process.exit(0);\n", "source.js": "export {};\n" },
+      initialFiles: {
+        "Z.js": "export const sentinel = true;\n",
+        "score.mjs": "process.exit(0);\n",
+        "source.js": "export {};\n",
+      },
       checks: [{ command: "node", scorerPath: "score.mjs" }],
       acceptance: [{ kind: "exists", path: "result.js" }],
       repetitions: 3,
@@ -55,7 +65,10 @@ const suite: BenchmarkSuite = BenchmarkSuiteSchema.parse({
   ],
 });
 
-function reviewEvidence(mediaType: "text/x-diff" | "application/x-ndjson") {
+function reviewEvidence(
+  mediaType: "text/x-diff" | "application/x-ndjson",
+  packetSchemaVersion: 1 | 2 = 1,
+) {
   const text = mediaType === "text/x-diff" ? "+const fixed = true;\n" : "{}\n";
   const observedBytes = Buffer.byteLength(text);
   return {
@@ -65,7 +78,10 @@ function reviewEvidence(mediaType: "text/x-diff" | "application/x-ndjson") {
     retainedBytes: observedBytes,
     omittedBytes: 0,
     truncated: false,
-    digest: contentHash({ mediaType, text, observedBytes, omittedBytes: 0, truncated: false }),
+    digest: benchmarkReviewEvidenceDigest(
+      { mediaType, text, observedBytes, omittedBytes: 0, truncated: false },
+      packetSchemaVersion,
+    ),
   };
 }
 
@@ -132,6 +148,59 @@ function trialResult(task: BenchmarkTask, trial: BenchmarkScheduleEntry, graphcr
   });
 }
 
+function portableTrialResult(
+  task: BenchmarkTask,
+  trial: BenchmarkScheduleEntry,
+  graphcraftTokens: number,
+) {
+  const total = trial.mode === "baseline" ? 100 : graphcraftTokens;
+  const scorerDigest = expectedBenchmarkScorerDigest(task, PORTABLE_CANONICAL_HASH_ALGORITHM);
+  return BenchmarkTrialResultV4Schema.parse({
+    trial,
+    hostVersion: "codex-cli 0.144.6",
+    modelPolicy: model,
+    effortPolicy: "high",
+    permissionPolicy: permission,
+    acceptanceScorerDigest: scorerDigest,
+    observedScorerDigest: scorerDigest,
+    scorerVerified: true,
+    repositoryDigest: contentHash(task.initialFiles, PORTABLE_CANONICAL_HASH_ALGORITHM),
+    baseSha: contentHash({ fixture: task.id }).slice(0, 40),
+    executionStatus: "completed",
+    attemptCheckpoint: "settled",
+    accepted: true,
+    acceptance: acceptance(task),
+    usage: {
+      input: total - 10,
+      cachedInput: 0,
+      uncachedInput: total - 10,
+      output: 10,
+      reasoning: 0,
+      total,
+      availability: {
+        input: "reported",
+        cachedInput: "reported",
+        uncachedInput: "derived",
+        output: "reported",
+        reasoning: "reported",
+        total: "derived",
+      },
+    },
+    usageReconciled: true,
+    limitations: [],
+    durationMs: 1_000,
+    humanInterventions: 0,
+    failureTrace: [],
+    reviewPacket: {
+      schemaVersion: 2,
+      hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+      patch: reviewEvidence("text/x-diff", 2),
+      transcript: reviewEvidence("application/x-ndjson", 2),
+      captureFailures: [],
+    },
+  });
+}
+
 function reportFixture(graphcraftTokens = 70): BenchmarkReportV3 {
   const schedule = createBenchmarkSchedule({
     suite,
@@ -170,6 +239,54 @@ function reportFixture(graphcraftTokens = 70): BenchmarkReportV3 {
   });
 }
 
+function portableReportFixture(graphcraftTokens = 70): BenchmarkReportV4 {
+  const identity = {
+    schemaVersion: 4 as const,
+    hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+  };
+  const schedule = createBenchmarkSchedule({
+    suite,
+    hosts: ["codex"],
+    seed: "validation-seed",
+    identity,
+  });
+  const tasks = new Map(suite.tasks.map((task) => [task.id, task]));
+  const results = schedule.map((trial) =>
+    portableTrialResult(tasks.get(trial.taskId)!, trial, graphcraftTokens),
+  );
+  return BenchmarkReportV4Schema.parse({
+    schemaVersion: 4,
+    hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+    status: "complete",
+    suite: {
+      id: suite.id,
+      version: suite.version,
+      digest: contentHash(suite, PORTABLE_CANONICAL_HASH_ALGORITHM),
+    },
+    startedAt: "2026-07-25T20:00:00.000Z",
+    updatedAt: "2026-07-25T21:00:00.000Z",
+    seed: "validation-seed",
+    randomized: true,
+    modelPolicy: { codex: model },
+    effortPolicy: "high",
+    permissionPolicy: { codex: permission },
+    scorerPolicy: "fixture_bound_scorers_plus_suite_assertions",
+    reviewPolicy: "bounded_redacted_patch_and_transcript_v2",
+    modelCallTimeoutMs: 900_000,
+    environment: {
+      platform: "fixture-platform",
+      architecture: "fixture-architecture",
+      nodeVersion: "v22.17.0",
+      graphcraftVersion: "0.1.2",
+      graphcraftSource: { commitSha: "a".repeat(40), dirty: false, dirtyStatusDigest: null },
+    },
+    limitations: [...BENCHMARK_REPORT_LIMITATIONS],
+    schedule,
+    results,
+    summary: summarizeBenchmark(results, schedule, identity),
+  });
+}
+
 function rebuiltReport(
   report: BenchmarkReportV3,
   mutate: (copy: BenchmarkReportV3) => void,
@@ -201,9 +318,52 @@ function reviewLabels(report: BenchmarkReportV3) {
 }
 
 describe("benchmark report evidence validation", () => {
-  it("accepts an exact suite-derived schedule and harness-derived controls", () => {
-    const report = reportFixture();
-    expect(assertBenchmarkReportEvidence({ report, suite })).toEqual(report);
+  it("accepts exact legacy-v3 and portable-v4 identities", () => {
+    const legacy = reportFixture();
+    const portable = portableReportFixture();
+    expect(assertBenchmarkReportEvidence({ report: legacy, suite })).toEqual(legacy);
+    expect(assertBenchmarkReportEvidence({ report: portable, suite })).toEqual(portable);
+    expect(portable.schedule.map(({ order }) => order)).toEqual(
+      legacy.schedule.map(({ order }) => order),
+    );
+    expect(portable.schedule.map(({ trialId }) => trialId)).not.toEqual(
+      legacy.schedule.map(({ trialId }) => trialId),
+    );
+  });
+
+  it("rejects cross-version schedules and alternate-algorithm portable evidence", () => {
+    const legacy = reportFixture();
+    const portable = portableReportFixture();
+    expect(() =>
+      assertBenchmarkReportEvidence({
+        report: portable,
+        suite,
+        expectedSchedule: legacy.schedule,
+      }),
+    ).toThrow(/expected benchmark schedule does not match/u);
+
+    const legacySuiteDigest = structuredClone(portable);
+    expect(contentHash(suite, LEGACY_CANONICAL_HASH_ALGORITHM)).not.toBe(
+      contentHash(suite, PORTABLE_CANONICAL_HASH_ALGORITHM),
+    );
+    legacySuiteDigest.suite.digest = contentHash(suite, LEGACY_CANONICAL_HASH_ALGORITHM);
+    expect(() => assertBenchmarkReportEvidence({ report: legacySuiteDigest, suite })).toThrow(
+      /suite identity/u,
+    );
+
+    const alternateTrial = structuredClone(portable);
+    const task = suite.tasks.find(({ id }) => id === alternateTrial.results[0]!.trial.taskId)!;
+    alternateTrial.results[0]!.repositoryDigest = contentHash(
+      task.initialFiles,
+      LEGACY_CANONICAL_HASH_ALGORITHM,
+    );
+    alternateTrial.summary = summarizeBenchmark(alternateTrial.results, alternateTrial.schedule, {
+      schemaVersion: 4,
+      hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+    });
+    expect(() => assertBenchmarkReportEvidence({ report: alternateTrial, suite })).toThrow(
+      /mismatched trial controls or evidence/u,
+    );
   });
 
   it("cannot cherry-pick one favorable task and render a false PASS", () => {

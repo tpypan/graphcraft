@@ -14,9 +14,14 @@ import { basename, dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   BenchmarkSuiteSchema,
+  BenchmarkReportV3Schema,
+  BenchmarkReportV4Schema,
+  LEGACY_CANONICAL_HASH_ALGORITHM,
   MAX_BENCHMARK_MODEL_CALL_TIMEOUT_MS,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
   REQUIRED_HOST_PROTOCOL_CAPABILITIES,
   assertRequiredHostCapabilities,
+  contentHash,
   createBenchmarkSchedule,
   hostCapabilitiesFromProtocolProfile,
   reconcilePersistedInvocation,
@@ -36,9 +41,11 @@ import {
 } from "@graphcraft/core";
 import { runProcess } from "@graphcraft/probes";
 import {
+  DEFAULT_BENCHMARK_MODEL_CALL_TIMEOUT_MS,
   inspectBenchmarkSourceIdentity,
   runBenchmark as runBenchmarkRuntime,
 } from "./benchmark.ts";
+import { BENCHMARK_REPORT_LIMITATIONS } from "./benchmark-validation.ts";
 
 const temporaryRoots: string[] = [];
 const cleanBenchmarkSource = {
@@ -374,6 +381,75 @@ describe("benchmark harness", () => {
     });
   }
 
+  function emptyRunningReport(input: {
+    schemaVersion: 3 | 4;
+    suite: BenchmarkSuite;
+    seed: string;
+    model: string;
+    effort?: "low" | "medium" | "high" | "xhigh";
+    graphcraftVersion: string;
+  }) {
+    const identity =
+      input.schemaVersion === 4
+        ? {
+            schemaVersion: 4 as const,
+            hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+          }
+        : {
+            schemaVersion: 3 as const,
+            hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM,
+          };
+    const schedule = createBenchmarkSchedule({
+      suite: input.suite,
+      hosts: ["codex"],
+      seed: input.seed,
+      repetitions: 1,
+      identity,
+    });
+    const common = {
+      status: "running" as const,
+      suite: {
+        id: input.suite.id,
+        version: input.suite.version,
+        digest: contentHash(input.suite, identity.hashAlgorithm),
+      },
+      startedAt: "2026-07-25T00:00:00.000Z",
+      updatedAt: "2026-07-25T00:00:00.000Z",
+      seed: input.seed,
+      randomized: true as const,
+      modelPolicy: { codex: input.model },
+      effortPolicy: input.effort ?? "low",
+      permissionPolicy: {
+        codex: "codex_workspace_write_shell_external_not_graphcraft_enforced" as const,
+      },
+      scorerPolicy: "fixture_bound_scorers_plus_suite_assertions" as const,
+      modelCallTimeoutMs: DEFAULT_BENCHMARK_MODEL_CALL_TIMEOUT_MS,
+      environment: {
+        platform: process.platform,
+        architecture: process.arch,
+        nodeVersion: process.version,
+        graphcraftVersion: input.graphcraftVersion,
+        graphcraftSource: cleanBenchmarkSource,
+      },
+      limitations: [...BENCHMARK_REPORT_LIMITATIONS],
+      schedule,
+      results: [],
+      summary: summarizeBenchmark([], schedule, identity),
+    };
+    return input.schemaVersion === 4
+      ? BenchmarkReportV4Schema.parse({
+          schemaVersion: 4,
+          hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+          reviewPolicy: "bounded_redacted_patch_and_transcript_v2",
+          ...common,
+        })
+      : BenchmarkReportV3Schema.parse({
+          schemaVersion: 3,
+          reviewPolicy: "bounded_redacted_patch_and_transcript_v1",
+          ...common,
+        });
+  }
+
   function trackPreservedFixture(recovery: {
     fixtureRepository: string;
     lastKnownRepository: string;
@@ -437,6 +513,194 @@ describe("benchmark harness", () => {
     expect(await readFile(outputPath, "utf8")).toBe(v2Report);
   });
 
+  it("creates fresh schema-v4 reports with portable identities and versioned trial IDs", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-v4-fresh-"));
+    temporaryRoots.push(root);
+    const outputPath = join(root, "report.json");
+    const suite = interruptionSuite("v4-fresh");
+    const seed = "v4-fresh-seed";
+    const adapter = new BenchmarkAdapter();
+
+    const { report } = await runBenchmark({
+      suite,
+      hosts: ["codex"],
+      adapters: { codex: adapter },
+      policies: { codex: { model: "v4-fresh-fixture", effort: "low" } },
+      graphcraftVersion: "0.1.2-v4-fresh-fixture",
+      seed,
+      repetitions: 1,
+      outputPath,
+    });
+
+    expect(report).toMatchObject({
+      schemaVersion: 4,
+      hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+      reviewPolicy: "bounded_redacted_patch_and_transcript_v2",
+    });
+    expect(report.results).toHaveLength(2);
+    expect(
+      report.results.every(
+        ({ reviewPacket }) =>
+          reviewPacket?.schemaVersion === 2 &&
+          reviewPacket.hashAlgorithm === PORTABLE_CANONICAL_HASH_ALGORITHM,
+      ),
+    ).toBe(true);
+    const legacySchedule = createBenchmarkSchedule({
+      suite,
+      hosts: ["codex"],
+      seed,
+      repetitions: 1,
+      identity: {
+        schemaVersion: 3,
+        hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM,
+      },
+    });
+    expect(report.schedule.map(({ trialId: _trialId, ...entry }) => entry)).toEqual(
+      legacySchedule.map(({ trialId: _trialId, ...entry }) => entry),
+    );
+    expect(report.schedule.map(({ trialId }) => trialId)).not.toEqual(
+      legacySchedule.map(({ trialId }) => trialId),
+    );
+    expect(JSON.parse(await readFile(outputPath, "utf8"))).toEqual(report);
+  });
+
+  it("resumes a running schema-v3 report with exact legacy identities", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-v3-resume-"));
+    temporaryRoots.push(root);
+    const outputPath = join(root, "report.json");
+    const suite = interruptionSuite("v3-resume");
+    const seed = "v3-resume-seed";
+    const model = "v3-resume-fixture";
+    const graphcraftVersion = "0.1.2-v3-resume-fixture";
+    const running = emptyRunningReport({
+      schemaVersion: 3,
+      suite,
+      seed,
+      model,
+      graphcraftVersion,
+    });
+    await writeFile(outputPath, `${JSON.stringify(running, null, 2)}\n`, "utf8");
+    const adapter = new BenchmarkAdapter();
+
+    const { report } = await runBenchmark({
+      suite,
+      hosts: ["codex"],
+      adapters: { codex: adapter },
+      policies: { codex: { model, effort: "low" } },
+      graphcraftVersion,
+      seed,
+      repetitions: 1,
+      outputPath,
+    });
+
+    expect(report.schemaVersion).toBe(3);
+    expect(report.schedule).toEqual(running.schedule);
+    expect(report.results).toHaveLength(2);
+    expect(report.results.every(({ reviewPacket }) => reviewPacket?.schemaVersion === 1)).toBe(
+      true,
+    );
+    expect(adapter.probeCalls).toBeGreaterThan(0);
+  });
+
+  it("leaves a complete schema-v3 report byte-identical on reopen", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-v3-complete-"));
+    temporaryRoots.push(root);
+    const outputPath = join(root, "report.json");
+    const suite = interruptionSuite("v3-complete");
+    const seed = "v3-complete-seed";
+    const model = "v3-complete-fixture";
+    const graphcraftVersion = "0.1.2-v3-complete-fixture";
+    const running = emptyRunningReport({
+      schemaVersion: 3,
+      suite,
+      seed,
+      model,
+      graphcraftVersion,
+    });
+    await writeFile(outputPath, `${JSON.stringify(running, null, 2)}\n`, "utf8");
+    await runBenchmark({
+      suite,
+      hosts: ["codex"],
+      adapters: { codex: new BenchmarkAdapter() },
+      policies: { codex: { model, effort: "low" } },
+      graphcraftVersion,
+      seed,
+      repetitions: 1,
+      outputPath,
+    });
+    const completeBytes = await readFile(outputPath);
+
+    const reopened = await runBenchmark({
+      suite,
+      hosts: ["codex"],
+      adapters: {},
+      policies: { codex: { model, effort: "low" } },
+      graphcraftVersion,
+      seed,
+      repetitions: 1,
+      outputPath,
+    });
+
+    expect(reopened.report.schemaVersion).toBe(3);
+    expect(await readFile(outputPath)).toEqual(completeBytes);
+  });
+
+  it.each([
+    { name: "legacy v3 identities relabelled as portable v4", from: 3 as const },
+    { name: "portable v4 identities relabelled as legacy v3", from: 4 as const },
+  ])("rejects $name before any adapter call", async ({ from }) => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-relabel-"));
+    temporaryRoots.push(root);
+    const outputPath = join(root, "report.json");
+    const suite = interruptionSuite(`relabel-${from}`);
+    const seed = `relabel-${from}-seed`;
+    const model = `relabel-${from}-fixture`;
+    const graphcraftVersion = `0.1.2-relabel-${from}-fixture`;
+    const original = emptyRunningReport({
+      schemaVersion: from,
+      suite,
+      seed,
+      model,
+      graphcraftVersion,
+    });
+    const relabelled =
+      from === 3
+        ? {
+            ...original,
+            schemaVersion: 4,
+            hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+            reviewPolicy: "bounded_redacted_patch_and_transcript_v2",
+          }
+        : Object.fromEntries(
+            Object.entries({
+              ...original,
+              schemaVersion: 3,
+              reviewPolicy: "bounded_redacted_patch_and_transcript_v1",
+            }).filter(([key]) => key !== "hashAlgorithm"),
+          );
+    const originalBytes = `${JSON.stringify(relabelled, null, 2)}\n`;
+    await writeFile(outputPath, originalBytes, "utf8");
+    const adapter = new BenchmarkAdapter();
+
+    await expect(
+      runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: { codex: adapter },
+        policies: { codex: { model, effort: "low" } },
+        graphcraftVersion,
+        seed,
+        repetitions: 1,
+        outputPath,
+      }),
+    ).rejects.toThrow(/trial ID does not match|does not match this suite and schedule/);
+    expect(adapter.probeCalls).toBe(0);
+    expect(adapter.planCalls).toBe(0);
+    expect(adapter.workerRequests).toHaveLength(0);
+    expect(adapter.verifyCalls).toBe(0);
+    expect(await readFile(outputPath, "utf8")).toBe(originalBytes);
+  });
+
   it("persists an abort-ignoring host preflight and refuses every probe on resume", async () => {
     const root = await mkdtemp(join(tmpdir(), "graphcraft-benchmark-unsettled-preflight-"));
     temporaryRoots.push(root);
@@ -461,7 +725,7 @@ describe("benchmark harness", () => {
     expect(adapter.probeCalls).toBe(1);
     expect(adapter.activeProbeCalls).toBe(1);
     expect(JSON.parse(await readFile(outputPath, "utf8"))).toMatchObject({
-      schemaVersion: 3,
+      schemaVersion: 4,
       status: "running",
       hostPreflightCheckpoint: {
         host: "codex",
@@ -517,7 +781,7 @@ describe("benchmark harness", () => {
     const checkpoint = JSON.parse(await readFile(outputPath, "utf8"));
     expect(checkpoint.hostPreflightCheckpoint).toBeUndefined();
     expect(checkpoint).toMatchObject({
-      schemaVersion: 3,
+      schemaVersion: 4,
       status: "running",
       results: [
         {
@@ -697,7 +961,7 @@ describe("benchmark harness", () => {
 
       const checkpoint = JSON.parse(await readFile(outputPath, "utf8"));
       expect(checkpoint).toMatchObject({
-        schemaVersion: 3,
+        schemaVersion: 4,
         status: "running",
         results: [
           {
@@ -771,7 +1035,7 @@ describe("benchmark harness", () => {
 
     const checkpoint = JSON.parse(await readFile(outputPath, "utf8"));
     expect(checkpoint).toMatchObject({
-      schemaVersion: 3,
+      schemaVersion: 4,
       status: "running",
       results: [
         {
@@ -846,7 +1110,7 @@ describe("benchmark harness", () => {
 
     const checkpoint = JSON.parse(await readFile(outputPath, "utf8"));
     expect(checkpoint).toMatchObject({
-      schemaVersion: 3,
+      schemaVersion: 4,
       status: "running",
       results: [
         {
@@ -981,7 +1245,7 @@ describe("benchmark harness", () => {
     ).rejects.toThrow("simulated process loss");
     const provisional = JSON.parse(await readFile(outputPath, "utf8"));
     expect(provisional).toMatchObject({
-      schemaVersion: 3,
+      schemaVersion: 4,
       status: "running",
       results: [
         {
@@ -1602,7 +1866,7 @@ describe("benchmark harness", () => {
       expect(persisted.environment.graphcraftSource?.commitSha).toMatch(
         /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/,
       );
-      expect(persisted.reviewPolicy).toBe("bounded_redacted_patch_and_transcript_v1");
+      expect(persisted.reviewPolicy).toBe("bounded_redacted_patch_and_transcript_v2");
       expect(persisted.summary).toMatchObject({
         codex: {
           baseline: { trials: 1, accepted: 1 },
@@ -1748,7 +2012,29 @@ describe("benchmark harness", () => {
       );
 
       const legacyOutputPath = join(root, "legacy-truncated-transcript-report.json");
-      const legacyReport = structuredClone(truncatedTranscript.report);
+      const legacySeed = "bounded-transcript-seed";
+      const legacyRunning = emptyRunningReport({
+        schemaVersion: 3,
+        suite,
+        seed: legacySeed,
+        model: policies.codex!.model,
+        effort: policies.codex!.effort,
+        graphcraftVersion,
+      });
+      await writeFile(legacyOutputPath, `${JSON.stringify(legacyRunning, null, 2)}\n`, "utf8");
+      const legacyCompleted = await runBenchmark({
+        suite,
+        hosts: ["codex"],
+        adapters: { codex: new BenchmarkAdapter({ baselineTranscriptMessageCount: 48 }) },
+        policies,
+        graphcraftVersion,
+        seed: legacySeed,
+        repetitions: 1,
+        outputPath: legacyOutputPath,
+      });
+      if (legacyCompleted.report.schemaVersion !== 3)
+        throw new Error("Expected the legacy benchmark fixture to remain schema v3");
+      const legacyReport = structuredClone(legacyCompleted.report);
       const legacyBaseline = legacyReport.results.find(({ trial }) => trial.mode === "baseline")!;
       legacyBaseline.accepted = true;
       legacyBaseline.reviewPacket!.captureFailures = [];
@@ -1761,7 +2047,10 @@ describe("benchmark harness", () => {
       )!;
       legacySummaryBaseline.accepted = true;
       delete legacySummaryBaseline.reviewPacket;
-      legacyReport.summary = summarizeBenchmark(legacySummaryResults, legacyReport.schedule);
+      legacyReport.summary = summarizeBenchmark(legacySummaryResults, legacyReport.schedule, {
+        schemaVersion: 3,
+        hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM,
+      });
       await writeFile(legacyOutputPath, `${JSON.stringify(legacyReport, null, 2)}\n`, "utf8");
 
       const migratedLegacy = await runBenchmark({
@@ -1988,7 +2277,10 @@ describe("benchmark harness", () => {
       ).rejects.toThrow("Graphcraft source identity does not match this execution");
 
       persisted.results[0]!.acceptanceScorerDigest = "tampered-scorer";
-      persisted.summary = summarizeBenchmark(persisted.results, persisted.schedule);
+      persisted.summary = summarizeBenchmark(persisted.results, persisted.schedule, {
+        schemaVersion: 4,
+        hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+      });
       await writeFile(outputPath, JSON.stringify(persisted), "utf8");
       await expect(
         runBenchmark({

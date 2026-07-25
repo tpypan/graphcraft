@@ -228,6 +228,10 @@ program
         hosts,
         seed: options.seed,
         ...(repetitions ? { repetitions } : {}),
+        identity: {
+          schemaVersion: 4,
+          hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
+        },
       });
       if (options.dryRun) {
         console.log(

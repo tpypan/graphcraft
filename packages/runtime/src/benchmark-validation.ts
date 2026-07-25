@@ -1,14 +1,28 @@
 import {
   BenchmarkReportV3Schema,
+  BenchmarkReportV4Schema,
   BenchmarkSuiteSchema,
+  LEGACY_CANONICAL_HASH_ALGORITHM,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
   contentHash,
   createBenchmarkSchedule,
+  type CanonicalHashAlgorithm,
   type BenchmarkPermissionPolicy,
   type BenchmarkReportV3,
+  type BenchmarkReportV4,
+  type BenchmarkReportIdentityPolicy,
   type BenchmarkScheduleEntry,
   type BenchmarkSuite,
   type BenchmarkTask,
 } from "@graphcraft/core";
+
+type EvidenceBenchmarkReport = BenchmarkReportV3 | BenchmarkReportV4;
+
+function reportIdentity(report: EvidenceBenchmarkReport): BenchmarkReportIdentityPolicy {
+  return report.schemaVersion === 4
+    ? { schemaVersion: 4, hashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM }
+    : { schemaVersion: 3, hashAlgorithm: LEGACY_CANONICAL_HASH_ALGORITHM };
+}
 
 export const BENCHMARK_REPORT_LIMITATIONS = [
   "Stable efficiency claims require at least three jointly accepted reconciled baseline/Graphcraft pairs per task and host.",
@@ -23,20 +37,26 @@ export function benchmarkPermissionPolicy(host: "codex" | "claude"): BenchmarkPe
     : "claude_accept_edits_bash_external_not_graphcraft_enforced";
 }
 
-function expectedScorerFiles(task: BenchmarkTask) {
+function expectedScorerFiles(task: BenchmarkTask, hashAlgorithm: CanonicalHashAlgorithm) {
   return [...new Set(task.checks.map(({ scorerPath }) => scorerPath))].sort().map((path) => ({
     path,
     kind: "regular_file" as const,
-    digest: contentHash(task.initialFiles[path]),
+    digest: contentHash(task.initialFiles[path], hashAlgorithm),
   }));
 }
 
-export function expectedBenchmarkScorerDigest(task: BenchmarkTask): string {
-  return contentHash({
-    checks: task.checks,
-    acceptance: task.acceptance,
-    files: expectedScorerFiles(task),
-  });
+export function expectedBenchmarkScorerDigest(
+  task: BenchmarkTask,
+  hashAlgorithm: CanonicalHashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM,
+): string {
+  return contentHash(
+    {
+      checks: task.checks,
+      acceptance: task.acceptance,
+      files: expectedScorerFiles(task, hashAlgorithm),
+    },
+    hashAlgorithm,
+  );
 }
 
 function expectedAcceptancePaths(task: BenchmarkTask): string[] {
@@ -48,7 +68,7 @@ function expectedAcceptancePaths(task: BenchmarkTask): string[] {
   ];
 }
 
-function validTokenEvidence(result: BenchmarkReportV3["results"][number]): boolean {
+function validTokenEvidence(result: EvidenceBenchmarkReport["results"][number]): boolean {
   const known = (value: string): boolean => value === "reported" || value === "derived";
   const reconciled = known(result.usage.availability.total);
   if (result.usageReconciled !== reconciled) return false;
@@ -68,16 +88,21 @@ function validTokenEvidence(result: BenchmarkReportV3["results"][number]): boole
 }
 
 function exactSchedule(
-  report: BenchmarkReportV3,
+  report: EvidenceBenchmarkReport,
   suite: BenchmarkSuite,
+  identity: BenchmarkReportIdentityPolicy,
   expected?: readonly BenchmarkScheduleEntry[],
 ): BenchmarkScheduleEntry[] {
   const hosts = [...new Set(report.schedule.map(({ host }) => host))].sort() as Array<
     "codex" | "claude"
   >;
-  const defaults = createBenchmarkSchedule({ suite, hosts, seed: report.seed });
+  const defaults = createBenchmarkSchedule({ suite, hosts, seed: report.seed, identity });
   let derived: BenchmarkScheduleEntry[] | undefined;
-  if (contentHash(defaults) === contentHash(report.schedule)) derived = defaults;
+  if (
+    contentHash(defaults, identity.hashAlgorithm) ===
+    contentHash(report.schedule, identity.hashAlgorithm)
+  )
+    derived = defaults;
 
   if (derived === undefined) {
     const counts = new Map<string, number>();
@@ -92,13 +117,21 @@ function exactSchedule(
         hosts,
         seed: report.seed,
         repetitions: repetitions[0]!,
+        identity,
       });
-      if (contentHash(overridden) === contentHash(report.schedule)) derived = overridden;
+      if (
+        contentHash(overridden, identity.hashAlgorithm) ===
+        contentHash(report.schedule, identity.hashAlgorithm)
+      )
+        derived = overridden;
     }
   }
   if (derived === undefined)
     throw new Error("The benchmark report schedule does not exactly cover its declared suite");
-  if (expected && contentHash(expected) !== contentHash(derived))
+  if (
+    expected &&
+    contentHash(expected, identity.hashAlgorithm) !== contentHash(derived, identity.hashAlgorithm)
+  )
     throw new Error("The expected benchmark schedule does not match the declared suite");
   return expected ? [...expected] : derived;
 }
@@ -117,28 +150,35 @@ function definedPolicyHosts(value: {
  * Revalidate a report against public suite evidence instead of trusting a
  * self-consistent schema object or its derived summary.
  */
-export function assertBenchmarkReportEvidence(input: {
-  report: BenchmarkReportV3;
+export function assertBenchmarkReportEvidence<T extends EvidenceBenchmarkReport>(input: {
+  report: T;
   suite: BenchmarkSuite;
   expectedSchedule?: readonly BenchmarkScheduleEntry[];
-}): BenchmarkReportV3 {
-  const report = BenchmarkReportV3Schema.parse(input.report);
+}): T {
+  const report: EvidenceBenchmarkReport =
+    input.report.schemaVersion === 4
+      ? BenchmarkReportV4Schema.parse(input.report)
+      : BenchmarkReportV3Schema.parse(input.report);
+  const identity = reportIdentity(report);
+  const hashAlgorithm = identity.hashAlgorithm;
   const suite = BenchmarkSuiteSchema.parse(input.suite);
   if (
     report.suite.id !== suite.id ||
     report.suite.version !== suite.version ||
-    report.suite.digest !== contentHash(suite)
+    report.suite.digest !== contentHash(suite, hashAlgorithm)
   ) {
     throw new Error("The benchmark report does not match its declared suite identity");
   }
 
-  const schedule = exactSchedule(report, suite, input.expectedSchedule);
-  if (contentHash(schedule) !== contentHash(report.schedule))
+  const schedule = exactSchedule(report, suite, identity, input.expectedSchedule);
+  if (contentHash(schedule, hashAlgorithm) !== contentHash(report.schedule, hashAlgorithm))
     throw new Error("The benchmark report schedule does not match the expected execution");
   const hosts = [...new Set(schedule.map(({ host }) => host))].sort();
   if (
-    contentHash(definedPolicyHosts(report.modelPolicy)) !== contentHash(hosts) ||
-    contentHash(definedPolicyHosts(report.permissionPolicy)) !== contentHash(hosts)
+    contentHash(definedPolicyHosts(report.modelPolicy), hashAlgorithm) !==
+      contentHash(hosts, hashAlgorithm) ||
+    contentHash(definedPolicyHosts(report.permissionPolicy), hashAlgorithm) !==
+      contentHash(hosts, hashAlgorithm)
   ) {
     throw new Error("The benchmark report host policies do not match its schedule");
   }
@@ -146,7 +186,10 @@ export function assertBenchmarkReportEvidence(input: {
     if (report.permissionPolicy[host] !== benchmarkPermissionPolicy(host))
       throw new Error("The benchmark report permission policy does not match its host");
   }
-  if (contentHash(report.limitations) !== contentHash(BENCHMARK_REPORT_LIMITATIONS))
+  if (
+    contentHash(report.limitations, hashAlgorithm) !==
+    contentHash(BENCHMARK_REPORT_LIMITATIONS, hashAlgorithm)
+  )
     throw new Error("The benchmark report limitations do not match this harness");
 
   const scheduleById = new Map(schedule.map((trial) => [trial.trialId, trial]));
@@ -154,9 +197,13 @@ export function assertBenchmarkReportEvidence(input: {
   for (const result of report.results) {
     const scheduled = scheduleById.get(result.trial.trialId);
     const task = taskById.get(result.trial.taskId);
-    if (!scheduled || contentHash(scheduled) !== contentHash(result.trial) || !task)
+    if (
+      !scheduled ||
+      contentHash(scheduled, hashAlgorithm) !== contentHash(result.trial, hashAlgorithm) ||
+      !task
+    )
       throw new Error("The benchmark report contains a result outside its exact suite schedule");
-    const expectedScorerDigest = expectedBenchmarkScorerDigest(task);
+    const expectedScorerDigest = expectedBenchmarkScorerDigest(task, hashAlgorithm);
     const scorerVerified = result.acceptanceScorerDigest === result.observedScorerDigest;
     const reviewComplete =
       result.reviewPacket !== undefined &&
@@ -173,16 +220,18 @@ export function assertBenchmarkReportEvidence(input: {
       result.effortPolicy !== report.effortPolicy ||
       result.permissionPolicy !== report.permissionPolicy[result.trial.host] ||
       result.permissionPolicy !== benchmarkPermissionPolicy(result.trial.host) ||
-      result.repositoryDigest !== contentHash(task.initialFiles) ||
+      result.repositoryDigest !== contentHash(task.initialFiles, hashAlgorithm) ||
       result.acceptanceScorerDigest !== expectedScorerDigest ||
       result.scorerVerified !== scorerVerified ||
       !validTokenEvidence(result) ||
-      contentHash(result.acceptance.map(({ path }) => path)) !==
-        contentHash(expectedAcceptancePaths(task)) ||
+      contentHash(
+        result.acceptance.map(({ path }) => path),
+        hashAlgorithm,
+      ) !== contentHash(expectedAcceptancePaths(task), hashAlgorithm) ||
       result.accepted !== accepted
     ) {
       throw new Error("The benchmark report contains mismatched trial controls or evidence");
     }
   }
-  return report;
+  return report as T;
 }
