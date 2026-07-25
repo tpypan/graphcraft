@@ -783,7 +783,8 @@ describe("run-state retention", () => {
             key !== "artifactPolicy" &&
             key !== "workspaceScopeSnapshots" &&
             key !== "probeEvidenceCheckpoints" &&
-            key !== "governanceControlIdentities",
+            key !== "governanceControlIdentities" &&
+            key !== "repositorySideEffectIdentities",
         ),
       ),
       heldOutProbes: 1,
@@ -802,6 +803,7 @@ describe("run-state retention", () => {
       if (event.type === "run.created") {
         delete data.probeEvidenceCheckpointFormat;
         delete data.governanceControlIdentityFormat;
+        delete data.repositorySideEffectIdentityFormat;
       }
       return createRunEvent({
         sequence: event.sequence,

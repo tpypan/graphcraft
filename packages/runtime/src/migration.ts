@@ -73,6 +73,7 @@ type ArtifactInventoryFormat = 1 | 2;
 type WorkspaceScopeSnapshotFormat = 1 | 2;
 type ProbeEvidenceCheckpointFormat = 1 | 2;
 type GovernanceControlIdentityFormat = 1 | 2;
+type RepositorySideEffectIdentityFormat = 1 | 2;
 type CurrentRunStorageManifest = Extract<RunStorageManifest, { schemaVersion: 3 }>;
 
 interface LegacyStorage {
@@ -95,6 +96,7 @@ function manifest(
   workspaceScopeSnapshotFormat: WorkspaceScopeSnapshotFormat,
   probeEvidenceCheckpointFormat: ProbeEvidenceCheckpointFormat,
   governanceControlIdentityFormat: GovernanceControlIdentityFormat,
+  repositorySideEffectIdentityFormat: RepositorySideEffectIdentityFormat,
   initialization: "initializing" | "ready",
 ): CurrentRunStorageManifest {
   return RunStorageManifestSchema.parse({
@@ -122,6 +124,7 @@ function manifest(
       workspaceScopeSnapshots: workspaceScopeSnapshotFormat,
       probeEvidenceCheckpoints: probeEvidenceCheckpointFormat,
       governanceControlIdentities: governanceControlIdentityFormat,
+      repositorySideEffectIdentities: repositorySideEffectIdentityFormat,
     },
   }) as CurrentRunStorageManifest;
 }
@@ -151,6 +154,7 @@ async function persistCurrentRunStorageManifest(
   workspaceScopeSnapshotFormat: WorkspaceScopeSnapshotFormat,
   probeEvidenceCheckpointFormat: ProbeEvidenceCheckpointFormat,
   governanceControlIdentityFormat: GovernanceControlIdentityFormat,
+  repositorySideEffectIdentityFormat: RepositorySideEffectIdentityFormat,
   initialization: "initializing" | "ready",
   lease?: MigrationLeaseContext,
 ): Promise<CurrentRunStorageManifest> {
@@ -163,6 +167,7 @@ async function persistCurrentRunStorageManifest(
     workspaceScopeSnapshotFormat,
     probeEvidenceCheckpointFormat,
     governanceControlIdentityFormat,
+    repositorySideEffectIdentityFormat,
     initialization,
   );
   await migrationStep(lease, async () => await ensurePrivateDirectory(runRoot));
@@ -192,6 +197,7 @@ export async function writeCurrentRunStorageManifest(
     2,
     2,
     2,
+    2,
     "ready",
   );
 }
@@ -205,6 +211,7 @@ export async function writeInitializingRunStorageManifest(
     runId,
     CURRENT_RUN_STORAGE_VERSION,
     PORTABLE_CANONICAL_HASH_ALGORITHM,
+    2,
     2,
     2,
     2,
@@ -1682,6 +1689,15 @@ async function validateInitializingRunStorage(
     throw new Error(
       `Run ${runId} has a governance/control identity format that disagrees with its schema-v3 initialization descriptor. No files were changed.`,
     );
+  const repositorySideEffectFormat = first.data.repositorySideEffectIdentityFormat;
+  const repositorySideEffectFormatMismatch =
+    manifest.formats.repositorySideEffectIdentities === 2
+      ? repositorySideEffectFormat !== 2
+      : repositorySideEffectFormat !== undefined;
+  if (repositorySideEffectFormatMismatch)
+    throw new Error(
+      `Run ${runId} has a repository side-effect identity format that disagrees with its schema-v3 initialization descriptor. No files were changed.`,
+    );
   try {
     validateHeldOutProbePlan(
       HeldOutProbePlanSchema.parse(first.data.heldOutProbePlan),
@@ -1762,6 +1778,7 @@ export async function ensureCurrentRunStorage(input: {
         storage.manifest.formats.workspaceScopeSnapshots,
         storage.manifest.formats.probeEvidenceCheckpoints,
         storage.manifest.formats.governanceControlIdentities,
+        storage.manifest.formats.repositorySideEffectIdentities,
         "ready",
         lease,
       );
@@ -1814,6 +1831,7 @@ export async function ensureCurrentRunStorage(input: {
       input.runId,
       storage.version,
       LEGACY_CANONICAL_HASH_ALGORITHM,
+      1,
       1,
       1,
       1,

@@ -98,7 +98,8 @@ export class RunStoreEventLogCorruptionError extends Error {
       | "sequence"
       | "scope"
       | "checkpoint"
-      | "governance",
+      | "governance"
+      | "repository_side_effect",
   ) {
     const location = trailing ? "trailing record" : `record ${record}`;
     const problem =
@@ -118,7 +119,9 @@ export class RunStoreEventLogCorruptionError extends Error {
                     ? "a probe-evidence checkpoint format that disagrees with its storage manifest"
                     : reason === "governance"
                       ? "a governance/control identity format that disagrees with its storage manifest"
-                      : "an invalid event sequence";
+                      : reason === "repository_side_effect"
+                        ? "a repository side-effect identity format that disagrees with its storage manifest"
+                        : "an invalid event sequence";
     super(
       `Run event log has ${problem} in ${location} at byte ${offsetBytes}; event log bytes were left unchanged`,
     );
@@ -228,6 +231,15 @@ function governanceControlIdentityUsesDifferentFormat(
   return selected === PORTABLE_CANONICAL_HASH_ALGORITHM ? format !== 2 : format !== undefined;
 }
 
+function repositorySideEffectIdentityUsesDifferentFormat(
+  event: RunEvent,
+  selected: CanonicalHashAlgorithm,
+): boolean {
+  if (event.type !== "run.created") return false;
+  const format = event.data.repositorySideEffectIdentityFormat;
+  return selected === PORTABLE_CANONICAL_HASH_ALGORITHM ? format !== 2 : format !== undefined;
+}
+
 export class RunStore {
   readonly repositoryRoot: string;
   readonly runId: string;
@@ -244,6 +256,7 @@ export class RunStore {
   private _workspaceScopeHashAlgorithm: CanonicalHashAlgorithm | undefined;
   private _probeEvidenceCheckpointHashAlgorithm: CanonicalHashAlgorithm | undefined;
   private _governanceControlIdentityHashAlgorithm: CanonicalHashAlgorithm | undefined;
+  private _repositorySideEffectIdentityHashAlgorithm: CanonicalHashAlgorithm | undefined;
 
   constructor(
     repositoryRoot: string,
@@ -316,6 +329,11 @@ export class RunStore {
           ? PORTABLE_CANONICAL_HASH_ALGORITHM
           : LEGACY_CANONICAL_HASH_ALGORITHM;
       this.bindGovernanceControlIdentityHashAlgorithm(governanceControlIdentityHashAlgorithm);
+      const repositorySideEffectIdentityHashAlgorithm =
+        manifest.formats.repositorySideEffectIdentities === 2
+          ? PORTABLE_CANONICAL_HASH_ALGORITHM
+          : LEGACY_CANONICAL_HASH_ALGORITHM;
+      this.bindRepositorySideEffectIdentityHashAlgorithm(repositorySideEffectIdentityHashAlgorithm);
       await this.validateStorageRoot();
     } catch (error) {
       if (this.storageReady === ready) this.storageReady = undefined;
@@ -363,6 +381,14 @@ export class RunStore {
     return this._governanceControlIdentityHashAlgorithm;
   }
 
+  get repositorySideEffectIdentityHashAlgorithm(): CanonicalHashAlgorithm {
+    if (!this._repositorySideEffectIdentityHashAlgorithm)
+      throw new Error(
+        "Repository side-effect identity hash policy is unavailable before run storage is prepared",
+      );
+    return this._repositorySideEffectIdentityHashAlgorithm;
+  }
+
   private bindArtifactHashAlgorithm(algorithm: CanonicalHashAlgorithm): void {
     if (this.artifactStore && this.artifactStore.hashAlgorithm !== algorithm)
       throw new Error("Artifact store was bound before its storage manifest policy was known");
@@ -397,6 +423,17 @@ export class RunStore {
         "Governance/control identity hashing was bound before its storage manifest policy was known",
       );
     this._governanceControlIdentityHashAlgorithm = algorithm;
+  }
+
+  private bindRepositorySideEffectIdentityHashAlgorithm(algorithm: CanonicalHashAlgorithm): void {
+    if (
+      this._repositorySideEffectIdentityHashAlgorithm &&
+      this._repositorySideEffectIdentityHashAlgorithm !== algorithm
+    )
+      throw new Error(
+        "Repository side-effect identity hashing was bound before its storage manifest policy was known",
+      );
+    this._repositorySideEffectIdentityHashAlgorithm = algorithm;
   }
 
   private artifacts(): RunArtifactStore {
@@ -490,6 +527,7 @@ export class RunStore {
     store.bindWorkspaceScopeHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     store.bindProbeEvidenceCheckpointHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     store.bindGovernanceControlIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    store.bindRepositorySideEffectIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     const persistedContract = RunContractSchema.parse(redactValue(contract));
     const persistedGraph = GraphSchema.parse(redactValue(graph));
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
@@ -528,6 +566,7 @@ export class RunStore {
           nodeIds: graph.nodes.map(({ id }) => id),
           probeEvidenceCheckpointFormat: 2,
           governanceControlIdentityFormat: 2,
+          repositorySideEffectIdentityFormat: 2,
         },
       },
       store.canonicalHashAlgorithm,
@@ -896,6 +935,18 @@ export class RunStore {
         )
       )
         throw new RunStoreEventLogCorruptionError(record, offset, trailing, "governance");
+      if (
+        repositorySideEffectIdentityUsesDifferentFormat(
+          event,
+          this.repositorySideEffectIdentityHashAlgorithm,
+        )
+      )
+        throw new RunStoreEventLogCorruptionError(
+          record,
+          offset,
+          trailing,
+          "repository_side_effect",
+        );
       const scopeSnapshot = eventWorkspaceScopeSnapshot(event);
       if (
         scopeSnapshot !== undefined &&

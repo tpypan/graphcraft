@@ -6532,6 +6532,179 @@ process.stdin.on("end", () => {
     expect(remoteHead.trim()).toBe(localHead.trim());
   });
 
+  it.each([1, 2] as const)(
+    "deduplicates format-v%s repository side effects across three cold restarts",
+    async (format) => {
+      const { repository, remote } = await createRepositoryWithRemote();
+      const adapter = new FakeAdapter(async (request) => {
+        if (request.capsule.nodeId === "implement")
+          await writeFile(join(request.repositoryPath, "feature.txt"), "pushed\n");
+      });
+      const created = await createRun("Implement the feature and push the verified changes", {
+        cwd: repository,
+        finishLine: "pushed",
+        planner: adapter,
+      });
+      if (format === 1) {
+        const events = await created.store.loadEvents();
+        const rewritten = events.map((event) => {
+          if (event.type !== "run.created") return event;
+          const data = { ...event.data };
+          delete data.repositorySideEffectIdentityFormat;
+          return createRunEvent(
+            {
+              sequence: event.sequence,
+              timestamp: event.timestamp,
+              actor: event.actor,
+              causationId: event.causationId,
+              type: event.type,
+              data,
+            },
+            PORTABLE_CANONICAL_HASH_ALGORITHM,
+          );
+        });
+        await writeFile(
+          created.store.eventsPath(),
+          `${rewritten.map((event) => JSON.stringify(event)).join("\n")}\n`,
+        );
+        const storagePath = join(created.store.runRoot, "storage.json");
+        const descriptor = JSON.parse(await readFile(storagePath, "utf8")) as {
+          formats: { repositorySideEffectIdentities?: number };
+        };
+        delete descriptor.formats.repositorySideEffectIdentities;
+        await writeFile(storagePath, `${JSON.stringify(descriptor, null, 2)}\n`);
+      }
+
+      const algorithm =
+        format === 1 ? LEGACY_CANONICAL_HASH_ALGORITHM : PORTABLE_CANONICAL_HASH_ALGORITHM;
+      const stores: RunStore[] = [];
+      const reopen = async (): Promise<RunStore> => {
+        const store = new RunStore(repository, created.store.runId);
+        await store.prepareStorage();
+        expect(store.repositorySideEffectIdentityHashAlgorithm).toBe(algorithm);
+        stores.push(store);
+        return store;
+      };
+      const interrupt = async (
+        store: RunStore,
+        point: SideEffectBoundary,
+        kind: "git_commit" | "git_push",
+      ): Promise<void> => {
+        await expect(
+          executeRun({
+            store,
+            adapter,
+            approve: true,
+            sideEffectBoundary: async (observed) => {
+              const state = await store.loadState();
+              if (observed === point && state.sideEffects.at(-1)?.claim.kind === kind)
+                throw new Error(`Interrupt ${kind} at ${point}`);
+            },
+          }),
+        ).rejects.toThrow(`Side-effect execution interrupted after ${point}`);
+      };
+      const localeCompare = vi
+        .spyOn(String.prototype, "localeCompare")
+        .mockImplementation(function (this: string, other: string) {
+          const left = String(this);
+          return left < other ? 1 : left > other ? -1 : 0;
+        });
+      let expectedCommitActionId = "";
+      let expectedCommitContentDigest = "";
+      let expectedPushActionId = "";
+      let completed: Awaited<ReturnType<typeof executeRun>> | undefined;
+      try {
+        expectedCommitActionId = contentHash(
+          {
+            schemaVersion: 1,
+            runId: created.contract.runId,
+            nodeId: "commit",
+            kind: "git_commit",
+          },
+          algorithm,
+        );
+        expectedCommitContentDigest = contentHash(
+          [
+            {
+              path: "feature.txt",
+              kind: "file",
+              executable: false,
+              contents: Buffer.from("pushed\n").toString("base64"),
+            },
+          ],
+          algorithm,
+        );
+        expectedPushActionId = contentHash(
+          {
+            schemaVersion: 1,
+            runId: created.contract.runId,
+            nodeId: "push",
+            kind: "git_push",
+          },
+          algorithm,
+        );
+        await interrupt(await reopen(), "after_claim", "git_commit");
+        await interrupt(await reopen(), "after_action_command", "git_commit");
+        await interrupt(await reopen(), "after_action_command", "git_push");
+        completed = await executeRun({ store: await reopen(), adapter, approve: true });
+      } finally {
+        localeCompare.mockRestore();
+      }
+      if (!completed) throw new Error("Expected repository side effects to complete");
+
+      const finalStore = stores.at(-1)!;
+      const workspace = await finalStore.loadWorkspace<{ path: string; branch: string }>();
+      const events = await finalStore.loadEvents();
+      const commit = completed.sideEffects.find(({ claim }) => claim.kind === "git_commit");
+      const push = completed.sideEffects.find(({ claim }) => claim.kind === "git_push");
+      const { stdout: commitCount } = await execFileAsync(
+        "git",
+        ["rev-list", "--count", `${created.contract.repository.baseSha}..HEAD`],
+        { cwd: workspace.path },
+      );
+      const { stdout: localHead } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+        cwd: workspace.path,
+      });
+      const { stdout: remoteHead } = await execFileAsync(
+        "git",
+        ["--git-dir", remote, "rev-parse", `refs/heads/${workspace.branch}`],
+        { cwd: repository },
+      );
+
+      expect(completed.status).toBe("completed");
+      expect(commitCount.trim()).toBe("1");
+      expect(remoteHead.trim()).toBe(localHead.trim());
+      expect(adapter.calls.filter((nodeId) => nodeId === "implement")).toHaveLength(1);
+      expect(commit?.claim.actionId).toBe(expectedCommitActionId);
+      expect(commit?.claim.precondition.contentDigest).toBe(expectedCommitContentDigest);
+      expect(push?.claim.actionId).toBe(expectedPushActionId);
+      for (const kind of ["git_commit", "git_push"] as const) {
+        const actionId = completed.sideEffects.find(({ claim }) => claim.kind === kind)?.claim
+          .actionId;
+        expect(
+          events.filter(
+            ({ type, data }) =>
+              type === "side_effect.claimed" &&
+              (data.claim as { kind?: string } | undefined)?.kind === kind,
+          ),
+        ).toHaveLength(1);
+        expect(
+          events.filter(
+            ({ type, data }) => type === "side_effect.confirmed" && data.actionId === actionId,
+          ),
+        ).toHaveLength(1);
+        expect(
+          events.filter(
+            ({ type, data }) =>
+              type === "node.accepted" &&
+              data.nodeId === (kind === "git_commit" ? "commit" : "push"),
+          ),
+        ).toHaveLength(1);
+      }
+    },
+    pushMatrixTimeout,
+  );
+
   const normalPushMatrix = async (): Promise<void> => {
     const faultPoints: SideEffectBoundary[] = [
       "before_claim",
@@ -9498,6 +9671,7 @@ process.stdin.on("end", () => {
           workspaceScopeSnapshots: 1,
           probeEvidenceCheckpoints: 1,
           governanceControlIdentities: 1,
+          repositorySideEffectIdentities: 1,
         },
       });
       expect(contract.runId).toBe(fixture.runId);
@@ -9559,7 +9733,8 @@ process.stdin.on("end", () => {
               key !== "artifactPolicy" &&
               key !== "workspaceScopeSnapshots" &&
               key !== "probeEvidenceCheckpoints" &&
-              key !== "governanceControlIdentities",
+              key !== "governanceControlIdentities" &&
+              key !== "repositorySideEffectIdentities",
           ),
         ),
         heldOutProbes: 1,
@@ -9579,6 +9754,7 @@ process.stdin.on("end", () => {
         if (event.type === "run.created") {
           delete data.probeEvidenceCheckpointFormat;
           delete data.governanceControlIdentityFormat;
+          delete data.repositorySideEffectIdentityFormat;
         }
         return createRunEvent(
           {
@@ -9647,6 +9823,9 @@ process.stdin.on("end", () => {
       expect(reopened.workspaceScopeHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
       expect(reopened.probeEvidenceCheckpointHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
       expect(reopened.governanceControlIdentityHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
+      expect(reopened.repositorySideEffectIdentityHashAlgorithm).toBe(
+        LEGACY_CANONICAL_HASH_ALGORITHM,
+      );
       const heldOutPath = join(created.store.runRoot, "held-out-probes.json");
       await writeFile(heldOutPath, `${JSON.stringify(freshHeldOutProbePlan, null, 2)}\n`);
       expect(await reopened.loadHeldOutProbePlan()).toMatchObject({ schemaVersion: 1 });
@@ -9661,6 +9840,7 @@ process.stdin.on("end", () => {
           workspaceScopeSnapshots: 1,
           probeEvidenceCheckpoints: 1,
           governanceControlIdentities: 1,
+          repositorySideEffectIdentities: 1,
         },
       });
       if (operation === "configure probes") {

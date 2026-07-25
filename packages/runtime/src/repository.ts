@@ -10,6 +10,7 @@ import {
 import {
   SideEffectClaimSchema,
   contentHash,
+  type CanonicalHashAlgorithm,
   type RepositoryIdentity,
   type RepositoryPlanningEvidence,
   type RunContract,
@@ -655,7 +656,10 @@ interface CommitPrecondition {
   contentDigest: string;
 }
 
-async function commitContentDigest(repositoryPath: string): Promise<string> {
+async function commitContentDigest(
+  repositoryPath: string,
+  hashAlgorithm: CanonicalHashAlgorithm,
+): Promise<string> {
   const [changedOutput, untrackedOutput] = await Promise.all([
     gitRaw(repositoryPath, ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"]),
     gitRaw(repositoryPath, ["ls-files", "--others", "--exclude-standard", "-z"]),
@@ -682,14 +686,17 @@ async function commitContentDigest(repositoryPath: string): Promise<string> {
       return { path, kind: "other" };
     }),
   );
-  return contentHash(changes);
+  return contentHash(changes, hashAlgorithm);
 }
 
-async function captureCommitPrecondition(workspace: RunWorkspace): Promise<CommitPrecondition> {
+async function captureCommitPrecondition(
+  workspace: RunWorkspace,
+  hashAlgorithm: CanonicalHashAlgorithm,
+): Promise<CommitPrecondition> {
   const [expectedHead, branch, contentDigest] = await Promise.all([
     git(workspace.path, ["rev-parse", "HEAD"]),
     git(workspace.path, ["branch", "--show-current"]),
-    commitContentDigest(workspace.path),
+    commitContentDigest(workspace.path, hashAlgorithm),
   ]);
   if (!branch) throw new Error("The Graphcraft worktree is not on a named branch");
   return { expectedHead, branch, contentDigest };
@@ -712,9 +719,13 @@ export async function createAtomicCommitClaim(
   workspace: RunWorkspace,
   runId: string,
   nodeId: string,
+  hashAlgorithm: CanonicalHashAlgorithm,
 ): Promise<SideEffectClaim> {
-  const precondition = await captureCommitPrecondition(workspace);
-  const actionId = contentHash({ schemaVersion: 1, runId, nodeId, kind: "git_commit" });
+  const precondition = await captureCommitPrecondition(workspace, hashAlgorithm);
+  const actionId = contentHash(
+    { schemaVersion: 1, runId, nodeId, kind: "git_commit" },
+    hashAlgorithm,
+  );
   return SideEffectClaimSchema.parse({
     schemaVersion: 1,
     actionId,
@@ -731,11 +742,12 @@ export async function performAtomicCommit(
   workspace: RunWorkspace,
   claim: SideEffectClaim,
   task: string,
+  hashAlgorithm: CanonicalHashAlgorithm,
   boundary?: (point: SideEffectBoundary) => void | Promise<void>,
 ): Promise<Record<string, unknown>> {
   if (claim.kind !== "git_commit") throw new Error(`Side effect ${claim.actionId} is not a commit`);
   const expected = commitPrecondition(claim);
-  const current = await captureCommitPrecondition(workspace);
+  const current = await captureCommitPrecondition(workspace, hashAlgorithm);
   if (
     current.expectedHead !== expected.expectedHead ||
     current.branch !== expected.branch ||
@@ -761,6 +773,7 @@ export async function performAtomicCommit(
 export async function reconcileAtomicCommit(
   workspace: RunWorkspace,
   claim: SideEffectClaim,
+  hashAlgorithm: CanonicalHashAlgorithm,
 ): Promise<SideEffectReconciliation> {
   if (claim.kind !== "git_commit") throw new Error(`Side effect ${claim.actionId} is not a commit`);
   const expected = commitPrecondition(claim);
@@ -776,7 +789,7 @@ export async function reconcileAtomicCommit(
       ],
     };
   if (currentHead === expected.expectedHead) {
-    const currentDigest = await commitContentDigest(workspace.path);
+    const currentDigest = await commitContentDigest(workspace.path, hashAlgorithm);
     return currentDigest === expected.contentDigest
       ? {
           status: "not_applied",
@@ -877,9 +890,13 @@ export async function createAtomicPushClaim(
   workspace: RunWorkspace,
   runId: string,
   nodeId: string,
+  hashAlgorithm: CanonicalHashAlgorithm,
 ): Promise<SideEffectClaim> {
   const precondition = await capturePushPrecondition(workspace);
-  const actionId = contentHash({ schemaVersion: 1, runId, nodeId, kind: "git_push" });
+  const actionId = contentHash(
+    { schemaVersion: 1, runId, nodeId, kind: "git_push" },
+    hashAlgorithm,
+  );
   return SideEffectClaimSchema.parse({
     schemaVersion: 1,
     actionId,

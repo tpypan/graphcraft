@@ -3,11 +3,21 @@ import { lstat, mkdir, mkdtemp, realpath, rm, unlink, writeFile } from "node:fs/
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
-import { compileRunContract, type HostAdapter, type RunContract } from "@graphcraft/core";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  LEGACY_CANONICAL_HASH_ALGORITHM,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
+  compileRunContract,
+  contentHash,
+  type HostAdapter,
+  type RunContract,
+} from "@graphcraft/core";
+import {
+  createAtomicCommitClaim,
+  createAtomicPushClaim,
   createRunWorkspace,
   discoverRepository,
+  reconcileAtomicCommit,
   RunWorkspaceReconciliationError,
   type RunWorkspaceCreationBoundary,
 } from "./repository.ts";
@@ -17,6 +27,7 @@ const execFileAsync = promisify(execFile);
 const temporaryRoots: string[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(
     temporaryRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })),
   );
@@ -108,6 +119,91 @@ async function commonGitDirectory(repository: string): Promise<string> {
 }
 
 describe.sequential("run workspace creation reconciliation", () => {
+  it("uses the selected repository side-effect identity algorithm without ambient locale ordering", async () => {
+    const { repository, contract } = await createFixture();
+    const workspace = await createRunWorkspace(contract);
+    const remote = join(dirname(repository), "remote.git");
+    await git(repository, "init", "--bare", remote);
+    await git(workspace.path, "remote", "add", "origin", remote);
+    await writeFile(join(workspace.path, "Ångstrom.txt"), "portable repository identity\n");
+
+    const actionPayload = {
+      schemaVersion: 1,
+      runId: contract.runId,
+      nodeId: "commit",
+      kind: "git_commit",
+    };
+    const changePayload = [
+      {
+        path: "Ångstrom.txt",
+        kind: "file",
+        executable: false,
+        contents: Buffer.from("portable repository identity\n").toString("base64"),
+      },
+    ];
+    const localeCompare = vi.spyOn(String.prototype, "localeCompare").mockImplementation(() => {
+      throw new Error("portable repository side-effect identity used ambient locale ordering");
+    });
+    try {
+      const commit = await createAtomicCommitClaim(
+        workspace,
+        contract.runId,
+        "commit",
+        PORTABLE_CANONICAL_HASH_ALGORITHM,
+      );
+      const push = await createAtomicPushClaim(
+        workspace,
+        contract.runId,
+        "push",
+        PORTABLE_CANONICAL_HASH_ALGORITHM,
+      );
+
+      expect(commit.actionId).toBe(contentHash(actionPayload, PORTABLE_CANONICAL_HASH_ALGORITHM));
+      expect(commit.precondition.contentDigest).toBe(
+        contentHash(changePayload, PORTABLE_CANONICAL_HASH_ALGORITHM),
+      );
+      await expect(
+        reconcileAtomicCommit(workspace, commit, PORTABLE_CANONICAL_HASH_ALGORITHM),
+      ).resolves.toMatchObject({ status: "not_applied" });
+      expect(push.actionId).toBe(
+        contentHash(
+          { ...actionPayload, nodeId: "push", kind: "git_push" },
+          PORTABLE_CANONICAL_HASH_ALGORITHM,
+        ),
+      );
+    } finally {
+      localeCompare.mockRestore();
+    }
+
+    const reversedLocale = vi.spyOn(String.prototype, "localeCompare").mockImplementation(function (
+      this: string,
+      other: string,
+    ) {
+      const left = String(this);
+      return left < other ? 1 : left > other ? -1 : 0;
+    });
+    try {
+      const legacy = await createAtomicCommitClaim(
+        workspace,
+        contract.runId,
+        "commit",
+        LEGACY_CANONICAL_HASH_ALGORITHM,
+      );
+      expect(legacy.actionId).toBe(contentHash(actionPayload, LEGACY_CANONICAL_HASH_ALGORITHM));
+      expect(legacy.precondition.contentDigest).toBe(
+        contentHash(changePayload, LEGACY_CANONICAL_HASH_ALGORITHM),
+      );
+      expect(legacy.actionId).not.toBe(
+        contentHash(actionPayload, PORTABLE_CANONICAL_HASH_ALGORITHM),
+      );
+      expect(legacy.precondition.contentDigest).not.toBe(
+        contentHash(changePayload, PORTABLE_CANONICAL_HASH_ALGORITHM),
+      );
+    } finally {
+      reversedLocale.mockRestore();
+    }
+  });
+
   it("propagates cancellation through repository discovery", async () => {
     const { repository } = await createFixture();
     const controller = new AbortController();

@@ -111,6 +111,34 @@ async function rewriteGovernanceControlIdentityFormat(
   );
 }
 
+async function rewriteRepositorySideEffectIdentityFormat(
+  store: RunStore,
+  format: 1 | 2,
+): Promise<void> {
+  const events = await store.loadEvents();
+  const created = events[0];
+  if (!created || created.type !== "run.created")
+    throw new Error("Expected a run.created fixture event");
+  const data = { ...created.data };
+  delete data.repositorySideEffectIdentityFormat;
+  if (format === 2) data.repositorySideEffectIdentityFormat = 2;
+  const rewritten = createRunEvent(
+    {
+      sequence: created.sequence,
+      timestamp: created.timestamp,
+      actor: created.actor,
+      causationId: created.causationId,
+      type: created.type,
+      data,
+    },
+    eventHashAlgorithm(created),
+  );
+  await writeFile(
+    store.eventsPath(),
+    Buffer.concat([serializedEvent(rewritten), ...events.slice(1).map(serializedEvent)]),
+  );
+}
+
 describe("storage v3 initialization", () => {
   it("finalizes an event-complete initializing descriptor concurrently without rewriting events", async () => {
     const { root, store } = await createStoreFixture();
@@ -138,6 +166,7 @@ describe("storage v3 initialization", () => {
         workspaceScopeSnapshots: 2,
         probeEvidenceCheckpoints: 2,
         governanceControlIdentities: 2,
+        repositorySideEffectIdentities: 2,
       },
     });
     expect(await readFile(store.eventsPath())).toEqual(eventsBefore);
@@ -154,6 +183,9 @@ describe("storage v3 initialization", () => {
     expect(() => reopened.governanceControlIdentityHashAlgorithm).toThrow(
       /before run storage is prepared/,
     );
+    expect(() => reopened.repositorySideEffectIdentityHashAlgorithm).toThrow(
+      /before run storage is prepared/,
+    );
     expect(() => reopened.artifactContentHash({ pending: true })).toThrow(
       /before run storage is prepared/,
     );
@@ -167,14 +199,20 @@ describe("storage v3 initialization", () => {
     expect(reopened.probeEvidenceCheckpointHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
     expect(store.governanceControlIdentityHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
     expect(reopened.governanceControlIdentityHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    expect(store.repositorySideEffectIdentityHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    expect(reopened.repositorySideEffectIdentityHashAlgorithm).toBe(
+      PORTABLE_CANONICAL_HASH_ALGORITHM,
+    );
     expect(JSON.parse(await readFile(join(store.runRoot, "storage.json"), "utf8"))).toMatchObject({
       formats: {
         artifactInventory: 2,
         workspaceScopeSnapshots: 2,
         probeEvidenceCheckpoints: 2,
         governanceControlIdentities: 2,
+        repositorySideEffectIdentities: 2,
       },
     });
+    expect((await reopened.loadEvents())[0]?.data.repositorySideEffectIdentityFormat).toBe(2);
 
     const capsule = { z: { a: 1 }, A: { b: 2 } };
     const capsuleHash = contentHash(capsule, PORTABLE_CANONICAL_HASH_ALGORITHM);
@@ -259,6 +297,28 @@ describe("storage v3 initialization", () => {
     expect(await readFile(storagePath)).toEqual(descriptorBefore);
   });
 
+  it("keeps a prior ready v3 repository side-effect identity policy legacy", async () => {
+    const { root, store } = await createStoreFixture();
+    const storagePath = join(store.runRoot, "storage.json");
+    await rewriteRepositorySideEffectIdentityFormat(store, 1);
+    const descriptor = JSON.parse(await readFile(storagePath, "utf8")) as {
+      formats: { repositorySideEffectIdentities?: number };
+    };
+    delete descriptor.formats.repositorySideEffectIdentities;
+    await writeFile(storagePath, `${JSON.stringify(descriptor, null, 2)}\n`);
+    const descriptorBefore = await readFile(storagePath);
+
+    const reopened = new RunStore(root, store.runId);
+    await reopened.prepareStorage();
+
+    expect(reopened.canonicalHashAlgorithm).toBe(PORTABLE_CANONICAL_HASH_ALGORITHM);
+    expect(reopened.repositorySideEffectIdentityHashAlgorithm).toBe(
+      LEGACY_CANONICAL_HASH_ALGORITHM,
+    );
+    await expect(reopened.loadEvents()).resolves.toHaveLength(1);
+    expect(await readFile(storagePath)).toEqual(descriptorBefore);
+  });
+
   it.each(
     [
       {
@@ -317,6 +377,70 @@ describe("storage v3 initialization", () => {
       const wrongPolicy = new RunStore(root, store.runId);
       await expect(wrongPolicy.loadEvents()).rejects.toThrow(
         /probe-evidence checkpoint format that disagrees/,
+      );
+      expect(await readFile(store.eventsPath())).toEqual(beforeRejection.events);
+      expect(await readFile(statePath)).toEqual(beforeRejection.state);
+      expect(await readFile(storagePath)).toEqual(beforeRejection.storage);
+    },
+  );
+
+  it.each(
+    [
+      {
+        name: "legacy v1 identities relabelled as portable v2",
+        sourceFormat: 1 as const,
+        relabelledFormat: 2 as const,
+      },
+      {
+        name: "portable v2 identities relabelled as legacy v1",
+        sourceFormat: 2 as const,
+        relabelledFormat: 1 as const,
+      },
+    ].flatMap((fixture) =>
+      (["ready", "initializing"] as const).map((initialization) => ({
+        ...fixture,
+        initialization,
+      })),
+    ),
+  )(
+    "rejects repository side-effect $name from an $initialization descriptor without changing durable bytes",
+    async (fixture) => {
+      const { root, store } = await createStoreFixture();
+      const storagePath = join(store.runRoot, "storage.json");
+      const statePath = join(store.runRoot, "state.json");
+      await rewriteRepositorySideEffectIdentityFormat(store, fixture.sourceFormat);
+      const descriptor = JSON.parse(await readFile(storagePath, "utf8")) as {
+        formats: { repositorySideEffectIdentities?: number };
+      };
+      if (fixture.sourceFormat === 1) delete descriptor.formats.repositorySideEffectIdentities;
+      else descriptor.formats.repositorySideEffectIdentities = 2;
+      await writeFile(storagePath, `${JSON.stringify(descriptor, null, 2)}\n`);
+
+      const selected = new RunStore(root, store.runId);
+      await selected.prepareStorage();
+      expect(selected.repositorySideEffectIdentityHashAlgorithm).toBe(
+        fixture.sourceFormat === 2
+          ? PORTABLE_CANONICAL_HASH_ALGORITHM
+          : LEGACY_CANONICAL_HASH_ALGORITHM,
+      );
+      await expect(selected.loadEvents()).resolves.toHaveLength(1);
+
+      const relabelled = JSON.parse(await readFile(storagePath, "utf8")) as {
+        initialization: string;
+        formats: { repositorySideEffectIdentities?: number };
+      };
+      if (fixture.relabelledFormat === 1) delete relabelled.formats.repositorySideEffectIdentities;
+      else relabelled.formats.repositorySideEffectIdentities = 2;
+      relabelled.initialization = fixture.initialization;
+      await writeFile(storagePath, `${JSON.stringify(relabelled, null, 2)}\n`);
+      const beforeRejection = {
+        events: await readFile(store.eventsPath()),
+        state: await readFile(statePath),
+        storage: await readFile(storagePath),
+      };
+
+      await expect(new RunStore(root, store.runId).loadEvents()).rejects.toThrow(
+        /repository side-effect identity format that disagrees/,
       );
       expect(await readFile(store.eventsPath())).toEqual(beforeRejection.events);
       expect(await readFile(statePath)).toEqual(beforeRejection.state);
@@ -427,6 +551,7 @@ describe("storage v3 initialization", () => {
     const priorData: Record<string, unknown> = { ...event.data, heldOutProbePlan: legacy };
     delete priorData.probeEvidenceCheckpointFormat;
     delete priorData.governanceControlIdentityFormat;
+    delete priorData.repositorySideEffectIdentityFormat;
     const priorEvent = createRunEvent(
       {
         sequence: event.sequence,
@@ -448,6 +573,7 @@ describe("storage v3 initialization", () => {
         workspaceScopeSnapshots?: number;
         probeEvidenceCheckpoints?: number;
         governanceControlIdentities?: number;
+        repositorySideEffectIdentities?: number;
       };
     };
     descriptor.initialization = "initializing";
@@ -456,6 +582,7 @@ describe("storage v3 initialization", () => {
     delete descriptor.formats.workspaceScopeSnapshots;
     delete descriptor.formats.probeEvidenceCheckpoints;
     delete descriptor.formats.governanceControlIdentities;
+    delete descriptor.formats.repositorySideEffectIdentities;
     await writeFile(storagePath, `${JSON.stringify(descriptor, null, 2)}\n`);
     const eventsBeforeRecovery = await readFile(store.eventsPath());
 
@@ -468,6 +595,9 @@ describe("storage v3 initialization", () => {
     expect(reopened.workspaceScopeHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
     expect(reopened.probeEvidenceCheckpointHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
     expect(reopened.governanceControlIdentityHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
+    expect(reopened.repositorySideEffectIdentityHashAlgorithm).toBe(
+      LEGACY_CANONICAL_HASH_ALGORITHM,
+    );
     expect(JSON.parse(await readFile(storagePath, "utf8"))).toMatchObject({
       initialization: "ready",
       canonicalHashAlgorithm: PORTABLE_CANONICAL_HASH_ALGORITHM,
@@ -478,6 +608,7 @@ describe("storage v3 initialization", () => {
         workspaceScopeSnapshots: 1,
         probeEvidenceCheckpoints: 1,
         governanceControlIdentities: 1,
+        repositorySideEffectIdentities: 1,
       },
     });
     expect(await readFile(store.eventsPath())).toEqual(eventsBeforeRecovery);

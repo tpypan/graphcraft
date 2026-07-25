@@ -309,6 +309,7 @@ describe("versioned protocol fixtures", () => {
         workspaceScopeSnapshots: 1,
         probeEvidenceCheckpoints: 1,
         governanceControlIdentities: 1,
+        repositorySideEffectIdentities: 1,
       },
     });
   });

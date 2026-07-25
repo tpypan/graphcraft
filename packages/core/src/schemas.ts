@@ -1333,6 +1333,9 @@ export const RunStorageManifestSchema = z.union([
       // Governance/control checkpoint identities predate their independent
       // selector. Omission therefore preserves the legacy v1 identity domain.
       governanceControlIdentities: z.union([z.literal(1), z.literal(2)]).default(1),
+      // Repository side-effect claims and commit-content preconditions also
+      // predate an independent selector. Omission preserves their v1 domain.
+      repositorySideEffectIdentities: z.union([z.literal(1), z.literal(2)]).default(1),
     }),
   }),
 ]);

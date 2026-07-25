@@ -5150,13 +5150,25 @@ export async function executeRun(input: {
             workspace,
             contract.runId,
             current.id,
+            input.store.repositorySideEffectIdentityHashAlgorithm,
           );
           const result = await executeSideEffect({
             store: input.store,
             claim: proposedClaim,
-            reconcile: async (claim) => await reconcileAtomicCommit(workspace, claim),
+            reconcile: async (claim) =>
+              await reconcileAtomicCommit(
+                workspace,
+                claim,
+                input.store.repositorySideEffectIdentityHashAlgorithm,
+              ),
             act: async (claim) =>
-              await performAtomicCommit(workspace, claim, contract.task, input.sideEffectBoundary),
+              await performAtomicCommit(
+                workspace,
+                claim,
+                contract.task,
+                input.store.repositorySideEffectIdentityHashAlgorithm,
+                input.sideEffectBoundary,
+              ),
             ...(input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}),
           });
           await input.store.append("runtime", "node.accepted", {
@@ -5199,7 +5211,12 @@ export async function executeRun(input: {
           return await input.store.loadState();
         }
         try {
-          const proposedClaim = await createAtomicPushClaim(workspace, contract.runId, current.id);
+          const proposedClaim = await createAtomicPushClaim(
+            workspace,
+            contract.runId,
+            current.id,
+            input.store.repositorySideEffectIdentityHashAlgorithm,
+          );
           const result = await executeSideEffect({
             store: input.store,
             claim: proposedClaim,
