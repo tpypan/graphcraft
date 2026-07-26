@@ -1424,6 +1424,7 @@ export async function rerunLifecycleChecks(input: {
   workspace: RunWorkspace;
   contract: RunContract;
   lifecycle: CapturedPullRequestLifecycle;
+  authorizeWorkspace?: () => Promise<void>;
   options?: GitHubExecutionOptions;
   boundary?: (point: SideEffectBoundary) => void | Promise<void>;
 }): Promise<string[]> {
@@ -1481,6 +1482,7 @@ export async function rerunLifecycleChecks(input: {
     const result = await executeSideEffect({
       store: input.store,
       claim,
+      ...(input.authorizeWorkspace ? { authorize: input.authorizeWorkspace } : {}),
       reconcile: async (currentClaim) =>
         await reconcileCheckRerun(input.workspace, currentClaim, hashAlgorithm, options),
       act: async (currentClaim, markDispatched) =>
@@ -1523,6 +1525,7 @@ export async function reconcileReviewThreadActions(input: {
   workspace: RunWorkspace;
   contract: RunContract;
   lifecycle: CapturedPullRequestLifecycle;
+  authorizeWorkspace?: () => Promise<void>;
   options?: GitHubExecutionOptions;
   boundary?: (point: SideEffectBoundary) => void | Promise<void>;
 }): Promise<string[]> {
@@ -1553,6 +1556,7 @@ export async function reconcileReviewThreadActions(input: {
     const replyResult = await executeSideEffect({
       store: input.store,
       claim: replyClaim,
+      ...(input.authorizeWorkspace ? { authorize: input.authorizeWorkspace } : {}),
       reconcile: async (claim) =>
         await reconcileReviewReply(input.workspace, claim, hashAlgorithm, options),
       act: async (claim) =>
@@ -1581,6 +1585,7 @@ export async function reconcileReviewThreadActions(input: {
     const resolutionResult = await executeSideEffect({
       store: input.store,
       claim: resolutionClaim,
+      ...(input.authorizeWorkspace ? { authorize: input.authorizeWorkspace } : {}),
       reconcile: async (claim) =>
         await reconcileReviewResolution(input.workspace, claim, hashAlgorithm, options),
       act: async (claim) =>
@@ -1606,6 +1611,7 @@ export async function reconcilePendingGitHubActions(input: {
   store: RunStore;
   node: GraphNode;
   workspace: RunWorkspace;
+  authorizeWorkspace?: () => Promise<void>;
   options?: GitHubExecutionOptions;
   boundary?: (point: SideEffectBoundary) => void | Promise<void>;
 }): Promise<string[]> {
@@ -1625,6 +1631,7 @@ export async function reconcilePendingGitHubActions(input: {
     const result = await executeSideEffect({
       store: input.store,
       claim: entry.claim,
+      ...(input.authorizeWorkspace ? { authorize: input.authorizeWorkspace } : {}),
       reconcile: async (claim) => {
         if (claim.kind === "github_pr_comment")
           return await reconcileReviewReply(input.workspace, claim, hashAlgorithm, options);

@@ -22,6 +22,7 @@ import {
   ContextSelectionReceiptSchema,
   HostTerminationError,
   LEGACY_CANONICAL_HASH_ALGORITHM,
+  MAX_REPOSITORY_INSTRUCTION_BYTES,
   PORTABLE_CANONICAL_HASH_ALGORITHM,
   REQUIRED_HOST_PROTOCOL_CAPABILITIES,
   RunStorageManifestSchema,
@@ -48,6 +49,7 @@ import type {
   ProbePlan,
   ProbeResult,
   ReconciliationResult,
+  RunControlRequest,
   RunEvent,
   SemanticVerificationRequest,
   SemanticVerificationResult,
@@ -62,6 +64,7 @@ import {
 import { configureRunProbes, createRun, executeRun } from "./runner.ts";
 import { runProbe, runProbes } from "@graphcraft/probes";
 import { requestRunControl, RunControlChannel } from "./control.ts";
+import { applyRunRetention, planRunRetention } from "./retention.ts";
 import {
   decideRunControl,
   evaluateControlAcceptance,
@@ -136,14 +139,20 @@ function reportedUsage(
   };
 }
 
-async function snapshotFiles(root: string): Promise<Record<string, string>> {
+async function snapshotFiles(
+  root: string,
+  includePath: (path: string) => boolean = () => true,
+): Promise<Record<string, string>> {
   const snapshot: Record<string, string> = {};
   const visit = async (directory: string): Promise<void> => {
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name);
       if (entry.isDirectory()) await visit(path);
-      else if (entry.isFile())
-        snapshot[relative(root, path)] = (await readFile(path)).toString("base64");
+      else if (entry.isFile()) {
+        const relativePath = relative(root, path);
+        if (includePath(relativePath))
+          snapshot[relativePath] = (await readFile(path)).toString("base64");
+      }
     }
   };
   await visit(root);
@@ -653,6 +662,7 @@ async function fakeGitHubCallCount(path: string): Promise<number> {
 
 class FakeAdapter implements HostAdapter {
   readonly id: HostAdapter["id"];
+  readonly containmentProfile = "test/fixture-containment-v1";
   readonly calls: string[] = [];
   readonly requests: WorkerRequest[] = [];
   readonly semanticRequests: SemanticVerificationRequest[] = [];
@@ -912,6 +922,18 @@ class FakeAdapter implements HostAdapter {
       },
       usage: reportedUsage(2, 0, 1),
     };
+  }
+}
+
+class IteratorCleanupTrackingAdapter extends FakeAdapter {
+  readonly closedNodes: string[] = [];
+
+  override async *execute(request: WorkerRequest, signal: AbortSignal): AsyncIterable<HostEvent> {
+    try {
+      yield* super.execute(request, signal);
+    } finally {
+      this.closedNodes.push(request.capsule.nodeId);
+    }
   }
 }
 
@@ -1948,8 +1970,10 @@ describe("durable runtime", () => {
       });
       const repositoryRoot = created.store.repositoryRoot;
       const fakeBin = join(repository, "..", ".test-bin");
+      const fakeCodexHome = join(repository, "..", ".test-codex-home");
       const fakeCodex = join(fakeBin, "codex");
       await mkdir(fakeBin);
+      await mkdir(fakeCodexHome);
       await writeFile(
         fakeCodex,
         `#!/usr/bin/env node
@@ -1963,6 +1987,7 @@ process.stdin.on("data", (chunk) => { input += chunk; });
 process.stdin.on("end", () => {
   fs.writeFileSync("feature.txt", "implemented by detached fixture\\n");
   console.log(JSON.stringify({ type: "thread.started", thread_id: "11111111-1111-4111-8111-111111111111" }));
+  console.log(JSON.stringify({ type: "turn.started" }));
   console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ status: "completed", summary: "implemented fixture", changedPaths: ["feature.txt"], evidence: ["fixture write"] }) } }));
   console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 4 } }));
 });
@@ -1976,7 +2001,11 @@ process.stdin.on("end", () => {
           resolve("node_modules/tsx/dist/loader.mjs"),
           resolve("packages/cli/src/bin.ts"),
         ],
-        env: { ...process.env, PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ""}` },
+        env: {
+          ...process.env,
+          CODEX_HOME: fakeCodexHome,
+          PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ""}`,
+        },
       };
       let activePid: number | undefined;
       try {
@@ -2527,6 +2556,264 @@ process.stdin.on("end", () => {
     },
   );
 
+  it("rejects malformed or redirected durable workspaces before host use without overwriting them", async () => {
+    const outside = await mkdtemp(join(tmpdir(), "graphcraft-workspace-redirect-"));
+    temporaryRoots.push(outside);
+    const marker = join(outside, "preserved.txt");
+    await writeFile(marker, "preserve me\n");
+    const cases: Array<
+      [string, (workspace: { path: string; branch: string; created: boolean }) => string]
+    > = [
+      [
+        "missing field",
+        (workspace) => JSON.stringify({ path: workspace.path, created: workspace.created }),
+      ],
+      ["invalid JSON", () => "{not-json\n"],
+      ["redirected path", (workspace) => JSON.stringify({ ...workspace, path: outside })],
+    ];
+
+    for (const [name, payloadFor] of cases) {
+      const repository = await createRepository();
+      const created = await createRun(`Implement a substantial ${name} workspace feature`, {
+        cwd: repository,
+      });
+      const workspace = await createRunWorkspace(created.contract);
+      await created.store.writeWorkspace(workspace);
+      const workspacePath = join(created.store.runRoot, "workspace.json");
+      const payload = payloadFor(workspace);
+      await writeFile(workspacePath, payload);
+      const adapter = new FakeAdapter(async () => undefined);
+      const probe = adapter.probe.bind(adapter);
+      let probeCalls = 0;
+      adapter.probe = async (signal) => {
+        probeCalls += 1;
+        return await probe(signal);
+      };
+
+      const state = await executeRun({ store: created.store, adapter, approve: true });
+
+      expect(state.status, name).toBe("blocked");
+      expect(state.stopReason, name).toMatch(/workspace validation failed before execution/i);
+      expect(probeCalls, name).toBe(0);
+      expect(adapter.calls, name).toEqual([]);
+      expect(await readFile(workspacePath, "utf8"), name).toBe(payload);
+    }
+    expect(await readFile(marker, "utf8")).toBe("preserve me\n");
+  });
+
+  it("rejects an unjournaled descendant workspace HEAD before host use", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a substantial HEAD-bound workspace feature", {
+      cwd: repository,
+    });
+    const workspace = await createRunWorkspace(created.contract);
+    await created.store.writeWorkspace(workspace);
+    await writeFile(join(workspace.path, "unjournaled.txt"), "untrusted commit\n");
+    await git(workspace.path, "add", "unjournaled.txt");
+    await git(workspace.path, "commit", "-m", "unjournaled descendant");
+    const head = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspace.path });
+    const adapter = new FakeAdapter(async () => undefined);
+    const probe = adapter.probe.bind(adapter);
+    let probeCalls = 0;
+    adapter.probe = async (signal) => {
+      probeCalls += 1;
+      return await probe(signal);
+    };
+
+    const state = await executeRun({ store: created.store, adapter, approve: true });
+
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toMatch(/workspace validation failed before execution/i);
+    expect(state.stopReason).toMatch(/checkout HEAD is not authorized by durable run state/i);
+    expect(probeCalls).toBe(0);
+    expect(adapter.calls).toEqual([]);
+    await expect(
+      execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspace.path }),
+    ).resolves.toMatchObject({ stdout: head.stdout });
+  });
+
+  it("refuses to recreate a missing workspace record after accepted execution progress", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a substantial durable workspace feature", {
+      cwd: repository,
+    });
+    const workspace = await createRunWorkspace(created.contract);
+    await created.store.writeWorkspace(workspace);
+    await created.store.append("user", "run.approved", { approved: true });
+    const acceptedNode = created.graph.nodes[0]!;
+    await created.store.append("runtime", "node.started", { nodeId: acceptedNode.id });
+    await created.store.append("runtime", "node.accepted", {
+      nodeId: acceptedNode.id,
+      summary: "Accepted progress must remain bound to its durable workspace",
+    });
+    const workspaceRecordPath = join(created.store.runRoot, "workspace.json");
+    await rm(workspaceRecordPath);
+    const adapter = new FakeAdapter(async () => undefined);
+    const probe = adapter.probe.bind(adapter);
+    let probeCalls = 0;
+    adapter.probe = async (signal) => {
+      probeCalls += 1;
+      return await probe(signal);
+    };
+
+    const first = await executeRun({
+      store: new RunStore(repository, created.contract.runId),
+      adapter,
+    });
+    const blockerCount = (await created.store.loadEvents()).filter(
+      ({ type }) => type === "run.blocked",
+    ).length;
+    const second = await executeRun({
+      store: new RunStore(repository, created.contract.runId),
+      adapter,
+    });
+
+    expect(first.status).toBe("blocked");
+    expect(first.stopReason).toMatch(/workspace.*unavailable after execution began/i);
+    expect(first.nodes[acceptedNode.id]?.status).toBe("accepted");
+    expect(second.stopReason).toBe(first.stopReason);
+    expect(second.nodes[acceptedNode.id]?.status).toBe("accepted");
+    expect(
+      (await created.store.loadEvents()).filter(({ type }) => type === "run.blocked"),
+    ).toHaveLength(blockerCount);
+    await expect(readFile(workspaceRecordPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(probeCalls).toBe(0);
+    expect(adapter.calls).toEqual([]);
+    expect(adapter.semanticRequests).toEqual([]);
+  });
+
+  it.each([
+    ["initial", 1],
+    ["worker", 2],
+  ] as const)(
+    "blocks a worktree replacement during the %s host capability probe",
+    async (_phase, replacementProbeCall) => {
+      const repository = await createRepository();
+      const created = await createRun("Implement a substantial workspace identity feature", {
+        cwd: repository,
+      });
+      const adapter = new FakeAdapter(async () => undefined);
+      const probe = adapter.probe.bind(adapter);
+      let probeCalls = 0;
+      let durableWorkspaceBytes: string | undefined;
+      let replacementMarker: string | undefined;
+      adapter.probe = async (signal) => {
+        probeCalls += 1;
+        const capabilities = await probe(signal);
+        if (probeCalls === replacementProbeCall) {
+          const workspace = await created.store.loadWorkspace<{
+            path: string;
+            branch: string;
+            created: boolean;
+          }>();
+          durableWorkspaceBytes = await readFile(
+            join(created.store.runRoot, "workspace.json"),
+            "utf8",
+          );
+          await rename(workspace.path, `${workspace.path}-moved`);
+          await mkdir(workspace.path);
+          replacementMarker = join(workspace.path, "preserved.txt");
+          await writeFile(replacementMarker, "replacement preserved\n");
+        }
+        return capabilities;
+      };
+
+      const state = await executeRun({ store: created.store, adapter, approve: true });
+
+      expect(state.status).toBe("blocked");
+      expect(state.stopReason).toMatch(/workspace validation failed after .*capability probing/i);
+      expect(probeCalls).toBe(replacementProbeCall);
+      expect(adapter.calls).toEqual([]);
+      expect(adapter.semanticRequests).toEqual([]);
+      expect(replacementMarker).toBeDefined();
+      expect(await readFile(replacementMarker!, "utf8")).toBe("replacement preserved\n");
+      expect(await readFile(join(created.store.runRoot, "workspace.json"), "utf8")).toBe(
+        durableWorkspaceBytes,
+      );
+    },
+  );
+
+  it("blocks a worktree replacement immediately before a GitHub review mutation", async () => {
+    const { repository, remote } = await createRepositoryWithRemote();
+    const github = await fakePullRequestGitHub(remote, {
+      syncPullRequestHead: true,
+      reviewThreads: [
+        {
+          id: "thread-workspace-replacement",
+          isResolved: false,
+          isOutdated: false,
+          path: "feature.txt",
+          line: 1,
+          body: "Apply the reviewed change before resolving this thread.",
+        },
+      ],
+      reviewDecision: "",
+    });
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "review\n");
+      if (request.capsule.nodeId === "repair-review-1")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "review-fixed\n");
+    });
+    const created = await createRun("Implement the feature and get the PR green", {
+      cwd: repository,
+      finishLine: "pr_green",
+    });
+    let replacementMarker: string | undefined;
+    let durableWorkspaceBytes: string | undefined;
+    const replaceBeforeReviewMutation = async (point: SideEffectBoundary): Promise<void> => {
+      if (replacementMarker || point !== "before_act") return;
+      const state = await created.store.loadState();
+      if (state.sideEffects.at(-1)?.claim.kind !== "github_pr_comment") return;
+      const workspace = await created.store.loadWorkspace<{
+        path: string;
+        branch: string;
+        created: boolean;
+      }>();
+      durableWorkspaceBytes = await readFile(join(created.store.runRoot, "workspace.json"), "utf8");
+      await rename(workspace.path, `${workspace.path}-moved`);
+      await mkdir(workspace.path);
+      replacementMarker = join(workspace.path, "preserved.txt");
+      await writeFile(replacementMarker, "replacement preserved\n");
+    };
+
+    const blocked = await executeRun({
+      store: created.store,
+      adapter,
+      approve: true,
+      github,
+      sideEffectBoundary: replaceBeforeReviewMutation,
+    });
+    const remoteState = JSON.parse(await readFile(github.statePath, "utf8")) as {
+      reviewThreads: Array<{ isResolved: boolean; replies?: unknown[] }>;
+    };
+    const calls = (await readFile(github.logPath, "utf8"))
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as string[]);
+
+    expect(blocked.status).toBe("blocked");
+    expect(blocked.stopReason).toMatch(/work(?:space|tree).*(?:invalid|registration|state|path)/i);
+    expect(adapter.calls).toEqual(["implement", "repair-review-1"]);
+    expect(replacementMarker).toBeDefined();
+    expect(await readFile(replacementMarker!, "utf8")).toBe("replacement preserved\n");
+    expect(await readFile(join(created.store.runRoot, "workspace.json"), "utf8")).toBe(
+      durableWorkspaceBytes,
+    );
+    expect(remoteState.reviewThreads[0]).toMatchObject({ isResolved: false });
+    expect(remoteState.reviewThreads[0]?.replies ?? []).toHaveLength(0);
+    expect(
+      calls.filter((args) =>
+        args.some(
+          (argument) =>
+            argument.includes("GraphcraftAddReviewReply") ||
+            argument.includes("GraphcraftResolveReviewThread"),
+        ),
+      ),
+    ).toHaveLength(0);
+  }, 60_000);
+
   it("prioritizes task identifiers and acronyms over incidental planning prose", async () => {
     const repository = await createRepository();
     await mkdir(join(repository, "packages", "cli", "src"), { recursive: true });
@@ -2740,6 +3027,135 @@ process.stdin.on("end", () => {
       contentHash(predecessorEvidence[0], PORTABLE_CANONICAL_HASH_ALGORITHM),
     ]);
     expect(selected.receipt.selected.predecessorNodeIds).toEqual(["prior-node"]);
+  });
+
+  it("embeds applicable repository instructions without relying on host customizations", async () => {
+    const repository = await createRepository();
+    await Promise.all([
+      mkdir(join(repository, "src"), { recursive: true }),
+      mkdir(join(repository, "docs"), { recursive: true }),
+    ]);
+    await Promise.all([
+      writeFile(join(repository, "AGENTS.md"), "Preserve the root contract.\n"),
+      writeFile(join(repository, "src", "AGENTS.md"), "Run the focused source check.\n"),
+      writeFile(join(repository, "docs", "AGENTS.md"), "This applies only to documentation.\n"),
+      writeFile(join(repository, "src", "index.ts"), "export const fixture = true;\n"),
+    ]);
+    await git(repository, "add", ".");
+    await git(repository, "commit", "-m", "add repository instructions");
+    const created = await createRun("Implement the instructed source fixture", {
+      cwd: repository,
+    });
+    const selectedNode = created.graph.nodes.find(
+      ({ kind }) => kind !== "commit" && kind !== "push" && kind !== "pull_request",
+    );
+    if (!selectedNode) throw new Error("Expected a worker node for instruction context");
+    const node: GraphNode = {
+      ...selectedNode,
+      scope: ["src/**"],
+      contextSelector: {
+        ...selectedNode.contextSelector,
+        relevantPaths: ["src/index.ts"],
+      },
+    };
+    const prepare = async () =>
+      await prepareWorkerContext({
+        store: created.store,
+        invocationId: randomUUID(),
+        contract: created.contract,
+        node,
+        repositoryPath: repository,
+        predecessorEvidence: [],
+        probeResults: [],
+      });
+
+    const selected = await prepare();
+    expect(selected.capsule.repositoryInstructions).toMatchObject({
+      policy: "tracked-shared-v1",
+      selectedPaths: ["AGENTS.md", "src/AGENTS.md"],
+      omittedPaths: ["docs/AGENTS.md"],
+      entries: [
+        expect.objectContaining({ path: "AGENTS.md", content: "Preserve the root contract.\n" }),
+        expect.objectContaining({
+          path: "src/AGENTS.md",
+          content: "Run the focused source check.\n",
+        }),
+      ],
+    });
+    expect(selected.receipt.repositoryInstructions).toMatchObject({
+      manifestDigest: selected.capsule.repositoryInstructions?.manifestDigest,
+      selectionDigest: selected.capsule.repositoryInstructions?.selectionDigest,
+      selectedPaths: ["AGENTS.md", "src/AGENTS.md"],
+      omittedPaths: ["docs/AGENTS.md"],
+    });
+    expect(selected.capsule.relevantPaths).toEqual(["src/index.ts"]);
+    expect(JSON.parse(await readFile(selected.receipt.capsule.path, "utf8"))).toEqual(
+      selected.capsule,
+    );
+
+    await writeFile(join(repository, "AGENTS.md"), "Changed after planning.\n");
+    await expect(prepare()).rejects.toThrow(
+      /repository instructions changed after the run was planned/i,
+    );
+  });
+
+  it("rejects oversized instruction metadata before planner admission or run persistence", async () => {
+    const repository = await createRepository();
+    const rules = join(repository, ".claude", "rules");
+    await mkdir(rules, { recursive: true });
+    await Promise.all(
+      Array.from({ length: 32 }, async (_, index) => {
+        const name = `${String(index).padStart(2, "0")}-${"p".repeat(225)}.md`;
+        await writeFile(join(rules, name), `Rule ${String(index)}.\n`);
+      }),
+    );
+    await git(repository, "add", ".claude/rules");
+    await git(repository, "commit", "-m", "add oversized instruction metadata");
+    const planner = new FakeAdapter(async () => undefined);
+    const readyProbe = planner.probe.bind(planner);
+    let probeCalls = 0;
+    planner.probe = async (signal) => {
+      probeCalls += 1;
+      return await readyProbe(signal);
+    };
+
+    await expect(
+      createRun("Implement a substantial feature with bounded instructions", {
+        cwd: repository,
+        planner,
+      }),
+    ).rejects.toThrow(
+      /repository-instruction manifest exceeds the 12000-character serialized limit/i,
+    );
+    expect(probeCalls).toBe(0);
+    expect(planner.planningRequests).toHaveLength(0);
+    await expect(readdir(join(repository, ".graphcraft", "runs"))).rejects.toThrow();
+  });
+
+  it("rejects over-byte multibyte instructions before planner admission or run persistence", async () => {
+    const repository = await createRepository();
+    const instructions = `${"é".repeat(MAX_REPOSITORY_INSTRUCTION_BYTES / 2)}a`;
+    expect(Buffer.byteLength(instructions, "utf8")).toBe(MAX_REPOSITORY_INSTRUCTION_BYTES + 1);
+    await writeFile(join(repository, "AGENTS.md"), instructions);
+    await git(repository, "add", "AGENTS.md");
+    await git(repository, "commit", "-m", "add over-byte repository instructions");
+    const planner = new FakeAdapter(async () => undefined);
+    const readyProbe = planner.probe.bind(planner);
+    let probeCalls = 0;
+    planner.probe = async (signal) => {
+      probeCalls += 1;
+      return await readyProbe(signal);
+    };
+
+    await expect(
+      createRun("Implement a substantial feature with bounded instructions", {
+        cwd: repository,
+        planner,
+      }),
+    ).rejects.toThrow(/repository instructions exceed the 8000-byte limit/i);
+    expect(probeCalls).toBe(0);
+    expect(planner.planningRequests).toHaveLength(0);
+    await expect(readdir(join(repository, ".graphcraft", "runs"))).rejects.toThrow();
   });
 
   it("uses the artifact domain policy for grounded path tie-breaking", () => {
@@ -3132,6 +3548,8 @@ process.stdin.on("end", () => {
       cwd: repository,
       planner: adapter,
     });
+    const workspace = await createRunWorkspace(created.contract);
+    await created.store.writeWorkspace(workspace);
     const legacyInvocationId = randomUUID();
     await created.store.append("user", "run.approved", { approved: true });
     await created.store.append("runtime", "node.started", { nodeId: "investigate" });
@@ -3894,6 +4312,49 @@ process.stdin.on("end", () => {
       evidence: expect.arrayContaining([expect.stringContaining("progress-probe-output.txt")]),
     });
   }, 30_000);
+
+  it("reconciles the durable workspace before pending scope recovery or host use", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async () => undefined);
+    const created = await createRun("Implement a substantial workspace recovery feature", {
+      cwd: repository,
+    });
+    const faultStore = new ProgressScopeStartFaultStore(created.store);
+
+    await expect(executeRun({ store: faultStore, adapter, approve: true })).rejects.toThrow(
+      /Injected process termination after progress scope start/,
+    );
+    const workspace = await created.store.loadWorkspace<{
+      path: string;
+      branch: string;
+      created: boolean;
+    }>();
+    const outside = await mkdtemp(join(tmpdir(), "graphcraft-scope-workspace-redirect-"));
+    temporaryRoots.push(outside);
+    const workspacePath = join(created.store.runRoot, "workspace.json");
+    const tampered = JSON.stringify({ ...workspace, path: outside });
+    await writeFile(workspacePath, tampered);
+    const callsAtCrash = [...adapter.calls];
+    const probe = adapter.probe.bind(adapter);
+    let resumeProbeCalls = 0;
+    adapter.probe = async (signal) => {
+      resumeProbeCalls += 1;
+      return await probe(signal);
+    };
+
+    const state = await executeRun({
+      store: new RunStore(repository, created.contract.runId),
+      adapter,
+    });
+
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toMatch(
+      /cannot recover progress-probe scope checkpoint.*workspace is unavailable or invalid/i,
+    );
+    expect(resumeProbeCalls).toBe(0);
+    expect(adapter.calls).toEqual(callsAtCrash);
+    expect(await readFile(workspacePath, "utf8")).toBe(tampered);
+  });
 
   it("recovers progress-probe scope blockers after the failing audit checkpoint", async () => {
     for (const stage of ["progress_baseline", "progress_current"] as const) {
@@ -6044,6 +6505,8 @@ process.stdin.on("end", () => {
         `Implement a substantial ${scenario.name} batch-recovery feature`,
         { cwd: repository, planner: adapter },
       );
+      const workspace = await createRunWorkspace(created.contract);
+      await created.store.writeWorkspace(workspace);
       await created.store.append("user", "run.approved", { approved: true });
       await amendRunGraph(created.store, splitParallelBranches(created.graph), "runtime");
       const batchId = randomUUID();
@@ -6495,7 +6958,7 @@ process.stdin.on("end", () => {
     atomicCommitMatrixTimeout,
   );
 
-  it("refuses to retry a claimed commit after unrelated Git state replaces its precondition", async () => {
+  it("blocks a claimed commit before retry when unrelated Git state replaces its precondition", async () => {
     const repository = await createRepository();
     const adapter = new FakeAdapter(async (request) => {
       if (request.capsule.nodeId === "implement")
@@ -6527,8 +6990,11 @@ process.stdin.on("end", () => {
     });
 
     expect(state.status).toBe("blocked");
-    expect(state.nodes.commit?.status).toBe("failed");
-    expect(state.sideEffects).toMatchObject([{ status: "uncertain", retryable: false }]);
+    expect(state.nodes.commit?.status).toBe("running");
+    expect(state.stopReason).toMatch(/checkout HEAD is not authorized by durable run state/i);
+    const commit = state.sideEffects.find(({ claim }) => claim.kind === "git_commit");
+    expect(commit).toMatchObject({ status: "claimed" });
+    expect(commit).not.toHaveProperty("dispatchedAt");
     expect(message).toContain("unrelated external commit");
     expect(message).not.toContain("Graphcraft-Action:");
   });
@@ -9187,6 +9653,72 @@ process.stdin.on("end", () => {
     githubRepairTimeout,
   );
 
+  it(
+    "rejects an unjournaled workspace commit immediately before a GitHub check rerun",
+    async () => {
+      const { repository, remote } = await createRepositoryWithRemote();
+      const github = await fakePullRequestGitHub(remote, {
+        syncPullRequestHead: true,
+        protected: true,
+        requiredStatusChecks: ["tests"],
+        checks: [
+          {
+            kind: "check_run",
+            id: "tests-check",
+            databaseId: 502,
+            name: "tests",
+            status: "COMPLETED",
+            conclusion: "STARTUP_FAILURE",
+          },
+        ],
+      });
+      const adapter = new FakeAdapter(async (request) => {
+        if (request.capsule.nodeId === "implement")
+          await writeFile(join(request.repositoryPath, "feature.txt"), "rerun guarded\n");
+      });
+      const created = await createRun("Implement the feature and get the PR green", {
+        cwd: repository,
+        finishLine: "pr_green",
+      });
+      let foreignHead: string | undefined;
+      const commitBeforeRerun = async (point: SideEffectBoundary): Promise<void> => {
+        if (foreignHead || point !== "before_act") return;
+        const state = await created.store.loadState();
+        if (state.sideEffects.at(-1)?.claim.kind !== "github_check_rerun") return;
+        const workspace = await created.store.loadWorkspace<{ path: string }>();
+        await writeFile(join(workspace.path, "foreign.txt"), "foreign\n");
+        await git(workspace.path, "add", "foreign.txt");
+        await git(workspace.path, "commit", "-m", "foreign unjournaled commit");
+        foreignHead = (
+          await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspace.path })
+        ).stdout.trim();
+      };
+
+      const blocked = await executeRun({
+        store: created.store,
+        adapter,
+        approve: true,
+        github,
+        sideEffectBoundary: commitBeforeRerun,
+      });
+      const workspace = await created.store.loadWorkspace<{ path: string }>();
+      const persisted = JSON.parse(await readFile(github.statePath, "utf8")) as {
+        rerunCalls: number;
+      };
+
+      expect(blocked.status).toBe("blocked");
+      expect(blocked.stopReason).toMatch(/checkout HEAD is not authorized by durable run state/i);
+      expect(persisted.rerunCalls).toBe(0);
+      expect(
+        (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspace.path })).stdout.trim(),
+      ).toBe(foreignHead);
+      const rerun = blocked.sideEffects.find(({ claim }) => claim.kind === "github_check_rerun");
+      expect(rerun).toMatchObject({ status: "claimed" });
+      expect(rerun).not.toHaveProperty("dispatchedAt");
+    },
+    githubRepairTimeout,
+  );
+
   it.each([1, 2] as const)(
     "durably retries format-v%s same-SHA check-rerun revalidation across cold restart",
     async (format) => {
@@ -10376,7 +10908,7 @@ process.stdin.on("end", () => {
     await expect(configureRunProbes(created.store, edited)).rejects.toThrow(/before.*approved/);
   });
 
-  it("fails closed before creating a workspace when the selected host is not authenticated", async () => {
+  it("reconciles the workspace before rejecting an unauthenticated host", async () => {
     const repository = await createRepository();
     const adapter = new FakeAdapter(async () => undefined, false);
     const created = await createRun("Implement a substantial feature across the fixture", {
@@ -10387,7 +10919,11 @@ process.stdin.on("end", () => {
     expect(state.status).toBe("blocked");
     expect(state.stopReason).toMatch(/not authenticated/);
     expect(adapter.calls).toHaveLength(0);
-    await expect(created.store.loadWorkspace()).rejects.toThrow();
+    await expect(created.store.loadWorkspace()).resolves.toMatchObject({
+      path: expect.stringContaining("graphcraft-worktrees"),
+      branch: expect.stringMatching(/^graphcraft\//),
+      created: true,
+    });
   });
 
   it.each(REQUIRED_HOST_PROTOCOL_CAPABILITIES)(
@@ -10644,7 +11180,7 @@ if (args[0] === "hash-object" && args.includes("--stdin")) {
   });
 
   it.each(REQUIRED_HOST_PROTOCOL_CAPABILITIES)(
-    "blocks execution before workspace creation when %s is unavailable",
+    "reconciles the workspace before blocking when %s is unavailable",
     async (capability) => {
       const repository = await createRepository();
       const adapter = new FakeAdapter(async () => undefined);
@@ -10658,7 +11194,11 @@ if (args[0] === "hash-object" && args.includes("--stdin")) {
       expect(state.status).toBe("blocked");
       expect(state.stopReason).toContain(capability);
       expect(adapter.calls).toHaveLength(0);
-      await expect(created.store.loadWorkspace()).rejects.toThrow();
+      await expect(created.store.loadWorkspace()).resolves.toMatchObject({
+        path: expect.stringContaining("graphcraft-worktrees"),
+        branch: expect.stringMatching(/^graphcraft\//),
+        created: true,
+      });
     },
   );
 
@@ -10704,7 +11244,11 @@ if (args[0] === "hash-object" && args.includes("--stdin")) {
       expect(settledState.status).toBe(action === "pause" ? "paused" : "stopped");
       expect(settlementLatencyMs).toBeLessThan(5_000);
       expect(adapter.calls).toEqual([]);
-      await expect(created.store.loadWorkspace()).rejects.toThrow();
+      await expect(created.store.loadWorkspace()).resolves.toMatchObject({
+        path: expect.stringContaining("graphcraft-worktrees"),
+        branch: expect.stringMatching(/^graphcraft\//),
+        created: true,
+      });
 
       const events = await created.store.loadEvents();
       expect(events.find(({ type }) => type === "run.blocked")).toBeUndefined();
@@ -11391,6 +11935,17 @@ if (args.length === blocked.length && blocked.every((value, index) => args[index
     const invocationId = randomUUID();
     const hostSessionId = randomUUID();
     const baseline = evidenceSnapshot("before-interruption", []);
+    const node = created.graph.nodes.find(({ id }) => id === "implement")!;
+    const pinnedContext = await prepareWorkerContext({
+      store: created.store,
+      invocationId,
+      contract: created.contract,
+      node,
+      repositoryPath: workspace.path,
+      predecessorEvidence: [],
+      probeResults: [],
+      recordSelection: false,
+    });
     const scopeBaseline = await captureWorkspaceScopeSnapshot(
       workspace.path,
       [],
@@ -11401,7 +11956,13 @@ if (args.length === blocked.length && blocked.every((value, index) => args[index
       invocationId,
       nodeId: "implement",
       adapter: "test",
-      capsuleHash: "persisted-capsule",
+      capsuleHash: pinnedContext.capsuleHash,
+      repositoryInstructionManifestDigest:
+        pinnedContext.capsule.repositoryInstructions?.manifestDigest,
+      repositoryInstructionSelectionDigest:
+        pinnedContext.capsule.repositoryInstructions?.selectionDigest,
+      containmentProfile: adapter.containmentProfile,
+      instructionManifestPinned: true,
       baseline,
       scopeBaseline,
     });
@@ -11437,6 +11998,17 @@ if (args.length === blocked.length && blocked.every((value, index) => args[index
     const invocationId = randomUUID();
     const hostSessionId = randomUUID();
     const baseline = evidenceSnapshot("before-interruption", []);
+    const node = created.graph.nodes.find(({ id }) => id === "implement")!;
+    const pinnedContext = await prepareWorkerContext({
+      store: created.store,
+      invocationId,
+      contract: created.contract,
+      node,
+      repositoryPath: workspace.path,
+      predecessorEvidence: [],
+      probeResults: [],
+      recordSelection: false,
+    });
     const scopeBaseline = await captureWorkspaceScopeSnapshot(
       workspace.path,
       [],
@@ -11447,7 +12019,13 @@ if (args.length === blocked.length && blocked.every((value, index) => args[index
       invocationId,
       nodeId: "implement",
       adapter: "test",
-      capsuleHash: "persisted-capsule",
+      capsuleHash: pinnedContext.capsuleHash,
+      repositoryInstructionManifestDigest:
+        pinnedContext.capsule.repositoryInstructions?.manifestDigest,
+      repositoryInstructionSelectionDigest:
+        pinnedContext.capsule.repositoryInstructions?.selectionDigest,
+      containmentProfile: adapter.containmentProfile,
+      instructionManifestPinned: true,
       baseline,
       scopeBaseline,
     });
@@ -11485,7 +12063,7 @@ if (args.length === blocked.length && blocked.every((value, index) => args[index
     expect(state.tokens.total).toBe(14);
     expect(
       (await created.store.loadEvents()).filter(({ type }) => type === "context.selected"),
-    ).toHaveLength(0);
+    ).toHaveLength(1);
     expect(
       (await created.store.loadEvents()).find(
         ({ type, data }) => type === "invocation.finished" && data.recovered === true,
@@ -11493,7 +12071,7 @@ if (args.length === blocked.length && blocked.every((value, index) => args[index
     ).toBeDefined();
   });
 
-  it("normalizes a recovered legacy progress baseline to its durable scope snapshot", async () => {
+  it("starts a recovered legacy completed invocation fresh when its context is unbound", async () => {
     const repository = await createRepository();
     const adapter = new FakeAdapter(async () => {
       throw new Error("the completed invocation must not execute again");
@@ -11542,15 +12120,107 @@ if (args.length === blocked.length && blocked.every((value, index) => args[index
     );
 
     const state = await executeRun({ store: created.store, adapter });
-    const trajectory = state.progressTrajectory.findLast(({ nodeId }) => nodeId === "implement");
-
     expect(state.status).toBe("blocked");
-    expect(adapter.calls).toEqual([]);
-    expect(trajectory).toMatchObject({
-      classification: "stalled",
-      baseline: { workspaceDigest: scopeBaseline.digest },
-      current: { workspaceDigest: scopeBaseline.digest },
+    expect(adapter.calls).toEqual(["implement"]);
+    expect(adapter.requests[0]?.resumeSessionId).toBeUndefined();
+    expect(
+      (await created.store.loadEvents()).find(
+        ({ type, data }) =>
+          type === "invocation.finished" &&
+          data.invocationId === invocationId &&
+          String(data.reason).includes("lacks the exact pinned instruction"),
+      ),
+    ).toBeDefined();
+  });
+
+  it.each([
+    ["legacy unbound", "legacy"],
+    ["changed capsule", "capsuleHash"],
+    ["changed instruction manifest", "repositoryInstructionManifestDigest"],
+    ["changed instruction selection", "repositoryInstructionSelectionDigest"],
+    ["changed containment profile", "containmentProfile"],
+  ] as const)("starts a %s persisted native session fresh", async (_name, mismatch) => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async (request) => {
+      await writeFile(join(request.repositoryPath, "feature.txt"), "fresh recovery\n");
     });
+    const created = await createRun("Implement a substantial recovery binding feature", {
+      cwd: repository,
+    });
+    await created.store.append("user", "run.approved", { approved: true });
+    const workspace = await createRunWorkspace(created.contract);
+    await created.store.writeWorkspace(workspace);
+    await created.store.append("runtime", "node.started", { nodeId: "implement" });
+    const invocationId = randomUUID();
+    const hostSessionId = randomUUID();
+    const node = created.graph.nodes.find(({ id }) => id === "implement")!;
+    const pinnedContext = await prepareWorkerContext({
+      store: created.store,
+      invocationId,
+      contract: created.contract,
+      node,
+      repositoryPath: workspace.path,
+      predecessorEvidence: [],
+      probeResults: [],
+      recordSelection: false,
+    });
+    const scopeBaseline = await captureWorkspaceScopeSnapshot(
+      workspace.path,
+      [],
+      undefined,
+      created.store.workspaceScopeHashAlgorithm,
+    );
+    const exactBinding = {
+      capsuleHash: pinnedContext.capsuleHash,
+      repositoryInstructionManifestDigest:
+        pinnedContext.capsule.repositoryInstructions?.manifestDigest,
+      repositoryInstructionSelectionDigest:
+        pinnedContext.capsule.repositoryInstructions?.selectionDigest,
+      containmentProfile: adapter.containmentProfile,
+      instructionManifestPinned: true,
+    };
+    const binding =
+      mismatch === "legacy"
+        ? {}
+        : {
+            ...exactBinding,
+            [mismatch]:
+              mismatch === "containmentProfile" ? "test/changed-containment-v1" : "0".repeat(64),
+          };
+    await created.store.append("runtime", "invocation.started", {
+      invocationId,
+      nodeId: "implement",
+      adapter: "test",
+      ...binding,
+      baseline: evidenceSnapshot("before-interruption", []),
+      scopeBaseline,
+    });
+    await created.store.appendInvocationEvent(invocationId, {
+      type: "started",
+      invocationId,
+    });
+    await created.store.appendInvocationEvent(invocationId, { type: "session", hostSessionId });
+
+    const state = await executeRun({ store: created.store, adapter });
+
+    expect(state.status).toBe("completed");
+    expect(adapter.calls).toEqual(["implement"]);
+    expect(adapter.requests[0]?.invocationId).not.toBe(invocationId);
+    expect(adapter.requests[0]?.resumeSessionId).toBeUndefined();
+    const events = await created.store.loadEvents();
+    expect(
+      events.find(
+        ({ type, data }) =>
+          type === "invocation.finished" &&
+          data.invocationId === invocationId &&
+          String(data.reason).includes("lacks the exact pinned instruction"),
+      ),
+    ).toBeDefined();
+    expect(
+      events.find(
+        ({ type, data }) => type === "invocation.resumed" && data.invocationId === invocationId,
+      ),
+    ).toBeUndefined();
   });
 
   it("refuses a stale work progress checkpoint after allowed evidence drift", async () => {
@@ -11594,6 +12264,25 @@ if (args.length === blocked.length && blocked.every((value, index) => args[index
     });
     expect(failure?.data.recordedEvidenceDigest).not.toBe(failure?.data.currentEvidenceDigest);
   }, 30_000);
+
+  it("closes an active host iterator when durable event persistence fails", async () => {
+    const repository = await createRepository();
+    const adapter = new IteratorCleanupTrackingAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+    });
+    const created = await createRun("Implement a substantial feature across the fixture", {
+      cwd: repository,
+      planner: adapter,
+    });
+    const faultStore = new FaultInjectingRunStore(created.store, "host.started");
+
+    await expect(executeRun({ store: faultStore, adapter, approve: true })).rejects.toThrow(
+      "Injected process termination after host.started",
+    );
+
+    expect(adapter.closedNodes).toContain("implement");
+  });
 
   it(
     "recovers across the complete durable invocation fault matrix on both host identities",
@@ -11820,11 +12509,7 @@ if (args.length === blocked.length && blocked.every((value, index) => args[index
     const lockLoss = new AbortController();
     const signal = vi.spyOn(RunLock.prototype, "signal", "get").mockReturnValue(lockLoss.signal);
     const durableRunFiles = async (): Promise<Record<string, string>> =>
-      Object.fromEntries(
-        Object.entries(await snapshotFiles(created.store.runRoot)).filter(
-          ([path]) => !path.endsWith(".tmp"),
-        ),
-      );
+      await snapshotFiles(created.store.runRoot, (path) => !path.endsWith(".tmp"));
 
     try {
       const execution = executeRun({ store: created.store, adapter, approve: true });
@@ -11943,6 +12628,121 @@ if (args.length === blocked.length && blocked.every((value, index) => args[index
     "distinguishes cancellation, shutdown, host crashes, and timeouts in durable state",
     interruptionClassification,
     interruptionClassificationTimeout,
+  );
+
+  it("settles workspace ownership when stop lands after worktree creation", async () => {
+    const repository = await createRepository();
+    const adapter = new FakeAdapter(async () => undefined);
+    const created = await createRun("Implement a substantial stoppable feature", {
+      cwd: repository,
+    });
+    const workspace = await createRunWorkspace(created.contract);
+    const workspaceRecordPath = join(created.store.runRoot, "workspace.json");
+    await expect(readFile(workspaceRecordPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    const reason = "Stop after the worktree was registered";
+    const request: RunControlRequest = {
+      schemaVersion: 1,
+      requestId: randomUUID(),
+      runId: created.contract.runId,
+      action: "stop",
+      cause: "user_stop",
+      reason,
+      requestedAt: new Date().toISOString(),
+      requestedByPid: process.pid,
+    };
+    const watch = vi
+      .spyOn(RunControlChannel.prototype, "watch")
+      .mockImplementationOnce((onRequest) => {
+        onRequest(request);
+        return async () => undefined;
+      });
+
+    try {
+      const stopped = await executeRun({ store: created.store, adapter, approve: true });
+
+      expect(stopped.status).toBe("stopped");
+      expect(stopped.stopReason).toBe(reason);
+      expect(adapter.calls).toEqual([]);
+      expect(await created.store.loadWorkspace()).toEqual({
+        path: workspace.path,
+        branch: workspace.branch,
+        created: false,
+      });
+      const plan = await planRunRetention({
+        repositoryRoot: repository,
+        runReference: created.contract.runId,
+      });
+      expect(plan).toMatchObject({
+        action: "delete_run_state",
+        runId: created.contract.runId,
+        state: { status: "stopped" },
+        preservedWorkspace: { path: workspace.path, branch: workspace.branch },
+      });
+
+      await applyRunRetention({ plan, confirmRunId: created.contract.runId });
+
+      await expect(stat(created.store.runRoot)).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await stat(workspace.path)).isDirectory()).toBe(true);
+      await expect(readFile(join(workspace.path, "package.json"), "utf8")).resolves.toContain(
+        '"name":"fixture"',
+      );
+      const branch = await execFileAsync("git", ["branch", "--show-current"], {
+        cwd: workspace.path,
+        encoding: "utf8",
+      });
+      expect(branch.stdout.trim()).toBe(workspace.branch);
+    } finally {
+      watch.mockRestore();
+    }
+  });
+
+  it.each(["malformed", "redirected"] as const)(
+    "preserves a %s workspace record while applying an early stop",
+    async (recordKind) => {
+      const repository = await createRepository();
+      const adapter = new FakeAdapter(async () => undefined);
+      const created = await createRun("Implement a substantial stoppable workspace feature", {
+        cwd: repository,
+      });
+      const workspaceRecordPath = join(created.store.runRoot, "workspace.json");
+      const payload =
+        recordKind === "malformed"
+          ? "{not-json\n"
+          : `${JSON.stringify({
+              path: join(repository, "redirected-workspace"),
+              branch: "graphcraft/redirected-workspace",
+              created: false,
+            })}\n`;
+      await writeFile(workspaceRecordPath, payload);
+      const reason = `Stop with a ${recordKind} workspace record`;
+      const request: RunControlRequest = {
+        schemaVersion: 1,
+        requestId: randomUUID(),
+        runId: created.contract.runId,
+        action: "stop",
+        cause: "user_stop",
+        reason,
+        requestedAt: new Date().toISOString(),
+        requestedByPid: process.pid,
+      };
+      const watch = vi
+        .spyOn(RunControlChannel.prototype, "watch")
+        .mockImplementationOnce((onRequest) => {
+          onRequest(request);
+          return async () => undefined;
+        });
+
+      try {
+        const stopped = await executeRun({ store: created.store, adapter, approve: true });
+
+        expect(stopped.status).toBe("stopped");
+        expect(stopped.stopReason).toBe(reason);
+        expect(adapter.calls).toEqual([]);
+        expect(await readFile(workspaceRecordPath, "utf8")).toBe(payload);
+      } finally {
+        watch.mockRestore();
+      }
+    },
   );
 
   it("uses an exclusive recoverable run lock", async () => {

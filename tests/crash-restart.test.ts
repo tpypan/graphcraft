@@ -838,6 +838,129 @@ describe("cold runtime restart fault recovery", () => {
     60_000,
   );
 
+  it("settles an owned probe tree before blocking on a missing workspace record", async () => {
+    const { repository, root } = await createRepository();
+    const created = await createRun("Implement durable missing-workspace probe recovery", {
+      cwd: repository,
+    });
+    const markerPath = join(root, "missing-workspace-probe-scope.json");
+    const requestLogPath = join(root, "missing-workspace-probe-scope.requests.jsonl");
+    await configureProbeScopeCrash(created, markerPath, false, "progress_baseline");
+    await created.store.append("user", "run.approved", { approved: true });
+    const crash = spawnCrashRunner(repository, "codex", "probe_scope", markerPath, requestLogPath);
+    const cleanupPids = new Set<number>();
+
+    try {
+      const marker = await waitForProbeScopeMarker(markerPath, crash.child, crash.diagnostics);
+      cleanupPids.add(marker.probePid);
+      cleanupPids.add(marker.descendantPid);
+      cleanupPids.add(marker.brokerPid);
+      expect([marker.brokerPid, marker.probePid, marker.descendantPid].every(isProcessAlive)).toBe(
+        true,
+      );
+      const beforeRestart = await created.store.loadEvents();
+      const scopeStart = beforeRestart.findLast(
+        ({ type, data }) =>
+          type === "scope.started" &&
+          data.nodeId === "implement" &&
+          data.stage === "progress_baseline",
+      );
+      const processStart = beforeRestart.findLast(
+        ({ type, data }) =>
+          type === "probe.process.started" && data.checkpointId === scopeStart?.data.checkpointId,
+      );
+      const executionId = (processStart?.data.definition as { executionId?: string } | undefined)
+        ?.executionId;
+      expect(scopeStart).toBeDefined();
+      expect(executionId).toEqual(expect.any(String));
+
+      expect(crash.child.kill("SIGKILL")).toBe(true);
+      await crash.closed;
+      const workspaceRecordPath = join(created.store.runRoot, "workspace.json");
+      await rm(workspaceRecordPath);
+      const resumed = runResume(repository, "codex", "probe_scope", markerPath, requestLogPath);
+      await Promise.all(
+        [marker.probePid, marker.descendantPid, marker.brokerPid].map((pid) =>
+          waitForProcessExit(pid),
+        ),
+      );
+      cleanupPids.clear();
+      await resumed;
+
+      const recoveredStore = new RunStore(repository, created.contract.runId);
+      const recovered = await recoveredStore.loadState();
+      const events = await recoveredStore.loadEvents();
+      const reconciliation = events.find(
+        ({ type, data }) => type === "probe.process.reconciled" && data.executionId === executionId,
+      );
+      const blocker = events.findLast(
+        ({ type, data }) =>
+          type === "run.blocked" && data.scopeCheckpointId === scopeStart?.data.checkpointId,
+      );
+      expect(recovered.status).toBe("blocked");
+      expect(recovered.stopReason).toMatch(
+        /cannot recover progress-probe scope checkpoint.*workspace is unavailable or invalid/i,
+      );
+      expect(reconciliation?.data).toMatchObject({
+        nodeId: "implement",
+        stage: "progress_baseline",
+        checkpointId: scopeStart?.data.checkpointId,
+        started: true,
+        settlement: {
+          outcome: "terminated",
+          confirmed: true,
+          brokerPid: marker.brokerPid,
+          childPid: marker.probePid,
+        },
+      });
+      expect(reconciliation!.sequence).toBeLessThan(blocker!.sequence);
+      expect(
+        events.filter(
+          ({ type, data }) =>
+            type === "scope.checked" && data.checkpointId === scopeStart?.data.checkpointId,
+        ),
+      ).toHaveLength(0);
+      expect(
+        events.filter(
+          ({ type, data }) => type === "invocation.started" && data.nodeId === "implement",
+        ),
+      ).toHaveLength(0);
+      expect(await probeLaunches(markerPath)).toHaveLength(1);
+      await expect(readFile(workspaceRecordPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+
+      const failureCount = events.filter(
+        ({ type, data }) =>
+          type === "node.failed" && data.scopeCheckpointId === scopeStart?.data.checkpointId,
+      ).length;
+      const blockerCount = events.filter(
+        ({ type, data }) =>
+          type === "run.blocked" && data.scopeCheckpointId === scopeStart?.data.checkpointId,
+      ).length;
+      await runResume(repository, "codex", "probe_scope", markerPath, requestLogPath);
+      const idempotentEvents = await recoveredStore.loadEvents();
+      expect(
+        idempotentEvents.filter(
+          ({ type, data }) =>
+            type === "node.failed" && data.scopeCheckpointId === scopeStart?.data.checkpointId,
+        ),
+      ).toHaveLength(failureCount);
+      expect(
+        idempotentEvents.filter(
+          ({ type, data }) =>
+            type === "run.blocked" && data.scopeCheckpointId === scopeStart?.data.checkpointId,
+        ),
+      ).toHaveLength(blockerCount);
+      expect(await probeLaunches(markerPath)).toHaveLength(1);
+      await expect(readFile(workspaceRecordPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      if (crash.child.exitCode === null && crash.child.signalCode === null) {
+        crash.child.kill("SIGKILL");
+        await crash.closed;
+      }
+      await Promise.all([...cleanupPids].map((pid) => killProcessForCleanup(pid)));
+    }
+  }, 60_000);
+
   it.each(["forged", "missing"] as const)(
     "blocks on $fault probe ownership evidence without signaling an ambiguous PID",
     async (fault) => {

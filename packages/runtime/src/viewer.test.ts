@@ -3,12 +3,50 @@ import { mkdtemp, readFile, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { compileGraph, compileRunContract } from "@graphcraft/core";
+import {
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
+  compileGraph,
+  compileRunContract,
+  contentHash,
+  type RepositoryInstructionManifest,
+} from "@graphcraft/core";
 import { RunStore } from "./store.ts";
 import { RunArtifactStore } from "./artifact-policy.ts";
+import { repositoryInstructionManifestDigest } from "./instructions.ts";
 import { createViewerSnapshot, startRunViewer, type RunViewer } from "./viewer.ts";
 
 const viewers: RunViewer[] = [];
+
+function instructionManifest(content?: string): RepositoryInstructionManifest {
+  const entries = content
+    ? [
+        {
+          path: "AGENTS.md",
+          sources: ["agents" as const],
+          scopes: ["**/*"],
+          gitMode: "100644" as const,
+          workingKind: "file" as const,
+          workingMode: 0,
+          importedBy: [],
+          content,
+          contentHash: contentHash(content, PORTABLE_CANONICAL_HASH_ALGORITHM),
+        },
+      ]
+    : [];
+  const partial = {
+    schemaVersion: 1 as const,
+    policy: "tracked-shared-v1" as const,
+    entries,
+    coverage: {
+      primaryPaths: entries.map(({ path }) => path),
+      importedPaths: [],
+      untrackedSources: "excluded" as const,
+      userAndManagedSources: "excluded" as const,
+      externalImports: "rejected" as const,
+    },
+  };
+  return { ...partial, digest: repositoryInstructionManifestDigest(partial) };
+}
 
 async function requestWithHost(
   url: string,
@@ -38,7 +76,9 @@ afterEach(async () => {
   );
 });
 
-async function viewerFixture(): Promise<RunStore> {
+async function viewerFixture(
+  repositoryInstructions?: RepositoryInstructionManifest,
+): Promise<RunStore> {
   const root = await mkdtemp(join(tmpdir(), "graphcraft-viewer-test-"));
   const contract = compileRunContract(
     "Implement the viewer token=ghp_abcdefghijklmnopqrstuvwxyz",
@@ -53,7 +93,15 @@ async function viewerFixture(): Promise<RunStore> {
       shouldExist: true,
     },
   ]);
-  const store = await RunStore.create(root, contract, graph);
+  const store = await RunStore.create(
+    root,
+    contract,
+    graph,
+    undefined,
+    undefined,
+    {},
+    repositoryInstructions,
+  );
   await store.writeArtifact(
     "logs/probe.log",
     "safe line\nAuthorization: ghp_abcdefghijklmnopqrstuvwxyz\n",
@@ -126,7 +174,8 @@ describe("local read-only viewer", () => {
   });
 
   it("projects durable state over loopback without mutating the run", async () => {
-    const store = await viewerFixture();
+    const repositoryInstructions = instructionManifest("Preserve viewer evidence.\n");
+    const store = await viewerFixture(repositoryInstructions);
     const before = await readFile(store.eventsPath(), "utf8");
     const viewer = await startRunViewer({ store, port: 0 });
     viewers.push(viewer);
@@ -156,8 +205,12 @@ describe("local read-only viewer", () => {
       controlEdges: unknown[];
       timeline: unknown[];
       artifacts: Array<{ href: string }>;
+      repositoryInstructions: Record<string, unknown>;
     };
     const exported = await exportResponse.text();
+    const exportedSnapshot = JSON.parse(exported) as {
+      repositoryInstructions: Record<string, unknown>;
+    };
     const artifact = await artifactResponse.text();
     const after = await readFile(store.eventsPath(), "utf8");
 
@@ -165,6 +218,8 @@ describe("local read-only viewer", () => {
     expect(page.status).toBe(200);
     expect(page.headers.get("content-security-policy")).toContain("connect-src 'self'");
     expect(pageText).toContain("Work and control graph");
+    expect(pageText).toContain("Pinned repository instructions");
+    expect(pageText).toContain("renderInstructions()");
     expect(pageText).toContain("setInterval(refresh,1500)");
     expect(snapshotResponse.status).toBe(200);
     expect(snapshot).toMatchObject({
@@ -178,6 +233,14 @@ describe("local read-only viewer", () => {
     expect(snapshot.artifacts).toEqual([
       expect.objectContaining({ href: "/artifacts/logs/probe.log" }),
     ]);
+    expect(snapshot.repositoryInstructions).toEqual({
+      state: "pinned",
+      policy: "tracked-shared-v1",
+      digest: repositoryInstructions.digest,
+      count: 1,
+      manifest: repositoryInstructions,
+    });
+    expect(exportedSnapshot.repositoryInstructions).toEqual(snapshot.repositoryInstructions);
     expect(snapshotText).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz");
     expect(exported).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz");
     expect(artifact).toContain("[REDACTED]");
@@ -193,7 +256,46 @@ describe("local read-only viewer", () => {
     const store = await viewerFixture();
     const snapshot = await createViewerSnapshot(store);
 
-    expect(snapshot).toMatchObject({ schemaVersion: 1, readOnly: true });
+    expect(snapshot).toMatchObject({
+      schemaVersion: 1,
+      readOnly: true,
+      repositoryInstructions: { state: "legacy_unpinned", manifest: null },
+    });
+  });
+
+  it("distinguishes a pinned empty instruction manifest from a legacy run", async () => {
+    const repositoryInstructions = instructionManifest();
+    const store = await viewerFixture(repositoryInstructions);
+
+    const snapshot = await createViewerSnapshot(store);
+
+    expect(snapshot.repositoryInstructions).toEqual({
+      state: "pinned",
+      policy: "tracked-shared-v1",
+      digest: repositoryInstructions.digest,
+      count: 0,
+      manifest: repositoryInstructions,
+    });
+  });
+
+  it("projects pinned instructions before any worker starts", async () => {
+    const repositoryInstructions = instructionManifest("Preserve pre-worker evidence.\n");
+    const store = await viewerFixture(repositoryInstructions);
+
+    const snapshot = (await createViewerSnapshot(store)) as {
+      repositoryInstructions: Record<string, unknown>;
+      timeline: Array<{ type: string }>;
+    };
+
+    expect(snapshot.repositoryInstructions).toMatchObject({
+      state: "pinned",
+      digest: repositoryInstructions.digest,
+      count: 1,
+      manifest: repositoryInstructions,
+    });
+    expect(snapshot.timeline.map(({ type }) => type)).not.toEqual(
+      expect.arrayContaining(["context.selected", "node.started", "invocation.started"]),
+    );
   });
 
   it("reads only a bounded prefix of a large artifact", async () => {

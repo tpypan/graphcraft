@@ -1,4 +1,5 @@
 import { appendFile, lstat, mkdir, readFile, readlink, realpath } from "node:fs/promises";
+import type { BigIntStats } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
   assertRepositoryFile,
@@ -15,12 +16,16 @@ import {
   type RepositoryPlanningEvidence,
   type RunContract,
   type SideEffectClaim,
+  type SideEffectJournalEntry,
 } from "@graphcraft/core";
 import {
   crossSideEffectBoundary,
   type SideEffectBoundary,
   type SideEffectReconciliation,
 } from "./side-effect.ts";
+import { parseRunWorkspace, type RunWorkspace } from "./workspace.ts";
+
+export type { RunWorkspace } from "./workspace.ts";
 
 async function gitRaw(
   repositoryPath: string,
@@ -335,12 +340,6 @@ async function ensureGraphcraftIgnored(
   signal?.throwIfAborted();
 }
 
-export interface RunWorkspace {
-  path: string;
-  branch: string;
-  created: boolean;
-}
-
 export type RunWorkspaceCreationBoundary =
   "after_parent_prepare" | "after_reconciliation" | "before_worktree_add" | "after_worktree_add";
 
@@ -373,6 +372,15 @@ function slug(task: string): string {
   );
 }
 
+export function expectedRunWorkspace(contract: RunContract): Pick<RunWorkspace, "path" | "branch"> {
+  const branch = `graphcraft/${contract.runId.slice(0, 8)}-${slug(contract.task)}`;
+  const parent = join(
+    dirname(contract.repository.root),
+    `.${basename(contract.repository.root)}-graphcraft-worktrees`,
+  );
+  return { branch, path: join(parent, contract.runId) };
+}
+
 interface WorktreeRegistration {
   path: string;
   head?: string;
@@ -380,7 +388,47 @@ interface WorktreeRegistration {
 }
 
 type ReconciledWorkspaceCreationState =
-  { status: "absent" } | { status: "branch_only" } | { status: "ready" };
+  | { status: "absent" }
+  | { status: "branch_only" }
+  | { status: "ready"; identity: DirectoryIdentity };
+
+interface DirectoryIdentity {
+  dev: bigint;
+  ino: bigint;
+  birthtimeNs: bigint;
+}
+
+function directoryIdentity(
+  stats: Pick<BigIntStats, "dev" | "ino" | "birthtimeNs">,
+): DirectoryIdentity {
+  return { dev: stats.dev, ino: stats.ino, birthtimeNs: stats.birthtimeNs };
+}
+
+function sameDirectoryIdentity(left: DirectoryIdentity, right: DirectoryIdentity): boolean {
+  if (left.ino !== 0n && right.ino !== 0n) return left.dev === right.dev && left.ino === right.ino;
+  return left.dev === right.dev && left.birthtimeNs === right.birthtimeNs;
+}
+
+async function assertDirectoryIdentity(
+  path: string,
+  expected: DirectoryIdentity,
+  detail: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  signal?.throwIfAborted();
+  let stats: BigIntStats;
+  try {
+    stats = await lstat(path, { bigint: true });
+  } catch (error) {
+    signal?.throwIfAborted();
+    throw workspaceStateError(path, `${detail} could not be re-inspected`, error);
+  }
+  signal?.throwIfAborted();
+  if (!stats.isDirectory() || stats.isSymbolicLink())
+    throw workspaceStateError(path, `${detail} is no longer a plain directory`);
+  if (!sameDirectoryIdentity(expected, directoryIdentity(stats)))
+    throw workspaceStateError(path, `${detail} identity changed during validation`);
+}
 
 function comparablePath(path: string): string {
   const absolute = resolve(path);
@@ -475,6 +523,80 @@ function workspaceStateError(
   return new RunWorkspaceReconciliationError(path, detail, cause ? { cause } : undefined);
 }
 
+interface DurableWorkspaceHeadAuthorization {
+  confirmedHead: string;
+  pendingCommit?: SideEffectClaim;
+}
+
+function durableWorkspaceHeadAuthorization(
+  contract: RunContract,
+  sideEffects: readonly SideEffectJournalEntry[],
+): DurableWorkspaceHeadAuthorization {
+  const expectedWorkspace = expectedRunWorkspace(contract);
+  let confirmedHead = contract.repository.baseSha;
+  let pendingCommit: SideEffectClaim | undefined;
+  for (const entry of sideEffects) {
+    if (entry.claim.kind !== "git_commit") continue;
+    if (pendingCommit)
+      throw workspaceStateError(
+        expectedWorkspace.path,
+        "durable run state contains more than one unresolved commit authorization",
+      );
+    const claim = SideEffectClaimSchema.parse(entry.claim);
+    const precondition = commitPrecondition(claim);
+    if (
+      claim.target !== expectedWorkspace.branch ||
+      precondition.branch !== expectedWorkspace.branch ||
+      precondition.expectedHead !== confirmedHead
+    )
+      throw workspaceStateError(
+        expectedWorkspace.path,
+        "durable commit authorization does not extend the last confirmed run HEAD",
+      );
+    if (entry.status === "confirmed") {
+      const sha = entry.result?.sha;
+      const branch = entry.result?.branch;
+      if (
+        typeof sha !== "string" ||
+        !/^[a-f0-9]{40,64}$/u.test(sha) ||
+        branch !== expectedWorkspace.branch
+      )
+        throw workspaceStateError(
+          expectedWorkspace.path,
+          "a confirmed durable commit has invalid result identity",
+        );
+      confirmedHead = sha;
+    } else if (entry.status === "claimed") {
+      pendingCommit = claim;
+    }
+  }
+  return {
+    confirmedHead,
+    ...(pendingCommit ? { pendingCommit } : {}),
+  };
+}
+
+async function matchesPendingCommitAuthorization(
+  repositoryPath: string,
+  head: string,
+  authorization: DurableWorkspaceHeadAuthorization,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const pending = authorization.pendingCommit;
+  if (!pending) return false;
+  const [commitLine, message] = await Promise.all([
+    git(repositoryPath, ["rev-list", "--parents", "-n", "1", head], signal),
+    git(repositoryPath, ["show", "-s", "--format=%B", head], signal),
+  ]);
+  const [commit, ...parents] = commitLine.split(" ");
+  return (
+    commit === head &&
+    parents.length === 1 &&
+    parents[0] === authorization.confirmedHead &&
+    message.split("\n").includes(`Graphcraft-Action: ${pending.idempotencyKey}`)
+  );
+}
+
 async function reconcileRunWorkspaceCreation(
   contract: RunContract,
   path: string,
@@ -482,9 +604,9 @@ async function reconcileRunWorkspaceCreation(
   signal?: AbortSignal,
 ): Promise<ReconciledWorkspaceCreationState> {
   signal?.throwIfAborted();
-  let pathStats: Awaited<ReturnType<typeof lstat>> | undefined;
+  let pathStats: BigIntStats | undefined;
   try {
-    pathStats = await lstat(path);
+    pathStats = await lstat(path, { bigint: true });
   } catch (error) {
     signal?.throwIfAborted();
     if ((error as NodeJS.ErrnoException).code !== "ENOENT")
@@ -537,6 +659,7 @@ async function reconcileRunWorkspaceCreation(
     throw workspaceStateError(path, "Git registers the intended path, but the path is missing");
   if (!pathStats.isDirectory() || pathStats.isSymbolicLink())
     throw workspaceStateError(path, "the intended path is not a plain directory");
+  const pathIdentity = directoryIdentity(pathStats);
   if (targetRegistrations.length !== 1)
     throw workspaceStateError(
       path,
@@ -586,7 +709,8 @@ async function reconcileRunWorkspaceCreation(
     throw workspaceStateError(path, "the registered worktree could not be validated", error);
   }
   signal?.throwIfAborted();
-  return { status: "ready" };
+  await assertDirectoryIdentity(path, pathIdentity, "the intended worktree directory", signal);
+  return { status: "ready", identity: pathIdentity };
 }
 
 async function crossRunWorkspaceCreationBoundary(
@@ -597,35 +721,208 @@ async function crossRunWorkspaceCreationBoundary(
   options.signal?.throwIfAborted();
 }
 
+export async function reconcileRunWorkspace(
+  contract: RunContract,
+  inputWorkspace: unknown,
+  sideEffects: readonly SideEffectJournalEntry[],
+  signal?: AbortSignal,
+): Promise<RunWorkspace> {
+  const expected = expectedRunWorkspace(contract);
+  const headAuthorization = durableWorkspaceHeadAuthorization(contract, sideEffects);
+  const workspace = parseRunWorkspace(inputWorkspace);
+  if (workspace.path !== expected.path)
+    throw workspaceStateError(
+      expected.path,
+      "the durable workspace path differs from the contract-derived path",
+    );
+  if (workspace.branch !== expected.branch)
+    throw workspaceStateError(
+      expected.path,
+      "the durable workspace branch differs from the contract-derived branch",
+    );
+  signal?.throwIfAborted();
+
+  let pathStats: BigIntStats;
+  let registrations: WorktreeRegistration[];
+  let branchHead: string | undefined;
+  try {
+    [pathStats, registrations, branchHead] = await Promise.all([
+      lstat(expected.path, { bigint: true }),
+      gitRaw(contract.repository.root, ["worktree", "list", "--porcelain", "-z"], signal).then(
+        parseWorktreeRegistrations,
+      ),
+      branchSha(contract.repository.root, expected.branch, signal),
+    ]);
+  } catch (error) {
+    signal?.throwIfAborted();
+    throw workspaceStateError(
+      expected.path,
+      "the durable workspace and its Git registration could not be inventoried",
+      error,
+    );
+  }
+  if (!pathStats.isDirectory() || pathStats.isSymbolicLink())
+    throw workspaceStateError(expected.path, "the durable workspace path is not a plain directory");
+  const pathIdentity = directoryIdentity(pathStats);
+
+  let targetPath: string;
+  try {
+    targetPath = await canonicalComparablePath(expected.path, signal);
+  } catch (error) {
+    signal?.throwIfAborted();
+    throw workspaceStateError(
+      expected.path,
+      "the durable workspace path identity could not be resolved",
+      error,
+    );
+  }
+  const expectedRef = `refs/heads/${expected.branch}`;
+  const targetRegistrations = registrations.filter(
+    (registration) => comparablePath(registration.path) === targetPath,
+  );
+  const branchRegistrations = registrations.filter(
+    (registration) => registration.branch === expectedRef,
+  );
+  if (targetRegistrations.length !== 1)
+    throw workspaceStateError(
+      expected.path,
+      targetRegistrations.length === 0
+        ? "the durable workspace lacks an exact Git worktree registration"
+        : "Git reports duplicate registrations for the durable workspace",
+    );
+  if (branchRegistrations.length !== 1 || branchRegistrations[0] !== targetRegistrations[0])
+    throw workspaceStateError(
+      expected.path,
+      "the contract-derived branch is missing or registered at another worktree",
+    );
+  const registration = targetRegistrations[0]!;
+  if (registration.branch !== expectedRef)
+    throw workspaceStateError(expected.path, "the registered worktree is on a different branch");
+
+  try {
+    const [topLevel, currentBranch, head, sourceCommonDirectory, worktreeCommonDirectory] =
+      await Promise.all([
+        git(expected.path, ["rev-parse", "--show-toplevel"], signal),
+        git(expected.path, ["symbolic-ref", "--quiet", "--short", "HEAD"], signal),
+        git(expected.path, ["rev-parse", "HEAD"], signal),
+        canonicalGitCommonDirectory(contract.repository.root, signal),
+        canonicalGitCommonDirectory(expected.path, signal),
+      ]);
+    if ((await canonicalComparablePath(topLevel, signal)) !== targetPath)
+      throw workspaceStateError(
+        expected.path,
+        "the worktree top level differs from the contract-derived path",
+      );
+    if (currentBranch !== expected.branch)
+      throw workspaceStateError(expected.path, "the worktree checkout is on a different branch");
+    if (registration.head !== head)
+      throw workspaceStateError(
+        expected.path,
+        "the Git worktree registration HEAD differs from the checkout HEAD",
+      );
+    if (branchHead !== head)
+      throw workspaceStateError(
+        expected.path,
+        "the contract-derived branch ref differs from the checkout HEAD",
+      );
+    const mergeBase = await git(
+      expected.path,
+      ["merge-base", contract.repository.baseSha, head],
+      signal,
+    );
+    if (mergeBase !== contract.repository.baseSha)
+      throw workspaceStateError(
+        expected.path,
+        "the checkout HEAD does not descend from the approved base",
+      );
+    if (
+      head !== headAuthorization.confirmedHead &&
+      !(await matchesPendingCommitAuthorization(expected.path, head, headAuthorization, signal))
+    )
+      throw workspaceStateError(
+        expected.path,
+        `the checkout HEAD is not authorized by durable run state; expected ${headAuthorization.confirmedHead}`,
+      );
+    if (sourceCommonDirectory !== worktreeCommonDirectory)
+      throw workspaceStateError(
+        expected.path,
+        "the worktree belongs to a different common Git directory",
+      );
+  } catch (error) {
+    signal?.throwIfAborted();
+    if (error instanceof RunWorkspaceReconciliationError) throw error;
+    throw workspaceStateError(expected.path, "the durable workspace could not be validated", error);
+  }
+  signal?.throwIfAborted();
+  await assertDirectoryIdentity(
+    expected.path,
+    pathIdentity,
+    "the durable workspace directory",
+    signal,
+  );
+  return workspace;
+}
+
 export async function createRunWorkspace(
   contract: RunContract,
   options: RunWorkspaceCreationOptions = {},
 ): Promise<RunWorkspace> {
-  const branch = `graphcraft/${contract.runId.slice(0, 8)}-${slug(contract.task)}`;
-  const parent = join(
-    dirname(contract.repository.root),
-    `.${basename(contract.repository.root)}-graphcraft-worktrees`,
-  );
-  const path = join(parent, contract.runId);
+  const { path, branch } = expectedRunWorkspace(contract);
+  const parent = dirname(path);
   options.signal?.throwIfAborted();
   await mkdir(parent, { recursive: true });
   options.signal?.throwIfAborted();
-  let parentStats: Awaited<ReturnType<typeof lstat>>;
+  let parentStats: BigIntStats;
   try {
-    parentStats = await lstat(parent);
+    parentStats = await lstat(parent, { bigint: true });
   } catch (error) {
     options.signal?.throwIfAborted();
     throw workspaceStateError(path, "the worktree parent could not be inspected", error);
   }
   if (!parentStats.isDirectory() || parentStats.isSymbolicLink())
     throw workspaceStateError(path, "the worktree parent is not a plain directory");
+  const parentIdentity = directoryIdentity(parentStats);
   await crossRunWorkspaceCreationBoundary(options, "after_parent_prepare");
+  await assertDirectoryIdentity(
+    parent,
+    parentIdentity,
+    "the worktree parent directory",
+    options.signal,
+  );
 
   const before = await reconcileRunWorkspaceCreation(contract, path, branch, options.signal);
   await crossRunWorkspaceCreationBoundary(options, "after_reconciliation");
-  if (before.status === "ready") return { path, branch, created: false };
+  await assertDirectoryIdentity(
+    parent,
+    parentIdentity,
+    "the worktree parent directory",
+    options.signal,
+  );
+  if (before.status === "ready") {
+    await assertDirectoryIdentity(
+      path,
+      before.identity,
+      "the intended worktree directory",
+      options.signal,
+    );
+    return { path, branch, created: false };
+  }
 
   await crossRunWorkspaceCreationBoundary(options, "before_worktree_add");
+  await assertDirectoryIdentity(
+    parent,
+    parentIdentity,
+    "the worktree parent directory",
+    options.signal,
+  );
+  const confirmedBefore = await reconcileRunWorkspaceCreation(
+    contract,
+    path,
+    branch,
+    options.signal,
+  );
+  if (confirmedBefore.status !== before.status)
+    throw workspaceStateError(path, "the intended worktree state changed before creation");
   let commandError: unknown;
   try {
     await git(
@@ -639,7 +936,30 @@ export async function createRunWorkspace(
     options.signal?.throwIfAborted();
     commandError = error;
   }
+  let createdIdentity: DirectoryIdentity | undefined;
+  try {
+    const createdStats = await lstat(path, { bigint: true });
+    if (createdStats.isDirectory() && !createdStats.isSymbolicLink())
+      createdIdentity = directoryIdentity(createdStats);
+  } catch (error) {
+    options.signal?.throwIfAborted();
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+      throw workspaceStateError(path, "the created worktree path could not be inspected", error);
+  }
   await crossRunWorkspaceCreationBoundary(options, "after_worktree_add");
+  await assertDirectoryIdentity(
+    parent,
+    parentIdentity,
+    "the worktree parent directory",
+    options.signal,
+  );
+  if (createdIdentity)
+    await assertDirectoryIdentity(
+      path,
+      createdIdentity,
+      "the created worktree directory",
+      options.signal,
+    );
   const after = await reconcileRunWorkspaceCreation(contract, path, branch, options.signal);
   if (after.status !== "ready")
     throw workspaceStateError(

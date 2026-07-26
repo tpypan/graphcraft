@@ -39,7 +39,9 @@ import {
   type HostCapabilities,
   type HostExecutionPolicy,
   type ProbePlan,
+  type RepositoryInstructionManifest,
   type RunContract,
+  type RunEvent,
   type RunState,
 } from "@graphcraft/core";
 import {
@@ -1741,10 +1743,25 @@ function probeView(item: ProbePlan["items"][number]): Record<string, unknown> {
   };
 }
 
+export function repositoryInstructionPinView(
+  manifest?: RepositoryInstructionManifest,
+): Record<string, unknown> {
+  return manifest
+    ? {
+        state: "pinned",
+        policy: manifest.policy,
+        digest: manifest.digest,
+        count: manifest.entries.length,
+        paths: manifest.entries.map(({ path }) => path),
+      }
+    : { state: "legacy_unpinned" };
+}
+
 export function contractView(
   contract: RunContract,
   graph?: Graph,
   inputProbePlan?: ProbePlan,
+  repositoryInstructions?: RepositoryInstructionManifest,
 ): Record<string, unknown> {
   const hasGraphProbes = graph?.nodes.some(
     (node) => node.progressProbes.length > 0 || node.completionProbes.length > 0,
@@ -1772,11 +1789,16 @@ export function contractView(
     ...(graph ? { planShape: graphPlanShape(graph) } : {}),
     ...(progressProbes ? { progressProbes } : {}),
     ...(completionProbes ? { completionProbes } : {}),
+    repositoryInstructions: repositoryInstructionPinView(repositoryInstructions),
     recovery: "Checkpoint after every event; accepted nodes are never repeated",
   };
 }
 
-export function stateView(state: RunState, contract: RunContract): Record<string, unknown> {
+export function stateView(
+  state: RunState,
+  contract: RunContract,
+  repositoryInstructions?: RepositoryInstructionManifest,
+): Record<string, unknown> {
   return {
     runId: state.runId,
     task: contract.task,
@@ -1803,6 +1825,7 @@ export function stateView(state: RunState, contract: RunContract): Record<string
     optimizationDecisions: state.optimizationDecisions,
     sideEffects: state.sideEffects,
     waits: state.waits,
+    repositoryInstructions: repositoryInstructionPinView(repositoryInstructions),
     stopReason: state.stopReason,
     updatedAt: state.updatedAt,
   };
@@ -1830,7 +1853,12 @@ export function recoveryHint(message: string): string | undefined {
   return undefined;
 }
 
-export function renderRunStatus(state: RunState, contract: RunContract, graph: Graph): string {
+export function renderRunStatus(
+  state: RunState,
+  contract: RunContract,
+  graph: Graph,
+  repositoryInstructions?: RepositoryInstructionManifest,
+): string {
   const accepted = Object.entries(state.nodes)
     .filter(([, value]) => value.status === "accepted")
     .map(([id]) => id);
@@ -1858,6 +1886,9 @@ export function renderRunStatus(state: RunState, contract: RunContract, graph: G
               `graphcraft inspect ${state.runId.slice(0, 8)} to review the blocker`)
             : `graphcraft inspect ${state.runId.slice(0, 8)}`;
   const evidence = state.latestProgressEvidence.slice(-3);
+  const instructionSummary = repositoryInstructions
+    ? `pinned policy=${repositoryInstructions.policy} · ${repositoryInstructions.digest.slice(0, 12)} · ${repositoryInstructions.entries.length} tracked file${repositoryInstructions.entries.length === 1 ? "" : "s"}`
+    : "legacy unpinned";
   return [
     line("Run", state.runId),
     line("Outcome", contract.outcome),
@@ -1866,6 +1897,7 @@ export function renderRunStatus(state: RunState, contract: RunContract, graph: G
     line("Accepted", accepted.join(", ") || "none"),
     line("Ready", ready.join(", ") || "none"),
     line("Running", running.join(", ") || "none"),
+    line("Instructions", instructionSummary),
     line("Evidence", evidence[0] ?? "none"),
     ...evidence.slice(1).map((item) => line("", item)),
     ...(state.stopReason ? [line("Blocker", state.stopReason)] : []),
@@ -1883,9 +1915,19 @@ export function renderRunInspection(input: {
   graph: Graph;
   graphHistory: Awaited<ReturnType<RunStore["loadGraphHistory"]>>;
   artifactInventory: Awaited<ReturnType<RunStore["loadArtifactInventory"]>>;
+  repositoryInstructions?: RepositoryInstructionManifest;
 }): string {
+  const instructionLines = input.repositoryInstructions
+    ? [
+        `Instructions   pinned policy=${input.repositoryInstructions.policy} · ${input.repositoryInstructions.digest}`,
+        ...input.repositoryInstructions.entries.map(
+          (entry) =>
+            `  ${entry.path} · ${entry.sources.join("+")} · ${entry.scopes.join(", ")} · ${entry.contentHash}`,
+        ),
+      ]
+    : ["Instructions   legacy unpinned run"];
   return [
-    renderRunStatus(input.state, input.contract, input.graph),
+    renderRunStatus(input.state, input.contract, input.graph, input.repositoryInstructions),
     "",
     "Plan",
     ...input.graph.nodes.map((node) => {
@@ -1895,6 +1937,7 @@ export function renderRunInspection(input: {
     "",
     `Governance    ${input.graph.controlEdges.length} control edges; ${input.contract.acceptanceAnchors.length} anchors`,
     `Revisions     ${input.graph.revision}; ${input.graphHistory.length} amendments`,
+    ...instructionLines,
     `Artifacts     ${input.artifactInventory.storedBytes}/${input.artifactInventory.sourceBytes} bytes stored; ${input.artifactInventory.omittedBytes} omitted across ${input.artifactInventory.entries.length} entries`,
     `Durable files ${join(input.contract.repository.root, ".graphcraft", "runs", input.state.runId)}`,
   ].join("\n");
@@ -1954,8 +1997,19 @@ export async function supervisorView(repositoryRoot: string, runId: string) {
   }
 }
 
-export function renderContract(contract: RunContract, graph: Graph, probePlan?: ProbePlan): string {
-  const view = contractView(contract, graph, probePlan);
+export function renderContract(
+  contract: RunContract,
+  graph: Graph,
+  probePlan?: ProbePlan,
+  repositoryInstructions?: RepositoryInstructionManifest,
+): string {
+  const view = contractView(contract, graph, probePlan, repositoryInstructions);
+  const instructions = view.repositoryInstructions as {
+    state: string;
+    policy?: string;
+    digest?: string;
+    count?: number;
+  };
   return [
     `Run            ${contract.runId}`,
     `Outcome        ${view.outcome}`,
@@ -1964,6 +2018,7 @@ export function renderContract(contract: RunContract, graph: Graph, probePlan?: 
     `Permissions    ${contract.permissions.join(", ")}`,
     `Progress       ${(view.progressProbes as Array<{ id: string }> | undefined)?.map(({ id }) => id).join(", ") ?? "none"}`,
     `Completion     ${(view.completionProbes as Array<{ id: string }> | undefined)?.map(({ id }) => id).join(", ") ?? "none"}`,
+    `Instructions   ${instructions.state === "pinned" ? `pinned policy=${instructions.policy} · ${instructions.digest?.slice(0, 12)} · ${String(instructions.count)} tracked` : "legacy unpinned"}`,
     `Recovery       ${view.recovery}`,
     `Plan           ${view.planShape}`,
   ].join("\n");
@@ -1973,17 +2028,47 @@ export async function askForApproval(
   contract: RunContract,
   graph: Graph,
   probePlan?: ProbePlan,
+  repositoryInstructions?: RepositoryInstructionManifest,
 ): Promise<boolean> {
   if (!stdin.isTTY || !stdout.isTTY) return false;
   const prompt = createInterface({ input: stdin, output: stdout });
   try {
     const answer = await prompt.question(
-      `${renderContract(contract, graph, probePlan)}\n\nStart? [Y/n] `,
+      `${renderContract(contract, graph, probePlan, repositoryInstructions)}\n\nStart? [Y/n] `,
     );
     return !/^n(?:o)?$/i.test(answer.trim());
   } finally {
     prompt.close();
   }
+}
+
+export function renderRunTrace(events: RunEvent[]): string {
+  return events
+    .map((event) => {
+      const details: string[] = [];
+      if (event.type === "run.created") {
+        const manifest = event.data.repositoryInstructions as
+          RepositoryInstructionManifest | undefined;
+        details.push(
+          manifest
+            ? `instructions=pinned:${manifest.digest.slice(0, 12)}:${manifest.entries.length}`
+            : "instructions=legacy_unpinned",
+        );
+      }
+      for (const [label, key] of [
+        ["manifest", "repositoryInstructionManifestDigest"],
+        ["selection", "repositoryInstructionSelectionDigest"],
+        ["capsule", "capsuleHash"],
+        ["containment", "containmentProfile"],
+      ] as const) {
+        const value = event.data[key];
+        if (typeof value === "string")
+          details.push(`${label}=${key === "containmentProfile" ? value : value.slice(0, 12)}`);
+      }
+      if (event.data.instructionManifestPinned === true) details.push("instructions=pinned");
+      return `${event.sequence}\t${event.timestamp}\t${event.type}\t${event.actor}${details.length ? `\t${details.join(" ")}` : ""}`;
+    })
+    .join("\n");
 }
 
 export function consoleObserver(json = false): RunObserver {
@@ -2095,10 +2180,16 @@ async function performAction(input: McpActionInput): Promise<Record<string, unkn
       planner: adapter,
       finishLine,
     });
+    const repositoryInstructions = await created.store.loadRepositoryInstructionManifest();
     if (!input.approve)
       return {
         approvalRequired: true,
-        contract: contractView(created.contract, created.graph, created.probePlan),
+        contract: contractView(
+          created.contract,
+          created.graph,
+          created.probePlan,
+          repositoryInstructions,
+        ),
       };
     const state = await executeRun({
       store: created.store,
@@ -2106,20 +2197,22 @@ async function performAction(input: McpActionInput): Promise<Record<string, unkn
       approve: true,
       maxWorkers: input.maxWorkers ?? 1,
     });
-    return stateView(state, created.contract);
+    return stateView(state, created.contract, repositoryInstructions);
   }
 
   const store = await storeFor(cwd, input.run);
-  const [contract, graph, state, probePlan, heldOutProbePlan] = await Promise.all([
-    store.loadContract(),
-    store.loadGraph(),
-    store.loadState(),
-    store.loadProbePlan(),
-    store.loadHeldOutProbePlan(),
-  ]);
+  const [contract, graph, state, probePlan, heldOutProbePlan, repositoryInstructions] =
+    await Promise.all([
+      store.loadContract(),
+      store.loadGraph(),
+      store.loadState(),
+      store.loadProbePlan(),
+      store.loadHeldOutProbePlan(),
+      store.loadRepositoryInstructionManifest(),
+    ]);
   if (input.action === "status")
     return {
-      ...stateView(state, contract),
+      ...stateView(state, contract, repositoryInstructions),
       supervisor: await supervisorView(store.repositoryRoot, store.runId),
     };
   if (input.action === "inspect")
@@ -2139,6 +2232,10 @@ async function performAction(input: McpActionInput): Promise<Record<string, unkn
       tokenReport: tokenCostReport(state.tokenLedger),
       graphHistory: await store.loadGraphHistory(),
       artifactInventory: await store.loadArtifactInventory(),
+      repositoryInstructions: {
+        ...repositoryInstructionPinView(repositoryInstructions),
+        manifest: repositoryInstructions ?? null,
+      },
       contextReceipts: (await store.loadEvents())
         .filter(({ type }) => type === "context.selected")
         .map(({ data }) => ContextSelectionReceiptSchema.parse(data.receipt)),
@@ -2172,13 +2269,19 @@ async function performAction(input: McpActionInput): Promise<Record<string, unkn
         ...(input.replaces ? { replaces: input.replaces } : {}),
       }),
       contract,
+      repositoryInstructions,
     );
   }
-  if (input.action === "stop") return stateView(await requestRunControl(store, "stop"), contract);
-  if (input.action === "pause") return stateView(await requestRunControl(store, "pause"), contract);
+  if (input.action === "stop")
+    return stateView(await requestRunControl(store, "stop"), contract, repositoryInstructions);
+  if (input.action === "pause")
+    return stateView(await requestRunControl(store, "pause"), contract, repositoryInstructions);
   if (input.action === "resume") {
     if (state.status === "awaiting_approval" && !input.approve) {
-      return { approvalRequired: true, contract: contractView(contract, graph, probePlan) };
+      return {
+        approvalRequired: true,
+        contract: contractView(contract, graph, probePlan, repositoryInstructions),
+      };
     }
     if (
       state.status === "awaiting_approval" &&
@@ -2191,7 +2294,7 @@ async function performAction(input: McpActionInput): Promise<Record<string, unkn
       approve: input.approve ?? false,
       maxWorkers: input.maxWorkers ?? 1,
     });
-    return stateView(resumed, contract);
+    return stateView(resumed, contract, repositoryInstructions);
   }
   throw new Error(`Unsupported action: ${input.action}`);
 }

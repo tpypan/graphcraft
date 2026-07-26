@@ -93,12 +93,15 @@ export async function* readBoundedProtocolLines(
   stream: Readable,
   signal?: AbortSignal,
 ): AsyncIterable<BoundedProtocolLine> {
+  if (signal?.aborted) return;
   let line = new LineAccumulator();
   try {
     for await (const chunk of stream) {
+      if (signal?.aborted) return;
       const source = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       let offset = 0;
       while (offset < source.length) {
+        if (signal?.aborted) return;
         const newline = source.indexOf(0x0a, offset);
         if (newline === -1) {
           line.append(source.subarray(offset));
@@ -106,6 +109,7 @@ export async function* readBoundedProtocolLines(
         }
         line.append(source.subarray(offset, newline));
         yield line.finish();
+        if (signal?.aborted) return;
         line = new LineAccumulator();
         offset = newline + 1;
       }
@@ -114,6 +118,7 @@ export async function* readBoundedProtocolLines(
     if (!signal?.aborted) throw error;
     return;
   }
+  if (signal?.aborted) return;
   if (!line.empty) yield line.finish();
 }
 
@@ -136,6 +141,10 @@ export function protocolLineLimitError(host: "Codex" | "Claude"): Error {
   return new Error(
     `${host} protocol line exceeded the ${ADAPTER_PROTOCOL_LINE_LIMIT_BYTES}-byte limit; output was rejected`,
   );
+}
+
+export function malformedProtocolLineError(host: "Codex" | "Claude"): Error {
+  return new Error(`${host} emitted a malformed JSON protocol line; output was rejected`);
 }
 
 export function structuredOutputLimitError(host: "Codex" | "Claude", kind: string): Error {

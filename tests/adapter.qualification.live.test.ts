@@ -7,26 +7,32 @@
  * Setting any variable in this namespace activates fail-closed configuration validation.
  * Run this file with `pnpm vitest run tests/adapter.qualification.live.test.ts`.
  */
-import { execFile } from "node:child_process";
+import { execFile, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { EventEmitter } from "node:events";
+import { lstat, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import crossSpawn from "cross-spawn";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   claudePlannerArgs,
   claudeSemanticVerifierArgs,
   claudeUsage,
   claudeWorkerArgs,
+  createClaudeIsolationBoundary,
+  createClaudeInvocationEnvironment,
+  createClaudeProtocolValidator,
   probeClaudeExecutable,
+  type ClaudeIsolationBoundary,
 } from "../packages/adapter-claude/src/index.ts";
 import {
   codexPlannerArgs,
   codexSemanticVerifierArgs,
   codexUsage,
   codexWorkerArgs,
+  createCodexProtocolValidator,
   probeCodexExecutable,
 } from "../packages/adapter-codex/src/index.ts";
 import {
@@ -185,6 +191,23 @@ interface NativeWorkerResult {
   nativeEventCount: number;
   streamingEvidence: boolean;
   sessionId?: string;
+}
+
+interface QualificationProtocolValidator {
+  observe(event: Record<string, unknown>): string | undefined | Promise<string | undefined>;
+  completionFailure(): string | undefined;
+}
+
+interface NativeProcessLifecycle {
+  controller: ChildTerminationController;
+  exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  settled: boolean;
+  spawnError: Error | undefined;
+}
+
+interface NativeProcessDependencies {
+  createCodexTemp?: () => Promise<string>;
+  spawnProcess?: typeof crossSpawn.spawn;
 }
 
 const FIXTURE_README = `# Graphcraft live qualification fixture
@@ -410,36 +433,18 @@ function aggregateUsage(usages: UsageNumbers[]): UsageNumbers {
   return result;
 }
 
-async function runNativeProcess(
-  executable: string,
-  host: Host,
-  args: string[],
-  cwd: string,
-  input: string | undefined,
-  onEvent: (
-    event: Record<string, unknown>,
-    abort: (reason: { cause: "user_pause" | "cancellation"; reason: string }) => void,
-  ) => void,
-): Promise<NativeProcessResult> {
-  const cancellation = new AbortController();
-  const child = crossSpawn.spawn(executable, args, {
-    cwd,
-    env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
-    shell: false,
-    stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
-  });
-  if (!child.stdout || !child.stderr)
-    throw new Error(`${host} live qualification could not open protocol streams`);
-  if (input !== undefined) child.stdin?.end(input);
-
+function createNativeProcessLifecycle(
+  child: ChildProcess,
+  signal: AbortSignal,
+): NativeProcessLifecycle {
   let spawnError: Error | undefined;
   const exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
     (resolveExit) => {
-      let settled = false;
-      const complete = (code: number | null, signal: NodeJS.Signals | null): void => {
-        if (settled) return;
-        settled = true;
-        resolveExit({ code, signal });
+      let observed = false;
+      const complete = (code: number | null, closeSignal: NodeJS.Signals | null): void => {
+        if (observed) return;
+        observed = true;
+        resolveExit({ code, signal: closeSignal });
       };
       child.once("error", (error) => {
         spawnError = error;
@@ -448,17 +453,107 @@ async function runNativeProcess(
       child.once("close", complete);
     },
   );
-  const terminationController = new ChildTerminationController(child, cancellation.signal);
-  const stderr = captureStderr(child.stderr);
-  const timeout = setTimeout(() => {
-    cancellation.abort({ cause: "timeout", reason: `${host} live qualification timed out` });
-  }, PROCESS_TIMEOUT_MS);
-  timeout.unref();
+  return {
+    controller: new ChildTerminationController(child, signal),
+    exit,
+    settled: false,
+    get spawnError() {
+      return spawnError;
+    },
+  };
+}
 
-  let protocolBytes = 0;
-  let protocolLines = 0;
-  let protocolError: Error | undefined;
+async function finishNativeProcess(lifecycle: NativeProcessLifecycle): Promise<{
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  termination: ReturnType<ChildTerminationController["finish"]>;
+}> {
+  const outcome = await lifecycle.controller.waitForExit(lifecycle.exit);
+  lifecycle.settled = true;
+  return {
+    ...outcome,
+    termination: lifecycle.controller.finish(outcome.code, outcome.signal),
+  };
+}
+
+async function cleanupNativeProcess(
+  lifecycle: NativeProcessLifecycle | undefined,
+  cancellation: AbortController,
+  host: Host,
+): Promise<void> {
+  if (!lifecycle) return;
+  if (!lifecycle.settled) {
+    if (!cancellation.signal.aborted)
+      cancellation.abort({
+        cause: "cancellation",
+        reason: `${host} live qualification stopped before child settlement`,
+      });
+    const outcome = await lifecycle.controller.waitForExit(lifecycle.exit);
+    lifecycle.settled = true;
+    lifecycle.controller.finish(outcome.code, outcome.signal);
+    return;
+  }
+  lifecycle.controller.dispose();
+}
+
+async function runNativeProcess(
+  executable: string,
+  host: Host,
+  args: string[] | ((boundary: ClaudeIsolationBoundary) => string[]),
+  cwd: string,
+  input: string | undefined,
+  onEvent: (
+    event: Record<string, unknown>,
+    abort: (reason: { cause: "user_pause" | "cancellation"; reason: string }) => void,
+  ) => void,
+  validateEvent?: (
+    event: Record<string, unknown>,
+  ) => string | undefined | Promise<string | undefined>,
+  dependencies: NativeProcessDependencies = {},
+): Promise<NativeProcessResult> {
+  const cancellation = new AbortController();
+  const claudeEnvironment =
+    host === "claude" ? await createClaudeInvocationEnvironment() : undefined;
+  const privateTemp =
+    claudeEnvironment?.directory ??
+    (await (
+      dependencies.createCodexTemp ??
+      (() => mkdtemp(join(tmpdir(), "graphcraft-live-qualification-codex-tmp-")))
+    )());
+  let lifecycle: NativeProcessLifecycle | undefined;
+  let timeout: NodeJS.Timeout | undefined;
   try {
+    const invocationArgs =
+      typeof args === "function"
+        ? args(await createClaudeIsolationBoundary(cwd, privateTemp, cancellation.signal))
+        : args;
+    const child = (dependencies.spawnProcess ?? crossSpawn.spawn)(executable, invocationArgs, {
+      cwd,
+      env: claudeEnvironment?.env ?? {
+        ...process.env,
+        TEMP: privateTemp,
+        TMP: privateTemp,
+        TMPDIR: privateTemp,
+        NO_COLOR: "1",
+        FORCE_COLOR: "0",
+      },
+      shell: false,
+      stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+    });
+    lifecycle = createNativeProcessLifecycle(child, cancellation.signal);
+    if (!child.stdout || !child.stderr)
+      throw new Error(`${host} live qualification could not open protocol streams`);
+    if (input !== undefined) child.stdin?.end(input);
+
+    const stderr = captureStderr(child.stderr);
+    timeout = setTimeout(() => {
+      cancellation.abort({ cause: "timeout", reason: `${host} live qualification timed out` });
+    }, PROCESS_TIMEOUT_MS);
+    timeout.unref();
+
+    let protocolBytes = 0;
+    let protocolLines = 0;
+    let protocolError: Error | undefined;
     for await (const line of readBoundedProtocolLines(child.stdout, cancellation.signal)) {
       protocolBytes += line.observedBytes;
       protocolLines += 1;
@@ -481,26 +576,33 @@ async function runNativeProcess(
         break;
       }
       try {
-        onEvent(record(event, `${host} protocol event`), (reason) => cancellation.abort(reason));
+        const protocolEvent = record(event, `${host} protocol event`);
+        const validationFailure = await validateEvent?.(protocolEvent);
+        if (validationFailure) throw new Error(validationFailure);
+        onEvent(protocolEvent, (reason) => cancellation.abort(reason));
       } catch (error) {
         protocolError = error instanceof Error ? error : new Error(String(error));
         cancellation.abort({ cause: "cancellation", reason: protocolError.message });
         break;
       }
     }
-    const outcome = await terminationController.waitForExit(exit);
-    const termination = terminationController.finish(outcome.code, outcome.signal);
-    if (spawnError) throw spawnError;
+    const outcome = await finishNativeProcess(lifecycle);
+    if (lifecycle.spawnError) throw lifecycle.spawnError;
     if (protocolError) throw protocolError;
     if (stderr.overflowed) throw new Error(`${host} stderr exceeded its qualification bound`);
-    if (termination?.cause === "timeout") throw new Error(`${host} live qualification timed out`);
+    if (outcome.termination?.cause === "timeout")
+      throw new Error(`${host} live qualification timed out`);
     return {
       exitCode: outcome.code,
-      ...(termination ? { termination } : {}),
+      ...(outcome.termination ? { termination: outcome.termination } : {}),
     };
   } finally {
-    clearTimeout(timeout);
-    terminationController.dispose();
+    if (timeout) clearTimeout(timeout);
+    try {
+      await cleanupNativeProcess(lifecycle, cancellation, host);
+    } finally {
+      await rm(privateTemp, { recursive: true, force: true });
+    }
   }
 }
 
@@ -527,10 +629,18 @@ async function qualifyPlanning(
 ): Promise<{ plan: GraphPlan; usage: TokenUsage }> {
   return await withCodexSchema(configuration.host, codexGraphPlanJsonSchema, async (schemaPath) => {
     const policy = { model: configuration.model, effort: configuration.effort };
+    const validator: QualificationProtocolValidator =
+      configuration.host === "claude"
+        ? createClaudeProtocolValidator({
+            cwd: await realpath(request.repositoryPath),
+            allowedTools: [],
+            model: configuration.model,
+          })
+        : createCodexProtocolValidator();
     const args =
       configuration.host === "codex"
         ? codexPlannerArgs(request, schemaPath!, policy)
-        : claudePlannerArgs(request, policy);
+        : (boundary: ClaudeIsolationBoundary) => claudePlannerArgs(request, boundary, policy);
     let plan: GraphPlan | undefined;
     let usage: TokenUsage | undefined;
     const processResult = await runNativeProcess(
@@ -558,7 +668,10 @@ async function qualifyPlanning(
           usage = normalizedUsage("claude", event.usage);
         }
       },
+      validator.observe,
     );
+    const completionFailure = validator.completionFailure();
+    if (completionFailure) throw new Error(completionFailure);
     if (processResult.termination || processResult.exitCode !== 0 || !plan)
       throw new Error(`${configuration.host} did not return a valid structured graph plan`);
     return { plan, usage: requireNonzeroUsage(usage, `${configuration.host} planning`) };
@@ -577,10 +690,25 @@ async function runWorker(
     codexWorkerResultJsonSchema,
     async (schemaPath) => {
       const policy = { model: configuration.model, effort: configuration.effort };
+      const validator: QualificationProtocolValidator =
+        configuration.host === "claude"
+          ? createClaudeProtocolValidator({
+              cwd: await realpath(request.repositoryPath),
+              allowedTools: request.allowedTools.includes("write")
+                ? ["Bash", "Edit", "Write", "Read"]
+                : ["Read"],
+              model: configuration.model,
+              expectedSessionId: request.resumeSessionId ?? request.invocationId,
+              sessionContext: request.resumeSessionId ? "resumed_worker" : "worker",
+            })
+          : createCodexProtocolValidator({
+              ...(request.resumeSessionId ? { expectedThreadId: request.resumeSessionId } : {}),
+              sessionContext: request.resumeSessionId ? "resumed_worker" : "worker",
+            });
       const args =
         configuration.host === "codex"
           ? codexWorkerArgs(request, schemaPath!, policy)
-          : claudeWorkerArgs(request, policy);
+          : (boundary: ClaudeIsolationBoundary) => claudeWorkerArgs(request, boundary, policy);
       const events: HostEvent[] = [
         HostEventSchema.parse({ type: "started", invocationId: request.invocationId }),
       ];
@@ -697,7 +825,12 @@ async function runWorker(
             }
           }
         },
+        validator.observe,
       );
+      if (!abortAfterSession) {
+        const completionFailure = validator.completionFailure();
+        if (completionFailure) throw new Error(completionFailure);
+      }
       if (processResult.termination) {
         events.push(
           HostEventSchema.parse({ type: "terminated", termination: processResult.termination }),
@@ -726,10 +859,20 @@ async function qualifySemanticVerification(
     codexSemanticVerdictJsonSchema,
     async (schemaPath) => {
       const policy = { model: configuration.model, effort: configuration.effort };
+      const validator: QualificationProtocolValidator =
+        configuration.host === "claude"
+          ? createClaudeProtocolValidator({
+              cwd: await realpath(request.repositoryPath),
+              allowedTools: ["Read"],
+              model: configuration.model,
+              expectedSessionId: request.invocationId,
+            })
+          : createCodexProtocolValidator();
       const args =
         configuration.host === "codex"
           ? codexSemanticVerifierArgs(request, schemaPath!, policy)
-          : claudeSemanticVerifierArgs(request, policy);
+          : (boundary: ClaudeIsolationBoundary) =>
+              claudeSemanticVerifierArgs(request, boundary, policy);
       let verdict: SemanticVerdict | undefined;
       let usage: TokenUsage | undefined;
       const processResult = await runNativeProcess(
@@ -755,7 +898,10 @@ async function qualifySemanticVerification(
             usage = normalizedUsage("claude", event.usage);
           }
         },
+        validator.observe,
       );
+      const completionFailure = validator.completionFailure();
+      if (completionFailure) throw new Error(completionFailure);
       if (processResult.termination || processResult.exitCode !== 0 || !verdict)
         throw new Error(`${configuration.host} did not return a valid semantic verdict`);
       return {
@@ -1291,6 +1437,54 @@ function assertReportControls(
       throw new Error(`Existing ${configuration.host} report controls do not match this run`);
   }
 }
+
+describe("live qualification subprocess lifecycle", () => {
+  it("removes its private temp directory when spawn fails synchronously", async () => {
+    const privateTemp = await mkdtemp(join(tmpdir(), "graphcraft-live-lifecycle-test-"));
+    const spawnFailure = new Error("synchronous live qualification spawn failure");
+    try {
+      await expect(
+        runNativeProcess("codex", "codex", [], process.cwd(), undefined, () => {}, undefined, {
+          createCodexTemp: async () => privateTemp,
+          spawnProcess: (() => {
+            throw spawnFailure;
+          }) as typeof crossSpawn.spawn,
+        }),
+      ).rejects.toBe(spawnFailure);
+      await expect(lstat(privateTemp)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(privateTemp, { recursive: true, force: true });
+    }
+  });
+
+  it("terminates an allocated child before rejecting missing protocol streams", async () => {
+    const privateTemp = await mkdtemp(join(tmpdir(), "graphcraft-live-lifecycle-test-"));
+    const child = new EventEmitter() as unknown as ChildProcess;
+    const kill = vi.fn((signal?: NodeJS.Signals | number) => {
+      queueMicrotask(() => child.emit("close", null, typeof signal === "string" ? signal : null));
+      return true;
+    });
+    Object.assign(child, {
+      stdin: null,
+      stdout: null,
+      stderr: null,
+      kill,
+      unref: vi.fn(),
+    });
+    try {
+      await expect(
+        runNativeProcess("codex", "codex", [], process.cwd(), undefined, () => {}, undefined, {
+          createCodexTemp: async () => privateTemp,
+          spawnProcess: (() => child) as typeof crossSpawn.spawn,
+        }),
+      ).rejects.toThrow("codex live qualification could not open protocol streams");
+      expect(kill).toHaveBeenCalledWith("SIGTERM");
+      await expect(lstat(privateTemp)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(privateTemp, { recursive: true, force: true });
+    }
+  });
+});
 
 describe.skipIf(!qualificationRequested)("candidate host live qualification", () => {
   it(

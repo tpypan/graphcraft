@@ -588,9 +588,18 @@ export async function waitForProbeProcessSettlement(
 ): Promise<ProbeProcessJournalInspection | undefined> {
   const deadline = Date.now() + timeoutMs;
   while (true) {
-    const inspected = await inspectProbeProcessJournal(input);
-    if (!inspected || inspected.settlement) return inspected;
-    if (Date.now() >= deadline) return inspected;
+    try {
+      const inspected = await inspectProbeProcessJournal(input);
+      if (!inspected || inspected.settlement) return inspected;
+      if (Date.now() >= deadline) return inspected;
+    } catch (error) {
+      if (
+        !(error instanceof Error) ||
+        error.message !== "Private file changed during its bounded read" ||
+        Date.now() >= deadline
+      )
+        throw error;
+    }
     await new Promise<void>((resolve) => setTimeout(resolve, 25));
   }
 }

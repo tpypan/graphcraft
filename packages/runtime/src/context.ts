@@ -18,6 +18,11 @@ import {
 } from "@graphcraft/probes";
 import { RunStore } from "./store.ts";
 import { redactValue } from "./redaction.ts";
+import {
+  assertRepositoryInstructionManifest,
+  resolveRepositoryInstructionManifest,
+  selectRepositoryInstructions,
+} from "./instructions.ts";
 
 const contextStopWords = new Set([
   "acceptance",
@@ -97,6 +102,7 @@ export async function prepareWorkerContext(input: {
   predecessorEvidence: string[];
   probeResults: ProbeResult[];
   signal?: AbortSignal;
+  recordSelection?: boolean;
 }): Promise<{
   capsule: ContextCapsule;
   capsuleHash: string;
@@ -136,6 +142,24 @@ export async function prepareWorkerContext(input: {
     await assertRepositoryPath(input.repositoryPath, repositoryPath, input.signal);
   if (relevantPaths.length > 0)
     await assertRepositoryInventoryPaths(input.repositoryPath, relevantPaths, input.signal);
+  const pinnedInstructions = await input.store.loadRepositoryInstructionManifest();
+  const baseInstructions = pinnedInstructions
+    ? pinnedInstructions
+    : await resolveRepositoryInstructionManifest({
+        repositoryPath: input.repositoryPath,
+        baseSha: input.contract.repository.baseSha,
+        ...(input.signal ? { signal: input.signal } : {}),
+      });
+  const instructionManifest = await assertRepositoryInstructionManifest({
+    expected: baseInstructions,
+    repositoryPath: input.repositoryPath,
+    ...(input.signal ? { signal: input.signal } : {}),
+  });
+  const repositoryInstructions = selectRepositoryInstructions({
+    manifest: instructionManifest,
+    node: input.node,
+    relevantPaths,
+  });
   const node: GraphNode = {
     ...input.node,
     contextSelector: { ...input.node.contextSelector, relevantPaths },
@@ -147,6 +171,7 @@ export async function prepareWorkerContext(input: {
         node,
         predecessorEvidence: input.predecessorEvidence,
         probeResults: input.probeResults,
+        repositoryInstructions,
       }),
     ),
   );
@@ -206,7 +231,14 @@ export async function prepareWorkerContext(input: {
       repositoryInventory: inventory.reused,
       artifacts: reusedArtifacts,
     },
+    repositoryInstructions: {
+      manifestDigest: repositoryInstructions.manifestDigest,
+      selectionDigest: repositoryInstructions.selectionDigest,
+      selectedPaths: repositoryInstructions.selectedPaths,
+      omittedPaths: repositoryInstructions.omittedPaths,
+    },
   });
-  await input.store.append("runtime", "context.selected", { receipt }, input.invocationId);
+  if (input.recordSelection !== false)
+    await input.store.append("runtime", "context.selected", { receipt }, input.invocationId);
   return { capsule, capsuleHash, receipt };
 }

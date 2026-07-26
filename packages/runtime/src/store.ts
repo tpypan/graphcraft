@@ -11,6 +11,7 @@ import {
   LEGACY_CANONICAL_HASH_ALGORITHM,
   PORTABLE_CANONICAL_HASH_ALGORITHM,
   ProbePlanSchema,
+  RepositoryInstructionManifestSchema,
   RunContractSchema,
   RunEventSchema,
   RunStateSchema,
@@ -28,6 +29,7 @@ import {
   type HostEvent,
   type HeldOutProbePlan,
   type ProbePlan,
+  type RepositoryInstructionManifest,
   type RunContract,
   type RunEvent,
   type RunState,
@@ -42,6 +44,11 @@ import {
 import { assertPersistenceSafe, redactTextBytes, redactValue } from "./redaction.ts";
 import { RunArtifactStore, type ArtifactPreview } from "./artifact-policy.ts";
 import { parseWorkspaceScopeSnapshot } from "./scope.ts";
+import {
+  repositoryInstructionManifestDigest,
+  selectRepositoryInstructions,
+} from "./instructions.ts";
+import { parseRunWorkspace, RunWorkspaceRecordError, type RunWorkspace } from "./workspace.ts";
 import {
   ensurePrivateDirectory,
   finalizePrivateFileMutation,
@@ -593,6 +600,7 @@ export class RunStore {
     inputProbePlan?: ProbePlan,
     inputHeldOutProbePlan?: HeldOutProbePlan,
     limits: Partial<RunStoreLimits> = {},
+    inputRepositoryInstructions?: RepositoryInstructionManifest,
   ): Promise<RunStore> {
     const store = new RunStore(
       repositoryRoot,
@@ -610,6 +618,18 @@ export class RunStore {
     store.bindRetentionJournalIdentityHashAlgorithm(PORTABLE_CANONICAL_HASH_ALGORITHM);
     const persistedContract = RunContractSchema.parse(redactValue(contract));
     const persistedGraph = GraphSchema.parse(redactValue(graph));
+    const repositoryInstructions = inputRepositoryInstructions
+      ? RepositoryInstructionManifestSchema.parse(inputRepositoryInstructions)
+      : undefined;
+    if (
+      repositoryInstructions &&
+      repositoryInstructionManifestDigest(repositoryInstructions) !== repositoryInstructions.digest
+    )
+      throw new Error("The repository-instruction manifest digest is invalid");
+    if (repositoryInstructions) {
+      selectRepositoryInstructions({ manifest: repositoryInstructions });
+      assertPersistenceSafe(repositoryInstructions, "Repository instruction manifest");
+    }
     const probePlan = ProbePlanSchema.parse(inputProbePlan ?? probePlanFromGraph(graph));
     const heldOutProbePlan = inputHeldOutProbePlan
       ? validateHeldOutProbePlan(inputHeldOutProbePlan, store.heldOutProbePlanHashAlgorithm)
@@ -619,6 +639,12 @@ export class RunStore {
     store.assertJsonProjectionFits(persistedContract, RUN_METADATA_MAX_BYTES, "Run contract");
     store.assertJsonProjectionFits(persistedGraph, RUN_METADATA_MAX_BYTES, "Run graph");
     store.assertJsonProjectionFits(probePlan, RUN_METADATA_MAX_BYTES, "Probe plan");
+    if (repositoryInstructions)
+      store.assertJsonProjectionFits(
+        repositoryInstructions,
+        RUN_METADATA_MAX_BYTES,
+        "Repository-instruction manifest",
+      );
     await ensurePrivateDirectory(store.graphcraftRoot);
     await Promise.all([
       ensurePrivateDirectory(join(store.graphcraftRoot, "runs")),
@@ -643,6 +669,7 @@ export class RunStore {
           graph: persistedGraph,
           probePlan,
           heldOutProbePlan,
+          ...(repositoryInstructions ? { repositoryInstructions } : {}),
           nodeIds: graph.nodes.map(({ id }) => id),
           probeEvidenceCheckpointFormat: 2,
           governanceControlIdentityFormat: 2,
@@ -811,6 +838,15 @@ export class RunStore {
     return RunContractSchema.parse(
       await this.readBoundedJson("contract.json", RUN_METADATA_MAX_BYTES),
     );
+  }
+
+  async loadRepositoryInstructionManifest(): Promise<RepositoryInstructionManifest | undefined> {
+    const created = (await this.loadEvents()).find(({ type }) => type === "run.created");
+    if (!created || created.data.repositoryInstructions === undefined) return undefined;
+    const manifest = RepositoryInstructionManifestSchema.parse(created.data.repositoryInstructions);
+    if (repositoryInstructionManifestDigest(manifest) !== manifest.digest)
+      throw new Error("The durable repository-instruction manifest digest is invalid");
+    return manifest;
   }
 
   async saveGraph(graph: Graph): Promise<void> {
@@ -1334,12 +1370,41 @@ export class RunStore {
 
   async writeWorkspace(value: unknown): Promise<void> {
     await this.ensureStorage();
-    await this.writeBoundedJson("workspace.json", value, RUN_WORKSPACE_MAX_BYTES, "Run workspace");
+    const persisted = redactValue(value);
+    this.assertJsonProjectionFits(persisted, RUN_WORKSPACE_MAX_BYTES, "Run workspace");
+    await this.writeBoundedJson(
+      "workspace.json",
+      parseRunWorkspace(persisted),
+      RUN_WORKSPACE_MAX_BYTES,
+      "Run workspace",
+    );
   }
 
-  async loadWorkspace<T>(): Promise<T> {
+  async loadOptionalWorkspace(): Promise<RunWorkspace | undefined> {
     await this.ensureStorage();
-    return (await this.readBoundedJson("workspace.json", RUN_WORKSPACE_MAX_BYTES)) as T;
+    let value: unknown;
+    try {
+      value = await this.readBoundedJson("workspace.json", RUN_WORKSPACE_MAX_BYTES);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw new RunWorkspaceRecordError(
+        (error as Error).message.includes("bounded read limit")
+          ? "the record exceeds its bounded read limit"
+          : "the record could not be read as bounded JSON",
+        { cause: error },
+      );
+    }
+    return parseRunWorkspace(value);
+  }
+
+  async loadWorkspace<T = RunWorkspace>(): Promise<T> {
+    const workspace = await this.loadOptionalWorkspace();
+    if (!workspace) {
+      const error = new Error("The durable run workspace record is unavailable");
+      Object.assign(error, { code: "ENOENT" });
+      throw error;
+    }
+    return workspace as T;
   }
 
   private async materialize(events: RunEvent[]): Promise<RunState> {

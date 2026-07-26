@@ -1,5 +1,15 @@
 import { execFile } from "node:child_process";
-import { lstat, mkdir, mkdtemp, realpath, rm, unlink, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -11,6 +21,7 @@ import {
   contentHash,
   type HostAdapter,
   type RunContract,
+  type SideEffectJournalEntry,
 } from "@graphcraft/core";
 import {
   createAtomicCommitClaim,
@@ -18,6 +29,7 @@ import {
   createRunWorkspace,
   discoverRepository,
   reconcileAtomicCommit,
+  reconcileRunWorkspace,
   RunWorkspaceReconciliationError,
   type RunWorkspaceCreationBoundary,
 } from "./repository.ts";
@@ -230,6 +242,229 @@ describe.sequential("run workspace creation reconciliation", () => {
     expect(await registrationCount(repository, created.path)).toBe(1);
   });
 
+  it("rejects replacement of the bound worktree parent during creation", async () => {
+    const { repository, contract } = await createFixture();
+    const intended = intendedWorkspace(contract);
+    const parent = dirname(intended.path);
+    const movedParent = `${parent}-moved`;
+
+    await expect(
+      createRunWorkspace(contract, {
+        boundary: async (point) => {
+          if (point !== "after_parent_prepare") return;
+          await rename(parent, movedParent);
+          await mkdir(parent);
+          await writeFile(join(parent, "preserved.txt"), "replacement preserved\n");
+        },
+      }),
+    ).rejects.toThrow(/worktree parent directory identity changed during validation/i);
+
+    expect(await readFile(join(parent, "preserved.txt"), "utf8")).toBe("replacement preserved\n");
+    expect(await pathExists(movedParent)).toBe(true);
+    expect(await registrationCount(repository, intended.path)).toBe(0);
+    expect(await branchTarget(repository, intended.branch)).toBeUndefined();
+  });
+
+  it("rejects replacement of a bound ready worktree across a creation boundary", async () => {
+    const { contract } = await createFixture();
+    const created = await createRunWorkspace(contract);
+    const movedWorktree = `${created.path}-moved`;
+
+    await expect(
+      createRunWorkspace(contract, {
+        boundary: async (point) => {
+          if (point !== "after_reconciliation") return;
+          await rename(created.path, movedWorktree);
+          await mkdir(created.path);
+          await writeFile(join(created.path, "preserved.txt"), "replacement preserved\n");
+        },
+      }),
+    ).rejects.toThrow(/intended worktree directory identity changed during validation/i);
+
+    expect(await readFile(join(created.path, "preserved.txt"), "utf8")).toBe(
+      "replacement preserved\n",
+    );
+    expect(await pathExists(join(movedWorktree, ".git"))).toBe(true);
+  });
+
+  it("reconciles the contract-derived workspace before fresh and resumed execution", async () => {
+    const { contract } = await createFixture();
+    const created = await createRunWorkspace(contract);
+
+    await expect(reconcileRunWorkspace(contract, created, [])).resolves.toEqual(created);
+    await writeFile(join(created.path, "in-progress.txt"), "uncommitted progress\n");
+    await expect(reconcileRunWorkspace(contract, created, [])).resolves.toEqual(created);
+  });
+
+  it("rejects an unjournaled descendant HEAD without changing it", async () => {
+    const { contract } = await createFixture();
+    const created = await createRunWorkspace(contract);
+
+    await git(created.path, "config", "user.name", "Graphcraft Test");
+    await git(created.path, "config", "user.email", "graphcraft@example.test");
+    await git(created.path, "config", "commit.gpgSign", "false");
+    await writeFile(join(created.path, "in-progress.txt"), "uncommitted progress\n");
+    await git(created.path, "add", "in-progress.txt");
+    await git(created.path, "commit", "-m", "unrelated external commit");
+    const unjournaledHead = await gitOutput(created.path, "rev-parse", "HEAD");
+
+    await expect(reconcileRunWorkspace(contract, created, [])).rejects.toThrow(
+      /checkout HEAD is not authorized by durable run state/i,
+    );
+    expect(await gitOutput(created.path, "rev-parse", "HEAD")).toBe(unjournaledHead);
+  });
+
+  it("accepts only the exact pending or confirmed durable Graphcraft commit", async () => {
+    const { contract } = await createFixture();
+    const created = await createRunWorkspace(contract);
+    await writeFile(join(created.path, "in-progress.txt"), "authorized progress\n");
+    const claim = await createAtomicCommitClaim(
+      created,
+      contract.runId,
+      "commit",
+      PORTABLE_CANONICAL_HASH_ALGORITHM,
+    );
+    await git(created.path, "add", "-A");
+    await git(
+      created.path,
+      "commit",
+      "-m",
+      "graphcraft: authorized progress",
+      "-m",
+      `Graphcraft-Action: ${claim.idempotencyKey}`,
+    );
+    const sha = await gitOutput(created.path, "rev-parse", "HEAD");
+    const pending: SideEffectJournalEntry = {
+      claim,
+      status: "claimed",
+      reconciliationAttempts: 0,
+      evidence: [],
+      updatedAt: new Date().toISOString(),
+    };
+
+    await expect(reconcileRunWorkspace(contract, created, [pending])).resolves.toEqual(created);
+    const confirmed: SideEffectJournalEntry = {
+      ...pending,
+      status: "confirmed",
+      result: { sha, branch: created.branch },
+    };
+    await expect(reconcileRunWorkspace(contract, created, [confirmed])).resolves.toEqual(created);
+
+    await writeFile(join(created.path, "foreign.txt"), "foreign progress\n");
+    await git(created.path, "add", "foreign.txt");
+    await git(created.path, "commit", "-m", "foreign descendant");
+    await expect(reconcileRunWorkspace(contract, created, [confirmed])).rejects.toThrow(
+      /checkout HEAD is not authorized by durable run state/i,
+    );
+  });
+
+  it("rejects durable workspace redirects before inspecting the redirected path", async () => {
+    const { contract } = await createFixture();
+    const created = await createRunWorkspace(contract);
+    const outside = await mkdtemp(join(tmpdir(), "graphcraft-workspace-redirect-"));
+    temporaryRoots.push(outside);
+    const marker = join(outside, "preserved.txt");
+    await writeFile(marker, "preserve me\n");
+
+    await expect(
+      reconcileRunWorkspace(contract, { ...created, path: outside }, []),
+    ).rejects.toThrow(/workspace path differs from the contract-derived path/i);
+    await expect(
+      reconcileRunWorkspace(contract, { ...created, branch: "graphcraft/redirect" }, []),
+    ).rejects.toThrow(/workspace branch differs from the contract-derived branch/i);
+    expect(await readFile(marker, "utf8")).toBe("preserve me\n");
+  });
+
+  it.each(["detached", "wrong branch"] as const)(
+    "rejects a durable workspace on a %s checkout",
+    async (checkout) => {
+      const { contract } = await createFixture();
+      const created = await createRunWorkspace(contract);
+      if (checkout === "detached")
+        await git(created.path, "checkout", "--detach", contract.repository.baseSha);
+      else
+        await git(
+          created.path,
+          "checkout",
+          "-b",
+          `graphcraft/test-wrong-${contract.runId.slice(0, 8)}`,
+          contract.repository.baseSha,
+        );
+
+      await expect(reconcileRunWorkspace(contract, created, [])).rejects.toThrow(
+        /contract-derived branch is missing or registered at another worktree/i,
+      );
+      expect(await readFile(join(created.path, "feature.txt"), "utf8")).toBe("base\n");
+    },
+  );
+
+  it("rejects a durable workspace whose Git registration was removed", async () => {
+    const { repository, contract } = await createFixture();
+    const created = await createRunWorkspace(contract);
+    const moved = `${created.path}-unregistered`;
+    await rename(created.path, moved);
+    await git(repository, "worktree", "prune", "--expire", "now");
+    await rename(moved, created.path);
+
+    expect(await registrationCount(repository, created.path)).toBe(0);
+    await expect(reconcileRunWorkspace(contract, created, [])).rejects.toThrow(
+      /durable workspace lacks an exact Git worktree registration/i,
+    );
+    expect(await readFile(join(created.path, "feature.txt"), "utf8")).toBe("base\n");
+  });
+
+  it("rejects a durable workspace whose intended branch is registered elsewhere", async () => {
+    const { repository, contract } = await createFixture();
+    const created = await createRunWorkspace(contract);
+    const otherPath = `${created.path}-expected-branch`;
+    const replacementBranch = `graphcraft/test-replacement-${contract.runId.slice(0, 8)}`;
+    await git(repository, "worktree", "move", created.path, otherPath);
+    await git(
+      repository,
+      "worktree",
+      "add",
+      "-b",
+      replacementBranch,
+      created.path,
+      contract.repository.baseSha,
+    );
+
+    await expect(reconcileRunWorkspace(contract, created, [])).rejects.toThrow(
+      /contract-derived branch is missing or registered at another worktree/i,
+    );
+    expect(await readFile(join(otherPath, "feature.txt"), "utf8")).toBe("base\n");
+    expect(await readFile(join(created.path, "feature.txt"), "utf8")).toBe("base\n");
+  });
+
+  it("rejects a durable workspace whose checkout no longer descends from the approved base", async () => {
+    const { repository, contract } = await createFixture();
+    const created = await createRunWorkspace(contract);
+    const tree = await gitOutput(created.path, "write-tree");
+    const unrelated = await gitOutput(created.path, "commit-tree", tree, "-m", "unrelated root");
+    await git(created.path, "reset", "--hard", unrelated);
+
+    expect(await branchTarget(repository, created.branch)).toBe(unrelated);
+    await expect(reconcileRunWorkspace(contract, created, [])).rejects.toThrow(
+      /checkout HEAD does not descend from the approved base|durable workspace could not be validated/i,
+    );
+    expect(await gitOutput(created.path, "rev-parse", "HEAD")).toBe(unrelated);
+  });
+
+  it("rejects a durable workspace whose expected branch ref is missing", async () => {
+    const { repository, contract } = await createFixture();
+    const created = await createRunWorkspace(contract);
+    await git(repository, "update-ref", "-d", `refs/heads/${created.branch}`);
+
+    expect(await branchTarget(repository, created.branch)).toBeUndefined();
+    await expect(reconcileRunWorkspace(contract, created, [])).rejects.toBeInstanceOf(
+      RunWorkspaceReconciliationError,
+    );
+    await expect(reconcileRunWorkspace(contract, created, [])).rejects.toThrow(
+      /branch ref differs from the checkout HEAD|durable workspace could not be validated/i,
+    );
+    expect(await readFile(join(created.path, "feature.txt"), "utf8")).toBe("base\n");
+  });
+
   it.each<RunWorkspaceCreationBoundary>([
     "after_parent_prepare",
     "after_reconciliation",
@@ -419,6 +654,9 @@ describe.sequential("run workspace creation reconciliation", () => {
     await git(created.path, "fetch", repository, contract.repository.baseSha);
     await git(created.path, "reset", "--hard", "FETCH_HEAD");
 
+    await expect(reconcileRunWorkspace(contract, created, [])).rejects.toThrow(
+      /different common Git directory/,
+    );
     await expect(createRunWorkspace(contract)).rejects.toBeInstanceOf(
       RunWorkspaceReconciliationError,
     );

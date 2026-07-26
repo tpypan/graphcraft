@@ -2,9 +2,17 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { compileGraph, compileRunContract, createRunEvent, reduceEvents } from "@graphcraft/core";
-import type { ProbePlan } from "@graphcraft/core";
+import {
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
+  compileGraph,
+  compileRunContract,
+  contentHash,
+  createRunEvent,
+  reduceEvents,
+} from "@graphcraft/core";
+import type { ProbePlan, RepositoryInstructionManifest } from "@graphcraft/core";
 import { DEFAULT_ARTIFACT_POLICY } from "@graphcraft/runtime";
+import { repositoryInstructionManifestDigest } from "../../runtime/src/instructions.ts";
 import {
   GRAPHCRAFT_VERSION,
   assessTaskShape,
@@ -16,6 +24,7 @@ import {
   renderRunInspection,
   renderRunList,
   renderRunStatus,
+  renderRunTrace,
   resolveGraphcraftHome,
   stageBundledMcp,
   stateView,
@@ -23,6 +32,37 @@ import {
 } from "./index.ts";
 
 const temporaryRoots: string[] = [];
+
+function instructionManifest(content?: string): RepositoryInstructionManifest {
+  const entries = content
+    ? [
+        {
+          path: "AGENTS.md",
+          sources: ["agents" as const],
+          scopes: ["**/*"],
+          gitMode: "100644" as const,
+          workingKind: "file" as const,
+          workingMode: 0,
+          importedBy: [],
+          content,
+          contentHash: contentHash(content, PORTABLE_CANONICAL_HASH_ALGORITHM),
+        },
+      ]
+    : [];
+  const partial = {
+    schemaVersion: 1 as const,
+    policy: "tracked-shared-v1" as const,
+    entries,
+    coverage: {
+      primaryPaths: entries.map(({ path }) => path),
+      importedPaths: [],
+      untrackedSources: "excluded" as const,
+      userAndManagedSources: "excluded" as const,
+      externalImports: "rejected" as const,
+    },
+  };
+  return { ...partial, digest: repositoryInstructionManifestDigest(partial) };
+}
 
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -142,6 +182,104 @@ describe("run approval", () => {
       completionProbes: [{ id: "tests", command: "pnpm test" }],
     });
     expect(renderContract(contract, graph)).toContain("Completion     tests");
+  });
+
+  it("distinguishes pinned empty, pinned nonempty, and legacy instruction state", () => {
+    const contract = compileRunContract("Implement a substantial feature", {
+      root: "/tmp/example",
+      baseRef: "main",
+      baseSha: "abc123",
+    });
+    const graph = compileGraph(contract, []);
+    const empty = instructionManifest();
+    const pinned = instructionManifest("Preserve the pinned repository policy.\n");
+    const created = createRunEvent({
+      sequence: 1,
+      actor: "runtime",
+      causationId: contract.runId,
+      type: "run.created",
+      data: {
+        contract,
+        graph,
+        nodeIds: graph.nodes.map(({ id }) => id),
+        repositoryInstructions: pinned,
+      },
+    });
+    const state = reduceEvents([created]);
+
+    expect(contractView(contract, graph, undefined, empty)).toMatchObject({
+      repositoryInstructions: {
+        state: "pinned",
+        policy: "tracked-shared-v1",
+        digest: empty.digest,
+        count: 0,
+        paths: [],
+      },
+    });
+    expect(contractView(contract, graph).repositoryInstructions).toEqual({
+      state: "legacy_unpinned",
+    });
+    expect(state.status).toBe("awaiting_approval");
+    expect(Object.values(state.nodes).every(({ status }) => status === "pending")).toBe(true);
+    expect(stateView(state, contract, pinned)).toMatchObject({
+      repositoryInstructions: {
+        state: "pinned",
+        digest: pinned.digest,
+        count: 1,
+        paths: ["AGENTS.md"],
+      },
+    });
+
+    const approval = renderContract(contract, graph, undefined, pinned);
+    const status = renderRunStatus(state, contract, graph, pinned);
+    const inspection = renderRunInspection({
+      state,
+      contract,
+      graph,
+      graphHistory: [],
+      artifactInventory: {
+        schemaVersion: 1,
+        runId: contract.runId,
+        policy: DEFAULT_ARTIFACT_POLICY,
+        sourceBytes: 0,
+        storedBytes: 0,
+        omittedBytes: 0,
+        entries: [],
+        updatedAt: new Date().toISOString(),
+      },
+      repositoryInstructions: pinned,
+    });
+    expect(approval).toContain(
+      `pinned policy=tracked-shared-v1 · ${pinned.digest.slice(0, 12)} · 1 tracked`,
+    );
+    expect(status).toContain(
+      `pinned policy=tracked-shared-v1 · ${pinned.digest.slice(0, 12)} · 1 tracked file`,
+    );
+    expect(inspection).toContain(
+      `Instructions   pinned policy=tracked-shared-v1 · ${pinned.digest}`,
+    );
+    expect(inspection).toContain(`AGENTS.md · agents · **/* · ${pinned.entries[0]?.contentHash}`);
+
+    const invocation = createRunEvent({
+      sequence: 2,
+      actor: "runtime",
+      causationId: contract.runId,
+      type: "invocation.started",
+      data: {
+        repositoryInstructionManifestDigest: pinned.digest,
+        repositoryInstructionSelectionDigest: "b".repeat(64),
+        capsuleHash: "c".repeat(64),
+        containmentProfile: "codex-workspace-write-v1",
+        instructionManifestPinned: true,
+      },
+    });
+    const trace = renderRunTrace([created, invocation]);
+    expect(trace).toContain(`instructions=pinned:${pinned.digest.slice(0, 12)}:1`);
+    expect(trace).toContain(`manifest=${pinned.digest.slice(0, 12)}`);
+    expect(trace).toContain(`selection=${"b".repeat(12)}`);
+    expect(trace).toContain(`capsule=${"c".repeat(12)}`);
+    expect(trace).toContain("containment=codex-workspace-write-v1");
+    expect(trace).toContain("instructions=pinned");
   });
 
   it("shows pushed as a distinct permissioned finish line", () => {
@@ -292,6 +430,7 @@ describe("run approval", () => {
     });
 
     expect(stateView(reduceEvents([created, usage]), contract)).toMatchObject({
+      repositoryInstructions: { state: "legacy_unpinned" },
       tokenReport: {
         receipts: 1,
         totals: { total: 14 },
@@ -305,26 +444,27 @@ describe("run approval", () => {
     const rendered = renderRunStatus(state, contract, graph);
     expect(rendered).toContain("Finish line   local_verified");
     expect(rendered).toContain("Status        awaiting_approval");
+    expect(rendered).toContain("Instructions  legacy unpinned");
     expect(rendered).toContain("cached 2, uncached 8, output 4, reasoning 1, total 14");
     expect(rendered).toContain(`graphcraft resume ${contract.runId.slice(0, 8)} --yes`);
-    expect(
-      renderRunInspection({
-        state,
-        contract,
-        graph,
-        graphHistory: [],
-        artifactInventory: {
-          schemaVersion: 1,
-          runId: contract.runId,
-          policy: DEFAULT_ARTIFACT_POLICY,
-          sourceBytes: 0,
-          storedBytes: 0,
-          omittedBytes: 0,
-          entries: [],
-          updatedAt: new Date().toISOString(),
-        },
-      }),
-    ).toContain("Governance");
+    const inspection = renderRunInspection({
+      state,
+      contract,
+      graph,
+      graphHistory: [],
+      artifactInventory: {
+        schemaVersion: 1,
+        runId: contract.runId,
+        policy: DEFAULT_ARTIFACT_POLICY,
+        sourceBytes: 0,
+        storedBytes: 0,
+        omittedBytes: 0,
+        entries: [],
+        updatedAt: new Date().toISOString(),
+      },
+    });
+    expect(inspection).toContain("Governance");
+    expect(inspection).toContain("Instructions   legacy unpinned run");
   });
 
   it("renders stable run selection and actionable recovery hints", () => {

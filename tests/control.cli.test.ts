@@ -123,7 +123,11 @@ describe("cross-process run control", () => {
       expect(processExists(probePid)).toBe(false);
       const state = await created.store.loadState();
       expect(state.status).toBe("paused");
-      await expect(created.store.loadWorkspace()).rejects.toThrow();
+      await expect(created.store.loadWorkspace()).resolves.toMatchObject({
+        path: expect.stringContaining("graphcraft-worktrees"),
+        branch: expect.stringMatching(/^graphcraft\//),
+        created: true,
+      });
       const events = await created.store.loadEvents();
       expect(events.find(({ type }) => type === "run.blocked")).toBeUndefined();
       const applied = events.findLast(({ type }) => type === "control.applied");

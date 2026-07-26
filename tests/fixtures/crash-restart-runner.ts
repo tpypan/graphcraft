@@ -22,6 +22,8 @@ import {
   executeRun,
   resolveRunId,
 } from "../../packages/runtime/src/index.ts";
+import { CODEX_CONTAINMENT_PROFILE } from "../../packages/adapter-codex/src/index.ts";
+import { CLAUDE_CONTAINMENT_PROFILE } from "../../packages/adapter-claude/src/index.ts";
 
 type HostId = "codex" | "claude";
 type FaultBoundary =
@@ -129,6 +131,7 @@ class ColdRestartFaultStore extends RunStore {
 
 class ColdRestartAdapter implements HostAdapter {
   readonly id: HostId;
+  readonly containmentProfile: string;
 
   constructor(
     host: HostId,
@@ -136,6 +139,8 @@ class ColdRestartAdapter implements HostAdapter {
     private readonly requestLogPath: string,
   ) {
     this.id = host;
+    this.containmentProfile =
+      host === "codex" ? CODEX_CONTAINMENT_PROFILE : CLAUDE_CONTAINMENT_PROFILE;
   }
 
   async probe(): Promise<HostCapabilities> {

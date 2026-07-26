@@ -24,8 +24,8 @@
     "algorithm": "sha256",
     "files": {
       "version.txt": "0e431af7cba34fdb4b31af93a3a5e4156b614f6d9e4496ca372cd4734dd7b63a",
-      "worker-interrupted.jsonl": "ce637d28595e95ccc1a1922565e80e505804585b799a05ac4e892c0a7efea1d0",
-      "worker-resumed.jsonl": "9712c203711ed2e4d916d657ce0896c12c1fc74801063820a26bb23213676169"
+      "worker-interrupted.jsonl": "6f9f08cd5c61b9ec3c58e5532af83636c53027a85c675bff027cde01f3333924",
+      "worker-resumed.jsonl": "111d5fc0472a2684048dc5b2fb568e9d80430439a89f0e9a884270de6a9a21ee"
     }
   },
   "expected": {

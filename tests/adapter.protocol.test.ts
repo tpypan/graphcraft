@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  CODEX_CONTAINMENT_PROFILE,
+  CodexAdapter,
   codexPlannerArgs,
   codexSemanticVerifierArgs,
   codexUsage,
@@ -63,6 +65,24 @@ function planningRequest(): PlanningRequest {
     probePlan: { schemaVersion: 1, family: "feature", items: [] },
     verificationProbes: [],
   };
+}
+
+const CLAUDE_BOUNDARY = {
+  repositoryRealPath: "/tmp/graphcraft fixture",
+  temporaryDirectory: "/tmp/graphcraft-claude-private",
+};
+
+function expectCodexPermissionProfile(args: string[], kind: "read" | "write"): string {
+  const assignment = args.find((arg) => arg.startsWith('default_permissions="graphcraft-'));
+  expect(assignment).toMatch(
+    new RegExp(`^default_permissions="graphcraft-${kind}-[a-f0-9-]{36}"$`, "u"),
+  );
+  const profile = assignment!.slice('default_permissions="'.length, -1);
+  const workspaceAccess = kind === "write" ? "write" : "read";
+  expect(args).toContain(
+    `permissions.${profile}={filesystem={":minimal"="read",":workspace_roots"="${workspaceAccess}",":tmpdir"="write"},network={enabled=false}}`,
+  );
+  return profile;
 }
 
 describe("native host continuation protocol", () => {
@@ -226,25 +246,32 @@ describe("native host continuation protocol", () => {
   it("persists Codex worker sessions and resumes an exact thread without ephemeral mode", () => {
     const fresh = codexWorkerArgs(request(), "/tmp/schema.json");
     expect(fresh).not.toContain("--ephemeral");
-    expect(fresh).toContain("workspace-write");
+    expectCodexPermissionProfile(fresh, "write");
     expect(fresh).toContain("/tmp/graphcraft fixture");
 
     const resumed = codexWorkerArgs(request("codex-thread"), "/tmp/schema.json");
-    expect(resumed.slice(0, 2)).toEqual(["exec", "resume"]);
-    expect(resumed).toContain("codex-thread");
-    expect(resumed).not.toContain("-C");
+    expect(resumed.slice(resumed.indexOf("resume"), resumed.indexOf("resume") + 2)).toEqual([
+      "resume",
+      "codex-thread",
+    ]);
+    expect(resumed.slice(resumed.indexOf("-C"), resumed.indexOf("-C") + 2)).toEqual([
+      "-C",
+      "/tmp/graphcraft fixture",
+    ]);
+    expect(resumed.indexOf("-C")).toBeLessThan(resumed.indexOf("resume"));
+    expectCodexPermissionProfile(resumed, "write");
     expect(resumed).not.toContain("--ephemeral");
   });
 
   it("assigns a Claude session ID and resumes the exact persisted conversation", () => {
     const freshRequest = request();
-    const fresh = claudeWorkerArgs(freshRequest);
+    const fresh = claudeWorkerArgs(freshRequest, CLAUDE_BOUNDARY);
     expect(fresh.slice(fresh.indexOf("--session-id"), fresh.indexOf("--session-id") + 2)).toEqual([
       "--session-id",
       freshRequest.invocationId,
     ]);
 
-    const resumed = claudeWorkerArgs(request("claude-session"));
+    const resumed = claudeWorkerArgs(request("claude-session"), CLAUDE_BOUNDARY);
     expect(resumed).toContain("--resume");
     expect(resumed).toContain("claude-session");
     expect(resumed).not.toContain("--session-id");
@@ -252,29 +279,218 @@ describe("native host continuation protocol", () => {
 
   it("enforces read-only host profiles for non-writing graph nodes", () => {
     const codex = codexWorkerArgs(request(undefined, ["read"]), "/tmp/schema.json");
-    expect(codex.slice(codex.indexOf("-s"), codex.indexOf("-s") + 2)).toEqual(["-s", "read-only"]);
+    expectCodexPermissionProfile(codex, "read");
 
-    const claude = claudeWorkerArgs(request(undefined, ["read"]));
+    const claude = claudeWorkerArgs(request(undefined, ["read"]), CLAUDE_BOUNDARY);
     expect(
       claude.slice(claude.indexOf("--permission-mode"), claude.indexOf("--permission-mode") + 2),
     ).toEqual(["--permission-mode", "dontAsk"]);
-    expect(claude[claude.indexOf("--allowedTools") + 1]).toBe("Read,Glob,Grep");
+    expect(claude[claude.indexOf("--allowedTools") + 1]).toBe("Read(./**)");
   });
 
   it("uses fresh read-only profiles for isolated semantic verification", () => {
     const codex = codexSemanticVerifierArgs(semanticRequest(), "/tmp/verdict.schema.json");
     expect(codex).toContain("--ephemeral");
-    expect(codex.slice(codex.indexOf("-s"), codex.indexOf("-s") + 2)).toEqual(["-s", "read-only"]);
+    expectCodexPermissionProfile(codex, "read");
     expect(codex).not.toContain("resume");
 
-    const claude = claudeSemanticVerifierArgs(semanticRequest());
+    const claude = claudeSemanticVerifierArgs(semanticRequest(), CLAUDE_BOUNDARY);
     expect(claude.slice(claude.indexOf("--effort"), claude.indexOf("--effort") + 2)).toEqual([
       "--effort",
       "low",
     ]);
-    expect(claude[claude.indexOf("--tools") + 1]).toBe("Read,Glob,Grep");
-    expect(claude[claude.indexOf("--allowedTools") + 1]).toBe("Read,Glob,Grep");
-    expect(claude.join(" ")).not.toMatch(/Bash|Edit|Write|--resume|--session-id/);
+    expect(claude[claude.indexOf("--tools") + 1]).toBe("Read");
+    expect(claude[claude.indexOf("--allowedTools") + 1]).toBe("Read(./**)");
+    expect(claude[claude.indexOf("--tools") + 1]!.split(",")).not.toEqual(
+      expect.arrayContaining(["Bash", "Edit", "Write"]),
+    );
+    expect(claude).not.toContain("--resume");
+    expect(claude).toContain("--session-id");
+  });
+
+  it("isolates every Claude invocation from customizations and undeclared tools", () => {
+    const planner = claudePlannerArgs(planningRequest(), CLAUDE_BOUNDARY);
+    const readOnlyWorker = claudeWorkerArgs(request(undefined, ["read"]), CLAUDE_BOUNDARY);
+    const writableWorker = claudeWorkerArgs(request(), CLAUDE_BOUNDARY);
+    const resumedWorker = claudeWorkerArgs(request("claude-session"), CLAUDE_BOUNDARY);
+    const verifier = claudeSemanticVerifierArgs(semanticRequest(), CLAUDE_BOUNDARY);
+
+    for (const args of [planner, readOnlyWorker, writableWorker, resumedWorker, verifier]) {
+      expect(args.filter((arg) => arg === "--safe-mode")).toHaveLength(1);
+      expect(args.filter((arg) => arg === "--no-chrome")).toHaveLength(1);
+      expect(args.filter((arg) => arg === "--include-hook-events")).toHaveLength(1);
+      expect(args).toContain("--disable-slash-commands");
+      expect(args).toContain("--strict-mcp-config");
+      expect(args[args.indexOf("--mcp-config") + 1]).toBe('{"mcpServers":{}}');
+    }
+
+    expect(planner[planner.indexOf("--tools") + 1]).toBe("");
+    for (const args of [readOnlyWorker, verifier]) {
+      expect(args[args.indexOf("--tools") + 1]).toBe("Read");
+      expect(args[args.indexOf("--allowedTools") + 1]).toBe("Read(./**)");
+    }
+    for (const args of [writableWorker, resumedWorker]) {
+      expect(
+        args.slice(args.indexOf("--permission-mode"), args.indexOf("--permission-mode") + 2),
+      ).toEqual(["--permission-mode", "dontAsk"]);
+      expect(args[args.indexOf("--tools") + 1]).toBe("Bash,Edit,Write,Read");
+      expect(args[args.indexOf("--allowedTools") + 1]).toBe(
+        "Bash(*),Read(./**),Edit(./**),Write(./**)",
+      );
+      const settings = JSON.parse(args[args.indexOf("--settings") + 1]!) as {
+        permissions: { deny: string[] };
+        sandbox: Record<string, unknown> & { network: Record<string, unknown> };
+      };
+      expect(settings).toMatchObject({
+        permissions: {
+          deny: expect.arrayContaining([
+            "Read(~/.ssh/**)",
+            "Edit(~/.ssh/**)",
+            "Write(~/.ssh/**)",
+            "Read(./**/.env.*)",
+            "Edit(./**/.env.*)",
+            "Write(./**/.env.*)",
+          ]),
+        },
+        sandbox: {
+          enabled: true,
+          failIfUnavailable: true,
+          autoAllowBashIfSandboxed: true,
+          allowUnsandboxedCommands: false,
+          excludedCommands: [],
+          enableWeakerNestedSandbox: false,
+          enableWeakerNetworkIsolation: false,
+          allowAppleEvents: false,
+          allowPty: false,
+          filesystem: {
+            denyRead: expect.arrayContaining(["~", "./.env", "./**/.env.*"]),
+            allowRead: ["/tmp/graphcraft fixture"],
+            allowWrite: ["/tmp/graphcraft-claude-private", "/tmp/graphcraft fixture"],
+            denyWrite: expect.arrayContaining([
+              "/tmp/claude",
+              "/private/tmp/claude",
+              "~/.ssh",
+              "~/.git-credentials",
+            ]),
+          },
+          credentials: {
+            files: expect.arrayContaining([{ path: "~/.ssh", mode: "deny" }]),
+            envVars: expect.arrayContaining([{ name: "ANTHROPIC_API_KEY", mode: "deny" }]),
+          },
+          network: {
+            allowedDomains: [],
+            deniedDomains: ["*"],
+            allowUnixSockets: [],
+            allowAllUnixSockets: false,
+            allowLocalBinding: false,
+            allowMachLookup: [],
+          },
+        },
+      });
+      const protectedPaths = settings.permissions.deny
+        .filter((rule) => rule.startsWith("Read(") && rule.endsWith(")"))
+        .map((rule) => rule.slice("Read(".length, -1));
+      expect(protectedPaths.length).toBeGreaterThan(0);
+      for (const path of protectedPaths) {
+        expect(settings.permissions.deny).toContain(`Edit(${path})`);
+        expect(settings.permissions.deny).toContain(`Write(${path})`);
+      }
+    }
+    for (const args of [planner, readOnlyWorker, verifier]) {
+      const settings = JSON.parse(args[args.indexOf("--settings") + 1]!) as {
+        sandbox: { filesystem: { allowWrite: string[] }; network: Record<string, unknown> };
+      };
+      expect(settings.sandbox.filesystem.allowWrite).toEqual(["/tmp/graphcraft-claude-private"]);
+      expect(settings.sandbox.network).toEqual({
+        allowedDomains: [],
+        deniedDomains: ["*"],
+        allowUnixSockets: [],
+        allowAllUnixSockets: false,
+        allowLocalBinding: false,
+        allowMachLookup: [],
+      });
+    }
+  });
+
+  it("applies explicit Codex process, network, search, and environment boundaries", () => {
+    const planner = codexPlannerArgs(planningRequest(), "/tmp/plan.schema.json");
+    const readOnlyWorker = codexWorkerArgs(request(undefined, ["read"]), "/tmp/read.schema.json");
+    const writableWorker = codexWorkerArgs(request(), "/tmp/write.schema.json");
+    const resumedWorker = codexWorkerArgs(request("codex-thread"), "/tmp/resume.schema.json");
+    const verifier = codexSemanticVerifierArgs(semanticRequest(), "/tmp/verdict.schema.json");
+
+    const invocations = [planner, readOnlyWorker, writableWorker, resumedWorker, verifier];
+    const requiredOverrides = [
+      "project_doc_max_bytes=0",
+      'project_root_markers=[".git"]',
+      "notify=[]",
+      'approval_policy="never"',
+      'web_search="disabled"',
+      "allow_login_shell=false",
+      'shell_environment_policy={inherit="core",ignore_default_excludes=false}',
+      'windows.sandbox="elevated"',
+      "features.hooks=false",
+      "features.multi_agent=false",
+      "features.multi_agent_v2=false",
+      "features.enable_fanout=false",
+      "features.apps=false",
+      "features.enable_mcp_apps=false",
+      "features.tool_suggest=false",
+      "features.plugins=false",
+      "features.remote_plugin=false",
+      "features.plugin_sharing=false",
+      "features.skill_mcp_dependency_install=false",
+      "features.in_app_browser=false",
+      "features.browser_use=false",
+      "features.browser_use_full_cdp_access=false",
+      "features.browser_use_external=false",
+      "features.computer_use=false",
+      "features.image_generation=false",
+      "features.memories=false",
+      "features.chronicle=false",
+      "features.goals=false",
+      "features.exec_permission_approvals=false",
+      "features.request_permissions_tool=false",
+      "features.guardian_approval=false",
+      "features.web_search_request=false",
+      "features.web_search_cached=false",
+      "features.standalone_web_search=false",
+      "features.workspace_dependencies=false",
+      "memories.generate_memories=false",
+      "memories.use_memories=false",
+      "memories.dedicated_tools=false",
+      "skills.include_instructions=false",
+      "skills.bundled.enabled=false",
+      "orchestrator.skills.enabled=false",
+      "orchestrator.mcp.enabled=false",
+      "tools.experimental_request_user_input={enabled=false}",
+    ];
+
+    for (const args of invocations) {
+      expect(args).toContain("--strict-config");
+      expect(args).toContain("--ignore-user-config");
+      expect(args).toContain("--ignore-rules");
+      for (const override of requiredOverrides) {
+        const index = args.indexOf(override);
+        expect(index, override).toBeGreaterThan(0);
+        expect(args[index - 1], override).toBe("--config");
+      }
+      expect(args).not.toContain("-s");
+    }
+
+    const profiles = [
+      expectCodexPermissionProfile(planner, "read"),
+      expectCodexPermissionProfile(readOnlyWorker, "read"),
+      expectCodexPermissionProfile(writableWorker, "write"),
+      expectCodexPermissionProfile(resumedWorker, "write"),
+      expectCodexPermissionProfile(verifier, "read"),
+    ];
+    expect(new Set(profiles).size).toBe(profiles.length);
+  });
+
+  it("binds durable Codex reuse to the exact containment profile", () => {
+    expect(new CodexAdapter().containmentProfile).toBe(CODEX_CONTAINMENT_PROFILE);
+    expect(CODEX_CONTAINMENT_PROFILE).toBe("codex-cli@0.144.6/graphcraft-containment-v1");
   });
 
   it("applies explicit model and effort policies to every host invocation path", () => {
@@ -294,10 +510,10 @@ describe("native host continuation protocol", () => {
     }
 
     const claudeInvocations = [
-      claudePlannerArgs(planningRequest(), policy),
-      claudeWorkerArgs(request(), policy),
-      claudeWorkerArgs(request("claude-session"), policy),
-      claudeSemanticVerifierArgs(semanticRequest(), policy),
+      claudePlannerArgs(planningRequest(), CLAUDE_BOUNDARY, policy),
+      claudeWorkerArgs(request(), CLAUDE_BOUNDARY, policy),
+      claudeWorkerArgs(request("claude-session"), CLAUDE_BOUNDARY, policy),
+      claudeSemanticVerifierArgs(semanticRequest(), CLAUDE_BOUNDARY, policy),
     ];
     for (const args of claudeInvocations) {
       expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2)).toEqual([

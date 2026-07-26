@@ -1,5 +1,9 @@
 import { z } from "zod";
-import { LEGACY_CANONICAL_HASH_ALGORITHM, PORTABLE_CANONICAL_HASH_ALGORITHM } from "./canonical.ts";
+import {
+  LEGACY_CANONICAL_HASH_ALGORITHM,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
+  contentHash,
+} from "./canonical.ts";
 
 export const CanonicalHashAlgorithmSchema = z.enum([
   LEGACY_CANONICAL_HASH_ALGORITHM,
@@ -715,6 +719,186 @@ export const WorkerResultSchema = z.strictObject({
   nextSuggestedObjective: z.string().max(MAX_HOST_EVENT_DETAIL_CHARACTERS).optional(),
 });
 
+export const MAX_REPOSITORY_INSTRUCTION_FILES = 32;
+export const MAX_REPOSITORY_INSTRUCTION_CHARACTERS = 8_000;
+export const MAX_REPOSITORY_INSTRUCTION_BYTES = 8_000;
+// Keep repository guidance at no more than half of the 24,000-character context capsule.
+// The serialized cap includes all path, scope, and import metadata in addition to content.
+export const MAX_REPOSITORY_INSTRUCTION_SERIALIZED_CHARACTERS = 12_000;
+
+const UTF8_ENCODER = new TextEncoder();
+const RepositoryInstructionPathSchema = z
+  .string()
+  .min(1)
+  .max(1_024)
+  .refine((value) => !value.includes("\0"), {
+    message: "Repository-instruction metadata cannot contain NUL characters",
+  });
+const RepositoryInstructionLinkTargetSchema = z
+  .string()
+  .min(1)
+  .max(4_096)
+  .refine((value) => !value.includes("\0"), {
+    message: "Repository-instruction metadata cannot contain NUL characters",
+  });
+const RepositoryInstructionPathListSchema = z
+  .array(RepositoryInstructionPathSchema)
+  .max(MAX_REPOSITORY_INSTRUCTION_FILES);
+
+function repositoryInstructionContentBytes(value: { entries: Array<{ content: string }> }): number {
+  return value.entries.reduce(
+    (total, entry) => total + UTF8_ENCODER.encode(entry.content).byteLength,
+    0,
+  );
+}
+
+export const RepositoryInstructionSourceSchema = z.enum([
+  "agents",
+  "claude",
+  "claude_local",
+  "claude_project",
+  "claude_rule",
+  "claude_import",
+]);
+
+export function repositoryInstructionSelectionDigest(input: {
+  manifestDigest: string;
+  selectedPaths: readonly string[];
+  omittedPaths: readonly string[];
+}): string {
+  return contentHash(
+    {
+      schemaVersion: 1,
+      policy: "tracked-shared-v1",
+      manifestDigest: input.manifestDigest,
+      selectedPaths: input.selectedPaths,
+      omittedPaths: input.omittedPaths,
+    },
+    PORTABLE_CANONICAL_HASH_ALGORITHM,
+  );
+}
+
+export const RepositoryInstructionEntrySchema = z.strictObject({
+  path: RepositoryInstructionPathSchema,
+  sources: z.array(RepositoryInstructionSourceSchema).min(1).max(6),
+  scopes: z.array(RepositoryInstructionPathSchema).min(1).max(32),
+  gitMode: z.string().regex(/^(?:100644|100755|120000)$/),
+  workingKind: z.enum(["file", "symlink"]),
+  workingMode: z.number().int().nonnegative().max(0o777),
+  linkTarget: RepositoryInstructionLinkTargetSchema.optional(),
+  importedBy: RepositoryInstructionPathListSchema,
+  content: z
+    .string()
+    .max(MAX_REPOSITORY_INSTRUCTION_CHARACTERS)
+    .refine((content) => !content.includes("\0"), {
+      message: "Repository instruction content cannot contain NUL characters",
+    }),
+  contentHash: z.string().regex(/^[a-f0-9]{64}$/),
+});
+
+export const RepositoryInstructionManifestSchema = z
+  .strictObject({
+    schemaVersion: z.literal(1),
+    policy: z.literal("tracked-shared-v1"),
+    digest: z.string().regex(/^[a-f0-9]{64}$/),
+    entries: z.array(RepositoryInstructionEntrySchema).max(MAX_REPOSITORY_INSTRUCTION_FILES),
+    coverage: z.strictObject({
+      primaryPaths: RepositoryInstructionPathListSchema,
+      importedPaths: RepositoryInstructionPathListSchema,
+      untrackedSources: z.literal("excluded"),
+      userAndManagedSources: z.literal("excluded"),
+      externalImports: z.literal("rejected"),
+    }),
+  })
+  .refine(
+    (manifest) =>
+      JSON.stringify(manifest).length <= MAX_REPOSITORY_INSTRUCTION_SERIALIZED_CHARACTERS,
+    {
+      message: `Repository-instruction manifest exceeds the ${MAX_REPOSITORY_INSTRUCTION_SERIALIZED_CHARACTERS}-character serialized limit`,
+    },
+  )
+  .refine(
+    (manifest) => repositoryInstructionContentBytes(manifest) <= MAX_REPOSITORY_INSTRUCTION_BYTES,
+    {
+      message: `Repository-instruction manifest exceeds the ${MAX_REPOSITORY_INSTRUCTION_BYTES}-byte content limit`,
+    },
+  );
+
+export const RepositoryInstructionSelectionSchema = z
+  .strictObject({
+    schemaVersion: z.literal(1),
+    policy: z.literal("tracked-shared-v1"),
+    manifestDigest: z.string().regex(/^[a-f0-9]{64}$/),
+    selectionDigest: z.string().regex(/^[a-f0-9]{64}$/),
+    entries: z.array(RepositoryInstructionEntrySchema).max(MAX_REPOSITORY_INSTRUCTION_FILES),
+    selectedPaths: RepositoryInstructionPathListSchema,
+    omittedPaths: RepositoryInstructionPathListSchema,
+  })
+  .refine(
+    (selection) =>
+      JSON.stringify(selection).length <= MAX_REPOSITORY_INSTRUCTION_SERIALIZED_CHARACTERS,
+    {
+      message: `Repository-instruction selection exceeds the ${MAX_REPOSITORY_INSTRUCTION_SERIALIZED_CHARACTERS}-character serialized limit`,
+    },
+  )
+  .refine(
+    (selection) => repositoryInstructionContentBytes(selection) <= MAX_REPOSITORY_INSTRUCTION_BYTES,
+    {
+      message: `Repository-instruction selection exceeds the ${MAX_REPOSITORY_INSTRUCTION_BYTES}-byte content limit`,
+    },
+  )
+  .superRefine((selection, context) => {
+    for (const [index, entry] of selection.entries.entries())
+      if (contentHash(entry.content, PORTABLE_CANONICAL_HASH_ALGORITHM) !== entry.contentHash)
+        context.addIssue({
+          code: "custom",
+          path: ["entries", index, "contentHash"],
+          message: `Repository instruction ${entry.path} has an invalid content hash`,
+        });
+
+    const entryPaths = selection.entries.map(({ path }) => path);
+    if (
+      entryPaths.length !== selection.selectedPaths.length ||
+      entryPaths.some((path, index) => selection.selectedPaths[index] !== path)
+    )
+      context.addIssue({
+        code: "custom",
+        path: ["selectedPaths"],
+        message: "Repository-instruction selected paths must exactly match ordered entry paths",
+      });
+    if (new Set(selection.selectedPaths).size !== selection.selectedPaths.length)
+      context.addIssue({
+        code: "custom",
+        path: ["selectedPaths"],
+        message: "Repository-instruction selected paths must be unique",
+      });
+    if (new Set(selection.omittedPaths).size !== selection.omittedPaths.length)
+      context.addIssue({
+        code: "custom",
+        path: ["omittedPaths"],
+        message: "Repository-instruction omitted paths must be unique",
+      });
+    const omittedPaths = new Set(selection.omittedPaths);
+    if (selection.selectedPaths.some((path) => omittedPaths.has(path)))
+      context.addIssue({
+        code: "custom",
+        path: ["omittedPaths"],
+        message: "Repository-instruction selected and omitted paths must be disjoint",
+      });
+    if (repositoryInstructionSelectionDigest(selection) !== selection.selectionDigest)
+      context.addIssue({
+        code: "custom",
+        path: ["selectionDigest"],
+        message: "Repository-instruction selection digest is invalid",
+      });
+  });
+
+export function validateRepositoryInstructionSelection(
+  value: unknown,
+): z.infer<typeof RepositoryInstructionSelectionSchema> {
+  return RepositoryInstructionSelectionSchema.parse(value);
+}
+
 export const ContextCapsuleSchema = z.strictObject({
   schemaVersion: z.literal(1),
   runId: z.uuid(),
@@ -726,6 +910,7 @@ export const ContextCapsuleSchema = z.strictObject({
   predecessorEvidence: z.array(z.string()),
   relevantPaths: z.array(z.string()),
   probeEvidence: z.array(z.string()),
+  repositoryInstructions: RepositoryInstructionSelectionSchema.optional(),
 });
 
 export const ContextSelectionReceiptSchema = z.strictObject({
@@ -763,6 +948,14 @@ export const ContextSelectionReceiptSchema = z.strictObject({
     repositoryInventory: z.boolean(),
     artifacts: z.array(z.string()),
   }),
+  repositoryInstructions: z
+    .strictObject({
+      manifestDigest: z.string().regex(/^[a-f0-9]{64}$/),
+      selectionDigest: z.string().regex(/^[a-f0-9]{64}$/),
+      selectedPaths: RepositoryInstructionPathListSchema,
+      omittedPaths: RepositoryInstructionPathListSchema,
+    })
+    .optional(),
 });
 
 export const SemanticVerifierContextSchema = z.strictObject({
@@ -778,6 +971,7 @@ export const SemanticVerifierContextSchema = z.strictObject({
   workerEvidence: z.array(z.string()),
   baselineProbeEvidence: z.array(ProbeResultSchema),
   currentProbeEvidence: z.array(ProbeResultSchema),
+  repositoryInstructions: RepositoryInstructionSelectionSchema.optional(),
 });
 
 export const SemanticVerdictSchema = z.strictObject({
@@ -1058,8 +1252,6 @@ const WINDOWS_INVALID_ARTIFACT_SEGMENT = /[\u0000-\u001f<>:"|?*]/u;
 const WINDOWS_RESERVED_ARTIFACT_SEGMENT =
   /^(?:aux|clock\$|con|conin\$|conout\$|nul|prn|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/iu;
 const UNPAIRED_SURROGATE = /[\ud800-\udfff]/u;
-const UTF8_ENCODER = new TextEncoder();
-
 export function artifactInventorySerializedBytes(value: unknown): number {
   return UTF8_ENCODER.encode(`${JSON.stringify(value, null, 2)}\n`).byteLength;
 }
@@ -1387,6 +1579,10 @@ export type SideEffectJournalEntry = z.infer<typeof SideEffectJournalEntrySchema
 export type WaitRuntimeState = z.infer<typeof WaitRuntimeStateSchema>;
 export type SupervisorRecord = z.infer<typeof SupervisorRecordSchema>;
 export type WorkerResult = z.infer<typeof WorkerResultSchema>;
+export type RepositoryInstructionSource = z.infer<typeof RepositoryInstructionSourceSchema>;
+export type RepositoryInstructionEntry = z.infer<typeof RepositoryInstructionEntrySchema>;
+export type RepositoryInstructionManifest = z.infer<typeof RepositoryInstructionManifestSchema>;
+export type RepositoryInstructionSelection = z.infer<typeof RepositoryInstructionSelectionSchema>;
 export type ContextCapsule = z.infer<typeof ContextCapsuleSchema>;
 export type ContextSelectionReceipt = z.infer<typeof ContextSelectionReceiptSchema>;
 export type SemanticVerifierContext = z.infer<typeof SemanticVerifierContextSchema>;

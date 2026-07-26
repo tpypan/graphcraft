@@ -46,6 +46,11 @@ describe("control decision CLI", () => {
     const created = await createRun("Implement a substantial feature across the fixture", {
       cwd: repository,
     });
+    const repositoryInstructions = await created.store.loadRepositoryInstructionManifest();
+    expect(repositoryInstructions).toMatchObject({
+      policy: "tracked-shared-v1",
+      entries: [],
+    });
     await created.store.append("user", "run.approved", { approved: true });
     await recordRunApprovalDecisions(created.store, created.graph);
     const approval = (await created.store.loadState()).controlDecisions.find(
@@ -88,6 +93,19 @@ describe("control decision CLI", () => {
       }),
     ]);
 
+    const status = JSON.parse(
+      (
+        await execFileAsync(cli, [
+          tsxCli,
+          "packages/cli/src/bin.ts",
+          "status",
+          created.contract.runId,
+          "-C",
+          repository,
+          "--json",
+        ])
+      ).stdout,
+    ) as { status: string; repositoryInstructions: Record<string, unknown> };
     const inspected = JSON.parse(
       (
         await execFileAsync(cli, [
@@ -100,7 +118,11 @@ describe("control decision CLI", () => {
           "--json",
         ])
       ).stdout,
-    ) as { graph: { controlEdges: unknown[] }; state: { controlDecisions: unknown[] } };
+    ) as {
+      graph: { controlEdges: unknown[] };
+      state: { controlDecisions: unknown[] };
+      repositoryInstructions: Record<string, unknown>;
+    };
     const traced = JSON.parse(
       (
         await execFileAsync(cli, [
@@ -117,6 +139,27 @@ describe("control decision CLI", () => {
 
     expect(inspected.graph.controlEdges.length).toBeGreaterThan(0);
     expect(inspected.state.controlDecisions).toEqual(decided.controlDecisions);
+    expect(status).toMatchObject({
+      repositoryInstructions: {
+        state: "pinned",
+        policy: "tracked-shared-v1",
+        digest: repositoryInstructions?.digest,
+        count: 0,
+        paths: [],
+      },
+    });
+    expect(inspected.repositoryInstructions).toEqual({
+      state: "pinned",
+      policy: "tracked-shared-v1",
+      digest: repositoryInstructions?.digest,
+      count: 0,
+      paths: [],
+      manifest: repositoryInstructions,
+    });
+    expect(traced[0]?.data.repositoryInstructions).toEqual(repositoryInstructions);
+    expect(traced.map(({ type }) => type)).not.toEqual(
+      expect.arrayContaining(["context.selected", "node.started", "invocation.started"]),
+    );
     expect(traced).toEqual(
       expect.arrayContaining([
         expect.objectContaining({

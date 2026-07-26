@@ -206,6 +206,7 @@ const CLAUDE_EVENT_FIELDS: Record<string, ReadonlySet<string>> = {
     "agents",
     "skills",
     "plugins",
+    "plugin_errors",
     "apiKeySource",
     "fast_mode_state",
     "uuid",
@@ -226,6 +227,8 @@ const CLAUDE_EVENT_FIELDS: Record<string, ReadonlySet<string>> = {
     "permission_denials",
     "uuid",
     "structured_output",
+    "terminal_reason",
+    "api_error_status",
   ]),
   rate_limit_event: new Set(["type", "rate_limit_info", "session_id", "uuid"]),
   tool_progress: new Set([
@@ -667,10 +670,51 @@ function sanitizeClaudeEvent(
     sanitized.session_id = state.sessionPlaceholder;
   }
   if (event.type === "system") {
-    if (event.subtype !== undefined) sanitized.subtype = protocolLiteral(event.subtype, "subtype");
+    if (event.subtype !== "init")
+      throw new Error("Claude live protocol system event is not an init attestation");
+    const expectedTools = ["Read"];
+    const expectedAgents = ["claude", "Explore", "general-purpose", "Plan"];
+    const exactInventory = (value: unknown, expected: string[]): boolean =>
+      Array.isArray(value) &&
+      value.length === expected.length &&
+      new Set(value).size === value.length &&
+      value.every((item) => typeof item === "string" && expected.includes(item));
+    if (!exactInventory(event.tools, expectedTools))
+      throw new Error("Claude live protocol init reported an unexpected tool inventory");
+    if (!exactInventory(event.agents, expectedAgents))
+      throw new Error("Claude live protocol init reported an unexpected agent inventory");
+    for (const field of ["mcp_servers", "slash_commands", "skills", "plugins"])
+      if (!Array.isArray(event[field]) || event[field].length !== 0)
+        throw new Error(`Claude live protocol init reported a nonempty ${field} inventory`);
+    if (
+      event.plugin_errors !== undefined &&
+      (!Array.isArray(event.plugin_errors) || event.plugin_errors.length !== 0)
+    )
+      throw new Error("Claude live protocol init reported plugin errors");
+    if (
+      event.permissionMode !== "dontAsk" ||
+      event.output_style !== "default" ||
+      event.model !== state.binding.control.model
+    )
+      throw new Error("Claude live protocol init did not match its qualification controls");
+    const protocolVersion = state.binding.control.rawVersion.match(/^(\d+\.\d+\.\d+)/u)?.[1];
+    if (!protocolVersion || event.claude_code_version !== protocolVersion)
+      throw new Error("Claude live protocol init reported a different protocol version");
+    const uuid = sanitizedIdentifier(event.uuid, state);
+    if (!uuid) throw new Error("Claude live protocol init omitted its event identity");
+    sanitized.subtype = "init";
     sanitized.cwd = "fixture-repository";
     sanitized.model = state.binding.control.model;
-    sanitized.claude_code_version = state.binding.control.rawVersion;
+    sanitized.claude_code_version = protocolVersion;
+    sanitized.tools = expectedTools;
+    sanitized.mcp_servers = [];
+    sanitized.permissionMode = "dontAsk";
+    sanitized.output_style = "default";
+    sanitized.slash_commands = [];
+    sanitized.agents = expectedAgents;
+    sanitized.skills = [];
+    sanitized.plugins = [];
+    sanitized.uuid = uuid;
   } else if (event.type === "result") {
     if (typeof event.session_id !== "string")
       throw new Error("Claude live worker output omitted its session identity");
@@ -680,6 +724,10 @@ function sanitizeClaudeEvent(
         throw new Error("Claude live result has an invalid error marker");
       sanitized.is_error = event.is_error;
     }
+    if (event.terminal_reason !== undefined)
+      sanitized.terminal_reason = protocolLiteral(event.terminal_reason, "terminal_reason");
+    if (event.api_error_status !== undefined)
+      throw new Error("Claude live result reported an API error status");
     sanitized.usage = sanitizeProtocolUsage(event.usage, "claude");
     if (Object.hasOwn(event, "result")) sanitized.result = JSON.stringify(SAFE_WORKER_RESULT);
     if (Object.hasOwn(event, "structured_output"))

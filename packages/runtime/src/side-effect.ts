@@ -25,6 +25,7 @@ export type SideEffectReconciliation =
 export interface ExecuteSideEffectInput {
   store: RunStore;
   claim: SideEffectClaim;
+  authorize?: () => Promise<void>;
   reconcile: (claim: SideEffectClaim) => Promise<SideEffectReconciliation>;
   act: (
     claim: SideEffectClaim,
@@ -72,6 +73,7 @@ async function reconcileAndRecord(
     "after_precondition_reconcile" | "after_confirmation_reconcile"
   >,
 ): Promise<SideEffectReconciliation> {
+  await input.authorize?.();
   let reconciliation: SideEffectReconciliation;
   try {
     reconciliation = await input.reconcile(claim);
@@ -174,6 +176,7 @@ export async function executeSideEffect(
   }
 
   await crossSideEffectBoundary(input.boundary, "before_act");
+  await input.authorize?.();
   let dispatched = entry.dispatchedAt !== undefined;
   const markDispatched = input.durableDispatch
     ? async (): Promise<void> => {

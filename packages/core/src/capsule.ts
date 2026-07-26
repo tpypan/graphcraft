@@ -1,5 +1,11 @@
-import type { ContextCapsule, GraphNode, ProbeResult, RunContract } from "./schemas.ts";
-import { ContextCapsuleSchema } from "./schemas.ts";
+import type {
+  ContextCapsule,
+  GraphNode,
+  ProbeResult,
+  RepositoryInstructionSelection,
+  RunContract,
+} from "./schemas.ts";
+import { ContextCapsuleSchema, validateRepositoryInstructionSelection } from "./schemas.ts";
 
 export const MAX_CONTEXT_CAPSULE_CHARACTERS = 24_000;
 
@@ -48,8 +54,12 @@ export function createContextCapsule(input: {
   node: GraphNode;
   predecessorEvidence?: string[];
   probeResults?: ProbeResult[];
+  repositoryInstructions?: RepositoryInstructionSelection;
 }): ContextCapsule {
   const { contract, node } = input;
+  const repositoryInstructions = input.repositoryInstructions
+    ? validateRepositoryInstructionSelection(input.repositoryInstructions)
+    : undefined;
   const capsule = {
     schemaVersion: 1,
     runId: contract.runId,
@@ -61,6 +71,11 @@ export function createContextCapsule(input: {
       `Do not touch excluded paths: ${contract.scope.exclude.join(", ")}`,
       "Do not weaken tests, repository policy, acceptance anchors, or the finish line.",
       "Preserve unrelated work and report evidence, not confidence.",
+      ...(repositoryInstructions
+        ? [
+            `Apply the pinned repository-instruction selection ${repositoryInstructions.selectionDigest}; each entry is restricted to its declared scopes.`,
+          ]
+        : []),
     ],
     acceptanceAnchors: contract.acceptanceAnchors,
     predecessorEvidence: compactList(input.predecessorEvidence ?? [], 8, 1_500, 4_000),
@@ -73,6 +88,7 @@ export function createContextCapsule(input: {
       1_500,
       5_000,
     ),
+    ...(repositoryInstructions ? { repositoryInstructions } : {}),
   };
   const parsed = ContextCapsuleSchema.parse(capsule);
   const characters = contextCapsuleCharacters(parsed);

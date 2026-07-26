@@ -18,14 +18,17 @@ import {
   createHeldOutProbePlan,
   createModelAuthorityBoundary,
   createRunEvent,
+  ContextSelectionReceiptSchema,
   evidenceSnapshot,
   GraphPlanSchema,
   graphPlanShape,
   MAX_CONTEXT_CAPSULE_CHARACTERS,
   optimizeGraph,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
   renderPlannerPrompt,
   renderSemanticVerifierPrompt,
   renderWorkerPrompt,
+  repositoryInstructionSelectionDigest,
   resolveHeldOutProbes,
   reduceEvents,
   semanticVerdictJsonSchema,
@@ -33,6 +36,7 @@ import {
   SemanticVerdictSchema,
   tokenCostReport,
   validateGraph,
+  validateRepositoryInstructionSelection,
   verifyRunEvent,
   workerVisibleProbePlan,
   workerResultJsonSchema,
@@ -42,6 +46,9 @@ import {
   type ArtifactInventory,
   type ProbeResult,
   type ProbePlan,
+  type PlanningRequest,
+  type RepositoryInstructionSelection,
+  type SemanticVerifierContext,
 } from "./index.ts";
 
 const repository = {
@@ -50,6 +57,40 @@ const repository = {
   baseRef: "main",
   baseSha: "abc123",
 };
+
+function repositoryInstructionSelectionFixture(): RepositoryInstructionSelection {
+  const content = "Pinned policy.\n";
+  const entries = [
+    {
+      path: "AGENTS.md",
+      sources: ["agents" as const],
+      scopes: ["**/*"],
+      gitMode: "120000" as const,
+      workingKind: "symlink" as const,
+      workingMode: 0,
+      linkTarget: "policy.md",
+      importedBy: ["CLAUDE.md"],
+      content,
+      contentHash: contentHash(content, PORTABLE_CANONICAL_HASH_ALGORITHM),
+    },
+  ];
+  const manifestDigest = "a".repeat(64);
+  const selectedPaths = ["AGENTS.md"];
+  const omittedPaths = ["docs/AGENTS.md"];
+  return {
+    schemaVersion: 1,
+    policy: "tracked-shared-v1",
+    manifestDigest,
+    selectionDigest: repositoryInstructionSelectionDigest({
+      manifestDigest,
+      selectedPaths,
+      omittedPaths,
+    }),
+    entries,
+    selectedPaths,
+    omittedPaths,
+  };
+}
 
 describe("run contracts and graphs", () => {
   it("classifies task families without matching keyword substrings", () => {
@@ -488,6 +529,233 @@ describe("run contracts and graphs", () => {
         node: { ...graph.nodes[0]!, objective: "x".repeat(MAX_CONTEXT_CAPSULE_CHARACTERS) },
       }),
     ).toThrow(/exceeds.*characters/);
+  });
+
+  it("rejects NUL-bearing repository-instruction metadata from context capsules", () => {
+    const contract = compileRunContract("Implement bounded instruction metadata", repository);
+    const graph = compileGraph(contract, [
+      {
+        id: "tests",
+        kind: "command",
+        command: "npm",
+        args: ["test"],
+        expectedExitCode: 0,
+        timeoutMs: 1_000,
+      },
+    ]);
+    const repositoryInstructions = repositoryInstructionSelectionFixture();
+    const cases: Array<
+      [string, (selection: RepositoryInstructionSelection) => RepositoryInstructionSelection]
+    > = [
+      [
+        "link target",
+        (selection) => ({
+          ...selection,
+          entries: selection.entries.map((entry) => ({
+            ...entry,
+            linkTarget: "policy\0.md",
+          })),
+        }),
+      ],
+      [
+        "imported-by path",
+        (selection) => ({
+          ...selection,
+          entries: selection.entries.map((entry) => ({
+            ...entry,
+            importedBy: ["CLAUDE\0.md"],
+          })),
+        }),
+      ],
+      ["selected path", (selection) => ({ ...selection, selectedPaths: ["AGENTS\0.md"] })],
+      ["omitted path", (selection) => ({ ...selection, omittedPaths: ["docs/AGENTS\0.md"] })],
+    ];
+
+    for (const [name, mutate] of cases)
+      expect(
+        () =>
+          createContextCapsule({
+            contract,
+            node: graph.nodes[0]!,
+            repositoryInstructions: mutate(repositoryInstructions),
+          }),
+        name,
+      ).toThrow(/NUL characters/i);
+  });
+
+  it("validates repository-instruction selection identities and path partitions", () => {
+    const selection = repositoryInstructionSelectionFixture();
+    const withDigest = (value: RepositoryInstructionSelection): RepositoryInstructionSelection => ({
+      ...value,
+      selectionDigest: repositoryInstructionSelectionDigest(value),
+    });
+    const entry = selection.entries[0]!;
+    const cases: Array<[string, RepositoryInstructionSelection, RegExp]> = [
+      [
+        "entry content hash",
+        {
+          ...selection,
+          entries: [{ ...entry, contentHash: "f".repeat(64) }],
+        },
+        /invalid content hash/i,
+      ],
+      [
+        "selected order",
+        withDigest({ ...selection, selectedPaths: ["different.md"] }),
+        /exactly match ordered entry paths/i,
+      ],
+      [
+        "selected uniqueness",
+        withDigest({
+          ...selection,
+          entries: [entry, { ...entry }],
+          selectedPaths: [entry.path, entry.path],
+        }),
+        /selected paths must be unique/i,
+      ],
+      [
+        "omitted uniqueness",
+        withDigest({
+          ...selection,
+          omittedPaths: [selection.omittedPaths[0]!, selection.omittedPaths[0]!],
+        }),
+        /omitted paths must be unique/i,
+      ],
+      [
+        "path partition",
+        withDigest({ ...selection, omittedPaths: [entry.path] }),
+        /selected and omitted paths must be disjoint/i,
+      ],
+      [
+        "selection digest",
+        { ...selection, selectionDigest: "f".repeat(64) },
+        /selection digest is invalid/i,
+      ],
+    ];
+
+    expect(validateRepositoryInstructionSelection(selection)).toEqual(selection);
+    for (const [name, invalid, expected] of cases)
+      expect(() => validateRepositoryInstructionSelection(invalid), name).toThrow(expected);
+  });
+
+  it("rejects invalid repository-instruction selections at capsule and prompt boundaries", () => {
+    const contract = compileRunContract("Implement pinned instruction validation", repository);
+    const graph = compileGraph(contract, [
+      {
+        id: "tests",
+        kind: "command",
+        command: "npm",
+        args: ["test"],
+        expectedExitCode: 0,
+        timeoutMs: 1_000,
+      },
+    ]);
+    const repositoryInstructions = repositoryInstructionSelectionFixture();
+    const invalid = { ...repositoryInstructions, selectionDigest: "f".repeat(64) };
+    const capsule = createContextCapsule({
+      contract,
+      node: graph.nodes[0]!,
+      repositoryInstructions,
+    });
+    const planningRequest: PlanningRequest = {
+      contract,
+      repositoryPath: repository.root,
+      repositoryEvidence: {
+        contentTrust: "untrusted_repository",
+        trackedPathCount: 1,
+        trackedPaths: ["package.json"],
+        trackedPathsTruncated: false,
+        files: [],
+      },
+      probePlan: { schemaVersion: 1, family: "feature", items: [] },
+      verificationProbes: [],
+      repositoryInstructions: invalid,
+    };
+    const semanticContext = {
+      phase: "completion",
+      repositoryInstructions: invalid,
+    } as SemanticVerifierContext;
+
+    expect(() =>
+      createContextCapsule({
+        contract,
+        node: graph.nodes[0]!,
+        repositoryInstructions: invalid,
+      }),
+    ).toThrow(/selection digest is invalid/i);
+    expect(() => renderWorkerPrompt({ ...capsule, repositoryInstructions: invalid })).toThrow(
+      /selection digest is invalid/i,
+    );
+    expect(() => renderPlannerPrompt(planningRequest)).toThrow(/selection digest is invalid/i);
+    expect(() => renderSemanticVerifierPrompt(semanticContext)).toThrow(
+      /selection digest is invalid/i,
+    );
+  });
+
+  it("bounds repository-instruction metadata in context-selection receipts", () => {
+    const receipt = {
+      schemaVersion: 1 as const,
+      runId: randomUUID(),
+      nodeId: "implement",
+      capsule: { hash: "a".repeat(64), path: "capsules/a.json", characters: 100 },
+      selected: {
+        repositoryPaths: [],
+        predecessorNodeIds: [],
+        predecessorEvidenceHashes: [],
+        probeIds: [],
+        probeSignatures: [],
+        acceptanceAnchorIds: [],
+      },
+      omitted: {
+        repositoryPathCount: 0,
+        declaredRepositoryPaths: [],
+        predecessorNodeIds: [],
+        probeIds: [],
+        repositoryInventory: {
+          digest: "b".repeat(64),
+          artifact: "inventory.json",
+          totalPathCount: 0,
+        },
+        rawHostTranscripts: true as const,
+        rawProbeOutputs: true as const,
+      },
+      reused: { capsule: false, repositoryInventory: false, artifacts: [] },
+      repositoryInstructions: {
+        manifestDigest: "c".repeat(64),
+        selectionDigest: "d".repeat(64),
+        selectedPaths: ["AGENTS.md"],
+        omittedPaths: ["docs/AGENTS.md"],
+      },
+    };
+
+    expect(() => ContextSelectionReceiptSchema.parse(receipt)).not.toThrow();
+    expect(() =>
+      ContextSelectionReceiptSchema.parse({
+        ...receipt,
+        repositoryInstructions: {
+          ...receipt.repositoryInstructions,
+          selectedPaths: ["AGENTS\0.md"],
+        },
+      }),
+    ).toThrow(/NUL characters/i);
+    expect(() =>
+      ContextSelectionReceiptSchema.parse({
+        ...receipt,
+        repositoryInstructions: {
+          ...receipt.repositoryInstructions,
+          omittedPaths: ["p".repeat(1_025)],
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      ContextSelectionReceiptSchema.parse({
+        ...receipt,
+        repositoryInstructions: {
+          ...receipt.repositoryInstructions,
+          selectedPaths: Array.from({ length: 33 }, (_, index) => `policy-${String(index)}.md`),
+        },
+      }),
+    ).toThrow();
   });
 
   it("exports Codex-compatible strict output schemas", () => {

@@ -1,7 +1,7 @@
 import type { ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
@@ -83,6 +83,7 @@ const fixtureCases = [
   ["codex-cli-0.144.6", "codex", "codex-cli@0.144.6"],
   ["claude-code-2.1.212", "claude", "claude-code@2.1.212"],
 ] as const;
+let fixtureRepositoryPath = process.cwd();
 
 class FakeChild extends EventEmitter {
   readonly stdin = new Writable({
@@ -147,11 +148,24 @@ function workerRequest(
 ): WorkerRequest {
   return {
     invocationId,
-    repositoryPath: process.cwd(),
+    repositoryPath: fixtureRepositoryPath,
     capsule: {} as WorkerRequest["capsule"],
     allowedTools: ["read"],
     ...(resumeSessionId ? { resumeSessionId } : {}),
   };
+}
+
+function bindProtocolToRequest(host: Host, raw: string, request: WorkerRequest): string {
+  if (host === "codex") return raw;
+  return `${protocolObjects(raw)
+    .map((event) =>
+      JSON.stringify(
+        event.type === "system" && event.subtype === "init"
+          ? { ...event, cwd: request.repositoryPath }
+          : event,
+      ),
+    )
+    .join("\n")}\n`;
 }
 
 async function collectEvents(iterable: AsyncIterable<HostEvent>): Promise<HostEvent[]> {
@@ -270,6 +284,9 @@ describe("versioned host protocol contract fixtures", () => {
 
   beforeAll(async () => {
     trustedCommandDirectory = await mkdtemp(join(tmpdir(), "graphcraft-protocol-fixtures-"));
+    fixtureRepositoryPath = await realpath(process.cwd());
+    const codexHome = join(trustedCommandDirectory, "codex-home");
+    await mkdir(codexHome);
     const suffix = process.platform === "win32" ? ".cmd" : "";
     await Promise.all(
       ["codex", "claude"].map(async (host) => {
@@ -286,6 +303,7 @@ describe("versioned host protocol contract fixtures", () => {
       "PATH",
       `${trustedCommandDirectory}${process.platform === "win32" ? ";" : ":"}${process.env.PATH ?? ""}`,
     );
+    vi.stubEnv("CODEX_HOME", codexHome);
   });
 
   afterEach(() => spawnMock.mockReset());
@@ -384,7 +402,9 @@ describe("versioned host protocol contract fixtures", () => {
       );
 
       queueReadyCapabilityProbe(fixture);
-      const interruptedChild = queueInterruptedChild(fixture.interruptedWorker);
+      const interruptedChild = queueInterruptedChild(
+        bindProtocolToRequest(fixture.manifest.host, fixture.interruptedWorker, initialRequest),
+      );
       const cancellation = new AbortController();
       const interruptedEvents: HostEvent[] = [];
       for await (const event of adapter.execute(initialRequest, cancellation.signal)) {
@@ -411,13 +431,13 @@ describe("versioned host protocol contract fixtures", () => {
       });
       expect(interruptedChild.kill).toHaveBeenCalledWith("SIGTERM");
 
+      const resumedRequest = workerRequest(fixture.manifest.sessionPlaceholder);
       queueReadyCapabilityProbe(fixture);
-      queueSettledChild(fixture.resumedWorker);
+      queueSettledChild(
+        bindProtocolToRequest(fixture.manifest.host, fixture.resumedWorker, resumedRequest),
+      );
       const resumedEvents = await collectEvents(
-        adapter.execute(
-          workerRequest(fixture.manifest.sessionPlaceholder),
-          new AbortController().signal,
-        ),
+        adapter.execute(resumedRequest, new AbortController().signal),
       );
 
       expect(resumedEvents).toContainEqual({
@@ -437,8 +457,12 @@ describe("versioned host protocol contract fixtures", () => {
       const invocationArgs = spawnMock.mock.calls.at(-1)?.[1] as string[] | undefined;
       expect(invocationArgs).toBeDefined();
       if (fixture.manifest.host === "codex") {
-        expect(invocationArgs?.slice(0, 2)).toEqual(["exec", "resume"]);
-        expect(invocationArgs).toContain(fixture.manifest.sessionPlaceholder);
+        const resumeIndex = invocationArgs?.indexOf("resume") ?? -1;
+        expect(invocationArgs?.slice(resumeIndex, resumeIndex + 2)).toEqual([
+          "resume",
+          fixture.manifest.sessionPlaceholder,
+        ]);
+        expect(invocationArgs?.indexOf("-C")).toBeLessThan(resumeIndex);
       } else {
         expect(
           invocationArgs?.slice(
@@ -470,7 +494,11 @@ describe("versioned host protocol contract fixtures", () => {
 
       queueReadyCapabilityProbe(fixture);
       const interruptedChild = queueInterruptedChild(
-        protocolEventsJsonl(evidence.captures.interruptedWorker),
+        bindProtocolToRequest(
+          fixture.manifest.host,
+          protocolEventsJsonl(evidence.captures.interruptedWorker),
+          initialRequest,
+        ),
       );
       const cancellation = new AbortController();
       const interruptedEvents: HostEvent[] = [];
@@ -490,10 +518,17 @@ describe("versioned host protocol contract fixtures", () => {
       });
       expect(interruptedChild.kill).toHaveBeenCalledWith("SIGTERM");
 
+      const resumedRequest = workerRequest(evidence.sessionPlaceholder);
       queueReadyCapabilityProbe(fixture);
-      queueSettledChild(protocolEventsJsonl(evidence.captures.resumedWorker));
+      queueSettledChild(
+        bindProtocolToRequest(
+          fixture.manifest.host,
+          protocolEventsJsonl(evidence.captures.resumedWorker),
+          resumedRequest,
+        ),
+      );
       const resumedEvents = await collectEvents(
-        adapter.execute(workerRequest(evidence.sessionPlaceholder), new AbortController().signal),
+        adapter.execute(resumedRequest, new AbortController().signal),
       );
       expect(resumedEvents).toContainEqual({
         type: "session",
@@ -516,39 +551,45 @@ describe("versioned host protocol contract fixtures", () => {
       const fixture = await loadFixture(directory);
       const adapter = adapterFor(fixture.manifest.host);
       const identityName = fixture.manifest.host === "codex" ? "thread" : "session";
+      const resumedRequest = workerRequest(fixture.manifest.sessionPlaceholder);
 
       queueReadyCapabilityProbe(fixture);
       const mismatchedChild = queueInterruptedChild(
-        replaceSessionIdentity(fixture, "00000000-0000-4000-8000-ffffffffffff"),
+        bindProtocolToRequest(
+          fixture.manifest.host,
+          replaceSessionIdentity(fixture, "00000000-0000-4000-8000-ffffffffffff"),
+          resumedRequest,
+        ),
       );
       const mismatchedEvents = await collectEvents(
-        adapter.execute(
-          workerRequest(fixture.manifest.sessionPlaceholder),
-          new AbortController().signal,
-        ),
+        adapter.execute(resumedRequest, new AbortController().signal),
       );
       expect(mismatchedEvents).toEqual([
         expect.objectContaining({ type: "started" }),
         {
           type: "error",
-          message: `${fixture.manifest.host === "codex" ? "Codex" : "Claude"} resumed worker reported a different ${identityName} identity; result was rejected`,
+          message:
+            fixture.manifest.host === "codex"
+              ? `Codex resumed worker reported a different ${identityName} identity; result was rejected`
+              : "Claude system/init reported a different session identity",
         },
       ]);
       expect(mismatchedChild.kill).toHaveBeenCalledWith("SIGTERM");
 
       queueReadyCapabilityProbe(fixture);
       const driftedChild = queueInterruptedChild(
-        addLateSessionDrift(
+        bindProtocolToRequest(
           fixture.manifest.host,
-          fixture.resumedWorker,
-          "00000000-0000-4000-8000-dddddddddddd",
+          addLateSessionDrift(
+            fixture.manifest.host,
+            fixture.resumedWorker,
+            "00000000-0000-4000-8000-dddddddddddd",
+          ),
+          resumedRequest,
         ),
       );
       const driftedEvents = await collectEvents(
-        adapter.execute(
-          workerRequest(fixture.manifest.sessionPlaceholder),
-          new AbortController().signal,
-        ),
+        adapter.execute(resumedRequest, new AbortController().signal),
       );
       expect(driftedEvents).toContainEqual({
         type: "session",
@@ -563,12 +604,15 @@ describe("versioned host protocol contract fixtures", () => {
       expect(driftedChild.kill).toHaveBeenCalledWith("SIGTERM");
 
       queueReadyCapabilityProbe(fixture);
-      queueSettledChild(removeSessionIdentity(fixture.manifest.host, fixture.resumedWorker));
-      const missingEvents = await collectEvents(
-        adapter.execute(
-          workerRequest(fixture.manifest.sessionPlaceholder),
-          new AbortController().signal,
+      queueSettledChild(
+        bindProtocolToRequest(
+          fixture.manifest.host,
+          removeSessionIdentity(fixture.manifest.host, fixture.resumedWorker),
+          resumedRequest,
         ),
+      );
+      const missingEvents = await collectEvents(
+        adapter.execute(resumedRequest, new AbortController().signal),
       );
       expect(missingEvents).toEqual([
         expect.objectContaining({ type: "started" }),
@@ -577,17 +621,21 @@ describe("versioned host protocol contract fixtures", () => {
           message:
             fixture.manifest.host === "codex"
               ? "Codex resumed worker did not report its thread identity; result was rejected"
-              : "Claude resumed worker output omitted its session identity; result was rejected",
+              : "Claude system/init omitted its session identity",
         },
       ]);
 
       const callerCancellation = new AbortController();
       queueReadyCapabilityProbe(fixture);
       queueInterruptedChild(
-        addLateSessionDrift(
+        bindProtocolToRequest(
           fixture.manifest.host,
-          fixture.resumedWorker,
-          "00000000-0000-4000-8000-eeeeeeeeeeee",
+          addLateSessionDrift(
+            fixture.manifest.host,
+            fixture.resumedWorker,
+            "00000000-0000-4000-8000-eeeeeeeeeeee",
+          ),
+          resumedRequest,
         ),
         () =>
           callerCancellation.abort({
@@ -596,10 +644,7 @@ describe("versioned host protocol contract fixtures", () => {
           }),
       );
       const callerCancelledEvents = await collectEvents(
-        adapter.execute(
-          workerRequest(fixture.manifest.sessionPlaceholder),
-          callerCancellation.signal,
-        ),
+        adapter.execute(resumedRequest, callerCancellation.signal),
       );
       expect(callerCancelledEvents.at(-1)).toMatchObject({
         type: "terminated",
@@ -610,12 +655,15 @@ describe("versioned host protocol contract fixtures", () => {
 
       if (fixture.manifest.host === "claude") {
         queueReadyCapabilityProbe(fixture);
-        queueInterruptedChild(removeClaudeOutputSessionIdentity(fixture.resumedWorker));
-        const outputWithoutIdentity = await collectEvents(
-          adapter.execute(
-            workerRequest(fixture.manifest.sessionPlaceholder),
-            new AbortController().signal,
+        queueInterruptedChild(
+          bindProtocolToRequest(
+            fixture.manifest.host,
+            removeClaudeOutputSessionIdentity(fixture.resumedWorker),
+            resumedRequest,
           ),
+        );
+        const outputWithoutIdentity = await collectEvents(
+          adapter.execute(resumedRequest, new AbortController().signal),
         );
         expect(outputWithoutIdentity).toEqual([
           expect.objectContaining({ type: "started" }),
@@ -642,10 +690,14 @@ describe("versioned host protocol contract fixtures", () => {
 
       queueReadyCapabilityProbe(fixture);
       const child = queueInterruptedChild(
-        addLateSessionDrift(
+        bindProtocolToRequest(
           fixture.manifest.host,
-          boundProtocol,
-          "00000000-0000-4000-8000-cccccccccccc",
+          addLateSessionDrift(
+            fixture.manifest.host,
+            boundProtocol,
+            "00000000-0000-4000-8000-cccccccccccc",
+          ),
+          request,
         ),
       );
       const events = await collectEvents(adapter.execute(request, new AbortController().signal));
@@ -663,7 +715,9 @@ describe("versioned host protocol contract fixtures", () => {
     const fixture = await loadFixture("claude-code-2.1.212");
     const request = workerRequest();
     queueReadyCapabilityProbe(fixture);
-    const child = queueInterruptedChild(fixture.resumedWorker);
+    const child = queueInterruptedChild(
+      bindProtocolToRequest(fixture.manifest.host, fixture.resumedWorker, request),
+    );
 
     const events = await collectEvents(
       new ClaudeAdapter().execute(request, new AbortController().signal),
@@ -673,7 +727,7 @@ describe("versioned host protocol contract fixtures", () => {
       expect.objectContaining({ type: "started" }),
       {
         type: "error",
-        message: "Claude worker reported a different session identity; result was rejected",
+        message: "Claude system/init reported a different session identity",
       },
     ]);
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");

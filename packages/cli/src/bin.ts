@@ -21,6 +21,7 @@ import {
   renderRunInspection,
   renderRunList,
   renderRunStatus,
+  renderRunTrace,
   stateView,
   storeFor,
   supervisorView,
@@ -479,10 +480,24 @@ program
         ...(options.include ? { include: options.include } : {}),
         ...(options.exclude ? { exclude: options.exclude } : {}),
       }).finally(planning.dispose);
+      const repositoryInstructions = await created.store.loadRepositoryInstructionManifest();
       const approved =
-        options.yes || (await askForApproval(created.contract, created.graph, created.probePlan));
+        options.yes ||
+        (await askForApproval(
+          created.contract,
+          created.graph,
+          created.probePlan,
+          repositoryInstructions,
+        ));
       if (!approved) {
-        console.log(renderContract(created.contract, created.graph, created.probePlan));
+        console.log(
+          renderContract(
+            created.contract,
+            created.graph,
+            created.probePlan,
+            repositoryInstructions,
+          ),
+        );
         console.log(
           `Run saved for approval. Resume with: graphcraft resume ${created.contract.runId}`,
         );
@@ -508,7 +523,13 @@ program
         signal: execution.signal,
         maxWorkers: Number(options.maxWorkers) as 1 | 2,
       }).finally(execution.dispose);
-      console.log(JSON.stringify(stateView(state, created.contract), null, options.json ? 0 : 2));
+      console.log(
+        JSON.stringify(
+          stateView(state, created.contract, repositoryInstructions),
+          null,
+          options.json ? 0 : 2,
+        ),
+      );
       if (state.status !== "completed") process.exitCode = 2;
     },
   );
@@ -521,16 +542,21 @@ program
   .option("--json", "emit JSON")
   .action(async (run: string | undefined, options: { cwd: string; json?: boolean }) => {
     const store = await storeFor(options.cwd, run);
-    const [state, contract, graph] = await Promise.all([
+    const [state, contract, graph, repositoryInstructions] = await Promise.all([
       store.loadState(),
       store.loadContract(),
       store.loadGraph(),
+      store.loadRepositoryInstructionManifest(),
     ]);
     const view = {
-      ...stateView(state, contract),
+      ...stateView(state, contract, repositoryInstructions),
       supervisor: await supervisorView(store.repositoryRoot, store.runId),
     };
-    console.log(options.json ? JSON.stringify(view) : renderRunStatus(state, contract, graph));
+    console.log(
+      options.json
+        ? JSON.stringify(view)
+        : renderRunStatus(state, contract, graph, repositoryInstructions),
+    );
   });
 
 program
@@ -667,14 +693,25 @@ program
       return;
     }
     const store = await storeFor(options.cwd, run);
-    const [state, contract, graph, graphHistory, artifactInventory] = await Promise.all([
-      store.loadState(),
-      store.loadContract(),
-      store.loadGraph(),
-      store.loadGraphHistory(),
-      store.loadArtifactInventory(),
-    ]);
-    console.log(renderRunInspection({ state, contract, graph, graphHistory, artifactInventory }));
+    const [state, contract, graph, graphHistory, artifactInventory, repositoryInstructions] =
+      await Promise.all([
+        store.loadState(),
+        store.loadContract(),
+        store.loadGraph(),
+        store.loadGraphHistory(),
+        store.loadArtifactInventory(),
+        store.loadRepositoryInstructionManifest(),
+      ]);
+    console.log(
+      renderRunInspection({
+        state,
+        contract,
+        graph,
+        graphHistory,
+        artifactInventory,
+        ...(repositoryInstructions ? { repositoryInstructions } : {}),
+      }),
+    );
   });
 
 program
@@ -801,6 +838,7 @@ program
       const graph = await store.loadGraph();
       const probePlan = await store.loadProbePlan();
       const state = await store.loadState();
+      const repositoryInstructions = await store.loadRepositoryInstructionManifest();
       const finishLine = contract.finishLine.kind;
       if (
         state.status === "awaiting_approval" &&
@@ -810,11 +848,14 @@ program
       const approved =
         state.status !== "awaiting_approval" ||
         options.yes ||
-        (await askForApproval(contract, graph, probePlan));
+        (await askForApproval(contract, graph, probePlan, repositoryInstructions));
       if (!approved) {
         console.log(
           JSON.stringify(
-            { approvalRequired: true, contract: contractView(contract, graph, probePlan) },
+            {
+              approvalRequired: true,
+              contract: contractView(contract, graph, probePlan, repositoryInstructions),
+            },
             null,
             2,
           ),
@@ -841,7 +882,13 @@ program
         signal: execution.signal,
         maxWorkers: Number(options.maxWorkers) as 1 | 2,
       }).finally(execution.dispose);
-      console.log(JSON.stringify(stateView(resumed, contract), null, options.json ? 0 : 2));
+      console.log(
+        JSON.stringify(
+          stateView(resumed, contract, repositoryInstructions),
+          null,
+          options.json ? 0 : 2,
+        ),
+      );
       if (resumed.status !== "completed") process.exitCode = 2;
     },
   );
@@ -942,9 +989,7 @@ program
     const store = await storeFor(options.cwd, run);
     const events = await store.loadEvents();
     if (options.json) console.log(JSON.stringify(events));
-    else
-      for (const event of events)
-        console.log(`${event.sequence}\t${event.timestamp}\t${event.type}\t${event.actor}`);
+    else console.log(renderRunTrace(events));
   });
 
 program

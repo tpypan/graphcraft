@@ -1,13 +1,15 @@
-import type { ChildProcess } from "node:child_process";
+import { execFile, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
+import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const spawnMock = vi.hoisted(() => vi.fn());
+const execFileAsync = promisify(execFile);
 let trustedCommandDirectory: string | undefined;
 
 vi.mock("cross-spawn", () => ({
@@ -31,6 +33,7 @@ import {
 import type {
   HostEvent,
   PlanningRequest,
+  RepositoryInstructionSelection,
   SemanticVerificationRequest,
   WorkerRequest,
 } from "../packages/core/src/index.ts";
@@ -39,7 +42,10 @@ import {
   HOST_CAPABILITY_PROBE_TIMEOUT_MS,
   HOST_TERMINATION_GRACE_MS,
   HOST_TERMINATION_SETTLE_GRACE_MS,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
   ChildTerminationController,
+  contentHash,
+  repositoryInstructionSelectionDigest,
   terminateChildProcessTree,
 } from "../packages/core/src/index.ts";
 
@@ -151,6 +157,38 @@ function workerRequest(resumeSessionId?: string): WorkerRequest {
   };
 }
 
+function repositoryInstructionSelection(): RepositoryInstructionSelection {
+  const content = "Pinned adapter policy.\n";
+  const manifestDigest = "a".repeat(64);
+  const selectedPaths = ["AGENTS.md"];
+  const omittedPaths: string[] = [];
+  return {
+    schemaVersion: 1,
+    policy: "tracked-shared-v1",
+    manifestDigest,
+    selectionDigest: repositoryInstructionSelectionDigest({
+      manifestDigest,
+      selectedPaths,
+      omittedPaths,
+    }),
+    entries: [
+      {
+        path: "AGENTS.md",
+        sources: ["agents"],
+        scopes: ["**/*"],
+        gitMode: "100644",
+        workingKind: "file",
+        workingMode: 0,
+        importedBy: [],
+        content,
+        contentHash: contentHash(content, PORTABLE_CANONICAL_HASH_ALGORITHM),
+      },
+    ],
+    selectedPaths,
+    omittedPaths,
+  };
+}
+
 function codexStructuredEvent(value: unknown): string {
   return JSON.stringify({
     type: "item.completed",
@@ -158,13 +196,56 @@ function codexStructuredEvent(value: unknown): string {
   });
 }
 
+function codexSuccessfulProtocol(value: unknown, sessionId: string = randomUUID()): string {
+  return [
+    JSON.stringify({ type: "thread.started", thread_id: sessionId }),
+    JSON.stringify({ type: "turn.started" }),
+    codexStructuredEvent(value),
+    JSON.stringify({ type: "turn.completed", usage: {} }),
+  ].join("\n");
+}
+
 function claudeStructuredEvent(value: unknown, sessionId?: string): string {
   return JSON.stringify({
     type: "result",
+    subtype: "success",
+    is_error: false,
     ...(sessionId ? { session_id: sessionId } : {}),
     structured_output: value,
     usage: {},
   });
+}
+
+type InvocationKind = "plan" | "verify" | "worker";
+
+function claudeSuccessfulProtocol(
+  value: unknown,
+  sessionId?: string,
+  kind: InvocationKind = sessionId ? "worker" : "plan",
+  cwd = process.cwd(),
+): string {
+  const tools = kind === "plan" ? [] : ["Read"];
+  const protocolSessionId = sessionId ?? randomUUID();
+  return [
+    JSON.stringify({
+      type: "system",
+      subtype: "init",
+      cwd,
+      session_id: protocolSessionId,
+      tools,
+      mcp_servers: [],
+      model: "fixture-model",
+      permissionMode: "dontAsk",
+      claude_code_version: "2.1.212",
+      output_style: "default",
+      slash_commands: [],
+      agents: ["claude", "Explore", "general-purpose", "Plan"],
+      skills: [],
+      plugins: [],
+      uuid: randomUUID(),
+    }),
+    claudeStructuredEvent(value, protocolSessionId),
+  ].join("\n");
 }
 
 function boundWorkerProtocol(
@@ -174,23 +255,19 @@ function boundWorkerProtocol(
 ): string {
   const sessionId =
     fixture.host === "Codex" ? "00000000-0000-4000-8000-000000000001" : request.invocationId;
-  const sessionEvent =
-    fixture.host === "Codex"
-      ? `${JSON.stringify({ type: "thread.started", thread_id: sessionId })}\n`
-      : "";
-  return `${sessionEvent}${fixture.structuredEvent(value, sessionId)}\n`;
+  return `${fixture.structuredEvent(value, sessionId, "worker")}\n`;
 }
 
 type AdapterFixture = {
   host: "Codex" | "Claude";
   adapter: CodexAdapter | ClaudeAdapter;
-  structuredEvent(value: unknown, sessionId?: string): string;
+  structuredEvent(value: unknown, sessionId?: string, kind?: InvocationKind, cwd?: string): string;
 };
 
 function rawAdapters(): AdapterFixture[] {
   return [
-    { host: "Codex", adapter: new CodexAdapter(), structuredEvent: codexStructuredEvent },
-    { host: "Claude", adapter: new ClaudeAdapter(), structuredEvent: claudeStructuredEvent },
+    { host: "Codex", adapter: new CodexAdapter(), structuredEvent: codexSuccessfulProtocol },
+    { host: "Claude", adapter: new ClaudeAdapter(), structuredEvent: claudeSuccessfulProtocol },
   ];
 }
 
@@ -219,6 +296,8 @@ function queueUnauthenticatedCapabilityProbe(host: "codex" | "claude"): void {
 describe("bounded adapter streams", () => {
   beforeAll(async () => {
     trustedCommandDirectory = await mkdtemp(join(tmpdir(), "graphcraft-adapter-path-"));
+    const codexHome = join(trustedCommandDirectory, "codex-home");
+    await mkdir(codexHome);
     const suffix = process.platform === "win32" ? ".cmd" : "";
     await Promise.all(
       ["codex", "claude"].map(async (host) => {
@@ -233,6 +312,7 @@ describe("bounded adapter streams", () => {
     );
     const inheritedPath = process.env.PATH ?? process.env.Path ?? "";
     vi.stubEnv("PATH", `${trustedCommandDirectory}${delimiter}${inheritedPath}`);
+    vi.stubEnv("CODEX_HOME", codexHome);
   });
   beforeEach(() => spawnMock.mockReset());
   afterEach(() => vi.useRealTimers());
@@ -245,6 +325,46 @@ describe("bounded adapter streams", () => {
         maxRetries: 5,
         retryDelay: 100,
       });
+    }
+  });
+
+  it("rejects invalid repository-instruction selections before direct adapter admission", async () => {
+    const selection = repositoryInstructionSelection();
+    const invalid = { ...selection, selectionDigest: "f".repeat(64) };
+    for (const { host, adapter } of rawAdapters()) {
+      const signal = new AbortController().signal;
+      const callsBefore = spawnMock.mock.calls.length;
+      await expect(
+        adapter.plan({ ...planningRequest(), repositoryInstructions: invalid }, signal),
+        `${host} planner`,
+      ).rejects.toThrow(/selection digest is invalid/i);
+      await expect(
+        adapter.verify(
+          {
+            ...semanticRequest(),
+            context: {
+              ...semanticRequest().context,
+              repositoryInstructions: invalid,
+            },
+          },
+          signal,
+        ),
+        `${host} verifier`,
+      ).rejects.toThrow(/selection digest is invalid/i);
+      const worker = workerRequest();
+      await expect(
+        collectEvents(
+          adapter.execute(
+            {
+              ...worker,
+              capsule: { ...worker.capsule, repositoryInstructions: invalid },
+            },
+            signal,
+          ),
+        ),
+        `${host} worker`,
+      ).rejects.toThrow(/selection digest is invalid/i);
+      expect(spawnMock.mock.calls, `${host} child processes`).toHaveLength(callsBefore);
     }
   });
 
@@ -268,6 +388,26 @@ describe("bounded adapter streams", () => {
         },
         { observedBytes: 2, overflowed: false, text: "{}" },
       ]);
+    }
+  });
+
+  it("does not dispatch buffered or final protocol lines after cancellation", async () => {
+    for (const readLines of [readCodexProtocolLines, readClaudeProtocolLines]) {
+      const stream = new PassThrough();
+      const abort = new AbortController();
+      stream.end('{"first":true}\n{"second":true}\n{"final":true}');
+      const lines = readLines(stream, abort.signal)[Symbol.asyncIterator]();
+
+      await expect(lines.next()).resolves.toEqual({
+        done: false,
+        value: {
+          observedBytes: 14,
+          overflowed: false,
+          text: '{"first":true}',
+        },
+      });
+      abort.abort({ cause: "cancellation", reason: "Reject the first protocol event" });
+      await expect(lines.next()).resolves.toEqual({ done: true, value: undefined });
     }
   });
 
@@ -299,19 +439,150 @@ describe("bounded adapter streams", () => {
     }
   });
 
+  it("latches malformed JSON ahead of buffered success in every invocation path", async () => {
+    const malformedLine = '{"type":';
+    const graphPlan = {
+      schemaVersion: 1,
+      family: "feature",
+      nodes: [
+        {
+          id: "reject-malformed-protocol",
+          kind: "implementation",
+          objective: "Reject malformed protocol output",
+          dependsOn: [],
+          scope: ["src/**"],
+          contextSelector: {
+            includeRepositoryInstructions: true,
+            predecessorResults: [],
+            relevantPaths: ["src"],
+          },
+          progressProbes: [],
+          completionProbes: [],
+          sideEffectClass: "workspace_write",
+        },
+      ],
+    };
+    const semanticVerdict = {
+      verdict: "supported",
+      evidence: ["Buffered success must not erase malformed protocol output."],
+      rationale: "The protocol failure remains authoritative.",
+      uncertainty: 0,
+    };
+    const workerResult = {
+      status: "completed",
+      summary: "buffered success",
+      changedPaths: [],
+      evidence: ["Buffered success must not erase malformed protocol output."],
+    };
+
+    for (const fixture of adapters()) {
+      const expectedMessage = `${fixture.host} emitted a malformed JSON protocol line; output was rejected`;
+      const expectSettledAndCleaned = async (child: FakeChild): Promise<void> => {
+        expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+        const options = spawnMock.mock.calls.at(-1)?.[2] as { env?: NodeJS.ProcessEnv } | undefined;
+        const privateTemp = options?.env?.TMPDIR;
+        expect(privateTemp).toEqual(expect.any(String));
+        await expect(lstat(privateTemp!)).rejects.toMatchObject({ code: "ENOENT" });
+      };
+
+      queueReadyCapabilityProbe(fixture.adapter.id);
+      let child = queueChild({
+        stdout: `${malformedLine}\n${fixture.structuredEvent(JSON.stringify(graphPlan), undefined, "plan")}\n`,
+      });
+      await expect(
+        fixture.adapter.plan(planningRequest(), new AbortController().signal),
+      ).rejects.toThrow(expectedMessage);
+      await expectSettledAndCleaned(child);
+
+      const verification = semanticRequest();
+      queueReadyCapabilityProbe(fixture.adapter.id);
+      child = queueChild({
+        stdout: `${malformedLine}\n${fixture.structuredEvent(JSON.stringify(semanticVerdict), verification.invocationId, "verify")}\n`,
+      });
+      await expect(
+        fixture.adapter.verify(verification, new AbortController().signal),
+      ).rejects.toThrow(expectedMessage);
+      await expectSettledAndCleaned(child);
+
+      const freshWorker = workerRequest();
+      const freshSessionId = fixture.host === "Claude" ? freshWorker.invocationId : randomUUID();
+      queueReadyCapabilityProbe(fixture.adapter.id);
+      child = queueChild({
+        stdout: `${malformedLine}\n${fixture.structuredEvent(JSON.stringify(workerResult), freshSessionId, "worker")}\n`,
+      });
+      let events = await collectEvents(
+        fixture.adapter.execute(freshWorker, new AbortController().signal),
+      );
+      expect(events.at(-1)).toEqual({ type: "error", message: expectedMessage });
+      expect(events).not.toContainEqual(expect.objectContaining({ type: "result" }));
+      await expectSettledAndCleaned(child);
+
+      const resumedSessionId = randomUUID();
+      const resumedWorker = workerRequest(resumedSessionId);
+      queueReadyCapabilityProbe(fixture.adapter.id);
+      child = queueChild({
+        stdout: `${malformedLine}\n${fixture.structuredEvent(JSON.stringify(workerResult), resumedSessionId, "worker")}\n`,
+      });
+      events = await collectEvents(
+        fixture.adapter.execute(resumedWorker, new AbortController().signal),
+      );
+      expect(events.at(-1)).toEqual({ type: "error", message: expectedMessage });
+      expect(events).not.toContainEqual(expect.objectContaining({ type: "result" }));
+      await expectSettledAndCleaned(child);
+    }
+  });
+
+  it("continues to ignore blank protocol lines", async () => {
+    const graphPlan = {
+      schemaVersion: 1,
+      family: "feature",
+      nodes: [
+        {
+          id: "ignore-blank-protocol-lines",
+          kind: "implementation",
+          objective: "Ignore blank protocol lines",
+          dependsOn: [],
+          scope: ["src/**"],
+          contextSelector: {
+            includeRepositoryInstructions: true,
+            predecessorResults: [],
+            relevantPaths: ["src"],
+          },
+          progressProbes: [],
+          completionProbes: [],
+          sideEffectClass: "workspace_write",
+        },
+      ],
+    };
+
+    for (const { adapter, structuredEvent } of adapters()) {
+      queueReadyCapabilityProbe(adapter.id);
+      const child = queueChild({
+        stdout: `\n \r\n\t\n${structuredEvent(JSON.stringify(graphPlan), undefined, "plan")}\n\n`,
+      });
+      await expect(
+        adapter.plan(planningRequest(), new AbortController().signal),
+      ).resolves.toMatchObject({ plan: graphPlan });
+      expect(child.kill).not.toHaveBeenCalled();
+    }
+  });
+
   it("rejects oversized structured authority in planning and semantic verification", async () => {
     expect(CODEX_STRUCTURED_OUTPUT_LIMIT_BYTES).toBe(CLAUDE_STRUCTURED_OUTPUT_LIMIT_BYTES);
     const oversizedAuthority = "x".repeat(CODEX_STRUCTURED_OUTPUT_LIMIT_BYTES + 1);
     for (const { host, adapter, structuredEvent } of adapters()) {
       queueReadyCapabilityProbe(adapter.id);
-      queueChild({ stdout: `${structuredEvent(oversizedAuthority)}\n` });
+      queueChild({ stdout: `${structuredEvent(oversizedAuthority, undefined, "plan")}\n` });
       await expect(adapter.plan(planningRequest(), new AbortController().signal)).rejects.toThrow(
         `${host} structured graph plan exceeded the ${CODEX_STRUCTURED_OUTPUT_LIMIT_BYTES}-byte structured-output limit`,
       );
 
       queueReadyCapabilityProbe(adapter.id);
-      queueChild({ stdout: `${structuredEvent(oversizedAuthority)}\n` });
-      await expect(adapter.verify(semanticRequest(), new AbortController().signal)).rejects.toThrow(
+      const verification = semanticRequest();
+      queueChild({
+        stdout: `${structuredEvent(oversizedAuthority, verification.invocationId, "verify")}\n`,
+      });
+      await expect(adapter.verify(verification, new AbortController().signal)).rejects.toThrow(
         `${host} semantic verdict exceeded the ${CODEX_STRUCTURED_OUTPUT_LIMIT_BYTES}-byte structured-output limit`,
       );
     }
@@ -321,13 +592,9 @@ describe("bounded adapter streams", () => {
     const oversizedAuthority = "x".repeat(CODEX_STRUCTURED_OUTPUT_LIMIT_BYTES + 1);
     for (const { host, adapter, structuredEvent } of adapters()) {
       const sessionId = `${host.toLowerCase()}-session`;
-      const sessionEvent =
-        host === "Codex"
-          ? `${JSON.stringify({ type: "thread.started", thread_id: sessionId })}\n`
-          : "";
       queueReadyCapabilityProbe(adapter.id);
       queueChild({
-        stdout: `${sessionEvent}${structuredEvent(oversizedAuthority, sessionId)}\n`,
+        stdout: `${structuredEvent(oversizedAuthority, sessionId, "worker")}\n`,
       });
       const events = await collectEvents(
         adapter.execute(workerRequest(sessionId), new AbortController().signal),
@@ -487,6 +754,407 @@ describe("bounded adapter streams", () => {
     expect(spawnMock).toHaveBeenCalledTimes(12);
   });
 
+  it("allowlists Claude environments on every model invocation path", async () => {
+    const originalGitHubToken = process.env.GITHUB_TOKEN;
+    const originalNpmToken = process.env.NPM_TOKEN;
+    process.env.GITHUB_TOKEN = "graphcraft-test-github-token";
+    process.env.NPM_TOKEN = "graphcraft-test-npm-token";
+    const adapter = new ClaudeAdapter();
+    const graphPlan = {
+      schemaVersion: 1,
+      family: "feature",
+      nodes: [
+        {
+          id: "scrub-environment",
+          kind: "implementation",
+          objective: "Scrub the subprocess environment",
+          dependsOn: [],
+          scope: ["src/**"],
+          contextSelector: {
+            includeRepositoryInstructions: true,
+            predecessorResults: [],
+            relevantPaths: ["src"],
+          },
+          progressProbes: [],
+          completionProbes: [],
+          sideEffectClass: "workspace_write",
+        },
+      ],
+    };
+    const semanticVerdict = {
+      verdict: "supported",
+      evidence: ["The subprocess environment was scrubbed."],
+      rationale: "Every Claude model invocation received the scrub policy.",
+      uncertainty: 0,
+    };
+    const workerResult = {
+      status: "completed",
+      summary: "scrubbed",
+      changedPaths: [],
+      evidence: ["The subprocess environment was scrubbed."],
+    };
+    const expectAllowlistedInvocation = async (): Promise<void> => {
+      const options = spawnMock.mock.calls.at(-1)?.[2] as
+        { env?: NodeJS.ProcessEnv; shell?: boolean } | undefined;
+      const privateTemp = options?.env?.TMPDIR;
+      expect(options).toMatchObject({
+        shell: false,
+        env: expect.objectContaining({
+          FORCE_COLOR: "0",
+          NO_COLOR: "1",
+          TEMP: privateTemp,
+          TMP: privateTemp,
+          TMPDIR: privateTemp,
+        }),
+      });
+      expect(options?.env).not.toHaveProperty("GITHUB_TOKEN");
+      expect(options?.env).not.toHaveProperty("NPM_TOKEN");
+      expect(options?.env).not.toHaveProperty("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB");
+      expect(privateTemp).toMatch(/graphcraft-claude-tmp-/);
+      await expect(lstat(privateTemp!)).rejects.toMatchObject({ code: "ENOENT" });
+    };
+
+    try {
+      queueReadyCapabilityProbe("claude");
+      queueChild({
+        stdout: `${claudeSuccessfulProtocol(JSON.stringify(graphPlan))}\n`,
+      });
+      await adapter.plan(planningRequest(), new AbortController().signal);
+      await expectAllowlistedInvocation();
+
+      for (const worker of [workerRequest(), workerRequest("claude-session")]) {
+        const sessionId = worker.resumeSessionId ?? worker.invocationId;
+        queueReadyCapabilityProbe("claude");
+        queueChild({
+          stdout: `${claudeSuccessfulProtocol(JSON.stringify(workerResult), sessionId)}\n`,
+        });
+        await collectEvents(adapter.execute(worker, new AbortController().signal));
+        await expectAllowlistedInvocation();
+      }
+
+      queueReadyCapabilityProbe("claude");
+      const verification = semanticRequest();
+      queueChild({
+        stdout: `${claudeSuccessfulProtocol(JSON.stringify(semanticVerdict), verification.invocationId, "verify")}\n`,
+      });
+      await adapter.verify(verification, new AbortController().signal);
+      await expectAllowlistedInvocation();
+    } finally {
+      if (originalGitHubToken === undefined) delete process.env.GITHUB_TOKEN;
+      else process.env.GITHUB_TOKEN = originalGitHubToken;
+      if (originalNpmToken === undefined) delete process.env.NPM_TOKEN;
+      else process.env.NPM_TOKEN = originalNpmToken;
+    }
+  });
+
+  it("rejects Claude hook events before buffered model output can be accepted", async () => {
+    const adapter = new ClaudeAdapter();
+    const hook = `${JSON.stringify({
+      type: "system",
+      subtype: "hook_started",
+      hook_name: "SessionStart",
+    })}\n`;
+    const graphPlan = {
+      schemaVersion: 1,
+      family: "feature",
+      nodes: [
+        {
+          id: "reject-hook",
+          kind: "implementation",
+          objective: "Reject the host hook",
+          dependsOn: [],
+          scope: ["src/**"],
+          contextSelector: {
+            includeRepositoryInstructions: true,
+            predecessorResults: [],
+            relevantPaths: ["src"],
+          },
+          progressProbes: [],
+          completionProbes: [],
+          sideEffectClass: "workspace_write",
+        },
+      ],
+    };
+    const semanticVerdict = {
+      verdict: "supported",
+      evidence: ["This buffered verdict must not erase the hook event."],
+      rationale: "The hook event is an unapproved side-effect boundary.",
+      uncertainty: 0,
+    };
+    const workerResult = {
+      status: "completed",
+      summary: "buffered",
+      changedPaths: [],
+      evidence: ["This buffered result must not erase the hook event."],
+    };
+
+    const verification = semanticRequest();
+    for (const [invoke, success] of [
+      [
+        async () => await adapter.plan(planningRequest(), new AbortController().signal),
+        claudeSuccessfulProtocol(JSON.stringify(graphPlan)),
+      ],
+      [
+        async () => await adapter.verify(verification, new AbortController().signal),
+        claudeSuccessfulProtocol(
+          JSON.stringify(semanticVerdict),
+          verification.invocationId,
+          "verify",
+        ),
+      ],
+    ] as const) {
+      queueReadyCapabilityProbe("claude");
+      const child = queueChild({ stdout: `${hook}${success}\n` });
+      await expect(invoke()).rejects.toThrow(/does not authorize host hooks/);
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    }
+
+    const request = workerRequest();
+    queueReadyCapabilityProbe("claude");
+    const child = queueChild({
+      stdout: `${hook}${claudeSuccessfulProtocol(JSON.stringify(workerResult), request.invocationId)}\n`,
+    });
+    const events = await collectEvents(adapter.execute(request, new AbortController().signal));
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(events.at(-1)).toEqual({
+      type: "error",
+      message:
+        "Claude reported a configured hook event; Graphcraft does not authorize host hooks, so the result was rejected",
+    });
+    expect(events).not.toContainEqual(expect.objectContaining({ type: "result" }));
+  });
+
+  it("gives every Codex model invocation a private disposable temp directory", async () => {
+    const adapter = new CodexAdapter();
+    const result = {
+      status: "completed",
+      summary: "isolated temp",
+      changedPaths: [],
+      evidence: ["The invocation used its private temp directory."],
+    };
+
+    for (const worker of [workerRequest(), workerRequest("codex-session")]) {
+      const sessionId = worker.resumeSessionId ?? randomUUID();
+      queueReadyCapabilityProbe("codex");
+      queueChild({
+        stdout: `${codexSuccessfulProtocol(JSON.stringify(result), sessionId)}\n`,
+      });
+      await collectEvents(adapter.execute(worker, new AbortController().signal));
+
+      const options = spawnMock.mock.calls.at(-1)?.[2] as
+        { env?: NodeJS.ProcessEnv; shell?: boolean } | undefined;
+      const privateTemp = options?.env?.TMPDIR;
+      expect(options).toMatchObject({
+        shell: false,
+        env: expect.objectContaining({
+          FORCE_COLOR: "0",
+          NO_COLOR: "1",
+          TEMP: privateTemp,
+          TMP: privateTemp,
+          TMPDIR: privateTemp,
+        }),
+      });
+      expect(privateTemp).toMatch(/graphcraft-codex-tmp-/);
+      await expect(lstat(privateTemp!)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+
+  it("rejects Codex startup policy warnings before model work can be accepted", async () => {
+    const adapter = new CodexAdapter();
+    for (const message of [
+      "permission_profile rejected; falling back",
+      "web_search_mode rejected; falling back",
+      "windows.sandbox rejected; falling back",
+    ]) {
+      const warning = `${JSON.stringify({
+        type: "item.completed",
+        item: { id: "config-warning", type: "error", message },
+      })}\n`;
+
+      for (const invoke of [
+        async () => await adapter.plan(planningRequest(), new AbortController().signal),
+        async () => await adapter.verify(semanticRequest(), new AbortController().signal),
+      ]) {
+        queueReadyCapabilityProbe("codex");
+        const child = queueChild({ stdout: warning });
+        await expect(invoke()).rejects.toThrow(message);
+        expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+      }
+
+      for (const worker of [workerRequest(), workerRequest(randomUUID())]) {
+        queueReadyCapabilityProbe("codex");
+        const child = queueChild({ stdout: warning });
+        const events = await collectEvents(adapter.execute(worker, new AbortController().signal));
+        expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+        expect(events.at(-1)).toEqual({ type: "error", message });
+        expect(events).not.toContainEqual(expect.objectContaining({ type: "result" }));
+      }
+    }
+  });
+
+  it("latches Codex policy and turn failures ahead of buffered success output", async () => {
+    const adapter = new CodexAdapter();
+    const graphPlan = {
+      schemaVersion: 1,
+      family: "feature",
+      nodes: [
+        {
+          id: "reject-fallback",
+          kind: "implementation",
+          objective: "Reject the policy fallback",
+          dependsOn: [],
+          scope: ["src/**"],
+          contextSelector: {
+            includeRepositoryInstructions: true,
+            predecessorResults: [],
+            relevantPaths: ["src"],
+          },
+          progressProbes: [],
+          completionProbes: [],
+          sideEffectClass: "workspace_write",
+        },
+      ],
+    };
+    const semanticVerdict = {
+      verdict: "supported",
+      evidence: ["The buffered verdict cannot erase the earlier failure."],
+      rationale: "The policy fallback remains authoritative.",
+      uncertainty: 0,
+    };
+    const workerResult = {
+      status: "completed",
+      summary: "buffered",
+      changedPaths: [],
+      evidence: ["The buffered result cannot erase the earlier failure."],
+    };
+    const warning = `${JSON.stringify({
+      type: "item.completed",
+      item: {
+        id: "config-warning",
+        type: "error",
+        message: "permission profile rejected; falling back",
+      },
+    })}\n`;
+    const turnStarted = `${JSON.stringify({ type: "turn.started" })}\n`;
+
+    const turnFailure = `${JSON.stringify({
+      type: "turn.failed",
+      error: { message: "turn failed after retries" },
+    })}\n`;
+    for (const [invoke, success] of [
+      [
+        async () => await adapter.plan(planningRequest(), new AbortController().signal),
+        codexStructuredEvent(JSON.stringify(graphPlan)),
+      ],
+      [
+        async () => await adapter.verify(semanticRequest(), new AbortController().signal),
+        codexStructuredEvent(JSON.stringify(semanticVerdict)),
+      ],
+    ] as const) {
+      for (const [failure, message] of [
+        [
+          `${JSON.stringify({ type: "thread.started", thread_id: randomUUID() })}\n${warning}${turnStarted}`,
+          "permission profile rejected; falling back",
+        ],
+        [
+          `${JSON.stringify({ type: "thread.started", thread_id: randomUUID() })}\n${turnStarted}${turnFailure}`,
+          "turn failed after retries",
+        ],
+      ] as const) {
+        queueReadyCapabilityProbe("codex");
+        const child = queueChild({ stdout: `${failure}${success}\n` });
+        await expect(invoke()).rejects.toThrow(message);
+        expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+      }
+    }
+
+    const sessionId = randomUUID();
+    for (const worker of [workerRequest(), workerRequest(sessionId)]) {
+      for (const [failure, message] of [
+        [`${warning}${turnStarted}`, "permission profile rejected; falling back"],
+        [`${turnStarted}${turnFailure}`, "turn failed after retries"],
+      ] as const) {
+        queueReadyCapabilityProbe("codex");
+        const child = queueChild({
+          stdout: `${JSON.stringify({ type: "thread.started", thread_id: sessionId })}\n${failure}${codexStructuredEvent(JSON.stringify(workerResult))}\n`,
+        });
+        const events = await collectEvents(adapter.execute(worker, new AbortController().signal));
+        expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+        expect(events.at(-1)).toEqual({ type: "error", message });
+        expect(events).not.toContainEqual(expect.objectContaining({ type: "result" }));
+      }
+    }
+  });
+
+  it("allows Codex to recover a transient transport error only after the turn starts", async () => {
+    const adapter = new CodexAdapter();
+    const graphPlan = {
+      schemaVersion: 1,
+      family: "feature",
+      nodes: [
+        {
+          id: "recover-transport",
+          kind: "implementation",
+          objective: "Recover the transient transport error",
+          dependsOn: [],
+          scope: ["src/**"],
+          contextSelector: {
+            includeRepositoryInstructions: true,
+            predecessorResults: [],
+            relevantPaths: ["src"],
+          },
+          progressProbes: [],
+          completionProbes: [],
+          sideEffectClass: "workspace_write",
+        },
+      ],
+    };
+    const semanticVerdict = {
+      verdict: "supported",
+      evidence: ["The host recovered and returned a valid verdict."],
+      rationale: "The transient error did not terminate the turn.",
+      uncertainty: 0,
+    };
+    const workerResult = {
+      status: "completed",
+      summary: "recovered",
+      changedPaths: [],
+      evidence: ["The host recovered and returned a valid result."],
+    };
+    const turnStarted = `${JSON.stringify({ type: "turn.started" })}\n`;
+    const transientError = `${JSON.stringify({
+      type: "error",
+      message: "transient stream failure; retrying",
+    })}\n`;
+
+    queueReadyCapabilityProbe("codex");
+    queueChild({
+      stdout: `${JSON.stringify({ type: "thread.started", thread_id: randomUUID() })}\n${turnStarted}${transientError}${codexStructuredEvent(JSON.stringify(graphPlan))}\n${JSON.stringify({ type: "turn.completed", usage: {} })}\n`,
+    });
+    await expect(
+      adapter.plan(planningRequest(), new AbortController().signal),
+    ).resolves.toMatchObject({ plan: graphPlan });
+
+    queueReadyCapabilityProbe("codex");
+    queueChild({
+      stdout: `${JSON.stringify({ type: "thread.started", thread_id: randomUUID() })}\n${turnStarted}${transientError}${codexStructuredEvent(JSON.stringify(semanticVerdict))}\n${JSON.stringify({ type: "turn.completed", usage: {} })}\n`,
+    });
+    await expect(
+      adapter.verify(semanticRequest(), new AbortController().signal),
+    ).resolves.toMatchObject({ verdict: semanticVerdict });
+
+    const sessionId = randomUUID();
+    for (const worker of [workerRequest(), workerRequest(sessionId)]) {
+      queueReadyCapabilityProbe("codex");
+      queueChild({
+        stdout: `${JSON.stringify({ type: "thread.started", thread_id: sessionId })}\n${turnStarted}${transientError}${codexStructuredEvent(JSON.stringify(workerResult))}\n${JSON.stringify({ type: "turn.completed", usage: {} })}\n`,
+      });
+      await expect(
+        collectEvents(adapter.execute(worker, new AbortController().signal)),
+      ).resolves.toContainEqual({ type: "result", result: workerResult });
+    }
+  });
+
   it("reports an unavailable trusted host as not installed without spawning", async () => {
     const inheritedPath = process.env.PATH ?? "";
     vi.stubEnv("PATH", join(tmpdir(), `graphcraft-missing-host-${randomUUID()}`));
@@ -537,6 +1205,10 @@ describe("bounded adapter streams", () => {
           trustedBin,
         ].map((directory) => mkdir(directory, { recursive: true })),
       );
+      await Promise.all([
+        execFileAsync("git", ["init", "-b", "main"], { cwd: originalRepository }),
+        execFileAsync("git", ["init", "-b", "main"], { cwd: siblingWorktree }),
+      ]);
       await Promise.all(
         [originalBin, siblingBin, trustedBin].flatMap((directory) =>
           ["codex", "claude"].map(async (host) => {
@@ -549,7 +1221,7 @@ describe("bounded adapter streams", () => {
 
       const inheritedPath = process.env.PATH ?? "";
       const cwd = vi.spyOn(process, "cwd").mockReturnValue(originalCwd);
-      vi.stubEnv("PATH", [originalBin, siblingBin, trustedBin].join(delimiter));
+      vi.stubEnv("PATH", [originalBin, siblingBin, trustedBin, inheritedPath].join(delimiter));
       try {
         const graphPlan = {
           schemaVersion: 1,
@@ -601,30 +1273,35 @@ describe("bounded adapter streams", () => {
           };
 
           await expectBoundInvocation(
-            `${structuredEvent(JSON.stringify(graphPlan))}\n`,
+            `${structuredEvent(JSON.stringify(graphPlan), undefined, "plan", siblingWorktree)}\n`,
             async () =>
               await adapter.plan(
                 { ...planningRequest(), repositoryPath: siblingWorktree },
                 new AbortController().signal,
               ),
           );
+          const verification = {
+            ...semanticRequest(),
+            repositoryPath: siblingWorktree,
+          };
           await expectBoundInvocation(
-            `${structuredEvent(JSON.stringify(semanticVerdict))}\n`,
-            async () =>
-              await adapter.verify(
-                { ...semanticRequest(), repositoryPath: siblingWorktree },
-                new AbortController().signal,
-              ),
+            `${structuredEvent(
+              JSON.stringify(semanticVerdict),
+              verification.invocationId,
+              "verify",
+              siblingWorktree,
+            )}\n`,
+            async () => await adapter.verify(verification, new AbortController().signal),
           );
+          const worker = { ...workerRequest(), repositoryPath: siblingWorktree };
           await expectBoundInvocation(
-            `${structuredEvent(JSON.stringify(workerResult))}\n`,
-            async () =>
-              await collectEvents(
-                adapter.execute(
-                  { ...workerRequest(), repositoryPath: siblingWorktree },
-                  new AbortController().signal,
-                ),
-              ),
+            `${structuredEvent(
+              JSON.stringify(workerResult),
+              worker.invocationId,
+              "worker",
+              siblingWorktree,
+            )}\n`,
+            async () => await collectEvents(adapter.execute(worker, new AbortController().signal)),
           );
         }
       } finally {
@@ -1014,4 +1691,73 @@ describe("bounded adapter streams", () => {
       expect(remaining.at(-1)).toEqual({ type: "result", result });
     }
   });
+
+  it("terminates an active worker and removes private resources when its consumer returns", async () => {
+    for (const fixture of adapters()) {
+      const request = workerRequest();
+      queueReadyCapabilityProbe(fixture.adapter.id);
+      const { child } = queueTerminatingChild();
+      const iterator = fixture.adapter
+        .execute(request, new AbortController().signal)
+        [Symbol.asyncIterator]();
+
+      await expect(iterator.next()).resolves.toEqual({
+        done: false,
+        value: { type: "started", invocationId: request.invocationId },
+      });
+      const invocation = spawnMock.mock.calls.at(-1)!;
+      const args = invocation[1] as string[];
+      const options = invocation[2] as { env: NodeJS.ProcessEnv };
+      const privateTemp = options.env.TMPDIR!;
+      const schemaPath =
+        fixture.host === "Codex" ? args[args.indexOf("--output-schema") + 1] : undefined;
+      await expect(lstat(privateTemp)).resolves.toBeDefined();
+      if (schemaPath) await expect(lstat(dirname(schemaPath))).resolves.toBeDefined();
+
+      await expect(iterator.return?.()).resolves.toMatchObject({ done: true });
+
+      expect(child.kill, fixture.host).toHaveBeenCalledWith("SIGTERM");
+      await expect(lstat(privateTemp), fixture.host).rejects.toMatchObject({ code: "ENOENT" });
+      if (schemaPath)
+        await expect(lstat(dirname(schemaPath)), fixture.host).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+    }
+  });
+
+  it.each(["plan", "verify", "worker"] as const)(
+    "removes every private invocation resource when %s spawn throws synchronously",
+    async (kind) => {
+      for (const fixture of adapters()) {
+        queueReadyCapabilityProbe(fixture.adapter.id);
+        let privateTemp: string | undefined;
+        let schemaPath: string | undefined;
+        spawnMock.mockImplementationOnce(
+          (_executable: string, args: string[], options: { env: NodeJS.ProcessEnv }) => {
+            privateTemp = options.env.TMPDIR;
+            if (fixture.host === "Codex") schemaPath = args[args.indexOf("--output-schema") + 1];
+            throw new Error(`${fixture.host} ${kind} spawn setup failed`);
+          },
+        );
+
+        const operation =
+          kind === "plan"
+            ? fixture.adapter.plan(planningRequest(), new AbortController().signal)
+            : kind === "verify"
+              ? fixture.adapter.verify(semanticRequest(), new AbortController().signal)
+              : fixture.adapter
+                  .execute(workerRequest(), new AbortController().signal)
+                  [Symbol.asyncIterator]()
+                  .next();
+        await expect(operation).rejects.toThrow(`${fixture.host} ${kind} spawn setup failed`);
+
+        expect(privateTemp, fixture.host).toBeDefined();
+        await expect(lstat(privateTemp!), fixture.host).rejects.toMatchObject({ code: "ENOENT" });
+        if (schemaPath)
+          await expect(lstat(dirname(schemaPath)), fixture.host).rejects.toMatchObject({
+            code: "ENOENT",
+          });
+      }
+    },
+  );
 });

@@ -6,6 +6,7 @@ import type {
   HostEvent,
   ProbePlan,
   ProbeSpec,
+  RepositoryInstructionSelection,
   RunContract,
   SemanticVerifierContext,
   SemanticVerdict,
@@ -22,6 +23,7 @@ export interface PlanningRequest {
   repositoryEvidence: RepositoryPlanningEvidence;
   probePlan: ProbePlan;
   verificationProbes: ProbeSpec[];
+  repositoryInstructions?: RepositoryInstructionSelection;
   authorityBoundary?: ModelAuthorityBoundary;
 }
 
@@ -51,6 +53,7 @@ export interface PlanningResult {
 
 export interface GraphPlanner {
   readonly id: "codex" | "claude" | "test";
+  readonly containmentProfile?: string;
   probe(signal?: AbortSignal): Promise<HostCapabilities>;
   plan(request: PlanningRequest, signal: AbortSignal): Promise<PlanningResult>;
 }
@@ -103,6 +106,11 @@ export interface InvocationRecord {
   hostSessionId?: string;
   baseline?: EvidenceSnapshot;
   transcript?: HostEvent[];
+  capsuleHash?: string;
+  repositoryInstructionManifestDigest?: string;
+  repositoryInstructionSelectionDigest?: string;
+  containmentProfile?: string;
+  instructionManifestPinned?: boolean;
 }
 
 export interface ReconciliationResult {

@@ -27,6 +27,11 @@ function compactEventData(event: RunEvent): Record<string, unknown> {
     "progressDecision",
     "decisionPacket",
     "packet",
+    "capsuleHash",
+    "repositoryInstructionManifestDigest",
+    "repositoryInstructionSelectionDigest",
+    "containmentProfile",
+    "instructionManifestPinned",
   ];
   const compact = Object.fromEntries(
     selected.filter((key) => data[key] !== undefined).map((key) => [key, data[key]]),
@@ -44,31 +49,59 @@ type ViewerProjection = [
   Awaited<ReturnType<RunStore["loadGraphHistory"]>>,
   Awaited<ReturnType<RunStore["loadProbePlan"]>>,
   Awaited<ReturnType<RunStore["loadArtifactInventory"]>>,
+  Awaited<ReturnType<RunStore["loadRepositoryInstructionManifest"]>>,
 ];
 
 export async function createViewerSnapshot(store: RunStore): Promise<Record<string, unknown>> {
   let projection: ViewerProjection | undefined;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const before = await store.loadEvents();
-    const [contract, graph, state, graphHistory, probePlan, artifactInventory] = await Promise.all([
+    const [
+      contract,
+      graph,
+      state,
+      graphHistory,
+      probePlan,
+      artifactInventory,
+      repositoryInstructions,
+    ] = await Promise.all([
       store.loadContract(),
       store.loadGraph(),
       store.loadState(),
       store.loadGraphHistory(),
       store.loadProbePlan(),
       store.loadArtifactInventory(),
+      store.loadRepositoryInstructionManifest(),
     ]);
     const events = await store.loadEvents();
     const beforeRevision = `${before.length}:${before.at(-1)?.hash ?? "empty"}`;
     const afterRevision = `${events.length}:${events.at(-1)?.hash ?? "empty"}`;
     if (beforeRevision === afterRevision) {
-      projection = [contract, graph, state, events, graphHistory, probePlan, artifactInventory];
+      projection = [
+        contract,
+        graph,
+        state,
+        events,
+        graphHistory,
+        probePlan,
+        artifactInventory,
+        repositoryInstructions,
+      ];
       break;
     }
   }
   if (!projection)
     throw new Error("Durable run state changed too often to build one consistent viewer snapshot");
-  const [contract, graph, state, events, graphHistory, probePlan, artifactInventory] = projection;
+  const [
+    contract,
+    graph,
+    state,
+    events,
+    graphHistory,
+    probePlan,
+    artifactInventory,
+    repositoryInstructions,
+  ] = projection;
   const artifacts = artifactInventory.entries
     .filter(({ path }) => path.startsWith("artifacts/"))
     .map((entry) => {
@@ -99,14 +132,21 @@ export async function createViewerSnapshot(store: RunStore): Promise<Record<stri
       const receipt = event.data.receipt;
       if (receipt && typeof receipt === "object" && !Array.isArray(receipt)) {
         const value = receipt as Record<string, unknown>;
+        const selected = value.selected as Record<string, unknown> | undefined;
+        const omitted = value.omitted as Record<string, unknown> | undefined;
+        const capsule = value.capsule as Record<string, unknown> | undefined;
+        const reused = value.reused as Record<string, unknown> | undefined;
         if (typeof value.nodeId === "string")
           contextByNode.set(value.nodeId, {
-            selectedPaths: value.selectedPaths,
-            omittedPredecessorIds: value.omittedPredecessorIds,
-            omittedProbeIds: value.omittedProbeIds,
-            capsuleCharacters: value.capsuleCharacters,
-            capsuleReused: value.capsuleReused,
-            repositoryInventoryReused: value.repositoryInventoryReused,
+            selectedPaths: selected?.repositoryPaths,
+            selectedPredecessorIds: selected?.predecessorNodeIds,
+            selectedProbeIds: selected?.probeIds,
+            omittedPredecessorIds: omitted?.predecessorNodeIds,
+            omittedProbeIds: omitted?.probeIds,
+            capsuleCharacters: capsule?.characters,
+            capsuleReused: reused?.capsule,
+            repositoryInventoryReused: reused?.repositoryInventory,
+            repositoryInstructions: value.repositoryInstructions,
           });
       }
     }
@@ -185,6 +225,15 @@ export async function createViewerSnapshot(store: RunStore): Promise<Record<stri
     waits: state.waits,
     sideEffects: state.sideEffects,
     decision: state.pendingDecision,
+    repositoryInstructions: repositoryInstructions
+      ? {
+          state: "pinned",
+          policy: repositoryInstructions.policy,
+          digest: repositoryInstructions.digest,
+          count: repositoryInstructions.entries.length,
+          manifest: repositoryInstructions,
+        }
+      : { state: "legacy_unpinned", manifest: null },
     artifactInventory,
     artifacts,
   }) as Record<string, unknown>;
@@ -300,10 +349,11 @@ const VIEWER_HTML = String.raw`<!doctype html>
     *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-sans-serif,system-ui,sans-serif}header{position:sticky;top:0;z-index:3;background:color-mix(in srgb,var(--panel) 92%,transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--line);padding:14px 20px;display:flex;gap:18px;align-items:center;flex-wrap:wrap}h1{font-size:18px;margin:0}.meta{color:var(--muted)}.badge{border:1px solid var(--line);border-radius:999px;padding:3px 9px}.tabs{display:flex;gap:6px;margin-left:auto}.tabs button,.filters button,.download{border:1px solid var(--line);background:var(--panel);color:var(--text);border-radius:7px;padding:7px 10px;cursor:pointer}.tabs button[aria-selected=true],.filters button.active{border-color:var(--accent);color:var(--accent)}main{padding:18px;max-width:1500px;margin:auto}.view{display:none}.view.active{display:block}.grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(280px,1fr);gap:16px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;min-width:0}.panel h2{font-size:15px;margin:0 0 12px}.graph-scroll{overflow:auto;min-height:480px}svg{min-width:900px;width:100%;height:620px}.edge{stroke:var(--line);stroke-width:2}.edge.control{stroke:var(--control);stroke-dasharray:7 5}.edge.depends{stroke:var(--accent)}.node rect{fill:var(--panel);stroke:var(--line);stroke-width:2;rx:10}.node.current rect{stroke:var(--accent);stroke-width:4}.node.failed rect{stroke:var(--bad)}.node.accepted rect{stroke:var(--good)}.node.waiting rect{stroke:var(--wait)}.node text{fill:var(--text);pointer-events:none}.node{cursor:pointer}.node:focus rect{outline:none;stroke:var(--accent);stroke-width:4}.legend{display:flex;gap:14px;color:var(--muted);flex-wrap:wrap}.swatch{display:inline-block;width:26px;border-top:3px solid var(--accent);vertical-align:middle;margin-right:5px}.swatch.control{border-color:var(--control);border-top-style:dashed}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:color-mix(in srgb,var(--bg) 75%,var(--panel));padding:12px;border-radius:8px;max-height:520px;overflow:auto}.timeline{display:grid;gap:7px}.event{border-left:3px solid var(--line);padding:8px 10px;background:var(--panel);border-radius:0 8px 8px 0}.event.side_effect{border-color:var(--control)}.event.recovery{border-color:var(--wait)}.event.graph{border-color:var(--accent)}.event small{color:var(--muted)}.filters{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}.token-row{display:grid;grid-template-columns:180px 1fr 90px;gap:8px;align-items:center;margin:8px 0}.bar{height:12px;background:var(--line);border-radius:6px;overflow:hidden}.bar i{display:block;height:100%;background:var(--accent)}.artifact-list{display:grid;gap:6px}.artifact-list a{color:var(--accent)}.empty{color:var(--muted)}@media(max-width:850px){.grid{grid-template-columns:1fr}.tabs{order:3;width:100%;overflow:auto}main{padding:10px}}
   </style>
 </head>
-<body><header><h1>Graphcraft</h1><span id="run-meta" class="meta">Loading durable state…</span><span id="status" class="badge"></span><nav class="tabs" aria-label="Viewer sections"><button aria-selected="true" data-view="graph">Graph</button><button aria-selected="false" data-view="timeline">Timeline</button><button aria-selected="false" data-view="revisions">Revisions</button><button aria-selected="false" data-view="tokens">Tokens</button><button aria-selected="false" data-view="artifacts">Artifacts</button></nav></header>
+<body><header><h1>Graphcraft</h1><span id="run-meta" class="meta">Loading durable state…</span><span id="status" class="badge"></span><nav class="tabs" aria-label="Viewer sections"><button aria-selected="true" data-view="graph">Graph</button><button aria-selected="false" data-view="timeline">Timeline</button><button aria-selected="false" data-view="revisions">Revisions</button><button aria-selected="false" data-view="instructions">Instructions</button><button aria-selected="false" data-view="tokens">Tokens</button><button aria-selected="false" data-view="artifacts">Artifacts</button></nav></header>
 <main><section id="graph" class="view active"><div class="grid"><div class="panel"><h2>Work and control graph</h2><div class="legend"><span><i class="swatch"></i>dependency</span><span><i class="swatch control"></i>control</span></div><div class="graph-scroll"><svg id="graph-svg" role="img" aria-label="Execution and governance graph"></svg></div></div><aside class="panel"><h2>Node evidence</h2><pre id="node-detail" tabindex="0">Select a node. Arrow keys move between nodes.</pre></aside></div></section>
 <section id="timeline" class="view"><div class="panel"><h2>Durable event timeline</h2><div id="filters" class="filters"></div><div id="event-list" class="timeline"></div></div></section>
 <section id="revisions" class="view"><div class="panel"><h2>Graph revisions</h2><div id="revision-list"></div></div></section>
+<section id="instructions" class="view"><div class="panel"><h2>Pinned repository instructions</h2><p id="instruction-summary" class="meta"></p><div id="instruction-list"></div></div></section>
 <section id="tokens" class="view"><div class="panel"><h2>Token cost by phase</h2><div id="token-list"></div></div></section>
 <section id="artifacts" class="view"><div class="panel"><h2>Local artifacts</h2><p class="meta">Redacted before bounded storage. Source, stored, and omitted byte counts come from the durable artifact inventory.</p><div id="artifact-summary" class="meta"></div><div id="artifact-list" class="artifact-list"></div><p><a class="download" href="/api/export" download="graphcraft-run-report.json">Export redacted run report</a></p></div></section></main>
 <script>
@@ -315,9 +365,10 @@ function renderGraph(){const svg=$('graph-svg');svg.textContent='';const nodes=[
 function selectNode(id){selected=id;const n=snapshot.nodes.find(n=>n.id===id)||snapshot.anchors.find(n=>n.id===id);$('node-detail').textContent=JSON.stringify(n,null,2)}
 function renderTimeline(){const categories=['all',...new Set(snapshot.timeline.map(e=>e.category))];$('filters').textContent='';categories.forEach(c=>{const b=document.createElement('button');b.textContent=c;b.className=c===filter?'active':'';b.onclick=()=>{filter=c;renderTimeline()};$('filters').append(b)});$('event-list').textContent='';snapshot.timeline.filter(e=>filter==='all'||e.category===filter).forEach(e=>{const d=document.createElement('div');d.className='event '+e.category;const title=document.createElement('div');title.textContent=e.sequence+'. '+e.type;const meta=document.createElement('small');meta.textContent=e.timestamp+' · '+e.actor;const pre=document.createElement('pre');pre.textContent=JSON.stringify(e.data,null,2);d.append(title,meta,pre);$('event-list').append(d)})}
 function renderRevisions(){const root=$('revision-list');root.textContent='';if(!snapshot.revisions.length){root.textContent='No amendments. Revision 1 is the approved graph.';root.className='empty';return}snapshot.revisions.forEach(r=>{const p=document.createElement('pre');p.textContent=JSON.stringify(r,null,2);root.append(p)})}
+function renderInstructions(){const root=$('instruction-list'),value=snapshot.repositoryInstructions;$('instruction-summary').textContent=value.state==='pinned'?'Pinned '+value.digest+' · '+value.count+' tracked file'+(value.count===1?'':'s'):'Legacy run without a pinned repository-instruction manifest.';root.textContent='';if(value.state!=='pinned'){root.className='empty';return}root.className='';if(!value.manifest.entries.length){root.textContent='The pinned manifest is empty.';root.className='empty';return}value.manifest.entries.forEach(entry=>{const p=document.createElement('pre');p.textContent=JSON.stringify({path:entry.path,sources:entry.sources,scopes:entry.scopes,gitMode:entry.gitMode,workingKind:entry.workingKind,workingMode:entry.workingMode,linkTarget:entry.linkTarget,importedBy:entry.importedBy,contentHash:entry.contentHash},null,2);root.append(p)})}
 function renderTokens(){const root=$('token-list');root.textContent='';const report=snapshot.tokenReport||{};const groups=[['Cumulative',{all:report.totals||{}}],['By phase',report.byPhase||{}],['By node',report.byNode||{}]];const all=groups.flatMap(([,rows])=>Object.values(rows));const max=Math.max(1,...all.map(v=>v.total||0));if(!report.receipts){root.textContent='No token receipts.';root.className='empty';return}groups.forEach(([heading,rows])=>{const h=document.createElement('h3');h.textContent=heading;root.append(h);Object.entries(rows).forEach(([name,value])=>{const row=document.createElement('div');row.className='token-row';const label=document.createElement('span');label.textContent=name;const bar=document.createElement('div');bar.className='bar';const fill=document.createElement('i');fill.style.width=100*(value.total||0)/max+'%';bar.append(fill);const number=document.createElement('code');number.textContent='cached '+(value.cachedInput||0)+' · uncached '+(value.uncachedInput||0)+' · output '+(value.output||0)+' · reasoning '+(value.reasoning||0)+' · total '+(value.total||0);row.append(label,bar,number);root.append(row)})})}
 function renderArtifacts(){const root=$('artifact-list'),inventory=snapshot.artifactInventory;$('artifact-summary').textContent=inventory?'Stored '+inventory.storedBytes+' of '+inventory.sourceBytes+' source bytes; '+inventory.omittedBytes+' omitted.':'';root.textContent='';if(!snapshot.artifacts.length){root.textContent='No artifacts.';root.className='empty';return}snapshot.artifacts.forEach(a=>{const item=a.href?document.createElement('a'):document.createElement('span');if(a.href){item.href=a.href;item.target='_blank';item.rel='noopener'}const omitted=a.omittedBytes?' · '+a.omittedBytes+' omitted':'';item.textContent=a.path+' ('+a.storedBytes+'/'+a.sourceBytes+' bytes'+omitted+(a.reason?' · '+a.reason:'')+')';root.append(item)})}
-function render(){const r=snapshot.run;$('run-meta').textContent=r.task+' · '+r.finishLine+' · '+r.id;$('status').textContent=r.status;renderGraph();renderTimeline();renderRevisions();renderTokens();renderArtifacts()}
+function render(){const r=snapshot.run;$('run-meta').textContent=r.task+' · '+r.finishLine+' · '+r.id;$('status').textContent=r.status;renderGraph();renderTimeline();renderRevisions();renderInstructions();renderTokens();renderArtifacts()}
 async function refresh(){try{const response=await fetch('/api/snapshot',{cache:'no-store'});if(!response.ok)throw new Error(await response.text());const next=await response.json();const changed=!snapshot||snapshot.run.updatedAt!==next.run.updatedAt||snapshot.timeline.length!==next.timeline.length;snapshot=next;if(changed)render()}catch(error){$('run-meta').textContent='Viewer refresh failed: '+error.message}}
 refresh();setInterval(refresh,1500);
 </script></body></html>`;
