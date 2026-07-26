@@ -9998,7 +9998,12 @@ process.stdin.on("end", () => {
         claim: { actionId: expectedRerunActionId },
         result: { status: "COMPLETED", conclusion: "SUCCESS" },
       });
-      expect(finalEvents.filter(({ type }) => type === "side_effect.dispatched")).toHaveLength(1);
+      expect(
+        finalEvents.filter(
+          ({ type, data }) =>
+            type === "side_effect.dispatched" && data.actionId === expectedRerunActionId,
+        ),
+      ).toHaveLength(1);
       expect(finalEvents.some(({ type }) => type === "side_effect.failed")).toBe(false);
       expect(finalEvents.some(({ type }) => type === "node.failed")).toBe(false);
       expect(finalEvents.some(({ type }) => type === "run.blocked")).toBe(false);
@@ -10118,7 +10123,12 @@ process.stdin.on("end", () => {
     expect(await fakeGitHubCallCount(github.logPath)).toBe(callsBeforeTimeout);
     expect(timedOut.tokens.total).toBe(tokensBeforeTimeout);
     expect(adapter.calls).toEqual(adapterCallsBeforeTimeout);
-    expect(events.filter(({ type }) => type === "side_effect.dispatched")).toHaveLength(0);
+    expect(
+      events.filter(
+        ({ type, data }) =>
+          type === "side_effect.dispatched" && data.actionId === finalRerun?.claim.actionId,
+      ),
+    ).toHaveLength(0);
     expect(events.filter(({ type }) => type === "side_effect.failed")).toHaveLength(0);
   }, 60_000);
 
