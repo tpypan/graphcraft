@@ -192,6 +192,40 @@ describe("generated migration properties", () => {
 });
 
 describe("generated side-effect protocol properties", () => {
+  it("rejects an unsafe retry policy before claiming an at-most-once action", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-generated-dispatch-policy-"));
+    roots.push(root);
+    const nodeId = "rerun";
+    const { contract, graph } = sideEffectGraph(root, [nodeId]);
+    const store = await RunStore.create(root, contract, graph);
+    const claim: SideEffectClaim = {
+      schemaVersion: 1,
+      actionId: contentHash({ protocol: "generated-dispatch-policy" }),
+      idempotencyKey: "generated-dispatch-policy",
+      nodeId,
+      kind: "github_check_rerun",
+      target: "fixture-check",
+      precondition: {},
+      claimedAt: "2026-07-26T12:00:00.000Z",
+    };
+    let acted = false;
+
+    await expect(
+      executeSideEffect({
+        store,
+        claim,
+        reconcile: async () => ({ status: "not_applied", evidence: [] }),
+        act: async () => {
+          acted = true;
+          return {};
+        },
+        dispatchPolicy: "reconcile_then_retry",
+      }),
+    ).rejects.toThrow("github_check_rerun side effects require the at_most_once dispatch policy");
+    expect(acted).toBe(false);
+    expect((await store.loadState()).sideEffects).toHaveLength(0);
+  });
+
   it("confirms and accepts each generated action once across every interruption boundary", async () => {
     const boundaries: SideEffectBoundary[] = [
       "before_claim",
@@ -199,6 +233,7 @@ describe("generated side-effect protocol properties", () => {
       "after_precondition_reconcile",
       "before_act",
       "after_action_prepare",
+      "after_action_dispatch",
       "after_action_command",
       "after_act",
       "after_confirmation_reconcile",
@@ -245,13 +280,15 @@ describe("generated side-effect protocol properties", () => {
                 evidence: [`observed-${index}`],
               }
             : { status: "not_applied" as const, evidence: [`absent-${index}`] },
-        act: async () => {
+        act: async (__: SideEffectClaim, markDispatched: () => Promise<void>) => {
           await crossSideEffectBoundary(boundary, "after_action_prepare");
+          await markDispatched();
           commandCalls += 1;
           externallyApplied = true;
           await crossSideEffectBoundary(boundary, "after_action_command");
           return { actionId };
         },
+        dispatchPolicy: "reconcile_then_retry" as const,
       };
 
       let completed = false;
@@ -293,6 +330,17 @@ describe("generated side-effect protocol properties", () => {
         ),
         interruption,
       ).toHaveLength(1);
+      expect(
+        events.filter(
+          ({ type, data }) => type === "side_effect.dispatched" && data.actionId === actionId,
+        ),
+        interruption,
+      ).toHaveLength(1);
+      expect(
+        state.sideEffects.find(({ claim: persisted }) => persisted.actionId === actionId)
+          ?.dispatchedAt,
+        interruption,
+      ).toEqual(expect.any(String));
       expect(
         events.filter(
           ({ type, data }) => type === "side_effect.confirmed" && data.actionId === actionId,

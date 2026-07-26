@@ -1063,6 +1063,7 @@ export async function performAtomicCommit(
   claim: SideEffectClaim,
   task: string,
   hashAlgorithm: CanonicalHashAlgorithm,
+  markDispatched: () => Promise<void>,
   boundary?: (point: SideEffectBoundary) => void | Promise<void>,
 ): Promise<Record<string, unknown>> {
   if (claim.kind !== "git_commit") throw new Error(`Side effect ${claim.actionId} is not a commit`);
@@ -1077,8 +1078,9 @@ export async function performAtomicCommit(
   const status = await git(workspace.path, ["status", "--porcelain=v1"]);
   if (!status) throw new Error("No accepted changes are available to commit");
   await git(workspace.path, ["add", "-A"]);
-  await crossSideEffectBoundary(boundary, "after_action_prepare");
   const summary = task.replace(/\s+/g, " ").slice(0, 64);
+  await crossSideEffectBoundary(boundary, "after_action_prepare");
+  await markDispatched();
   await git(workspace.path, [
     "commit",
     "-m",
@@ -1232,6 +1234,7 @@ export async function createAtomicPushClaim(
 export async function performAtomicPush(
   workspace: RunWorkspace,
   claim: SideEffectClaim,
+  markDispatched: () => Promise<void>,
   boundary?: (point: SideEffectBoundary) => void | Promise<void>,
 ): Promise<Record<string, unknown>> {
   if (claim.kind !== "git_push") throw new Error(`Side effect ${claim.actionId} is not a push`);
@@ -1245,6 +1248,7 @@ export async function performAtomicPush(
   )
     throw new Error(`Push precondition changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  await markDispatched();
   await gitRaw(workspace.path, [
     "push",
     "--porcelain",

@@ -11,11 +11,14 @@ export type SideEffectBoundary =
   | "after_precondition_reconcile"
   | "before_act"
   | "after_action_prepare"
+  | "after_action_dispatch"
   | "after_action_command"
   | "after_act"
   | "after_confirmation_reconcile"
   | "after_confirm"
   | "after_node_acceptance";
+
+export type SideEffectDispatchPolicy = "reconcile_then_retry" | "at_most_once";
 
 export type SideEffectReconciliation =
   | { status: "applied"; result: Record<string, unknown>; evidence: string[] }
@@ -29,11 +32,11 @@ export interface ExecuteSideEffectInput {
   reconcile: (claim: SideEffectClaim) => Promise<SideEffectReconciliation>;
   act: (
     claim: SideEffectClaim,
-    markDispatched?: () => Promise<void>,
+    markDispatched: () => Promise<void>,
   ) => Promise<Record<string, unknown>>;
+  dispatchPolicy: SideEffectDispatchPolicy;
   boundary?: (point: SideEffectBoundary) => void | Promise<void>;
   revalidateConfirmed?: boolean;
-  durableDispatch?: boolean;
   deferError?: (error: unknown) => boolean;
 }
 
@@ -123,12 +126,30 @@ async function confirm(
   return reconciliation.result;
 }
 
+function unobservableDisposition(
+  policy: SideEffectDispatchPolicy,
+  dispatched: boolean,
+  reconciliation: Exclude<SideEffectReconciliation, { status: "applied" }>,
+): { retryable: boolean; uncertain: boolean } {
+  const retryable =
+    reconciliation.status === "not_applied" && (!dispatched || policy === "reconcile_then_retry");
+  return { retryable, uncertain: !retryable };
+}
+
+function assertDispatchPolicy(claim: SideEffectClaim, policy: SideEffectDispatchPolicy): void {
+  const required = claim.kind === "github_check_rerun" ? "at_most_once" : "reconcile_then_retry";
+  if (policy !== required)
+    throw new Error(`${claim.kind} side effects require the ${required} dispatch policy`);
+}
+
 export async function executeSideEffect(
   input: ExecuteSideEffectInput,
 ): Promise<Record<string, unknown>> {
   const proposedClaim = SideEffectClaimSchema.parse(input.claim);
+  assertDispatchPolicy(proposedClaim, input.dispatchPolicy);
   let entry = journalEntry((await input.store.loadState()).sideEffects, proposedClaim.actionId);
   let claim = entry?.claim ?? proposedClaim;
+  assertDispatchPolicy(claim, input.dispatchPolicy);
   if (!entry) {
     await crossSideEffectBoundary(input.boundary, "before_claim");
     await input.store.append("runtime", "side_effect.claimed", { claim }, claim.actionId);
@@ -164,7 +185,7 @@ export async function executeSideEffect(
     );
     throw new Error(reason);
   }
-  if (input.durableDispatch && entry.dispatchedAt) {
+  if (input.dispatchPolicy === "at_most_once" && entry.dispatchedAt) {
     const reason = `The dispatched ${claim.kind} ${claim.actionId} is not yet observable; refusing a possibly duplicate retry`;
     await input.store.append(
       "runtime",
@@ -178,34 +199,41 @@ export async function executeSideEffect(
   await crossSideEffectBoundary(input.boundary, "before_act");
   await input.authorize?.();
   let dispatched = entry.dispatchedAt !== undefined;
-  const markDispatched = input.durableDispatch
-    ? async (): Promise<void> => {
-        if (dispatched) return;
-        await input.store.append(
-          "runtime",
-          "side_effect.dispatched",
-          { actionId: claim.actionId },
-          claim.actionId,
-        );
-        dispatched = true;
-      }
-    : undefined;
+  let markedThisAttempt = false;
+  const markDispatched = async (): Promise<void> => {
+    await input.authorize?.();
+    if (!dispatched) {
+      await input.store.append(
+        "runtime",
+        "side_effect.dispatched",
+        { actionId: claim.actionId },
+        claim.actionId,
+      );
+      dispatched = true;
+    }
+    markedThisAttempt = true;
+    await crossSideEffectBoundary(input.boundary, "after_action_dispatch");
+  };
   try {
     await input.act(claim, markDispatched);
   } catch (error) {
     if (error instanceof SideEffectBoundaryInterruption) throw error;
-    if (!dispatched && input.deferError?.(error)) throw error;
+    if (!markedThisAttempt && input.deferError?.(error)) throw error;
     const reason = error instanceof Error ? error.message : String(error);
     const afterFailure = await reconcileAndRecord(input, claim, "after_confirmation_reconcile");
     if (afterFailure.status === "applied") return await confirm(input, claim, afterFailure);
-    const uncertain = afterFailure.status === "unknown";
+    const { retryable, uncertain } = unobservableDisposition(
+      input.dispatchPolicy,
+      dispatched,
+      afterFailure,
+    );
     await input.store.append(
       "runtime",
       "side_effect.failed",
       {
         actionId: claim.actionId,
         reason,
-        retryable: !uncertain,
+        retryable,
         uncertain,
       },
       claim.actionId,
@@ -216,20 +244,20 @@ export async function executeSideEffect(
         : reason,
     );
   }
-  if (input.durableDispatch && !dispatched)
-    throw new Error(`Durable ${claim.kind} ${claim.actionId} acted without a dispatch checkpoint`);
+  if (!markedThisAttempt)
+    throw new Error(`${claim.kind} ${claim.actionId} acted without a dispatch checkpoint`);
   await crossSideEffectBoundary(input.boundary, "after_act");
 
   const after = await reconcileAndRecord(input, claim, "after_confirmation_reconcile");
   if (after.status === "applied") return await confirm(input, claim, after);
-  const uncertain = after.status === "unknown";
+  const { retryable, uncertain } = unobservableDisposition(input.dispatchPolicy, dispatched, after);
   const reason = uncertain
     ? `The outcome of ${claim.kind} ${claim.actionId} is uncertain after execution`
     : `${claim.kind} ${claim.actionId} was not observable after execution`;
   await input.store.append(
     "runtime",
     "side_effect.failed",
-    { actionId: claim.actionId, reason, retryable: !uncertain, uncertain },
+    { actionId: claim.actionId, reason, retryable, uncertain },
     claim.actionId,
   );
   throw new Error(reason);

@@ -5545,20 +5545,23 @@ export async function executeRun(input: {
           const result = await executeSideEffect({
             store: input.store,
             claim: proposedClaim,
+            authorize: authorizeWorkspace,
             reconcile: async (claim) =>
               await reconcileAtomicCommit(
                 workspace,
                 claim,
                 input.store.repositorySideEffectIdentityHashAlgorithm,
               ),
-            act: async (claim) =>
+            act: async (claim, markDispatched) =>
               await performAtomicCommit(
                 workspace,
                 claim,
                 contract.task,
                 input.store.repositorySideEffectIdentityHashAlgorithm,
+                markDispatched,
                 input.sideEffectBoundary,
               ),
+            dispatchPolicy: "reconcile_then_retry",
             ...(input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}),
           });
           await input.store.append("runtime", "node.accepted", {
@@ -5611,9 +5614,11 @@ export async function executeRun(input: {
           const result = await executeSideEffect({
             store: input.store,
             claim: proposedClaim,
+            authorize: authorizeWorkspace,
             reconcile: async (claim) => await reconcileAtomicPush(workspace, claim),
-            act: async (claim) =>
-              await performAtomicPush(workspace, claim, input.sideEffectBoundary),
+            act: async (claim, markDispatched) =>
+              await performAtomicPush(workspace, claim, markDispatched, input.sideEffectBoundary),
+            dispatchPolicy: "reconcile_then_retry",
             revalidateConfirmed: true,
             ...(input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}),
           });
@@ -5683,14 +5688,16 @@ export async function executeRun(input: {
                 input.store.githubMutationLifecycleIdentityHashAlgorithm,
                 input.github,
               ),
-            act: async (claim) =>
+            act: async (claim, markDispatched) =>
               await performPullRequestCreation(
                 workspace,
                 claim,
                 input.store.githubMutationLifecycleIdentityHashAlgorithm,
+                markDispatched,
                 input.github,
                 input.sideEffectBoundary,
               ),
+            dispatchPolicy: "reconcile_then_retry",
             revalidateConfirmed: true,
             ...(input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}),
           });

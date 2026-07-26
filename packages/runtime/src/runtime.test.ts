@@ -53,6 +53,7 @@ import type {
   RunEvent,
   SemanticVerificationRequest,
   SemanticVerificationResult,
+  SideEffectKind,
   TokenUsage,
   WaitCondition,
   WorkerRequest,
@@ -110,10 +111,28 @@ const storageFixturesRoot = fileURLToPath(new URL("./fixtures/storage", import.m
 const atomicCommitMatrixTimeout =
   process.platform === "win32" ? 300_000 : process.platform === "darwin" ? 120_000 : 60_000;
 const pushMatrixTimeout = process.platform === "win32" ? 300_000 : 120_000;
-const checkRerunMatrixTimeout = process.platform === "win32" ? 600_000 : 180_000;
+const checkRerunMatrixTimeout = process.platform === "win32" ? 600_000 : 240_000;
 const pullRequestCreateMatrixTimeout = process.platform === "win32" ? 300_000 : 180_000;
 const interruptionClassificationTimeout = process.platform === "win32" ? 60_000 : 30_000;
 const githubRepairTimeout = process.platform === "win32" ? 60_000 : 30_000;
+
+async function expectUndispatchedSideEffect(
+  store: RunStore,
+  kind: SideEffectKind,
+  label: string,
+): Promise<void> {
+  const [state, events] = await Promise.all([store.loadState(), store.loadEvents()]);
+  const entry = state.sideEffects.find(({ claim }) => claim.kind === kind);
+  expect(entry, label).toBeDefined();
+  expect(entry, label).not.toHaveProperty("dispatchedAt");
+  expect(
+    events.filter(
+      ({ type, data }) =>
+        type === "side_effect.dispatched" && data.actionId === entry?.claim.actionId,
+    ),
+    label,
+  ).toHaveLength(0);
+}
 
 function reportedUsage(
   input: number,
@@ -6923,6 +6942,7 @@ process.stdin.on("end", () => {
     expect(sideEffectEvents.map(({ type }) => type)).toEqual([
       "side_effect.claimed",
       "side_effect.reconciled",
+      "side_effect.dispatched",
       "side_effect.reconciled",
       "side_effect.confirmed",
     ]);
@@ -6935,6 +6955,7 @@ process.stdin.on("end", () => {
       "after_precondition_reconcile",
       "before_act",
       "after_action_prepare",
+      "after_action_dispatch",
       "after_action_command",
       "after_act",
       "after_confirmation_reconcile",
@@ -6968,6 +6989,8 @@ process.stdin.on("end", () => {
         faultPoint,
       ).rejects.toThrow(`Side-effect execution interrupted after ${faultPoint}`);
       expect(armed, faultPoint).toBe(false);
+      if (faultPoint === "after_action_prepare")
+        await expectUndispatchedSideEffect(created.store, "git_commit", faultPoint);
 
       const completed = await executeRun({ store: created.store, adapter });
       const workspace = await created.store.loadWorkspace<{ path: string }>();
@@ -6982,6 +7005,7 @@ process.stdin.on("end", () => {
       expect(completed.sideEffects, faultPoint).toHaveLength(1);
       expect(completed.sideEffects[0], faultPoint).toMatchObject({
         status: "confirmed",
+        dispatchedAt: expect.any(String),
         claim: { kind: "git_commit", nodeId: "commit" },
       });
       expect(commitCount.trim(), faultPoint).toBe("1");
@@ -6991,6 +7015,14 @@ process.stdin.on("end", () => {
       ).toHaveLength(1);
       expect(
         events.filter(({ type }) => type === "side_effect.claimed"),
+        faultPoint,
+      ).toHaveLength(1);
+      expect(
+        events.filter(
+          ({ type, data }) =>
+            type === "side_effect.dispatched" &&
+            data.actionId === completed.sideEffects[0]?.claim.actionId,
+        ),
         faultPoint,
       ).toHaveLength(1);
       expect(
@@ -7270,6 +7302,7 @@ process.stdin.on("end", () => {
       "after_precondition_reconcile",
       "before_act",
       "after_action_prepare",
+      "after_action_dispatch",
       "after_action_command",
       "after_act",
       "after_confirmation_reconcile",
@@ -7312,6 +7345,8 @@ process.stdin.on("end", () => {
         faultPoint,
       ).rejects.toThrow(`Side-effect execution interrupted after ${faultPoint}`);
       expect(armed, faultPoint).toBe(false);
+      if (faultPoint === "after_action_prepare")
+        await expectUndispatchedSideEffect(created.store, "git_push", faultPoint);
 
       const completed = await executeRun({
         store: created.store,
@@ -7334,12 +7369,21 @@ process.stdin.on("end", () => {
       expect(
         completed.sideEffects.filter(({ claim }) => claim.kind === "git_push"),
         faultPoint,
-      ).toMatchObject([{ status: "confirmed" }]);
+      ).toMatchObject([{ status: "confirmed", dispatchedAt: expect.any(String) }]);
       expect(
         events.filter(
           ({ type, data }) =>
             type === "side_effect.claimed" &&
             (data.claim as { kind?: string } | undefined)?.kind === "git_push",
+        ),
+        faultPoint,
+      ).toHaveLength(1);
+      expect(
+        events.filter(
+          ({ type, data }) =>
+            type === "side_effect.dispatched" &&
+            data.actionId ===
+              completed.sideEffects.find(({ claim }) => claim.kind === "git_push")?.claim.actionId,
         ),
         faultPoint,
       ).toHaveLength(1);
@@ -9381,6 +9425,7 @@ process.stdin.on("end", () => {
         "after_precondition_reconcile",
         "before_act",
         "after_action_prepare",
+        "after_action_dispatch",
         "after_action_command",
         "after_act",
         "after_confirmation_reconcile",
@@ -9443,6 +9488,12 @@ process.stdin.on("end", () => {
             `${actionKind}:${faultPoint}`,
           ).rejects.toThrow(`Side-effect execution interrupted after ${faultPoint}`);
           expect(armed, `${actionKind}:${faultPoint}`).toBe(false);
+          if (faultPoint === "after_action_prepare")
+            await expectUndispatchedSideEffect(
+              created.store,
+              actionKind,
+              `${actionKind}:${faultPoint}`,
+            );
 
           const completed = await executeRun({
             store: created.store,
@@ -9468,12 +9519,22 @@ process.stdin.on("end", () => {
           expect(
             completed.sideEffects.filter(({ claim }) => claim.kind === actionKind),
             `${actionKind}:${faultPoint}`,
-          ).toMatchObject([{ status: "confirmed" }]);
+          ).toMatchObject([{ status: "confirmed", dispatchedAt: expect.any(String) }]);
           expect(
             events.filter(
               ({ type, data }) =>
                 type === "side_effect.claimed" &&
                 (data.claim as { kind?: string } | undefined)?.kind === actionKind,
+            ),
+            `${actionKind}:${faultPoint}`,
+          ).toHaveLength(1);
+          expect(
+            events.filter(
+              ({ type, data }) =>
+                type === "side_effect.dispatched" &&
+                data.actionId ===
+                  completed.sideEffects.find(({ claim }) => claim.kind === actionKind)?.claim
+                    .actionId,
             ),
             `${actionKind}:${faultPoint}`,
           ).toHaveLength(1);
@@ -10068,6 +10129,7 @@ process.stdin.on("end", () => {
       "after_precondition_reconcile",
       "before_act",
       "after_action_prepare",
+      "after_action_dispatch",
       "after_action_command",
       "after_act",
       "after_confirmation_reconcile",
@@ -10123,6 +10185,8 @@ process.stdin.on("end", () => {
         faultPoint,
       ).rejects.toThrow(`Side-effect execution interrupted after ${faultPoint}`);
       expect(armed, faultPoint).toBe(false);
+      if (faultPoint === "after_action_prepare")
+        await expectUndispatchedSideEffect(created.store, "github_check_rerun", faultPoint);
 
       const resumed = await executeRun({
         store: created.store,
@@ -10134,8 +10198,9 @@ process.stdin.on("end", () => {
         rerunCalls: number;
       };
       const reruns = resumed.sideEffects.filter(({ claim }) => claim.kind === "github_check_rerun");
+      const events = await created.store.loadEvents();
 
-      if (faultPoint === "after_action_prepare") {
+      if (faultPoint === "after_action_dispatch") {
         expect(resumed.status, faultPoint).toBe("blocked");
         expect(resumed.stopReason, faultPoint).toContain("possibly duplicate retry");
         expect(persisted.rerunCalls, faultPoint).toBe(0);
@@ -10145,8 +10210,17 @@ process.stdin.on("end", () => {
       } else {
         expect(resumed.status, faultPoint).toBe("completed");
         expect(persisted.rerunCalls, faultPoint).toBe(1);
-        expect(reruns, faultPoint).toMatchObject([{ status: "confirmed" }]);
+        expect(reruns, faultPoint).toMatchObject([
+          { status: "confirmed", dispatchedAt: expect.any(String) },
+        ]);
       }
+      expect(
+        events.filter(
+          ({ type, data }) =>
+            type === "side_effect.dispatched" && data.actionId === reruns[0]?.claim.actionId,
+        ),
+        faultPoint,
+      ).toHaveLength(1);
       expect(adapter.calls, faultPoint).toEqual(["implement"]);
     }
   };
@@ -10240,6 +10314,7 @@ process.stdin.on("end", () => {
       "after_precondition_reconcile",
       "before_act",
       "after_action_prepare",
+      "after_action_dispatch",
       "after_action_command",
       "after_act",
       "after_confirmation_reconcile",
@@ -10284,6 +10359,8 @@ process.stdin.on("end", () => {
         faultPoint,
       ).rejects.toThrow(`Side-effect execution interrupted after ${faultPoint}`);
       expect(armed, faultPoint).toBe(false);
+      if (faultPoint === "after_action_prepare")
+        await expectUndispatchedSideEffect(created.store, "github_pr_create", faultPoint);
 
       const completed = await executeRun({
         store: created.store,
@@ -10303,12 +10380,28 @@ process.stdin.on("end", () => {
       expect(
         completed.sideEffects.filter(({ claim }) => claim.kind === "github_pr_create"),
         faultPoint,
-      ).toMatchObject([{ status: "confirmed", result: { state: "OPEN" } }]);
+      ).toMatchObject([
+        {
+          status: "confirmed",
+          dispatchedAt: expect.any(String),
+          result: { state: "OPEN" },
+        },
+      ]);
       expect(
         events.filter(
           ({ type, data }) =>
             type === "side_effect.claimed" &&
             (data.claim as { kind?: string } | undefined)?.kind === "github_pr_create",
+        ),
+        faultPoint,
+      ).toHaveLength(1);
+      expect(
+        events.filter(
+          ({ type, data }) =>
+            type === "side_effect.dispatched" &&
+            data.actionId ===
+              completed.sideEffects.find(({ claim }) => claim.kind === "github_pr_create")?.claim
+                .actionId,
         ),
         faultPoint,
       ).toHaveLength(1);

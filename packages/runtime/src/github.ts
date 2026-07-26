@@ -415,6 +415,7 @@ export async function performPullRequestCreation(
   workspace: RunWorkspace,
   claim: SideEffectClaim,
   hashAlgorithm: CanonicalHashAlgorithm,
+  markDispatched: () => Promise<void>,
   options: GitHubExecutionOptions = {},
   boundary?: (point: SideEffectBoundary) => void | Promise<void>,
 ): Promise<Record<string, unknown>> {
@@ -433,6 +434,7 @@ export async function performPullRequestCreation(
   if (contentHash(body, hashAlgorithm) !== expected.bodyHash)
     throw new Error(`Pull-request body changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  await markDispatched();
   await createGitHubPullRequest(commandOptions(workspace, options), {
     nameWithOwner: expected.nameWithOwner,
     headRefName: expected.headRefName,
@@ -1058,6 +1060,7 @@ async function performReviewReply(
   claim: SideEffectClaim,
   hashAlgorithm: CanonicalHashAlgorithm,
   options: GitHubExecutionOptions,
+  markDispatched: () => Promise<void>,
   boundary?: (point: SideEffectBoundary) => void | Promise<void>,
 ): Promise<Record<string, unknown>> {
   const expected = reviewReplyPrecondition(claim);
@@ -1081,6 +1084,7 @@ async function performReviewReply(
   if (contentHash(body, hashAlgorithm) !== expected.replyBodyHash)
     throw new Error(`Review reply body changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  await markDispatched();
   const reply = await addGitHubReviewThreadReply(commandOptions(workspace, options), {
     host: expected.host,
     threadId: expected.threadId,
@@ -1191,6 +1195,7 @@ async function performReviewResolution(
   claim: SideEffectClaim,
   hashAlgorithm: CanonicalHashAlgorithm,
   options: GitHubExecutionOptions,
+  markDispatched: () => Promise<void>,
   boundary?: (point: SideEffectBoundary) => void | Promise<void>,
 ): Promise<Record<string, unknown>> {
   const expected = reviewResolutionPrecondition(claim);
@@ -1208,6 +1213,7 @@ async function performReviewResolution(
   if (!reply || thread.isResolved || thread.comments.at(-1)?.id !== reply.id)
     throw new Error(`Review thread ${expected.threadId} is not ready for resolution`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  await markDispatched();
   const resolved = await resolveGitHubReviewThread(commandOptions(workspace, options), {
     host: expected.host,
     threadId: expected.threadId,
@@ -1393,7 +1399,7 @@ async function performCheckRerun(
   claim: SideEffectClaim,
   hashAlgorithm: CanonicalHashAlgorithm,
   options: GitHubExecutionOptions,
-  markDispatched?: () => Promise<void>,
+  markDispatched: () => Promise<void>,
   boundary?: (point: SideEffectBoundary) => void | Promise<void>,
 ): Promise<Record<string, unknown>> {
   const expected = checkRerunPrecondition(claim);
@@ -1407,8 +1413,8 @@ async function performCheckRerun(
     (check.conclusion ?? null) !== expected.checkConclusion
   )
     throw new Error(`Check run ${expected.checkId} moved before rerun`);
-  await markDispatched?.();
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  await markDispatched();
   await rerequestGitHubCheckRun(commandOptions(workspace, options), {
     host: expected.host,
     nameWithOwner: expected.nameWithOwner,
@@ -1494,7 +1500,7 @@ export async function rerunLifecycleChecks(input: {
           markDispatched,
           input.boundary,
         ),
-      durableDispatch: true,
+      dispatchPolicy: "at_most_once",
       deferError: (error) => error instanceof GitHubLifecycleConsistencyError,
       ...(input.boundary ? { boundary: input.boundary } : {}),
     });
@@ -1559,8 +1565,16 @@ export async function reconcileReviewThreadActions(input: {
       ...(input.authorizeWorkspace ? { authorize: input.authorizeWorkspace } : {}),
       reconcile: async (claim) =>
         await reconcileReviewReply(input.workspace, claim, hashAlgorithm, options),
-      act: async (claim) =>
-        await performReviewReply(input.workspace, claim, hashAlgorithm, options, input.boundary),
+      act: async (claim, markDispatched) =>
+        await performReviewReply(
+          input.workspace,
+          claim,
+          hashAlgorithm,
+          options,
+          markDispatched,
+          input.boundary,
+        ),
+      dispatchPolicy: "reconcile_then_retry",
       revalidateConfirmed: true,
       ...(input.boundary ? { boundary: input.boundary } : {}),
     });
@@ -1588,14 +1602,16 @@ export async function reconcileReviewThreadActions(input: {
       ...(input.authorizeWorkspace ? { authorize: input.authorizeWorkspace } : {}),
       reconcile: async (claim) =>
         await reconcileReviewResolution(input.workspace, claim, hashAlgorithm, options),
-      act: async (claim) =>
+      act: async (claim, markDispatched) =>
         await performReviewResolution(
           input.workspace,
           claim,
           hashAlgorithm,
           options,
+          markDispatched,
           input.boundary,
         ),
+      dispatchPolicy: "reconcile_then_retry",
       revalidateConfirmed: true,
       ...(input.boundary ? { boundary: input.boundary } : {}),
     });
@@ -1646,6 +1662,7 @@ export async function reconcilePendingGitHubActions(input: {
             claim,
             hashAlgorithm,
             options,
+            markDispatched,
             input.boundary,
           );
         if (claim.kind === "github_review_thread_resolve")
@@ -1654,6 +1671,7 @@ export async function reconcilePendingGitHubActions(input: {
             claim,
             hashAlgorithm,
             options,
+            markDispatched,
             input.boundary,
           );
         return await performCheckRerun(
@@ -1665,8 +1683,9 @@ export async function reconcilePendingGitHubActions(input: {
           input.boundary,
         );
       },
+      dispatchPolicy:
+        entry.claim.kind === "github_check_rerun" ? "at_most_once" : "reconcile_then_retry",
       revalidateConfirmed: true,
-      ...(entry.claim.kind === "github_check_rerun" ? { durableDispatch: true } : {}),
       ...(entry.claim.kind === "github_check_rerun"
         ? {
             deferError: (error: unknown) => error instanceof GitHubLifecycleConsistencyError,
