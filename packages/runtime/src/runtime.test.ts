@@ -214,7 +214,14 @@ async function waitForAbort(signal: AbortSignal): Promise<void> {
 
 afterEach(async () => {
   await Promise.all(
-    temporaryRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })),
+    temporaryRoots.splice(0).map((path) =>
+      rm(path, {
+        recursive: true,
+        force: true,
+        maxRetries: process.platform === "win32" ? 5 : 0,
+        retryDelay: 100,
+      }),
+    ),
   );
 });
 
@@ -231,6 +238,7 @@ async function createRepository(
   const repository = join(root, repositoryName);
   await mkdir(repository);
   await git(repository, "init", "-b", "main");
+  await git(repository, "config", "--local", "core.autocrlf", "false");
   await git(repository, "config", "user.name", "Graphcraft Test");
   await git(repository, "config", "user.email", "graphcraft@example.test");
   await git(repository, "config", "commit.gpgSign", "false");
@@ -1231,18 +1239,23 @@ class WaitSatisfactionFaultStore extends RunStore {
   }
 }
 
-type InvocationFaultPoint =
-  | "node.started"
-  | "invocation.started"
-  | "host.started"
-  | "host.session"
-  | "invocation.session"
-  | "host.usage"
-  | "tokens.recorded"
-  | "host.result"
-  | "invocation.finished"
-  | "node.progress"
-  | "node.accepted";
+const invocationFaultPoints = [
+  "node.started",
+  "invocation.started",
+  "host.started",
+  "host.session",
+  "invocation.session",
+  "host.usage",
+  "tokens.recorded",
+  "host.result",
+  "invocation.finished",
+  "node.progress",
+  "node.accepted",
+] as const;
+type InvocationFaultPoint = (typeof invocationFaultPoints)[number];
+const invocationRecoveryCases = (["codex", "claude"] as const).flatMap((adapterId) =>
+  invocationFaultPoints.map((faultPoint) => [adapterId, faultPoint] as const),
+);
 
 class FaultInjectingRunStore extends RunStore {
   private armed = true;
@@ -3175,7 +3188,7 @@ process.stdin.on("end", () => {
     await mkdir(rules, { recursive: true });
     await Promise.all(
       Array.from({ length: 32 }, async (_, index) => {
-        const name = `${String(index).padStart(2, "0")}-${"p".repeat(225)}.md`;
+        const name = `${String(index).padStart(2, "0")}-${"p".repeat(64)}.md`;
         await writeFile(join(rules, name), `Rule ${String(index)}.\n`);
       }),
     );
@@ -12438,126 +12451,102 @@ if (args.length === blocked.length && blocked.every((value, index) => args[index
     expect(adapter.closedNodes).toContain("implement");
   });
 
-  it(
-    "recovers across the complete durable invocation fault matrix on both host identities",
-    async () => {
-      const faultPoints: InvocationFaultPoint[] = [
-        "node.started",
-        "invocation.started",
-        "host.started",
-        "host.session",
-        "invocation.session",
-        "host.usage",
-        "tokens.recorded",
-        "host.result",
-        "invocation.finished",
-        "node.progress",
-        "node.accepted",
-      ];
+  it.each(invocationRecoveryCases)(
+    "recovers a durable invocation for the %s host after %s",
+    async (adapterId, faultPoint) => {
+      const repository = await createRepository();
+      const adapter = new FakeAdapter(
+        async (request) => {
+          if (request.capsule.nodeId === "implement")
+            await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
+        },
+        true,
+        undefined,
+        undefined,
+        adapterId,
+      );
+      const created = await createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+        planner: adapter,
+      });
+      const faultStore = new FaultInjectingRunStore(created.store, faultPoint);
 
-      for (const adapterId of ["codex", "claude"] as const) {
-        for (const faultPoint of faultPoints) {
-          const repository = await createRepository();
-          const adapter = new FakeAdapter(
-            async (request) => {
-              if (request.capsule.nodeId === "implement")
-                await writeFile(join(request.repositoryPath, "feature.txt"), "implemented\n");
-            },
-            true,
-            undefined,
-            undefined,
-            adapterId,
-          );
-          const created = await createRun("Implement a substantial feature across the fixture", {
-            cwd: repository,
-            planner: adapter,
-          });
-          const faultStore = new FaultInjectingRunStore(created.store, faultPoint);
+      await expect(
+        executeRun({ store: faultStore, adapter, approve: true }),
+        `${adapterId} at ${faultPoint}`,
+      ).rejects.toThrow(`Injected process termination after ${faultPoint}`);
+      expect(faultStore.injected, `${adapterId} at ${faultPoint}`).toBe(true);
 
-          await expect(
-            executeRun({ store: faultStore, adapter, approve: true }),
-            `${adapterId} at ${faultPoint}`,
-          ).rejects.toThrow(`Injected process termination after ${faultPoint}`);
-          expect(faultStore.injected, `${adapterId} at ${faultPoint}`).toBe(true);
-
-          const stateAtCrash = await created.store.loadState();
-          const decisionsAtCrash = stateAtCrash.controlDecisions.map(
-            ({ decisionId }) => decisionId,
-          );
-          const implementationRequestsAtCrash = adapter.requests.filter(
-            ({ capsule }) => capsule.nodeId === "implement",
-          ).length;
-          const completed = await executeRun({ store: created.store, adapter });
-          const events = await created.store.loadEvents();
-          const implementationRequests = adapter.requests.filter(
-            ({ capsule }) => capsule.nodeId === "implement",
-          );
-          const implementationStarts = events.filter(
-            ({ type, data }) => type === "invocation.started" && data.nodeId === "implement",
-          );
-          const firstInvocationId = String(implementationStarts[0]?.data.invocationId ?? "");
-          const acceptanceCounts = new Map<string, number>();
-          for (const { type, data } of events) {
-            if (type !== "node.accepted") continue;
-            const nodeId = String(data.nodeId);
-            acceptanceCounts.set(nodeId, (acceptanceCounts.get(nodeId) ?? 0) + 1);
-          }
-
-          expect(completed.status, `${adapterId} at ${faultPoint}`).toBe("completed");
-          expect(acceptanceCounts.get("implement"), `${adapterId} at ${faultPoint}`).toBe(1);
-          expect(
-            [...acceptanceCounts.values()].every((count) => count === 1),
-            `${adapterId} at ${faultPoint}`,
-          ).toBe(true);
-          expect(
-            completed.controlDecisions.map(({ decisionId }) => decisionId),
-            `${adapterId} at ${faultPoint}`,
-          ).toEqual(expect.arrayContaining(decisionsAtCrash));
-
-          if (
-            ["host.session", "invocation.session", "host.usage", "tokens.recorded"].includes(
-              faultPoint,
-            )
-          ) {
-            expect(implementationRequests, `${adapterId} at ${faultPoint}`).toHaveLength(2);
-            expect(
-              implementationRequests[1]?.resumeSessionId,
-              `${adapterId} at ${faultPoint}`,
-            ).toBe(firstInvocationId);
-            expect(implementationRequests[1]?.invocationId, `${adapterId} at ${faultPoint}`).toBe(
-              firstInvocationId,
-            );
-          }
-
-          if (faultPoint === "invocation.started" || faultPoint === "host.started") {
-            expect(implementationStarts, `${adapterId} at ${faultPoint}`).toHaveLength(2);
-            expect(implementationRequests.at(-1)?.resumeSessionId).toBeUndefined();
-            expect(implementationRequests.length - implementationRequestsAtCrash).toBe(1);
-          }
-
-          if (
-            ["host.result", "invocation.finished", "node.progress", "node.accepted"].includes(
-              faultPoint,
-            )
-          )
-            expect(implementationRequests.length, `${adapterId} at ${faultPoint}`).toBe(
-              implementationRequestsAtCrash,
-            );
-
-          const recoveredUsage = events.filter(
-            ({ type, data, causationId }) =>
-              type === "tokens.recorded" &&
-              causationId === firstInvocationId &&
-              data.recovered === true,
-          );
-          if (faultPoint === "host.usage")
-            expect(recoveredUsage, `${adapterId} at ${faultPoint}`).toHaveLength(1);
-          if (faultPoint === "tokens.recorded")
-            expect(recoveredUsage, `${adapterId} at ${faultPoint}`).toHaveLength(0);
-        }
+      const stateAtCrash = await created.store.loadState();
+      const decisionsAtCrash = stateAtCrash.controlDecisions.map(({ decisionId }) => decisionId);
+      const implementationRequestsAtCrash = adapter.requests.filter(
+        ({ capsule }) => capsule.nodeId === "implement",
+      ).length;
+      const completed = await executeRun({ store: created.store, adapter });
+      const events = await created.store.loadEvents();
+      const implementationRequests = adapter.requests.filter(
+        ({ capsule }) => capsule.nodeId === "implement",
+      );
+      const implementationStarts = events.filter(
+        ({ type, data }) => type === "invocation.started" && data.nodeId === "implement",
+      );
+      const firstInvocationId = String(implementationStarts[0]?.data.invocationId ?? "");
+      const acceptanceCounts = new Map<string, number>();
+      for (const { type, data } of events) {
+        if (type !== "node.accepted") continue;
+        const nodeId = String(data.nodeId);
+        acceptanceCounts.set(nodeId, (acceptanceCounts.get(nodeId) ?? 0) + 1);
       }
+
+      expect(completed.status, `${adapterId} at ${faultPoint}`).toBe("completed");
+      expect(acceptanceCounts.get("implement"), `${adapterId} at ${faultPoint}`).toBe(1);
+      expect(
+        [...acceptanceCounts.values()].every((count) => count === 1),
+        `${adapterId} at ${faultPoint}`,
+      ).toBe(true);
+      expect(
+        completed.controlDecisions.map(({ decisionId }) => decisionId),
+        `${adapterId} at ${faultPoint}`,
+      ).toEqual(expect.arrayContaining(decisionsAtCrash));
+
+      if (
+        ["host.session", "invocation.session", "host.usage", "tokens.recorded"].includes(faultPoint)
+      ) {
+        expect(implementationRequests, `${adapterId} at ${faultPoint}`).toHaveLength(2);
+        expect(implementationRequests[1]?.resumeSessionId, `${adapterId} at ${faultPoint}`).toBe(
+          firstInvocationId,
+        );
+        expect(implementationRequests[1]?.invocationId, `${adapterId} at ${faultPoint}`).toBe(
+          firstInvocationId,
+        );
+      }
+
+      if (faultPoint === "invocation.started" || faultPoint === "host.started") {
+        expect(implementationStarts, `${adapterId} at ${faultPoint}`).toHaveLength(2);
+        expect(implementationRequests.at(-1)?.resumeSessionId).toBeUndefined();
+        expect(implementationRequests.length - implementationRequestsAtCrash).toBe(1);
+      }
+
+      if (
+        ["host.result", "invocation.finished", "node.progress", "node.accepted"].includes(
+          faultPoint,
+        )
+      )
+        expect(implementationRequests.length, `${adapterId} at ${faultPoint}`).toBe(
+          implementationRequestsAtCrash,
+        );
+
+      const recoveredUsage = events.filter(
+        ({ type, data, causationId }) =>
+          type === "tokens.recorded" &&
+          causationId === firstInvocationId &&
+          data.recovered === true,
+      );
+      if (faultPoint === "host.usage")
+        expect(recoveredUsage, `${adapterId} at ${faultPoint}`).toHaveLength(1);
+      if (faultPoint === "tokens.recorded")
+        expect(recoveredUsage, `${adapterId} at ${faultPoint}`).toHaveLength(0);
     },
-    process.platform === "win32" ? 600_000 : 300_000,
   );
 
   it("coordinates an active pause, checkpoints termination, and resumes the same session", async () => {

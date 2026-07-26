@@ -41,7 +41,14 @@ const temporaryRoots: string[] = [];
 afterEach(async () => {
   vi.restoreAllMocks();
   await Promise.all(
-    temporaryRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })),
+    temporaryRoots.splice(0).map((path) =>
+      rm(path, {
+        recursive: true,
+        force: true,
+        maxRetries: process.platform === "win32" ? 5 : 0,
+        retryDelay: 100,
+      }),
+    ),
   );
 });
 
@@ -59,6 +66,7 @@ async function createFixture(): Promise<{ repository: string; contract: RunContr
   const repository = join(root, "repo");
   await mkdir(repository);
   await git(repository, "init", "-b", "main");
+  await git(repository, "config", "--local", "core.autocrlf", "false");
   await git(repository, "config", "user.name", "Graphcraft Test");
   await git(repository, "config", "user.email", "graphcraft@example.test");
   await git(repository, "config", "commit.gpgSign", "false");
