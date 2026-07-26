@@ -45946,10 +45946,21 @@ async function confirm(input, claim, reconciliation) {
   await crossSideEffectBoundary(input.boundary, "after_confirm");
   return reconciliation.result;
 }
+function unobservableDisposition(policy, dispatched, reconciliation) {
+  const retryable = reconciliation.status === "not_applied" && (!dispatched || policy === "reconcile_then_retry");
+  return { retryable, uncertain: !retryable };
+}
+function assertDispatchPolicy(claim, policy) {
+  const required2 = claim.kind === "github_check_rerun" ? "at_most_once" : "reconcile_then_retry";
+  if (policy !== required2)
+    throw new Error(`${claim.kind} side effects require the ${required2} dispatch policy`);
+}
 async function executeSideEffect(input) {
   const proposedClaim = SideEffectClaimSchema.parse(input.claim);
+  assertDispatchPolicy(proposedClaim, input.dispatchPolicy);
   let entry = journalEntry((await input.store.loadState()).sideEffects, proposedClaim.actionId);
   let claim = entry?.claim ?? proposedClaim;
+  assertDispatchPolicy(claim, input.dispatchPolicy);
   if (!entry) {
     await crossSideEffectBoundary(input.boundary, "before_claim");
     await input.store.append("runtime", "side_effect.claimed", { claim }, claim.actionId);
@@ -45984,7 +45995,7 @@ async function executeSideEffect(input) {
     );
     throw new Error(reason2);
   }
-  if (input.durableDispatch && entry.dispatchedAt) {
+  if (input.dispatchPolicy === "at_most_once" && entry.dispatchedAt) {
     const reason2 = `The dispatched ${claim.kind} ${claim.actionId} is not yet observable; refusing a possibly duplicate retry`;
     await input.store.append(
       "runtime",
@@ -45997,32 +46008,41 @@ async function executeSideEffect(input) {
   await crossSideEffectBoundary(input.boundary, "before_act");
   await input.authorize?.();
   let dispatched = entry.dispatchedAt !== void 0;
-  const markDispatched = input.durableDispatch ? async () => {
-    if (dispatched) return;
-    await input.store.append(
-      "runtime",
-      "side_effect.dispatched",
-      { actionId: claim.actionId },
-      claim.actionId
-    );
-    dispatched = true;
-  } : void 0;
+  let markedThisAttempt = false;
+  const markDispatched = async () => {
+    await input.authorize?.();
+    if (!dispatched) {
+      await input.store.append(
+        "runtime",
+        "side_effect.dispatched",
+        { actionId: claim.actionId },
+        claim.actionId
+      );
+      dispatched = true;
+    }
+    markedThisAttempt = true;
+    await crossSideEffectBoundary(input.boundary, "after_action_dispatch");
+  };
   try {
     await input.act(claim, markDispatched);
   } catch (error51) {
     if (error51 instanceof SideEffectBoundaryInterruption) throw error51;
-    if (!dispatched && input.deferError?.(error51)) throw error51;
+    if (!markedThisAttempt && input.deferError?.(error51)) throw error51;
     const reason2 = error51 instanceof Error ? error51.message : String(error51);
     const afterFailure = await reconcileAndRecord(input, claim, "after_confirmation_reconcile");
     if (afterFailure.status === "applied") return await confirm(input, claim, afterFailure);
-    const uncertain2 = afterFailure.status === "unknown";
+    const { retryable: retryable2, uncertain: uncertain2 } = unobservableDisposition(
+      input.dispatchPolicy,
+      dispatched,
+      afterFailure
+    );
     await input.store.append(
       "runtime",
       "side_effect.failed",
       {
         actionId: claim.actionId,
         reason: reason2,
-        retryable: !uncertain2,
+        retryable: retryable2,
         uncertain: uncertain2
       },
       claim.actionId
@@ -46031,17 +46051,17 @@ async function executeSideEffect(input) {
       uncertain2 ? `${reason2}; the side-effect outcome is uncertain and will not be retried blindly` : reason2
     );
   }
-  if (input.durableDispatch && !dispatched)
-    throw new Error(`Durable ${claim.kind} ${claim.actionId} acted without a dispatch checkpoint`);
+  if (!markedThisAttempt)
+    throw new Error(`${claim.kind} ${claim.actionId} acted without a dispatch checkpoint`);
   await crossSideEffectBoundary(input.boundary, "after_act");
   const after = await reconcileAndRecord(input, claim, "after_confirmation_reconcile");
   if (after.status === "applied") return await confirm(input, claim, after);
-  const uncertain = after.status === "unknown";
+  const { retryable, uncertain } = unobservableDisposition(input.dispatchPolicy, dispatched, after);
   const reason = uncertain ? `The outcome of ${claim.kind} ${claim.actionId} is uncertain after execution` : `${claim.kind} ${claim.actionId} was not observable after execution`;
   await input.store.append(
     "runtime",
     "side_effect.failed",
-    { actionId: claim.actionId, reason, retryable: !uncertain, uncertain },
+    { actionId: claim.actionId, reason, retryable, uncertain },
     claim.actionId
   );
   throw new Error(reason);
@@ -46877,7 +46897,7 @@ async function createAtomicCommitClaim(workspace, runId, nodeId, hashAlgorithm) 
     claimedAt: (/* @__PURE__ */ new Date()).toISOString()
   });
 }
-async function performAtomicCommit(workspace, claim, task, hashAlgorithm, boundary) {
+async function performAtomicCommit(workspace, claim, task, hashAlgorithm, markDispatched, boundary) {
   if (claim.kind !== "git_commit") throw new Error(`Side effect ${claim.actionId} is not a commit`);
   const expected = commitPrecondition(claim);
   const current = await captureCommitPrecondition(workspace, hashAlgorithm);
@@ -46886,8 +46906,9 @@ async function performAtomicCommit(workspace, claim, task, hashAlgorithm, bounda
   const status3 = await git(workspace.path, ["status", "--porcelain=v1"]);
   if (!status3) throw new Error("No accepted changes are available to commit");
   await git(workspace.path, ["add", "-A"]);
-  await crossSideEffectBoundary(boundary, "after_action_prepare");
   const summary = task.replace(/\s+/g, " ").slice(0, 64);
+  await crossSideEffectBoundary(boundary, "after_action_prepare");
+  await markDispatched();
   await git(workspace.path, [
     "commit",
     "-m",
@@ -46992,13 +47013,14 @@ async function createAtomicPushClaim(workspace, runId, nodeId, hashAlgorithm) {
     claimedAt: (/* @__PURE__ */ new Date()).toISOString()
   });
 }
-async function performAtomicPush(workspace, claim, boundary) {
+async function performAtomicPush(workspace, claim, markDispatched, boundary) {
   if (claim.kind !== "git_push") throw new Error(`Side effect ${claim.actionId} is not a push`);
   const expected = pushPrecondition(claim);
   const current = await capturePushPrecondition(workspace, expected.remote);
   if (current.remoteUrl !== expected.remoteUrl || current.branch !== expected.branch || current.localSha !== expected.localSha || current.expectedRemoteSha !== expected.expectedRemoteSha)
     throw new Error(`Push precondition changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  await markDispatched();
   await gitRaw(workspace.path, [
     "push",
     "--porcelain",
@@ -52030,7 +52052,7 @@ async function reconcilePullRequest(workspace, claim, hashAlgorithm, options = {
     evidence: [...bindingEvidence, `Pull request #${current.number} carries the action marker`]
   };
 }
-async function performPullRequestCreation(workspace, claim, hashAlgorithm, options = {}, boundary) {
+async function performPullRequestCreation(workspace, claim, hashAlgorithm, markDispatched, options = {}, boundary) {
   if (claim.kind !== "github_pr_create")
     throw new Error(`Side effect ${claim.actionId} is not a pull-request creation`);
   const expected = pullRequestPrecondition(claim);
@@ -52046,6 +52068,7 @@ async function performPullRequestCreation(workspace, claim, hashAlgorithm, optio
   if (contentHash(body, hashAlgorithm) !== expected.bodyHash)
     throw new Error(`Pull-request body changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  await markDispatched();
   await createGitHubPullRequest(commandOptions(workspace, options), {
     nameWithOwner: expected.nameWithOwner,
     headRefName: expected.headRefName,
@@ -52456,7 +52479,7 @@ async function reconcileReviewReply(workspace, claim, hashAlgorithm, options) {
     evidence: [...evidence, `Review thread ${thread.id} has no action reply yet`]
   };
 }
-async function performReviewReply(workspace, claim, hashAlgorithm, options, boundary) {
+async function performReviewReply(workspace, claim, hashAlgorithm, options, markDispatched, boundary) {
   const expected = reviewReplyPrecondition(claim);
   await assertPullRequestBinding(workspace, expected, expected.number, options);
   const thread = await readGitHubReviewThread(commandOptions(workspace, options), {
@@ -52470,6 +52493,7 @@ async function performReviewReply(workspace, claim, hashAlgorithm, options, boun
   if (contentHash(body, hashAlgorithm) !== expected.replyBodyHash)
     throw new Error(`Review reply body changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  await markDispatched();
   const reply = await addGitHubReviewThreadReply(commandOptions(workspace, options), {
     host: expected.host,
     threadId: expected.threadId,
@@ -52554,7 +52578,7 @@ async function reconcileReviewResolution(workspace, claim, hashAlgorithm, option
     evidence: [...evidence, `Review thread ${thread.id} remains unresolved`]
   };
 }
-async function performReviewResolution(workspace, claim, hashAlgorithm, options, boundary) {
+async function performReviewResolution(workspace, claim, hashAlgorithm, options, markDispatched, boundary) {
   const expected = reviewResolutionPrecondition(claim);
   await assertPullRequestBinding(workspace, expected, expected.number, options);
   const thread = await readGitHubReviewThread(commandOptions(workspace, options), {
@@ -52567,6 +52591,7 @@ async function performReviewResolution(workspace, claim, hashAlgorithm, options,
   if (!reply || thread.isResolved || thread.comments.at(-1)?.id !== reply.id)
     throw new Error(`Review thread ${expected.threadId} is not ready for resolution`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  await markDispatched();
   const resolved = await resolveGitHubReviewThread(commandOptions(workspace, options), {
     host: expected.host,
     threadId: expected.threadId,
@@ -52704,8 +52729,8 @@ async function performCheckRerun(workspace, claim, hashAlgorithm, options, markD
   const check2 = current.check;
   if (!check2 || check2.kind !== "check_run" || check2.name !== expected.checkName || check2.status !== expected.checkStatus || (check2.conclusion ?? null) !== expected.checkConclusion)
     throw new Error(`Check run ${expected.checkId} moved before rerun`);
-  await markDispatched?.();
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  await markDispatched();
   await rerequestGitHubCheckRun(commandOptions(workspace, options), {
     host: expected.host,
     nameWithOwner: expected.nameWithOwner,
@@ -52764,7 +52789,7 @@ async function rerunLifecycleChecks(input) {
         markDispatched,
         input.boundary
       ),
-      durableDispatch: true,
+      dispatchPolicy: "at_most_once",
       deferError: (error51) => error51 instanceof GitHubLifecycleConsistencyError,
       ...input.boundary ? { boundary: input.boundary } : {}
     });
@@ -52806,7 +52831,15 @@ async function reconcileReviewThreadActions(input) {
       claim: replyClaim,
       ...input.authorizeWorkspace ? { authorize: input.authorizeWorkspace } : {},
       reconcile: async (claim) => await reconcileReviewReply(input.workspace, claim, hashAlgorithm, options),
-      act: async (claim) => await performReviewReply(input.workspace, claim, hashAlgorithm, options, input.boundary),
+      act: async (claim, markDispatched) => await performReviewReply(
+        input.workspace,
+        claim,
+        hashAlgorithm,
+        options,
+        markDispatched,
+        input.boundary
+      ),
+      dispatchPolicy: "reconcile_then_retry",
       revalidateConfirmed: true,
       ...input.boundary ? { boundary: input.boundary } : {}
     });
@@ -52828,13 +52861,15 @@ async function reconcileReviewThreadActions(input) {
       claim: resolutionClaim,
       ...input.authorizeWorkspace ? { authorize: input.authorizeWorkspace } : {},
       reconcile: async (claim) => await reconcileReviewResolution(input.workspace, claim, hashAlgorithm, options),
-      act: async (claim) => await performReviewResolution(
+      act: async (claim, markDispatched) => await performReviewResolution(
         input.workspace,
         claim,
         hashAlgorithm,
         options,
+        markDispatched,
         input.boundary
       ),
+      dispatchPolicy: "reconcile_then_retry",
       revalidateConfirmed: true,
       ...input.boundary ? { boundary: input.boundary } : {}
     });
@@ -52874,6 +52909,7 @@ async function reconcilePendingGitHubActions(input) {
             claim,
             hashAlgorithm,
             options,
+            markDispatched,
             input.boundary
           );
         if (claim.kind === "github_review_thread_resolve")
@@ -52882,6 +52918,7 @@ async function reconcilePendingGitHubActions(input) {
             claim,
             hashAlgorithm,
             options,
+            markDispatched,
             input.boundary
           );
         return await performCheckRerun(
@@ -52893,8 +52930,8 @@ async function reconcilePendingGitHubActions(input) {
           input.boundary
         );
       },
+      dispatchPolicy: entry.claim.kind === "github_check_rerun" ? "at_most_once" : "reconcile_then_retry",
       revalidateConfirmed: true,
-      ...entry.claim.kind === "github_check_rerun" ? { durableDispatch: true } : {},
       ...entry.claim.kind === "github_check_rerun" ? {
         deferError: (error51) => error51 instanceof GitHubLifecycleConsistencyError
       } : {},
@@ -57592,18 +57629,21 @@ async function executeRun(input) {
           const result = await executeSideEffect({
             store: input.store,
             claim: proposedClaim,
+            authorize: authorizeWorkspace,
             reconcile: async (claim) => await reconcileAtomicCommit(
               workspace,
               claim,
               input.store.repositorySideEffectIdentityHashAlgorithm
             ),
-            act: async (claim) => await performAtomicCommit(
+            act: async (claim, markDispatched) => await performAtomicCommit(
               workspace,
               claim,
               contract.task,
               input.store.repositorySideEffectIdentityHashAlgorithm,
+              markDispatched,
               input.sideEffectBoundary
             ),
+            dispatchPolicy: "reconcile_then_retry",
             ...input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}
           });
           await input.store.append("runtime", "node.accepted", {
@@ -57655,8 +57695,10 @@ async function executeRun(input) {
           const result = await executeSideEffect({
             store: input.store,
             claim: proposedClaim,
+            authorize: authorizeWorkspace,
             reconcile: async (claim) => await reconcileAtomicPush(workspace, claim),
-            act: async (claim) => await performAtomicPush(workspace, claim, input.sideEffectBoundary),
+            act: async (claim, markDispatched) => await performAtomicPush(workspace, claim, markDispatched, input.sideEffectBoundary),
+            dispatchPolicy: "reconcile_then_retry",
             revalidateConfirmed: true,
             ...input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}
           });
@@ -57722,13 +57764,15 @@ async function executeRun(input) {
               input.store.githubMutationLifecycleIdentityHashAlgorithm,
               input.github
             ),
-            act: async (claim) => await performPullRequestCreation(
+            act: async (claim, markDispatched) => await performPullRequestCreation(
               workspace,
               claim,
               input.store.githubMutationLifecycleIdentityHashAlgorithm,
+              markDispatched,
               input.github,
               input.sideEffectBoundary
             ),
+            dispatchPolicy: "reconcile_then_retry",
             revalidateConfirmed: true,
             ...input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}
           });
