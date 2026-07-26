@@ -5,6 +5,7 @@ import {
   assertRepositoryFile,
   assertRepositoryPath,
   isRepositoryFileError,
+  ProcessOutputLimitError,
   readRepositoryTextFile,
   runProcess,
 } from "@graphcraft/probes";
@@ -27,19 +28,110 @@ import { parseRunWorkspace, type RunWorkspace } from "./workspace.ts";
 
 export type { RunWorkspace } from "./workspace.ts";
 
+export type GitMutationCancellationOutcome =
+  "cancelled_before_spawn" | "terminated" | "unconfirmed";
+
+export class GitMutationCancellationError extends Error {
+  readonly outcome: GitMutationCancellationOutcome;
+
+  constructor(outcome: GitMutationCancellationOutcome) {
+    const message =
+      outcome === "cancelled_before_spawn"
+        ? "Git operation was cancelled before its subprocess started"
+        : outcome === "terminated"
+          ? "Git operation was cancelled and its subprocess terminated"
+          : "Git operation was cancelled without confirmed subprocess termination";
+    super(message);
+    this.name = "GitMutationCancellationError";
+    this.outcome = outcome;
+  }
+}
+
+export class GitCommandError extends Error {
+  readonly childSettlement: "confirmed" | "unconfirmed";
+
+  constructor(
+    message: string,
+    childSettlement: "confirmed" | "unconfirmed",
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "GitCommandError";
+    this.childSettlement = childSettlement;
+  }
+}
+
+function throwIfGitCancelledBeforeSpawn(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new GitMutationCancellationError("cancelled_before_spawn");
+}
+
+function throwIfGitCancelledAfterSpawn(
+  signal: AbortSignal | undefined,
+  childSettlement: "confirmed" | "unconfirmed",
+): void {
+  if (!signal?.aborted) return;
+  throw new GitMutationCancellationError(
+    childSettlement === "confirmed" ? "terminated" : "unconfirmed",
+  );
+}
+
+async function rethrowAfterConcurrentGitSettlement(
+  error: unknown,
+  operations: readonly Promise<unknown>[],
+  signal?: AbortSignal,
+): Promise<never> {
+  const settlements = await Promise.allSettled(operations);
+  const unconfirmed = settlements.find(
+    (settlement) =>
+      settlement.status === "rejected" &&
+      ((settlement.reason instanceof GitMutationCancellationError &&
+        settlement.reason.outcome === "unconfirmed") ||
+        (settlement.reason instanceof GitCommandError &&
+          settlement.reason.childSettlement === "unconfirmed")),
+  );
+  if (unconfirmed?.status === "rejected") {
+    if (signal?.aborted) throw new GitMutationCancellationError("unconfirmed");
+    throw unconfirmed.reason;
+  }
+  if (!signal?.aborted) throw error;
+  const outcomes = settlements.flatMap((settlement) =>
+    settlement.status === "rejected" && settlement.reason instanceof GitMutationCancellationError
+      ? [settlement.reason.outcome]
+      : [],
+  );
+  if (outcomes.includes("terminated")) throw new GitMutationCancellationError("terminated");
+  throw error;
+}
+
 async function gitRaw(
   repositoryPath: string,
   args: string[],
   signal?: AbortSignal,
 ): Promise<string> {
-  signal?.throwIfAborted();
-  const result = await runProcess("git", args, {
-    cwd: repositoryPath,
-    timeoutMs: 120_000,
-    ...(signal ? { signal } : {}),
-  });
-  signal?.throwIfAborted();
-  if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `git ${args[0]} failed`);
+  throwIfGitCancelledBeforeSpawn(signal);
+  let result;
+  try {
+    result = await runProcess("git", args, {
+      cwd: repositoryPath,
+      timeoutMs: 120_000,
+      ...(signal ? { signal } : {}),
+    });
+  } catch (error) {
+    if (error instanceof ProcessOutputLimitError)
+      throw new GitCommandError(error.message, error.childSettlement, { cause: error });
+    throw error;
+  }
+  if (result.timedOut)
+    throw new GitCommandError(
+      result.stderr.trim() || `git ${args[0]} exceeded its 120000ms timeout`,
+      result.childSettlement,
+    );
+  throwIfGitCancelledAfterSpawn(signal, result.childSettlement);
+  if (result.exitCode !== 0)
+    throw new GitCommandError(
+      result.stderr.trim() || `git ${args[0]} failed`,
+      result.childSettlement,
+    );
   return result.stdout;
 }
 
@@ -979,11 +1071,20 @@ interface CommitPrecondition {
 async function commitContentDigest(
   repositoryPath: string,
   hashAlgorithm: CanonicalHashAlgorithm,
+  signal?: AbortSignal,
 ): Promise<string> {
-  const [changedOutput, untrackedOutput] = await Promise.all([
-    gitRaw(repositoryPath, ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"]),
-    gitRaw(repositoryPath, ["ls-files", "--others", "--exclude-standard", "-z"]),
-  ]);
+  const operations = [
+    gitRaw(repositoryPath, ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"], signal),
+    gitRaw(repositoryPath, ["ls-files", "--others", "--exclude-standard", "-z"], signal),
+  ] as const;
+  let changedOutput: string;
+  let untrackedOutput: string;
+  try {
+    [changedOutput, untrackedOutput] = await Promise.all(operations);
+  } catch (error) {
+    await rethrowAfterConcurrentGitSettlement(error, operations, signal);
+    throw error;
+  }
   const paths = [
     ...new Set(
       [changedOutput, untrackedOutput].flatMap((output) => output.split("\0").filter(Boolean)),
@@ -1012,12 +1113,22 @@ async function commitContentDigest(
 async function captureCommitPrecondition(
   workspace: RunWorkspace,
   hashAlgorithm: CanonicalHashAlgorithm,
+  signal?: AbortSignal,
 ): Promise<CommitPrecondition> {
-  const [expectedHead, branch, contentDigest] = await Promise.all([
-    git(workspace.path, ["rev-parse", "HEAD"]),
-    git(workspace.path, ["branch", "--show-current"]),
-    commitContentDigest(workspace.path, hashAlgorithm),
-  ]);
+  const operations = [
+    git(workspace.path, ["rev-parse", "HEAD"], signal),
+    git(workspace.path, ["branch", "--show-current"], signal),
+    commitContentDigest(workspace.path, hashAlgorithm, signal),
+  ] as const;
+  let expectedHead: string;
+  let branch: string;
+  let contentDigest: string;
+  try {
+    [expectedHead, branch, contentDigest] = await Promise.all(operations);
+  } catch (error) {
+    await rethrowAfterConcurrentGitSettlement(error, operations, signal);
+    throw error;
+  }
   if (!branch) throw new Error("The Graphcraft worktree is not on a named branch");
   return { expectedHead, branch, contentDigest };
 }
@@ -1065,31 +1176,38 @@ export async function performAtomicCommit(
   hashAlgorithm: CanonicalHashAlgorithm,
   markDispatched: () => Promise<void>,
   boundary?: (point: SideEffectBoundary) => void | Promise<void>,
+  signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
   if (claim.kind !== "git_commit") throw new Error(`Side effect ${claim.actionId} is not a commit`);
+  throwIfGitCancelledBeforeSpawn(signal);
   const expected = commitPrecondition(claim);
-  const current = await captureCommitPrecondition(workspace, hashAlgorithm);
+  const current = await captureCommitPrecondition(workspace, hashAlgorithm, signal);
   if (
     current.expectedHead !== expected.expectedHead ||
     current.branch !== expected.branch ||
     current.contentDigest !== expected.contentDigest
   )
     throw new Error(`Commit precondition changed for side effect ${claim.actionId}`);
-  const status = await git(workspace.path, ["status", "--porcelain=v1"]);
+  const status = await git(workspace.path, ["status", "--porcelain=v1"], signal);
   if (!status) throw new Error("No accepted changes are available to commit");
-  await git(workspace.path, ["add", "-A"]);
+  await git(workspace.path, ["add", "-A"], signal);
   const summary = task.replace(/\s+/g, " ").slice(0, 64);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  throwIfGitCancelledBeforeSpawn(signal);
   await markDispatched();
-  await git(workspace.path, [
-    "commit",
-    "-m",
-    `graphcraft: ${summary}`,
-    "-m",
-    `Graphcraft-Action: ${claim.idempotencyKey}`,
-  ]);
+  await git(
+    workspace.path,
+    ["commit", "-m", `graphcraft: ${summary}`, "-m", `Graphcraft-Action: ${claim.idempotencyKey}`],
+    signal,
+  );
   await crossSideEffectBoundary(boundary, "after_action_command");
-  return { sha: await git(workspace.path, ["rev-parse", "HEAD"]), branch: expected.branch };
+  return {
+    // The mutation child has already settled. Keep this bounded local read out of
+    // cancellation classification so a later abort cannot be mistaken for a
+    // commit that never spawned.
+    sha: await git(workspace.path, ["rev-parse", "HEAD"]),
+    branch: expected.branch,
+  };
 }
 
 export async function reconcileAtomicCommit(
@@ -1157,15 +1275,27 @@ async function remoteBranchSha(
   repositoryPath: string,
   remote: string,
   branch: string,
+  signal?: AbortSignal,
 ): Promise<string | null> {
+  throwIfGitCancelledBeforeSpawn(signal);
   const ref = `refs/heads/${branch}`;
   const result = await runProcess("git", ["ls-remote", "--exit-code", "--refs", remote, ref], {
     cwd: repositoryPath,
     timeoutMs: 120_000,
+    ...(signal ? { signal } : {}),
   });
+  if (result.timedOut)
+    throw new GitCommandError(
+      result.stderr.trim() || `Reading ${remote}/${branch} exceeded its 120000ms timeout`,
+      result.childSettlement,
+    );
+  throwIfGitCancelledAfterSpawn(signal, result.childSettlement);
   if (result.exitCode === 2 && result.stdout.trim().length === 0) return null;
   if (result.exitCode !== 0)
-    throw new Error(result.stderr.trim() || `Unable to read ${remote}/${branch}`);
+    throw new GitCommandError(
+      result.stderr.trim() || `Unable to read ${remote}/${branch}`,
+      result.childSettlement,
+    );
   const matches = result.stdout
     .trim()
     .split("\n")
@@ -1180,14 +1310,24 @@ async function remoteBranchSha(
 async function capturePushPrecondition(
   workspace: RunWorkspace,
   remote = "origin",
+  signal?: AbortSignal,
 ): Promise<PushPrecondition> {
-  const [remoteUrl, branch, localSha] = await Promise.all([
-    git(workspace.path, ["remote", "get-url", remote]),
-    git(workspace.path, ["branch", "--show-current"]),
-    git(workspace.path, ["rev-parse", "HEAD"]),
-  ]);
+  const operations = [
+    git(workspace.path, ["remote", "get-url", remote], signal),
+    git(workspace.path, ["branch", "--show-current"], signal),
+    git(workspace.path, ["rev-parse", "HEAD"], signal),
+  ] as const;
+  let remoteUrl: string;
+  let branch: string;
+  let localSha: string;
+  try {
+    [remoteUrl, branch, localSha] = await Promise.all(operations);
+  } catch (error) {
+    await rethrowAfterConcurrentGitSettlement(error, operations, signal);
+    throw error;
+  }
   if (!branch) throw new Error("The Graphcraft worktree is not on a named branch");
-  const expectedRemoteSha = await remoteBranchSha(workspace.path, remote, branch);
+  const expectedRemoteSha = await remoteBranchSha(workspace.path, remote, branch, signal);
   return { remote, remoteUrl, branch, localSha, expectedRemoteSha };
 }
 
@@ -1236,10 +1376,12 @@ export async function performAtomicPush(
   claim: SideEffectClaim,
   markDispatched: () => Promise<void>,
   boundary?: (point: SideEffectBoundary) => void | Promise<void>,
+  signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
   if (claim.kind !== "git_push") throw new Error(`Side effect ${claim.actionId} is not a push`);
+  throwIfGitCancelledBeforeSpawn(signal);
   const expected = pushPrecondition(claim);
-  const current = await capturePushPrecondition(workspace, expected.remote);
+  const current = await capturePushPrecondition(workspace, expected.remote, signal);
   if (
     current.remoteUrl !== expected.remoteUrl ||
     current.branch !== expected.branch ||
@@ -1248,13 +1390,13 @@ export async function performAtomicPush(
   )
     throw new Error(`Push precondition changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  throwIfGitCancelledBeforeSpawn(signal);
   await markDispatched();
-  await gitRaw(workspace.path, [
-    "push",
-    "--porcelain",
-    expected.remote,
-    `${expected.branch}:refs/heads/${expected.branch}`,
-  ]);
+  await gitRaw(
+    workspace.path,
+    ["push", "--porcelain", expected.remote, `${expected.branch}:refs/heads/${expected.branch}`],
+    signal,
+  );
   await crossSideEffectBoundary(boundary, "after_action_command");
   return {
     remote: expected.remote,

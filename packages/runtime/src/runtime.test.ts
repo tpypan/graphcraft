@@ -308,7 +308,7 @@ async function fakePullRequestGitHub(
     script,
     `#!/usr/bin/env node
 const fs = require("node:fs");
-const { execFileSync } = require("node:child_process");
+const { execFileSync, spawn } = require("node:child_process");
 const args = process.argv.slice(2);
 const statePath = process.env.GRAPHCRAFT_RUNTIME_GH_STATE;
 const logPath = process.env.GRAPHCRAFT_RUNTIME_GH_LOG;
@@ -322,6 +322,20 @@ const save = () => {
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
 const fail = (message, code = 1) => { process.stderr.write(message + "\\n"); process.exit(code); };
 const value = (flag) => args[args.indexOf(flag) + 1];
+const blockMutation = (kind) => {
+  if (state.unconfirmedMutation === kind) {
+    const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1_000)"], {
+      detached: true,
+      stdio: ["ignore", "inherit", "inherit"],
+    });
+    descendant.unref();
+    fs.writeFileSync(state.unconfirmedMutationMarker, String(descendant.pid) + "\\n");
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+  }
+  if (state.blockMutation !== kind) return;
+  fs.writeFileSync(state.blockMutationMarker, String(process.pid) + "\\n");
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+};
 const sha = (branch) => execFileSync("git", ["--git-dir", state.remote, "rev-parse", "refs/heads/" + branch], { encoding: "utf8" }).trim();
 if (state.syncPullRequestHead || state.syncPullRequestBase) {
   let changed = false;
@@ -350,6 +364,7 @@ if (args[0] === "pr" && args[1] === "create") {
   const headRefName = value("--head");
   if (state.pullRequests.some((candidate) => candidate.headRefName === headRefName && candidate.state === "OPEN"))
     fail("a pull request for this branch already exists");
+  blockMutation("github_pr_create");
   const number = 100 + state.pullRequests.length;
   const pullRequest = {
     number,
@@ -397,6 +412,7 @@ if (endpoint && endpoint.startsWith("repos/tpypan/fixture/check-runs/") && endpo
   const databaseId = Number(endpoint.split("/").at(-2));
   const check = state.checks.find((candidate) => candidate.databaseId === databaseId);
   if (!check) fail("check run not found");
+  blockMutation("github_check_rerun");
   state.rerunCalls += 1;
   if (!state.rerunLeavesFailure) {
     check.status = "COMPLETED";
@@ -459,6 +475,7 @@ if (query.includes("GraphcraftReviewThread")) {
 if (query.includes("GraphcraftAddReviewReply")) {
   const thread = state.reviewThreads.find((candidate) => candidate.id === fields.threadId);
   if (!thread) fail("review thread not found");
+  blockMutation("github_pr_comment");
   thread.replies = thread.replies || [];
   const comment = {
     id: "graphcraft-reply-" + thread.id + "-" + (thread.replies.length + 1),
@@ -478,6 +495,7 @@ if (query.includes("GraphcraftAddReviewReply")) {
 if (query.includes("GraphcraftResolveReviewThread")) {
   const thread = state.reviewThreads.find((candidate) => candidate.id === fields.threadId);
   if (!thread) fail("review thread not found");
+  blockMutation("github_review_thread_resolve");
   thread.isResolved = true;
   save();
   send({ data: { resolveReviewThread: {
@@ -12887,6 +12905,427 @@ if (args.length === blocked.length && blocked.every((value, index) => args[index
       }
     },
   );
+
+  const cooperativeMutationKinds = [
+    "git_commit",
+    "git_push",
+    "github_pr_create",
+    "github_pr_comment",
+    "github_review_thread_resolve",
+    "github_check_rerun",
+  ] as const;
+  const cooperativeMutationControls = cooperativeMutationKinds.flatMap((kind) =>
+    (["pause", "stop"] as const).map((action) => ({ kind, action })),
+  );
+
+  async function createCooperativeMutationFixture(
+    kind: (typeof cooperativeMutationKinds)[number],
+    action: "pause" | "stop",
+    blockMutationMarker?: string,
+  ): Promise<{
+    repository: string;
+    remote: string | undefined;
+    github: Awaited<ReturnType<typeof fakePullRequestGitHub>> | undefined;
+    adapter: FakeAdapter;
+    created: Awaited<ReturnType<typeof createRun>>;
+  }> {
+    const needsRemote = kind !== "git_commit";
+    const repositoryFixture = needsRemote
+      ? await createRepositoryWithRemote()
+      : { repository: await createRepository(), remote: undefined };
+    const github = kind.startsWith("github_")
+      ? await fakePullRequestGitHub(repositoryFixture.remote!, {
+          ...(blockMutationMarker ? { blockMutation: kind, blockMutationMarker } : {}),
+          ...(kind === "github_pr_comment" || kind === "github_review_thread_resolve"
+            ? {
+                syncPullRequestHead: true,
+                reviewThreads: [
+                  {
+                    id: `thread-cooperative-${kind}-${action}`,
+                    isResolved: false,
+                    isOutdated: false,
+                    path: "feature.txt",
+                    line: 1,
+                    body: "Apply the reviewed change before resolving this thread.",
+                  },
+                ],
+                reviewDecision: "",
+              }
+            : {}),
+          ...(kind === "github_check_rerun"
+            ? {
+                syncPullRequestHead: true,
+                protected: true,
+                requiredStatusChecks: ["tests"],
+                checks: [
+                  {
+                    kind: "check_run",
+                    id: `tests-cooperative-${action}`,
+                    databaseId: 701,
+                    name: "tests",
+                    status: "COMPLETED",
+                    conclusion: "STARTUP_FAILURE",
+                  },
+                ],
+              }
+            : {}),
+        })
+      : undefined;
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(
+          join(request.repositoryPath, "feature.txt"),
+          `cooperative ${kind} ${action}\n`,
+        );
+      if (request.capsule.nodeId === "repair-review-1")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "review-fixed\n");
+    });
+    const finishLine =
+      kind === "git_commit"
+        ? "committed"
+        : kind === "git_push"
+          ? "pushed"
+          : kind === "github_pr_create"
+            ? "pr_open"
+            : "pr_green";
+    const created = await createRun(
+      `Implement a substantial feature with cooperative ${action} settlement`,
+      {
+        cwd: repositoryFixture.repository,
+        finishLine,
+        planner: adapter,
+      },
+    );
+    return { ...repositoryFixture, github, adapter, created };
+  }
+
+  it.each(cooperativeMutationControls)(
+    "applies cooperative $action to a dispatched $kind mutation before spawn and records its settlement",
+    async ({ kind, action }) => {
+      const { created, adapter, github } = await createCooperativeMutationFixture(kind, action);
+      const reason = `${action} during dispatched ${kind}`;
+      const controlObserved = Promise.withResolvers<void>();
+      const originalWatch = RunControlChannel.prototype.watch;
+      const watch = vi.spyOn(RunControlChannel.prototype, "watch").mockImplementationOnce(function (
+        this: RunControlChannel,
+        onRequest,
+        intervalMs,
+        onFailure,
+      ) {
+        return originalWatch.call(
+          this,
+          (request) => {
+            onRequest(request);
+            controlObserved.resolve();
+          },
+          intervalMs,
+          onFailure,
+        );
+      });
+      let controlIssued = false;
+
+      try {
+        const settled = await executeRun({
+          store: created.store,
+          adapter,
+          approve: true,
+          ...(github ? { github } : {}),
+          sideEffectBoundary: async (point) => {
+            if (controlIssued || point !== "after_action_dispatch") return;
+            const state = await created.store.loadState();
+            if (state.sideEffects.at(-1)?.claim.kind !== kind) return;
+            controlIssued = true;
+            await new RunControlChannel(
+              created.store.graphcraftRoot,
+              created.contract.runId,
+            ).request(action, reason);
+            await controlObserved.promise;
+          },
+        });
+        const events = await created.store.loadEvents();
+        const journal = settled.sideEffects.find(({ claim }) => claim.kind === kind);
+        if (!journal) throw new Error(`Missing ${kind} settlement journal`);
+        const atMostOnce = kind === "github_check_rerun";
+        const applied = events.findLast(
+          ({ type, data }) =>
+            type === "control.applied" &&
+            (data.sideEffect as { actionId?: unknown } | undefined)?.actionId ===
+              journal.claim.actionId,
+        );
+
+        expect(controlIssued).toBe(true);
+        expect(settled.status).toBe(action === "pause" ? "paused" : "stopped");
+        expect(settled.stopReason).toBe(reason);
+        expect(journal).toMatchObject({
+          status: "failed",
+          retryable: true,
+          childSettlement: "confirmed",
+        });
+        expect(journal.dispatchedAt).toBeUndefined();
+        expect(applied?.data).toMatchObject({
+          request: {
+            action,
+            cause: action === "pause" ? "user_pause" : "user_stop",
+            reason,
+          },
+          action,
+          cause: action === "pause" ? "user_pause" : "user_stop",
+          reason,
+          outcome: "checkpointed",
+          sideEffect: {
+            actionId: journal.claim.actionId,
+            kind,
+            dispatchPolicy: atMostOnce ? "at_most_once" : "reconcile_then_retry",
+            dispatched: true,
+            childSettlement: "not_started",
+            reconciliation: "not_attempted",
+            disposition: "retryable",
+          },
+          nodeIds: [journal.claim.nodeId],
+        });
+        expect(events.some(({ type }) => type === "node.failed")).toBe(false);
+        expect(events.some(({ type }) => type === "run.blocked")).toBe(false);
+        expect(
+          events.some(
+            ({ type, data }) =>
+              type === "side_effect.confirmed" && data.actionId === journal.claim.actionId,
+          ),
+        ).toBe(false);
+
+        if (kind === "git_commit" && action === "pause") {
+          const resumed = await executeRun({ store: created.store, adapter });
+          const resumedJournal = resumed.sideEffects.find(({ claim }) => claim.kind === kind);
+          const workspace = await created.store.loadWorkspace<{ path: string }>();
+          const { stdout: commitCount } = await execFileAsync(
+            "git",
+            ["rev-list", "--count", `${created.contract.repository.baseSha}..HEAD`],
+            { cwd: workspace.path },
+          );
+
+          expect(resumed.status).toBe("completed");
+          expect(resumedJournal).toMatchObject({
+            status: "confirmed",
+            dispatchedAt: expect.any(String),
+          });
+          expect(resumedJournal?.childSettlement).toBeUndefined();
+          expect(resumedJournal?.retryable).toBeUndefined();
+          expect(commitCount.trim()).toBe("1");
+        }
+
+        if (kind === "github_check_rerun" && action === "pause") {
+          const resumed = await executeRun({
+            store: created.store,
+            adapter,
+            github: github!,
+          });
+          const resumedJournal = resumed.sideEffects.find(({ claim }) => claim.kind === kind);
+          const remoteState = await readFakeGitHubState(github!.statePath);
+
+          expect(resumed.status).toBe("completed");
+          expect(resumedJournal).toMatchObject({
+            status: "confirmed",
+            dispatchedAt: expect.any(String),
+          });
+          expect(resumedJournal?.childSettlement).toBeUndefined();
+          expect(resumedJournal?.retryable).toBeUndefined();
+          expect(remoteState.rerunCalls).toBe(1);
+        }
+      } finally {
+        watch.mockRestore();
+      }
+    },
+    process.platform === "win32" ? 180_000 : 60_000,
+  );
+
+  const inFlightMutationControls = cooperativeMutationKinds.flatMap((kind) =>
+    (["pause", "stop"] as const).map((action) => ({ kind, action })),
+  );
+
+  async function installBlockingGitMutationCommand(
+    kind: "git_commit" | "git_push",
+    repository: string,
+    marker: string,
+  ): Promise<() => void> {
+    const originalGit = await resolveTrustedExecutable("git", { untrustedCwd: repository });
+    const originalPath = process.env.PATH;
+    const fakeBin = join(repository, "..", `.cooperative-git-${randomUUID()}`);
+    const fakeGit = join(fakeBin, "git");
+    await mkdir(fakeBin);
+    await writeFile(
+      fakeGit,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const args = process.argv.slice(2);
+if (args[0] === ${JSON.stringify(kind === "git_commit" ? "commit" : "push")}) {
+  fs.writeFileSync(${JSON.stringify(marker)}, String(process.pid) + "\\n");
+  setInterval(() => {}, 1_000);
+} else {
+  const result = spawnSync(${JSON.stringify(originalGit)}, args, { stdio: "inherit" });
+  if (result.error) throw result.error;
+  process.exit(result.status ?? 1);
+}
+`,
+    );
+    await chmod(fakeGit, 0o700);
+    process.env.PATH = `${fakeBin}${delimiter}${originalPath ?? ""}`;
+    return () => {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    };
+  }
+
+  it.each(inFlightMutationControls)(
+    "settles an in-flight $kind child after cooperative $action",
+    async ({ kind, action }) => {
+      const markerRoot = await mkdtemp(join(tmpdir(), "graphcraft-mutation-child-test-"));
+      temporaryRoots.push(markerRoot);
+      const marker = join(markerRoot, "started.pid");
+      const { repository, created, adapter, github } = await createCooperativeMutationFixture(
+        kind,
+        action,
+        marker,
+      );
+      let restoreGitPath = (): void => undefined;
+      if (kind === "git_commit" || kind === "git_push")
+        restoreGitPath = await installBlockingGitMutationCommand(kind, repository, marker);
+
+      try {
+        const reason = `${action} after ${kind} child spawn`;
+        const execution = executeRun({
+          store: created.store,
+          adapter,
+          approve: true,
+          ...(github ? { github } : {}),
+        });
+
+        await waitFor(
+          () =>
+            stat(marker).then(
+              () => true,
+              () => false,
+            ),
+          process.platform === "win32" ? 60_000 : 30_000,
+        );
+        const childPid = Number((await readFile(marker, "utf8")).trim());
+        expect(Number.isSafeInteger(childPid)).toBe(true);
+        expect(isProcessAlive(childPid)).toBe(true);
+
+        const [requested, settled] = await Promise.all([
+          requestRunControl(created.store, action, reason, 15_000),
+          execution,
+        ]);
+        const events = await created.store.loadEvents();
+        const journal = settled.sideEffects.find(({ claim }) => claim.kind === kind);
+        if (!journal) throw new Error(`Missing in-flight ${kind} settlement journal`);
+        const atMostOnce = kind === "github_check_rerun";
+        const applied = events.findLast(
+          ({ type, data }) =>
+            type === "control.applied" &&
+            (data.sideEffect as { actionId?: unknown } | undefined)?.actionId ===
+              journal.claim.actionId,
+        );
+
+        expect(requested.status).toBe(action === "pause" ? "paused" : "stopped");
+        expect(settled.status).toBe(action === "pause" ? "paused" : "stopped");
+        expect(settled.stopReason).toBe(reason);
+        expect(isProcessAlive(childPid)).toBe(false);
+        expect(journal).toMatchObject({
+          status: atMostOnce ? "uncertain" : "failed",
+          retryable: !atMostOnce,
+          childSettlement: "confirmed",
+          dispatchedAt: expect.any(String),
+        });
+        expect(applied?.data).toMatchObject({
+          request: {
+            action,
+            cause: action === "pause" ? "user_pause" : "user_stop",
+            reason,
+          },
+          action,
+          cause: action === "pause" ? "user_pause" : "user_stop",
+          reason,
+          outcome: "checkpointed",
+          sideEffect: {
+            actionId: journal.claim.actionId,
+            kind,
+            dispatchPolicy: atMostOnce ? "at_most_once" : "reconcile_then_retry",
+            dispatched: true,
+            childSettlement: "confirmed",
+            reconciliation: "not_applied",
+            disposition: atMostOnce ? "uncertain" : "retryable",
+          },
+          nodeIds: [journal.claim.nodeId],
+        });
+        expect(events.some(({ type }) => type === "node.failed")).toBe(false);
+        expect(events.some(({ type }) => type === "run.blocked")).toBe(false);
+        expect(
+          events.some(
+            ({ type, data }) =>
+              type === "side_effect.confirmed" && data.actionId === journal.claim.actionId,
+          ),
+        ).toBe(false);
+      } finally {
+        restoreGitPath();
+      }
+    },
+    process.platform === "win32" ? 240_000 : 120_000,
+  );
+
+  it("blocks an unconfirmed mutation failure without misclassifying it as runtime shutdown", async () => {
+    const markerRoot = await mkdtemp(join(tmpdir(), "graphcraft-unconfirmed-mutation-test-"));
+    temporaryRoots.push(markerRoot);
+    const marker = join(markerRoot, "descendant.pid");
+    const { created, adapter, github } = await createCooperativeMutationFixture(
+      "github_pr_create",
+      "pause",
+    );
+    if (!github) throw new Error("Missing GitHub fixture");
+    const remoteState = await readFakeGitHubState(github.statePath);
+    remoteState.unconfirmedMutation = "github_pr_create";
+    remoteState.unconfirmedMutationMarker = marker;
+    await writeFakeGitHubState(github.statePath, remoteState);
+    let descendantPid: number | undefined;
+
+    try {
+      const blocked = await executeRun({
+        store: created.store,
+        adapter,
+        approve: true,
+        github: { ...github, timeoutMs: 1_000 },
+      });
+      descendantPid = Number((await readFile(marker, "utf8")).trim());
+      const events = await created.store.loadEvents();
+      const journal = blocked.sideEffects.find(({ claim }) => claim.kind === "github_pr_create");
+      const nodeFailure = events.findLast(
+        ({ type, data }) => type === "node.failed" && data.nodeId === "pull-request",
+      );
+      const runBlocker = events.findLast(({ type }) => type === "run.blocked");
+      const timeoutReason = "gh exceeded its 1000ms timeout";
+
+      expect(Number.isSafeInteger(descendantPid)).toBe(true);
+      expect(blocked.status).toBe("blocked");
+      expect(blocked.nodes["pull-request"]?.status).toBe("failed");
+      expect(journal).toMatchObject({
+        status: "uncertain",
+        retryable: false,
+        childSettlement: "unconfirmed",
+        dispatchedAt: expect.any(String),
+      });
+      expect(nodeFailure?.data.reason).toContain(timeoutReason);
+      expect(runBlocker?.data.reason).toContain(timeoutReason);
+      expect(blocked.stopReason).toContain(timeoutReason);
+      expect(events.some(({ type }) => type === "run.paused")).toBe(false);
+      expect(events.some(({ type }) => type === "control.applied")).toBe(false);
+      expect(blocked.stopReason).not.toMatch(/runtime shutdown/i);
+    } finally {
+      if (!descendantPid) descendantPid = Number(await readFile(marker, "utf8").catch(() => ""));
+      if (descendantPid && isProcessAlive(descendantPid)) {
+        process.kill(descendantPid, "SIGKILL");
+        await waitFor(() => !isProcessAlive(descendantPid!), 5_000);
+      }
+    }
+  }, 120_000);
 
   it("uses an exclusive recoverable run lock", async () => {
     const root = await mkdtemp(join(tmpdir(), "graphcraft-lock-test-"));

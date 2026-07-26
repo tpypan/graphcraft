@@ -647,6 +647,7 @@ export const SideEffectJournalEntrySchema = z.strictObject({
   evidence: z.array(z.string()).default([]),
   failure: z.string().optional(),
   retryable: z.boolean().optional(),
+  childSettlement: z.enum(["confirmed", "unconfirmed"]).optional(),
   updatedAt: z.iso.datetime(),
 });
 

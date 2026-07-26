@@ -90,6 +90,8 @@ import {
   discoverPlanningEvidence,
   discoverRepository,
   expectedRunWorkspace,
+  GitCommandError,
+  GitMutationCancellationError,
   performAtomicCommit,
   performAtomicPush,
   reconcileAtomicCommit,
@@ -100,9 +102,13 @@ import {
 } from "./repository.ts";
 import {
   SideEffectBoundaryInterruption,
+  SideEffectInterruption,
   crossSideEffectBoundary,
   executeSideEffect,
   type SideEffectBoundary,
+  type SideEffectAuthorizationPhase,
+  type SideEffectCancellation,
+  type SideEffectInterruptionReceipt,
 } from "./side-effect.ts";
 import { RunStore, RunStoreLimitError } from "./store.ts";
 import { redactString, redactValue } from "./redaction.ts";
@@ -144,6 +150,7 @@ import {
 } from "./probe-process.ts";
 import {
   capturePullRequestLifecycleProbe,
+  classifyGitHubCommandCancellation,
   createPullRequestClaim,
   deferGitHubLifecycleConsistency,
   evaluateGitHubLifecycleWait,
@@ -4173,6 +4180,17 @@ async function recoverDurableNodeFailureBlocker(
   return await store.loadState();
 }
 
+function classifyGitMutationCancellation(error: unknown): SideEffectCancellation | undefined {
+  if (error instanceof GitMutationCancellationError)
+    return {
+      outcome: error.outcome,
+      childSettlement: error.outcome === "unconfirmed" ? "unconfirmed" : "confirmed",
+    };
+  if (error instanceof GitCommandError)
+    return { outcome: "failed", childSettlement: error.childSettlement };
+  return undefined;
+}
+
 export async function executeRun(input: {
   store: RunStore;
   adapter: HostAdapter;
@@ -4245,6 +4263,7 @@ export async function executeRun(input: {
       nodeIds?: string | string[],
       termination?: HostTermination,
       artifact?: string,
+      sideEffect?: SideEffectInterruptionReceipt,
     ): Promise<RunState> => {
       const activeNodeIds = nodeIds ? (Array.isArray(nodeIds) ? nodeIds : [nodeIds]) : [];
       const request = infrastructureFailure
@@ -4286,6 +4305,7 @@ export async function executeRun(input: {
         outcome: termination?.outcome ?? "checkpointed",
         termination: termination ?? null,
         artifact: artifact ?? null,
+        sideEffect: sideEffect ?? null,
         nodeIds: activeNodeIds,
       });
       await input.store.append(
@@ -4551,8 +4571,15 @@ export async function executeRun(input: {
     if (state.status !== "running")
       await input.store.append("runtime", "run.started", { workspace });
 
-    const authorizeWorkspace = async (): Promise<void> => {
-      workspace = await reconcileStoredRunWorkspace(input.store, contract, workspace, signal);
+    const authorizeWorkspace = async (
+      phase: SideEffectAuthorizationPhase = "precondition",
+    ): Promise<void> => {
+      workspace = await reconcileStoredRunWorkspace(
+        input.store,
+        contract,
+        workspace,
+        phase === "settlement" ? lockSignal : signal,
+      );
     };
 
     while (!signal.aborted) {
@@ -4827,6 +4854,7 @@ export async function executeRun(input: {
                 node: current,
                 workspace,
                 authorizeWorkspace,
+                signal,
                 ...(input.github ? { options: input.github } : {}),
                 ...(input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}),
               });
@@ -4839,6 +4867,9 @@ export async function executeRun(input: {
                 });
             } catch (error) {
               if (error instanceof SideEffectBoundaryInterruption) throw error;
+              if (error instanceof SideEffectInterruption && signal.aborted)
+                return await finishInterruption(current.id, undefined, undefined, error.receipt);
+              if (signal.aborted) return await finishInterruption(current.id);
               if (error instanceof GitHubLifecycleConsistencyError) {
                 const deferred = await deferLifecycleConsistency(current, error);
                 if (deferred) return deferred;
@@ -4952,6 +4983,7 @@ export async function executeRun(input: {
                   contract,
                   lifecycle: outcome.lifecycle,
                   authorizeWorkspace,
+                  signal,
                   ...(input.github ? { options: input.github } : {}),
                   ...(input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}),
                 });
@@ -4964,6 +4996,9 @@ export async function executeRun(input: {
                 continue;
               } catch (error) {
                 if (error instanceof SideEffectBoundaryInterruption) throw error;
+                if (error instanceof SideEffectInterruption && signal.aborted)
+                  return await finishInterruption(current.id, undefined, undefined, error.receipt);
+                if (signal.aborted) return await finishInterruption(current.id);
                 const reason = error instanceof Error ? error.message : String(error);
                 await appendDurableNodeFailureBlocker({
                   store: input.store,
@@ -5085,6 +5120,7 @@ export async function executeRun(input: {
                 contract,
                 lifecycle: outcome.lifecycle,
                 authorizeWorkspace,
+                signal,
                 ...(input.github ? { options: input.github } : {}),
                 ...(input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}),
               });
@@ -5097,6 +5133,9 @@ export async function executeRun(input: {
               continue;
             } catch (error) {
               if (error instanceof SideEffectBoundaryInterruption) throw error;
+              if (error instanceof SideEffectInterruption && signal.aborted)
+                return await finishInterruption(current.id, undefined, undefined, error.receipt);
+              if (signal.aborted) return await finishInterruption(current.id);
               if (error instanceof GitHubLifecycleConsistencyError) {
                 const deferred = await deferLifecycleConsistency(current, error);
                 if (deferred) return deferred;
@@ -5560,8 +5599,11 @@ export async function executeRun(input: {
                 input.store.repositorySideEffectIdentityHashAlgorithm,
                 markDispatched,
                 input.sideEffectBoundary,
+                signal,
               ),
             dispatchPolicy: "reconcile_then_retry",
+            signal,
+            classifyCancellation: classifyGitMutationCancellation,
             ...(input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}),
           });
           await input.store.append("runtime", "node.accepted", {
@@ -5572,6 +5614,9 @@ export async function executeRun(input: {
           await crossSideEffectBoundary(input.sideEffectBoundary, "after_node_acceptance");
         } catch (error) {
           if (error instanceof SideEffectBoundaryInterruption) throw error;
+          if (error instanceof SideEffectInterruption && signal.aborted)
+            return await finishInterruption(current.id, undefined, undefined, error.receipt);
+          if (signal.aborted) return await finishInterruption(current.id);
           await input.store.append("runtime", "node.failed", {
             nodeId: current.id,
             reason: (error as Error).message,
@@ -5617,9 +5662,17 @@ export async function executeRun(input: {
             authorize: authorizeWorkspace,
             reconcile: async (claim) => await reconcileAtomicPush(workspace, claim),
             act: async (claim, markDispatched) =>
-              await performAtomicPush(workspace, claim, markDispatched, input.sideEffectBoundary),
+              await performAtomicPush(
+                workspace,
+                claim,
+                markDispatched,
+                input.sideEffectBoundary,
+                signal,
+              ),
             dispatchPolicy: "reconcile_then_retry",
             revalidateConfirmed: true,
+            signal,
+            classifyCancellation: classifyGitMutationCancellation,
             ...(input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}),
           });
           await input.store.append("runtime", "node.accepted", {
@@ -5632,6 +5685,9 @@ export async function executeRun(input: {
           await crossSideEffectBoundary(input.sideEffectBoundary, "after_node_acceptance");
         } catch (error) {
           if (error instanceof SideEffectBoundaryInterruption) throw error;
+          if (error instanceof SideEffectInterruption && signal.aborted)
+            return await finishInterruption(current.id, undefined, undefined, error.receipt);
+          if (signal.aborted) return await finishInterruption(current.id);
           await input.store.append("runtime", "node.failed", {
             nodeId: current.id,
             reason: (error as Error).message,
@@ -5696,9 +5752,12 @@ export async function executeRun(input: {
                 markDispatched,
                 input.github,
                 input.sideEffectBoundary,
+                signal,
               ),
             dispatchPolicy: "reconcile_then_retry",
             revalidateConfirmed: true,
+            signal,
+            classifyCancellation: classifyGitHubCommandCancellation,
             ...(input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}),
           });
           const lifecycle = await captureProbes(
@@ -5781,6 +5840,9 @@ export async function executeRun(input: {
           await crossSideEffectBoundary(input.sideEffectBoundary, "after_node_acceptance");
         } catch (error) {
           if (error instanceof SideEffectBoundaryInterruption) throw error;
+          if (error instanceof SideEffectInterruption && signal.aborted)
+            return await finishInterruption(current.id, undefined, undefined, error.receipt);
+          if (signal.aborted) return await finishInterruption(current.id);
           if (error instanceof GitHubLifecycleConsistencyError) {
             const deferred = await deferLifecycleConsistency(current, error);
             if (deferred) return deferred;

@@ -19,6 +19,9 @@ import {
   classifyGitHubPullRequestLifecycle,
   createGitHubPullRequest,
   GITHUB_GRAPHQL_OPERATION_COST_BUDGET,
+  GitHubCommandCancellationError,
+  GitHubCommandError,
+  GitHubCommandResultError,
   GitHubLifecycleConsistencyError,
   listGitHubPullRequestsForHead,
   readGitHubRateLimits,
@@ -33,13 +36,28 @@ import {
 import {
   crossSideEffectBoundary,
   executeSideEffect,
+  type SideEffectAuthorizationPhase,
   type SideEffectBoundary,
+  type SideEffectCancellation,
   type SideEffectReconciliation,
 } from "./side-effect.ts";
 import type { RunWorkspace } from "./repository.ts";
 import { RunStore } from "./store.ts";
 
-export type GitHubExecutionOptions = Omit<GitHubCommandOptions, "cwd">;
+export type GitHubExecutionOptions = Omit<GitHubCommandOptions, "cwd" | "signal">;
+
+export function classifyGitHubCommandCancellation(
+  error: unknown,
+): SideEffectCancellation | undefined {
+  if (error instanceof GitHubCommandCancellationError)
+    return {
+      outcome: error.outcome,
+      childSettlement: error.outcome === "unconfirmed" ? "unconfirmed" : "confirmed",
+    };
+  if (error instanceof GitHubCommandError || error instanceof GitHubCommandResultError)
+    return { outcome: "failed", childSettlement: error.childSettlement };
+  return undefined;
+}
 
 function compareGitHubIdentityStrings(
   left: string,
@@ -72,6 +90,21 @@ function commandOptions(
   options: GitHubExecutionOptions = {},
 ): GitHubCommandOptions {
   return { cwd: workspace.path, ...options };
+}
+
+function mutationCommandOptions(
+  workspace: RunWorkspace,
+  options: GitHubExecutionOptions,
+  signal?: AbortSignal,
+): GitHubCommandOptions {
+  return {
+    ...commandOptions(workspace, options),
+    ...(signal ? { signal } : {}),
+  };
+}
+
+function throwIfGitHubMutationCancelledBeforeDispatch(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new GitHubCommandCancellationError("cancelled_before_spawn");
 }
 
 async function git(repositoryPath: string, args: string[]): Promise<string> {
@@ -418,6 +451,7 @@ export async function performPullRequestCreation(
   markDispatched: () => Promise<void>,
   options: GitHubExecutionOptions = {},
   boundary?: (point: SideEffectBoundary) => void | Promise<void>,
+  signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
   if (claim.kind !== "github_pr_create")
     throw new Error(`Side effect ${claim.actionId} is not a pull-request creation`);
@@ -434,8 +468,9 @@ export async function performPullRequestCreation(
   if (contentHash(body, hashAlgorithm) !== expected.bodyHash)
     throw new Error(`Pull-request body changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  throwIfGitHubMutationCancelledBeforeDispatch(signal);
   await markDispatched();
-  await createGitHubPullRequest(commandOptions(workspace, options), {
+  await createGitHubPullRequest(mutationCommandOptions(workspace, options, signal), {
     nameWithOwner: expected.nameWithOwner,
     headRefName: expected.headRefName,
     baseRefName: expected.baseRefName,
@@ -1062,6 +1097,7 @@ async function performReviewReply(
   options: GitHubExecutionOptions,
   markDispatched: () => Promise<void>,
   boundary?: (point: SideEffectBoundary) => void | Promise<void>,
+  signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
   const expected = reviewReplyPrecondition(claim);
   await assertPullRequestBinding(workspace, expected, expected.number, options);
@@ -1084,13 +1120,17 @@ async function performReviewReply(
   if (contentHash(body, hashAlgorithm) !== expected.replyBodyHash)
     throw new Error(`Review reply body changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  throwIfGitHubMutationCancelledBeforeDispatch(signal);
   await markDispatched();
-  const reply = await addGitHubReviewThreadReply(commandOptions(workspace, options), {
-    host: expected.host,
-    threadId: expected.threadId,
-    body,
-    clientMutationId: claim.idempotencyKey,
-  });
+  const reply = await addGitHubReviewThreadReply(
+    mutationCommandOptions(workspace, options, signal),
+    {
+      host: expected.host,
+      threadId: expected.threadId,
+      body,
+      clientMutationId: claim.idempotencyKey,
+    },
+  );
   await crossSideEffectBoundary(boundary, "after_action_command");
   return { threadId: expected.threadId, commentId: reply.id, url: reply.url };
 }
@@ -1197,6 +1237,7 @@ async function performReviewResolution(
   options: GitHubExecutionOptions,
   markDispatched: () => Promise<void>,
   boundary?: (point: SideEffectBoundary) => void | Promise<void>,
+  signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
   const expected = reviewResolutionPrecondition(claim);
   await assertPullRequestBinding(workspace, expected, expected.number, options);
@@ -1213,12 +1254,16 @@ async function performReviewResolution(
   if (!reply || thread.isResolved || thread.comments.at(-1)?.id !== reply.id)
     throw new Error(`Review thread ${expected.threadId} is not ready for resolution`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  throwIfGitHubMutationCancelledBeforeDispatch(signal);
   await markDispatched();
-  const resolved = await resolveGitHubReviewThread(commandOptions(workspace, options), {
-    host: expected.host,
-    threadId: expected.threadId,
-    clientMutationId: claim.idempotencyKey,
-  });
+  const resolved = await resolveGitHubReviewThread(
+    mutationCommandOptions(workspace, options, signal),
+    {
+      host: expected.host,
+      threadId: expected.threadId,
+      clientMutationId: claim.idempotencyKey,
+    },
+  );
   await crossSideEffectBoundary(boundary, "after_action_command");
   return { threadId: resolved.id, resolved: resolved.isResolved, replyCommentId: reply.id };
 }
@@ -1401,6 +1446,7 @@ async function performCheckRerun(
   options: GitHubExecutionOptions,
   markDispatched: () => Promise<void>,
   boundary?: (point: SideEffectBoundary) => void | Promise<void>,
+  signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
   const expected = checkRerunPrecondition(claim);
   const current = await currentBoundCheck(workspace, expected, hashAlgorithm, options);
@@ -1414,8 +1460,9 @@ async function performCheckRerun(
   )
     throw new Error(`Check run ${expected.checkId} moved before rerun`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  throwIfGitHubMutationCancelledBeforeDispatch(signal);
   await markDispatched();
-  await rerequestGitHubCheckRun(commandOptions(workspace, options), {
+  await rerequestGitHubCheckRun(mutationCommandOptions(workspace, options, signal), {
     host: expected.host,
     nameWithOwner: expected.nameWithOwner,
     databaseId: expected.databaseId,
@@ -1430,9 +1477,10 @@ export async function rerunLifecycleChecks(input: {
   workspace: RunWorkspace;
   contract: RunContract;
   lifecycle: CapturedPullRequestLifecycle;
-  authorizeWorkspace?: () => Promise<void>;
+  authorizeWorkspace?: (phase: SideEffectAuthorizationPhase) => Promise<void>;
   options?: GitHubExecutionOptions;
   boundary?: (point: SideEffectBoundary) => void | Promise<void>;
+  signal?: AbortSignal;
 }): Promise<string[]> {
   const classification = input.lifecycle.classification;
   const relevantIds =
@@ -1499,9 +1547,12 @@ export async function rerunLifecycleChecks(input: {
           options,
           markDispatched,
           input.boundary,
+          input.signal,
         ),
       dispatchPolicy: "at_most_once",
       deferError: (error) => error instanceof GitHubLifecycleConsistencyError,
+      ...(input.signal ? { signal: input.signal } : {}),
+      classifyCancellation: classifyGitHubCommandCancellation,
       ...(input.boundary ? { boundary: input.boundary } : {}),
     });
     evidence.push(
@@ -1531,9 +1582,10 @@ export async function reconcileReviewThreadActions(input: {
   workspace: RunWorkspace;
   contract: RunContract;
   lifecycle: CapturedPullRequestLifecycle;
-  authorizeWorkspace?: () => Promise<void>;
+  authorizeWorkspace?: (phase: SideEffectAuthorizationPhase) => Promise<void>;
   options?: GitHubExecutionOptions;
   boundary?: (point: SideEffectBoundary) => void | Promise<void>;
+  signal?: AbortSignal;
 }): Promise<string[]> {
   const options = input.options ?? {};
   await input.store.prepareStorage();
@@ -1573,9 +1625,12 @@ export async function reconcileReviewThreadActions(input: {
           options,
           markDispatched,
           input.boundary,
+          input.signal,
         ),
       dispatchPolicy: "reconcile_then_retry",
       revalidateConfirmed: true,
+      ...(input.signal ? { signal: input.signal } : {}),
+      classifyCancellation: classifyGitHubCommandCancellation,
       ...(input.boundary ? { boundary: input.boundary } : {}),
     });
     state = await input.store.loadState();
@@ -1610,9 +1665,12 @@ export async function reconcileReviewThreadActions(input: {
           options,
           markDispatched,
           input.boundary,
+          input.signal,
         ),
       dispatchPolicy: "reconcile_then_retry",
       revalidateConfirmed: true,
+      ...(input.signal ? { signal: input.signal } : {}),
+      classifyCancellation: classifyGitHubCommandCancellation,
       ...(input.boundary ? { boundary: input.boundary } : {}),
     });
     evidence.push(
@@ -1627,9 +1685,10 @@ export async function reconcilePendingGitHubActions(input: {
   store: RunStore;
   node: GraphNode;
   workspace: RunWorkspace;
-  authorizeWorkspace?: () => Promise<void>;
+  authorizeWorkspace?: (phase: SideEffectAuthorizationPhase) => Promise<void>;
   options?: GitHubExecutionOptions;
   boundary?: (point: SideEffectBoundary) => void | Promise<void>;
+  signal?: AbortSignal;
 }): Promise<string[]> {
   const options = input.options ?? {};
   const state = await input.store.loadState();
@@ -1664,6 +1723,7 @@ export async function reconcilePendingGitHubActions(input: {
             options,
             markDispatched,
             input.boundary,
+            input.signal,
           );
         if (claim.kind === "github_review_thread_resolve")
           return await performReviewResolution(
@@ -1673,6 +1733,7 @@ export async function reconcilePendingGitHubActions(input: {
             options,
             markDispatched,
             input.boundary,
+            input.signal,
           );
         return await performCheckRerun(
           input.workspace,
@@ -1681,6 +1742,7 @@ export async function reconcilePendingGitHubActions(input: {
           options,
           markDispatched,
           input.boundary,
+          input.signal,
         );
       },
       dispatchPolicy:
@@ -1691,6 +1753,8 @@ export async function reconcilePendingGitHubActions(input: {
             deferError: (error: unknown) => error instanceof GitHubLifecycleConsistencyError,
           }
         : {}),
+      ...(input.signal ? { signal: input.signal } : {}),
+      classifyCancellation: classifyGitHubCommandCancellation,
       ...(input.boundary ? { boundary: input.boundary } : {}),
     });
     evidence.push(

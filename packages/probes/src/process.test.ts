@@ -261,7 +261,11 @@ describe("bounded subprocess output capture", () => {
     await vi.advanceTimersByTimeAsync(10);
     child.emit("close", 1, null);
 
-    await expect(result).resolves.toMatchObject({ exitCode: 124, timedOut: true });
+    await expect(result).resolves.toMatchObject({
+      exitCode: 124,
+      timedOut: true,
+      childSettlement: "confirmed",
+    });
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
   });
 
@@ -285,10 +289,49 @@ describe("bounded subprocess output capture", () => {
       10 + PROCESS_TERMINATION_GRACE_MS + PROCESS_SETTLEMENT_GRACE_MS + 1,
     );
 
-    await expect(result).resolves.toMatchObject({ exitCode: 124, timedOut: true });
+    await expect(result).resolves.toMatchObject({
+      exitCode: 124,
+      timedOut: true,
+      childSettlement: "unconfirmed",
+    });
     expect(child.kill).toHaveBeenNthCalledWith(1, "SIGTERM");
     expect(child.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
     expect(child.stdin.destroyed).toBe(true);
+    expect(child.stdout.destroyed).toBe(true);
+    expect(child.stderr.destroyed).toBe(true);
+    expect(child.unref).toHaveBeenCalledOnce();
+  });
+
+  it("retains unconfirmed child settlement on rejected output overflow", async () => {
+    vi.useFakeTimers();
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill: vi.fn(() => true),
+      unref: vi.fn(),
+    });
+    vi.spyOn(crossSpawn, "spawn").mockReturnValue(child as never);
+
+    const result = runProcess(process.execPath, [], {
+      cwd: process.cwd(),
+      maxOutputBytesPerStream: 1,
+    });
+    const observedResult = result.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    child.stdout.write("overflow");
+    await vi.advanceTimersByTimeAsync(
+      PROCESS_TERMINATION_GRACE_MS + PROCESS_SETTLEMENT_GRACE_MS + 1,
+    );
+
+    await expect(observedResult).resolves.toMatchObject({
+      name: "ProcessOutputLimitError",
+      stream: "stdout",
+      childSettlement: "unconfirmed",
+    });
+    expect(child.kill).toHaveBeenNthCalledWith(1, "SIGTERM");
+    expect(child.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
     expect(child.stdout.destroyed).toBe(true);
     expect(child.stderr.destroyed).toBe(true);
     expect(child.unref).toHaveBeenCalledOnce();

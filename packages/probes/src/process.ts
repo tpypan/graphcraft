@@ -39,6 +39,7 @@ export interface ProcessResult {
   stderr: string;
   durationMs: number;
   timedOut: boolean;
+  childSettlement: "confirmed" | "unconfirmed";
   capture: ProcessCaptureMetadata;
 }
 
@@ -86,13 +87,19 @@ export interface ManagedProcessLifecycle {
 export class ProcessOutputLimitError extends Error {
   readonly stream: "stdout" | "stderr";
   readonly capture: ProcessCaptureMetadata;
+  readonly childSettlement: ProcessResult["childSettlement"];
 
-  constructor(stream: "stdout" | "stderr", capture: ProcessCaptureMetadata) {
+  constructor(
+    stream: "stdout" | "stderr",
+    capture: ProcessCaptureMetadata,
+    childSettlement: ProcessResult["childSettlement"] = "confirmed",
+  ) {
     const limit = capture[stream].limitBytes;
     super(`Subprocess ${stream} exceeded the ${limit}-byte capture limit; output was rejected`);
     this.name = "ProcessOutputLimitError";
     this.stream = stream;
     this.capture = capture;
+    this.childSettlement = childSettlement;
   }
 }
 
@@ -650,7 +657,7 @@ async function runManagedProcess(
         stderr: stderr.metadata,
       };
       if (overflowStream) {
-        reject(new ProcessOutputLimitError(overflowStream, captureMetadata));
+        reject(new ProcessOutputLimitError(overflowStream, captureMetadata, "confirmed"));
         return;
       }
       resolve({
@@ -659,6 +666,7 @@ async function runManagedProcess(
         stderr: stderr.text,
         durationMs: Math.round(performance.now() - started),
         timedOut,
+        childSettlement: "confirmed",
         capture: captureMetadata,
       });
     };
@@ -800,7 +808,10 @@ export async function runProcess(
         } catch {
           // Bounded settlement below prevents an unresponsive child from hanging the caller.
         }
-        settlementTimer = setTimeout(() => complete(null), PROCESS_SETTLEMENT_GRACE_MS);
+        settlementTimer = setTimeout(
+          () => complete(null, undefined, "unconfirmed"),
+          PROCESS_SETTLEMENT_GRACE_MS,
+        );
         settlementTimer.unref();
       }, PROCESS_TERMINATION_GRACE_MS);
       escalationTimer.unref();
@@ -843,7 +854,11 @@ export async function runProcess(
       options.signal?.removeEventListener("abort", abort);
     };
 
-    const complete = (code: number | null, error?: Error): void => {
+    const complete = (
+      code: number | null,
+      error?: Error,
+      childSettlement: ProcessResult["childSettlement"] = "confirmed",
+    ): void => {
       if (settled) return;
       settled = true;
       cleanup();
@@ -870,7 +885,7 @@ export async function runProcess(
         stderr: stderr.metadata,
       };
       if (overflowStream) {
-        reject(new ProcessOutputLimitError(overflowStream, captureMetadata));
+        reject(new ProcessOutputLimitError(overflowStream, captureMetadata, childSettlement));
         return;
       }
       resolve({
@@ -879,6 +894,7 @@ export async function runProcess(
         stderr: stderr.text,
         durationMs: Math.round(performance.now() - started),
         timedOut,
+        childSettlement,
         capture: captureMetadata,
       });
     };

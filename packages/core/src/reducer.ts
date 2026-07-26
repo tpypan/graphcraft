@@ -244,6 +244,7 @@ export function reduceEvents(events: RunEvent[]): RunState {
           : entry.evidence;
         entry.failure = undefined;
         entry.retryable = undefined;
+        entry.childSettlement = undefined;
         entry.updatedAt = event.timestamp;
         break;
       }
@@ -254,6 +255,21 @@ export function reduceEvents(events: RunEvent[]): RunState {
         entry.status = data.uncertain === true ? "uncertain" : "failed";
         entry.failure = requiredString(data, "reason");
         entry.retryable = data.retryable === true;
+        entry.childSettlement =
+          data.childSettlement === "confirmed" || data.childSettlement === "unconfirmed"
+            ? data.childSettlement
+            : undefined;
+        if (data.cancellationOutcome === "cancelled_before_spawn") {
+          if (
+            entry.childSettlement !== "confirmed" ||
+            entry.retryable !== true ||
+            data.uncertain === true
+          )
+            throw new Error(
+              `Side effect ${actionId} has an invalid cancelled-before-spawn settlement`,
+            );
+          entry.dispatchedAt = undefined;
+        }
         entry.updatedAt = event.timestamp;
         break;
       }

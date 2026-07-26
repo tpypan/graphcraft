@@ -20,6 +20,23 @@ export type SideEffectBoundary =
 
 export type SideEffectDispatchPolicy = "reconcile_then_retry" | "at_most_once";
 
+export type SideEffectAuthorizationPhase = "precondition" | "dispatch" | "settlement";
+
+export interface SideEffectCancellation {
+  outcome: "cancelled_before_spawn" | "terminated" | "unconfirmed" | "failed";
+  childSettlement: "confirmed" | "unconfirmed";
+}
+
+export interface SideEffectInterruptionReceipt {
+  actionId: string;
+  kind: SideEffectClaim["kind"];
+  dispatchPolicy: SideEffectDispatchPolicy;
+  dispatched: boolean;
+  childSettlement: "not_started" | "confirmed" | "unconfirmed";
+  reconciliation: "not_attempted" | SideEffectReconciliation["status"];
+  disposition: "checkpointed" | "confirmed" | "retryable" | "uncertain";
+}
+
 export type SideEffectReconciliation =
   | { status: "applied"; result: Record<string, unknown>; evidence: string[] }
   | { status: "not_applied"; evidence: string[] }
@@ -28,7 +45,7 @@ export type SideEffectReconciliation =
 export interface ExecuteSideEffectInput {
   store: RunStore;
   claim: SideEffectClaim;
-  authorize?: () => Promise<void>;
+  authorize?: (phase: SideEffectAuthorizationPhase) => Promise<void>;
   reconcile: (claim: SideEffectClaim) => Promise<SideEffectReconciliation>;
   act: (
     claim: SideEffectClaim,
@@ -38,6 +55,8 @@ export interface ExecuteSideEffectInput {
   boundary?: (point: SideEffectBoundary) => void | Promise<void>;
   revalidateConfirmed?: boolean;
   deferError?: (error: unknown) => boolean;
+  signal?: AbortSignal;
+  classifyCancellation?: (error: unknown) => SideEffectCancellation | undefined;
 }
 
 export class SideEffectBoundaryInterruption extends Error {
@@ -50,11 +69,67 @@ export class SideEffectBoundaryInterruption extends Error {
   }
 }
 
+export class SideEffectInterruption extends Error {
+  constructor(readonly receipt: SideEffectInterruptionReceipt) {
+    super(`Side-effect ${receipt.kind} ${receipt.actionId} was interrupted safely`);
+    this.name = "SideEffectInterruption";
+  }
+}
+
 function journalEntry(
   entries: SideEffectJournalEntry[],
   actionId: string,
 ): SideEffectJournalEntry | undefined {
   return entries.find(({ claim }) => claim.actionId === actionId);
+}
+
+function interruptionReceipt(
+  input: ExecuteSideEffectInput,
+  claim: SideEffectClaim,
+  dispatched: boolean,
+  childSettlement: SideEffectInterruptionReceipt["childSettlement"],
+  reconciliation: SideEffectInterruptionReceipt["reconciliation"],
+  disposition: SideEffectInterruptionReceipt["disposition"],
+): SideEffectInterruptionReceipt {
+  return {
+    actionId: claim.actionId,
+    kind: claim.kind,
+    dispatchPolicy: input.dispatchPolicy,
+    dispatched,
+    childSettlement,
+    reconciliation,
+    disposition,
+  };
+}
+
+function checkpointInterruption(
+  input: ExecuteSideEffectInput,
+  claim: SideEffectClaim,
+  dispatched: boolean,
+): SideEffectInterruption {
+  return new SideEffectInterruption(
+    interruptionReceipt(input, claim, dispatched, "not_started", "not_attempted", "checkpointed"),
+  );
+}
+
+async function authorizePhase(
+  input: ExecuteSideEffectInput,
+  claim: SideEffectClaim,
+  phase: SideEffectAuthorizationPhase,
+  dispatched: boolean,
+): Promise<void> {
+  try {
+    if (phase !== "settlement" && input.signal?.aborted)
+      throw checkpointInterruption(input, claim, dispatched);
+    await input.authorize?.(phase);
+    if (phase !== "settlement" && input.signal?.aborted)
+      throw checkpointInterruption(input, claim, dispatched);
+  } catch (error) {
+    if (error instanceof SideEffectInterruption) throw error;
+    if (phase !== "settlement" && input.signal?.aborted)
+      throw checkpointInterruption(input, claim, dispatched);
+    throw error;
+  }
 }
 
 export async function crossSideEffectBoundary(
@@ -75,22 +150,42 @@ async function reconcileAndRecord(
     SideEffectBoundary,
     "after_precondition_reconcile" | "after_confirmation_reconcile"
   >,
+  phase: Extract<SideEffectAuthorizationPhase, "precondition" | "settlement">,
+  dispatched: boolean,
+  options: { childSettlement?: "confirmed"; deferErrors?: boolean } = {},
 ): Promise<SideEffectReconciliation> {
-  await input.authorize?.();
+  if (phase === "precondition") await authorizePhase(input, claim, phase, dispatched);
   let reconciliation: SideEffectReconciliation;
   try {
+    if (phase === "settlement") await authorizePhase(input, claim, phase, dispatched);
     reconciliation = await input.reconcile(claim);
   } catch (error) {
-    if (input.deferError?.(error)) throw error;
+    if (phase === "precondition" && input.signal?.aborted)
+      throw checkpointInterruption(input, claim, dispatched);
+    const interruptedSettlement = phase === "settlement" && input.signal?.aborted === true;
+    if (!interruptedSettlement && options.deferErrors !== false && input.deferError?.(error))
+      throw error;
     const reason = `Unable to reconcile ${claim.kind} ${claim.actionId}: ${
       error instanceof Error ? error.message : String(error)
     }`;
     await input.store.append(
       "runtime",
       "side_effect.failed",
-      { actionId: claim.actionId, reason, retryable: false, uncertain: true },
+      {
+        actionId: claim.actionId,
+        reason,
+        retryable: false,
+        uncertain: true,
+        ...(options.childSettlement || interruptedSettlement
+          ? { childSettlement: options.childSettlement ?? "confirmed" }
+          : {}),
+      },
       claim.actionId,
     );
+    if (interruptedSettlement)
+      throw new SideEffectInterruption(
+        interruptionReceipt(input, claim, dispatched, "confirmed", "unknown", "uncertain"),
+      );
     throw new Error(reason);
   }
   await input.store.append(
@@ -142,6 +237,118 @@ function assertDispatchPolicy(claim: SideEffectClaim, policy: SideEffectDispatch
     throw new Error(`${claim.kind} side effects require the ${required} dispatch policy`);
 }
 
+function classifyCancellation(
+  input: ExecuteSideEffectInput,
+  error: unknown,
+): SideEffectCancellation | undefined {
+  const classified = input.classifyCancellation?.(error);
+  if (
+    classified &&
+    (classified.outcome !== "failed" ||
+      classified.childSettlement === "unconfirmed" ||
+      input.signal?.aborted)
+  )
+    return classified;
+  return undefined;
+}
+
+async function recordInterruptionFailure(
+  input: ExecuteSideEffectInput,
+  claim: SideEffectClaim,
+  reason: string,
+  retryable: boolean,
+  uncertain: boolean,
+  childSettlement: "confirmed" | "unconfirmed",
+  cancellationOutcome?: "cancelled_before_spawn",
+): Promise<void> {
+  await input.store.append(
+    "runtime",
+    "side_effect.failed",
+    {
+      actionId: claim.actionId,
+      reason,
+      retryable,
+      uncertain,
+      childSettlement,
+      ...(cancellationOutcome ? { cancellationOutcome } : {}),
+    },
+    claim.actionId,
+  );
+}
+
+async function settleCancellation(
+  input: ExecuteSideEffectInput,
+  claim: SideEffectClaim,
+  cancellation: SideEffectCancellation,
+  dispatched: boolean,
+  reason: string,
+  settledReconciliation?: SideEffectReconciliation,
+): Promise<never> {
+  if (cancellation.childSettlement === "unconfirmed") {
+    await recordInterruptionFailure(input, claim, reason, false, true, "unconfirmed");
+    throw new SideEffectInterruption(
+      interruptionReceipt(input, claim, dispatched, "unconfirmed", "not_attempted", "uncertain"),
+    );
+  }
+
+  if (cancellation.outcome === "cancelled_before_spawn") {
+    await recordInterruptionFailure(
+      input,
+      claim,
+      reason,
+      true,
+      false,
+      "confirmed",
+      "cancelled_before_spawn",
+    );
+    throw new SideEffectInterruption(
+      interruptionReceipt(input, claim, dispatched, "not_started", "not_attempted", "retryable"),
+    );
+  }
+
+  let reconciliation: SideEffectReconciliation;
+  try {
+    reconciliation =
+      settledReconciliation ??
+      (await reconcileAndRecord(
+        input,
+        claim,
+        "after_confirmation_reconcile",
+        "settlement",
+        dispatched,
+        { childSettlement: "confirmed", deferErrors: false },
+      ));
+  } catch (error) {
+    if (error instanceof SideEffectBoundaryInterruption) throw error;
+    if (error instanceof SideEffectInterruption) throw error;
+    throw new SideEffectInterruption(
+      interruptionReceipt(input, claim, dispatched, "confirmed", "unknown", "uncertain"),
+    );
+  }
+  if (reconciliation.status === "applied") {
+    await confirm(input, claim, reconciliation);
+    throw new SideEffectInterruption(
+      interruptionReceipt(input, claim, dispatched, "confirmed", "applied", "confirmed"),
+    );
+  }
+  const { retryable, uncertain } = unobservableDisposition(
+    input.dispatchPolicy,
+    dispatched,
+    reconciliation,
+  );
+  await recordInterruptionFailure(input, claim, reason, retryable, uncertain, "confirmed");
+  throw new SideEffectInterruption(
+    interruptionReceipt(
+      input,
+      claim,
+      dispatched,
+      "confirmed",
+      reconciliation.status,
+      uncertain ? "uncertain" : "retryable",
+    ),
+  );
+}
+
 export async function executeSideEffect(
   input: ExecuteSideEffectInput,
 ): Promise<Record<string, unknown>> {
@@ -158,10 +365,20 @@ export async function executeSideEffect(
   }
   if (!entry) throw new Error(`Side-effect claim ${claim.actionId} was not persisted`);
   claim = entry.claim;
+  if (entry.childSettlement === "unconfirmed")
+    throw new Error(
+      `The child settlement for ${claim.kind} ${claim.actionId} is unconfirmed; refusing to reconcile or retry while the mutation process may still be running`,
+    );
   if (entry.status === "confirmed") {
     if (!entry.result) throw new Error(`Confirmed side effect ${claim.actionId} has no result`);
     if (!input.revalidateConfirmed) return entry.result;
-    const confirmed = await reconcileAndRecord(input, claim, "after_precondition_reconcile");
+    const confirmed = await reconcileAndRecord(
+      input,
+      claim,
+      "after_precondition_reconcile",
+      "precondition",
+      true,
+    );
     if (confirmed.status === "applied") return confirmed.result;
     const reason = `Confirmed ${claim.kind} ${claim.actionId} no longer matches external truth`;
     await input.store.append(
@@ -173,7 +390,13 @@ export async function executeSideEffect(
     throw new Error(reason);
   }
 
-  const before = await reconcileAndRecord(input, claim, "after_precondition_reconcile");
+  const before = await reconcileAndRecord(
+    input,
+    claim,
+    "after_precondition_reconcile",
+    "precondition",
+    entry.dispatchedAt !== undefined,
+  );
   if (before.status === "applied") return await confirm(input, claim, before);
   if (before.status === "unknown") {
     const reason = `The outcome of ${claim.kind} ${claim.actionId} is uncertain; refusing to retry`;
@@ -197,11 +420,11 @@ export async function executeSideEffect(
   }
 
   await crossSideEffectBoundary(input.boundary, "before_act");
-  await input.authorize?.();
   let dispatched = entry.dispatchedAt !== undefined;
   let markedThisAttempt = false;
+  await authorizePhase(input, claim, "dispatch", dispatched);
   const markDispatched = async (): Promise<void> => {
-    await input.authorize?.();
+    await authorizePhase(input, claim, "dispatch", dispatched);
     if (!dispatched) {
       await input.store.append(
         "runtime",
@@ -218,10 +441,51 @@ export async function executeSideEffect(
     await input.act(claim, markDispatched);
   } catch (error) {
     if (error instanceof SideEffectBoundaryInterruption) throw error;
-    if (!markedThisAttempt && input.deferError?.(error)) throw error;
+    if (error instanceof SideEffectInterruption) throw error;
+    let cancellation = classifyCancellation(input, error);
     const reason = error instanceof Error ? error.message : String(error);
-    const afterFailure = await reconcileAndRecord(input, claim, "after_confirmation_reconcile");
-    if (afterFailure.status === "applied") return await confirm(input, claim, afterFailure);
+    if (
+      cancellation?.outcome === "failed" &&
+      cancellation.childSettlement === "unconfirmed" &&
+      !input.signal?.aborted
+    ) {
+      await recordInterruptionFailure(input, claim, reason, false, true, "unconfirmed");
+      throw error;
+    }
+    if (!markedThisAttempt) {
+      if (cancellation?.childSettlement === "unconfirmed")
+        await settleCancellation(input, claim, cancellation, dispatched, reason);
+      if (cancellation || input.signal?.aborted)
+        throw checkpointInterruption(input, claim, dispatched);
+    }
+    if (!cancellation && input.signal?.aborted)
+      cancellation = { outcome: "unconfirmed", childSettlement: "unconfirmed" };
+    if (cancellation) await settleCancellation(input, claim, cancellation, dispatched, reason);
+    if (!markedThisAttempt && input.deferError?.(error)) throw error;
+    const afterFailure = await reconcileAndRecord(
+      input,
+      claim,
+      "after_confirmation_reconcile",
+      "settlement",
+      dispatched,
+    );
+    if (input.signal?.aborted)
+      await settleCancellation(
+        input,
+        claim,
+        { outcome: "terminated", childSettlement: "confirmed" },
+        dispatched,
+        reason,
+        afterFailure,
+      );
+    if (afterFailure.status === "applied") {
+      const result = await confirm(input, claim, afterFailure);
+      if (input.signal?.aborted)
+        throw new SideEffectInterruption(
+          interruptionReceipt(input, claim, dispatched, "confirmed", "applied", "confirmed"),
+        );
+      return result;
+    }
     const { retryable, uncertain } = unobservableDisposition(
       input.dispatchPolicy,
       dispatched,
@@ -238,6 +502,17 @@ export async function executeSideEffect(
       },
       claim.actionId,
     );
+    if (input.signal?.aborted)
+      throw new SideEffectInterruption(
+        interruptionReceipt(
+          input,
+          claim,
+          dispatched,
+          "confirmed",
+          afterFailure.status,
+          uncertain ? "uncertain" : "retryable",
+        ),
+      );
     throw new Error(
       uncertain
         ? `${reason}; the side-effect outcome is uncertain and will not be retried blindly`
@@ -248,8 +523,39 @@ export async function executeSideEffect(
     throw new Error(`${claim.kind} ${claim.actionId} acted without a dispatch checkpoint`);
   await crossSideEffectBoundary(input.boundary, "after_act");
 
-  const after = await reconcileAndRecord(input, claim, "after_confirmation_reconcile");
-  if (after.status === "applied") return await confirm(input, claim, after);
+  if (input.signal?.aborted)
+    await settleCancellation(
+      input,
+      claim,
+      { outcome: "terminated", childSettlement: "confirmed" },
+      dispatched,
+      `${claim.kind} ${claim.actionId} settled after cancellation`,
+    );
+
+  const after = await reconcileAndRecord(
+    input,
+    claim,
+    "after_confirmation_reconcile",
+    "settlement",
+    dispatched,
+  );
+  if (input.signal?.aborted)
+    await settleCancellation(
+      input,
+      claim,
+      { outcome: "terminated", childSettlement: "confirmed" },
+      dispatched,
+      `${claim.kind} ${claim.actionId} settled during reconciliation`,
+      after,
+    );
+  if (after.status === "applied") {
+    const result = await confirm(input, claim, after);
+    if (input.signal?.aborted)
+      throw new SideEffectInterruption(
+        interruptionReceipt(input, claim, dispatched, "confirmed", "applied", "confirmed"),
+      );
+    return result;
+  }
   const { retryable, uncertain } = unobservableDisposition(input.dispatchPolicy, dispatched, after);
   const reason = uncertain
     ? `The outcome of ${claim.kind} ${claim.actionId} is uncertain after execution`
@@ -260,5 +566,16 @@ export async function executeSideEffect(
     { actionId: claim.actionId, reason, retryable, uncertain },
     claim.actionId,
   );
+  if (input.signal?.aborted)
+    throw new SideEffectInterruption(
+      interruptionReceipt(
+        input,
+        claim,
+        dispatched,
+        "confirmed",
+        after.status,
+        uncertain ? "uncertain" : "retryable",
+      ),
+    );
   throw new Error(reason);
 }

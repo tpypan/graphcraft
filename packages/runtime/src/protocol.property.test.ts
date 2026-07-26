@@ -16,9 +16,12 @@ import { afterEach, describe, expect, it } from "vitest";
 import { CURRENT_RUN_STORAGE_VERSION, ensureCurrentRunStorage } from "./migration.ts";
 import {
   SideEffectBoundaryInterruption,
+  SideEffectInterruption,
   crossSideEffectBoundary,
   executeSideEffect,
   type SideEffectBoundary,
+  type SideEffectCancellation,
+  type SideEffectDispatchPolicy,
   type SideEffectReconciliation,
 } from "./side-effect.ts";
 import { RunStore } from "./store.ts";
@@ -141,6 +144,54 @@ function sideEffectGraph(
   return { contract, graph };
 }
 
+class GeneratedSideEffectCancellation extends Error {
+  constructor(
+    readonly cancellation: SideEffectCancellation,
+    message = `generated ${cancellation.outcome} cancellation`,
+  ) {
+    super(message);
+    this.name = "GeneratedSideEffectCancellation";
+  }
+}
+
+async function interruptionFrom(
+  execution: Promise<Record<string, unknown>>,
+): Promise<SideEffectInterruption> {
+  try {
+    await execution;
+  } catch (error) {
+    expect(error).toBeInstanceOf(SideEffectInterruption);
+    return error as SideEffectInterruption;
+  }
+  throw new Error("Expected side-effect execution to be interrupted");
+}
+
+async function generatedSideEffectFixture(seed: string, dispatchPolicy: SideEffectDispatchPolicy) {
+  const root = await mkdtemp(join(tmpdir(), `graphcraft-generated-${seed}-`));
+  roots.push(root);
+  const nodeId = `effect-${seed}`;
+  const { contract, graph } = sideEffectGraph(root, [nodeId]);
+  const store = await RunStore.create(root, contract, graph);
+  const kind = dispatchPolicy === "at_most_once" ? "github_check_rerun" : "github_pr_comment";
+  const claim: SideEffectClaim = {
+    schemaVersion: 1,
+    actionId: contentHash({ protocol: "generated-cancellation", seed, dispatchPolicy }),
+    idempotencyKey: `generated-${seed}`,
+    nodeId,
+    kind,
+    target: `fixture-${seed}`,
+    precondition: { seed },
+    claimedAt: "2026-07-26T12:00:00.000Z",
+  };
+  return { claim, nodeId, store };
+}
+
+async function expectNoExecutionFailure(store: RunStore, nodeId: string): Promise<void> {
+  const [state, events] = await Promise.all([store.loadState(), store.loadEvents()]);
+  expect(state.nodes[nodeId]?.status).toBe("pending");
+  expect(events.filter(({ type }) => type === "node.failed" || type === "run.blocked")).toEqual([]);
+}
+
 describe("generated migration properties", () => {
   it("migrates generated implicit-v0 and explicit-v1 trees idempotently to current storage", async () => {
     for (let seed = 1; seed <= 8; seed += 1) {
@@ -224,6 +275,521 @@ describe("generated side-effect protocol properties", () => {
     ).rejects.toThrow("github_check_rerun side effects require the at_most_once dispatch policy");
     expect(acted).toBe(false);
     expect((await store.loadState()).sideEffects).toHaveLength(0);
+  });
+
+  it("checkpoints cancellation before spawn and while authorizing the dispatch checkpoint", async () => {
+    for (const interruptionPoint of ["precondition", "pre_spawn", "checkpoint"] as const) {
+      const { claim, nodeId, store } = await generatedSideEffectFixture(
+        `checkpoint-${interruptionPoint}`,
+        "reconcile_then_retry",
+      );
+      const cancellation = new GeneratedSideEffectCancellation({
+        outcome: "cancelled_before_spawn",
+        childSettlement: "confirmed",
+      });
+      const controller = new AbortController();
+      const authorizationPhases: string[] = [];
+      let dispatchAuthorizations = 0;
+      let reconciliationCalls = 0;
+      let actCalls = 0;
+      const interruption = await interruptionFrom(
+        executeSideEffect({
+          store,
+          claim,
+          dispatchPolicy: "reconcile_then_retry",
+          authorize: async (phase) => {
+            authorizationPhases.push(phase);
+            if (phase === "precondition" && interruptionPoint === "precondition") {
+              controller.abort(cancellation);
+              throw cancellation;
+            }
+            if (phase === "dispatch") {
+              dispatchAuthorizations += 1;
+              if (interruptionPoint === "checkpoint" && dispatchAuthorizations === 2) {
+                controller.abort(cancellation);
+                throw cancellation;
+              }
+            }
+          },
+          reconcile: async () => {
+            reconciliationCalls += 1;
+            return { status: "not_applied", evidence: ["absent"] };
+          },
+          act: async (__, markDispatched) => {
+            actCalls += 1;
+            if (interruptionPoint === "pre_spawn") {
+              controller.abort(cancellation);
+              throw cancellation;
+            }
+            await markDispatched();
+            throw new Error("dispatch checkpoint unexpectedly allowed execution");
+          },
+          signal: controller.signal,
+          classifyCancellation: (error) =>
+            error instanceof GeneratedSideEffectCancellation ? error.cancellation : undefined,
+        }),
+      );
+
+      expect(interruption.receipt).toEqual({
+        actionId: claim.actionId,
+        kind: claim.kind,
+        dispatchPolicy: "reconcile_then_retry",
+        dispatched: false,
+        childSettlement: "not_started",
+        reconciliation: "not_attempted",
+        disposition: "checkpointed",
+      });
+      expect(authorizationPhases).toEqual(
+        interruptionPoint === "precondition"
+          ? ["precondition"]
+          : interruptionPoint === "pre_spawn"
+            ? ["precondition", "dispatch"]
+            : ["precondition", "dispatch", "dispatch"],
+      );
+      expect(reconciliationCalls).toBe(interruptionPoint === "precondition" ? 0 : 1);
+      expect(actCalls).toBe(interruptionPoint === "precondition" ? 0 : 1);
+      const entry = (await store.loadState()).sideEffects.find(
+        ({ claim: persisted }) => persisted.actionId === claim.actionId,
+      );
+      expect(entry).toMatchObject({
+        status: "claimed",
+        reconciliationAttempts: reconciliationCalls,
+      });
+      expect(entry?.dispatchedAt).toBeUndefined();
+      await expectNoExecutionFailure(store, nodeId);
+    }
+  });
+
+  it("checkpoints an ordinary preparatory failure that races cancellation without inventing a child", async () => {
+    const { claim, nodeId, store } = await generatedSideEffectFixture(
+      "ordinary-preparation-race",
+      "reconcile_then_retry",
+    );
+    const controller = new AbortController();
+    const failure = new Error("read-only preparation failed");
+    let reconciliationCalls = 0;
+
+    const interruption = await interruptionFrom(
+      executeSideEffect({
+        store,
+        claim,
+        dispatchPolicy: "reconcile_then_retry",
+        reconcile: async () => {
+          reconciliationCalls += 1;
+          return { status: "not_applied", evidence: ["absent-before-preparation"] };
+        },
+        act: async () => {
+          controller.abort(new Error("pause raced preparation"));
+          throw failure;
+        },
+        signal: controller.signal,
+      }),
+    );
+
+    expect(interruption.receipt).toEqual({
+      actionId: claim.actionId,
+      kind: claim.kind,
+      dispatchPolicy: "reconcile_then_retry",
+      dispatched: false,
+      childSettlement: "not_started",
+      reconciliation: "not_attempted",
+      disposition: "checkpointed",
+    });
+    expect(reconciliationCalls).toBe(1);
+    const entry = (await store.loadState()).sideEffects[0];
+    expect(entry).toMatchObject({ status: "claimed", reconciliationAttempts: 1 });
+    expect(entry?.childSettlement).toBeUndefined();
+    expect(entry?.failure).toBeUndefined();
+    await expectNoExecutionFailure(store, nodeId);
+  });
+
+  it("reconciles confirmed cancellation according to policy and external truth", async () => {
+    const cases: Array<{
+      policy: SideEffectDispatchPolicy;
+      reconciliation: SideEffectReconciliation;
+      disposition: SideEffectInterruption["receipt"]["disposition"];
+      journalStatus: "confirmed" | "failed" | "uncertain";
+      retryable?: boolean;
+    }> = [];
+    for (const policy of ["reconcile_then_retry", "at_most_once"] as const) {
+      cases.push(
+        {
+          policy,
+          reconciliation: {
+            status: "applied",
+            result: { externalId: `applied-${policy}` },
+            evidence: [`observed-${policy}`],
+          },
+          disposition: "confirmed",
+          journalStatus: "confirmed",
+        },
+        {
+          policy,
+          reconciliation: { status: "not_applied", evidence: [`absent-${policy}`] },
+          disposition: policy === "reconcile_then_retry" ? "retryable" : "uncertain",
+          journalStatus: policy === "reconcile_then_retry" ? "failed" : "uncertain",
+          retryable: policy === "reconcile_then_retry",
+        },
+        {
+          policy,
+          reconciliation: { status: "unknown", evidence: [`unknown-${policy}`] },
+          disposition: "uncertain",
+          journalStatus: "uncertain",
+          retryable: false,
+        },
+      );
+    }
+
+    for (const [index, testCase] of cases.entries()) {
+      const { claim, nodeId, store } = await generatedSideEffectFixture(
+        `confirmed-${index}`,
+        testCase.policy,
+      );
+      const cancellation = new GeneratedSideEffectCancellation({
+        outcome: "terminated",
+        childSettlement: "confirmed",
+      });
+      const authorizationPhases: string[] = [];
+      let reconciliationCalls = 0;
+      const interruption = await interruptionFrom(
+        executeSideEffect({
+          store,
+          claim,
+          dispatchPolicy: testCase.policy,
+          authorize: async (phase) => {
+            authorizationPhases.push(phase);
+          },
+          reconcile: async () => {
+            reconciliationCalls += 1;
+            return reconciliationCalls === 1
+              ? { status: "not_applied", evidence: ["absent-before-dispatch"] }
+              : testCase.reconciliation;
+          },
+          act: async (__, markDispatched) => {
+            await markDispatched();
+            throw cancellation;
+          },
+          classifyCancellation: (error) =>
+            error instanceof GeneratedSideEffectCancellation ? error.cancellation : undefined,
+        }),
+      );
+
+      expect(interruption.receipt).toEqual({
+        actionId: claim.actionId,
+        kind: claim.kind,
+        dispatchPolicy: testCase.policy,
+        dispatched: true,
+        childSettlement: "confirmed",
+        reconciliation: testCase.reconciliation.status,
+        disposition: testCase.disposition,
+      });
+      expect(authorizationPhases).toEqual(["precondition", "dispatch", "dispatch", "settlement"]);
+      expect(reconciliationCalls).toBe(2);
+      const entry = (await store.loadState()).sideEffects.find(
+        ({ claim: persisted }) => persisted.actionId === claim.actionId,
+      );
+      expect(entry).toMatchObject({
+        status: testCase.journalStatus,
+        reconciliationAttempts: 2,
+      });
+      expect(entry?.dispatchedAt).toEqual(expect.any(String));
+      if (testCase.reconciliation.status === "applied") {
+        expect(entry?.result).toEqual(testCase.reconciliation.result);
+        expect(entry?.retryable).toBeUndefined();
+        expect(entry?.childSettlement).toBeUndefined();
+      } else {
+        expect(entry?.retryable).toBe(testCase.retryable);
+        expect(entry?.childSettlement).toBe("confirmed");
+      }
+      await expectNoExecutionFailure(store, nodeId);
+    }
+  });
+
+  it("records unconfirmed child settlement without attempting post-failure reconciliation", async () => {
+    for (const policy of ["reconcile_then_retry", "at_most_once"] as const) {
+      const { claim, nodeId, store } = await generatedSideEffectFixture(
+        `unconfirmed-${policy}`,
+        policy,
+      );
+      const cancellation = new GeneratedSideEffectCancellation({
+        outcome: "unconfirmed",
+        childSettlement: "unconfirmed",
+      });
+      const authorizationPhases: string[] = [];
+      let reconciliationCalls = 0;
+      const interruption = await interruptionFrom(
+        executeSideEffect({
+          store,
+          claim,
+          dispatchPolicy: policy,
+          authorize: async (phase) => {
+            authorizationPhases.push(phase);
+          },
+          reconcile: async () => {
+            reconciliationCalls += 1;
+            return { status: "not_applied", evidence: ["absent-before-dispatch"] };
+          },
+          act: async (__, markDispatched) => {
+            await markDispatched();
+            throw cancellation;
+          },
+          classifyCancellation: (error) =>
+            error instanceof GeneratedSideEffectCancellation ? error.cancellation : undefined,
+        }),
+      );
+
+      expect(interruption.receipt).toEqual({
+        actionId: claim.actionId,
+        kind: claim.kind,
+        dispatchPolicy: policy,
+        dispatched: true,
+        childSettlement: "unconfirmed",
+        reconciliation: "not_attempted",
+        disposition: "uncertain",
+      });
+      expect(authorizationPhases).toEqual(["precondition", "dispatch", "dispatch"]);
+      expect(reconciliationCalls).toBe(1);
+      const entry = (await store.loadState()).sideEffects.find(
+        ({ claim: persisted }) => persisted.actionId === claim.actionId,
+      );
+      expect(entry).toMatchObject({
+        status: "uncertain",
+        reconciliationAttempts: 1,
+        retryable: false,
+        childSettlement: "unconfirmed",
+      });
+      expect(entry?.dispatchedAt).toEqual(expect.any(String));
+
+      await expect(
+        executeSideEffect({
+          store,
+          claim,
+          dispatchPolicy: policy,
+          reconcile: async () => {
+            reconciliationCalls += 1;
+            return { status: "unknown", evidence: ["must not reconcile"] };
+          },
+          act: async () => {
+            throw new Error("must not act");
+          },
+        }),
+      ).rejects.toThrow("child settlement");
+      expect(reconciliationCalls).toBe(1);
+      await expectNoExecutionFailure(store, nodeId);
+    }
+  });
+
+  it("blocks an unconfirmed command failure without misreporting cooperative cancellation", async () => {
+    const { claim, nodeId, store } = await generatedSideEffectFixture(
+      "unconfirmed-command-failure",
+      "reconcile_then_retry",
+    );
+    const failure = new GeneratedSideEffectCancellation(
+      { outcome: "failed", childSettlement: "unconfirmed" },
+      "mutation command timed out without confirmed settlement",
+    );
+    let reconciliationCalls = 0;
+
+    const execution = executeSideEffect({
+      store,
+      claim,
+      dispatchPolicy: "reconcile_then_retry",
+      reconcile: async () => {
+        reconciliationCalls += 1;
+        return { status: "not_applied", evidence: ["absent-before-dispatch"] };
+      },
+      act: async (__, markDispatched) => {
+        await markDispatched();
+        throw failure;
+      },
+      classifyCancellation: (error) =>
+        error instanceof GeneratedSideEffectCancellation ? error.cancellation : undefined,
+    });
+
+    await expect(execution).rejects.toBe(failure);
+    expect(reconciliationCalls).toBe(1);
+    expect((await store.loadState()).sideEffects[0]).toMatchObject({
+      status: "uncertain",
+      failure: failure.message,
+      retryable: false,
+      childSettlement: "unconfirmed",
+      dispatchedAt: expect.any(String),
+    });
+    await expectNoExecutionFailure(store, nodeId);
+  });
+
+  it.each(["returns", "throws"] as const)(
+    "applies cancellation that arrives while settlement reconciliation $caseName",
+    async (caseName) => {
+      const { claim, nodeId, store } = await generatedSideEffectFixture(
+        `settlement-race-${caseName}`,
+        "reconcile_then_retry",
+      );
+      const controller = new AbortController();
+      const commandFailure = new GeneratedSideEffectCancellation(
+        { outcome: "failed", childSettlement: "confirmed" },
+        "mutation command failed after confirmed settlement",
+      );
+      let reconciliationCalls = 0;
+
+      const interruption = await interruptionFrom(
+        executeSideEffect({
+          store,
+          claim,
+          dispatchPolicy: "reconcile_then_retry",
+          reconcile: async () => {
+            reconciliationCalls += 1;
+            if (reconciliationCalls === 1)
+              return { status: "not_applied", evidence: ["absent-before-dispatch"] };
+            controller.abort(new Error("pause during settlement reconciliation"));
+            if (caseName === "throws") throw new Error("settlement read failed");
+            return {
+              status: "applied",
+              result: { externalId: "settled-after-cancellation" },
+              evidence: ["observed-after-cancellation"],
+            };
+          },
+          act: async (__, markDispatched) => {
+            await markDispatched();
+            throw commandFailure;
+          },
+          signal: controller.signal,
+          classifyCancellation: (error) =>
+            error instanceof GeneratedSideEffectCancellation ? error.cancellation : undefined,
+        }),
+      );
+
+      expect(interruption.receipt).toEqual({
+        actionId: claim.actionId,
+        kind: claim.kind,
+        dispatchPolicy: "reconcile_then_retry",
+        dispatched: true,
+        childSettlement: "confirmed",
+        reconciliation: caseName === "returns" ? "applied" : "unknown",
+        disposition: caseName === "returns" ? "confirmed" : "uncertain",
+      });
+      expect(reconciliationCalls).toBe(2);
+      expect((await store.loadState()).sideEffects[0]).toMatchObject(
+        caseName === "returns"
+          ? {
+              status: "confirmed",
+              result: { externalId: "settled-after-cancellation" },
+            }
+          : {
+              status: "uncertain",
+              retryable: false,
+              childSettlement: "confirmed",
+            },
+      );
+      await expectNoExecutionFailure(store, nodeId);
+    },
+  );
+
+  it("records uncertain settlement when post-child authorization fails", async () => {
+    const { claim, nodeId, store } = await generatedSideEffectFixture(
+      "settlement-authorization-failure",
+      "reconcile_then_retry",
+    );
+    const controller = new AbortController();
+    const cancellation = new GeneratedSideEffectCancellation({
+      outcome: "terminated",
+      childSettlement: "confirmed",
+    });
+    const authorizationPhases: string[] = [];
+    let reconciliationCalls = 0;
+
+    const interruption = await interruptionFrom(
+      executeSideEffect({
+        store,
+        claim,
+        dispatchPolicy: "reconcile_then_retry",
+        authorize: async (phase) => {
+          authorizationPhases.push(phase);
+          if (phase === "settlement") throw new Error("workspace authorization changed");
+        },
+        reconcile: async () => {
+          reconciliationCalls += 1;
+          return { status: "not_applied", evidence: ["absent-before-dispatch"] };
+        },
+        act: async (__, markDispatched) => {
+          await markDispatched();
+          controller.abort(cancellation);
+          throw cancellation;
+        },
+        signal: controller.signal,
+        classifyCancellation: (error) =>
+          error instanceof GeneratedSideEffectCancellation ? error.cancellation : undefined,
+      }),
+    );
+
+    expect(interruption.receipt).toEqual({
+      actionId: claim.actionId,
+      kind: claim.kind,
+      dispatchPolicy: "reconcile_then_retry",
+      dispatched: true,
+      childSettlement: "confirmed",
+      reconciliation: "unknown",
+      disposition: "uncertain",
+    });
+    expect(authorizationPhases).toEqual(["precondition", "dispatch", "dispatch", "settlement"]);
+    expect(reconciliationCalls).toBe(1);
+    expect((await store.loadState()).sideEffects[0]).toMatchObject({
+      status: "uncertain",
+      failure: expect.stringContaining("workspace authorization changed"),
+      retryable: false,
+      childSettlement: "confirmed",
+      dispatchedAt: expect.any(String),
+    });
+    expect(
+      (await store.loadEvents()).filter(({ type }) => type === "side_effect.failed"),
+    ).toHaveLength(1);
+    await expectNoExecutionFailure(store, nodeId);
+  });
+
+  it("fails closed when a preparatory child has unconfirmed settlement before dispatch", async () => {
+    const { claim, nodeId, store } = await generatedSideEffectFixture(
+      "unconfirmed-preparation",
+      "reconcile_then_retry",
+    );
+    const cancellation = new GeneratedSideEffectCancellation({
+      outcome: "unconfirmed",
+      childSettlement: "unconfirmed",
+    });
+    let reconciliationCalls = 0;
+
+    const interruption = await interruptionFrom(
+      executeSideEffect({
+        store,
+        claim,
+        dispatchPolicy: "reconcile_then_retry",
+        reconcile: async () => {
+          reconciliationCalls += 1;
+          return { status: "not_applied", evidence: ["absent-before-preparation"] };
+        },
+        act: async () => {
+          throw cancellation;
+        },
+        classifyCancellation: (error) =>
+          error instanceof GeneratedSideEffectCancellation ? error.cancellation : undefined,
+      }),
+    );
+
+    expect(interruption.receipt).toEqual({
+      actionId: claim.actionId,
+      kind: claim.kind,
+      dispatchPolicy: "reconcile_then_retry",
+      dispatched: false,
+      childSettlement: "unconfirmed",
+      reconciliation: "not_attempted",
+      disposition: "uncertain",
+    });
+    expect(reconciliationCalls).toBe(1);
+    expect((await store.loadState()).sideEffects[0]).toMatchObject({
+      status: "uncertain",
+      retryable: false,
+      childSettlement: "unconfirmed",
+    });
+    await expectNoExecutionFailure(store, nodeId);
   });
 
   it("confirms and accepts each generated action once across every interruption boundary", async () => {

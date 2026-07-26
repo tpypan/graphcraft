@@ -28,6 +28,9 @@ import {
   createAtomicPushClaim,
   createRunWorkspace,
   discoverRepository,
+  GitMutationCancellationError,
+  performAtomicCommit,
+  performAtomicPush,
   reconcileAtomicCommit,
   reconcileRunWorkspace,
   RunWorkspaceReconciliationError,
@@ -230,7 +233,108 @@ describe.sequential("run workspace creation reconciliation", () => {
     const interruption = new Error("cancel repository discovery");
     controller.abort(interruption);
 
-    await expect(discoverRepository(repository, controller.signal)).rejects.toBe(interruption);
+    await expect(discoverRepository(repository, controller.signal)).rejects.toMatchObject({
+      name: "GitMutationCancellationError",
+      outcome: "cancelled_before_spawn",
+    } satisfies Partial<GitMutationCancellationError>);
+  });
+
+  it("does not dispatch or mutate a commit for a pre-aborted signal", async () => {
+    const { contract } = await createFixture();
+    const workspace = await createRunWorkspace(contract);
+    await writeFile(join(workspace.path, "in-progress.txt"), "uncommitted progress\n");
+    const claim = await createAtomicCommitClaim(
+      workspace,
+      contract.runId,
+      "commit",
+      PORTABLE_CANONICAL_HASH_ALGORITHM,
+    );
+    const head = await gitOutput(workspace.path, "rev-parse", "HEAD");
+    const controller = new AbortController();
+    const interruption = new Error("cancel commit before dispatch");
+    const markDispatched = vi.fn(async () => {});
+    controller.abort(interruption);
+
+    await expect(
+      performAtomicCommit(
+        workspace,
+        claim,
+        contract.task,
+        PORTABLE_CANONICAL_HASH_ALGORITHM,
+        markDispatched,
+        undefined,
+        controller.signal,
+      ),
+    ).rejects.toMatchObject({
+      name: "GitMutationCancellationError",
+      outcome: "cancelled_before_spawn",
+    } satisfies Partial<GitMutationCancellationError>);
+
+    expect(markDispatched).not.toHaveBeenCalled();
+    expect(await gitOutput(workspace.path, "rev-parse", "HEAD")).toBe(head);
+    expect(await gitOutput(workspace.path, "diff", "--cached", "--name-only")).toBe("");
+  });
+
+  it("does not misclassify cancellation after a completed commit as pre-spawn", async () => {
+    const { contract } = await createFixture();
+    const workspace = await createRunWorkspace(contract);
+    await writeFile(join(workspace.path, "completed-before-pause.txt"), "committed progress\n");
+    const claim = await createAtomicCommitClaim(
+      workspace,
+      contract.runId,
+      "commit",
+      PORTABLE_CANONICAL_HASH_ALGORITHM,
+    );
+    const controller = new AbortController();
+    const markDispatched = vi.fn(async () => {});
+
+    const result = await performAtomicCommit(
+      workspace,
+      claim,
+      contract.task,
+      PORTABLE_CANONICAL_HASH_ALGORITHM,
+      markDispatched,
+      async (point) => {
+        if (point === "after_action_command")
+          controller.abort(new Error("pause after completed commit"));
+      },
+      controller.signal,
+    );
+
+    expect(controller.signal.aborted).toBe(true);
+    expect(markDispatched).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      sha: await gitOutput(workspace.path, "rev-parse", "HEAD"),
+      branch: workspace.branch,
+    });
+  });
+
+  it("does not dispatch or mutate a push for a pre-aborted signal", async () => {
+    const { repository, contract } = await createFixture();
+    const workspace = await createRunWorkspace(contract);
+    const remote = join(dirname(repository), "remote.git");
+    await git(repository, "init", "--bare", remote);
+    await git(workspace.path, "remote", "add", "origin", remote);
+    const claim = await createAtomicPushClaim(
+      workspace,
+      contract.runId,
+      "push",
+      PORTABLE_CANONICAL_HASH_ALGORITHM,
+    );
+    const controller = new AbortController();
+    const interruption = new Error("cancel push before dispatch");
+    const markDispatched = vi.fn(async () => {});
+    controller.abort(interruption);
+
+    await expect(
+      performAtomicPush(workspace, claim, markDispatched, undefined, controller.signal),
+    ).rejects.toMatchObject({
+      name: "GitMutationCancellationError",
+      outcome: "cancelled_before_spawn",
+    } satisfies Partial<GitMutationCancellationError>);
+
+    expect(markDispatched).not.toHaveBeenCalled();
+    expect(await branchTarget(remote, workspace.branch)).toBeUndefined();
   });
 
   it("creates an exact clean worktree once and reuses only that ready state", async () => {

@@ -202,15 +202,42 @@ export interface GitHubCommandOptions {
   commandArgs?: string[];
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
-class GitHubCommandError extends Error {
+export type GitHubCommandCancellationOutcome =
+  "cancelled_before_spawn" | "terminated" | "unconfirmed";
+
+export class GitHubCommandCancellationError extends Error {
+  constructor(readonly outcome: GitHubCommandCancellationOutcome) {
+    super(
+      outcome === "cancelled_before_spawn"
+        ? "GitHub command was cancelled before spawn"
+        : outcome === "terminated"
+          ? "GitHub command was cancelled and its child settled"
+          : "GitHub command was cancelled without confirmed child settlement",
+    );
+    this.name = "GitHubCommandCancellationError";
+  }
+}
+
+export class GitHubCommandError extends Error {
   constructor(
     message: string,
     readonly exitCode: number,
+    readonly childSettlement: "confirmed" | "unconfirmed" = "confirmed",
   ) {
     super(message);
     this.name = "GitHubCommandError";
+  }
+}
+
+export class GitHubCommandResultError extends Error {
+  readonly childSettlement = "confirmed" as const;
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "GitHubCommandResultError";
   }
 }
 
@@ -218,12 +245,14 @@ async function runCommand(
   options: GitHubCommandOptions,
   args: string[],
 ): Promise<{ stdout: string; stderr: string }> {
+  if (options.signal?.aborted) throw new GitHubCommandCancellationError("cancelled_before_spawn");
   const command =
     options.command ??
     (await resolveTrustedExecutable("gh", {
       environment: options.env ?? process.env,
       untrustedCwd: options.cwd,
     }));
+  if (options.signal?.aborted) throw new GitHubCommandCancellationError("cancelled_before_spawn");
   const commandArgs = [...(options.commandArgs ?? []), ...args];
   return await new Promise((resolve, reject) => {
     const child = crossSpawn.spawn(command, commandArgs, {
@@ -235,19 +264,26 @@ async function runCommand(
     let stdout = "";
     let stderr = "";
     let outputBytes = 0;
-    let failure: string | undefined;
     let settled = false;
     let forceTimer: NodeJS.Timeout | undefined;
     let settlementTimer: NodeJS.Timeout | undefined;
     const timeoutMs = options.timeoutMs ?? 60_000;
     let timeout: NodeJS.Timeout | undefined;
+    let termination: { kind: "failure"; message: string } | { kind: "cancellation" } | undefined;
+
+    const abortFromCaller = (): void => terminate({ kind: "cancellation" });
 
     const cleanup = (): void => {
       if (timeout) clearTimeout(timeout);
       if (forceTimer) clearTimeout(forceTimer);
       if (settlementTimer) clearTimeout(settlementTimer);
+      options.signal?.removeEventListener("abort", abortFromCaller);
     };
-    const complete = (exitCode: number | null, error?: Error): void => {
+    const complete = (
+      exitCode: number | null,
+      error?: Error,
+      cancellationOutcome: "terminated" | "unconfirmed" = "terminated",
+    ): void => {
       if (settled) return;
       settled = true;
       cleanup();
@@ -258,12 +294,22 @@ async function runCommand(
       } catch {
         // Cleanup must not hide the bounded GitHub command outcome.
       }
-      if (error) {
-        reject(error);
+      if (termination?.kind === "cancellation") {
+        reject(new GitHubCommandCancellationError(cancellationOutcome));
         return;
       }
-      if (failure) {
-        reject(new GitHubCommandError(failure, exitCode ?? 1));
+      if (termination?.kind === "failure") {
+        reject(
+          new GitHubCommandError(
+            termination.message,
+            exitCode ?? 1,
+            cancellationOutcome === "unconfirmed" ? "unconfirmed" : "confirmed",
+          ),
+        );
+        return;
+      }
+      if (error) {
+        reject(error);
         return;
       }
       const code = exitCode ?? 1;
@@ -276,44 +322,58 @@ async function runCommand(
           ),
         );
     };
-    const terminate = (reason: string): void => {
-      if (failure || settled) return;
-      failure = reason;
+    function terminate(
+      reason: { kind: "failure"; message: string } | { kind: "cancellation" },
+    ): void {
+      if (termination || settled) return;
+      termination = reason;
       if (timeout) clearTimeout(timeout);
       try {
         terminateChildProcessTree(child, "SIGTERM");
       } catch {
         // Escalation and bounded settlement still apply when graceful delivery fails.
       }
+      if (settled) return;
       forceTimer = setTimeout(() => {
         try {
           terminateChildProcessTree(child, "SIGKILL");
         } catch {
           // Bounded settlement below prevents an unresponsive child from hanging the caller.
         }
-        settlementTimer = setTimeout(() => complete(null), GITHUB_COMMAND_SETTLEMENT_GRACE_MS);
+        if (settled) return;
+        settlementTimer = setTimeout(
+          () => complete(null, undefined, "unconfirmed"),
+          GITHUB_COMMAND_SETTLEMENT_GRACE_MS,
+        );
         settlementTimer.unref();
       }, GITHUB_COMMAND_TERMINATION_GRACE_MS);
       forceTimer.unref();
-    };
-    timeout = setTimeout(() => terminate(`gh exceeded its ${timeoutMs}ms timeout`), timeoutMs);
+    }
+    timeout = setTimeout(
+      () => terminate({ kind: "failure", message: `gh exceeded its ${timeoutMs}ms timeout` }),
+      timeoutMs,
+    );
     timeout.unref();
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       outputBytes += Buffer.byteLength(chunk);
       if (outputBytes > 16 * 1024 * 1024)
-        return terminate("gh output exceeded the 16MiB safety limit");
+        return terminate({ kind: "failure", message: "gh output exceeded the 16MiB safety limit" });
       stdout += chunk;
     });
     child.stderr.on("data", (chunk: string) => {
       outputBytes += Buffer.byteLength(chunk);
       if (outputBytes > 16 * 1024 * 1024)
-        return terminate("gh output exceeded the 16MiB safety limit");
+        return terminate({ kind: "failure", message: "gh output exceeded the 16MiB safety limit" });
       stderr += chunk;
     });
-    child.once("error", (error) => complete(null, error));
+    child.once("error", (error) => {
+      if (!termination) complete(null, error);
+    });
     child.once("close", (exitCode) => complete(exitCode));
+    options.signal?.addEventListener("abort", abortFromCaller, { once: true });
+    if (options.signal?.aborted) abortFromCaller();
   });
 }
 
@@ -321,8 +381,11 @@ async function jsonCommand(options: GitHubCommandOptions, args: string[]): Promi
   const { stdout } = await runCommand(options, args);
   try {
     return JSON.parse(stdout);
-  } catch {
-    throw new Error(`gh returned invalid JSON for ${args.slice(0, 2).join(" ")}`);
+  } catch (error) {
+    throw new GitHubCommandResultError(
+      `gh returned invalid JSON for ${args.slice(0, 2).join(" ")}`,
+      { cause: error },
+    );
   }
 }
 
@@ -344,6 +407,10 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function rethrowCommandCancellation(error: unknown): void {
+  if (error instanceof GitHubCommandCancellationError) throw error;
+}
+
 async function readBranchProtection(
   options: GitHubCommandOptions,
   input: { host: string; nameWithOwner: string; branch: string },
@@ -356,6 +423,7 @@ async function readBranchProtection(
       .object({ protected: z.boolean() })
       .parse(await jsonCommand(options, ["api", "--hostname", input.host, endpoint]));
   } catch (error) {
+    rethrowCommandCancellation(error);
     return GitHubBranchProtectionSchema.parse({
       status: "unknown",
       branch: input.branch,
@@ -415,6 +483,7 @@ async function readBranchProtection(
         : {}),
     });
   } catch (error) {
+    rethrowCommandCancellation(error);
     return GitHubBranchProtectionSchema.parse({
       status: "unknown",
       branch: input.branch,
@@ -432,6 +501,7 @@ export async function probeGitHub(
   try {
     commandVersion = (await runCommand(options, ["--version"])).stdout.split("\n")[0]?.trim();
   } catch (error) {
+    rethrowCommandCancellation(error);
     errors.push(`GitHub CLI is unavailable: ${errorMessage(error)}`);
     return GitHubCapabilityReportSchema.parse({
       schemaVersion: 1,
@@ -448,6 +518,7 @@ export async function probeGitHub(
   try {
     await runCommand(options, ["auth", "status", "--active"]);
   } catch (error) {
+    rethrowCommandCancellation(error);
     errors.push(`GitHub CLI authentication is unavailable: ${errorMessage(error)}`);
     return GitHubCapabilityReportSchema.parse({
       schemaVersion: 1,
@@ -473,6 +544,7 @@ export async function probeGitHub(
       ]),
     );
   } catch (error) {
+    rethrowCommandCancellation(error);
     errors.push(`GitHub repository access is unavailable: ${errorMessage(error)}`);
     return GitHubCapabilityReportSchema.parse({
       schemaVersion: 1,
@@ -1029,11 +1101,20 @@ export async function addGitHubReviewThreadReply(
   options: GitHubCommandOptions,
   input: { host: string; threadId: string; body: string; clientMutationId: string },
 ): Promise<{ id: string; body: string; url: string }> {
-  const response = ReviewReplyMutationResponseSchema.parse(
-    await graphql(options, input.host, ADD_REVIEW_REPLY_MUTATION, input),
-  ).data.addPullRequestReviewThreadReply;
+  const rawResponse = await graphql(options, input.host, ADD_REVIEW_REPLY_MUTATION, input);
+  let response;
+  try {
+    response =
+      ReviewReplyMutationResponseSchema.parse(rawResponse).data.addPullRequestReviewThreadReply;
+  } catch (error) {
+    throw new GitHubCommandResultError("GitHub returned an invalid review-reply response", {
+      cause: error,
+    });
+  }
   if (!response || response.clientMutationId !== input.clientMutationId)
-    throw new Error(`GitHub did not confirm review reply ${input.clientMutationId}`);
+    throw new GitHubCommandResultError(
+      `GitHub did not confirm review reply ${input.clientMutationId}`,
+    );
   return response.comment;
 }
 
@@ -1041,16 +1122,25 @@ export async function resolveGitHubReviewThread(
   options: GitHubCommandOptions,
   input: { host: string; threadId: string; clientMutationId: string },
 ): Promise<{ id: string; isResolved: boolean }> {
-  const response = ResolveReviewThreadMutationResponseSchema.parse(
-    await graphql(options, input.host, RESOLVE_REVIEW_THREAD_MUTATION, input),
-  ).data.resolveReviewThread;
+  const rawResponse = await graphql(options, input.host, RESOLVE_REVIEW_THREAD_MUTATION, input);
+  let response;
+  try {
+    response =
+      ResolveReviewThreadMutationResponseSchema.parse(rawResponse).data.resolveReviewThread;
+  } catch (error) {
+    throw new GitHubCommandResultError("GitHub returned an invalid review-resolution response", {
+      cause: error,
+    });
+  }
   if (
     !response ||
     response.clientMutationId !== input.clientMutationId ||
     response.thread.id !== input.threadId ||
     !response.thread.isResolved
   )
-    throw new Error(`GitHub did not confirm review-thread resolution ${input.clientMutationId}`);
+    throw new GitHubCommandResultError(
+      `GitHub did not confirm review-thread resolution ${input.clientMutationId}`,
+    );
   return response.thread;
 }
 

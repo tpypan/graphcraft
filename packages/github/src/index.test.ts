@@ -13,6 +13,8 @@ import {
 import {
   GITHUB_COMMAND_SETTLEMENT_GRACE_MS,
   GITHUB_COMMAND_TERMINATION_GRACE_MS,
+  GitHubCommandCancellationError,
+  GitHubCommandResultError,
   GitHubLifecycleConsistencyError,
   addGitHubReviewThreadReply,
   assertGitHubPushCapability,
@@ -434,6 +436,261 @@ async function expectLifecycleConsistency(
 }
 
 describe("GitHub capability and snapshot layer", () => {
+  it("rejects an already-aborted command before spawn without exposing its reason", async () => {
+    const abort = new AbortController();
+    abort.abort({ cause: "user_stop", reason: "ghp_should_not_escape" });
+    const spawn = vi.spyOn(crossSpawn, "spawn").mockImplementation(() => {
+      throw new Error("spawn must not be reached");
+    });
+
+    const observed = await probeGitHub({
+      command: "gh-fixture",
+      cwd: process.cwd(),
+      signal: abort.signal,
+    }).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+
+    expect(observed).toBeInstanceOf(GitHubCommandCancellationError);
+    expect(observed).toMatchObject({
+      name: "GitHubCommandCancellationError",
+      outcome: "cancelled_before_spawn",
+      message: "GitHub command was cancelled before spawn",
+    });
+    expect(String(observed)).not.toContain("ghp_should_not_escape");
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("reports confirmed child settlement when an active command is aborted", async () => {
+    vi.useFakeTimers();
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill: vi.fn(() => true),
+      unref: vi.fn(),
+    });
+    vi.spyOn(crossSpawn, "spawn").mockReturnValue(child as never);
+    const abort = new AbortController();
+
+    const command = rerequestGitHubCheckRun(
+      { command: "gh-fixture", cwd: process.cwd(), signal: abort.signal },
+      { host: "github.com", nameWithOwner: "tpypan/graphcraft", databaseId: 101 },
+    );
+    abort.abort({ cause: "user_pause", reason: "private pause reason" });
+    child.emit("close", null, "SIGTERM");
+    const observed = await command.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await vi.advanceTimersByTimeAsync(
+      GITHUB_COMMAND_TERMINATION_GRACE_MS + GITHUB_COMMAND_SETTLEMENT_GRACE_MS + 1,
+    );
+
+    expect(observed).toBeInstanceOf(GitHubCommandCancellationError);
+    expect(observed).toMatchObject({ outcome: "terminated" });
+    expect(String(observed)).not.toContain("private pause reason");
+    expect(child.kill).toHaveBeenCalledOnce();
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(child.stdout.destroyed).toBe(true);
+    expect(child.stderr.destroyed).toBe(true);
+    expect(child.unref).toHaveBeenCalledOnce();
+  });
+
+  it("reports unconfirmed settlement after bounded abort escalation", async () => {
+    vi.useFakeTimers();
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill: vi.fn(() => true),
+      unref: vi.fn(),
+    });
+    vi.spyOn(crossSpawn, "spawn").mockReturnValue(child as never);
+    const abort = new AbortController();
+
+    const command = rerequestGitHubCheckRun(
+      { command: "gh-fixture", cwd: process.cwd(), signal: abort.signal },
+      { host: "github.com", nameWithOwner: "tpypan/graphcraft", databaseId: 101 },
+    );
+    const observedCommand = command.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    abort.abort(new Error("private abort reason"));
+    await vi.advanceTimersByTimeAsync(
+      GITHUB_COMMAND_TERMINATION_GRACE_MS + GITHUB_COMMAND_SETTLEMENT_GRACE_MS + 1,
+    );
+    const observed = await observedCommand;
+
+    expect(observed).toBeInstanceOf(GitHubCommandCancellationError);
+    expect(observed).toMatchObject({ outcome: "unconfirmed" });
+    expect(String(observed)).not.toContain("private abort reason");
+    expect(child.kill).toHaveBeenNthCalledWith(1, "SIGTERM");
+    expect(child.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
+    expect(child.stdout.destroyed).toBe(true);
+    expect(child.stderr.destroyed).toBe(true);
+    expect(child.unref).toHaveBeenCalledOnce();
+  });
+
+  it("preserves timeout precedence when cancellation arrives during settlement", async () => {
+    vi.useFakeTimers();
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill: vi.fn(() => true),
+      unref: vi.fn(),
+    });
+    vi.spyOn(crossSpawn, "spawn").mockReturnValue(child as never);
+    const abort = new AbortController();
+
+    const command = rerequestGitHubCheckRun(
+      { command: "gh-fixture", cwd: process.cwd(), signal: abort.signal, timeoutMs: 10 },
+      { host: "github.com", nameWithOwner: "tpypan/graphcraft", databaseId: 101 },
+    );
+    const observedCommand = command.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await vi.advanceTimersByTimeAsync(10);
+    abort.abort(new Error("late private abort reason"));
+    await vi.advanceTimersByTimeAsync(
+      GITHUB_COMMAND_TERMINATION_GRACE_MS + GITHUB_COMMAND_SETTLEMENT_GRACE_MS + 1,
+    );
+    const observed = await observedCommand;
+
+    expect(observed).not.toBeInstanceOf(GitHubCommandCancellationError);
+    expect(observed).toMatchObject({
+      name: "GitHubCommandError",
+      message: "gh exceeded its 10ms timeout",
+      childSettlement: "unconfirmed",
+    });
+    expect(String(observed)).not.toContain("late private abort reason");
+  });
+
+  it("retains unconfirmed settlement when bounded output termination never closes", async () => {
+    vi.useFakeTimers();
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill: vi.fn(() => true),
+      unref: vi.fn(),
+    });
+    vi.spyOn(crossSpawn, "spawn").mockReturnValue(child as never);
+
+    const command = rerequestGitHubCheckRun(
+      { command: "gh-fixture", cwd: process.cwd() },
+      { host: "github.com", nameWithOwner: "tpypan/graphcraft", databaseId: 101 },
+    );
+    const observedCommand = command.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    child.stdout.write(Buffer.alloc(16 * 1024 * 1024 + 1));
+    await vi.advanceTimersByTimeAsync(
+      GITHUB_COMMAND_TERMINATION_GRACE_MS + GITHUB_COMMAND_SETTLEMENT_GRACE_MS + 1,
+    );
+    const observed = await observedCommand;
+
+    expect(observed).toMatchObject({
+      name: "GitHubCommandError",
+      message: "gh output exceeded the 16MiB safety limit",
+      childSettlement: "unconfirmed",
+    });
+    expect(child.kill).toHaveBeenNthCalledWith(1, "SIGTERM");
+    expect(child.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
+  });
+
+  it("retains confirmed settlement when mutation-response parsing races cancellation", async () => {
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill: vi.fn(() => true),
+      unref: vi.fn(),
+    });
+    vi.spyOn(crossSpawn, "spawn").mockReturnValue(child as never);
+    const abort = new AbortController();
+
+    const command = addGitHubReviewThreadReply(
+      { command: "gh-fixture", cwd: process.cwd(), signal: abort.signal },
+      {
+        host: "github.com",
+        threadId: "thread-1",
+        body: "Reviewed fix",
+        clientMutationId: "graphcraft-action",
+      },
+    );
+    child.stdout.write("{invalid-json");
+    child.emit("close", 0);
+    abort.abort(new Error("pause after command settlement"));
+    const observed = await command.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+
+    expect(observed).toBeInstanceOf(GitHubCommandResultError);
+    expect(observed).toMatchObject({
+      message: "gh returned invalid JSON for api graphql",
+      childSettlement: "confirmed",
+    });
+    expect(child.kill).not.toHaveBeenCalled();
+  });
+
+  it("preserves a child error that occurs before cancellation and removes the abort listener", async () => {
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill: vi.fn(() => true),
+      unref: vi.fn(),
+    });
+    vi.spyOn(crossSpawn, "spawn").mockReturnValue(child as never);
+    const abort = new AbortController();
+    const failure = new Error("spawn transport failed");
+
+    const command = rerequestGitHubCheckRun(
+      { command: "gh-fixture", cwd: process.cwd(), signal: abort.signal },
+      { host: "github.com", nameWithOwner: "tpypan/graphcraft", databaseId: 101 },
+    );
+    child.emit("error", failure);
+    abort.abort(new Error("late cancellation"));
+
+    await expect(command).rejects.toBe(failure);
+    expect(child.kill).not.toHaveBeenCalled();
+    expect(child.stdout.destroyed).toBe(true);
+    expect(child.stderr.destroyed).toBe(true);
+    expect(child.unref).toHaveBeenCalledOnce();
+  });
+
+  it("preserves cancellation precedence over a later child error", async () => {
+    vi.useFakeTimers();
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill: vi.fn(() => true),
+      unref: vi.fn(),
+    });
+    vi.spyOn(crossSpawn, "spawn").mockReturnValue(child as never);
+    const abort = new AbortController();
+
+    const command = rerequestGitHubCheckRun(
+      { command: "gh-fixture", cwd: process.cwd(), signal: abort.signal },
+      { host: "github.com", nameWithOwner: "tpypan/graphcraft", databaseId: 101 },
+    );
+    const observedCommand = command.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    abort.abort(new Error("private cancellation"));
+    child.emit("error", new Error("private late child error"));
+    await vi.advanceTimersByTimeAsync(
+      GITHUB_COMMAND_TERMINATION_GRACE_MS + GITHUB_COMMAND_SETTLEMENT_GRACE_MS + 1,
+    );
+    const observed = await observedCommand;
+
+    expect(observed).toBeInstanceOf(GitHubCommandCancellationError);
+    expect(observed).toMatchObject({ outcome: "unconfirmed" });
+    expect(String(observed)).not.toMatch(/private cancellation|private late child error/u);
+  });
+
   it("settles after escalation when a timed-out GitHub child never emits close", async () => {
     vi.useFakeTimers();
     const child = Object.assign(new EventEmitter(), {
