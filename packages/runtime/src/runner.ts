@@ -5675,6 +5675,7 @@ export async function executeRun(input: {
           const result = await executeSideEffect({
             store: input.store,
             claim: proposedClaim,
+            authorize: authorizeWorkspace,
             reconcile: async (claim) =>
               await reconcilePullRequest(
                 workspace,

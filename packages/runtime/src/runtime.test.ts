@@ -2733,6 +2733,57 @@ process.stdin.on("end", () => {
     },
   );
 
+  it("blocks a worktree replacement immediately before pull-request creation", async () => {
+    const { repository, remote } = await createRepositoryWithRemote();
+    const github = await fakePullRequestGitHub(remote);
+    const adapter = new FakeAdapter(async (request) => {
+      if (request.capsule.nodeId === "implement")
+        await writeFile(join(request.repositoryPath, "feature.txt"), "pull request\n");
+    });
+    const created = await createRun("Implement the feature and open a pull request", {
+      cwd: repository,
+      finishLine: "pr_open",
+    });
+    let replacementMarker: string | undefined;
+    let durableWorkspaceBytes: string | undefined;
+    const replaceBeforePullRequest = async (point: SideEffectBoundary): Promise<void> => {
+      if (replacementMarker || point !== "before_act") return;
+      const state = await created.store.loadState();
+      if (state.sideEffects.at(-1)?.claim.kind !== "github_pr_create") return;
+      const workspace = await created.store.loadWorkspace<{ path: string }>();
+      durableWorkspaceBytes = await readFile(join(created.store.runRoot, "workspace.json"), "utf8");
+      await rename(workspace.path, `${workspace.path}-moved`);
+      await mkdir(workspace.path);
+      replacementMarker = join(workspace.path, "preserved.txt");
+      await writeFile(replacementMarker, "replacement preserved\n");
+    };
+
+    const blocked = await executeRun({
+      store: created.store,
+      adapter,
+      approve: true,
+      github,
+      sideEffectBoundary: replaceBeforePullRequest,
+    });
+    const persisted = JSON.parse(await readFile(github.statePath, "utf8")) as {
+      createCalls: number;
+      pullRequests: unknown[];
+    };
+    const creation = blocked.sideEffects.find(({ claim }) => claim.kind === "github_pr_create");
+
+    expect(blocked.status).toBe("blocked");
+    expect(blocked.stopReason).toMatch(/work(?:space|tree).*(?:invalid|registration|state|path)/i);
+    expect(adapter.calls).toEqual(["implement"]);
+    expect(replacementMarker).toBeDefined();
+    expect(await readFile(replacementMarker!, "utf8")).toBe("replacement preserved\n");
+    expect(await readFile(join(created.store.runRoot, "workspace.json"), "utf8")).toBe(
+      durableWorkspaceBytes,
+    );
+    expect(persisted.createCalls).toBe(0);
+    expect(persisted.pullRequests).toHaveLength(0);
+    expect(creation).toMatchObject({ status: "claimed" });
+  });
+
   it("blocks a worktree replacement immediately before a GitHub review mutation", async () => {
     const { repository, remote } = await createRepositoryWithRemote();
     const github = await fakePullRequestGitHub(remote, {
