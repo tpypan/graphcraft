@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import crossSpawn from "cross-spawn";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ManagedProcessLifecycle, ManagedProcessSettlement } from "@graphcraft/probes";
 import {
   LEGACY_CANONICAL_HASH_ALGORITHM,
   PORTABLE_CANONICAL_HASH_ALGORITHM,
@@ -435,6 +436,83 @@ async function expectLifecycleConsistency(
   expect(observed).toMatchObject({ message: expect.stringMatching(message) });
 }
 
+let managedBrokerSequence = 0;
+
+function installManagedBroker(
+  callbacks: Partial<Pick<ManagedProcessLifecycle, "onReady" | "onSettled">> = {},
+): {
+  broker: EventEmitter & {
+    stdout: PassThrough;
+    stderr: PassThrough;
+    connected: boolean;
+    pid: number;
+    send: ReturnType<typeof vi.fn>;
+    kill: ReturnType<typeof vi.fn>;
+    unref: ReturnType<typeof vi.fn>;
+  };
+  lifecycle: ManagedProcessLifecycle;
+  spawn: ReturnType<typeof vi.spyOn>;
+} {
+  managedBrokerSequence += 1;
+  const pid = 40_000 + managedBrokerSequence;
+  const broker = Object.assign(new EventEmitter(), {
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+    connected: true,
+    pid,
+    send: vi.fn(() => true),
+    kill: vi.fn(() => true),
+    unref: vi.fn(),
+  });
+  const lifecycle: ManagedProcessLifecycle = {
+    executionId: `github-managed-${managedBrokerSequence}`,
+    ownerToken: `owner-${managedBrokerSequence}`,
+    journalFd: 1,
+    onReady: callbacks.onReady ?? (async () => undefined),
+    onSettled: callbacks.onSettled ?? (async () => undefined),
+  };
+  const spawn = vi.spyOn(crossSpawn, "spawn").mockReturnValue(broker as never);
+  return { broker, lifecycle, spawn };
+}
+
+async function authorizeManagedBroker(
+  input: ReturnType<typeof installManagedBroker>,
+): Promise<void> {
+  await vi.waitFor(() => expect(input.spawn).toHaveBeenCalledOnce());
+  input.broker.emit("message", {
+    type: "ready",
+    schemaVersion: 1,
+    executionId: input.lifecycle.executionId,
+    brokerPid: input.broker.pid,
+    processGroupId: null,
+    platform: process.platform,
+    readyAt: new Date().toISOString(),
+  });
+  await vi.waitFor(() =>
+    expect(input.broker.send).toHaveBeenCalledWith(expect.objectContaining({ type: "start" })),
+  );
+}
+
+function settleManagedBroker(
+  input: ReturnType<typeof installManagedBroker>,
+  settlement: Partial<ManagedProcessSettlement> = {},
+): void {
+  input.broker.emit("message", {
+    type: "settled",
+    status: "settled",
+    schemaVersion: 1,
+    executionId: input.lifecycle.executionId,
+    brokerPid: input.broker.pid,
+    childPid: 50_000 + managedBrokerSequence,
+    outcome: "exited",
+    confirmed: true,
+    exitCode: 0,
+    exitSignal: null,
+    settledAt: new Date().toISOString(),
+    ...settlement,
+  });
+}
+
 describe("GitHub capability and snapshot layer", () => {
   it("rejects an already-aborted command before spawn without exposing its reason", async () => {
     const abort = new AbortController();
@@ -633,6 +711,162 @@ describe("GitHub capability and snapshot layer", () => {
       childSettlement: "confirmed",
     });
     expect(child.kill).not.toHaveBeenCalled();
+  });
+
+  it("allows a managed GitHub response that uses 10MiB on one stream", async () => {
+    const managed = installManagedBroker();
+    const command = rerequestGitHubCheckRun(
+      { command: process.execPath, cwd: process.cwd(), lifecycle: managed.lifecycle },
+      { host: "github.com", nameWithOwner: "tpypan/graphcraft", databaseId: 101 },
+    );
+    await authorizeManagedBroker(managed);
+
+    managed.broker.stdout.write(Buffer.alloc(10 * 1024 * 1024, "x"));
+    settleManagedBroker(managed);
+    managed.broker.emit("close", 0);
+
+    await expect(command).resolves.toBeUndefined();
+    expect(managed.broker.send).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "terminate" }),
+    );
+  });
+
+  it("terminates managed GitHub output at the exact combined 16MiB limit", async () => {
+    const abort = new AbortController();
+    const managed = installManagedBroker();
+    const command = rerequestGitHubCheckRun(
+      {
+        command: process.execPath,
+        cwd: process.cwd(),
+        lifecycle: managed.lifecycle,
+        signal: abort.signal,
+      },
+      { host: "github.com", nameWithOwner: "tpypan/graphcraft", databaseId: 101 },
+    );
+    const observedCommand = command.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await authorizeManagedBroker(managed);
+
+    managed.broker.stdout.write(Buffer.alloc(9 * 1024 * 1024, "x"));
+    managed.broker.stderr.write(Buffer.alloc(8 * 1024 * 1024, "y"));
+    abort.abort(new Error("late private cancellation"));
+    managed.broker.emit("close", 1);
+    const observed = await observedCommand;
+
+    expect(observed).toMatchObject({
+      name: "GitHubCommandError",
+      message: "gh output exceeded the 16MiB safety limit",
+      childSettlement: "unconfirmed",
+    });
+    expect(String(observed)).not.toContain("late private cancellation");
+    expect(managed.broker.send).toHaveBeenCalledWith({ type: "terminate" });
+  });
+
+  it("keeps managed timeout precedence over later output and cancellation", async () => {
+    vi.useFakeTimers();
+    const abort = new AbortController();
+    const managed = installManagedBroker();
+    const command = rerequestGitHubCheckRun(
+      {
+        command: process.execPath,
+        cwd: process.cwd(),
+        lifecycle: managed.lifecycle,
+        signal: abort.signal,
+        timeoutMs: 2_000,
+      },
+      { host: "github.com", nameWithOwner: "tpypan/graphcraft", databaseId: 101 },
+    );
+    const observedCommand = command.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await authorizeManagedBroker(managed);
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    managed.broker.stdout.write(Buffer.alloc(9 * 1024 * 1024, "x"));
+    managed.broker.stderr.write(Buffer.alloc(8 * 1024 * 1024, "y"));
+    abort.abort(new Error("late private cancellation"));
+    managed.broker.emit("close", 1);
+    const observed = await observedCommand;
+
+    expect(observed).toMatchObject({
+      name: "GitHubCommandError",
+      message: "gh exceeded its 2000ms timeout",
+      childSettlement: "unconfirmed",
+    });
+    expect(String(observed)).not.toContain("late private cancellation");
+  });
+
+  it("reports managed cancellation that occurs before target settlement", async () => {
+    const abort = new AbortController();
+    const managed = installManagedBroker();
+    const command = rerequestGitHubCheckRun(
+      {
+        command: process.execPath,
+        cwd: process.cwd(),
+        lifecycle: managed.lifecycle,
+        signal: abort.signal,
+      },
+      { host: "github.com", nameWithOwner: "tpypan/graphcraft", databaseId: 101 },
+    );
+    await authorizeManagedBroker(managed);
+
+    abort.abort(new Error("private cancellation"));
+    settleManagedBroker(managed, { outcome: "terminated", exitCode: null });
+    managed.broker.emit("close", 0);
+
+    await expect(command).rejects.toMatchObject({
+      name: "GitHubCommandCancellationError",
+      outcome: "terminated",
+    });
+  });
+
+  it("preserves managed response validation after target settlement is durable", async () => {
+    let releaseSettlement!: () => void;
+    let markSettlementStarted!: () => void;
+    const settlementStarted = new Promise<void>((resolve) => (markSettlementStarted = resolve));
+    const settlementDurable = new Promise<void>((resolve) => (releaseSettlement = resolve));
+    const managed = installManagedBroker({
+      onSettled: async () => {
+        markSettlementStarted();
+        await settlementDurable;
+      },
+    });
+    const abort = new AbortController();
+    const command = addGitHubReviewThreadReply(
+      {
+        command: process.execPath,
+        cwd: process.cwd(),
+        lifecycle: managed.lifecycle,
+        signal: abort.signal,
+      },
+      {
+        host: "github.com",
+        threadId: "thread-1",
+        body: "Reviewed fix",
+        clientMutationId: "graphcraft-action",
+      },
+    );
+    await authorizeManagedBroker(managed);
+
+    managed.broker.stdout.write("{invalid-json");
+    settleManagedBroker(managed);
+    await settlementStarted;
+    managed.broker.emit("close", 0);
+    abort.abort(new Error("pause after target settlement"));
+    releaseSettlement();
+    const observed = await command.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+
+    expect(observed).toBeInstanceOf(GitHubCommandResultError);
+    expect(observed).toMatchObject({
+      message: "gh returned invalid JSON for api graphql",
+      childSettlement: "confirmed",
+    });
   });
 
   it("preserves a child error that occurs before cancellation and removes the abort listener", async () => {

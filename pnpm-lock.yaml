@@ -86,6 +86,9 @@ importers:
       '@graphcraft/core':
         specifier: workspace:^
         version: link:../core
+      '@graphcraft/probes':
+        specifier: workspace:^
+        version: link:../probes
       cross-spawn:
         specifier: 7.0.6
         version: 7.0.6

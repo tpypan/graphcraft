@@ -111,8 +111,10 @@ const storageFixturesRoot = fileURLToPath(new URL("./fixtures/storage", import.m
 const atomicCommitMatrixTimeout =
   process.platform === "win32" ? 300_000 : process.platform === "darwin" ? 120_000 : 60_000;
 const pushMatrixTimeout = process.platform === "win32" ? 300_000 : 120_000;
-const checkRerunMatrixTimeout = process.platform === "win32" ? 600_000 : 240_000;
-const pullRequestCreateMatrixTimeout = process.platform === "win32" ? 300_000 : 180_000;
+const checkRerunMatrixTimeout =
+  process.platform === "win32" ? 600_000 : process.platform === "darwin" ? 360_000 : 240_000;
+const pullRequestCreateMatrixTimeout = process.platform === "win32" ? 420_000 : 180_000;
+const reviewMutationMatrixTimeout = process.platform === "win32" ? 1_500_000 : 600_000;
 const interruptionClassificationTimeout = process.platform === "win32" ? 60_000 : 30_000;
 const githubRepairTimeout = process.platform === "win32" ? 60_000 : 30_000;
 
@@ -132,6 +134,41 @@ async function expectUndispatchedSideEffect(
     ),
     label,
   ).toHaveLength(0);
+}
+
+function expectRecoveredPreStartDispatch(
+  events: RunEvent[],
+  actionId: string | undefined,
+  faultPoint: SideEffectBoundary,
+  label: string,
+): void {
+  const recoveredBeforeStart = faultPoint === "after_action_dispatch";
+  const dispatches = events.filter(
+    ({ type, data }) => type === "side_effect.dispatched" && data.actionId === actionId,
+  );
+  expect(dispatches, label).toHaveLength(recoveredBeforeStart ? 2 : 1);
+  const receipts = events.filter(({ type, data }) => {
+    if (
+      type !== "side_effect.process.finished" ||
+      data.actionId !== actionId ||
+      data.started !== false ||
+      typeof data.settlement !== "object" ||
+      data.settlement === null ||
+      Array.isArray(data.settlement)
+    )
+      return false;
+    const settlement = data.settlement as Record<string, unknown>;
+    return (
+      settlement.outcome === "cancelled_before_start" &&
+      settlement.confirmed === true &&
+      settlement.childPid === null
+    );
+  });
+  expect(receipts, label).toHaveLength(recoveredBeforeStart ? 1 : 0);
+  if (recoveredBeforeStart) {
+    expect(receipts[0]!.sequence, label).toBeGreaterThan(dispatches[0]!.sequence);
+    expect(receipts[0]!.sequence, label).toBeLessThan(dispatches[1]!.sequence);
+  }
 }
 
 function reportedUsage(
@@ -4566,74 +4603,78 @@ process.stdin.on("end", () => {
     }
   }, 60_000);
 
-  it("fails closed when a durable progress scope start has corrupt baseline or policy linkage", async () => {
-    for (const fault of ["baseline_digest", "policy_linkage"] as const) {
-      const repository = await createRepository();
-      const adapter = new FakeAdapter(async () => undefined);
-      const created = await createRun(`Implement a substantial ${fault} recovery feature`, {
-        cwd: repository,
-        planner: adapter,
-      });
-      const faultStore = new ProgressScopeProtocolFaultStore(created.store, fault);
+  it(
+    "fails closed when a durable progress scope start has corrupt baseline or policy linkage",
+    async () => {
+      for (const fault of ["baseline_digest", "policy_linkage"] as const) {
+        const repository = await createRepository();
+        const adapter = new FakeAdapter(async () => undefined);
+        const created = await createRun(`Implement a substantial ${fault} recovery feature`, {
+          cwd: repository,
+          planner: adapter,
+        });
+        const faultStore = new ProgressScopeProtocolFaultStore(created.store, fault);
 
-      await expect(
-        executeRun({ store: faultStore, adapter, approve: true }),
-        fault,
-      ).rejects.toThrow(`Injected process termination after ${fault} progress scope protocol`);
-      const crashEvents = await created.store.loadEvents();
-      const started = crashEvents.findLast(
-        ({ type, data }) =>
-          type === "scope.started" &&
-          data.nodeId === "implement" &&
-          data.stage === "progress_baseline",
-      );
-      const callsAtCrash = [...adapter.calls];
-      const requestsAtCrash = adapter.requests.length;
+        await expect(
+          executeRun({ store: faultStore, adapter, approve: true }),
+          fault,
+        ).rejects.toThrow(`Injected process termination after ${fault} progress scope protocol`);
+        const crashEvents = await created.store.loadEvents();
+        const started = crashEvents.findLast(
+          ({ type, data }) =>
+            type === "scope.started" &&
+            data.nodeId === "implement" &&
+            data.stage === "progress_baseline",
+        );
+        const callsAtCrash = [...adapter.calls];
+        const requestsAtCrash = adapter.requests.length;
 
-      expect(started?.data.checkpointId, fault).toEqual(expect.any(String));
-      expect(callsAtCrash, fault).toEqual(["investigate"]);
+        expect(started?.data.checkpointId, fault).toEqual(expect.any(String));
+        expect(callsAtCrash, fault).toEqual(["investigate"]);
 
-      const recovered = await executeRun({
-        store: new RunStore(repository, created.contract.runId),
-        adapter,
-      });
-      const events = await created.store.loadEvents();
-      const checkpointId = started?.data.checkpointId;
-      const failures = events.filter(
-        ({ type, data }) =>
-          type === "node.failed" &&
-          data.nodeId === "implement" &&
-          data.scopeCheckpointId === checkpointId,
-      );
-      const blockers = events.filter(
-        ({ type, data }) => type === "run.blocked" && data.scopeCheckpointId === checkpointId,
-      );
+        const recovered = await executeRun({
+          store: new RunStore(repository, created.contract.runId),
+          adapter,
+        });
+        const events = await created.store.loadEvents();
+        const checkpointId = started?.data.checkpointId;
+        const failures = events.filter(
+          ({ type, data }) =>
+            type === "node.failed" &&
+            data.nodeId === "implement" &&
+            data.scopeCheckpointId === checkpointId,
+        );
+        const blockers = events.filter(
+          ({ type, data }) => type === "run.blocked" && data.scopeCheckpointId === checkpointId,
+        );
 
-      expect(recovered.status, fault).toBe("blocked");
-      expect(recovered.stopReason, fault).toContain(
-        `cannot validate progress-probe scope checkpoint ${checkpointId}`,
-      );
-      expect(adapter.calls, fault).toEqual(callsAtCrash);
-      expect(adapter.requests, fault).toHaveLength(requestsAtCrash);
-      expect(failures, fault).toHaveLength(1);
-      expect(blockers, fault).toHaveLength(1);
-      expect(failures[0]?.data, fault).toMatchObject({
-        reason: recovered.stopReason,
-        progressProbeStage: "progress_baseline",
-        scopeCheckpointId: checkpointId,
-        runBlocker: {
+        expect(recovered.status, fault).toBe("blocked");
+        expect(recovered.stopReason, fault).toContain(
+          `cannot validate progress-probe scope checkpoint ${checkpointId}`,
+        );
+        expect(adapter.calls, fault).toEqual(callsAtCrash);
+        expect(adapter.requests, fault).toHaveLength(requestsAtCrash);
+        expect(failures, fault).toHaveLength(1);
+        expect(blockers, fault).toHaveLength(1);
+        expect(failures[0]?.data, fault).toMatchObject({
           reason: recovered.stopReason,
           progressProbeStage: "progress_baseline",
           scopeCheckpointId: checkpointId,
-        },
-      });
-      expect(blockers[0]?.data, fault).toMatchObject({
-        reason: recovered.stopReason,
-        progressProbeStage: "progress_baseline",
-        scopeCheckpointId: checkpointId,
-      });
-    }
-  }, 60_000);
+          runBlocker: {
+            reason: recovered.stopReason,
+            progressProbeStage: "progress_baseline",
+            scopeCheckpointId: checkpointId,
+          },
+        });
+        expect(blockers[0]?.data, fault).toMatchObject({
+          reason: recovered.stopReason,
+          progressProbeStage: "progress_baseline",
+          scopeCheckpointId: checkpointId,
+        });
+      }
+    },
+    process.platform === "win32" ? 120_000 : 60_000,
+  );
 
   it("fails closed on malformed or duplicate matching durable progress scope checks", async () => {
     for (const fault of ["malformed_check", "duplicate_check"] as const) {
@@ -6974,6 +7015,8 @@ process.stdin.on("end", () => {
       "side_effect.claimed",
       "side_effect.reconciled",
       "side_effect.dispatched",
+      "side_effect.process.started",
+      "side_effect.process.finished",
       "side_effect.reconciled",
       "side_effect.confirmed",
     ]);
@@ -7048,14 +7091,12 @@ process.stdin.on("end", () => {
         events.filter(({ type }) => type === "side_effect.claimed"),
         faultPoint,
       ).toHaveLength(1);
-      expect(
-        events.filter(
-          ({ type, data }) =>
-            type === "side_effect.dispatched" &&
-            data.actionId === completed.sideEffects[0]?.claim.actionId,
-        ),
+      expectRecoveredPreStartDispatch(
+        events,
+        completed.sideEffects[0]?.claim.actionId,
         faultPoint,
-      ).toHaveLength(1);
+        faultPoint,
+      );
       expect(
         events.filter(({ type }) => type === "side_effect.confirmed"),
         faultPoint,
@@ -7409,15 +7450,12 @@ process.stdin.on("end", () => {
         ),
         faultPoint,
       ).toHaveLength(1);
-      expect(
-        events.filter(
-          ({ type, data }) =>
-            type === "side_effect.dispatched" &&
-            data.actionId ===
-              completed.sideEffects.find(({ claim }) => claim.kind === "git_push")?.claim.actionId,
-        ),
+      expectRecoveredPreStartDispatch(
+        events,
+        completed.sideEffects.find(({ claim }) => claim.kind === "git_push")?.claim.actionId,
         faultPoint,
-      ).toHaveLength(1);
+        faultPoint,
+      );
       expect(
         events.filter(
           ({ type, data }) =>
@@ -9399,53 +9437,57 @@ process.stdin.on("end", () => {
     expect(adapter.calls).toEqual(["implement", "repair-review-1"]);
   }, 180_000);
 
-  it("clears a sticky changes-requested decision only after explicit approval", async () => {
-    const { repository, remote } = await createRepositoryWithRemote();
-    const github = await fakePullRequestGitHub(remote, {
-      syncPullRequestHead: true,
-      reviewThreads: [
-        {
-          id: "thread-approved",
-          isResolved: false,
-          isOutdated: false,
-          path: "feature.txt",
-          line: 1,
-          body: "Apply the change before approval.",
-        },
-      ],
-      reviewDecision: "CHANGES_REQUESTED",
-    });
-    const adapter = new FakeAdapter(async (request) => {
-      if (request.capsule.nodeId === "implement")
-        await writeFile(join(request.repositoryPath, "feature.txt"), "review\n");
-      if (request.capsule.nodeId === "repair-review-1") {
-        await writeFile(join(request.repositoryPath, "feature.txt"), "review-fixed\n");
-        const remoteState = JSON.parse(await readFile(github.statePath, "utf8")) as {
-          reviewDecision: string;
-        };
-        remoteState.reviewDecision = "APPROVED";
-        await writeFile(github.statePath, `${JSON.stringify(remoteState)}\n`);
-      }
-    });
-    const created = await createRun("Implement the feature and get the PR green", {
-      cwd: repository,
-      finishLine: "pr_green",
-    });
+  it(
+    "clears a sticky changes-requested decision only after explicit approval",
+    async () => {
+      const { repository, remote } = await createRepositoryWithRemote();
+      const github = await fakePullRequestGitHub(remote, {
+        syncPullRequestHead: true,
+        reviewThreads: [
+          {
+            id: "thread-approved",
+            isResolved: false,
+            isOutdated: false,
+            path: "feature.txt",
+            line: 1,
+            body: "Apply the change before approval.",
+          },
+        ],
+        reviewDecision: "CHANGES_REQUESTED",
+      });
+      const adapter = new FakeAdapter(async (request) => {
+        if (request.capsule.nodeId === "implement")
+          await writeFile(join(request.repositoryPath, "feature.txt"), "review\n");
+        if (request.capsule.nodeId === "repair-review-1") {
+          await writeFile(join(request.repositoryPath, "feature.txt"), "review-fixed\n");
+          const remoteState = JSON.parse(await readFile(github.statePath, "utf8")) as {
+            reviewDecision: string;
+          };
+          remoteState.reviewDecision = "APPROVED";
+          await writeFile(github.statePath, `${JSON.stringify(remoteState)}\n`);
+        }
+      });
+      const created = await createRun("Implement the feature and get the PR green", {
+        cwd: repository,
+        finishLine: "pr_green",
+      });
 
-    const state = await executeRun({
-      store: created.store,
-      adapter,
-      approve: true,
-      github,
-    });
-    const events = await created.store.loadEvents();
+      const state = await executeRun({
+        store: created.store,
+        adapter,
+        approve: true,
+        github,
+      });
+      const events = await created.store.loadEvents();
 
-    expect(state.status).toBe("completed");
-    expect(state.waits[0]?.stickyHumanDecision).toBeUndefined();
-    expect(events.filter(({ type }) => type === "wait.human_decision_observed")).toHaveLength(1);
-    expect(events.filter(({ type }) => type === "wait.human_decision_resolved")).toHaveLength(1);
-    expect(adapter.calls).toEqual(["implement", "repair-review-1"]);
-  }, 60_000);
+      expect(state.status).toBe("completed");
+      expect(state.waits[0]?.stickyHumanDecision).toBeUndefined();
+      expect(events.filter(({ type }) => type === "wait.human_decision_observed")).toHaveLength(1);
+      expect(events.filter(({ type }) => type === "wait.human_decision_resolved")).toHaveLength(1);
+      expect(adapter.calls).toEqual(["implement", "repair-review-1"]);
+    },
+    process.platform === "win32" ? 120_000 : 60_000,
+  );
 
   it(
     "reconciles review replies and resolutions across every mutation boundary",
@@ -9559,16 +9601,12 @@ process.stdin.on("end", () => {
             ),
             `${actionKind}:${faultPoint}`,
           ).toHaveLength(1);
-          expect(
-            events.filter(
-              ({ type, data }) =>
-                type === "side_effect.dispatched" &&
-                data.actionId ===
-                  completed.sideEffects.find(({ claim }) => claim.kind === actionKind)?.claim
-                    .actionId,
-            ),
+          expectRecoveredPreStartDispatch(
+            events,
+            completed.sideEffects.find(({ claim }) => claim.kind === actionKind)?.claim.actionId,
+            faultPoint,
             `${actionKind}:${faultPoint}`,
-          ).toHaveLength(1);
+          );
           expect(
             events.filter(
               ({ type, data }) =>
@@ -9598,7 +9636,7 @@ process.stdin.on("end", () => {
         }
       }
     },
-    process.platform === "win32" ? 1_200_000 : 600_000,
+    reviewMutationMatrixTimeout,
   );
 
   itGitHub("resumes a confirmed review-repair push without repeating the mutation", async () => {
@@ -10241,32 +10279,17 @@ process.stdin.on("end", () => {
       const reruns = resumed.sideEffects.filter(({ claim }) => claim.kind === "github_check_rerun");
       const events = await created.store.loadEvents();
 
-      if (faultPoint === "after_action_dispatch") {
-        expect(resumed.status, faultPoint).toBe("blocked");
-        expect(resumed.stopReason, faultPoint).toContain("possibly duplicate retry");
-        expect(persisted.rerunCalls, faultPoint).toBe(0);
-        expect(reruns, faultPoint).toMatchObject([
-          { status: "uncertain", retryable: false, dispatchedAt: expect.any(String) },
-        ]);
-      } else {
-        expect(resumed.status, faultPoint).toBe("completed");
-        expect(persisted.rerunCalls, faultPoint).toBe(1);
-        expect(reruns, faultPoint).toMatchObject([
-          { status: "confirmed", dispatchedAt: expect.any(String) },
-        ]);
-      }
-      expect(
-        events.filter(
-          ({ type, data }) =>
-            type === "side_effect.dispatched" && data.actionId === reruns[0]?.claim.actionId,
-        ),
-        faultPoint,
-      ).toHaveLength(1);
+      expect(resumed.status, faultPoint).toBe("completed");
+      expect(persisted.rerunCalls, faultPoint).toBe(1);
+      expect(reruns, faultPoint).toMatchObject([
+        { status: "confirmed", dispatchedAt: expect.any(String) },
+      ]);
+      expectRecoveredPreStartDispatch(events, reruns[0]?.claim.actionId, faultPoint, faultPoint);
       expect(adapter.calls, faultPoint).toEqual(["implement"]);
     }
   };
   it(
-    "reconciles a check rerun without issuing a possibly duplicate dispatch",
+    "reconciles a check rerun without issuing a possibly duplicate mutation",
     checkRerunMatrix,
     checkRerunMatrixTimeout,
   );
@@ -10436,16 +10459,13 @@ process.stdin.on("end", () => {
         ),
         faultPoint,
       ).toHaveLength(1);
-      expect(
-        events.filter(
-          ({ type, data }) =>
-            type === "side_effect.dispatched" &&
-            data.actionId ===
-              completed.sideEffects.find(({ claim }) => claim.kind === "github_pr_create")?.claim
-                .actionId,
-        ),
+      expectRecoveredPreStartDispatch(
+        events,
+        completed.sideEffects.find(({ claim }) => claim.kind === "github_pr_create")?.claim
+          .actionId,
         faultPoint,
-      ).toHaveLength(1);
+        faultPoint,
+      );
       expect(
         events.filter(
           ({ type, data }) => type === "node.accepted" && data.nodeId === "pull-request",
@@ -13285,6 +13305,16 @@ if (args[0] === ${JSON.stringify(kind === "git_commit" ? "commit" : "push")}) {
     remoteState.unconfirmedMutation = "github_pr_create";
     remoteState.unconfirmedMutationMarker = marker;
     await writeFakeGitHubState(github.statePath, remoteState);
+    const mutationEnvironment = { ...github.env };
+    if (process.platform === "win32") {
+      for (const name of Object.keys(mutationEnvironment))
+        if (name.toLowerCase() === "systemroot") delete mutationEnvironment[name];
+      // This fixture requires genuinely unconfirmed tree settlement. Windows
+      // normally proves the detached descendant terminated through taskkill /t;
+      // point only this test at a missing taskkill executable so the broker must
+      // retain the conservative unconfirmed outcome.
+      mutationEnvironment.SystemRoot = join(markerRoot, "missing-system-root");
+    }
     let descendantPid: number | undefined;
 
     try {
@@ -13292,7 +13322,7 @@ if (args[0] === ${JSON.stringify(kind === "git_commit" ? "commit" : "push")}) {
         store: created.store,
         adapter,
         approve: true,
-        github: { ...github, timeoutMs: 1_000 },
+        github: { ...github, env: mutationEnvironment, timeoutMs: 1_000 },
       });
       descendantPid = Number((await readFile(marker, "utf8")).trim());
       const events = await created.store.loadEvents();

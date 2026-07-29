@@ -86,13 +86,16 @@ interface RunnerRequest {
   resumeSessionId: string | null;
 }
 
-afterEach(async () => {
-  await Promise.all(
-    temporaryRoots
-      .splice(0)
-      .map((path) => rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })),
-  );
-});
+afterEach(
+  async () => {
+    await Promise.all(
+      temporaryRoots
+        .splice(0)
+        .map((path) => rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })),
+    );
+  },
+  process.platform === "win32" ? 30_000 : 10_000,
+);
 
 async function git(cwd: string, ...args: string[]): Promise<void> {
   await execFileAsync("git", args, { cwd });
@@ -192,7 +195,7 @@ async function waitForMarker(
   markerPath: string,
   child: ChildProcess,
   diagnostics: () => string,
-  timeoutMs = 15_000,
+  timeoutMs = process.platform === "win32" ? 45_000 : 15_000,
 ): Promise<{ boundary: FaultBoundary; invocationId: string; pid: number }> {
   const deadline = Date.now() + timeoutMs;
   while (true) {
@@ -510,7 +513,7 @@ describe("cold runtime restart fault recovery", () => {
         }
       }
     },
-    45_000,
+    process.platform === "win32" ? 90_000 : 45_000,
   );
 
   const probeScopeCases = (

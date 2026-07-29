@@ -711,6 +711,30 @@ async function assertNoProbeProcessState(repositoryRoot: string, runId: string):
   );
 }
 
+async function assertNoSideEffectProcessState(
+  repositoryRoot: string,
+  runId: string,
+): Promise<void> {
+  const graphcraftRoot = join(repositoryRoot, ".graphcraft");
+  const path = join(graphcraftRoot, "locks", "side-effect-processes", runId);
+  try {
+    await validatePrivatePath(graphcraftRoot, relative(graphcraftRoot, path));
+    const stats = await lstat(path);
+    if (stats.isSymbolicLink() || !stats.isDirectory())
+      throw new Error("side-effect-process state is not an ordinary directory");
+  } catch (error) {
+    if (isMissing(error)) return;
+    throw refusal(
+      runId,
+      `side-effect-process ownership evidence is ambiguous (${error instanceof Error ? error.message : String(error)})`,
+    );
+  }
+  throw refusal(
+    runId,
+    "side-effect-process ownership evidence remains; resume the run so Graphcraft can reconcile it before deletion",
+  );
+}
+
 async function inspectDeletableRun(
   repositoryRoot: string,
   runId: string,
@@ -722,6 +746,7 @@ async function inspectDeletableRun(
   const preservedWorkspace = await readPreservedWorkspace(repositoryRoot, runId);
   await assertNoLiveSupervisor(repositoryRoot, runId);
   await assertNoProbeProcessState(repositoryRoot, runId);
+  await assertNoSideEffectProcessState(repositoryRoot, runId);
   return createRetentionPlan(policy.hashAlgorithm, {
     action: "delete_run_state",
     repositoryRoot,
@@ -744,6 +769,7 @@ export async function planRunRetention(input: {
     const journal = await readRetentionJournal(repositoryRoot, input.runReference);
     if (journal) {
       await assertNoProbeProcessState(repositoryRoot, journal.runId);
+      await assertNoSideEffectProcessState(repositoryRoot, journal.runId);
       return planFromJournal(repositoryRoot, journal);
     }
   }
@@ -985,6 +1011,7 @@ async function applyRetention(
       validateEligibility?.(current);
       await assertNoLiveSupervisor(repositoryRoot, plan.runId);
       await assertNoProbeProcessState(repositoryRoot, plan.runId);
+      await assertNoSideEffectProcessState(repositoryRoot, plan.runId);
       await validateTargets(graphcraftRoot, targets, true);
     } else {
       const resolvedRunId = await resolveRunId(repositoryRoot, plan.runId);
@@ -1131,7 +1158,10 @@ export async function planCompletedRunPrune(input: {
   );
   const deletionPlans: RunRetentionPlan[] = [];
   for (const { runId, journal } of selected) {
-    if (journal) await assertNoProbeProcessState(repositoryRoot, runId);
+    if (journal) {
+      await assertNoProbeProcessState(repositoryRoot, runId);
+      await assertNoSideEffectProcessState(repositoryRoot, runId);
+    }
     deletionPlans.push(
       journal
         ? planFromJournal(repositoryRoot, journal)

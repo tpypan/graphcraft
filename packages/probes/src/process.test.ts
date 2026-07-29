@@ -11,8 +11,10 @@ import {
   PROCESS_SETTLEMENT_GRACE_MS,
   PROCESS_TERMINATION_GRACE_MS,
   WINDOWS_PROCESS_SETTLEMENT_GRACE_MS,
+  managedProcessBrokerSource,
   managedProcessSettlementGraceMs,
   runProcess,
+  type ManagedProcessSettlement,
 } from "./process.ts";
 
 afterEach(() => {
@@ -28,6 +30,114 @@ async function waitFor(check: () => boolean | Promise<boolean>, timeoutMs = 5_00
   }
 }
 
+async function exerciseWindowsBrokerTermination(
+  taskkill: "success" | "nonzero" | "missing",
+): Promise<{
+  settlement: ManagedProcessSettlement;
+  brokerCode: number | null;
+  taskkillCompletedBeforeSettlement: boolean;
+}> {
+  const root = await mkdtemp(join(tmpdir(), "graphcraft-windows-broker-"));
+  const journal = await open(join(root, "journal.jsonl"), "a+", 0o600);
+  const completionMarker = join(root, "taskkill-complete.txt");
+  const taskkillExecutable =
+    taskkill === "missing" ? join(root, "missing-taskkill.exe") : process.execPath;
+  const taskkillArgumentPrefix =
+    taskkill === "missing"
+      ? []
+      : [
+          "-e",
+          `const fs = require("node:fs");
+const pidIndex = process.argv.indexOf("/pid");
+const pid = Number(process.argv[pidIndex + 1]);
+try { process.kill(pid, "SIGKILL"); } catch {}
+setTimeout(() => {
+  fs.writeFileSync(${JSON.stringify(completionMarker)}, "complete\\n");
+  process.exit(${taskkill === "success" ? 0 : 1});
+}, 75);`,
+        ];
+
+  let targetPid: number | undefined;
+  const broker = crossSpawn.spawn(
+    process.execPath,
+    [
+      "-e",
+      managedProcessBrokerSource("win32", taskkillExecutable, taskkillArgumentPrefix),
+      `windows-broker-${taskkill}`,
+      `windows-owner-${taskkill}`,
+      "100",
+      "1000",
+    ],
+    {
+      cwd: root,
+      env: { ...process.env },
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe", "ipc", journal.fd],
+    },
+  );
+  let stderr = "";
+  broker.stderr!.setEncoding("utf8");
+  broker.stderr!.on("data", (chunk: string) => (stderr += chunk));
+  const brokerExit = new Promise<number | null>((resolve) =>
+    broker.once("close", (code) => resolve(code)),
+  );
+  const waitForMessage = <T extends { type: string }>(type: T["type"]): Promise<T> =>
+    new Promise<T>((resolve, reject) => {
+      const timeout = setTimeout(
+        () => reject(new Error(`Timed out waiting for broker ${type}: ${stderr}`)),
+        5_000,
+      );
+      const receive = (message: unknown): void => {
+        if (!message || typeof message !== "object" || !("type" in message)) return;
+        if ((message as { type: unknown }).type !== type) return;
+        clearTimeout(timeout);
+        broker.off("message", receive);
+        resolve(message as T);
+      };
+      broker.on("message", receive);
+    });
+
+  try {
+    await waitForMessage<{ type: "ready" }>("ready");
+    broker.send({
+      type: "start",
+      executable: process.execPath,
+      args: ["-e", "setInterval(() => undefined, 1_000)"],
+      cwd: root,
+      env: { ...process.env },
+    });
+    await waitFor(async () =>
+      (await readFile(join(root, "journal.jsonl"), "utf8")).includes('"status":"started"'),
+    );
+    const journalText = await readFile(join(root, "journal.jsonl"), "utf8");
+    targetPid = Number(journalText.match(/"childPid":(\d+)/u)?.[1]);
+    const settled = waitForMessage<ManagedProcessSettlement & { type: "settled" }>("settled");
+    broker.send({ type: "terminate" });
+    const settlement = await settled;
+    const taskkillCompletedBeforeSettlement = await stat(completionMarker).then(
+      () => true,
+      () => false,
+    );
+    const brokerCode = await brokerExit;
+    return { settlement, brokerCode, taskkillCompletedBeforeSettlement };
+  } finally {
+    try {
+      broker.kill("SIGKILL");
+    } catch {
+      // Best-effort cleanup for a failed broker assertion.
+    }
+    if (targetPid && Number.isSafeInteger(targetPid)) {
+      try {
+        process.kill(targetPid, "SIGKILL");
+      } catch {
+        // The broker normally settles the target before this cleanup path.
+      }
+    }
+    await journal.close();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 describe("bounded subprocess output capture", () => {
   it("allows a bounded Windows tree-settlement window without slowing other platforms", () => {
     expect(managedProcessSettlementGraceMs("win32")).toBe(WINDOWS_PROCESS_SETTLEMENT_GRACE_MS);
@@ -36,6 +146,29 @@ describe("bounded subprocess output capture", () => {
     expect(managedProcessSettlementGraceMs("linux")).toBe(PROCESS_SETTLEMENT_GRACE_MS);
     expect(managedProcessSettlementGraceMs("darwin")).toBe(PROCESS_SETTLEMENT_GRACE_MS);
   });
+
+  it("confirms Windows termination only after taskkill succeeds and the child closes", async () => {
+    const observed = await exerciseWindowsBrokerTermination("success");
+
+    expect(observed).toMatchObject({
+      settlement: { outcome: "terminated", confirmed: true },
+      brokerCode: 0,
+      taskkillCompletedBeforeSettlement: true,
+    });
+  });
+
+  it.each(["nonzero", "missing"] as const)(
+    "keeps Windows termination unconfirmed when taskkill is %s",
+    async (taskkill) => {
+      const observed = await exerciseWindowsBrokerTermination(taskkill);
+
+      expect(observed).toMatchObject({
+        settlement: { outcome: "unconfirmed", confirmed: false },
+        brokerCode: 1,
+        taskkillCompletedBeforeSettlement: taskkill === "nonzero",
+      });
+    },
+  );
 
   it("does not start a managed command until its ownership checkpoint is durable", async () => {
     const root = await mkdtemp(join(tmpdir(), "graphcraft-managed-process-"));
@@ -82,6 +215,64 @@ describe("bounded subprocess output capture", () => {
       expect(await readFile(join(root, "journal.jsonl"), "utf8")).toContain('"status":"settled"');
     } finally {
       release();
+      await journal.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("persists managed settlement only after the ready checkpoint finishes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-managed-settlement-order-"));
+    const marker = join(root, "must-not-start.txt");
+    const journal = await open(join(root, "journal.jsonl"), "a+", 0o600);
+    const controller = new AbortController();
+    let release!: () => void;
+    const durable = new Promise<void>((resolve) => (release = resolve));
+    let ready = false;
+    let readyFinished = false;
+    const settlementReadyStates: boolean[] = [];
+    const result = runProcess(
+      process.execPath,
+      ["-e", `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "started\\n")`],
+      {
+        cwd: root,
+        signal: controller.signal,
+        lifecycle: {
+          executionId: "managed-settlement-order",
+          ownerToken: "managed-settlement-order-token",
+          journalFd: journal.fd,
+          onReady: async () => {
+            ready = true;
+            await durable;
+            readyFinished = true;
+          },
+          onSettled: async () => {
+            settlementReadyStates.push(readyFinished);
+          },
+        },
+      },
+    );
+
+    try {
+      await waitFor(() => ready);
+      controller.abort();
+      await waitFor(async () =>
+        (await readFile(join(root, "journal.jsonl"), "utf8")).includes('"status":"settled"'),
+      );
+      expect(settlementReadyStates).toEqual([]);
+      await expect(stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+
+      release();
+      await expect(result).resolves.toMatchObject({
+        exitCode: 1,
+        timedOut: false,
+        childSettlement: "confirmed",
+      });
+      expect(settlementReadyStates).toEqual([true]);
+      await expect(stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      release();
+      controller.abort();
+      await result.catch(() => undefined);
       await journal.close();
       await rm(root, { recursive: true, force: true });
     }
@@ -242,6 +433,53 @@ describe("bounded subprocess output capture", () => {
         },
       },
     });
+  });
+
+  it("enforces an optional combined output limit without reducing either stream limit", async () => {
+    const accepted = await runProcess(
+      process.execPath,
+      ["-e", 'process.stdout.write("x".repeat(1_200));'],
+      {
+        cwd: process.cwd(),
+        maxOutputBytesPerStream: 2_000,
+        maxOutputBytesTotal: 1_500,
+      },
+    );
+    expect(accepted).toMatchObject({ exitCode: 0, stdout: "x".repeat(1_200) });
+
+    const rejected = runProcess(
+      process.execPath,
+      ["-e", 'process.stdout.write("x".repeat(800)); process.stderr.write("y".repeat(800));'],
+      {
+        cwd: process.cwd(),
+        maxOutputBytesPerStream: 2_000,
+        maxOutputBytesTotal: 1_500,
+      },
+    );
+    await expect(rejected).rejects.toMatchObject({
+      name: "ProcessOutputLimitError",
+      scope: "combined",
+      limitBytes: 1_500,
+      childSettlement: "confirmed",
+    });
+  });
+
+  it("bounds combined retention when total overflow is truncated", async () => {
+    const result = await runProcess(
+      process.execPath,
+      ["-e", 'process.stdout.write("x".repeat(800)); process.stderr.write("y".repeat(800));'],
+      {
+        cwd: process.cwd(),
+        maxOutputBytesPerStream: 2_000,
+        maxOutputBytesTotal: 1_000,
+        outputOverflow: "truncate",
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.capture.stdout.observedBytes + result.capture.stderr.observedBytes).toBe(1_600);
+    expect(result.capture.stdout.retainedBytes + result.capture.stderr.retainedBytes).toBe(1_000);
+    expect(result.capture.stdout.truncated || result.capture.stderr.truncated).toBe(true);
   });
 
   it("normalizes a child close code after the timeout boundary", async () => {

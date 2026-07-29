@@ -1,6 +1,12 @@
 import crossSpawn from "cross-spawn";
 import { z } from "zod";
 import {
+  ProcessOutputLimitError,
+  ProcessSettlementError,
+  runProcess,
+  type ManagedProcessLifecycle,
+} from "@graphcraft/probes";
+import {
   LEGACY_CANONICAL_HASH_ALGORITHM,
   contentHash,
   resolveTrustedExecutable,
@@ -10,6 +16,7 @@ import {
 
 export const GITHUB_COMMAND_TERMINATION_GRACE_MS = 2_000;
 export const GITHUB_COMMAND_SETTLEMENT_GRACE_MS = 2_000;
+const GITHUB_COMMAND_OUTPUT_LIMIT_BYTES = 16 * 1024 * 1024;
 
 const PermissionSchema = z.enum(["ADMIN", "MAINTAIN", "WRITE", "TRIAGE", "READ", "NONE"]);
 
@@ -203,6 +210,7 @@ export interface GitHubCommandOptions {
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
   signal?: AbortSignal;
+  lifecycle?: ManagedProcessLifecycle;
 }
 
 export type GitHubCommandCancellationOutcome =
@@ -254,6 +262,89 @@ async function runCommand(
     }));
   if (options.signal?.aborted) throw new GitHubCommandCancellationError("cancelled_before_spawn");
   const commandArgs = [...(options.commandArgs ?? []), ...args];
+  if (options.lifecycle) {
+    const timeoutMs = options.timeoutMs ?? 60_000;
+    const lifecycle = options.lifecycle;
+    let targetSettled = false;
+    let abortedBeforeTargetSettlement = options.signal?.aborted ?? false;
+    const recordAbort = (): void => {
+      if (!targetSettled) abortedBeforeTargetSettlement = true;
+    };
+    options.signal?.addEventListener("abort", recordAbort, { once: true });
+    let result: Awaited<ReturnType<typeof runProcess>>;
+    try {
+      result = await runProcess(command, commandArgs, {
+        cwd: options.cwd,
+        timeoutMs,
+        maxOutputBytesPerStream: GITHUB_COMMAND_OUTPUT_LIMIT_BYTES,
+        maxOutputBytesTotal: GITHUB_COMMAND_OUTPUT_LIMIT_BYTES,
+        outputOverflow: "reject",
+        ...(options.env ? { env: options.env } : {}),
+        ...(options.signal ? { signal: options.signal } : {}),
+        lifecycle: {
+          ...lifecycle,
+          onSettled: async (settlement) => {
+            targetSettled = true;
+            await lifecycle.onSettled(settlement);
+          },
+        },
+      });
+    } catch (error) {
+      if (error instanceof ProcessOutputLimitError)
+        throw new GitHubCommandError(
+          "gh output exceeded the 16MiB safety limit",
+          1,
+          error.childSettlement,
+        );
+      if (error instanceof ProcessSettlementError) {
+        if (error.timedOut)
+          throw new GitHubCommandError(
+            `gh exceeded its ${timeoutMs}ms timeout`,
+            124,
+            "unconfirmed",
+          );
+        if (error.outputLimit)
+          throw new GitHubCommandError(
+            "gh output exceeded the 16MiB safety limit",
+            1,
+            "unconfirmed",
+          );
+        if (abortedBeforeTargetSettlement) throw new GitHubCommandCancellationError("unconfirmed");
+        throw new GitHubCommandError(error.message, 1, "unconfirmed");
+      }
+      throw error;
+    } finally {
+      options.signal?.removeEventListener("abort", recordAbort);
+    }
+    if (result.timedOut)
+      throw new GitHubCommandError(
+        `gh exceeded its ${timeoutMs}ms timeout`,
+        result.exitCode,
+        result.childSettlement,
+      );
+    if (abortedBeforeTargetSettlement)
+      throw new GitHubCommandCancellationError(
+        result.childSettlement === "confirmed" ? "terminated" : "unconfirmed",
+      );
+    if (
+      result.capture.stdout.observedBytes + result.capture.stderr.observedBytes >
+      GITHUB_COMMAND_OUTPUT_LIMIT_BYTES
+    )
+      throw new GitHubCommandError(
+        "gh output exceeded the 16MiB safety limit",
+        result.exitCode,
+        result.childSettlement,
+      );
+    if (result.exitCode !== 0)
+      throw new GitHubCommandError(
+        result.stderr.trim() ||
+          result.stdout.trim() ||
+          `${command} ${commandArgs[0] ?? ""} exited ${result.exitCode}`,
+        result.exitCode,
+        result.childSettlement,
+      );
+    return { stdout: result.stdout, stderr: result.stderr };
+  }
   return await new Promise((resolve, reject) => {
     const child = crossSpawn.spawn(command, commandArgs, {
       cwd: options.cwd,
@@ -358,13 +449,13 @@ async function runCommand(
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       outputBytes += Buffer.byteLength(chunk);
-      if (outputBytes > 16 * 1024 * 1024)
+      if (outputBytes > GITHUB_COMMAND_OUTPUT_LIMIT_BYTES)
         return terminate({ kind: "failure", message: "gh output exceeded the 16MiB safety limit" });
       stdout += chunk;
     });
     child.stderr.on("data", (chunk: string) => {
       outputBytes += Buffer.byteLength(chunk);
-      if (outputBytes > 16 * 1024 * 1024)
+      if (outputBytes > GITHUB_COMMAND_OUTPUT_LIMIT_BYTES)
         return terminate({ kind: "failure", message: "gh output exceeded the 16MiB safety limit" });
       stderr += chunk;
     });

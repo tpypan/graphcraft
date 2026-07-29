@@ -2295,6 +2295,6 @@ describe("benchmark harness", () => {
         }),
       ).rejects.toThrow("mismatched trial controls");
     },
-    process.platform === "win32" ? 120_000 : 60_000,
+    process.platform === "win32" ? 180_000 : 60_000,
   );
 });

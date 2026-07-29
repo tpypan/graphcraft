@@ -6,12 +6,15 @@ import {
   assertRepositoryPath,
   isRepositoryFileError,
   ProcessOutputLimitError,
+  ProcessSettlementError,
   readRepositoryTextFile,
   runProcess,
+  type ManagedProcessLifecycle,
 } from "@graphcraft/probes";
 import {
   SideEffectClaimSchema,
   contentHash,
+  resolveTrustedExecutable,
   type CanonicalHashAlgorithm,
   type RepositoryIdentity,
   type RepositoryPlanningEvidence,
@@ -21,6 +24,7 @@ import {
 } from "@graphcraft/core";
 import {
   crossSideEffectBoundary,
+  type SideEffectDispatch,
   type SideEffectBoundary,
   type SideEffectReconciliation,
 } from "./side-effect.ts";
@@ -107,6 +111,7 @@ async function gitRaw(
   repositoryPath: string,
   args: string[],
   signal?: AbortSignal,
+  lifecycle?: ManagedProcessLifecycle,
 ): Promise<string> {
   throwIfGitCancelledBeforeSpawn(signal);
   let result;
@@ -115,10 +120,21 @@ async function gitRaw(
       cwd: repositoryPath,
       timeoutMs: 120_000,
       ...(signal ? { signal } : {}),
+      ...(lifecycle ? { lifecycle } : {}),
     });
   } catch (error) {
     if (error instanceof ProcessOutputLimitError)
       throw new GitCommandError(error.message, error.childSettlement, { cause: error });
+    if (error instanceof ProcessSettlementError) {
+      if (error.timedOut)
+        throw new GitCommandError(
+          `git ${args[0]} exceeded its 120000ms timeout`,
+          error.childSettlement,
+          { cause: error },
+        );
+      if (signal?.aborted) throw new GitMutationCancellationError("unconfirmed");
+      throw new GitCommandError(error.message, error.childSettlement, { cause: error });
+    }
     throw error;
   }
   if (result.timedOut)
@@ -135,8 +151,103 @@ async function gitRaw(
   return result.stdout;
 }
 
-async function git(repositoryPath: string, args: string[], signal?: AbortSignal): Promise<string> {
-  return (await gitRaw(repositoryPath, args, signal)).trim();
+const ATOMIC_COMMIT_PROCESS_SOURCE = String.raw`
+const { spawn } = require("node:child_process");
+
+const git = process.argv[1];
+const commitArgs = process.argv.slice(2);
+if (!git || commitArgs.length === 0) process.exit(2);
+const commands = [["add", "-A"], commitArgs];
+
+function run(index) {
+  if (index >= commands.length) return;
+  const args = commands[index];
+  const child = spawn(git, args, {
+    cwd: process.cwd(),
+    env: process.env,
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  let spawnError;
+  child.stdout.pipe(process.stdout, { end: false });
+  child.stderr.pipe(process.stderr, { end: false });
+  child.once("error", (error) => { spawnError = error; });
+  child.once("close", (code, signal) => {
+    if (spawnError) {
+      process.stderr.write("Unable to start git " + args[0] + ": " + spawnError.message + "\n");
+      process.exitCode = 1;
+      return;
+    }
+    if (code !== 0) {
+      if (signal) process.stderr.write("git " + args[0] + " exited via " + signal + "\n");
+      process.exitCode = Number.isInteger(code) ? code : 1;
+      return;
+    }
+    run(index + 1);
+  });
+}
+
+run(0);
+`;
+
+async function atomicCommit(
+  repositoryPath: string,
+  args: string[],
+  signal: AbortSignal | undefined,
+  lifecycle: ManagedProcessLifecycle | undefined,
+): Promise<void> {
+  throwIfGitCancelledBeforeSpawn(signal);
+  const executable = await resolveTrustedExecutable("git", {
+    environment: process.env,
+    untrustedCwd: repositoryPath,
+  });
+  let result;
+  try {
+    result = await runProcess(
+      process.execPath,
+      ["-e", ATOMIC_COMMIT_PROCESS_SOURCE, executable, ...args],
+      {
+        cwd: repositoryPath,
+        timeoutMs: 120_000,
+        ...(signal ? { signal } : {}),
+        ...(lifecycle ? { lifecycle } : {}),
+      },
+    );
+  } catch (error) {
+    if (error instanceof ProcessOutputLimitError)
+      throw new GitCommandError(error.message, error.childSettlement, { cause: error });
+    if (error instanceof ProcessSettlementError) {
+      if (error.timedOut)
+        throw new GitCommandError(
+          "git commit exceeded its 120000ms timeout",
+          error.childSettlement,
+          {
+            cause: error,
+          },
+        );
+      if (signal?.aborted) throw new GitMutationCancellationError("unconfirmed");
+      throw new GitCommandError(error.message, error.childSettlement, { cause: error });
+    }
+    throw error;
+  }
+  if (result.timedOut)
+    throw new GitCommandError(
+      result.stderr.trim() || "git commit exceeded its 120000ms timeout",
+      result.childSettlement,
+    );
+  throwIfGitCancelledAfterSpawn(signal, result.childSettlement);
+  if (result.exitCode !== 0)
+    throw new GitCommandError(result.stderr.trim() || "git commit failed", result.childSettlement);
+}
+
+async function git(
+  repositoryPath: string,
+  args: string[],
+  signal?: AbortSignal,
+  lifecycle?: ManagedProcessLifecycle,
+): Promise<string> {
+  return (await gitRaw(repositoryPath, args, signal, lifecycle)).trim();
 }
 
 async function readUtf8(path: string, signal?: AbortSignal): Promise<string> {
@@ -1174,7 +1285,7 @@ export async function performAtomicCommit(
   claim: SideEffectClaim,
   task: string,
   hashAlgorithm: CanonicalHashAlgorithm,
-  markDispatched: () => Promise<void>,
+  prepareProcess: SideEffectDispatch,
   boundary?: (point: SideEffectBoundary) => void | Promise<void>,
   signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
@@ -1190,15 +1301,15 @@ export async function performAtomicCommit(
     throw new Error(`Commit precondition changed for side effect ${claim.actionId}`);
   const status = await git(workspace.path, ["status", "--porcelain=v1"], signal);
   if (!status) throw new Error("No accepted changes are available to commit");
-  await git(workspace.path, ["add", "-A"], signal);
   const summary = task.replace(/\s+/g, " ").slice(0, 64);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
   throwIfGitCancelledBeforeSpawn(signal);
-  await markDispatched();
-  await git(
+  const lifecycle = (await prepareProcess({ managedProcess: true })) || undefined;
+  await atomicCommit(
     workspace.path,
     ["commit", "-m", `graphcraft: ${summary}`, "-m", `Graphcraft-Action: ${claim.idempotencyKey}`],
     signal,
+    lifecycle,
   );
   await crossSideEffectBoundary(boundary, "after_action_command");
   return {
@@ -1374,7 +1485,7 @@ export async function createAtomicPushClaim(
 export async function performAtomicPush(
   workspace: RunWorkspace,
   claim: SideEffectClaim,
-  markDispatched: () => Promise<void>,
+  prepareProcess: SideEffectDispatch,
   boundary?: (point: SideEffectBoundary) => void | Promise<void>,
   signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
@@ -1391,11 +1502,12 @@ export async function performAtomicPush(
     throw new Error(`Push precondition changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
   throwIfGitCancelledBeforeSpawn(signal);
-  await markDispatched();
+  const lifecycle = (await prepareProcess({ managedProcess: true })) || undefined;
   await gitRaw(
     workspace.path,
     ["push", "--porcelain", expected.remote, `${expected.branch}:refs/heads/${expected.branch}`],
     signal,
+    lifecycle,
   );
   await crossSideEffectBoundary(boundary, "after_action_command");
   return {

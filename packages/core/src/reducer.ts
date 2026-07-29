@@ -32,6 +32,61 @@ function requiredRecord(data: Record<string, unknown>, key: string): Record<stri
   return value as Record<string, unknown>;
 }
 
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function hasExactKeys(data: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(data).sort();
+  const sortedExpected = [...expected].sort();
+  return (
+    actual.length === sortedExpected.length &&
+    actual.every((key, index) => key === sortedExpected[index])
+  );
+}
+
+function positivePid(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) > 0;
+}
+
+function validateSideEffectProcessSettlement(
+  data: Record<string, unknown>,
+  actionId: string,
+): { confirmed: boolean; outcome: string } {
+  if (
+    !hasExactKeys(data, [
+      "schemaVersion",
+      "executionId",
+      "brokerPid",
+      "childPid",
+      "outcome",
+      "confirmed",
+      "exitCode",
+      "exitSignal",
+      "settledAt",
+    ]) ||
+    data.schemaVersion !== 1 ||
+    typeof data.executionId !== "string" ||
+    !UUID_V4.test(data.executionId) ||
+    !positivePid(data.brokerPid) ||
+    (data.childPid !== null && !positivePid(data.childPid)) ||
+    !["exited", "terminated", "cancelled_before_start", "failed_to_start", "unconfirmed"].includes(
+      String(data.outcome),
+    ) ||
+    typeof data.confirmed !== "boolean" ||
+    (data.exitCode !== null && !Number.isInteger(data.exitCode)) ||
+    (data.exitSignal !== null &&
+      (typeof data.exitSignal !== "string" || data.exitSignal.length === 0)) ||
+    typeof data.settledAt !== "string" ||
+    !Number.isFinite(Date.parse(data.settledAt)) ||
+    (data.confirmed === true && data.outcome === "unconfirmed") ||
+    (data.confirmed === false && data.outcome !== "unconfirmed") ||
+    (["exited", "terminated"].includes(String(data.outcome)) && !positivePid(data.childPid)) ||
+    (["cancelled_before_start", "failed_to_start"].includes(String(data.outcome)) &&
+      (data.childPid !== null || data.exitCode !== null || data.exitSignal !== null))
+  )
+    throw new Error(`Side effect ${actionId} has invalid process-settlement evidence`);
+  return { confirmed: data.confirmed, outcome: String(data.outcome) };
+}
+
 export function reduceEvents(events: RunEvent[]): RunState {
   let state: RunState | undefined;
   let previousSequence = 0;
@@ -411,9 +466,52 @@ export function reduceEvents(events: RunEvent[]): RunState {
       case "probe.process.started":
       case "probe.process.finished":
       case "probe.process.reconciled":
+      case "side_effect.process.started":
       case "control.observed":
       case "control.override":
         break;
+      case "side_effect.process.finished":
+      case "side_effect.process.reconciled": {
+        const actionId = requiredString(data, "actionId");
+        const entry = state.sideEffects.find(({ claim }) => claim.actionId === actionId);
+        if (!entry) throw new Error(`Unknown side effect ${actionId}`);
+        if (
+          !hasExactKeys(data, [
+            "schemaVersion",
+            "actionId",
+            "nodeId",
+            "kind",
+            "executionId",
+            "started",
+            "settlement",
+          ]) ||
+          data.schemaVersion !== 1 ||
+          event.actor !== "runtime" ||
+          event.causationId !== actionId ||
+          data.nodeId !== entry.claim.nodeId ||
+          data.kind !== entry.claim.kind ||
+          typeof data.executionId !== "string" ||
+          !UUID_V4.test(data.executionId)
+        )
+          throw new Error(`Side effect ${actionId} has invalid process-lifecycle evidence`);
+        const settlement = requiredRecord(data, "settlement");
+        const validated = validateSideEffectProcessSettlement(settlement, actionId);
+        if (settlement.executionId !== data.executionId)
+          throw new Error(`Side effect ${actionId} has mismatched process-settlement evidence`);
+        if (event.type === "side_effect.process.reconciled" && !validated.confirmed)
+          throw new Error(`Side effect ${actionId} has an unconfirmed process reconciliation`);
+        if (typeof data.started !== "boolean")
+          throw new Error(`Side effect ${actionId} has invalid process-start evidence`);
+        const outcome = validated.outcome;
+        if (data.started === false && outcome !== "cancelled_before_start")
+          throw new Error(`Side effect ${actionId} settled without process-start authorization`);
+        if (outcome === "cancelled_before_start" || outcome === "failed_to_start") {
+          entry.dispatchedAt = undefined;
+        }
+        entry.childSettlement = validated.confirmed ? "confirmed" : "unconfirmed";
+        entry.updatedAt = event.timestamp;
+        break;
+      }
       case "control.decision": {
         const decision = ControlDecisionSchema.parse(data.decision);
         if (decision.replaces) {

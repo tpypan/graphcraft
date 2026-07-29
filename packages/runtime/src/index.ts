@@ -15,6 +15,7 @@ export * from "./redaction.ts";
 export * from "./retention.ts";
 export * from "./runner.ts";
 export * from "./side-effect.ts";
+export * from "./side-effect-process.ts";
 export * from "./secure-fs.ts";
 export * from "./scope.ts";
 export * from "./github.ts";

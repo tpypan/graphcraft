@@ -1,17 +1,22 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import {
+  LEGACY_CANONICAL_HASH_ALGORITHM,
+  PORTABLE_CANONICAL_HASH_ALGORITHM,
   RunStorageManifestSchema,
   compileGraph,
   compileRunContract,
   contentHash,
+  createRunEvent,
+  reduceEvents,
   validateGraph,
   type Graph,
   type GraphNode,
   type SideEffectClaim,
 } from "@graphcraft/core";
+import { runProcess } from "@graphcraft/probes";
 import { afterEach, describe, expect, it } from "vitest";
 import { CURRENT_RUN_STORAGE_VERSION, ensureCurrentRunStorage } from "./migration.ts";
 import {
@@ -21,9 +26,15 @@ import {
   executeSideEffect,
   type SideEffectBoundary,
   type SideEffectCancellation,
+  type SideEffectDispatch,
   type SideEffectDispatchPolicy,
   type SideEffectReconciliation,
 } from "./side-effect.ts";
+import {
+  closeSideEffectProcessLease,
+  createSideEffectProcessDefinition,
+  createSideEffectProcessLease,
+} from "./side-effect-process.ts";
 import { RunStore } from "./store.ts";
 
 const roots: string[] = [];
@@ -243,6 +254,387 @@ describe("generated migration properties", () => {
 });
 
 describe("generated side-effect protocol properties", () => {
+  it.each([
+    { durableAuthorization: false, terminalEvent: false },
+    { durableAuthorization: true, terminalEvent: false },
+    { durableAuthorization: true, terminalEvent: true },
+  ])(
+    "retries an at-most-once action after confirmed pre-start recovery ($durableAuthorization, $terminalEvent)",
+    async ({ durableAuthorization, terminalEvent }) => {
+      const { claim, store } = await generatedSideEffectFixture(
+        `pre-start-recovery-${durableAuthorization}-${terminalEvent}`,
+        "at_most_once",
+      );
+      await store.append("runtime", "side_effect.claimed", { claim }, claim.actionId);
+      await store.append(
+        "runtime",
+        "side_effect.dispatched",
+        { actionId: claim.actionId },
+        claim.actionId,
+      );
+
+      const definition = createSideEffectProcessDefinition(claim);
+      const lease = await createSideEffectProcessLease({
+        graphcraftRoot: store.graphcraftRoot,
+        runId: store.runId,
+        definition,
+        hashAlgorithm: store.githubMutationLifecycleIdentityHashAlgorithm,
+      });
+      const lifecycle = lease.lifecycle({
+        onReady: async () => undefined,
+        onSettled: async () => undefined,
+      });
+      const brokerPid = process.pid;
+      const readyAt = "2026-07-29T12:00:00.000Z";
+      const ready = {
+        type: "ready" as const,
+        schemaVersion: 1 as const,
+        executionId: definition.executionId,
+        brokerPid,
+        processGroupId: null,
+        platform: process.platform,
+        readyAt,
+      };
+      await lease.handle.write(
+        `${JSON.stringify({
+          schemaVersion: 1,
+          executionId: definition.executionId,
+          ownerToken: lifecycle.ownerToken,
+          brokerPid,
+          status: "ready",
+          readyAt,
+        })}\n`,
+      );
+      if (durableAuthorization)
+        await store.append(
+          "runtime",
+          "side_effect.process.started",
+          {
+            schemaVersion: 1,
+            actionId: claim.actionId,
+            nodeId: claim.nodeId,
+            kind: claim.kind,
+            definition,
+            ownerTokenHash: lease.ownerTokenHash,
+            journalPath: lease.journalRelativePath,
+            ready,
+          },
+          claim.actionId,
+        );
+      await lease.handle.write(
+        `${JSON.stringify({
+          schemaVersion: 1,
+          executionId: definition.executionId,
+          ownerToken: lifecycle.ownerToken,
+          brokerPid,
+          status: "settled",
+          outcome: "cancelled_before_start",
+          confirmed: true,
+          childPid: null,
+          exitCode: null,
+          exitSignal: null,
+          settledAt: "2026-07-29T12:00:01.000Z",
+        })}\n`,
+      );
+      await lease.handle.sync();
+      if (terminalEvent)
+        await store.append(
+          "runtime",
+          "side_effect.process.finished",
+          {
+            schemaVersion: 1,
+            actionId: claim.actionId,
+            nodeId: claim.nodeId,
+            kind: claim.kind,
+            executionId: definition.executionId,
+            started: durableAuthorization,
+            settlement: {
+              schemaVersion: 1,
+              executionId: definition.executionId,
+              brokerPid,
+              childPid: null,
+              outcome: "cancelled_before_start",
+              confirmed: true,
+              exitCode: null,
+              exitSignal: null,
+              settledAt: "2026-07-29T12:00:01.000Z",
+            },
+          },
+          claim.actionId,
+        );
+      await closeSideEffectProcessLease(lease);
+
+      let applied = false;
+      await expect(
+        executeSideEffect({
+          store,
+          claim,
+          dispatchPolicy: "at_most_once",
+          reconcile: async () =>
+            applied
+              ? { status: "applied", result: { applied: true }, evidence: ["applied"] }
+              : { status: "not_applied", evidence: ["absent"] },
+          act: async (__, markDispatched) => {
+            await markDispatched();
+            applied = true;
+            return { applied: true };
+          },
+        }),
+      ).resolves.toEqual({ applied: true });
+
+      const events = await store.loadEvents();
+      expect(
+        events.filter(
+          ({ type, data }) => type === "side_effect.dispatched" && data.actionId === claim.actionId,
+        ),
+      ).toHaveLength(2);
+      expect(
+        events.filter(
+          ({ type, data }) =>
+            type === "side_effect.process.reconciled" &&
+            data.executionId === definition.executionId,
+        ),
+      ).toEqual(
+        terminalEvent
+          ? []
+          : [
+              expect.objectContaining({
+                data: expect.objectContaining({
+                  started: durableAuthorization,
+                  settlement: expect.objectContaining({
+                    outcome: "cancelled_before_start",
+                    confirmed: true,
+                    childPid: null,
+                  }),
+                }),
+              }),
+            ],
+      );
+      if (terminalEvent)
+        expect(
+          events.filter(
+            ({ type, data }) =>
+              type === "side_effect.process.finished" &&
+              data.executionId === definition.executionId,
+          ),
+        ).toEqual([
+          expect.objectContaining({
+            data: expect.objectContaining({
+              started: durableAuthorization,
+              settlement: expect.objectContaining({
+                outcome: "cancelled_before_start",
+                confirmed: true,
+                childPid: null,
+              }),
+            }),
+          }),
+        ]);
+    },
+  );
+
+  it("removes an owned journal when terminal evidence was durable before projection failure", async () => {
+    const { claim, store } = await generatedSideEffectFixture(
+      "durable-terminal-projection-failure",
+      "reconcile_then_retry",
+    );
+    const marker = join(dirname(store.graphcraftRoot), "durable-terminal-applied.txt");
+    const originalAppend = store.append.bind(store);
+    let failAfterTerminalAppend = true;
+    store.append = (async (...args: Parameters<RunStore["append"]>) => {
+      const event = await originalAppend(...args);
+      if (args[1] === "side_effect.process.finished" && failAfterTerminalAppend) {
+        failAfterTerminalAppend = false;
+        throw new Error("simulated projection write failure after durable append");
+      }
+      return event;
+    }) as RunStore["append"];
+
+    const result = await executeSideEffect({
+      store,
+      claim,
+      dispatchPolicy: "reconcile_then_retry",
+      reconcile: async () => {
+        const applied = await stat(marker).then(
+          () => true,
+          () => false,
+        );
+        return applied
+          ? { status: "applied", result: { applied: true }, evidence: ["marker"] }
+          : { status: "not_applied", evidence: ["marker absent"] };
+      },
+      act: async (__, markDispatched) => {
+        const lifecycle = await markDispatched({ managedProcess: true });
+        if (!lifecycle) throw new Error("Managed process lifecycle was not prepared");
+        await runProcess(
+          process.execPath,
+          ["-e", `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "applied\\n")`],
+          { cwd: dirname(store.graphcraftRoot), lifecycle },
+        );
+        return { applied: true };
+      },
+    });
+
+    expect(result).toEqual({ applied: true });
+    expect(
+      (await store.loadState()).sideEffects.find(
+        ({ claim: candidate }) => candidate.actionId === claim.actionId,
+      ),
+    ).toMatchObject({ status: "confirmed" });
+    await expect(
+      stat(join(store.graphcraftRoot, "locks", "side-effect-processes", store.runId)),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("blocks confirmation until a missing terminal event is recovered from its journal", async () => {
+    const { claim, store } = await generatedSideEffectFixture(
+      "missing-terminal-event",
+      "reconcile_then_retry",
+    );
+    const marker = join(dirname(store.graphcraftRoot), "missing-terminal-applied.txt");
+    const originalAppend = store.append.bind(store);
+    let rejectTerminalAppend = true;
+    let launches = 0;
+    store.append = (async (...args: Parameters<RunStore["append"]>) => {
+      if (args[1] === "side_effect.process.finished" && rejectTerminalAppend) {
+        rejectTerminalAppend = false;
+        throw new Error("simulated terminal append failure");
+      }
+      return await originalAppend(...args);
+    }) as RunStore["append"];
+    const input = {
+      store,
+      claim,
+      dispatchPolicy: "reconcile_then_retry" as const,
+      reconcile: async (): Promise<SideEffectReconciliation> => {
+        const applied = await stat(marker).then(
+          () => true,
+          () => false,
+        );
+        return applied
+          ? { status: "applied", result: { applied: true }, evidence: ["marker"] }
+          : { status: "not_applied", evidence: ["marker absent"] };
+      },
+      act: async (__: SideEffectClaim, markDispatched: SideEffectDispatch) => {
+        launches += 1;
+        const lifecycle = await markDispatched({ managedProcess: true });
+        if (!lifecycle) throw new Error("Managed process lifecycle was not prepared");
+        await runProcess(
+          process.execPath,
+          ["-e", `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "applied\\n")`],
+          { cwd: dirname(store.graphcraftRoot), lifecycle },
+        );
+        return { applied: true };
+      },
+    };
+
+    await expect(executeSideEffect(input)).rejects.toMatchObject({
+      name: "SideEffectProcessCleanupError",
+      childSettlement: "confirmed",
+    });
+    expect(
+      (await store.loadState()).sideEffects.find(
+        ({ claim: candidate }) => candidate.actionId === claim.actionId,
+      ),
+    ).toMatchObject({ status: "failed", childSettlement: "confirmed" });
+    await expect(
+      stat(join(store.graphcraftRoot, "locks", "side-effect-processes", store.runId)),
+    ).resolves.toBeDefined();
+
+    await expect(executeSideEffect(input)).resolves.toEqual({ applied: true });
+    expect(launches).toBe(1);
+    await expect(
+      stat(join(store.graphcraftRoot, "locks", "side-effect-processes", store.runId)),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a malformed no-child receipt before it can clear durable dispatch", async () => {
+    const { claim, store } = await generatedSideEffectFixture(
+      "malformed-pre-start-receipt",
+      "at_most_once",
+    );
+    await store.append("runtime", "side_effect.claimed", { claim }, claim.actionId);
+    await store.append(
+      "runtime",
+      "side_effect.dispatched",
+      { actionId: claim.actionId },
+      claim.actionId,
+    );
+    const events = await store.loadEvents();
+    const definition = createSideEffectProcessDefinition(claim);
+    const malformed = createRunEvent(
+      {
+        sequence: events.length + 1,
+        timestamp: "2026-07-29T12:00:01.000Z",
+        actor: "runtime",
+        causationId: claim.actionId,
+        type: "side_effect.process.finished",
+        data: {
+          schemaVersion: 1,
+          actionId: claim.actionId,
+          nodeId: claim.nodeId,
+          kind: claim.kind,
+          executionId: definition.executionId,
+          started: true,
+          settlement: {
+            schemaVersion: 1,
+            executionId: definition.executionId,
+            brokerPid: "not-a-pid",
+            childPid: null,
+            outcome: "cancelled_before_start",
+            confirmed: true,
+            exitCode: null,
+            exitSignal: null,
+            settledAt: "2026-07-29T12:00:01.000Z",
+          },
+        },
+      },
+      events[0]!.schemaVersion === 2
+        ? PORTABLE_CANONICAL_HASH_ALGORITHM
+        : LEGACY_CANONICAL_HASH_ALGORITHM,
+    );
+
+    const before = reduceEvents(events).sideEffects.find(
+      ({ claim: persisted }) => persisted.actionId === claim.actionId,
+    );
+    expect(before?.dispatchedAt).toEqual(expect.any(String));
+    expect(() => reduceEvents([...events, malformed])).toThrow(
+      /invalid process-settlement evidence/i,
+    );
+  });
+
+  it("cleans an empty ownership directory left after a journal unlink boundary", async () => {
+    const { claim, store } = await generatedSideEffectFixture(
+      "partial-process-cleanup",
+      "reconcile_then_retry",
+    );
+    const ownershipDirectory = join(
+      store.graphcraftRoot,
+      "locks",
+      "side-effect-processes",
+      store.runId,
+    );
+    await mkdir(ownershipDirectory, { recursive: true });
+    let applied = false;
+
+    await expect(
+      executeSideEffect({
+        store,
+        claim,
+        dispatchPolicy: "reconcile_then_retry",
+        reconcile: async () =>
+          applied
+            ? { status: "applied", result: { applied: true }, evidence: ["applied"] }
+            : { status: "not_applied", evidence: ["absent"] },
+        act: async (__, markDispatched) => {
+          await markDispatched();
+          applied = true;
+          return { applied: true };
+        },
+      }),
+    ).resolves.toEqual({ applied: true });
+    await expect(stat(ownershipDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("rejects an unsafe retry policy before claiming an at-most-once action", async () => {
     const root = await mkdtemp(join(tmpdir(), "graphcraft-generated-dispatch-policy-"));
     roots.push(root);
@@ -846,7 +1238,7 @@ describe("generated side-effect protocol properties", () => {
                 evidence: [`observed-${index}`],
               }
             : { status: "not_applied" as const, evidence: [`absent-${index}`] },
-        act: async (__: SideEffectClaim, markDispatched: () => Promise<void>) => {
+        act: async (__: SideEffectClaim, markDispatched: SideEffectDispatch) => {
           await crossSideEffectBoundary(boundary, "after_action_prepare");
           await markDispatched();
           commandCalls += 1;

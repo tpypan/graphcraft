@@ -49,6 +49,7 @@ export interface RunProcessOptions {
   signal?: AbortSignal;
   env?: NodeJS.ProcessEnv;
   maxOutputBytesPerStream?: number;
+  maxOutputBytesTotal?: number;
   outputOverflow?: ProcessOutputOverflow;
   input?: string | Buffer;
   lifecycle?: ManagedProcessLifecycle;
@@ -88,18 +89,52 @@ export class ProcessOutputLimitError extends Error {
   readonly stream: "stdout" | "stderr";
   readonly capture: ProcessCaptureMetadata;
   readonly childSettlement: ProcessResult["childSettlement"];
+  readonly scope: "stream" | "combined";
+  readonly limitBytes: number;
 
   constructor(
     stream: "stdout" | "stderr",
     capture: ProcessCaptureMetadata,
     childSettlement: ProcessResult["childSettlement"] = "confirmed",
+    limit?: { scope: "stream" | "combined"; limitBytes: number },
   ) {
-    const limit = capture[stream].limitBytes;
-    super(`Subprocess ${stream} exceeded the ${limit}-byte capture limit; output was rejected`);
+    const scope = limit?.scope ?? "stream";
+    const limitBytes = limit?.limitBytes ?? capture[stream].limitBytes;
+    super(
+      scope === "combined"
+        ? `Subprocess combined output exceeded the ${limitBytes}-byte capture limit; output was rejected`
+        : `Subprocess ${stream} exceeded the ${limitBytes}-byte capture limit; output was rejected`,
+    );
     this.name = "ProcessOutputLimitError";
     this.stream = stream;
     this.capture = capture;
     this.childSettlement = childSettlement;
+    this.scope = scope;
+    this.limitBytes = limitBytes;
+  }
+}
+
+export interface ProcessOutputLimitEvidence {
+  stream: "stdout" | "stderr";
+  scope: "stream" | "combined";
+  limitBytes: number;
+}
+
+type ProcessTerminationCause = "abort" | "failure" | "output_limit" | "timeout";
+
+export class ProcessSettlementError extends Error {
+  readonly childSettlement = "unconfirmed" as const;
+
+  constructor(
+    executionId: string,
+    brokerCode: number | null,
+    readonly timedOut: boolean,
+    readonly outputLimit?: ProcessOutputLimitEvidence,
+  ) {
+    super(
+      `Managed subprocess ${executionId} exited without confirmed tree settlement (broker ${brokerCode ?? "unknown"})`,
+    );
+    this.name = "ProcessSettlementError";
   }
 }
 
@@ -133,16 +168,24 @@ class BoundedStreamCapture {
 
   constructor(private readonly limitBytes: number) {}
 
-  append(chunk: Buffer): boolean {
+  append(
+    chunk: Buffer,
+    maxRetainedBytesFromChunk = chunk.length,
+  ): { overflowed: boolean; retainedBytes: number } {
     this.digest.update(chunk);
     this.observedBytes += chunk.length;
-    const available = Math.max(0, this.limitBytes - this.retainedBytes);
+    const available = Math.min(
+      Math.max(0, this.limitBytes - this.retainedBytes),
+      Math.max(0, maxRetainedBytesFromChunk),
+    );
+    let retainedBytes = 0;
     if (available > 0) {
       const retained = Buffer.from(chunk.subarray(0, available));
       this.chunks.push(retained);
       this.retainedBytes += retained.length;
+      retainedBytes = retained.length;
     }
-    return this.observedBytes > this.limitBytes;
+    return { overflowed: this.observedBytes > this.limitBytes, retainedBytes };
   }
 
   finish(stream: "stdout" | "stderr"): {
@@ -167,10 +210,72 @@ class BoundedStreamCapture {
   }
 }
 
-const MANAGED_PROCESS_BROKER_SOURCE = String.raw`
+class BoundedProcessCapture {
+  private readonly stdout: BoundedStreamCapture;
+  private readonly stderr: BoundedStreamCapture;
+  private combinedObservedBytes = 0;
+  private combinedRetainedBytes = 0;
+
+  constructor(
+    private readonly maxOutputBytesPerStream: number,
+    private readonly maxOutputBytesTotal?: number,
+  ) {
+    this.stdout = new BoundedStreamCapture(maxOutputBytesPerStream);
+    this.stderr = new BoundedStreamCapture(maxOutputBytesPerStream);
+  }
+
+  append(stream: "stdout" | "stderr", chunk: Buffer): ProcessOutputLimitEvidence | undefined {
+    const target = stream === "stdout" ? this.stdout : this.stderr;
+    this.combinedObservedBytes += chunk.length;
+    const combinedAvailable =
+      this.maxOutputBytesTotal === undefined
+        ? chunk.length
+        : Math.max(0, this.maxOutputBytesTotal - this.combinedRetainedBytes);
+    const appended = target.append(chunk, combinedAvailable);
+    this.combinedRetainedBytes += appended.retainedBytes;
+    if (appended.overflowed)
+      return { stream, scope: "stream", limitBytes: this.maxOutputBytesPerStream };
+    if (
+      this.maxOutputBytesTotal !== undefined &&
+      this.combinedObservedBytes > this.maxOutputBytesTotal
+    )
+      return { stream, scope: "combined", limitBytes: this.maxOutputBytesTotal };
+    return undefined;
+  }
+
+  finish(): {
+    stdout: { text: string; metadata: ProcessStreamCapture };
+    stderr: { text: string; metadata: ProcessStreamCapture };
+  } {
+    return {
+      stdout: this.stdout.finish("stdout"),
+      stderr: this.stderr.finish("stderr"),
+    };
+  }
+}
+
+/** Builds the isolated broker source; overrides exist for broker-level tests. @internal */
+export function managedProcessBrokerSource(
+  platformOverride?: NodeJS.Platform,
+  windowsTaskkillExecutableOverride?: string,
+  windowsTaskkillArgumentPrefixOverride?: string[],
+): string {
+  const managedPlatformSource =
+    platformOverride === undefined ? "process.platform" : JSON.stringify(platformOverride);
+  const windowsTaskkillExecutableSource =
+    windowsTaskkillExecutableOverride === undefined
+      ? "null"
+      : JSON.stringify(windowsTaskkillExecutableOverride);
+  const windowsTaskkillArgumentPrefixSource = JSON.stringify(
+    windowsTaskkillArgumentPrefixOverride ?? [],
+  );
+  return String.raw`
 const { spawn } = require("node:child_process");
 const { fsyncSync, writeSync } = require("node:fs");
 
+const managedPlatform = ${managedPlatformSource};
+const managedWindowsTaskkillExecutable = ${windowsTaskkillExecutableSource};
+const managedWindowsTaskkillArgumentPrefix = ${windowsTaskkillArgumentPrefixSource};
 const executionId = process.argv[1];
 const ownerToken = process.argv[2];
 const gracefulMs = Number(process.argv[3]);
@@ -193,6 +298,8 @@ let forceTimer;
 let settlementTimer;
 let settlementPoll;
 let startTimer;
+let windowsTaskkillInFlight = false;
+let windowsTaskkillSucceeded = false;
 
 function append(record) {
   writeSync(journalFd, JSON.stringify({
@@ -261,7 +368,8 @@ function finish(outcome, confirmed, code, signal) {
 
 function targetTreeAlive() {
   if (!target || !Number.isSafeInteger(target.pid) || target.pid <= 0) return false;
-  if (process.platform === "win32") return !targetClosed;
+  if (managedPlatform === "win32")
+    return !targetClosed || (terminating && !windowsTaskkillSucceeded);
   try {
     process.kill(-target.pid, 0);
     return true;
@@ -279,21 +387,44 @@ function settleIfTreeExited() {
 }
 
 function windowsTaskkill(pid) {
+  if (windowsTaskkillSucceeded || windowsTaskkillInFlight) return;
+  windowsTaskkillInFlight = true;
   const root = process.env.SystemRoot;
-  const executable = root ? require("node:path").win32.join(root, "System32", "taskkill.exe") : "taskkill.exe";
-  const killer = spawn(executable, ["/pid", String(pid), "/t", "/f"], {
-    shell: false,
-    stdio: "ignore",
-    windowsHide: true,
+  const executable = managedWindowsTaskkillExecutable || (root ? require("node:path").win32.join(root, "System32", "taskkill.exe") : "taskkill.exe");
+  let killer;
+  try {
+    killer = spawn(executable, [...managedWindowsTaskkillArgumentPrefix, "/pid", String(pid), "/t", "/f"], {
+      shell: false,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+  } catch {
+    windowsTaskkillInFlight = false;
+    try { target.kill("SIGKILL"); } catch {}
+    return;
+  }
+  let failed = false;
+  killer.once("error", () => {
+    failed = true;
+    windowsTaskkillInFlight = false;
+    try { target.kill("SIGKILL"); } catch {}
+    settleIfTreeExited();
   });
-  killer.once("error", () => { try { target.kill("SIGKILL"); } catch {} });
+  killer.once("close", (code) => {
+    windowsTaskkillInFlight = false;
+    if (!failed && code === 0) windowsTaskkillSucceeded = true;
+    else if (!failed) {
+      try { target.kill("SIGKILL"); } catch {}
+    }
+    settleIfTreeExited();
+  });
   killer.unref();
 }
 
 function signalTarget(signal) {
   if (!target || !Number.isSafeInteger(target.pid) || target.pid <= 0) return;
   try {
-    if (process.platform === "win32") windowsTaskkill(target.pid);
+    if (managedPlatform === "win32") windowsTaskkill(target.pid);
     else process.kill(-target.pid, signal);
   } catch {
     try { target.kill(signal); } catch {}
@@ -350,7 +481,7 @@ process.on("message", (message) => {
       env: message.env,
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
-      detached: process.platform !== "win32",
+      detached: managedPlatform !== "win32",
       windowsHide: true,
     });
     target.once("error", () => {
@@ -398,10 +529,13 @@ send({
   executionId,
   brokerPid: process.pid,
   processGroupId: null,
-  platform: process.platform,
+  platform: managedPlatform,
   readyAt: new Date().toISOString(),
 });
 `;
+}
+
+const MANAGED_PROCESS_BROKER_SOURCE = managedProcessBrokerSource();
 
 function exactMessageKeys(value: object, expected: readonly string[]): boolean {
   const actual = Object.keys(value).sort();
@@ -527,6 +661,7 @@ async function runManagedProcess(
   started: number,
   timeoutMs: number,
   maxOutputBytesPerStream: number,
+  maxOutputBytesTotal: number | undefined,
   outputOverflow: ProcessOutputOverflow,
 ): Promise<ProcessResult> {
   const lifecycle = options.lifecycle;
@@ -553,22 +688,21 @@ async function runManagedProcess(
         windowsHide: true,
       },
     );
-    const stdoutCapture = new BoundedStreamCapture(maxOutputBytesPerStream);
-    const stderrCapture = new BoundedStreamCapture(maxOutputBytesPerStream);
-    let timedOut = false;
-    let overflowStream: "stdout" | "stderr" | undefined;
+    const processCapture = new BoundedProcessCapture(maxOutputBytesPerStream, maxOutputBytesTotal);
+    let outputLimit: ProcessOutputLimitEvidence | undefined;
     let settled = false;
-    let terminationStarted = false;
+    let terminationCause: ProcessTerminationCause | undefined;
     let lifecycleError: Error | undefined;
     let targetSettlement: ManagedProcessSettlement | undefined;
+    let readyPersistence: Promise<void> | undefined;
     let settlementPersisted: Promise<void> | undefined;
     let escalationTimer: NodeJS.Timeout | undefined;
     let settlementTimer: NodeJS.Timeout | undefined;
     let timer: NodeJS.Timeout | undefined;
 
-    const requestTermination = (): void => {
-      if (terminationStarted || settled) return;
-      terminationStarted = true;
+    const requestTermination = (cause: ProcessTerminationCause): void => {
+      if (terminationCause || settled) return;
+      terminationCause = cause;
       if (timer) clearTimeout(timer);
       try {
         if (broker.connected) broker.send({ type: "terminate" });
@@ -592,26 +726,19 @@ async function runManagedProcess(
       }, PROCESS_TERMINATION_GRACE_MS);
       escalationTimer.unref();
     };
-    const capture = (
-      stream: "stdout" | "stderr",
-      target: BoundedStreamCapture,
-      chunk: Buffer,
-    ): void => {
-      const overflowed = target.append(chunk);
-      if (overflowed && outputOverflow === "reject" && !overflowStream) {
-        overflowStream = stream;
-        requestTermination();
+    const capture = (stream: "stdout" | "stderr", chunk: Buffer): void => {
+      const observedLimit = processCapture.append(stream, chunk);
+      if (observedLimit && outputOverflow === "reject" && !terminationCause) {
+        outputLimit = observedLimit;
+        requestTermination("output_limit");
       }
     };
-    broker.stdout!.on("data", (chunk: Buffer) => capture("stdout", stdoutCapture, chunk));
-    broker.stderr!.on("data", (chunk: Buffer) => capture("stderr", stderrCapture, chunk));
+    broker.stdout!.on("data", (chunk: Buffer) => capture("stdout", chunk));
+    broker.stderr!.on("data", (chunk: Buffer) => capture("stderr", chunk));
 
-    const abort = (): void => requestTermination();
+    const abort = (): void => requestTermination("abort");
     options.signal?.addEventListener("abort", abort, { once: true });
-    timer = setTimeout(() => {
-      timedOut = true;
-      requestTermination();
-    }, timeoutMs);
+    timer = setTimeout(() => requestTermination("timeout"), timeoutMs);
     timer.unref();
 
     const cleanup = (): void => {
@@ -637,35 +764,44 @@ async function runManagedProcess(
       } catch {
         // Cleanup must not hide the managed subprocess outcome.
       }
-      const finalError = lifecycleError ?? error;
+      const finalError = lifecycleError ?? (terminationCause ? undefined : error);
       if (finalError) {
         reject(finalError);
         return;
       }
       if (!targetSettlement?.confirmed) {
         reject(
-          new Error(
-            `Managed subprocess ${lifecycle.executionId} exited without confirmed tree settlement (broker ${brokerCode ?? "unknown"})`,
+          new ProcessSettlementError(
+            lifecycle.executionId,
+            brokerCode,
+            terminationCause === "timeout",
+            terminationCause === "output_limit" ? outputLimit : undefined,
           ),
         );
         return;
       }
-      const stdout = stdoutCapture.finish("stdout");
-      const stderr = stderrCapture.finish("stderr");
+      const { stdout, stderr } = processCapture.finish();
       const captureMetadata: ProcessCaptureMetadata = {
         stdout: stdout.metadata,
         stderr: stderr.metadata,
       };
-      if (overflowStream) {
-        reject(new ProcessOutputLimitError(overflowStream, captureMetadata, "confirmed"));
+      if (terminationCause === "output_limit" && outputLimit) {
+        reject(
+          new ProcessOutputLimitError(
+            outputLimit.stream,
+            captureMetadata,
+            "confirmed",
+            outputLimit,
+          ),
+        );
         return;
       }
       resolve({
-        exitCode: timedOut ? 124 : (targetSettlement.exitCode ?? 1),
+        exitCode: terminationCause === "timeout" ? 124 : (targetSettlement.exitCode ?? 1),
         stdout: stdout.text,
         stderr: stderr.text,
         durationMs: Math.round(performance.now() - started),
-        timedOut,
+        timedOut: terminationCause === "timeout",
         childSettlement: "confirmed",
         capture: captureMetadata,
       });
@@ -678,14 +814,14 @@ async function runManagedProcess(
           lifecycleError = new Error(
             `Managed subprocess ${lifecycle.executionId} reported an ambiguous broker identity`,
           );
-          requestTermination();
+          requestTermination("failure");
           return;
         }
-        void lifecycle
-          .onReady(ready)
-          .then(() => {
-            if (terminationStarted || options.signal?.aborted) {
-              requestTermination();
+        readyPersistence = (async () => {
+          try {
+            await lifecycle.onReady(ready);
+            if (terminationCause || options.signal?.aborted) {
+              requestTermination("abort");
               return;
             }
             if (!broker.connected) {
@@ -701,11 +837,11 @@ async function runManagedProcess(
               cwd: options.cwd,
               env: environment,
             });
-          })
-          .catch((error) => {
+          } catch (error) {
             lifecycleError = error as Error;
-            requestTermination();
-          });
+            requestTermination("failure");
+          }
+        })();
         return;
       }
       const settlement = validManagedSettlement(message, lifecycle);
@@ -714,15 +850,22 @@ async function runManagedProcess(
         lifecycleError = new Error(
           `Managed subprocess ${lifecycle.executionId} settled under an ambiguous broker identity`,
         );
-        requestTermination();
+        requestTermination("failure");
         return;
       }
       targetSettlement = settlement;
-      settlementPersisted = lifecycle.onSettled(settlement);
+      settlementPersisted = (async () => {
+        await readyPersistence;
+        await lifecycle.onSettled(settlement);
+      })();
+      // The broker can take another event-loop turn to close after settlement.
+      // Attach a handler immediately while complete() remains responsible for
+      // surfacing the original lifecycle failure to the caller.
+      void settlementPersisted.catch(() => undefined);
     });
     broker.once("error", (error) => void complete(null, error));
     broker.once("close", (code) => void complete(code));
-    if (options.signal?.aborted) requestTermination();
+    if (options.signal?.aborted) requestTermination("abort");
   });
 }
 
@@ -740,9 +883,15 @@ export async function runProcess(
   const timeoutMs = options.timeoutMs ?? 120_000;
   const maxOutputBytesPerStream =
     options.maxOutputBytesPerStream ?? DEFAULT_PROCESS_OUTPUT_BYTES_PER_STREAM;
+  const maxOutputBytesTotal = options.maxOutputBytesTotal;
   const outputOverflow = options.outputOverflow ?? "reject";
   if (!Number.isSafeInteger(maxOutputBytesPerStream) || maxOutputBytesPerStream <= 0)
     throw new Error("Subprocess output capture limit must be a positive safe integer");
+  if (
+    maxOutputBytesTotal !== undefined &&
+    (!Number.isSafeInteger(maxOutputBytesTotal) || maxOutputBytesTotal <= 0)
+  )
+    throw new Error("Subprocess combined output capture limit must be a positive safe integer");
   const inputBytes =
     options.input === undefined
       ? 0
@@ -770,6 +919,7 @@ export async function runProcess(
       started,
       timeoutMs,
       maxOutputBytesPerStream,
+      maxOutputBytesTotal,
       outputOverflow,
     );
 
@@ -782,20 +932,18 @@ export async function runProcess(
     });
     const childStdout = child.stdout!;
     const childStderr = child.stderr!;
-    const stdoutCapture = new BoundedStreamCapture(maxOutputBytesPerStream);
-    const stderrCapture = new BoundedStreamCapture(maxOutputBytesPerStream);
-    let timedOut = false;
-    let overflowStream: "stdout" | "stderr" | undefined;
+    const processCapture = new BoundedProcessCapture(maxOutputBytesPerStream, maxOutputBytesTotal);
+    let outputLimit: ProcessOutputLimitEvidence | undefined;
     let inputError: Error | undefined;
     let settled = false;
-    let terminationStarted = false;
+    let terminationCause: ProcessTerminationCause | "input_error" | undefined;
     let escalationTimer: NodeJS.Timeout | undefined;
     let settlementTimer: NodeJS.Timeout | undefined;
     let timer: NodeJS.Timeout | undefined;
 
-    const terminateWithEscalation = (): void => {
-      if (terminationStarted || settled) return;
-      terminationStarted = true;
+    const terminateWithEscalation = (cause: ProcessTerminationCause | "input_error"): void => {
+      if (terminationCause || settled) return;
+      terminationCause = cause;
       if (timer) clearTimeout(timer);
       try {
         terminateChildProcessTree(child, "SIGTERM");
@@ -816,35 +964,28 @@ export async function runProcess(
       }, PROCESS_TERMINATION_GRACE_MS);
       escalationTimer.unref();
     };
-    const capture = (
-      stream: "stdout" | "stderr",
-      target: BoundedStreamCapture,
-      chunk: Buffer,
-    ): void => {
-      const overflowed = target.append(chunk);
-      if (overflowed && outputOverflow === "reject" && !overflowStream) {
-        overflowStream = stream;
-        terminateWithEscalation();
+    const capture = (stream: "stdout" | "stderr", chunk: Buffer): void => {
+      const observedLimit = processCapture.append(stream, chunk);
+      if (observedLimit && outputOverflow === "reject" && !terminationCause) {
+        outputLimit = observedLimit;
+        terminateWithEscalation("output_limit");
       }
     };
-    childStdout.on("data", (chunk: Buffer) => capture("stdout", stdoutCapture, chunk));
-    childStderr.on("data", (chunk: Buffer) => capture("stderr", stderrCapture, chunk));
+    childStdout.on("data", (chunk: Buffer) => capture("stdout", chunk));
+    childStderr.on("data", (chunk: Buffer) => capture("stderr", chunk));
     if (options.input !== undefined && child.stdin) {
       child.stdin.on("error", (error: NodeJS.ErrnoException) => {
-        if (terminationStarted || settled) return;
+        if (terminationCause || settled) return;
         inputError = error;
-        terminateWithEscalation();
+        terminateWithEscalation("input_error");
       });
       child.stdin.end(options.input);
     }
 
-    const abort = (): void => terminateWithEscalation();
+    const abort = (): void => terminateWithEscalation("abort");
     options.signal?.addEventListener("abort", abort, { once: true });
 
-    timer = setTimeout(() => {
-      timedOut = true;
-      terminateWithEscalation();
-    }, timeoutMs);
+    timer = setTimeout(() => terminateWithEscalation("timeout"), timeoutMs);
     timer.unref();
 
     const cleanup = (): void => {
@@ -870,30 +1011,36 @@ export async function runProcess(
       } catch {
         // Cleanup must not hide the bounded subprocess outcome.
       }
-      if (error) {
+      if (error && !terminationCause) {
         reject(error);
         return;
       }
-      if (inputError) {
+      if (terminationCause === "input_error" && inputError) {
         reject(inputError);
         return;
       }
-      const stdout = stdoutCapture.finish("stdout");
-      const stderr = stderrCapture.finish("stderr");
+      const { stdout, stderr } = processCapture.finish();
       const captureMetadata: ProcessCaptureMetadata = {
         stdout: stdout.metadata,
         stderr: stderr.metadata,
       };
-      if (overflowStream) {
-        reject(new ProcessOutputLimitError(overflowStream, captureMetadata, childSettlement));
+      if (terminationCause === "output_limit" && outputLimit) {
+        reject(
+          new ProcessOutputLimitError(
+            outputLimit.stream,
+            captureMetadata,
+            childSettlement,
+            outputLimit,
+          ),
+        );
         return;
       }
       resolve({
-        exitCode: timedOut ? 124 : (code ?? 1),
+        exitCode: terminationCause === "timeout" ? 124 : (code ?? 1),
         stdout: stdout.text,
         stderr: stderr.text,
         durationMs: Math.round(performance.now() - started),
-        timedOut,
+        timedOut: terminationCause === "timeout",
         childSettlement,
         capture: captureMetadata,
       });
