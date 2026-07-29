@@ -3909,7 +3909,7 @@ var program = new Command();
 // packages/cli/src/bin.ts
 import { spawn as spawn7 } from "node:child_process";
 import { readFile as readFile6 } from "node:fs/promises";
-import { dirname as dirname17, join as join20, parse as parse3, resolve as resolve21 } from "node:path";
+import { dirname as dirname18, join as join21, parse as parse3, resolve as resolve21 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // benchmarks/stable-v1.json
@@ -4121,22 +4121,22 @@ var stable_v1_default = {
 // packages/cli/src/index.ts
 var import_cross_spawn5 = __toESM(require_cross_spawn(), 1);
 import { createInterface } from "node:readline/promises";
-import { createHash as createHash9, randomUUID as randomUUID14 } from "node:crypto";
+import { createHash as createHash9, randomUUID as randomUUID15 } from "node:crypto";
 import {
   access as access3,
   chmod as chmod2,
   lstat as lstat17,
   mkdir as mkdir7,
   mkdtemp as mkdtemp4,
-  open as open11,
+  open as open12,
   readdir as readdir7,
   rename as rename3,
   rm as rm8,
-  rmdir as rmdir3
+  rmdir as rmdir4
 } from "node:fs/promises";
 import { homedir as homedir3, platform, tmpdir as tmpdir4 } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname as dirname16, isAbsolute as isAbsolute14, join as join19, resolve as resolve20 } from "node:path";
+import { dirname as dirname17, isAbsolute as isAbsolute14, join as join20, resolve as resolve20 } from "node:path";
 import { stdin, stdout } from "node:process";
 
 // package.json
@@ -19722,6 +19722,9 @@ var RunEventTypeSchema = external_exports.enum([
   "optimizer.decided",
   "side_effect.claimed",
   "side_effect.dispatched",
+  "side_effect.process.started",
+  "side_effect.process.finished",
+  "side_effect.process.reconciled",
   "side_effect.reconciled",
   "side_effect.confirmed",
   "side_effect.failed",
@@ -22981,6 +22984,32 @@ function requiredRecord(data, key) {
     throw new Error(`Event data.${key} must be an object`);
   return value;
 }
+var UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+function hasExactKeys(data, expected) {
+  const actual = Object.keys(data).sort();
+  const sortedExpected = [...expected].sort();
+  return actual.length === sortedExpected.length && actual.every((key, index) => key === sortedExpected[index]);
+}
+function positivePid(value) {
+  return Number.isSafeInteger(value) && Number(value) > 0;
+}
+function validateSideEffectProcessSettlement(data, actionId) {
+  if (!hasExactKeys(data, [
+    "schemaVersion",
+    "executionId",
+    "brokerPid",
+    "childPid",
+    "outcome",
+    "confirmed",
+    "exitCode",
+    "exitSignal",
+    "settledAt"
+  ]) || data.schemaVersion !== 1 || typeof data.executionId !== "string" || !UUID_V4.test(data.executionId) || !positivePid(data.brokerPid) || data.childPid !== null && !positivePid(data.childPid) || !["exited", "terminated", "cancelled_before_start", "failed_to_start", "unconfirmed"].includes(
+    String(data.outcome)
+  ) || typeof data.confirmed !== "boolean" || data.exitCode !== null && !Number.isInteger(data.exitCode) || data.exitSignal !== null && (typeof data.exitSignal !== "string" || data.exitSignal.length === 0) || typeof data.settledAt !== "string" || !Number.isFinite(Date.parse(data.settledAt)) || data.confirmed === true && data.outcome === "unconfirmed" || data.confirmed === false && data.outcome !== "unconfirmed" || ["exited", "terminated"].includes(String(data.outcome)) && !positivePid(data.childPid) || ["cancelled_before_start", "failed_to_start"].includes(String(data.outcome)) && (data.childPid !== null || data.exitCode !== null || data.exitSignal !== null))
+    throw new Error(`Side effect ${actionId} has invalid process-settlement evidence`);
+  return { confirmed: data.confirmed, outcome: String(data.outcome) };
+}
 function reduceEvents(events) {
   let state;
   let previousSequence = 0;
@@ -23311,9 +23340,43 @@ function reduceEvents(events) {
       case "probe.process.started":
       case "probe.process.finished":
       case "probe.process.reconciled":
+      case "side_effect.process.started":
       case "control.observed":
       case "control.override":
         break;
+      case "side_effect.process.finished":
+      case "side_effect.process.reconciled": {
+        const actionId = requiredString(data, "actionId");
+        const entry = state.sideEffects.find(({ claim }) => claim.actionId === actionId);
+        if (!entry) throw new Error(`Unknown side effect ${actionId}`);
+        if (!hasExactKeys(data, [
+          "schemaVersion",
+          "actionId",
+          "nodeId",
+          "kind",
+          "executionId",
+          "started",
+          "settlement"
+        ]) || data.schemaVersion !== 1 || event.actor !== "runtime" || event.causationId !== actionId || data.nodeId !== entry.claim.nodeId || data.kind !== entry.claim.kind || typeof data.executionId !== "string" || !UUID_V4.test(data.executionId))
+          throw new Error(`Side effect ${actionId} has invalid process-lifecycle evidence`);
+        const settlement = requiredRecord(data, "settlement");
+        const validated = validateSideEffectProcessSettlement(settlement, actionId);
+        if (settlement.executionId !== data.executionId)
+          throw new Error(`Side effect ${actionId} has mismatched process-settlement evidence`);
+        if (event.type === "side_effect.process.reconciled" && !validated.confirmed)
+          throw new Error(`Side effect ${actionId} has an unconfirmed process reconciliation`);
+        if (typeof data.started !== "boolean")
+          throw new Error(`Side effect ${actionId} has invalid process-start evidence`);
+        const outcome = validated.outcome;
+        if (data.started === false && outcome !== "cancelled_before_start")
+          throw new Error(`Side effect ${actionId} settled without process-start authorization`);
+        if (outcome === "cancelled_before_start" || outcome === "failed_to_start") {
+          entry.dispatchedAt = void 0;
+        }
+        entry.childSettlement = validated.confirmed ? "confirmed" : "unconfirmed";
+        entry.updatedAt = event.timestamp;
+        break;
+      }
       case "control.decision": {
         const decision = ControlDecisionSchema.parse(data.decision);
         if (decision.replaces) {
@@ -23679,8 +23742,8 @@ function structuredOutputExceedsLimit(value) {
     return Buffer.byteLength(value) > ADAPTER_STRUCTURED_OUTPUT_LIMIT_BYTES;
   }
   try {
-    const serialized2 = JSON.stringify(value);
-    return typeof serialized2 === "string" && Buffer.byteLength(serialized2) > ADAPTER_STRUCTURED_OUTPUT_LIMIT_BYTES;
+    const serialized3 = JSON.stringify(value);
+    return typeof serialized3 === "string" && Buffer.byteLength(serialized3) > ADAPTER_STRUCTURED_OUTPUT_LIMIT_BYTES;
   } catch {
     return false;
   }
@@ -24703,8 +24766,8 @@ function structuredOutputExceedsLimit2(value) {
     return Buffer.byteLength(value) > ADAPTER_STRUCTURED_OUTPUT_LIMIT_BYTES2;
   }
   try {
-    const serialized2 = JSON.stringify(value);
-    return typeof serialized2 === "string" && Buffer.byteLength(serialized2) > ADAPTER_STRUCTURED_OUTPUT_LIMIT_BYTES2;
+    const serialized3 = JSON.stringify(value);
+    return typeof serialized3 === "string" && Buffer.byteLength(serialized3) > ADAPTER_STRUCTURED_OUTPUT_LIMIT_BYTES2;
   } catch {
     return false;
   }
@@ -25781,9 +25844,1545 @@ function claudeSemanticVerifierArgs(request, boundary, policy) {
 }
 
 // packages/github/src/index.ts
+var import_cross_spawn4 = __toESM(require_cross_spawn(), 1);
+
+// packages/probes/src/index.ts
+import { dirname as dirname4, resolve as resolve5, sep as sep5 } from "node:path";
+
+// packages/probes/src/process.ts
 var import_cross_spawn3 = __toESM(require_cross_spawn(), 1);
+import { createHash as createHash3 } from "node:crypto";
+import { constants as osConstants } from "node:os";
+var MIB3 = 1024 * 1024;
+var DEFAULT_PROCESS_OUTPUT_BYTES_PER_STREAM = 8 * MIB3;
+var DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM = MIB3;
+var DEFAULT_PROCESS_INPUT_BYTES = 8 * MIB3;
+var PROCESS_TERMINATION_GRACE_MS = 2e3;
+var PROCESS_SETTLEMENT_GRACE_MS = 2e3;
+var WINDOWS_PROCESS_SETTLEMENT_GRACE_MS = 8e3;
+function managedProcessSettlementGraceMs(platform2) {
+  return platform2 === "win32" ? WINDOWS_PROCESS_SETTLEMENT_GRACE_MS : PROCESS_SETTLEMENT_GRACE_MS;
+}
+var ProcessOutputLimitError = class extends Error {
+  stream;
+  capture;
+  childSettlement;
+  scope;
+  limitBytes;
+  constructor(stream, capture, childSettlement = "confirmed", limit) {
+    const scope = limit?.scope ?? "stream";
+    const limitBytes = limit?.limitBytes ?? capture[stream].limitBytes;
+    super(
+      scope === "combined" ? `Subprocess combined output exceeded the ${limitBytes}-byte capture limit; output was rejected` : `Subprocess ${stream} exceeded the ${limitBytes}-byte capture limit; output was rejected`
+    );
+    this.name = "ProcessOutputLimitError";
+    this.stream = stream;
+    this.capture = capture;
+    this.childSettlement = childSettlement;
+    this.scope = scope;
+    this.limitBytes = limitBytes;
+  }
+};
+var ProcessSettlementError = class extends Error {
+  constructor(executionId, brokerCode, timedOut, outputLimit) {
+    super(
+      `Managed subprocess ${executionId} exited without confirmed tree settlement (broker ${brokerCode ?? "unknown"})`
+    );
+    this.timedOut = timedOut;
+    this.outputLimit = outputLimit;
+    this.name = "ProcessSettlementError";
+  }
+  timedOut;
+  outputLimit;
+  childSettlement = "unconfirmed";
+};
+function decodeUtf8Prefix3(source) {
+  for (let trim = 0; trim <= Math.min(3, source.length); trim += 1) {
+    const end = source.length - trim;
+    try {
+      const text = new TextDecoder("utf-8", { fatal: true }).decode(source.subarray(0, end));
+      return { bytes: end, text };
+    } catch {
+    }
+  }
+  return { bytes: source.length, text: source.toString("utf8") };
+}
+function truncationMarker(stream, capture) {
+  return `[GRAPHCRAFT ${stream.toUpperCase()} TRUNCATED: retained ${capture.retainedBytes} of ${capture.observedBytes} bytes]`;
+}
+var BoundedStreamCapture = class {
+  constructor(limitBytes) {
+    this.limitBytes = limitBytes;
+  }
+  limitBytes;
+  chunks = [];
+  digest = createHash3("sha256");
+  observedBytes = 0;
+  retainedBytes = 0;
+  append(chunk, maxRetainedBytesFromChunk = chunk.length) {
+    this.digest.update(chunk);
+    this.observedBytes += chunk.length;
+    const available = Math.min(
+      Math.max(0, this.limitBytes - this.retainedBytes),
+      Math.max(0, maxRetainedBytesFromChunk)
+    );
+    let retainedBytes = 0;
+    if (available > 0) {
+      const retained = Buffer.from(chunk.subarray(0, available));
+      this.chunks.push(retained);
+      this.retainedBytes += retained.length;
+      retainedBytes = retained.length;
+    }
+    return { overflowed: this.observedBytes > this.limitBytes, retainedBytes };
+  }
+  finish(stream) {
+    const decoded = decodeUtf8Prefix3(Buffer.concat(this.chunks, this.retainedBytes));
+    const metadata = {
+      limitBytes: this.limitBytes,
+      observedBytes: this.observedBytes,
+      retainedBytes: decoded.bytes,
+      omittedBytes: Math.max(0, this.observedBytes - decoded.bytes),
+      truncated: decoded.bytes < this.observedBytes,
+      digest: this.digest.digest("hex")
+    };
+    if (!metadata.truncated) return { text: decoded.text, metadata };
+    const separator = decoded.text.length > 0 && !decoded.text.endsWith("\n") ? "\n" : "";
+    return {
+      text: `${decoded.text}${separator}${truncationMarker(stream, metadata)}
+`,
+      metadata
+    };
+  }
+};
+var BoundedProcessCapture = class {
+  constructor(maxOutputBytesPerStream, maxOutputBytesTotal) {
+    this.maxOutputBytesPerStream = maxOutputBytesPerStream;
+    this.maxOutputBytesTotal = maxOutputBytesTotal;
+    this.stdout = new BoundedStreamCapture(maxOutputBytesPerStream);
+    this.stderr = new BoundedStreamCapture(maxOutputBytesPerStream);
+  }
+  maxOutputBytesPerStream;
+  maxOutputBytesTotal;
+  stdout;
+  stderr;
+  combinedObservedBytes = 0;
+  combinedRetainedBytes = 0;
+  append(stream, chunk) {
+    const target = stream === "stdout" ? this.stdout : this.stderr;
+    this.combinedObservedBytes += chunk.length;
+    const combinedAvailable = this.maxOutputBytesTotal === void 0 ? chunk.length : Math.max(0, this.maxOutputBytesTotal - this.combinedRetainedBytes);
+    const appended = target.append(chunk, combinedAvailable);
+    this.combinedRetainedBytes += appended.retainedBytes;
+    if (appended.overflowed)
+      return { stream, scope: "stream", limitBytes: this.maxOutputBytesPerStream };
+    if (this.maxOutputBytesTotal !== void 0 && this.combinedObservedBytes > this.maxOutputBytesTotal)
+      return { stream, scope: "combined", limitBytes: this.maxOutputBytesTotal };
+    return void 0;
+  }
+  finish() {
+    return {
+      stdout: this.stdout.finish("stdout"),
+      stderr: this.stderr.finish("stderr")
+    };
+  }
+};
+function managedProcessBrokerSource(platformOverride, windowsTaskkillExecutableOverride, windowsTaskkillArgumentPrefixOverride) {
+  const managedPlatformSource = platformOverride === void 0 ? "process.platform" : JSON.stringify(platformOverride);
+  const windowsTaskkillExecutableSource = windowsTaskkillExecutableOverride === void 0 ? "null" : JSON.stringify(windowsTaskkillExecutableOverride);
+  const windowsTaskkillArgumentPrefixSource = JSON.stringify(
+    windowsTaskkillArgumentPrefixOverride ?? []
+  );
+  return String.raw`
+const { spawn } = require("node:child_process");
+const { fsyncSync, writeSync } = require("node:fs");
+
+const managedPlatform = ${managedPlatformSource};
+const managedWindowsTaskkillExecutable = ${windowsTaskkillExecutableSource};
+const managedWindowsTaskkillArgumentPrefix = ${windowsTaskkillArgumentPrefixSource};
+const executionId = process.argv[1];
+const ownerToken = process.argv[2];
+const gracefulMs = Number(process.argv[3]);
+const settlementMs = Number(process.argv[4]);
+const journalFd = 4;
+if (
+  !Number.isSafeInteger(gracefulMs) ||
+  gracefulMs <= 0 ||
+  !Number.isSafeInteger(settlementMs) ||
+  settlementMs <= 0
+) process.exit(1);
+let target;
+let settled = false;
+let terminating = false;
+let targetClosed = false;
+let targetCode = null;
+let targetSignal = null;
+let settlementOutcome = "terminated";
+let forceTimer;
+let settlementTimer;
+let settlementPoll;
+let startTimer;
+let windowsTaskkillInFlight = false;
+let windowsTaskkillSucceeded = false;
+
+function append(record) {
+  writeSync(journalFd, JSON.stringify({
+    schemaVersion: 1,
+    executionId,
+    ownerToken,
+    brokerPid: process.pid,
+    ...record,
+  }) + "\n");
+  fsyncSync(journalFd);
+}
+
+function send(message) {
+  if (process.connected) {
+    try { process.send(message); } catch {}
+  }
+}
+
+function finish(outcome, confirmed, code, signal) {
+  if (settled) return;
+  settled = true;
+  if (forceTimer) clearTimeout(forceTimer);
+  if (settlementTimer) clearTimeout(settlementTimer);
+  if (settlementPoll) clearInterval(settlementPoll);
+  if (startTimer) clearTimeout(startTimer);
+  const record = {
+    status: "settled",
+    outcome,
+    confirmed,
+    childPid: target && Number.isSafeInteger(target.pid) ? target.pid : null,
+    exitCode: code === undefined ? null : code,
+    exitSignal: signal === undefined ? null : signal,
+    settledAt: new Date().toISOString(),
+  };
+  try { append(record); } catch {
+    record.confirmed = false;
+    record.outcome = "unconfirmed";
+  }
+  const message = {
+    type: "settled",
+    schemaVersion: 1,
+    ...record,
+    executionId,
+    brokerPid: process.pid,
+  };
+  let exitScheduled = false;
+  let exitTimer;
+  const exitBroker = () => {
+    if (exitScheduled) return;
+    exitScheduled = true;
+    if (exitTimer) clearTimeout(exitTimer);
+    try { if (process.connected) process.disconnect(); } catch {}
+    setImmediate(() => process.exit(record.confirmed ? 0 : 1));
+  };
+  if (process.connected) {
+    try {
+      process.send(message, exitBroker);
+      exitTimer = setTimeout(exitBroker, 1000);
+    } catch {
+      exitBroker();
+    }
+  } else {
+    exitBroker();
+  }
+}
+
+function targetTreeAlive() {
+  if (!target || !Number.isSafeInteger(target.pid) || target.pid <= 0) return false;
+  if (managedPlatform === "win32")
+    return !targetClosed || (terminating && !windowsTaskkillSucceeded);
+  try {
+    process.kill(-target.pid, 0);
+    return true;
+  } catch (error) {
+    return !error || error.code !== "ESRCH";
+  }
+}
+
+function settleIfTreeExited() {
+  if (targetClosed && !targetTreeAlive()) {
+    finish(settlementOutcome, true, targetCode, targetSignal);
+    return true;
+  }
+  return false;
+}
+
+function windowsTaskkill(pid) {
+  if (windowsTaskkillSucceeded || windowsTaskkillInFlight) return;
+  windowsTaskkillInFlight = true;
+  const root = process.env.SystemRoot;
+  const executable = managedWindowsTaskkillExecutable || (root ? require("node:path").win32.join(root, "System32", "taskkill.exe") : "taskkill.exe");
+  let killer;
+  try {
+    killer = spawn(executable, [...managedWindowsTaskkillArgumentPrefix, "/pid", String(pid), "/t", "/f"], {
+      shell: false,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+  } catch {
+    windowsTaskkillInFlight = false;
+    try { target.kill("SIGKILL"); } catch {}
+    return;
+  }
+  let failed = false;
+  killer.once("error", () => {
+    failed = true;
+    windowsTaskkillInFlight = false;
+    try { target.kill("SIGKILL"); } catch {}
+    settleIfTreeExited();
+  });
+  killer.once("close", (code) => {
+    windowsTaskkillInFlight = false;
+    if (!failed && code === 0) windowsTaskkillSucceeded = true;
+    else if (!failed) {
+      try { target.kill("SIGKILL"); } catch {}
+    }
+    settleIfTreeExited();
+  });
+  killer.unref();
+}
+
+function signalTarget(signal) {
+  if (!target || !Number.isSafeInteger(target.pid) || target.pid <= 0) return;
+  try {
+    if (managedPlatform === "win32") windowsTaskkill(target.pid);
+    else process.kill(-target.pid, signal);
+  } catch {
+    try { target.kill(signal); } catch {}
+  }
+}
+
+function terminate(outcome = "terminated") {
+  if (settled) return;
+  if (!terminating) {
+    terminating = true;
+    settlementOutcome = outcome;
+  }
+  if (!target) {
+    finish("cancelled_before_start", true, null, null);
+    return;
+  }
+  if (settleIfTreeExited()) return;
+  signalTarget("SIGTERM");
+  if (!forceTimer)
+    forceTimer = setTimeout(() => {
+      signalTarget("SIGKILL");
+      settleIfTreeExited();
+    }, gracefulMs);
+  if (!settlementPoll)
+    settlementPoll = setInterval(() => settleIfTreeExited(), 25);
+  if (!settlementTimer)
+    settlementTimer = setTimeout(() => {
+      if (!settleIfTreeExited()) finish("unconfirmed", false, targetCode, targetSignal);
+    }, gracefulMs + settlementMs);
+}
+
+function outputFailed() {
+  // A killed runtime closes the broker's inherited stdout/stderr pipes. Treat
+  // EPIPE (and any other output transport failure) as a termination request so
+  // the owned target tree is still reaped before the broker exits.
+  terminate();
+}
+
+process.stdout.on("error", outputFailed);
+process.stderr.on("error", outputFailed);
+
+process.on("message", (message) => {
+  if (!message || typeof message !== "object") return;
+  if (message.type === "terminate") {
+    terminate();
+    return;
+  }
+  if (message.type !== "start" || target || settled || terminating) return;
+  if (startTimer) clearTimeout(startTimer);
+  try {
+    append({ status: "starting", startingAt: new Date().toISOString() });
+    target = spawn(message.executable, message.args, {
+      cwd: message.cwd,
+      env: message.env,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: managedPlatform !== "win32",
+      windowsHide: true,
+    });
+    target.once("error", () => {
+      if (!Number.isSafeInteger(target && target.pid) || target.pid <= 0)
+        finish("failed_to_start", true, null, null);
+      else
+        terminate();
+    });
+    if (!Number.isSafeInteger(target.pid) || target.pid <= 0) return;
+    append({
+      status: "started",
+      childPid: target.pid,
+      startedAt: new Date().toISOString(),
+    });
+    target.stdout.on("error", outputFailed);
+    target.stderr.on("error", outputFailed);
+    target.stdout.pipe(process.stdout);
+    target.stderr.pipe(process.stderr);
+    target.once("close", (code, signal) => {
+      targetClosed = true;
+      targetCode = code;
+      targetSignal = signal;
+      if (terminating) {
+        settleIfTreeExited();
+        return;
+      }
+      if (targetTreeAlive()) terminate("exited");
+      else finish("exited", true, code, signal);
+    });
+  } catch {
+    if (target && Number.isSafeInteger(target.pid) && target.pid > 0) terminate();
+    else finish("failed_to_start", true, null, null);
+  }
+});
+
+process.once("disconnect", terminate);
+process.once("SIGTERM", terminate);
+process.once("SIGINT", terminate);
+startTimer = setTimeout(terminate, 30000);
+startTimer.unref();
+append({ status: "ready", readyAt: new Date().toISOString() });
+send({
+  type: "ready",
+  schemaVersion: 1,
+  executionId,
+  brokerPid: process.pid,
+  processGroupId: null,
+  platform: managedPlatform,
+  readyAt: new Date().toISOString(),
+});
+`;
+}
+var MANAGED_PROCESS_BROKER_SOURCE = managedProcessBrokerSource();
+function exactMessageKeys(value, expected) {
+  const actual = Object.keys(value).sort();
+  const sortedExpected = [...expected].sort();
+  return actual.length === sortedExpected.length && actual.every((key, index) => key === sortedExpected[index]);
+}
+function validExitSignal(value) {
+  return value === null || typeof value === "string" && Object.prototype.hasOwnProperty.call(osConstants.signals, value);
+}
+function validManagedReady(value, lifecycle) {
+  if (!value || typeof value !== "object") return void 0;
+  const candidate = value;
+  if (!exactMessageKeys(value, [
+    "type",
+    "schemaVersion",
+    "executionId",
+    "brokerPid",
+    "processGroupId",
+    "platform",
+    "readyAt"
+  ]) || candidate.type !== "ready" || candidate.schemaVersion !== 1 || candidate.executionId !== lifecycle.executionId || !Number.isSafeInteger(candidate.brokerPid) || candidate.brokerPid <= 0 || candidate.processGroupId !== null && (!Number.isSafeInteger(candidate.processGroupId) || candidate.processGroupId <= 0) || ![
+    "aix",
+    "android",
+    "darwin",
+    "freebsd",
+    "haiku",
+    "linux",
+    "openbsd",
+    "sunos",
+    "win32",
+    "cygwin",
+    "netbsd"
+  ].includes(String(candidate.platform)) || typeof candidate.readyAt !== "string" || !Number.isFinite(Date.parse(candidate.readyAt)))
+    return void 0;
+  return candidate;
+}
+function validManagedSettlement(value, lifecycle) {
+  if (!value || typeof value !== "object") return void 0;
+  const candidate = value;
+  if (!exactMessageKeys(value, [
+    "type",
+    "schemaVersion",
+    "executionId",
+    "brokerPid",
+    "status",
+    "outcome",
+    "confirmed",
+    "childPid",
+    "exitCode",
+    "exitSignal",
+    "settledAt"
+  ]) || candidate.type !== "settled" || candidate.schemaVersion !== 1 || candidate.executionId !== lifecycle.executionId || !Number.isSafeInteger(candidate.brokerPid) || candidate.brokerPid <= 0 || candidate.childPid !== null && (!Number.isSafeInteger(candidate.childPid) || candidate.childPid <= 0) || !["exited", "terminated", "cancelled_before_start", "failed_to_start", "unconfirmed"].includes(
+    String(candidate.outcome)
+  ) || typeof candidate.confirmed !== "boolean" || candidate.exitCode !== null && !Number.isInteger(candidate.exitCode) || !validExitSignal(candidate.exitSignal) || typeof candidate.settledAt !== "string" || !Number.isFinite(Date.parse(candidate.settledAt)) || candidate.status !== "settled" || candidate.confirmed === true && candidate.outcome === "unconfirmed" || candidate.confirmed === false && candidate.outcome !== "unconfirmed" || ["exited", "terminated"].includes(String(candidate.outcome)) && (!Number.isSafeInteger(candidate.childPid) || candidate.childPid <= 0) || ["cancelled_before_start", "failed_to_start"].includes(String(candidate.outcome)) && (candidate.childPid !== null || candidate.exitCode !== null || candidate.exitSignal !== null))
+    return void 0;
+  return {
+    schemaVersion: 1,
+    executionId: candidate.executionId,
+    brokerPid: candidate.brokerPid,
+    childPid: candidate.childPid,
+    outcome: candidate.outcome,
+    confirmed: candidate.confirmed,
+    exitCode: candidate.exitCode,
+    exitSignal: candidate.exitSignal,
+    settledAt: candidate.settledAt
+  };
+}
+async function runManagedProcess(executable, args, environment, options, started, timeoutMs, maxOutputBytesPerStream, maxOutputBytesTotal, outputOverflow) {
+  const lifecycle = options.lifecycle;
+  return await new Promise((resolve22, reject) => {
+    const broker = import_cross_spawn3.default.spawn(
+      process.execPath,
+      [
+        "-e",
+        MANAGED_PROCESS_BROKER_SOURCE,
+        lifecycle.executionId,
+        lifecycle.ownerToken,
+        String(PROCESS_TERMINATION_GRACE_MS),
+        String(managedProcessSettlementGraceMs(process.platform))
+      ],
+      {
+        cwd: options.cwd,
+        env: environment,
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe", "ipc", lifecycle.journalFd],
+        // libuv assigns non-detached Windows children to a kill-on-close job.
+        // The broker must outlive a crashed runtime so it can settle the owned
+        // target tree and fsync the terminal journal record.
+        detached: true,
+        windowsHide: true
+      }
+    );
+    const processCapture = new BoundedProcessCapture(maxOutputBytesPerStream, maxOutputBytesTotal);
+    let outputLimit;
+    let settled = false;
+    let terminationCause;
+    let lifecycleError;
+    let targetSettlement;
+    let readyPersistence;
+    let settlementPersisted;
+    let escalationTimer;
+    let settlementTimer;
+    let timer;
+    const requestTermination = (cause) => {
+      if (terminationCause || settled) return;
+      terminationCause = cause;
+      if (timer) clearTimeout(timer);
+      try {
+        if (broker.connected) broker.send({ type: "terminate" });
+      } catch {
+      }
+      escalationTimer = setTimeout(() => {
+        try {
+          if (broker.connected) broker.send({ type: "terminate", force: true });
+        } catch {
+        }
+        settlementTimer = setTimeout(() => {
+          try {
+            terminateChildProcessTree(broker, "SIGKILL");
+          } catch {
+          }
+        }, managedProcessSettlementGraceMs(process.platform));
+        settlementTimer.unref();
+      }, PROCESS_TERMINATION_GRACE_MS);
+      escalationTimer.unref();
+    };
+    const capture = (stream, chunk) => {
+      const observedLimit = processCapture.append(stream, chunk);
+      if (observedLimit && outputOverflow === "reject" && !terminationCause) {
+        outputLimit = observedLimit;
+        requestTermination("output_limit");
+      }
+    };
+    broker.stdout.on("data", (chunk) => capture("stdout", chunk));
+    broker.stderr.on("data", (chunk) => capture("stderr", chunk));
+    const abort = () => requestTermination("abort");
+    options.signal?.addEventListener("abort", abort, { once: true });
+    timer = setTimeout(() => requestTermination("timeout"), timeoutMs);
+    timer.unref();
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      if (escalationTimer) clearTimeout(escalationTimer);
+      if (settlementTimer) clearTimeout(settlementTimer);
+      options.signal?.removeEventListener("abort", abort);
+    };
+    const complete = async (brokerCode, error51) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      try {
+        await settlementPersisted;
+      } catch (settlementError) {
+        lifecycleError ??= settlementError;
+      }
+      try {
+        broker.stdout.destroy();
+        broker.stderr.destroy();
+        broker.unref();
+      } catch {
+      }
+      const finalError = lifecycleError ?? (terminationCause ? void 0 : error51);
+      if (finalError) {
+        reject(finalError);
+        return;
+      }
+      if (!targetSettlement?.confirmed) {
+        reject(
+          new ProcessSettlementError(
+            lifecycle.executionId,
+            brokerCode,
+            terminationCause === "timeout",
+            terminationCause === "output_limit" ? outputLimit : void 0
+          )
+        );
+        return;
+      }
+      const { stdout: stdout2, stderr } = processCapture.finish();
+      const captureMetadata = {
+        stdout: stdout2.metadata,
+        stderr: stderr.metadata
+      };
+      if (terminationCause === "output_limit" && outputLimit) {
+        reject(
+          new ProcessOutputLimitError(
+            outputLimit.stream,
+            captureMetadata,
+            "confirmed",
+            outputLimit
+          )
+        );
+        return;
+      }
+      resolve22({
+        exitCode: terminationCause === "timeout" ? 124 : targetSettlement.exitCode ?? 1,
+        stdout: stdout2.text,
+        stderr: stderr.text,
+        durationMs: Math.round(performance.now() - started),
+        timedOut: terminationCause === "timeout",
+        childSettlement: "confirmed",
+        capture: captureMetadata
+      });
+    };
+    broker.on("message", (message) => {
+      const ready = validManagedReady(message, lifecycle);
+      if (ready) {
+        if (ready.brokerPid !== broker.pid) {
+          lifecycleError = new Error(
+            `Managed subprocess ${lifecycle.executionId} reported an ambiguous broker identity`
+          );
+          requestTermination("failure");
+          return;
+        }
+        readyPersistence = (async () => {
+          try {
+            await lifecycle.onReady(ready);
+            if (terminationCause || options.signal?.aborted) {
+              requestTermination("abort");
+              return;
+            }
+            if (!broker.connected) {
+              lifecycleError = new Error(
+                `Managed subprocess ${lifecycle.executionId} disconnected before authorization`
+              );
+              return;
+            }
+            broker.send({
+              type: "start",
+              executable,
+              args,
+              cwd: options.cwd,
+              env: environment
+            });
+          } catch (error51) {
+            lifecycleError = error51;
+            requestTermination("failure");
+          }
+        })();
+        return;
+      }
+      const settlement = validManagedSettlement(message, lifecycle);
+      if (!settlement) return;
+      if (settlement.brokerPid !== broker.pid) {
+        lifecycleError = new Error(
+          `Managed subprocess ${lifecycle.executionId} settled under an ambiguous broker identity`
+        );
+        requestTermination("failure");
+        return;
+      }
+      targetSettlement = settlement;
+      settlementPersisted = (async () => {
+        await readyPersistence;
+        await lifecycle.onSettled(settlement);
+      })();
+      void settlementPersisted.catch(() => void 0);
+    });
+    broker.once("error", (error51) => void complete(null, error51));
+    broker.once("close", (code) => void complete(code));
+    if (options.signal?.aborted) requestTermination("abort");
+  });
+}
+async function runProcess(command, args, options) {
+  if (command.trim().length === 0) throw new Error("Subprocess command must not be empty");
+  if (command.includes("\0")) throw new Error("Subprocess command must not contain NUL bytes");
+  const nulArgument = args.findIndex((argument) => argument.includes("\0"));
+  if (nulArgument !== -1)
+    throw new Error(`Subprocess argument ${nulArgument} must not contain NUL bytes`);
+  const started = performance.now();
+  const timeoutMs = options.timeoutMs ?? 12e4;
+  const maxOutputBytesPerStream = options.maxOutputBytesPerStream ?? DEFAULT_PROCESS_OUTPUT_BYTES_PER_STREAM;
+  const maxOutputBytesTotal = options.maxOutputBytesTotal;
+  const outputOverflow = options.outputOverflow ?? "reject";
+  if (!Number.isSafeInteger(maxOutputBytesPerStream) || maxOutputBytesPerStream <= 0)
+    throw new Error("Subprocess output capture limit must be a positive safe integer");
+  if (maxOutputBytesTotal !== void 0 && (!Number.isSafeInteger(maxOutputBytesTotal) || maxOutputBytesTotal <= 0))
+    throw new Error("Subprocess combined output capture limit must be a positive safe integer");
+  const inputBytes = options.input === void 0 ? 0 : typeof options.input === "string" ? Buffer.byteLength(options.input) : options.input.length;
+  if (inputBytes > DEFAULT_PROCESS_INPUT_BYTES)
+    throw new Error(
+      `Subprocess input exceeded the ${DEFAULT_PROCESS_INPUT_BYTES}-byte bounded input limit`
+    );
+  if (options.lifecycle && options.input !== void 0)
+    throw new Error("Managed subprocess input is not supported");
+  const environment = { ...process.env, ...options.env, NO_COLOR: "1", FORCE_COLOR: "0" };
+  const executable = await resolveTrustedExecutable(command, {
+    environment,
+    untrustedCwd: options.cwd
+  });
+  if (options.lifecycle)
+    return await runManagedProcess(
+      executable,
+      args,
+      environment,
+      options,
+      started,
+      timeoutMs,
+      maxOutputBytesPerStream,
+      maxOutputBytesTotal,
+      outputOverflow
+    );
+  return await new Promise((resolve22, reject) => {
+    const child = import_cross_spawn3.default.spawn(executable, args, {
+      cwd: options.cwd,
+      env: environment,
+      shell: false,
+      stdio: [options.input === void 0 ? "ignore" : "pipe", "pipe", "pipe"]
+    });
+    const childStdout = child.stdout;
+    const childStderr = child.stderr;
+    const processCapture = new BoundedProcessCapture(maxOutputBytesPerStream, maxOutputBytesTotal);
+    let outputLimit;
+    let inputError;
+    let settled = false;
+    let terminationCause;
+    let escalationTimer;
+    let settlementTimer;
+    let timer;
+    const terminateWithEscalation = (cause) => {
+      if (terminationCause || settled) return;
+      terminationCause = cause;
+      if (timer) clearTimeout(timer);
+      try {
+        terminateChildProcessTree(child, "SIGTERM");
+      } catch {
+      }
+      escalationTimer = setTimeout(() => {
+        try {
+          terminateChildProcessTree(child, "SIGKILL");
+        } catch {
+        }
+        settlementTimer = setTimeout(
+          () => complete(null, void 0, "unconfirmed"),
+          PROCESS_SETTLEMENT_GRACE_MS
+        );
+        settlementTimer.unref();
+      }, PROCESS_TERMINATION_GRACE_MS);
+      escalationTimer.unref();
+    };
+    const capture = (stream, chunk) => {
+      const observedLimit = processCapture.append(stream, chunk);
+      if (observedLimit && outputOverflow === "reject" && !terminationCause) {
+        outputLimit = observedLimit;
+        terminateWithEscalation("output_limit");
+      }
+    };
+    childStdout.on("data", (chunk) => capture("stdout", chunk));
+    childStderr.on("data", (chunk) => capture("stderr", chunk));
+    if (options.input !== void 0 && child.stdin) {
+      child.stdin.on("error", (error51) => {
+        if (terminationCause || settled) return;
+        inputError = error51;
+        terminateWithEscalation("input_error");
+      });
+      child.stdin.end(options.input);
+    }
+    const abort = () => terminateWithEscalation("abort");
+    options.signal?.addEventListener("abort", abort, { once: true });
+    timer = setTimeout(() => terminateWithEscalation("timeout"), timeoutMs);
+    timer.unref();
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      if (escalationTimer) clearTimeout(escalationTimer);
+      if (settlementTimer) clearTimeout(settlementTimer);
+      options.signal?.removeEventListener("abort", abort);
+    };
+    const complete = (code, error51, childSettlement = "confirmed") => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      try {
+        child.stdin?.destroy();
+        childStdout.destroy();
+        childStderr.destroy();
+        child.unref();
+      } catch {
+      }
+      if (error51 && !terminationCause) {
+        reject(error51);
+        return;
+      }
+      if (terminationCause === "input_error" && inputError) {
+        reject(inputError);
+        return;
+      }
+      const { stdout: stdout2, stderr } = processCapture.finish();
+      const captureMetadata = {
+        stdout: stdout2.metadata,
+        stderr: stderr.metadata
+      };
+      if (terminationCause === "output_limit" && outputLimit) {
+        reject(
+          new ProcessOutputLimitError(
+            outputLimit.stream,
+            captureMetadata,
+            childSettlement,
+            outputLimit
+          )
+        );
+        return;
+      }
+      resolve22({
+        exitCode: terminationCause === "timeout" ? 124 : code ?? 1,
+        stdout: stdout2.text,
+        stderr: stderr.text,
+        durationMs: Math.round(performance.now() - started),
+        timedOut: terminationCause === "timeout",
+        childSettlement,
+        capture: captureMetadata
+      });
+    };
+    child.once("error", (error51) => complete(null, error51));
+    child.once("close", (code) => complete(code));
+    if (options.signal?.aborted) abort();
+  });
+}
+
+// packages/probes/src/repository-file.ts
+import { constants as constants2 } from "node:fs";
+import { lstat as lstat4, open, readlink, realpath as realpath4, stat as stat3 } from "node:fs/promises";
+import { dirname as dirname3, isAbsolute as isAbsolute5, relative as relative4, resolve as resolve4, sep as sep4 } from "node:path";
+var MEBIBYTE = 1024 * 1024;
+var READ_CHUNK_BYTES = 64 * 1024;
+var REPOSITORY_FILE_MAX_BYTES = 8 * MEBIBYTE;
+var RepositoryFileError = class extends Error {
+  kind;
+  repositoryPath;
+  constructor(kind, repositoryPath, detail) {
+    super(`Repository path ${JSON.stringify(repositoryPath)} ${detail}`);
+    this.name = "RepositoryFileError";
+    this.kind = kind;
+    this.repositoryPath = repositoryPath;
+  }
+};
+function isRepositoryFileError(error51, ...kinds) {
+  return error51 instanceof RepositoryFileError && (kinds.length === 0 || kinds.includes(error51.kind));
+}
+function sanitizedPath(candidate) {
+  return candidate.slice(0, 4096);
+}
+function inside(root, candidate) {
+  const path2 = relative4(root, candidate);
+  return path2 === "" || !isAbsolute5(path2) && path2 !== ".." && !path2.startsWith(`..${sep4}`);
+}
+async function assertUnresolvedPathInsideRepository(canonicalRoot, candidate, displayPath, signal) {
+  let current = candidate;
+  const visited = /* @__PURE__ */ new Set();
+  for (let hop = 0; hop < 64; hop += 1) {
+    signal?.throwIfAborted();
+    if (visited.has(current))
+      throw new RepositoryFileError("unreadable", displayPath, "could not be resolved safely");
+    visited.add(current);
+    let details;
+    try {
+      details = await lstat4(current);
+    } catch (error51) {
+      signal?.throwIfAborted();
+      const code = error51.code;
+      if (code !== "ENOENT" && code !== "ENOTDIR")
+        throw new RepositoryFileError("unreadable", displayPath, "could not be resolved safely");
+    }
+    if (details?.isSymbolicLink()) {
+      try {
+        current = resolve4(dirname3(current), await readlink(current));
+      } catch {
+        signal?.throwIfAborted();
+        throw new RepositoryFileError("unreadable", displayPath, "could not be resolved safely");
+      }
+      continue;
+    }
+    try {
+      const canonicalExistingPath = await realpath4(current);
+      if (!inside(canonicalRoot, canonicalExistingPath))
+        throw new RepositoryFileError(
+          "outside_repository",
+          displayPath,
+          "resolves outside the repository boundary"
+        );
+      return;
+    } catch (error51) {
+      signal?.throwIfAborted();
+      if (isRepositoryFileError(error51)) throw error51;
+      const code = error51.code;
+      if (code !== "ENOENT" && code !== "ENOTDIR")
+        throw new RepositoryFileError("unreadable", displayPath, "could not be resolved safely");
+    }
+    const parent = dirname3(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  throw new RepositoryFileError("unreadable", displayPath, "could not be resolved safely");
+}
+function validateMaximumBytes(maximumBytes) {
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes <= 0)
+    throw new Error("Repository file read limit must be a positive safe integer");
+}
+async function canonicalRepositoryPath(repositoryRoot, candidate, signal) {
+  signal?.throwIfAborted();
+  const displayPath = sanitizedPath(candidate);
+  if (candidate.includes("\0") || isAbsolute5(candidate))
+    throw new RepositoryFileError(
+      "outside_repository",
+      displayPath,
+      "is outside the repository boundary"
+    );
+  const root = resolve4(repositoryRoot);
+  const lexicalPath = resolve4(root, candidate);
+  if (!inside(root, lexicalPath))
+    throw new RepositoryFileError(
+      "outside_repository",
+      displayPath,
+      "is outside the repository boundary"
+    );
+  let canonicalRoot;
+  try {
+    canonicalRoot = await realpath4(root);
+  } catch (error51) {
+    signal?.throwIfAborted();
+    throw new RepositoryFileError("unreadable", ".", "could not establish the repository boundary");
+  }
+  let canonicalPath;
+  try {
+    canonicalPath = await realpath4(lexicalPath);
+  } catch (error51) {
+    signal?.throwIfAborted();
+    const code = error51.code;
+    if (code === "ENOENT" || code === "ENOTDIR")
+      await assertUnresolvedPathInsideRepository(canonicalRoot, lexicalPath, displayPath, signal);
+    throw new RepositoryFileError(
+      code === "ENOENT" || code === "ENOTDIR" ? "missing" : "unreadable",
+      displayPath,
+      code === "ENOENT" || code === "ENOTDIR" ? "does not exist" : "could not be resolved safely"
+    );
+  }
+  signal?.throwIfAborted();
+  if (!inside(canonicalRoot, canonicalPath))
+    throw new RepositoryFileError(
+      "outside_repository",
+      displayPath,
+      "resolves outside the repository boundary"
+    );
+  return { canonicalRoot, canonicalPath, displayPath };
+}
+function sameIdentity(left, right) {
+  if (left.dev !== right.dev) return false;
+  if (left.ino !== 0n && right.ino !== 0n && left.ino !== right.ino) return false;
+  return true;
+}
+async function closeIgnoringFailure(handle) {
+  if (!handle) return;
+  await handle.close().catch(() => void 0);
+}
+async function inspectRepositoryPath(repositoryRoot, repositoryPath, signal) {
+  const resolved = await canonicalRepositoryPath(repositoryRoot, repositoryPath, signal);
+  let details;
+  try {
+    details = await stat3(resolved.canonicalPath, { bigint: true });
+  } catch (error51) {
+    signal?.throwIfAborted();
+    const code = error51.code;
+    throw new RepositoryFileError(
+      code === "ENOENT" || code === "ENOTDIR" ? "missing" : "unreadable",
+      resolved.displayPath,
+      code === "ENOENT" || code === "ENOTDIR" ? "does not exist" : "could not be inspected"
+    );
+  }
+  signal?.throwIfAborted();
+  return {
+    canonicalPath: resolved.canonicalPath,
+    displayPath: resolved.displayPath,
+    details
+  };
+}
+async function assertRepositoryPath(repositoryRoot, repositoryPath, signal) {
+  const inspected = await inspectRepositoryPath(repositoryRoot, repositoryPath, signal);
+  if (!inspected.details.isFile() && !inspected.details.isDirectory())
+    throw new RepositoryFileError(
+      "unsupported_type",
+      inspected.displayPath,
+      "is not a regular file or repository directory"
+    );
+  return inspected.canonicalPath;
+}
+async function assertRepositoryFile(repositoryRoot, repositoryPath, signal) {
+  const inspected = await inspectRepositoryPath(repositoryRoot, repositoryPath, signal);
+  if (!inspected.details.isFile())
+    throw new RepositoryFileError("not_file", inspected.displayPath, "is not a regular file");
+  return inspected.canonicalPath;
+}
+async function readRepositoryFile(repositoryRoot, repositoryPath, options = {}) {
+  const maximumBytes = options.maximumBytes ?? REPOSITORY_FILE_MAX_BYTES;
+  validateMaximumBytes(maximumBytes);
+  const inspected = await inspectRepositoryPath(repositoryRoot, repositoryPath, options.signal);
+  if (!inspected.details.isFile())
+    throw new RepositoryFileError("not_file", inspected.displayPath, "is not a regular file");
+  if (inspected.details.size > BigInt(maximumBytes))
+    throw new RepositoryFileError(
+      "too_large",
+      inspected.displayPath,
+      `exceeds the ${maximumBytes}-byte bounded read limit`
+    );
+  let handle;
+  try {
+    const noFollow = process.platform === "win32" ? 0 : constants2.O_NOFOLLOW;
+    handle = await open(inspected.canonicalPath, constants2.O_RDONLY | noFollow);
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile())
+      throw new RepositoryFileError("not_file", inspected.displayPath, "is not a regular file");
+    if (!sameIdentity(inspected.details, before))
+      throw new RepositoryFileError("changed", inspected.displayPath, "changed during validation");
+    if (before.size > BigInt(maximumBytes))
+      throw new RepositoryFileError(
+        "too_large",
+        inspected.displayPath,
+        `exceeds the ${maximumBytes}-byte bounded read limit`
+      );
+    const chunks = [];
+    let total = 0;
+    while (total <= maximumBytes) {
+      options.signal?.throwIfAborted();
+      const remaining = maximumBytes + 1 - total;
+      const buffer = Buffer.allocUnsafe(Math.min(READ_CHUNK_BYTES, remaining));
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
+      total += bytesRead;
+    }
+    options.signal?.throwIfAborted();
+    if (total > maximumBytes)
+      throw new RepositoryFileError(
+        "too_large",
+        inspected.displayPath,
+        `exceeds the ${maximumBytes}-byte bounded read limit`
+      );
+    const after = await handle.stat({ bigint: true });
+    if (!sameIdentity(before, after) || before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs)
+      throw new RepositoryFileError("changed", inspected.displayPath, "changed while being read");
+    return Buffer.concat(chunks, total);
+  } catch (error51) {
+    options.signal?.throwIfAborted();
+    if (isRepositoryFileError(error51)) throw error51;
+    throw new RepositoryFileError("unreadable", inspected.displayPath, "could not be read safely");
+  } finally {
+    await closeIgnoringFailure(handle);
+  }
+}
+async function readRepositoryTextFile(repositoryRoot, repositoryPath, options = {}) {
+  return (await readRepositoryFile(repositoryRoot, repositoryPath, options)).toString("utf8");
+}
+async function assertRepositoryDirectory(repositoryRoot, repositoryPath, signal) {
+  const inspected = await inspectRepositoryPath(repositoryRoot, repositoryPath, signal);
+  if (!inspected.details.isDirectory())
+    throw new RepositoryFileError(
+      "not_directory",
+      inspected.displayPath,
+      "is not a repository directory"
+    );
+  return inspected.canonicalPath;
+}
+
+// packages/probes/src/index.ts
+function compactOutput(result) {
+  const value = [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join("\n");
+  const truncated = ["stdout", "stderr"].flatMap((stream) => {
+    const capture = result.capture[stream];
+    return capture.truncated ? [`${stream} retained ${capture.retainedBytes} of ${capture.observedBytes} bytes`] : [];
+  });
+  if (truncated.length === 0) return value.length > 1e3 ? `${value.slice(0, 1e3)}
+\u2026` : value;
+  const note = `[Output truncated by Graphcraft: ${truncated.join("; ")}]`;
+  const available = Math.max(0, 1e3 - note.length - 2);
+  const prefix = value.slice(0, available);
+  return `${prefix}${value.length > available ? "\n\u2026" : ""}
+${note}`;
+}
+async function assertRepositoryInventoryPaths(repositoryPath, paths, signal) {
+  const inventory = await runProcess("git", ["ls-files", "--stage", "-z", "--", ...paths], {
+    cwd: repositoryPath,
+    timeoutMs: 3e4,
+    ...signal ? { signal } : {}
+  });
+  signal?.throwIfAborted();
+  if (inventory.exitCode !== 0)
+    throw new Error("Unable to validate repository-inventory probe paths");
+  const entries = /* @__PURE__ */ new Map();
+  for (const record2 of inventory.stdout.split("\0").filter(Boolean)) {
+    const separator = record2.indexOf("	");
+    const metadata = separator === -1 ? [] : record2.slice(0, separator).split(" ");
+    const path2 = separator === -1 ? "" : record2.slice(separator + 1);
+    if (!metadata[0] || !path2) throw new Error("Git returned an invalid repository-inventory path");
+    entries.set(path2, metadata[0]);
+  }
+  const values = [...entries.entries()];
+  for (let index = 0; index < values.length; index += 32) {
+    signal?.throwIfAborted();
+    await Promise.all(
+      values.slice(index, index + 32).map(async ([path2, mode]) => {
+        try {
+          if (mode === "120000" || mode === "160000")
+            await assertRepositoryPath(repositoryPath, path2, signal);
+          else await assertRepositoryFile(repositoryPath, path2, signal);
+        } catch (error51) {
+          signal?.throwIfAborted();
+          if (isRepositoryFileError(error51, "missing")) return;
+          throw error51;
+        }
+      })
+    );
+  }
+}
+async function runProbe(spec, repositoryPath, signal, lifecycle, algorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
+  const started = performance.now();
+  if (spec.kind === "held_out")
+    throw new Error(`Held-out probe ${spec.id} must be resolved by the runtime`);
+  if (spec.kind === "command") {
+    const cwd = await assertRepositoryDirectory(repositoryPath, spec.cwd ?? ".", signal);
+    const processResult = await runProcess(spec.command, spec.args, {
+      cwd,
+      timeoutMs: spec.timeoutMs,
+      maxOutputBytesPerStream: DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM,
+      outputOverflow: "truncate",
+      ...signal ? { signal } : {},
+      ...lifecycle ? { lifecycle } : {}
+    });
+    const output2 = [processResult.stdout, processResult.stderr].filter(Boolean).join("\n");
+    const passed2 = !processResult.timedOut && processResult.exitCode === spec.expectedExitCode;
+    return {
+      result: {
+        probeId: spec.id,
+        kind: spec.kind,
+        passed: passed2,
+        signature: contentHash(
+          {
+            exitCode: processResult.exitCode,
+            output: compactOutput(processResult),
+            stdoutDigest: processResult.capture.stdout.digest,
+            stderrDigest: processResult.capture.stderr.digest
+          },
+          algorithm
+        ),
+        summary: processResult.timedOut ? `Timed out after ${spec.timeoutMs}ms` : `${spec.command} exited ${processResult.exitCode}${compactOutput(processResult) ? `: ${compactOutput(processResult)}` : ""}`,
+        durationMs: processResult.durationMs
+      },
+      output: output2
+    };
+  }
+  if (spec.kind === "file") {
+    let exists = true;
+    let contents;
+    try {
+      if (spec.contains)
+        contents = await readRepositoryFile(repositoryPath, spec.path, {
+          ...signal ? { signal } : {}
+        });
+      else await assertRepositoryFile(repositoryPath, spec.path, signal);
+    } catch (error51) {
+      if (isRepositoryFileError(error51, "missing")) exists = false;
+      else throw error51;
+    }
+    let contains = true;
+    if (exists && spec.contains) contains = contents.toString("utf8").includes(spec.contains);
+    const passed2 = exists === spec.shouldExist && contains;
+    const summary = `${spec.path} ${exists ? "exists" : "does not exist"}${spec.contains ? ` and ${contains ? "contains" : "does not contain"} the required text` : ""}`;
+    return {
+      result: {
+        probeId: spec.id,
+        kind: spec.kind,
+        passed: passed2,
+        signature: contentHash({ exists, contains }, algorithm),
+        summary,
+        durationMs: Math.round(performance.now() - started)
+      },
+      output: summary
+    };
+  }
+  if (spec.kind === "repository_inventory") {
+    await assertRepositoryInventoryPaths(repositoryPath, spec.paths, signal);
+    const args = ["grep", "-l", "-I", "-F"];
+    for (const term of spec.terms) args.push("-e", term);
+    args.push("--", ...spec.paths);
+    const inventory = await runProcess("git", args, {
+      cwd: repositoryPath,
+      ...signal ? { signal } : {}
+    });
+    const matches = inventory.stdout.split("\n").filter(Boolean);
+    const passed2 = inventory.exitCode === 0 || inventory.exitCode === 1;
+    const summary = matches.length ? `${matches.length} tracked files match ${spec.terms.join(", ")}: ${matches.slice(0, 20).join(", ")}` : `No tracked files match ${spec.terms.join(", ")}`;
+    return {
+      result: {
+        probeId: spec.id,
+        kind: spec.kind,
+        passed: passed2,
+        signature: contentHash({ matches, terms: spec.terms }, algorithm),
+        summary,
+        durationMs: inventory.durationMs,
+        metrics: { inventoryMatches: matches.length }
+      },
+      output: inventory.stdout
+    };
+  }
+  if (spec.kind === "github_snapshot")
+    throw new Error(`GitHub snapshot probe ${spec.id} must be executed by the runtime`);
+  const diff = await runProcess(
+    "git",
+    ["diff", "--no-ext-diff", "--name-status", spec.baseSha, "--"],
+    { cwd: repositoryPath, ...signal ? { signal } : {} }
+  );
+  const untracked = await runProcess("git", ["ls-files", "--others", "--exclude-standard"], {
+    cwd: repositoryPath,
+    ...signal ? { signal } : {}
+  });
+  const output = [diff.stdout.trim(), untracked.stdout.trim()].filter(Boolean).join("\n");
+  const hasChanges = output.length > 0;
+  const passed = diff.exitCode === 0 && untracked.exitCode === 0 && (!spec.requireChanges || hasChanges);
+  return {
+    result: {
+      probeId: spec.id,
+      kind: spec.kind,
+      passed,
+      signature: contentHash(output, algorithm),
+      summary: hasChanges ? output.split("\n").slice(0, 20).join(", ") : "No workspace changes",
+      durationMs: Math.round(performance.now() - started)
+    },
+    output
+  };
+}
+var probeStopWords = /* @__PURE__ */ new Set([
+  "across",
+  "add",
+  "and",
+  "audit",
+  "bug",
+  "every",
+  "feature",
+  "files",
+  "fix",
+  "from",
+  "implement",
+  "investigate",
+  "migration",
+  "refactor",
+  "repository",
+  "review",
+  "that",
+  "the",
+  "this",
+  "verify",
+  "with"
+]);
+function taskTerms(task) {
+  const quoted = [...task.matchAll(/[`"']([^`"']{2,40})[`"']/g)].map((match) => match[1]);
+  const words = task.toLowerCase().match(/[a-z0-9][a-z0-9._/-]{2,}/g) ?? [];
+  return [
+    ...new Set(
+      [...quoted, ...words].map((value) => value.toLowerCase()).filter((value) => !probeStopWords.has(value))
+    )
+  ].slice(0, 10);
+}
+function stableId(value) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 64);
+}
+var packageManagerPattern = /^(npm|pnpm|yarn)(?:@[a-z0-9][a-z0-9._+-]*)?$/i;
+var packageScriptPattern = /^[a-z0-9][a-z0-9:._/-]*$/i;
+function resolvePackageScriptCommand(packageManager, script, options = {}) {
+  const packageManagerValue = packageManager ?? "npm";
+  const match = packageManagerPattern.exec(packageManagerValue);
+  if (!match || script.length > 256 || !packageScriptPattern.test(script)) return void 0;
+  const manager = match[1].toLowerCase();
+  const direct = manager === "pnpm" || manager === "yarn" ? "corepack" : manager;
+  const directArgs = [
+    ...direct === "corepack" ? [manager] : [],
+    ...manager === "npm" ? ["run"] : [],
+    script
+  ];
+  const platform2 = options.platform ?? process.platform;
+  if (platform2 !== "win32") {
+    return { command: direct, args: directArgs, platforms: ["darwin", "linux"] };
+  }
+  return {
+    command: options.comSpec ?? process.env.ComSpec ?? "cmd.exe",
+    args: ["/d", "/s", "/c", [direct, ...directArgs].join(" ")],
+    platforms: ["win32"]
+  };
+}
+function familyScriptPurpose(family, name, terms) {
+  const normalized = name.toLowerCase();
+  if (!/test|check|lint|typecheck|build|verify|validate|audit/.test(normalized)) return void 0;
+  if (/fix|write|update|generate|deploy|publish|release/.test(normalized)) return void 0;
+  if (terms.some((term) => term.length >= 3 && normalized.includes(stableId(term))))
+    return "focused";
+  if (family === "feature" && /accept|integration|e2e|scenario/.test(normalized))
+    return "acceptance";
+  const matchedFamily = family === "bug" && /unit|regression|focused/.test(normalized) || family === "migration" && /migrat|upgrade|compat/.test(normalized) || family === "refactor" && /unit|structur|typecheck/.test(normalized) || family === "audit" && /audit|lint|static|typecheck/.test(normalized);
+  if (matchedFamily) return "focused";
+  if (["check", "test", "typecheck", "lint", "build"].includes(normalized)) return "regression";
+  return void 0;
+}
+async function packageCandidates(repositoryPath, family, terms, signal) {
+  signal?.throwIfAborted();
+  const tracked = await runProcess("git", ["ls-files"], {
+    cwd: repositoryPath,
+    ...signal ? { signal } : {}
+  });
+  signal?.throwIfAborted();
+  if (tracked.exitCode !== 0) return [];
+  const manifests = tracked.stdout.split("\n").filter((path2) => path2 === "package.json" || path2.endsWith("/package.json")).slice(0, 100);
+  const rootManifest = manifests.includes("package.json") ? JSON.parse(
+    await readRepositoryTextFile(repositoryPath, "package.json", {
+      ...signal ? { signal } : {}
+    })
+  ) : void 0;
+  signal?.throwIfAborted();
+  const candidates = [];
+  for (const manifestPath of manifests) {
+    signal?.throwIfAborted();
+    const manifest2 = JSON.parse(
+      await readRepositoryTextFile(repositoryPath, manifestPath, {
+        ...signal ? { signal } : {}
+      })
+    );
+    const directory = dirname4(manifestPath) === "." ? void 0 : dirname4(manifestPath);
+    const relevant = !directory || terms.some(
+      (term) => directory.toLowerCase().includes(term) || manifest2.name?.toLowerCase().includes(term)
+    );
+    if (!relevant) continue;
+    for (const name of Object.keys(manifest2.scripts ?? {}).sort()) {
+      const purpose = familyScriptPurpose(family, name, terms);
+      if (!purpose) continue;
+      const command = resolvePackageScriptCommand(
+        manifest2.packageManager ?? rootManifest?.packageManager,
+        name
+      );
+      if (!command) continue;
+      candidates.push({
+        root: !directory,
+        item: {
+          phase: "completion",
+          purpose,
+          source: `${manifestPath} script ${name}`,
+          probe: {
+            id: stableId(`package-${directory ?? "root"}-${name}`),
+            kind: "command",
+            ...command,
+            ...directory ? { cwd: directory } : {},
+            expectedExitCode: 0,
+            timeoutMs: /test|e2e|integration/.test(name) ? 3e5 : 18e4
+          }
+        }
+      });
+    }
+  }
+  return candidates;
+}
+function selectPackageCandidates(candidates) {
+  const focused = candidates.filter(({ item }) => item.purpose !== "regression").sort((left, right) => Number(right.root) - Number(left.root)).slice(0, 2).map(({ item }) => item);
+  const rootCheck = candidates.find(
+    ({ root, item }) => root && item.purpose === "regression" && item.probe.id.endsWith("-check")
+  );
+  const regression = (rootCheck ? [rootCheck] : candidates.filter(({ item }) => item.purpose === "regression").slice(0, 3)).map(({ item }) => item);
+  return [...focused, ...regression].filter(
+    (item, index, items) => items.findIndex(({ probe }) => probe.id === item.probe.id) === index
+  );
+}
+function withinRepository(repositoryPath, candidate) {
+  const root = resolve5(repositoryPath);
+  const path2 = resolve5(repositoryPath, candidate);
+  return path2 === root || path2.startsWith(`${root}${sep5}`);
+}
+async function validateProbePlan(input, repositoryPath, signal) {
+  signal?.throwIfAborted();
+  const plan = ProbePlanSchema.parse(input);
+  if (!plan.items.some(({ phase }) => phase === "completion"))
+    throw new Error("A probe plan must contain at least one completion probe");
+  const keys = /* @__PURE__ */ new Set();
+  for (const item of plan.items) {
+    signal?.throwIfAborted();
+    const key = `${item.phase}:${item.probe.id}`;
+    if (keys.has(key)) throw new Error(`Duplicate ${item.phase} probe ID ${item.probe.id}`);
+    keys.add(key);
+    if (item.probe.kind === "held_out")
+      throw new Error("User-editable probe plans cannot contain held-out references");
+    if (item.probe.kind === "github_snapshot" && item.phase !== "progress")
+      throw new Error(`GitHub snapshot probe ${item.probe.id} must be progress evidence`);
+    if (item.probe.kind === "command") {
+      if (item.probe.timeoutMs > 18e5)
+        throw new Error(`Probe ${item.probe.id} exceeds the 30 minute timeout limit`);
+      if (item.probe.platforms && !item.probe.platforms.includes(process.platform))
+        throw new Error(`Probe ${item.probe.id} does not support ${process.platform}`);
+      const cwd = item.probe.cwd ?? ".";
+      if (!withinRepository(repositoryPath, cwd))
+        throw new Error(`Probe ${item.probe.id} escapes the repository working directory`);
+      try {
+        await assertRepositoryDirectory(repositoryPath, cwd, signal);
+      } catch (error51) {
+        if (isRepositoryFileError(error51, "missing", "not_directory"))
+          throw new Error(`Probe ${item.probe.id} uses missing working directory ${cwd}`);
+        throw error51;
+      }
+    }
+    if (item.probe.kind === "file") {
+      if (!withinRepository(repositoryPath, item.probe.path))
+        throw new Error(`Probe ${item.probe.id} escapes the repository`);
+      try {
+        await assertRepositoryFile(repositoryPath, item.probe.path, signal);
+      } catch (error51) {
+        if (!isRepositoryFileError(error51, "missing")) throw error51;
+      }
+    }
+    if (item.probe.kind === "repository_inventory" && item.probe.paths.some((path2) => !withinRepository(repositoryPath, path2))) {
+      throw new Error(`Probe ${item.probe.id} escapes the repository inventory scope`);
+    }
+    if (item.probe.kind === "repository_inventory")
+      await assertRepositoryInventoryPaths(repositoryPath, item.probe.paths, signal);
+  }
+  signal?.throwIfAborted();
+  return plan;
+}
+async function discoverProbePlan(repositoryPath, task, baseSha, options = {}) {
+  options.signal?.throwIfAborted();
+  const family = classifyTask(task);
+  const terms = taskTerms(task);
+  const inventoryTerms = terms.length ? terms : [family];
+  const inventory = {
+    id: `${family}-task-inventory`,
+    kind: "repository_inventory",
+    paths: ["."],
+    terms: inventoryTerms
+  };
+  const items = [
+    {
+      phase: "progress",
+      purpose: "inventory",
+      source: "Task terms matched against tracked repository files",
+      probe: inventory
+    },
+    {
+      phase: "progress",
+      purpose: "focused",
+      source: "Approved base SHA workspace delta",
+      probe: {
+        id: "workspace-diff",
+        kind: "git_diff",
+        baseSha,
+        requireChanges: family !== "audit"
+      }
+    }
+  ];
+  if (options.finishLine === "pr_open") {
+    items.push({
+      phase: "progress",
+      purpose: "acceptance",
+      source: "Authoritative SHA-bound GitHub snapshot for the approved run branch",
+      probe: {
+        id: "pull-request-lifecycle",
+        kind: "github_snapshot",
+        pullRequest: "run_branch",
+        expectedState: "open",
+        requiredChecks: "observe",
+        reviewThreads: "observe"
+      }
+    });
+  }
+  const selected = selectPackageCandidates(
+    await packageCandidates(repositoryPath, family, inventoryTerms, options.signal)
+  );
+  options.signal?.throwIfAborted();
+  for (const completion of selected) {
+    if (completion.purpose !== "regression") items.push({ ...completion, phase: "progress" });
+    items.push(completion);
+  }
+  try {
+    await assertRepositoryFile(repositoryPath, "pyproject.toml", options.signal);
+    items.push({
+      phase: "completion",
+      purpose: "regression",
+      source: "pyproject.toml",
+      probe: {
+        id: "python-tests",
+        kind: "command",
+        command: "python",
+        args: ["-m", "pytest", "-q"],
+        expectedExitCode: 0,
+        timeoutMs: 3e5,
+        platforms: ["darwin", "linux", "win32"]
+      }
+    });
+  } catch (error51) {
+    if (!isRepositoryFileError(error51, "missing")) throw error51;
+  }
+  try {
+    await assertRepositoryFile(repositoryPath, "go.mod", options.signal);
+    items.push({
+      phase: "completion",
+      purpose: "regression",
+      source: "go.mod",
+      probe: {
+        id: "go-tests",
+        kind: "command",
+        command: "go",
+        args: ["test", "./..."],
+        expectedExitCode: 0,
+        timeoutMs: 3e5,
+        platforms: ["darwin", "linux", "win32"]
+      }
+    });
+  } catch (error51) {
+    if (!isRepositoryFileError(error51, "missing")) throw error51;
+  }
+  if (family === "audit" || !items.some(({ phase }) => phase === "completion")) {
+    items.push({
+      phase: "completion",
+      purpose: "inventory",
+      source: "Task-term coverage across tracked repository files",
+      probe: inventory
+    });
+  }
+  options.signal?.throwIfAborted();
+  return await validateProbePlan(
+    { schemaVersion: 1, family, items },
+    repositoryPath,
+    options.signal
+  );
+}
+
+// packages/github/src/index.ts
 var GITHUB_COMMAND_TERMINATION_GRACE_MS = 2e3;
 var GITHUB_COMMAND_SETTLEMENT_GRACE_MS = 2e3;
+var GITHUB_COMMAND_OUTPUT_LIMIT_BYTES = 16 * 1024 * 1024;
 var PermissionSchema2 = external_exports.enum(["ADMIN", "MAINTAIN", "WRITE", "TRIAGE", "READ", "NONE"]);
 var RequiredStatusCheckSchema = external_exports.strictObject({
   context: external_exports.string().min(1),
@@ -25979,8 +27578,86 @@ async function runCommand(options, args) {
   });
   if (options.signal?.aborted) throw new GitHubCommandCancellationError("cancelled_before_spawn");
   const commandArgs = [...options.commandArgs ?? [], ...args];
+  if (options.lifecycle) {
+    const timeoutMs = options.timeoutMs ?? 6e4;
+    const lifecycle = options.lifecycle;
+    let targetSettled = false;
+    let abortedBeforeTargetSettlement = options.signal?.aborted ?? false;
+    const recordAbort = () => {
+      if (!targetSettled) abortedBeforeTargetSettlement = true;
+    };
+    options.signal?.addEventListener("abort", recordAbort, { once: true });
+    let result;
+    try {
+      result = await runProcess(command, commandArgs, {
+        cwd: options.cwd,
+        timeoutMs,
+        maxOutputBytesPerStream: GITHUB_COMMAND_OUTPUT_LIMIT_BYTES,
+        maxOutputBytesTotal: GITHUB_COMMAND_OUTPUT_LIMIT_BYTES,
+        outputOverflow: "reject",
+        ...options.env ? { env: options.env } : {},
+        ...options.signal ? { signal: options.signal } : {},
+        lifecycle: {
+          ...lifecycle,
+          onSettled: async (settlement) => {
+            targetSettled = true;
+            await lifecycle.onSettled(settlement);
+          }
+        }
+      });
+    } catch (error51) {
+      if (error51 instanceof ProcessOutputLimitError)
+        throw new GitHubCommandError(
+          "gh output exceeded the 16MiB safety limit",
+          1,
+          error51.childSettlement
+        );
+      if (error51 instanceof ProcessSettlementError) {
+        if (error51.timedOut)
+          throw new GitHubCommandError(
+            `gh exceeded its ${timeoutMs}ms timeout`,
+            124,
+            "unconfirmed"
+          );
+        if (error51.outputLimit)
+          throw new GitHubCommandError(
+            "gh output exceeded the 16MiB safety limit",
+            1,
+            "unconfirmed"
+          );
+        if (abortedBeforeTargetSettlement) throw new GitHubCommandCancellationError("unconfirmed");
+        throw new GitHubCommandError(error51.message, 1, "unconfirmed");
+      }
+      throw error51;
+    } finally {
+      options.signal?.removeEventListener("abort", recordAbort);
+    }
+    if (result.timedOut)
+      throw new GitHubCommandError(
+        `gh exceeded its ${timeoutMs}ms timeout`,
+        result.exitCode,
+        result.childSettlement
+      );
+    if (abortedBeforeTargetSettlement)
+      throw new GitHubCommandCancellationError(
+        result.childSettlement === "confirmed" ? "terminated" : "unconfirmed"
+      );
+    if (result.capture.stdout.observedBytes + result.capture.stderr.observedBytes > GITHUB_COMMAND_OUTPUT_LIMIT_BYTES)
+      throw new GitHubCommandError(
+        "gh output exceeded the 16MiB safety limit",
+        result.exitCode,
+        result.childSettlement
+      );
+    if (result.exitCode !== 0)
+      throw new GitHubCommandError(
+        result.stderr.trim() || result.stdout.trim() || `${command} ${commandArgs[0] ?? ""} exited ${result.exitCode}`,
+        result.exitCode,
+        result.childSettlement
+      );
+    return { stdout: result.stdout, stderr: result.stderr };
+  }
   return await new Promise((resolve22, reject) => {
-    const child = import_cross_spawn3.default.spawn(command, commandArgs, {
+    const child = import_cross_spawn4.default.spawn(command, commandArgs, {
       cwd: options.cwd,
       env: options.env ?? process.env,
       shell: false,
@@ -26072,13 +27749,13 @@ async function runCommand(options, args) {
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       outputBytes += Buffer.byteLength(chunk);
-      if (outputBytes > 16 * 1024 * 1024)
+      if (outputBytes > GITHUB_COMMAND_OUTPUT_LIMIT_BYTES)
         return terminate({ kind: "failure", message: "gh output exceeded the 16MiB safety limit" });
       stdout2 += chunk;
     });
     child.stderr.on("data", (chunk) => {
       outputBytes += Buffer.byteLength(chunk);
-      if (outputBytes > 16 * 1024 * 1024)
+      if (outputBytes > GITHUB_COMMAND_OUTPUT_LIMIT_BYTES)
         return terminate({ kind: "failure", message: "gh output exceeded the 16MiB safety limit" });
       stderr += chunk;
     });
@@ -27273,19 +28950,19 @@ import { join as join5 } from "node:path";
 import { hostname as hostname3 } from "node:os";
 import { randomUUID as randomUUID4 } from "node:crypto";
 import { constants as fsConstants2 } from "node:fs";
-import { lstat as lstat5, open as open3, unlink } from "node:fs/promises";
-import { basename as basename2, dirname as dirname5, resolve as resolve5 } from "node:path";
+import { lstat as lstat6, open as open4, unlink } from "node:fs/promises";
+import { basename as basename2, dirname as dirname7, resolve as resolve7 } from "node:path";
 
 // packages/runtime/src/secure-fs.ts
 import { spawn as spawn4 } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { chmod, lstat as lstat4, mkdir as mkdir2, open as open2, readdir } from "node:fs/promises";
-import { dirname as dirname4, isAbsolute as isAbsolute5, join as join4, relative as relative4, resolve as resolve4, sep as sep4, win32 as win322 } from "node:path";
+import { chmod, lstat as lstat5, mkdir as mkdir2, open as open3, readdir } from "node:fs/promises";
+import { dirname as dirname6, isAbsolute as isAbsolute6, join as join4, relative as relative5, resolve as resolve6, sep as sep6, win32 as win322 } from "node:path";
 
 // packages/runtime/src/json.ts
 import { randomUUID as randomUUID3 } from "node:crypto";
-import { mkdir, open, rename, rm as rm3 } from "node:fs/promises";
-import { dirname as dirname3 } from "node:path";
+import { mkdir, open as open2, rename, rm as rm3 } from "node:fs/promises";
+import { dirname as dirname5 } from "node:path";
 
 // packages/runtime/src/redaction.ts
 var secretKey = /(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|passwd|credential)/i;
@@ -27456,8 +29133,8 @@ function replaceJsonValue(source, value, configured) {
   const leading = body.match(/^[\t\n\r ]*/u)?.[0] ?? "";
   const trailing = body.match(/[\t\n\r ]*$/u)?.[0] ?? "";
   const tokenRedacted = redactJsonTokens(JSON.stringify(value), configured);
-  const serialized2 = redactString(tokenRedacted, configured) === tokenRedacted ? tokenRedacted : JSON.stringify("[REDACTED]");
-  return `${bom}${leading}${serialized2}${trailing}`;
+  const serialized3 = redactString(tokenRedacted, configured) === tokenRedacted ? tokenRedacted : JSON.stringify("[REDACTED]");
+  return `${bom}${leading}${serialized3}${trailing}`;
 }
 function redactJsonDocument(source, configured) {
   const bom = source.startsWith("\uFEFF") ? source.slice(1) : source;
@@ -27526,10 +29203,10 @@ function assertPersistenceSafe(value, label) {
 
 // packages/runtime/src/json.ts
 async function writeJsonAtomic(path2, value) {
-  await mkdir(dirname3(path2), { recursive: true });
+  await mkdir(dirname5(path2), { recursive: true });
   const temporaryPath = `${path2}.${process.pid}.${randomUUID3()}.tmp`;
   try {
-    const handle = await open(temporaryPath, "wx", 384);
+    const handle = await open2(temporaryPath, "wx", 384);
     let publication;
     try {
       await handle.writeFile(`${JSON.stringify(redactValue(value), null, 2)}
@@ -27556,7 +29233,7 @@ async function writeJsonAtomic(path2, value) {
 }
 async function syncDirectory(path2) {
   if (process.platform === "win32") return;
-  const handle = await open(path2, "r");
+  const handle = await open2(path2, "r");
   try {
     await handle.sync();
   } finally {
@@ -27578,8 +29255,8 @@ async function replacePathAtomic(temporaryPath, path2) {
       delayMs = Math.min(100, delayMs * 2);
     }
   }
-  const sourceDirectory = dirname3(temporaryPath);
-  const targetDirectory = dirname3(path2);
+  const sourceDirectory = dirname5(temporaryPath);
+  const targetDirectory = dirname5(path2);
   await syncDirectory(targetDirectory);
   if (sourceDirectory !== targetDirectory) await syncDirectory(sourceDirectory);
 }
@@ -28277,7 +29954,7 @@ function rememberDarwinEntry(path2, fingerprint) {
   }
 }
 async function inspectPrivateEntry(path2) {
-  const status3 = await lstat4(path2, { bigint: true });
+  const status3 = await lstat5(path2, { bigint: true });
   const identityFingerprint = privateEntryIdentityFingerprint(status3);
   const publicationIdentityFingerprint = privatePublicationIdentityFingerprint(status3);
   const metadataFingerprint = identityFingerprint === void 0 ? void 0 : `${identityFingerprint}:${status3.ctimeNs}`;
@@ -28342,7 +30019,7 @@ async function serializeWindowsAclWork(work) {
   }
 }
 async function serializePrivatePathMutation(path2, work) {
-  const absolute = resolve4(path2);
+  const absolute = resolve6(path2);
   const previous = privatePathMutationTails.get(absolute);
   let release;
   const turn = new Promise((resolveTurn) => {
@@ -28467,7 +30144,7 @@ async function hardenPosixEntries(entries, force = false) {
     }
 }
 function privatePathSegments(relativePath) {
-  if (isAbsolute5(relativePath))
+  if (isAbsolute6(relativePath))
     throw new Error(`Private path must be relative to its owned root: ${relativePath}`);
   const segments = relativePath.split(process.platform === "win32" ? /[\\/]/ : /\//).filter((segment) => segment.length > 0);
   if (segments.some((segment) => segment === "." || segment === ".."))
@@ -28475,16 +30152,16 @@ function privatePathSegments(relativePath) {
   return segments;
 }
 async function validatePrivatePath(ownedRoot, relativePath) {
-  const root = resolve4(ownedRoot);
+  const root = resolve6(ownedRoot);
   const segments = privatePathSegments(relativePath);
-  const absolute = resolve4(root, ...segments);
-  const requested = resolve4(root, relativePath);
+  const absolute = resolve6(root, ...segments);
+  const requested = resolve6(root, relativePath);
   if (absolute !== requested)
     throw new Error(`Private path validation changed the requested path: ${relativePath}`);
-  const relation = relative4(root, absolute);
-  if (relation === ".." || relation.startsWith(`..${sep4}`) || isAbsolute5(relation))
+  const relation = relative5(root, absolute);
+  if (relation === ".." || relation.startsWith(`..${sep6}`) || isAbsolute6(relation))
     throw new Error(`Private path escapes its owned root: ${relativePath}`);
-  const rootStatus = await lstat4(root);
+  const rootStatus = await lstat5(root);
   if (rootStatus.isSymbolicLink()) rejectSymbolicLink(root);
   if (!rootStatus.isDirectory()) throw new Error(`Private root is not a directory: ${root}`);
   let current = root;
@@ -28492,7 +30169,7 @@ async function validatePrivatePath(ownedRoot, relativePath) {
     current = join4(current, segment);
     let status3;
     try {
-      status3 = await lstat4(current);
+      status3 = await lstat5(current);
     } catch (error51) {
       if (isMissing(error51)) return absolute;
       throw error51;
@@ -28510,17 +30187,17 @@ async function validatePrivatePath(ownedRoot, relativePath) {
 async function readBoundedRegularFile(path2, maximumBytes, options) {
   if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0)
     throw new Error("Private file read limit must be a non-negative safe integer");
-  const absolute = resolve4(path2);
+  const absolute = resolve6(path2);
   if (options.ownedRoot !== void 0)
-    await validatePrivatePath(options.ownedRoot, relative4(resolve4(options.ownedRoot), absolute));
+    await validatePrivatePath(options.ownedRoot, relative5(resolve6(options.ownedRoot), absolute));
   const noFollow = process.platform === "win32" ? 0 : fsConstants.O_NOFOLLOW;
   for (let replacementAttempt = 0; ; replacementAttempt += 1) {
     try {
-      const observed = await lstat4(absolute, { bigint: true });
+      const observed = await lstat5(absolute, { bigint: true });
       assertPrivateRegularFile(absolute, observed, options.allowMultipleLinks);
       if (observed.size > BigInt(maximumBytes))
         throw new Error(`Private file exceeds its ${maximumBytes}-byte bounded read limit`);
-      const handle = await open2(absolute, fsConstants.O_RDONLY | noFollow);
+      const handle = await open3(absolute, fsConstants.O_RDONLY | noFollow);
       try {
         const before = await handle.stat({ bigint: true });
         assertPrivateRegularFile(absolute, before, options.allowMultipleLinks);
@@ -28560,20 +30237,20 @@ async function readPrivateFileBounded(path2, maximumBytes, ownedRoot) {
   });
 }
 async function ensurePrivateDirectory(path2, ownedRoot = path2) {
-  const absolute = resolve4(path2);
-  const root = resolve4(ownedRoot);
-  const relativePath = relative4(root, absolute);
+  const absolute = resolve6(path2);
+  const root = resolve6(ownedRoot);
+  const relativePath = relative5(root, absolute);
   if (absolute !== root) await validatePrivatePath(root, relativePath);
   const missingDirectories = [];
   let candidate = absolute;
   while (true) {
     try {
-      await lstat4(candidate);
+      await lstat5(candidate);
       break;
     } catch (error51) {
       if (!isMissing(error51)) throw error51;
       missingDirectories.push(candidate);
-      const parent = dirname4(candidate);
+      const parent = dirname6(candidate);
       if (parent === candidate)
         throw new Error(`Private directory has no existing ancestor: ${absolute}`);
       candidate = parent;
@@ -28581,7 +30258,7 @@ async function ensurePrivateDirectory(path2, ownedRoot = path2) {
   }
   await mkdir2(absolute, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
   if (absolute !== root) await validatePrivatePath(root, relativePath);
-  const status3 = await lstat4(absolute);
+  const status3 = await lstat5(absolute);
   if (status3.isSymbolicLink()) rejectSymbolicLink(path2);
   if (!status3.isDirectory()) throw new Error(`Private directory path is not a directory: ${path2}`);
   const directories = [root];
@@ -28601,12 +30278,12 @@ async function ensurePrivateDirectory(path2, ownedRoot = path2) {
   }
   for (const directory of missingDirectories.reverse()) {
     await syncDirectory(directory);
-    await syncDirectory(dirname4(directory));
+    await syncDirectory(dirname6(directory));
   }
 }
 var activePrivateDirectoryMutations = /* @__PURE__ */ new WeakSet();
 async function preparePrivateDirectoryMutation(path2, ownedRoot = path2) {
-  const absolute = resolve4(path2);
+  const absolute = resolve6(path2);
   await ensurePrivateDirectory(absolute, ownedRoot);
   const inspected = await inspectPrivateEntry(absolute);
   if (inspected.entry.kind !== "directory")
@@ -28626,7 +30303,7 @@ async function finalizePrivateDirectoryMutation(checkpoint, ownedRoot = checkpoi
   }
   if (supportsPosixModes) {
     if (process.platform !== "darwin") return;
-    await validatePrivatePath(ownedRoot, relative4(resolve4(ownedRoot), resolve4(checkpoint.path)));
+    await validatePrivatePath(ownedRoot, relative5(resolve6(ownedRoot), resolve6(checkpoint.path)));
     const inspected = await inspectPrivateEntry(checkpoint.path);
     if (inspected.entry.kind === "directory" && checkpoint.identityFingerprint !== void 0 && inspected.identityFingerprint === checkpoint.identityFingerprint && hardenedDarwinEntries.get(checkpoint.path) === checkpoint.metadataFingerprint) {
       rememberDarwinEntry(checkpoint.path, inspected.metadataFingerprint);
@@ -28638,7 +30315,7 @@ async function finalizePrivateDirectoryMutation(checkpoint, ownedRoot = checkpoi
     return;
   }
   await serializeWindowsAclWork(async () => {
-    await validatePrivatePath(ownedRoot, relative4(resolve4(ownedRoot), resolve4(checkpoint.path)));
+    await validatePrivatePath(ownedRoot, relative5(resolve6(ownedRoot), resolve6(checkpoint.path)));
     const inspected = await inspectPrivateEntry(checkpoint.path);
     if (inspected.entry.kind === "directory" && checkpoint.identityFingerprint !== void 0 && inspected.identityFingerprint === checkpoint.identityFingerprint && hardenedWindowsIdentities.get(checkpoint.identityFingerprint) === checkpoint.metadataFingerprint) {
       rememberWindowsIdentity(inspected.identityFingerprint, inspected.metadataFingerprint);
@@ -28691,14 +30368,14 @@ async function inspectWindowsPublicationParentsLocked(parentPaths, checkpoint) {
   throw new Error("Unable to verify owner-only publication parent identity");
 }
 async function publishPrivateFileAtomic(input) {
-  const absolute = resolve4(input.path);
-  const root = resolve4(input.ownedRoot);
-  const sourceDirectory = resolve4(input.sourceDirectory);
-  const targetDirectory = dirname4(absolute);
-  const relativePath = relative4(root, absolute);
+  const absolute = resolve6(input.path);
+  const root = resolve6(input.ownedRoot);
+  const sourceDirectory = resolve6(input.sourceDirectory);
+  const targetDirectory = dirname6(absolute);
+  const relativePath = relative5(root, absolute);
   await validatePrivatePath(root, relativePath);
   const parentPaths = [.../* @__PURE__ */ new Set([sourceDirectory, targetDirectory])];
-  for (const parent of parentPaths) await validatePrivatePath(root, relative4(root, parent));
+  for (const parent of parentPaths) await validatePrivatePath(root, relative5(root, parent));
   if (supportsPosixModes) {
     await serializePrivatePathMutation(absolute, async () => {
       const publication = await input.publish();
@@ -28709,7 +30386,7 @@ async function publishPrivateFileAtomic(input) {
         ino: publication.inode,
         birthtimeNs: publication.birthtimeNs
       });
-      if (resolve4(publication.path) !== absolute || fileAfter.entry.kind !== "file")
+      if (resolve6(publication.path) !== absolute || fileAfter.entry.kind !== "file")
         throw new Error(`Published private file changed filesystem identity: ${absolute}`);
       const superseded = publicationIdentity !== void 0 && fileAfter.identityFingerprint !== void 0 && fileAfter.identityFingerprint !== publicationIdentity;
       if (superseded && input.supersessionPolicy !== "reconstructable_projection")
@@ -28759,7 +30436,7 @@ async function publishPrivateFileAtomic(input) {
         ino: publication.inode,
         birthtimeNs: publication.birthtimeNs
       });
-      if (resolve4(publication.path) !== absolute)
+      if (resolve6(publication.path) !== absolute)
         throw new Error(`Published private file changed filesystem identity: ${absolute}`);
       await hardenWindowsEntriesLocked(
         requiresParentHardening ? [...parentsAfter.map(({ entry }) => entry), fileAfter.entry] : [fileAfter.entry],
@@ -28778,23 +30455,23 @@ async function publishPrivateFileAtomic(input) {
   });
 }
 async function writePrivateJsonAtomic(path2, value, ownedRoot, options = {}) {
-  const absolute = resolve4(path2);
+  const absolute = resolve6(path2);
   await publishPrivateFileAtomic({
     path: absolute,
     ownedRoot,
-    sourceDirectory: dirname4(absolute),
+    sourceDirectory: dirname6(absolute),
     hardenOnPosix: false,
     supersessionPolicy: options.supersessionPolicy ?? "strict",
     publish: async () => await writeJsonAtomic(absolute, value)
   });
 }
 async function hardenPrivateFile(path2, ownedRoot) {
-  const absolute = resolve4(path2);
+  const absolute = resolve6(path2);
   if (ownedRoot !== void 0)
-    await validatePrivatePath(ownedRoot, relative4(resolve4(ownedRoot), absolute));
+    await validatePrivatePath(ownedRoot, relative5(resolve6(ownedRoot), absolute));
   let status3;
   try {
-    status3 = await lstat4(absolute);
+    status3 = await lstat5(absolute);
   } catch (error51) {
     if (isMissing(error51)) return;
     throw error51;
@@ -28807,7 +30484,7 @@ async function hardenPrivateFile(path2, ownedRoot) {
     else await hardenWindowsEntries([{ kind: "file", path: absolute }]);
   } catch (error51) {
     try {
-      await lstat4(absolute);
+      await lstat5(absolute);
     } catch (inspectionError) {
       if (isMissing(inspectionError)) return;
       throw inspectionError;
@@ -28817,7 +30494,7 @@ async function hardenPrivateFile(path2, ownedRoot) {
 }
 var activePrivateFileMutations = /* @__PURE__ */ new WeakSet();
 async function preparePrivateFileMutation(path2, ownedRoot) {
-  const absolute = resolve4(path2);
+  const absolute = resolve6(path2);
   await hardenPrivateFile(absolute, ownedRoot);
   try {
     const inspected = await inspectPrivateEntry(absolute);
@@ -28847,7 +30524,7 @@ async function finalizePrivateFileMutation(checkpoint, ownedRoot) {
     return;
   }
   if (ownedRoot !== void 0)
-    await validatePrivatePath(ownedRoot, relative4(resolve4(ownedRoot), resolve4(checkpoint.path)));
+    await validatePrivatePath(ownedRoot, relative5(resolve6(ownedRoot), resolve6(checkpoint.path)));
   let inspected;
   try {
     inspected = await inspectPrivateEntry(checkpoint.path);
@@ -28862,8 +30539,8 @@ async function finalizePrivateFileMutation(checkpoint, ownedRoot) {
   await hardenPrivateFile(checkpoint.path, ownedRoot);
 }
 async function hardenPrivateTree(root, ownedRoot = root) {
-  const absoluteRoot = resolve4(root);
-  await validatePrivatePath(ownedRoot, relative4(resolve4(ownedRoot), absoluteRoot));
+  const absoluteRoot = resolve6(root);
+  await validatePrivatePath(ownedRoot, relative5(resolve6(ownedRoot), absoluteRoot));
   const entries = await collectPrivateTree(
     absoluteRoot,
     supportsPosixModes ? Number.POSITIVE_INFINITY : WINDOWS_ACL_REQUEST_LIMITS.maximumTargets
@@ -28934,11 +30611,11 @@ function processExists(pid) {
   }
 }
 function lockOwnedRoot(path2) {
-  let candidate = dirname5(path2);
+  let candidate = dirname7(path2);
   while (true) {
     if (basename2(candidate) === ".graphcraft") return candidate;
-    const parent = dirname5(candidate);
-    if (parent === candidate) return dirname5(path2);
+    const parent = dirname7(candidate);
+    if (parent === candidate) return dirname7(path2);
     candidate = parent;
   }
 }
@@ -28948,7 +30625,7 @@ async function readLockRecord(path2, ownedRoot) {
 async function pathNamesLockDescriptor(path2, ownedRoot, descriptorStatus, token) {
   let pathStatus;
   try {
-    pathStatus = await lstat5(path2, { bigint: true });
+    pathStatus = await lstat6(path2, { bigint: true });
   } catch (error51) {
     if (error51.code === "ENOENT") return false;
     throw error51;
@@ -28971,7 +30648,7 @@ var RunLock = class {
   loss = new AbortController();
   acquired = false;
   constructor(path2) {
-    this.path = resolve5(path2);
+    this.path = resolve7(path2);
     this.ownedRoot = lockOwnedRoot(this.path);
   }
   get signal() {
@@ -28981,17 +30658,17 @@ var RunLock = class {
     let contentionAttempts = 0;
     while (true) {
       await ensurePrivateDirectory(this.ownedRoot);
-      await ensurePrivateDirectory(dirname5(this.path), this.ownedRoot);
+      await ensurePrivateDirectory(dirname7(this.path), this.ownedRoot);
       await hardenPrivateFile(this.path, this.ownedRoot);
       let descriptorOpened = false;
       try {
         await publishPrivateFileAtomic({
           path: this.path,
           ownedRoot: this.ownedRoot,
-          sourceDirectory: dirname5(this.path),
+          sourceDirectory: dirname7(this.path),
           hardenOnPosix: true,
           publish: async () => {
-            const handle = await open3(this.path, "wx", 384);
+            const handle = await open4(this.path, "wx", 384);
             descriptorOpened = true;
             const acquiredAt = (/* @__PURE__ */ new Date()).toISOString();
             let publication;
@@ -29051,7 +30728,7 @@ var RunLock = class {
         try {
           observed = await readLockRecord(this.path, this.ownedRoot);
           record2 = parseLockRecord(observed);
-          observedStatus = await lstat5(this.path, { bigint: true });
+          observedStatus = await lstat6(this.path, { bigint: true });
         } catch {
         }
         const heartbeatAge = observedStatus ? Math.max(0, Date.now() - Number(observedStatus.mtimeMs)) : Number.POSITIVE_INFINITY;
@@ -29066,7 +30743,7 @@ var RunLock = class {
               throw readError;
             }
           );
-          const currentStatus = await lstat5(this.path, { bigint: true }).catch(
+          const currentStatus = await lstat6(this.path, { bigint: true }).catch(
             (statusError) => {
               if (statusError.code === "ENOENT") return void 0;
               throw statusError;
@@ -29121,7 +30798,7 @@ var RunLock = class {
   }
   async mutateLockDirectory(operation) {
     return await serializePrivatePathMutation(this.path, async () => {
-      const mutation = await preparePrivateDirectoryMutation(dirname5(this.path), this.ownedRoot);
+      const mutation = await preparePrivateDirectoryMutation(dirname7(this.path), this.ownedRoot);
       try {
         return await operation();
       } finally {
@@ -29153,7 +30830,7 @@ var RunLock = class {
           const noFollow = process.platform === "win32" ? 0 : fsConstants2.O_NOFOLLOW;
           let handle;
           try {
-            handle = await open3(this.path, fsConstants2.O_RDWR | noFollow);
+            handle = await open4(this.path, fsConstants2.O_RDWR | noFollow);
           } catch (error51) {
             if (error51.code === "ENOENT") return false;
             throw error51;
@@ -29291,23 +30968,23 @@ async function amendRunGraph(store, input, actor = "runtime") {
 }
 
 // packages/runtime/src/artifact-policy.ts
-import { createHash as createHash3, randomUUID as randomUUID5 } from "node:crypto";
+import { createHash as createHash4, randomUUID as randomUUID5 } from "node:crypto";
 import { constants as fsConstants3 } from "node:fs";
-import { lstat as lstat6, open as open4, readdir as readdir2, rmdir, unlink as unlink2 } from "node:fs/promises";
-import { basename as basename3, dirname as dirname6, isAbsolute as isAbsolute6, join as join6, posix, relative as relative5, resolve as resolve6, win32 as win323 } from "node:path";
+import { lstat as lstat7, open as open5, readdir as readdir2, rmdir, unlink as unlink2 } from "node:fs/promises";
+import { basename as basename3, dirname as dirname8, isAbsolute as isAbsolute7, join as join6, posix, relative as relative6, resolve as resolve8, win32 as win323 } from "node:path";
 import { isDeepStrictEqual as isDeepStrictEqual2 } from "node:util";
-var MIB3 = 1024 * 1024;
+var MIB4 = 1024 * 1024;
 var ATOMIC_STAGING_DIRECTORY = ".artifact-staging";
 var MUTATION_JOURNAL_PATH = "artifact-mutation.json";
 var MUTATION_PAYLOAD_PATH = "artifact-mutation.payload";
 var DEFAULT_ARTIFACT_POLICY = Object.freeze({
-  ordinaryArtifactBytes: MIB3,
-  identityArtifactBytes: MIB3,
-  capsuleBytes: MIB3,
-  invocationTranscriptBytes: 8 * MIB3,
-  invocationReservedBytes: 2 * MIB3,
-  runArtifactBytes: 64 * MIB3,
-  runReservedBytes: 8 * MIB3
+  ordinaryArtifactBytes: MIB4,
+  identityArtifactBytes: MIB4,
+  capsuleBytes: MIB4,
+  invocationTranscriptBytes: 8 * MIB4,
+  invocationReservedBytes: 2 * MIB4,
+  runArtifactBytes: 64 * MIB4,
+  runReservedBytes: 8 * MIB4
 });
 var RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 function now() {
@@ -29327,7 +31004,7 @@ function formatForPath(path2) {
   return "binary";
 }
 function validatePortableRelativePath(path2) {
-  if (path2.length === 0 || path2.includes("\0") || isAbsolute6(path2) || posix.isAbsolute(path2) || win323.isAbsolute(path2) || /^[a-z]:/i.test(path2) || path2.startsWith("\\\\") || path2.includes("\\"))
+  if (path2.length === 0 || path2.includes("\0") || isAbsolute7(path2) || posix.isAbsolute(path2) || win323.isAbsolute(path2) || /^[a-z]:/i.test(path2) || path2.startsWith("\\\\") || path2.includes("\\"))
     throw new Error(`Artifact path must be a portable relative path: ${path2}`);
   const parts = path2.split("/");
   if (parts.some((part) => part.length === 0 || part === "." || part === ".."))
@@ -29370,7 +31047,7 @@ function isMissing2(error51) {
 }
 async function targetStatus(path2) {
   try {
-    return await lstat6(path2);
+    return await lstat7(path2);
   } catch (error51) {
     if (isMissing2(error51)) return void 0;
     throw error51;
@@ -29380,13 +31057,13 @@ function sameFileSnapshot2(left, right) {
   return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
 }
 async function readBoundedArtifactInventory(path2) {
-  const observed = await lstat6(path2, { bigint: true });
+  const observed = await lstat7(path2, { bigint: true });
   assertRegularPrivateTarget(path2, observed);
   if (observed.size > BigInt(MAX_ARTIFACT_INVENTORY_BYTES))
     throw new Error(
       `Artifact inventory exceeds its ${MAX_ARTIFACT_INVENTORY_BYTES}-byte read limit`
     );
-  const handle = await open4(path2, fsConstants3.O_RDONLY | fsConstants3.O_NOFOLLOW);
+  const handle = await open5(path2, fsConstants3.O_RDONLY | fsConstants3.O_NOFOLLOW);
   try {
     const before = await handle.stat({ bigint: true });
     assertRegularPrivateTarget(path2, before);
@@ -29458,7 +31135,7 @@ async function atomicWrite(root, relativePath, bytes, lease) {
       sourceDirectory: stagingRoot,
       hardenOnPosix: true,
       publish: async () => {
-        const handle = await open4(temporaryPath, "wx", 384);
+        const handle = await open5(temporaryPath, "wx", 384);
         let publication;
         try {
           await handle.writeFile(bytes);
@@ -29474,7 +31151,7 @@ async function atomicWrite(root, relativePath, bytes, lease) {
         } finally {
           await handle.close();
         }
-        await validatePrivatePath(root, relative5(root, path2));
+        await validatePrivatePath(root, relative6(root, path2));
         const existing = await targetStatus(path2);
         if (existing) assertRegularPrivateTarget(path2, existing);
         await replacePathAtomic(temporaryPath, path2);
@@ -29521,7 +31198,7 @@ async function cleanupAtomicStaging(root, lease) {
     const path2 = join6(stagingRoot, item.name);
     if (!item.isFile() || item.isSymbolicLink())
       throw new Error(`Unsupported entry in artifact staging directory: ${path2}`);
-    assertRegularPrivateTarget(path2, await lstat6(path2));
+    assertRegularPrivateTarget(path2, await lstat7(path2));
     lease.assertHeld();
     const mutation2 = await preparePrivateDirectoryMutation(stagingRoot, root);
     let bodyFailureWasThrown2 = false;
@@ -29552,7 +31229,7 @@ async function cleanupAtomicStaging(root, lease) {
     await syncDirectory(stagingRoot);
     lease.assertHeld();
   }
-  const parent = dirname6(stagingRoot);
+  const parent = dirname8(stagingRoot);
   lease.assertHeld();
   const mutation = await preparePrivateDirectoryMutation(parent, root);
   let bodyFailureWasThrown = false;
@@ -29588,7 +31265,7 @@ async function removePrivateFile(root, relativePath, lease) {
   });
   lease.assertHeld();
   if (path2) {
-    const parent = dirname6(path2);
+    const parent = dirname8(path2);
     lease.assertHeld();
     const mutation = await preparePrivateDirectoryMutation(parent, root);
     let bodyFailureWasThrown = false;
@@ -29935,8 +31612,8 @@ var RunArtifactStore = class {
       throw new Error("Run artifact reserve must be smaller than the run quota");
     if (policy.runReservedBytes < policy.invocationReservedBytes)
       throw new Error("Run artifact reserve must cover the invocation recovery reserve");
-    const runParent = dirname6(resolve6(runRoot));
-    const lockRoot = basename3(runParent) === "runs" ? dirname6(runParent) : runParent;
+    const runParent = dirname8(resolve8(runRoot));
+    const lockRoot = basename3(runParent) === "runs" ? dirname8(runParent) : runParent;
     this.mutationLockPath = join6(lockRoot, "locks", `${runId}.artifacts.lock`);
   }
   runRoot;
@@ -30286,8 +31963,8 @@ var RunArtifactStore = class {
     );
   }
   async readArtifactPreview(relativePath, maxBytes) {
-    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > MIB3)
-      throw new Error(`Artifact preview limit must be an integer from 0 through ${MIB3}`);
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > MIB4)
+      throw new Error(`Artifact preview limit must be an integer from 0 through ${MIB4}`);
     return await this.serializeMutation(async (lease) => {
       const parts = validatePortableRelativePath(relativePath);
       if (parts[0] !== "artifacts" || parts.length < 2)
@@ -30298,7 +31975,7 @@ var RunArtifactStore = class {
       if (!entry || !expected)
         throw new Error("Artifact preview is not represented by stored inventory bytes");
       const path2 = await resolvePrivatePath(this.runRoot, relativePath, false, lease);
-      const handle = await open4(path2, fsConstants3.O_RDONLY | fsConstants3.O_NOFOLLOW);
+      const handle = await open5(path2, fsConstants3.O_RDONLY | fsConstants3.O_NOFOLLOW);
       try {
         const before = await handle.stat();
         if (!before.isFile() || before.nlink > 1)
@@ -30307,7 +31984,7 @@ var RunArtifactStore = class {
           throw new Error("Artifact preview size does not match its durable inventory");
         const preview = Buffer.alloc(Math.min(before.size, maxBytes));
         const chunkBuffer = Buffer.alloc(Math.min(64 * 1024, Math.max(1, before.size)));
-        const digest = createHash3("sha256").update('{"contents":"');
+        const digest = createHash4("sha256").update('{"contents":"');
         let carry = Buffer.alloc(0);
         let position = 0;
         while (position < before.size) {
@@ -30368,7 +32045,7 @@ var RunArtifactStore = class {
           continue;
         }
         if (!item.isFile()) throw new Error(`Unsupported entry in artifact tree: ${absolute}`);
-        const metadata = await lstat6(absolute);
+        const metadata = await lstat7(absolute);
         assertRegularPrivateTarget(absolute, metadata);
         files.push({
           path: relativePath,
@@ -30909,1432 +32586,10 @@ var RunArtifactStore = class {
 };
 
 // packages/runtime/src/benchmark.ts
-import { randomUUID as randomUUID11 } from "node:crypto";
+import { randomUUID as randomUUID12 } from "node:crypto";
 import { access as access2, lstat as lstat14, mkdir as mkdir5, mkdtemp as mkdtemp3, readFile as readFile4, realpath as realpath7, rm as rm5, writeFile as writeFile2 } from "node:fs/promises";
 import { tmpdir as tmpdir3 } from "node:os";
-import { basename as basename5, dirname as dirname12, extname as extname2, isAbsolute as isAbsolute13, join as join15, resolve as resolve16, sep as sep11 } from "node:path";
-
-// packages/probes/src/index.ts
-import { dirname as dirname8, resolve as resolve8, sep as sep6 } from "node:path";
-
-// packages/probes/src/process.ts
-var import_cross_spawn4 = __toESM(require_cross_spawn(), 1);
-import { createHash as createHash4 } from "node:crypto";
-import { constants as osConstants } from "node:os";
-var MIB4 = 1024 * 1024;
-var DEFAULT_PROCESS_OUTPUT_BYTES_PER_STREAM = 8 * MIB4;
-var DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM = MIB4;
-var DEFAULT_PROCESS_INPUT_BYTES = 8 * MIB4;
-var PROCESS_TERMINATION_GRACE_MS = 2e3;
-var PROCESS_SETTLEMENT_GRACE_MS = 2e3;
-var WINDOWS_PROCESS_SETTLEMENT_GRACE_MS = 8e3;
-function managedProcessSettlementGraceMs(platform2) {
-  return platform2 === "win32" ? WINDOWS_PROCESS_SETTLEMENT_GRACE_MS : PROCESS_SETTLEMENT_GRACE_MS;
-}
-var ProcessOutputLimitError = class extends Error {
-  stream;
-  capture;
-  childSettlement;
-  constructor(stream, capture, childSettlement = "confirmed") {
-    const limit = capture[stream].limitBytes;
-    super(`Subprocess ${stream} exceeded the ${limit}-byte capture limit; output was rejected`);
-    this.name = "ProcessOutputLimitError";
-    this.stream = stream;
-    this.capture = capture;
-    this.childSettlement = childSettlement;
-  }
-};
-function decodeUtf8Prefix3(source) {
-  for (let trim = 0; trim <= Math.min(3, source.length); trim += 1) {
-    const end = source.length - trim;
-    try {
-      const text = new TextDecoder("utf-8", { fatal: true }).decode(source.subarray(0, end));
-      return { bytes: end, text };
-    } catch {
-    }
-  }
-  return { bytes: source.length, text: source.toString("utf8") };
-}
-function truncationMarker(stream, capture) {
-  return `[GRAPHCRAFT ${stream.toUpperCase()} TRUNCATED: retained ${capture.retainedBytes} of ${capture.observedBytes} bytes]`;
-}
-var BoundedStreamCapture = class {
-  constructor(limitBytes) {
-    this.limitBytes = limitBytes;
-  }
-  limitBytes;
-  chunks = [];
-  digest = createHash4("sha256");
-  observedBytes = 0;
-  retainedBytes = 0;
-  append(chunk) {
-    this.digest.update(chunk);
-    this.observedBytes += chunk.length;
-    const available = Math.max(0, this.limitBytes - this.retainedBytes);
-    if (available > 0) {
-      const retained = Buffer.from(chunk.subarray(0, available));
-      this.chunks.push(retained);
-      this.retainedBytes += retained.length;
-    }
-    return this.observedBytes > this.limitBytes;
-  }
-  finish(stream) {
-    const decoded = decodeUtf8Prefix3(Buffer.concat(this.chunks, this.retainedBytes));
-    const metadata = {
-      limitBytes: this.limitBytes,
-      observedBytes: this.observedBytes,
-      retainedBytes: decoded.bytes,
-      omittedBytes: Math.max(0, this.observedBytes - decoded.bytes),
-      truncated: decoded.bytes < this.observedBytes,
-      digest: this.digest.digest("hex")
-    };
-    if (!metadata.truncated) return { text: decoded.text, metadata };
-    const separator = decoded.text.length > 0 && !decoded.text.endsWith("\n") ? "\n" : "";
-    return {
-      text: `${decoded.text}${separator}${truncationMarker(stream, metadata)}
-`,
-      metadata
-    };
-  }
-};
-var MANAGED_PROCESS_BROKER_SOURCE = String.raw`
-const { spawn } = require("node:child_process");
-const { fsyncSync, writeSync } = require("node:fs");
-
-const executionId = process.argv[1];
-const ownerToken = process.argv[2];
-const gracefulMs = Number(process.argv[3]);
-const settlementMs = Number(process.argv[4]);
-const journalFd = 4;
-if (
-  !Number.isSafeInteger(gracefulMs) ||
-  gracefulMs <= 0 ||
-  !Number.isSafeInteger(settlementMs) ||
-  settlementMs <= 0
-) process.exit(1);
-let target;
-let settled = false;
-let terminating = false;
-let targetClosed = false;
-let targetCode = null;
-let targetSignal = null;
-let settlementOutcome = "terminated";
-let forceTimer;
-let settlementTimer;
-let settlementPoll;
-let startTimer;
-
-function append(record) {
-  writeSync(journalFd, JSON.stringify({
-    schemaVersion: 1,
-    executionId,
-    ownerToken,
-    brokerPid: process.pid,
-    ...record,
-  }) + "\n");
-  fsyncSync(journalFd);
-}
-
-function send(message) {
-  if (process.connected) {
-    try { process.send(message); } catch {}
-  }
-}
-
-function finish(outcome, confirmed, code, signal) {
-  if (settled) return;
-  settled = true;
-  if (forceTimer) clearTimeout(forceTimer);
-  if (settlementTimer) clearTimeout(settlementTimer);
-  if (settlementPoll) clearInterval(settlementPoll);
-  if (startTimer) clearTimeout(startTimer);
-  const record = {
-    status: "settled",
-    outcome,
-    confirmed,
-    childPid: target && Number.isSafeInteger(target.pid) ? target.pid : null,
-    exitCode: code === undefined ? null : code,
-    exitSignal: signal === undefined ? null : signal,
-    settledAt: new Date().toISOString(),
-  };
-  try { append(record); } catch {
-    record.confirmed = false;
-    record.outcome = "unconfirmed";
-  }
-  const message = {
-    type: "settled",
-    schemaVersion: 1,
-    ...record,
-    executionId,
-    brokerPid: process.pid,
-  };
-  let exitScheduled = false;
-  let exitTimer;
-  const exitBroker = () => {
-    if (exitScheduled) return;
-    exitScheduled = true;
-    if (exitTimer) clearTimeout(exitTimer);
-    try { if (process.connected) process.disconnect(); } catch {}
-    setImmediate(() => process.exit(record.confirmed ? 0 : 1));
-  };
-  if (process.connected) {
-    try {
-      process.send(message, exitBroker);
-      exitTimer = setTimeout(exitBroker, 1000);
-    } catch {
-      exitBroker();
-    }
-  } else {
-    exitBroker();
-  }
-}
-
-function targetTreeAlive() {
-  if (!target || !Number.isSafeInteger(target.pid) || target.pid <= 0) return false;
-  if (process.platform === "win32") return !targetClosed;
-  try {
-    process.kill(-target.pid, 0);
-    return true;
-  } catch (error) {
-    return !error || error.code !== "ESRCH";
-  }
-}
-
-function settleIfTreeExited() {
-  if (targetClosed && !targetTreeAlive()) {
-    finish(settlementOutcome, true, targetCode, targetSignal);
-    return true;
-  }
-  return false;
-}
-
-function windowsTaskkill(pid) {
-  const root = process.env.SystemRoot;
-  const executable = root ? require("node:path").win32.join(root, "System32", "taskkill.exe") : "taskkill.exe";
-  const killer = spawn(executable, ["/pid", String(pid), "/t", "/f"], {
-    shell: false,
-    stdio: "ignore",
-    windowsHide: true,
-  });
-  killer.once("error", () => { try { target.kill("SIGKILL"); } catch {} });
-  killer.unref();
-}
-
-function signalTarget(signal) {
-  if (!target || !Number.isSafeInteger(target.pid) || target.pid <= 0) return;
-  try {
-    if (process.platform === "win32") windowsTaskkill(target.pid);
-    else process.kill(-target.pid, signal);
-  } catch {
-    try { target.kill(signal); } catch {}
-  }
-}
-
-function terminate(outcome = "terminated") {
-  if (settled) return;
-  if (!terminating) {
-    terminating = true;
-    settlementOutcome = outcome;
-  }
-  if (!target) {
-    finish("cancelled_before_start", true, null, null);
-    return;
-  }
-  if (settleIfTreeExited()) return;
-  signalTarget("SIGTERM");
-  if (!forceTimer)
-    forceTimer = setTimeout(() => {
-      signalTarget("SIGKILL");
-      settleIfTreeExited();
-    }, gracefulMs);
-  if (!settlementPoll)
-    settlementPoll = setInterval(() => settleIfTreeExited(), 25);
-  if (!settlementTimer)
-    settlementTimer = setTimeout(() => {
-      if (!settleIfTreeExited()) finish("unconfirmed", false, targetCode, targetSignal);
-    }, gracefulMs + settlementMs);
-}
-
-function outputFailed() {
-  // A killed runtime closes the broker's inherited stdout/stderr pipes. Treat
-  // EPIPE (and any other output transport failure) as a termination request so
-  // the owned target tree is still reaped before the broker exits.
-  terminate();
-}
-
-process.stdout.on("error", outputFailed);
-process.stderr.on("error", outputFailed);
-
-process.on("message", (message) => {
-  if (!message || typeof message !== "object") return;
-  if (message.type === "terminate") {
-    terminate();
-    return;
-  }
-  if (message.type !== "start" || target || settled || terminating) return;
-  if (startTimer) clearTimeout(startTimer);
-  try {
-    append({ status: "starting", startingAt: new Date().toISOString() });
-    target = spawn(message.executable, message.args, {
-      cwd: message.cwd,
-      env: message.env,
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: process.platform !== "win32",
-      windowsHide: true,
-    });
-    target.once("error", () => {
-      if (!Number.isSafeInteger(target && target.pid) || target.pid <= 0)
-        finish("failed_to_start", true, null, null);
-      else
-        terminate();
-    });
-    if (!Number.isSafeInteger(target.pid) || target.pid <= 0) return;
-    append({
-      status: "started",
-      childPid: target.pid,
-      startedAt: new Date().toISOString(),
-    });
-    target.stdout.on("error", outputFailed);
-    target.stderr.on("error", outputFailed);
-    target.stdout.pipe(process.stdout);
-    target.stderr.pipe(process.stderr);
-    target.once("close", (code, signal) => {
-      targetClosed = true;
-      targetCode = code;
-      targetSignal = signal;
-      if (terminating) {
-        settleIfTreeExited();
-        return;
-      }
-      if (targetTreeAlive()) terminate("exited");
-      else finish("exited", true, code, signal);
-    });
-  } catch {
-    if (target && Number.isSafeInteger(target.pid) && target.pid > 0) terminate();
-    else finish("failed_to_start", true, null, null);
-  }
-});
-
-process.once("disconnect", terminate);
-process.once("SIGTERM", terminate);
-process.once("SIGINT", terminate);
-startTimer = setTimeout(terminate, 30000);
-startTimer.unref();
-append({ status: "ready", readyAt: new Date().toISOString() });
-send({
-  type: "ready",
-  schemaVersion: 1,
-  executionId,
-  brokerPid: process.pid,
-  processGroupId: null,
-  platform: process.platform,
-  readyAt: new Date().toISOString(),
-});
-`;
-function exactMessageKeys(value, expected) {
-  const actual = Object.keys(value).sort();
-  const sortedExpected = [...expected].sort();
-  return actual.length === sortedExpected.length && actual.every((key, index) => key === sortedExpected[index]);
-}
-function validExitSignal(value) {
-  return value === null || typeof value === "string" && Object.prototype.hasOwnProperty.call(osConstants.signals, value);
-}
-function validManagedReady(value, lifecycle) {
-  if (!value || typeof value !== "object") return void 0;
-  const candidate = value;
-  if (!exactMessageKeys(value, [
-    "type",
-    "schemaVersion",
-    "executionId",
-    "brokerPid",
-    "processGroupId",
-    "platform",
-    "readyAt"
-  ]) || candidate.type !== "ready" || candidate.schemaVersion !== 1 || candidate.executionId !== lifecycle.executionId || !Number.isSafeInteger(candidate.brokerPid) || candidate.brokerPid <= 0 || candidate.processGroupId !== null && (!Number.isSafeInteger(candidate.processGroupId) || candidate.processGroupId <= 0) || ![
-    "aix",
-    "android",
-    "darwin",
-    "freebsd",
-    "haiku",
-    "linux",
-    "openbsd",
-    "sunos",
-    "win32",
-    "cygwin",
-    "netbsd"
-  ].includes(String(candidate.platform)) || typeof candidate.readyAt !== "string" || !Number.isFinite(Date.parse(candidate.readyAt)))
-    return void 0;
-  return candidate;
-}
-function validManagedSettlement(value, lifecycle) {
-  if (!value || typeof value !== "object") return void 0;
-  const candidate = value;
-  if (!exactMessageKeys(value, [
-    "type",
-    "schemaVersion",
-    "executionId",
-    "brokerPid",
-    "status",
-    "outcome",
-    "confirmed",
-    "childPid",
-    "exitCode",
-    "exitSignal",
-    "settledAt"
-  ]) || candidate.type !== "settled" || candidate.schemaVersion !== 1 || candidate.executionId !== lifecycle.executionId || !Number.isSafeInteger(candidate.brokerPid) || candidate.brokerPid <= 0 || candidate.childPid !== null && (!Number.isSafeInteger(candidate.childPid) || candidate.childPid <= 0) || !["exited", "terminated", "cancelled_before_start", "failed_to_start", "unconfirmed"].includes(
-    String(candidate.outcome)
-  ) || typeof candidate.confirmed !== "boolean" || candidate.exitCode !== null && !Number.isInteger(candidate.exitCode) || !validExitSignal(candidate.exitSignal) || typeof candidate.settledAt !== "string" || !Number.isFinite(Date.parse(candidate.settledAt)) || candidate.status !== "settled" || candidate.confirmed === true && candidate.outcome === "unconfirmed" || candidate.confirmed === false && candidate.outcome !== "unconfirmed" || ["exited", "terminated"].includes(String(candidate.outcome)) && (!Number.isSafeInteger(candidate.childPid) || candidate.childPid <= 0) || ["cancelled_before_start", "failed_to_start"].includes(String(candidate.outcome)) && (candidate.childPid !== null || candidate.exitCode !== null || candidate.exitSignal !== null))
-    return void 0;
-  return {
-    schemaVersion: 1,
-    executionId: candidate.executionId,
-    brokerPid: candidate.brokerPid,
-    childPid: candidate.childPid,
-    outcome: candidate.outcome,
-    confirmed: candidate.confirmed,
-    exitCode: candidate.exitCode,
-    exitSignal: candidate.exitSignal,
-    settledAt: candidate.settledAt
-  };
-}
-async function runManagedProcess(executable, args, environment, options, started, timeoutMs, maxOutputBytesPerStream, outputOverflow) {
-  const lifecycle = options.lifecycle;
-  return await new Promise((resolve22, reject) => {
-    const broker = import_cross_spawn4.default.spawn(
-      process.execPath,
-      [
-        "-e",
-        MANAGED_PROCESS_BROKER_SOURCE,
-        lifecycle.executionId,
-        lifecycle.ownerToken,
-        String(PROCESS_TERMINATION_GRACE_MS),
-        String(managedProcessSettlementGraceMs(process.platform))
-      ],
-      {
-        cwd: options.cwd,
-        env: environment,
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe", "ipc", lifecycle.journalFd],
-        // libuv assigns non-detached Windows children to a kill-on-close job.
-        // The broker must outlive a crashed runtime so it can settle the owned
-        // target tree and fsync the terminal journal record.
-        detached: true,
-        windowsHide: true
-      }
-    );
-    const stdoutCapture = new BoundedStreamCapture(maxOutputBytesPerStream);
-    const stderrCapture = new BoundedStreamCapture(maxOutputBytesPerStream);
-    let timedOut = false;
-    let overflowStream;
-    let settled = false;
-    let terminationStarted = false;
-    let lifecycleError;
-    let targetSettlement;
-    let settlementPersisted;
-    let escalationTimer;
-    let settlementTimer;
-    let timer;
-    const requestTermination = () => {
-      if (terminationStarted || settled) return;
-      terminationStarted = true;
-      if (timer) clearTimeout(timer);
-      try {
-        if (broker.connected) broker.send({ type: "terminate" });
-      } catch {
-      }
-      escalationTimer = setTimeout(() => {
-        try {
-          if (broker.connected) broker.send({ type: "terminate", force: true });
-        } catch {
-        }
-        settlementTimer = setTimeout(() => {
-          try {
-            terminateChildProcessTree(broker, "SIGKILL");
-          } catch {
-          }
-        }, managedProcessSettlementGraceMs(process.platform));
-        settlementTimer.unref();
-      }, PROCESS_TERMINATION_GRACE_MS);
-      escalationTimer.unref();
-    };
-    const capture = (stream, target, chunk) => {
-      const overflowed = target.append(chunk);
-      if (overflowed && outputOverflow === "reject" && !overflowStream) {
-        overflowStream = stream;
-        requestTermination();
-      }
-    };
-    broker.stdout.on("data", (chunk) => capture("stdout", stdoutCapture, chunk));
-    broker.stderr.on("data", (chunk) => capture("stderr", stderrCapture, chunk));
-    const abort = () => requestTermination();
-    options.signal?.addEventListener("abort", abort, { once: true });
-    timer = setTimeout(() => {
-      timedOut = true;
-      requestTermination();
-    }, timeoutMs);
-    timer.unref();
-    const cleanup = () => {
-      if (timer) clearTimeout(timer);
-      if (escalationTimer) clearTimeout(escalationTimer);
-      if (settlementTimer) clearTimeout(settlementTimer);
-      options.signal?.removeEventListener("abort", abort);
-    };
-    const complete = async (brokerCode, error51) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      try {
-        await settlementPersisted;
-      } catch (settlementError) {
-        lifecycleError ??= settlementError;
-      }
-      try {
-        broker.stdout.destroy();
-        broker.stderr.destroy();
-        broker.unref();
-      } catch {
-      }
-      const finalError = lifecycleError ?? error51;
-      if (finalError) {
-        reject(finalError);
-        return;
-      }
-      if (!targetSettlement?.confirmed) {
-        reject(
-          new Error(
-            `Managed subprocess ${lifecycle.executionId} exited without confirmed tree settlement (broker ${brokerCode ?? "unknown"})`
-          )
-        );
-        return;
-      }
-      const stdout2 = stdoutCapture.finish("stdout");
-      const stderr = stderrCapture.finish("stderr");
-      const captureMetadata = {
-        stdout: stdout2.metadata,
-        stderr: stderr.metadata
-      };
-      if (overflowStream) {
-        reject(new ProcessOutputLimitError(overflowStream, captureMetadata, "confirmed"));
-        return;
-      }
-      resolve22({
-        exitCode: timedOut ? 124 : targetSettlement.exitCode ?? 1,
-        stdout: stdout2.text,
-        stderr: stderr.text,
-        durationMs: Math.round(performance.now() - started),
-        timedOut,
-        childSettlement: "confirmed",
-        capture: captureMetadata
-      });
-    };
-    broker.on("message", (message) => {
-      const ready = validManagedReady(message, lifecycle);
-      if (ready) {
-        if (ready.brokerPid !== broker.pid) {
-          lifecycleError = new Error(
-            `Managed subprocess ${lifecycle.executionId} reported an ambiguous broker identity`
-          );
-          requestTermination();
-          return;
-        }
-        void lifecycle.onReady(ready).then(() => {
-          if (terminationStarted || options.signal?.aborted) {
-            requestTermination();
-            return;
-          }
-          if (!broker.connected) {
-            lifecycleError = new Error(
-              `Managed subprocess ${lifecycle.executionId} disconnected before authorization`
-            );
-            return;
-          }
-          broker.send({
-            type: "start",
-            executable,
-            args,
-            cwd: options.cwd,
-            env: environment
-          });
-        }).catch((error51) => {
-          lifecycleError = error51;
-          requestTermination();
-        });
-        return;
-      }
-      const settlement = validManagedSettlement(message, lifecycle);
-      if (!settlement) return;
-      if (settlement.brokerPid !== broker.pid) {
-        lifecycleError = new Error(
-          `Managed subprocess ${lifecycle.executionId} settled under an ambiguous broker identity`
-        );
-        requestTermination();
-        return;
-      }
-      targetSettlement = settlement;
-      settlementPersisted = lifecycle.onSettled(settlement);
-    });
-    broker.once("error", (error51) => void complete(null, error51));
-    broker.once("close", (code) => void complete(code));
-    if (options.signal?.aborted) requestTermination();
-  });
-}
-async function runProcess(command, args, options) {
-  if (command.trim().length === 0) throw new Error("Subprocess command must not be empty");
-  if (command.includes("\0")) throw new Error("Subprocess command must not contain NUL bytes");
-  const nulArgument = args.findIndex((argument) => argument.includes("\0"));
-  if (nulArgument !== -1)
-    throw new Error(`Subprocess argument ${nulArgument} must not contain NUL bytes`);
-  const started = performance.now();
-  const timeoutMs = options.timeoutMs ?? 12e4;
-  const maxOutputBytesPerStream = options.maxOutputBytesPerStream ?? DEFAULT_PROCESS_OUTPUT_BYTES_PER_STREAM;
-  const outputOverflow = options.outputOverflow ?? "reject";
-  if (!Number.isSafeInteger(maxOutputBytesPerStream) || maxOutputBytesPerStream <= 0)
-    throw new Error("Subprocess output capture limit must be a positive safe integer");
-  const inputBytes = options.input === void 0 ? 0 : typeof options.input === "string" ? Buffer.byteLength(options.input) : options.input.length;
-  if (inputBytes > DEFAULT_PROCESS_INPUT_BYTES)
-    throw new Error(
-      `Subprocess input exceeded the ${DEFAULT_PROCESS_INPUT_BYTES}-byte bounded input limit`
-    );
-  if (options.lifecycle && options.input !== void 0)
-    throw new Error("Managed subprocess input is not supported");
-  const environment = { ...process.env, ...options.env, NO_COLOR: "1", FORCE_COLOR: "0" };
-  const executable = await resolveTrustedExecutable(command, {
-    environment,
-    untrustedCwd: options.cwd
-  });
-  if (options.lifecycle)
-    return await runManagedProcess(
-      executable,
-      args,
-      environment,
-      options,
-      started,
-      timeoutMs,
-      maxOutputBytesPerStream,
-      outputOverflow
-    );
-  return await new Promise((resolve22, reject) => {
-    const child = import_cross_spawn4.default.spawn(executable, args, {
-      cwd: options.cwd,
-      env: environment,
-      shell: false,
-      stdio: [options.input === void 0 ? "ignore" : "pipe", "pipe", "pipe"]
-    });
-    const childStdout = child.stdout;
-    const childStderr = child.stderr;
-    const stdoutCapture = new BoundedStreamCapture(maxOutputBytesPerStream);
-    const stderrCapture = new BoundedStreamCapture(maxOutputBytesPerStream);
-    let timedOut = false;
-    let overflowStream;
-    let inputError;
-    let settled = false;
-    let terminationStarted = false;
-    let escalationTimer;
-    let settlementTimer;
-    let timer;
-    const terminateWithEscalation = () => {
-      if (terminationStarted || settled) return;
-      terminationStarted = true;
-      if (timer) clearTimeout(timer);
-      try {
-        terminateChildProcessTree(child, "SIGTERM");
-      } catch {
-      }
-      escalationTimer = setTimeout(() => {
-        try {
-          terminateChildProcessTree(child, "SIGKILL");
-        } catch {
-        }
-        settlementTimer = setTimeout(
-          () => complete(null, void 0, "unconfirmed"),
-          PROCESS_SETTLEMENT_GRACE_MS
-        );
-        settlementTimer.unref();
-      }, PROCESS_TERMINATION_GRACE_MS);
-      escalationTimer.unref();
-    };
-    const capture = (stream, target, chunk) => {
-      const overflowed = target.append(chunk);
-      if (overflowed && outputOverflow === "reject" && !overflowStream) {
-        overflowStream = stream;
-        terminateWithEscalation();
-      }
-    };
-    childStdout.on("data", (chunk) => capture("stdout", stdoutCapture, chunk));
-    childStderr.on("data", (chunk) => capture("stderr", stderrCapture, chunk));
-    if (options.input !== void 0 && child.stdin) {
-      child.stdin.on("error", (error51) => {
-        if (terminationStarted || settled) return;
-        inputError = error51;
-        terminateWithEscalation();
-      });
-      child.stdin.end(options.input);
-    }
-    const abort = () => terminateWithEscalation();
-    options.signal?.addEventListener("abort", abort, { once: true });
-    timer = setTimeout(() => {
-      timedOut = true;
-      terminateWithEscalation();
-    }, timeoutMs);
-    timer.unref();
-    const cleanup = () => {
-      if (timer) clearTimeout(timer);
-      if (escalationTimer) clearTimeout(escalationTimer);
-      if (settlementTimer) clearTimeout(settlementTimer);
-      options.signal?.removeEventListener("abort", abort);
-    };
-    const complete = (code, error51, childSettlement = "confirmed") => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      try {
-        child.stdin?.destroy();
-        childStdout.destroy();
-        childStderr.destroy();
-        child.unref();
-      } catch {
-      }
-      if (error51) {
-        reject(error51);
-        return;
-      }
-      if (inputError) {
-        reject(inputError);
-        return;
-      }
-      const stdout2 = stdoutCapture.finish("stdout");
-      const stderr = stderrCapture.finish("stderr");
-      const captureMetadata = {
-        stdout: stdout2.metadata,
-        stderr: stderr.metadata
-      };
-      if (overflowStream) {
-        reject(new ProcessOutputLimitError(overflowStream, captureMetadata, childSettlement));
-        return;
-      }
-      resolve22({
-        exitCode: timedOut ? 124 : code ?? 1,
-        stdout: stdout2.text,
-        stderr: stderr.text,
-        durationMs: Math.round(performance.now() - started),
-        timedOut,
-        childSettlement,
-        capture: captureMetadata
-      });
-    };
-    child.once("error", (error51) => complete(null, error51));
-    child.once("close", (code) => complete(code));
-    if (options.signal?.aborted) abort();
-  });
-}
-
-// packages/probes/src/repository-file.ts
-import { constants as constants2 } from "node:fs";
-import { lstat as lstat7, open as open5, readlink, realpath as realpath4, stat as stat4 } from "node:fs/promises";
-import { dirname as dirname7, isAbsolute as isAbsolute7, relative as relative6, resolve as resolve7, sep as sep5 } from "node:path";
-var MEBIBYTE = 1024 * 1024;
-var READ_CHUNK_BYTES = 64 * 1024;
-var REPOSITORY_FILE_MAX_BYTES = 8 * MEBIBYTE;
-var RepositoryFileError = class extends Error {
-  kind;
-  repositoryPath;
-  constructor(kind, repositoryPath, detail) {
-    super(`Repository path ${JSON.stringify(repositoryPath)} ${detail}`);
-    this.name = "RepositoryFileError";
-    this.kind = kind;
-    this.repositoryPath = repositoryPath;
-  }
-};
-function isRepositoryFileError(error51, ...kinds) {
-  return error51 instanceof RepositoryFileError && (kinds.length === 0 || kinds.includes(error51.kind));
-}
-function sanitizedPath(candidate) {
-  return candidate.slice(0, 4096);
-}
-function inside(root, candidate) {
-  const path2 = relative6(root, candidate);
-  return path2 === "" || !isAbsolute7(path2) && path2 !== ".." && !path2.startsWith(`..${sep5}`);
-}
-async function assertUnresolvedPathInsideRepository(canonicalRoot, candidate, displayPath, signal) {
-  let current = candidate;
-  const visited = /* @__PURE__ */ new Set();
-  for (let hop = 0; hop < 64; hop += 1) {
-    signal?.throwIfAborted();
-    if (visited.has(current))
-      throw new RepositoryFileError("unreadable", displayPath, "could not be resolved safely");
-    visited.add(current);
-    let details;
-    try {
-      details = await lstat7(current);
-    } catch (error51) {
-      signal?.throwIfAborted();
-      const code = error51.code;
-      if (code !== "ENOENT" && code !== "ENOTDIR")
-        throw new RepositoryFileError("unreadable", displayPath, "could not be resolved safely");
-    }
-    if (details?.isSymbolicLink()) {
-      try {
-        current = resolve7(dirname7(current), await readlink(current));
-      } catch {
-        signal?.throwIfAborted();
-        throw new RepositoryFileError("unreadable", displayPath, "could not be resolved safely");
-      }
-      continue;
-    }
-    try {
-      const canonicalExistingPath = await realpath4(current);
-      if (!inside(canonicalRoot, canonicalExistingPath))
-        throw new RepositoryFileError(
-          "outside_repository",
-          displayPath,
-          "resolves outside the repository boundary"
-        );
-      return;
-    } catch (error51) {
-      signal?.throwIfAborted();
-      if (isRepositoryFileError(error51)) throw error51;
-      const code = error51.code;
-      if (code !== "ENOENT" && code !== "ENOTDIR")
-        throw new RepositoryFileError("unreadable", displayPath, "could not be resolved safely");
-    }
-    const parent = dirname7(current);
-    if (parent === current) break;
-    current = parent;
-  }
-  throw new RepositoryFileError("unreadable", displayPath, "could not be resolved safely");
-}
-function validateMaximumBytes(maximumBytes) {
-  if (!Number.isSafeInteger(maximumBytes) || maximumBytes <= 0)
-    throw new Error("Repository file read limit must be a positive safe integer");
-}
-async function canonicalRepositoryPath(repositoryRoot, candidate, signal) {
-  signal?.throwIfAborted();
-  const displayPath = sanitizedPath(candidate);
-  if (candidate.includes("\0") || isAbsolute7(candidate))
-    throw new RepositoryFileError(
-      "outside_repository",
-      displayPath,
-      "is outside the repository boundary"
-    );
-  const root = resolve7(repositoryRoot);
-  const lexicalPath = resolve7(root, candidate);
-  if (!inside(root, lexicalPath))
-    throw new RepositoryFileError(
-      "outside_repository",
-      displayPath,
-      "is outside the repository boundary"
-    );
-  let canonicalRoot;
-  try {
-    canonicalRoot = await realpath4(root);
-  } catch (error51) {
-    signal?.throwIfAborted();
-    throw new RepositoryFileError("unreadable", ".", "could not establish the repository boundary");
-  }
-  let canonicalPath;
-  try {
-    canonicalPath = await realpath4(lexicalPath);
-  } catch (error51) {
-    signal?.throwIfAborted();
-    const code = error51.code;
-    if (code === "ENOENT" || code === "ENOTDIR")
-      await assertUnresolvedPathInsideRepository(canonicalRoot, lexicalPath, displayPath, signal);
-    throw new RepositoryFileError(
-      code === "ENOENT" || code === "ENOTDIR" ? "missing" : "unreadable",
-      displayPath,
-      code === "ENOENT" || code === "ENOTDIR" ? "does not exist" : "could not be resolved safely"
-    );
-  }
-  signal?.throwIfAborted();
-  if (!inside(canonicalRoot, canonicalPath))
-    throw new RepositoryFileError(
-      "outside_repository",
-      displayPath,
-      "resolves outside the repository boundary"
-    );
-  return { canonicalRoot, canonicalPath, displayPath };
-}
-function sameIdentity(left, right) {
-  if (left.dev !== right.dev) return false;
-  if (left.ino !== 0n && right.ino !== 0n && left.ino !== right.ino) return false;
-  return true;
-}
-async function closeIgnoringFailure(handle) {
-  if (!handle) return;
-  await handle.close().catch(() => void 0);
-}
-async function inspectRepositoryPath(repositoryRoot, repositoryPath, signal) {
-  const resolved = await canonicalRepositoryPath(repositoryRoot, repositoryPath, signal);
-  let details;
-  try {
-    details = await stat4(resolved.canonicalPath, { bigint: true });
-  } catch (error51) {
-    signal?.throwIfAborted();
-    const code = error51.code;
-    throw new RepositoryFileError(
-      code === "ENOENT" || code === "ENOTDIR" ? "missing" : "unreadable",
-      resolved.displayPath,
-      code === "ENOENT" || code === "ENOTDIR" ? "does not exist" : "could not be inspected"
-    );
-  }
-  signal?.throwIfAborted();
-  return {
-    canonicalPath: resolved.canonicalPath,
-    displayPath: resolved.displayPath,
-    details
-  };
-}
-async function assertRepositoryPath(repositoryRoot, repositoryPath, signal) {
-  const inspected = await inspectRepositoryPath(repositoryRoot, repositoryPath, signal);
-  if (!inspected.details.isFile() && !inspected.details.isDirectory())
-    throw new RepositoryFileError(
-      "unsupported_type",
-      inspected.displayPath,
-      "is not a regular file or repository directory"
-    );
-  return inspected.canonicalPath;
-}
-async function assertRepositoryFile(repositoryRoot, repositoryPath, signal) {
-  const inspected = await inspectRepositoryPath(repositoryRoot, repositoryPath, signal);
-  if (!inspected.details.isFile())
-    throw new RepositoryFileError("not_file", inspected.displayPath, "is not a regular file");
-  return inspected.canonicalPath;
-}
-async function readRepositoryFile(repositoryRoot, repositoryPath, options = {}) {
-  const maximumBytes = options.maximumBytes ?? REPOSITORY_FILE_MAX_BYTES;
-  validateMaximumBytes(maximumBytes);
-  const inspected = await inspectRepositoryPath(repositoryRoot, repositoryPath, options.signal);
-  if (!inspected.details.isFile())
-    throw new RepositoryFileError("not_file", inspected.displayPath, "is not a regular file");
-  if (inspected.details.size > BigInt(maximumBytes))
-    throw new RepositoryFileError(
-      "too_large",
-      inspected.displayPath,
-      `exceeds the ${maximumBytes}-byte bounded read limit`
-    );
-  let handle;
-  try {
-    const noFollow = process.platform === "win32" ? 0 : constants2.O_NOFOLLOW;
-    handle = await open5(inspected.canonicalPath, constants2.O_RDONLY | noFollow);
-    const before = await handle.stat({ bigint: true });
-    if (!before.isFile())
-      throw new RepositoryFileError("not_file", inspected.displayPath, "is not a regular file");
-    if (!sameIdentity(inspected.details, before))
-      throw new RepositoryFileError("changed", inspected.displayPath, "changed during validation");
-    if (before.size > BigInt(maximumBytes))
-      throw new RepositoryFileError(
-        "too_large",
-        inspected.displayPath,
-        `exceeds the ${maximumBytes}-byte bounded read limit`
-      );
-    const chunks = [];
-    let total = 0;
-    while (total <= maximumBytes) {
-      options.signal?.throwIfAborted();
-      const remaining = maximumBytes + 1 - total;
-      const buffer = Buffer.allocUnsafe(Math.min(READ_CHUNK_BYTES, remaining));
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
-      if (bytesRead === 0) break;
-      chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
-      total += bytesRead;
-    }
-    options.signal?.throwIfAborted();
-    if (total > maximumBytes)
-      throw new RepositoryFileError(
-        "too_large",
-        inspected.displayPath,
-        `exceeds the ${maximumBytes}-byte bounded read limit`
-      );
-    const after = await handle.stat({ bigint: true });
-    if (!sameIdentity(before, after) || before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs)
-      throw new RepositoryFileError("changed", inspected.displayPath, "changed while being read");
-    return Buffer.concat(chunks, total);
-  } catch (error51) {
-    options.signal?.throwIfAborted();
-    if (isRepositoryFileError(error51)) throw error51;
-    throw new RepositoryFileError("unreadable", inspected.displayPath, "could not be read safely");
-  } finally {
-    await closeIgnoringFailure(handle);
-  }
-}
-async function readRepositoryTextFile(repositoryRoot, repositoryPath, options = {}) {
-  return (await readRepositoryFile(repositoryRoot, repositoryPath, options)).toString("utf8");
-}
-async function assertRepositoryDirectory(repositoryRoot, repositoryPath, signal) {
-  const inspected = await inspectRepositoryPath(repositoryRoot, repositoryPath, signal);
-  if (!inspected.details.isDirectory())
-    throw new RepositoryFileError(
-      "not_directory",
-      inspected.displayPath,
-      "is not a repository directory"
-    );
-  return inspected.canonicalPath;
-}
-
-// packages/probes/src/index.ts
-function compactOutput(result) {
-  const value = [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join("\n");
-  const truncated = ["stdout", "stderr"].flatMap((stream) => {
-    const capture = result.capture[stream];
-    return capture.truncated ? [`${stream} retained ${capture.retainedBytes} of ${capture.observedBytes} bytes`] : [];
-  });
-  if (truncated.length === 0) return value.length > 1e3 ? `${value.slice(0, 1e3)}
-\u2026` : value;
-  const note = `[Output truncated by Graphcraft: ${truncated.join("; ")}]`;
-  const available = Math.max(0, 1e3 - note.length - 2);
-  const prefix = value.slice(0, available);
-  return `${prefix}${value.length > available ? "\n\u2026" : ""}
-${note}`;
-}
-async function assertRepositoryInventoryPaths(repositoryPath, paths, signal) {
-  const inventory = await runProcess("git", ["ls-files", "--stage", "-z", "--", ...paths], {
-    cwd: repositoryPath,
-    timeoutMs: 3e4,
-    ...signal ? { signal } : {}
-  });
-  signal?.throwIfAborted();
-  if (inventory.exitCode !== 0)
-    throw new Error("Unable to validate repository-inventory probe paths");
-  const entries = /* @__PURE__ */ new Map();
-  for (const record2 of inventory.stdout.split("\0").filter(Boolean)) {
-    const separator = record2.indexOf("	");
-    const metadata = separator === -1 ? [] : record2.slice(0, separator).split(" ");
-    const path2 = separator === -1 ? "" : record2.slice(separator + 1);
-    if (!metadata[0] || !path2) throw new Error("Git returned an invalid repository-inventory path");
-    entries.set(path2, metadata[0]);
-  }
-  const values = [...entries.entries()];
-  for (let index = 0; index < values.length; index += 32) {
-    signal?.throwIfAborted();
-    await Promise.all(
-      values.slice(index, index + 32).map(async ([path2, mode]) => {
-        try {
-          if (mode === "120000" || mode === "160000")
-            await assertRepositoryPath(repositoryPath, path2, signal);
-          else await assertRepositoryFile(repositoryPath, path2, signal);
-        } catch (error51) {
-          signal?.throwIfAborted();
-          if (isRepositoryFileError(error51, "missing")) return;
-          throw error51;
-        }
-      })
-    );
-  }
-}
-async function runProbe(spec, repositoryPath, signal, lifecycle, algorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
-  const started = performance.now();
-  if (spec.kind === "held_out")
-    throw new Error(`Held-out probe ${spec.id} must be resolved by the runtime`);
-  if (spec.kind === "command") {
-    const cwd = await assertRepositoryDirectory(repositoryPath, spec.cwd ?? ".", signal);
-    const processResult = await runProcess(spec.command, spec.args, {
-      cwd,
-      timeoutMs: spec.timeoutMs,
-      maxOutputBytesPerStream: DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM,
-      outputOverflow: "truncate",
-      ...signal ? { signal } : {},
-      ...lifecycle ? { lifecycle } : {}
-    });
-    const output2 = [processResult.stdout, processResult.stderr].filter(Boolean).join("\n");
-    const passed2 = !processResult.timedOut && processResult.exitCode === spec.expectedExitCode;
-    return {
-      result: {
-        probeId: spec.id,
-        kind: spec.kind,
-        passed: passed2,
-        signature: contentHash(
-          {
-            exitCode: processResult.exitCode,
-            output: compactOutput(processResult),
-            stdoutDigest: processResult.capture.stdout.digest,
-            stderrDigest: processResult.capture.stderr.digest
-          },
-          algorithm
-        ),
-        summary: processResult.timedOut ? `Timed out after ${spec.timeoutMs}ms` : `${spec.command} exited ${processResult.exitCode}${compactOutput(processResult) ? `: ${compactOutput(processResult)}` : ""}`,
-        durationMs: processResult.durationMs
-      },
-      output: output2
-    };
-  }
-  if (spec.kind === "file") {
-    let exists = true;
-    let contents;
-    try {
-      if (spec.contains)
-        contents = await readRepositoryFile(repositoryPath, spec.path, {
-          ...signal ? { signal } : {}
-        });
-      else await assertRepositoryFile(repositoryPath, spec.path, signal);
-    } catch (error51) {
-      if (isRepositoryFileError(error51, "missing")) exists = false;
-      else throw error51;
-    }
-    let contains = true;
-    if (exists && spec.contains) contains = contents.toString("utf8").includes(spec.contains);
-    const passed2 = exists === spec.shouldExist && contains;
-    const summary = `${spec.path} ${exists ? "exists" : "does not exist"}${spec.contains ? ` and ${contains ? "contains" : "does not contain"} the required text` : ""}`;
-    return {
-      result: {
-        probeId: spec.id,
-        kind: spec.kind,
-        passed: passed2,
-        signature: contentHash({ exists, contains }, algorithm),
-        summary,
-        durationMs: Math.round(performance.now() - started)
-      },
-      output: summary
-    };
-  }
-  if (spec.kind === "repository_inventory") {
-    await assertRepositoryInventoryPaths(repositoryPath, spec.paths, signal);
-    const args = ["grep", "-l", "-I", "-F"];
-    for (const term of spec.terms) args.push("-e", term);
-    args.push("--", ...spec.paths);
-    const inventory = await runProcess("git", args, {
-      cwd: repositoryPath,
-      ...signal ? { signal } : {}
-    });
-    const matches = inventory.stdout.split("\n").filter(Boolean);
-    const passed2 = inventory.exitCode === 0 || inventory.exitCode === 1;
-    const summary = matches.length ? `${matches.length} tracked files match ${spec.terms.join(", ")}: ${matches.slice(0, 20).join(", ")}` : `No tracked files match ${spec.terms.join(", ")}`;
-    return {
-      result: {
-        probeId: spec.id,
-        kind: spec.kind,
-        passed: passed2,
-        signature: contentHash({ matches, terms: spec.terms }, algorithm),
-        summary,
-        durationMs: inventory.durationMs,
-        metrics: { inventoryMatches: matches.length }
-      },
-      output: inventory.stdout
-    };
-  }
-  if (spec.kind === "github_snapshot")
-    throw new Error(`GitHub snapshot probe ${spec.id} must be executed by the runtime`);
-  const diff = await runProcess(
-    "git",
-    ["diff", "--no-ext-diff", "--name-status", spec.baseSha, "--"],
-    { cwd: repositoryPath, ...signal ? { signal } : {} }
-  );
-  const untracked = await runProcess("git", ["ls-files", "--others", "--exclude-standard"], {
-    cwd: repositoryPath,
-    ...signal ? { signal } : {}
-  });
-  const output = [diff.stdout.trim(), untracked.stdout.trim()].filter(Boolean).join("\n");
-  const hasChanges = output.length > 0;
-  const passed = diff.exitCode === 0 && untracked.exitCode === 0 && (!spec.requireChanges || hasChanges);
-  return {
-    result: {
-      probeId: spec.id,
-      kind: spec.kind,
-      passed,
-      signature: contentHash(output, algorithm),
-      summary: hasChanges ? output.split("\n").slice(0, 20).join(", ") : "No workspace changes",
-      durationMs: Math.round(performance.now() - started)
-    },
-    output
-  };
-}
-var probeStopWords = /* @__PURE__ */ new Set([
-  "across",
-  "add",
-  "and",
-  "audit",
-  "bug",
-  "every",
-  "feature",
-  "files",
-  "fix",
-  "from",
-  "implement",
-  "investigate",
-  "migration",
-  "refactor",
-  "repository",
-  "review",
-  "that",
-  "the",
-  "this",
-  "verify",
-  "with"
-]);
-function taskTerms(task) {
-  const quoted = [...task.matchAll(/[`"']([^`"']{2,40})[`"']/g)].map((match) => match[1]);
-  const words = task.toLowerCase().match(/[a-z0-9][a-z0-9._/-]{2,}/g) ?? [];
-  return [
-    ...new Set(
-      [...quoted, ...words].map((value) => value.toLowerCase()).filter((value) => !probeStopWords.has(value))
-    )
-  ].slice(0, 10);
-}
-function stableId(value) {
-  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 64);
-}
-var packageManagerPattern = /^(npm|pnpm|yarn)(?:@[a-z0-9][a-z0-9._+-]*)?$/i;
-var packageScriptPattern = /^[a-z0-9][a-z0-9:._/-]*$/i;
-function resolvePackageScriptCommand(packageManager, script, options = {}) {
-  const packageManagerValue = packageManager ?? "npm";
-  const match = packageManagerPattern.exec(packageManagerValue);
-  if (!match || script.length > 256 || !packageScriptPattern.test(script)) return void 0;
-  const manager = match[1].toLowerCase();
-  const direct = manager === "pnpm" || manager === "yarn" ? "corepack" : manager;
-  const directArgs = [
-    ...direct === "corepack" ? [manager] : [],
-    ...manager === "npm" ? ["run"] : [],
-    script
-  ];
-  const platform2 = options.platform ?? process.platform;
-  if (platform2 !== "win32") {
-    return { command: direct, args: directArgs, platforms: ["darwin", "linux"] };
-  }
-  return {
-    command: options.comSpec ?? process.env.ComSpec ?? "cmd.exe",
-    args: ["/d", "/s", "/c", [direct, ...directArgs].join(" ")],
-    platforms: ["win32"]
-  };
-}
-function familyScriptPurpose(family, name, terms) {
-  const normalized = name.toLowerCase();
-  if (!/test|check|lint|typecheck|build|verify|validate|audit/.test(normalized)) return void 0;
-  if (/fix|write|update|generate|deploy|publish|release/.test(normalized)) return void 0;
-  if (terms.some((term) => term.length >= 3 && normalized.includes(stableId(term))))
-    return "focused";
-  if (family === "feature" && /accept|integration|e2e|scenario/.test(normalized))
-    return "acceptance";
-  const matchedFamily = family === "bug" && /unit|regression|focused/.test(normalized) || family === "migration" && /migrat|upgrade|compat/.test(normalized) || family === "refactor" && /unit|structur|typecheck/.test(normalized) || family === "audit" && /audit|lint|static|typecheck/.test(normalized);
-  if (matchedFamily) return "focused";
-  if (["check", "test", "typecheck", "lint", "build"].includes(normalized)) return "regression";
-  return void 0;
-}
-async function packageCandidates(repositoryPath, family, terms, signal) {
-  signal?.throwIfAborted();
-  const tracked = await runProcess("git", ["ls-files"], {
-    cwd: repositoryPath,
-    ...signal ? { signal } : {}
-  });
-  signal?.throwIfAborted();
-  if (tracked.exitCode !== 0) return [];
-  const manifests = tracked.stdout.split("\n").filter((path2) => path2 === "package.json" || path2.endsWith("/package.json")).slice(0, 100);
-  const rootManifest = manifests.includes("package.json") ? JSON.parse(
-    await readRepositoryTextFile(repositoryPath, "package.json", {
-      ...signal ? { signal } : {}
-    })
-  ) : void 0;
-  signal?.throwIfAborted();
-  const candidates = [];
-  for (const manifestPath of manifests) {
-    signal?.throwIfAborted();
-    const manifest2 = JSON.parse(
-      await readRepositoryTextFile(repositoryPath, manifestPath, {
-        ...signal ? { signal } : {}
-      })
-    );
-    const directory = dirname8(manifestPath) === "." ? void 0 : dirname8(manifestPath);
-    const relevant = !directory || terms.some(
-      (term) => directory.toLowerCase().includes(term) || manifest2.name?.toLowerCase().includes(term)
-    );
-    if (!relevant) continue;
-    for (const name of Object.keys(manifest2.scripts ?? {}).sort()) {
-      const purpose = familyScriptPurpose(family, name, terms);
-      if (!purpose) continue;
-      const command = resolvePackageScriptCommand(
-        manifest2.packageManager ?? rootManifest?.packageManager,
-        name
-      );
-      if (!command) continue;
-      candidates.push({
-        root: !directory,
-        item: {
-          phase: "completion",
-          purpose,
-          source: `${manifestPath} script ${name}`,
-          probe: {
-            id: stableId(`package-${directory ?? "root"}-${name}`),
-            kind: "command",
-            ...command,
-            ...directory ? { cwd: directory } : {},
-            expectedExitCode: 0,
-            timeoutMs: /test|e2e|integration/.test(name) ? 3e5 : 18e4
-          }
-        }
-      });
-    }
-  }
-  return candidates;
-}
-function selectPackageCandidates(candidates) {
-  const focused = candidates.filter(({ item }) => item.purpose !== "regression").sort((left, right) => Number(right.root) - Number(left.root)).slice(0, 2).map(({ item }) => item);
-  const rootCheck = candidates.find(
-    ({ root, item }) => root && item.purpose === "regression" && item.probe.id.endsWith("-check")
-  );
-  const regression = (rootCheck ? [rootCheck] : candidates.filter(({ item }) => item.purpose === "regression").slice(0, 3)).map(({ item }) => item);
-  return [...focused, ...regression].filter(
-    (item, index, items) => items.findIndex(({ probe }) => probe.id === item.probe.id) === index
-  );
-}
-function withinRepository(repositoryPath, candidate) {
-  const root = resolve8(repositoryPath);
-  const path2 = resolve8(repositoryPath, candidate);
-  return path2 === root || path2.startsWith(`${root}${sep6}`);
-}
-async function validateProbePlan(input, repositoryPath, signal) {
-  signal?.throwIfAborted();
-  const plan = ProbePlanSchema.parse(input);
-  if (!plan.items.some(({ phase }) => phase === "completion"))
-    throw new Error("A probe plan must contain at least one completion probe");
-  const keys = /* @__PURE__ */ new Set();
-  for (const item of plan.items) {
-    signal?.throwIfAborted();
-    const key = `${item.phase}:${item.probe.id}`;
-    if (keys.has(key)) throw new Error(`Duplicate ${item.phase} probe ID ${item.probe.id}`);
-    keys.add(key);
-    if (item.probe.kind === "held_out")
-      throw new Error("User-editable probe plans cannot contain held-out references");
-    if (item.probe.kind === "github_snapshot" && item.phase !== "progress")
-      throw new Error(`GitHub snapshot probe ${item.probe.id} must be progress evidence`);
-    if (item.probe.kind === "command") {
-      if (item.probe.timeoutMs > 18e5)
-        throw new Error(`Probe ${item.probe.id} exceeds the 30 minute timeout limit`);
-      if (item.probe.platforms && !item.probe.platforms.includes(process.platform))
-        throw new Error(`Probe ${item.probe.id} does not support ${process.platform}`);
-      const cwd = item.probe.cwd ?? ".";
-      if (!withinRepository(repositoryPath, cwd))
-        throw new Error(`Probe ${item.probe.id} escapes the repository working directory`);
-      try {
-        await assertRepositoryDirectory(repositoryPath, cwd, signal);
-      } catch (error51) {
-        if (isRepositoryFileError(error51, "missing", "not_directory"))
-          throw new Error(`Probe ${item.probe.id} uses missing working directory ${cwd}`);
-        throw error51;
-      }
-    }
-    if (item.probe.kind === "file") {
-      if (!withinRepository(repositoryPath, item.probe.path))
-        throw new Error(`Probe ${item.probe.id} escapes the repository`);
-      try {
-        await assertRepositoryFile(repositoryPath, item.probe.path, signal);
-      } catch (error51) {
-        if (!isRepositoryFileError(error51, "missing")) throw error51;
-      }
-    }
-    if (item.probe.kind === "repository_inventory" && item.probe.paths.some((path2) => !withinRepository(repositoryPath, path2))) {
-      throw new Error(`Probe ${item.probe.id} escapes the repository inventory scope`);
-    }
-    if (item.probe.kind === "repository_inventory")
-      await assertRepositoryInventoryPaths(repositoryPath, item.probe.paths, signal);
-  }
-  signal?.throwIfAborted();
-  return plan;
-}
-async function discoverProbePlan(repositoryPath, task, baseSha, options = {}) {
-  options.signal?.throwIfAborted();
-  const family = classifyTask(task);
-  const terms = taskTerms(task);
-  const inventoryTerms = terms.length ? terms : [family];
-  const inventory = {
-    id: `${family}-task-inventory`,
-    kind: "repository_inventory",
-    paths: ["."],
-    terms: inventoryTerms
-  };
-  const items = [
-    {
-      phase: "progress",
-      purpose: "inventory",
-      source: "Task terms matched against tracked repository files",
-      probe: inventory
-    },
-    {
-      phase: "progress",
-      purpose: "focused",
-      source: "Approved base SHA workspace delta",
-      probe: {
-        id: "workspace-diff",
-        kind: "git_diff",
-        baseSha,
-        requireChanges: family !== "audit"
-      }
-    }
-  ];
-  if (options.finishLine === "pr_open") {
-    items.push({
-      phase: "progress",
-      purpose: "acceptance",
-      source: "Authoritative SHA-bound GitHub snapshot for the approved run branch",
-      probe: {
-        id: "pull-request-lifecycle",
-        kind: "github_snapshot",
-        pullRequest: "run_branch",
-        expectedState: "open",
-        requiredChecks: "observe",
-        reviewThreads: "observe"
-      }
-    });
-  }
-  const selected = selectPackageCandidates(
-    await packageCandidates(repositoryPath, family, inventoryTerms, options.signal)
-  );
-  options.signal?.throwIfAborted();
-  for (const completion of selected) {
-    if (completion.purpose !== "regression") items.push({ ...completion, phase: "progress" });
-    items.push(completion);
-  }
-  try {
-    await assertRepositoryFile(repositoryPath, "pyproject.toml", options.signal);
-    items.push({
-      phase: "completion",
-      purpose: "regression",
-      source: "pyproject.toml",
-      probe: {
-        id: "python-tests",
-        kind: "command",
-        command: "python",
-        args: ["-m", "pytest", "-q"],
-        expectedExitCode: 0,
-        timeoutMs: 3e5,
-        platforms: ["darwin", "linux", "win32"]
-      }
-    });
-  } catch (error51) {
-    if (!isRepositoryFileError(error51, "missing")) throw error51;
-  }
-  try {
-    await assertRepositoryFile(repositoryPath, "go.mod", options.signal);
-    items.push({
-      phase: "completion",
-      purpose: "regression",
-      source: "go.mod",
-      probe: {
-        id: "go-tests",
-        kind: "command",
-        command: "go",
-        args: ["test", "./..."],
-        expectedExitCode: 0,
-        timeoutMs: 3e5,
-        platforms: ["darwin", "linux", "win32"]
-      }
-    });
-  } catch (error51) {
-    if (!isRepositoryFileError(error51, "missing")) throw error51;
-  }
-  if (family === "audit" || !items.some(({ phase }) => phase === "completion")) {
-    items.push({
-      phase: "completion",
-      purpose: "inventory",
-      source: "Task-term coverage across tracked repository files",
-      probe: inventory
-    });
-  }
-  options.signal?.throwIfAborted();
-  return await validateProbePlan(
-    { schemaVersion: 1, family, items },
-    repositoryPath,
-    options.signal
-  );
-}
+import { basename as basename5, dirname as dirname13, extname as extname2, isAbsolute as isAbsolute13, join as join16, resolve as resolve16, sep as sep11 } from "node:path";
 
 // packages/runtime/src/benchmark-validation.ts
 function reportIdentity(report) {
@@ -32464,8 +32719,8 @@ function assertBenchmarkReportEvidence(input) {
 }
 
 // packages/runtime/src/runner.ts
-import { randomUUID as randomUUID10 } from "node:crypto";
-import { join as join14 } from "node:path";
+import { randomUUID as randomUUID11 } from "node:crypto";
+import { join as join15 } from "node:path";
 
 // packages/runtime/src/control.ts
 import { randomUUID as randomUUID6 } from "node:crypto";
@@ -32521,9 +32776,9 @@ var RunControlChannel = class {
   async read() {
     await this.ensureStorage();
     await hardenPrivateFile(this.path, this.graphcraftRoot);
-    let serialized2;
+    let serialized3;
     try {
-      serialized2 = await readPrivateFileBounded(
+      serialized3 = await readPrivateFileBounded(
         this.path,
         CONTROL_REQUEST_MAX_BYTES,
         this.graphcraftRoot
@@ -32533,7 +32788,7 @@ var RunControlChannel = class {
       throw error51;
     }
     try {
-      return RunControlRequestSchema.parse(JSON.parse(serialized2.toString("utf8")));
+      return RunControlRequestSchema.parse(JSON.parse(serialized3.toString("utf8")));
     } catch {
       return void 0;
     }
@@ -33366,7 +33621,382 @@ async function decideRunControl(store, input) {
 
 // packages/runtime/src/repository.ts
 import { appendFile, lstat as lstat8, mkdir as mkdir3, readFile as readFile2, readlink as readlink2, realpath as realpath5 } from "node:fs/promises";
-import { basename as basename4, dirname as dirname10, isAbsolute as isAbsolute8, join as join9, resolve as resolve9 } from "node:path";
+import { basename as basename4, dirname as dirname11, isAbsolute as isAbsolute8, join as join10, resolve as resolve9 } from "node:path";
+
+// packages/runtime/src/side-effect.ts
+import { constants as osConstants3 } from "node:os";
+
+// packages/runtime/src/side-effect-process.ts
+import { randomUUID as randomUUID8 } from "node:crypto";
+import { constants as fsConstants4 } from "node:fs";
+import { open as open6, rmdir as rmdir2, unlink as unlink4 } from "node:fs/promises";
+import { constants as osConstants2 } from "node:os";
+import { dirname as dirname10, join as join9, relative as relative7 } from "node:path";
+var SIDE_EFFECT_PROCESS_JOURNAL_MAX_BYTES = 64 * 1024;
+var SIDE_EFFECT_PROCESS_SETTLEMENT_WAIT_MS = process.platform === "win32" ? 12e3 : 6e3;
+var SIDE_EFFECT_PROCESS_REMOVAL_RETRY_MS = 2e3;
+var WINDOWS_TRANSIENT_REMOVAL_ERRORS = /* @__PURE__ */ new Set(["EACCES", "EBUSY", "EPERM"]);
+var sideEffectProcessRunMutationTails = /* @__PURE__ */ new Map();
+var UUID_V42 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+var ACTION_ID = /^[a-f0-9]{64}$/;
+function createSideEffectProcessDefinition(claim) {
+  if (!ACTION_ID.test(claim.actionId)) throw new Error("Side-effect process action ID is invalid");
+  if (claim.nodeId.length === 0) throw new Error("Side-effect process node ID must not be empty");
+  const kind = SideEffectKindSchema.parse(claim.kind);
+  return {
+    schemaVersion: 1,
+    executionId: randomUUID8(),
+    actionId: claim.actionId,
+    nodeId: claim.nodeId,
+    kind
+  };
+}
+function parseSideEffectProcessDefinition(value) {
+  const record2 = strictObject2(value);
+  if (!record2 || !exactKeys(record2, ["schemaVersion", "executionId", "actionId", "nodeId", "kind"]) || record2.schemaVersion !== 1 || typeof record2.executionId !== "string" || !UUID_V42.test(record2.executionId) || typeof record2.actionId !== "string" || !ACTION_ID.test(record2.actionId) || typeof record2.nodeId !== "string" || record2.nodeId.length === 0)
+    return void 0;
+  const kind = SideEffectKindSchema.safeParse(record2.kind);
+  if (!kind.success) return void 0;
+  return {
+    schemaVersion: 1,
+    executionId: record2.executionId,
+    actionId: record2.actionId,
+    nodeId: record2.nodeId,
+    kind: kind.data
+  };
+}
+function journalPath(graphcraftRoot2, runId, actionId) {
+  return join9(graphcraftRoot2, "locks", "side-effect-processes", runId, `${actionId}.jsonl`);
+}
+async function readSideEffectProcessDefinition(input) {
+  if (!ACTION_ID.test(input.claim.actionId))
+    throw new Error("Side-effect process action ID is invalid");
+  const path2 = journalPath(input.graphcraftRoot, input.runId, input.claim.actionId);
+  let source;
+  try {
+    source = await readPrivateFileBounded(
+      path2,
+      SIDE_EFFECT_PROCESS_JOURNAL_MAX_BYTES,
+      input.graphcraftRoot
+    );
+  } catch (error51) {
+    if (error51.code === "ENOENT") return void 0;
+    throw error51;
+  }
+  const firstLine = source.toString("utf8").split("\n", 1)[0];
+  let prepared;
+  try {
+    prepared = firstLine ? parsePrepared(JSON.parse(firstLine)) : void 0;
+  } catch {
+  }
+  if (!prepared || prepared.actionId !== input.claim.actionId || prepared.nodeId !== input.claim.nodeId || prepared.kind !== input.claim.kind)
+    throw new Error(
+      `Side-effect process for ${input.claim.actionId} has ambiguous ownership metadata`
+    );
+  return {
+    schemaVersion: 1,
+    executionId: prepared.executionId,
+    actionId: prepared.actionId,
+    nodeId: prepared.nodeId,
+    kind: prepared.kind
+  };
+}
+async function withSideEffectProcessRunMutation(runRoot, action) {
+  const previous = sideEffectProcessRunMutationTails.get(runRoot) ?? Promise.resolve();
+  let release;
+  const gate = new Promise((resolve22) => release = resolve22);
+  const tail = previous.then(() => gate);
+  sideEffectProcessRunMutationTails.set(runRoot, tail);
+  await previous;
+  try {
+    return await action();
+  } finally {
+    release();
+    if (sideEffectProcessRunMutationTails.get(runRoot) === tail)
+      sideEffectProcessRunMutationTails.delete(runRoot);
+  }
+}
+function serialized(value) {
+  return `${JSON.stringify(value)}
+`;
+}
+async function createSideEffectProcessLease(input) {
+  const definition = parseSideEffectProcessDefinition(input.definition);
+  if (!definition) throw new Error("Side-effect process definition is invalid");
+  const root = join9(input.graphcraftRoot, "locks", "side-effect-processes", input.runId);
+  return await withSideEffectProcessRunMutation(root, async () => {
+    await ensurePrivateDirectory(root, input.graphcraftRoot);
+    const path2 = journalPath(input.graphcraftRoot, input.runId, definition.actionId);
+    await validatePrivatePath(input.graphcraftRoot, relative7(input.graphcraftRoot, path2));
+    const directoryMutation = await preparePrivateDirectoryMutation(
+      dirname10(path2),
+      input.graphcraftRoot
+    );
+    const noFollow = process.platform === "win32" ? 0 : fsConstants4.O_NOFOLLOW;
+    let handle;
+    try {
+      handle = await open6(
+        path2,
+        fsConstants4.O_CREAT | fsConstants4.O_EXCL | fsConstants4.O_RDWR | fsConstants4.O_APPEND | noFollow,
+        384
+      );
+      const ownerToken = randomUUID8();
+      const prepared = {
+        ...definition,
+        ownerToken,
+        status: "prepared",
+        preparedAt: (/* @__PURE__ */ new Date()).toISOString()
+      };
+      await handle.write(serialized(prepared));
+      await handle.sync();
+      await hardenPrivateFile(path2, input.graphcraftRoot);
+      await finalizePrivateDirectoryMutation(directoryMutation, input.graphcraftRoot);
+      return {
+        definition,
+        ownerTokenHash: contentHash(
+          ownerToken,
+          input.hashAlgorithm ?? LEGACY_CANONICAL_HASH_ALGORITHM
+        ),
+        journalPath: path2,
+        journalRelativePath: relative7(input.graphcraftRoot, path2).replaceAll("\\", "/"),
+        handle,
+        lifecycle: ({ onReady, onSettled }) => ({
+          executionId: definition.executionId,
+          ownerToken,
+          journalFd: handle.fd,
+          onReady,
+          onSettled
+        })
+      };
+    } catch (error51) {
+      if (handle) await handle.close().catch(() => void 0);
+      await finalizePrivateDirectoryMutation(directoryMutation, input.graphcraftRoot).catch(
+        () => void 0
+      );
+      throw error51;
+    }
+  });
+}
+function strictObject2(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : void 0;
+}
+function positivePid2(value) {
+  return Number.isSafeInteger(value) && Number(value) > 0;
+}
+function exactKeys(record2, expected) {
+  const actual = Object.keys(record2).sort();
+  const sortedExpected = [...expected].sort();
+  return actual.length === sortedExpected.length && actual.every((key, index) => key === sortedExpected[index]);
+}
+function validDate(value) {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+function parsePrepared(value) {
+  const record2 = strictObject2(value);
+  if (!record2 || !exactKeys(record2, [
+    "schemaVersion",
+    "executionId",
+    "actionId",
+    "nodeId",
+    "kind",
+    "ownerToken",
+    "status",
+    "preparedAt"
+  ]) || record2.ownerToken === void 0 || typeof record2.ownerToken !== "string" || !UUID_V42.test(record2.ownerToken) || record2.status !== "prepared" || !validDate(record2.preparedAt))
+    return void 0;
+  const definition = parseSideEffectProcessDefinition({
+    schemaVersion: record2.schemaVersion,
+    executionId: record2.executionId,
+    actionId: record2.actionId,
+    nodeId: record2.nodeId,
+    kind: record2.kind
+  });
+  if (!definition) return void 0;
+  return {
+    ...definition,
+    ownerToken: record2.ownerToken,
+    status: "prepared",
+    preparedAt: record2.preparedAt
+  };
+}
+function parseBroker(value) {
+  const record2 = strictObject2(value);
+  if (!record2 || record2.schemaVersion !== 1 || typeof record2.executionId !== "string" || !UUID_V42.test(record2.executionId) || typeof record2.ownerToken !== "string" || !UUID_V42.test(record2.ownerToken) || !positivePid2(record2.brokerPid) || !["ready", "starting", "started", "settled"].includes(String(record2.status)))
+    return void 0;
+  if (record2.status === "ready" && (!exactKeys(record2, [
+    "schemaVersion",
+    "executionId",
+    "ownerToken",
+    "brokerPid",
+    "status",
+    "readyAt"
+  ]) || !validDate(record2.readyAt)) || record2.status === "starting" && (!exactKeys(record2, [
+    "schemaVersion",
+    "executionId",
+    "ownerToken",
+    "brokerPid",
+    "status",
+    "startingAt"
+  ]) || !validDate(record2.startingAt)) || record2.status === "started" && (!exactKeys(record2, [
+    "schemaVersion",
+    "executionId",
+    "ownerToken",
+    "brokerPid",
+    "status",
+    "childPid",
+    "startedAt"
+  ]) || !positivePid2(record2.childPid) || !validDate(record2.startedAt)) || record2.status === "settled" && (!exactKeys(record2, [
+    "schemaVersion",
+    "executionId",
+    "ownerToken",
+    "brokerPid",
+    "status",
+    "outcome",
+    "confirmed",
+    "childPid",
+    "exitCode",
+    "exitSignal",
+    "settledAt"
+  ]) || record2.childPid !== null && !positivePid2(record2.childPid) || ![
+    "exited",
+    "terminated",
+    "cancelled_before_start",
+    "failed_to_start",
+    "unconfirmed"
+  ].includes(String(record2.outcome)) || typeof record2.confirmed !== "boolean" || record2.exitCode !== null && !Number.isInteger(record2.exitCode) || record2.exitSignal !== null && (typeof record2.exitSignal !== "string" || !Object.prototype.hasOwnProperty.call(osConstants2.signals, record2.exitSignal)) || !validDate(record2.settledAt) || record2.confirmed === true && record2.outcome === "unconfirmed" || record2.confirmed === false && record2.outcome !== "unconfirmed" || ["exited", "terminated"].includes(String(record2.outcome)) && !positivePid2(record2.childPid) || ["cancelled_before_start", "failed_to_start"].includes(String(record2.outcome)) && (record2.childPid !== null || record2.exitCode !== null || record2.exitSignal !== null)))
+    return void 0;
+  return record2;
+}
+async function inspectSideEffectProcessJournal(input) {
+  const definition = parseSideEffectProcessDefinition(input.definition);
+  if (!definition) throw new Error("Side-effect process definition is invalid");
+  const path2 = journalPath(input.graphcraftRoot, input.runId, definition.actionId);
+  let source;
+  try {
+    source = await readPrivateFileBounded(
+      path2,
+      SIDE_EFFECT_PROCESS_JOURNAL_MAX_BYTES,
+      input.graphcraftRoot
+    );
+  } catch (error51) {
+    if (error51.code === "ENOENT") return void 0;
+    throw error51;
+  }
+  const lines = source.toString("utf8").split("\n").filter((line2) => line2.length > 0);
+  if (lines.length === 0) throw new Error("Side-effect process journal is empty");
+  let prepared;
+  try {
+    prepared = parsePrepared(JSON.parse(lines[0]));
+  } catch {
+  }
+  if (!prepared || prepared.executionId !== definition.executionId || prepared.actionId !== definition.actionId || prepared.nodeId !== definition.nodeId || prepared.kind !== definition.kind || input.ownerTokenHash !== void 0 && contentHash(prepared.ownerToken, input.hashAlgorithm ?? LEGACY_CANONICAL_HASH_ALGORITHM) !== input.ownerTokenHash)
+    throw new Error(
+      `Side-effect process ${definition.executionId} has ambiguous ownership metadata`
+    );
+  let previous = "prepared";
+  let brokerPid;
+  let settlement;
+  for (const line2 of lines.slice(1)) {
+    let record2;
+    try {
+      record2 = parseBroker(JSON.parse(line2));
+    } catch {
+    }
+    if (!record2 || record2.executionId !== prepared.executionId || record2.ownerToken !== prepared.ownerToken || brokerPid !== void 0 && record2.brokerPid !== brokerPid)
+      throw new Error(`Side-effect process ${definition.executionId} has an invalid journal chain`);
+    brokerPid ??= record2.brokerPid;
+    const allowed = previous === "prepared" && record2.status === "ready" || previous === "ready" && ["starting", "settled"].includes(record2.status) || previous === "starting" && ["started", "settled"].includes(record2.status) || previous === "started" && record2.status === "settled";
+    if (!allowed)
+      throw new Error(`Side-effect process ${definition.executionId} has an invalid journal order`);
+    previous = record2.status;
+    if (record2.status === "settled") {
+      settlement = {
+        schemaVersion: 1,
+        executionId: prepared.executionId,
+        brokerPid: record2.brokerPid,
+        childPid: positivePid2(record2.childPid) ? record2.childPid : null,
+        outcome: record2.outcome,
+        confirmed: record2.confirmed,
+        exitCode: Number.isInteger(record2.exitCode) ? record2.exitCode : null,
+        exitSignal: typeof record2.exitSignal === "string" ? record2.exitSignal : null,
+        settledAt: record2.settledAt
+      };
+    }
+  }
+  if (input.expectedBrokerPid !== void 0 && brokerPid !== input.expectedBrokerPid)
+    throw new Error(`Side-effect process ${definition.executionId} broker identity is ambiguous`);
+  return {
+    prepared,
+    status: previous,
+    ...brokerPid ? { brokerPid } : {},
+    ...settlement ? { settlement } : {}
+  };
+}
+async function waitForSideEffectProcessSettlement(input, timeoutMs = SIDE_EFFECT_PROCESS_SETTLEMENT_WAIT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      const inspected = await inspectSideEffectProcessJournal(input);
+      if (!inspected || inspected.settlement) return inspected;
+      if (Date.now() >= deadline) return inspected;
+    } catch (error51) {
+      if (!(error51 instanceof Error) || error51.message !== "Private file changed during its bounded read" || Date.now() >= deadline)
+        throw error51;
+    }
+    await new Promise((resolve22) => setTimeout(resolve22, 25));
+  }
+}
+async function closeSideEffectProcessLease(lease) {
+  await lease.handle.close();
+}
+async function retryWindowsRemoval(action, ignoredErrors) {
+  const deadline = Date.now() + SIDE_EFFECT_PROCESS_REMOVAL_RETRY_MS;
+  let delayMs = 5;
+  while (true) {
+    try {
+      await action();
+      return;
+    } catch (error51) {
+      const code = error51.code ?? "";
+      if (ignoredErrors.has(code)) return;
+      if (process.platform !== "win32" || !WINDOWS_TRANSIENT_REMOVAL_ERRORS.has(code) || Date.now() >= deadline)
+        throw error51;
+      await new Promise((resolve22) => setTimeout(resolve22, delayMs));
+      delayMs = Math.min(100, delayMs * 2);
+    }
+  }
+}
+async function removeSideEffectProcessJournal(input) {
+  if (!ACTION_ID.test(input.actionId)) throw new Error("Side-effect process action ID is invalid");
+  const runRoot = join9(input.graphcraftRoot, "locks", "side-effect-processes", input.runId);
+  const path2 = journalPath(input.graphcraftRoot, input.runId, input.actionId);
+  await withSideEffectProcessRunMutation(runRoot, async () => {
+    const mutation = await preparePrivateDirectoryMutation(dirname10(path2), input.graphcraftRoot);
+    try {
+      await retryWindowsRemoval(
+        async () => {
+          await validatePrivatePath(input.graphcraftRoot, relative7(input.graphcraftRoot, path2));
+          await unlink4(path2);
+        },
+        /* @__PURE__ */ new Set(["ENOENT"])
+      );
+    } finally {
+      await finalizePrivateDirectoryMutation(mutation, input.graphcraftRoot);
+    }
+    const parentMutation = await preparePrivateDirectoryMutation(
+      dirname10(runRoot),
+      input.graphcraftRoot
+    );
+    try {
+      await retryWindowsRemoval(
+        async () => await rmdir2(runRoot),
+        /* @__PURE__ */ new Set(["ENOENT", "ENOTEMPTY", "EEXIST"])
+      );
+    } finally {
+      await finalizePrivateDirectoryMutation(parentMutation, input.graphcraftRoot);
+    }
+  });
+}
 
 // packages/runtime/src/side-effect.ts
 var SideEffectBoundaryInterruption = class extends Error {
@@ -33385,8 +34015,351 @@ var SideEffectInterruption = class extends Error {
   }
   receipt;
 };
+var SideEffectProcessCleanupError = class extends Error {
+  constructor(message, childSettlement, options) {
+    super(message, options);
+    this.childSettlement = childSettlement;
+    this.name = "SideEffectProcessCleanupError";
+  }
+  childSettlement;
+};
 function journalEntry(entries, actionId) {
   return entries.find(({ claim }) => claim.actionId === actionId);
+}
+var sideEffectProcessEventTypes = /* @__PURE__ */ new Set([
+  "side_effect.process.started",
+  "side_effect.process.finished",
+  "side_effect.process.reconciled"
+]);
+var managedPlatforms = /* @__PURE__ */ new Set([
+  "aix",
+  "android",
+  "darwin",
+  "freebsd",
+  "haiku",
+  "linux",
+  "openbsd",
+  "sunos",
+  "win32",
+  "cygwin",
+  "netbsd"
+]);
+function strictRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : void 0;
+}
+function exactKeys2(record2, expected) {
+  const actual = Object.keys(record2).sort();
+  const sortedExpected = [...expected].sort();
+  return actual.length === sortedExpected.length && actual.every((key, index) => key === sortedExpected[index]);
+}
+function positivePid3(value) {
+  return Number.isSafeInteger(value) && Number(value) > 0;
+}
+function parseManagedReady(value, executionId) {
+  const record2 = strictRecord(value);
+  if (!record2 || !exactKeys2(record2, [
+    "type",
+    "schemaVersion",
+    "executionId",
+    "brokerPid",
+    "processGroupId",
+    "platform",
+    "readyAt"
+  ]) || record2.type !== "ready" || record2.schemaVersion !== 1 || record2.executionId !== executionId || !positivePid3(record2.brokerPid) || record2.processGroupId !== null && !positivePid3(record2.processGroupId) || !managedPlatforms.has(String(record2.platform)) || typeof record2.readyAt !== "string" || !Number.isFinite(Date.parse(record2.readyAt)))
+    return void 0;
+  return {
+    schemaVersion: 1,
+    executionId,
+    brokerPid: record2.brokerPid,
+    processGroupId: record2.processGroupId,
+    platform: record2.platform,
+    readyAt: record2.readyAt
+  };
+}
+function parseManagedSettlement(value, executionId) {
+  const record2 = strictRecord(value);
+  if (!record2 || !exactKeys2(record2, [
+    "schemaVersion",
+    "executionId",
+    "brokerPid",
+    "childPid",
+    "outcome",
+    "confirmed",
+    "exitCode",
+    "exitSignal",
+    "settledAt"
+  ]) || record2.schemaVersion !== 1 || record2.executionId !== executionId || !positivePid3(record2.brokerPid) || record2.childPid !== null && !positivePid3(record2.childPid) || !["exited", "terminated", "cancelled_before_start", "failed_to_start", "unconfirmed"].includes(
+    String(record2.outcome)
+  ) || typeof record2.confirmed !== "boolean" || record2.exitCode !== null && !Number.isInteger(record2.exitCode) || record2.exitSignal !== null && (typeof record2.exitSignal !== "string" || !Object.prototype.hasOwnProperty.call(osConstants3.signals, record2.exitSignal)) || typeof record2.settledAt !== "string" || !Number.isFinite(Date.parse(record2.settledAt)) || record2.confirmed === true && record2.outcome === "unconfirmed" || record2.confirmed === false && record2.outcome !== "unconfirmed" || ["exited", "terminated"].includes(String(record2.outcome)) && !positivePid3(record2.childPid) || ["cancelled_before_start", "failed_to_start"].includes(String(record2.outcome)) && (record2.childPid !== null || record2.exitCode !== null || record2.exitSignal !== null))
+    return void 0;
+  return {
+    schemaVersion: 1,
+    executionId,
+    brokerPid: record2.brokerPid,
+    childPid: record2.childPid,
+    outcome: record2.outcome,
+    confirmed: record2.confirmed,
+    exitCode: record2.exitCode,
+    exitSignal: record2.exitSignal,
+    settledAt: record2.settledAt
+  };
+}
+function sideEffectProcessHashAlgorithm(store, claim) {
+  return claim.kind === "git_commit" || claim.kind === "git_push" ? store.repositorySideEffectIdentityHashAlgorithm : store.githubMutationLifecycleIdentityHashAlgorithm;
+}
+function parseSideEffectProcessEventChains(events, claim, runId, options = {}) {
+  const chains = /* @__PURE__ */ new Map();
+  const expectedJournalPath = `locks/side-effect-processes/${runId}/${claim.actionId}.jsonl`;
+  for (const event of events) {
+    if (!sideEffectProcessEventTypes.has(event.type) || event.data.actionId !== claim.actionId)
+      continue;
+    if (event.actor !== "runtime" || event.causationId !== claim.actionId || event.data.schemaVersion !== 1 || event.data.nodeId !== claim.nodeId || event.data.kind !== claim.kind)
+      throw new Error(`Side-effect process lifecycle for ${claim.actionId} is invalid`);
+    if (event.type === "side_effect.process.started") {
+      if (!exactKeys2(event.data, [
+        "schemaVersion",
+        "actionId",
+        "nodeId",
+        "kind",
+        "definition",
+        "ownerTokenHash",
+        "journalPath",
+        "ready"
+      ]))
+        throw new Error(`Side-effect process start for ${claim.actionId} is invalid`);
+      const definition = parseSideEffectProcessDefinition(event.data.definition);
+      const ownerTokenHash = event.data.ownerTokenHash;
+      const journalPath3 = event.data.journalPath;
+      if (!definition || definition.actionId !== claim.actionId || definition.nodeId !== claim.nodeId || definition.kind !== claim.kind || typeof ownerTokenHash !== "string" || !/^[a-f0-9]{64}$/.test(ownerTokenHash) || journalPath3 !== expectedJournalPath)
+        throw new Error(`Side-effect process start for ${claim.actionId} is invalid`);
+      const ready = parseManagedReady(event.data.ready, definition.executionId);
+      if (!ready) throw new Error(`Side-effect process start for ${claim.actionId} is invalid`);
+      const chain2 = chains.get(definition.executionId) ?? {};
+      if (chain2.start)
+        throw new Error(`Side-effect process ${definition.executionId} started more than once`);
+      chain2.start = { event, definition, ownerTokenHash, journalPath: journalPath3, ready };
+      chains.set(definition.executionId, chain2);
+      continue;
+    }
+    if (!exactKeys2(event.data, [
+      "schemaVersion",
+      "actionId",
+      "nodeId",
+      "kind",
+      "executionId",
+      "started",
+      "settlement"
+    ]) || typeof event.data.executionId !== "string" || typeof event.data.started !== "boolean")
+      throw new Error(`Side-effect process settlement for ${claim.actionId} is invalid`);
+    const settlement = parseManagedSettlement(event.data.settlement, event.data.executionId);
+    if (!settlement)
+      throw new Error(`Side-effect process settlement for ${claim.actionId} is invalid`);
+    const chain = chains.get(event.data.executionId) ?? {};
+    if (chain.terminal)
+      throw new Error(`Side-effect process ${event.data.executionId} settled more than once`);
+    chain.terminal = { event, started: event.data.started, settlement };
+    chains.set(event.data.executionId, chain);
+  }
+  for (const [executionId, chain] of chains) {
+    if (!chain.terminal) continue;
+    if (!chain.terminal.settlement.confirmed && !options.allowUnconfirmedTerminal)
+      throw new Error(`Side-effect process ${executionId} has unconfirmed child settlement`);
+    if (chain.terminal.started !== Boolean(chain.start))
+      throw new Error(`Side-effect process ${executionId} has inconsistent start evidence`);
+    if (!chain.start && !["cancelled_before_start", "failed_to_start"].includes(chain.terminal.settlement.outcome))
+      throw new Error(`Side-effect process ${executionId} lacks start authorization`);
+    if (chain.start && (chain.terminal.event.sequence <= chain.start.event.sequence || chain.terminal.settlement.brokerPid !== chain.start.ready.brokerPid))
+      throw new Error(`Side-effect process ${executionId} has inconsistent broker evidence`);
+  }
+  return chains;
+}
+async function loadSideEffectProcessEventChain(store, claim, executionId, options = {}) {
+  return parseSideEffectProcessEventChains(await store.loadEvents(), claim, store.runId, options).get(
+    executionId
+  ) ?? {};
+}
+function exactSideEffectProcessEventData(event, expected, hashAlgorithm) {
+  return contentHash(event.data, hashAlgorithm) === contentHash(expected, hashAlgorithm);
+}
+async function failSideEffectProcessRecovery(input, claim, detail, childSettlement = "unconfirmed") {
+  const reason = `Graphcraft cannot safely recover the owned process for ${claim.kind} ${claim.actionId}: ${detail}`;
+  await input.store.append(
+    "runtime",
+    "side_effect.failed",
+    {
+      actionId: claim.actionId,
+      reason,
+      retryable: childSettlement === "confirmed",
+      uncertain: childSettlement === "unconfirmed",
+      childSettlement
+    },
+    claim.actionId
+  );
+  throw new Error(reason);
+}
+async function cleanupSideEffectProcessJournal(input, claim) {
+  try {
+    await removeSideEffectProcessJournal({
+      graphcraftRoot: input.store.graphcraftRoot,
+      runId: input.store.runId,
+      actionId: claim.actionId
+    });
+  } catch (error51) {
+    await failSideEffectProcessRecovery(
+      input,
+      claim,
+      `the confirmed settlement journal cannot be removed: ${error51 instanceof Error ? error51.message : String(error51)}`,
+      "confirmed"
+    );
+  }
+}
+async function reconcileSideEffectProcessOwnership(input, claim) {
+  const algorithm = sideEffectProcessHashAlgorithm(input.store, claim);
+  let chains = /* @__PURE__ */ new Map();
+  try {
+    chains = parseSideEffectProcessEventChains(
+      await input.store.loadEvents(),
+      claim,
+      input.store.runId
+    );
+  } catch (error51) {
+    await failSideEffectProcessRecovery(
+      input,
+      claim,
+      error51 instanceof Error ? error51.message : String(error51)
+    );
+  }
+  let definition;
+  try {
+    definition = await readSideEffectProcessDefinition({
+      graphcraftRoot: input.store.graphcraftRoot,
+      runId: input.store.runId,
+      claim
+    });
+  } catch (error51) {
+    await failSideEffectProcessRecovery(
+      input,
+      claim,
+      error51 instanceof Error ? error51.message : String(error51)
+    );
+  }
+  const incomplete = [...chains.entries()].filter(([, chain2]) => chain2.start && !chain2.terminal);
+  if (!definition) {
+    if (incomplete.length > 0)
+      await failSideEffectProcessRecovery(
+        input,
+        claim,
+        `the ownership journal for process ${incomplete[0][0]} is missing`
+      );
+    await cleanupSideEffectProcessJournal(input, claim);
+    return;
+  }
+  const unexpectedIncomplete = incomplete.find(
+    ([executionId]) => executionId !== definition.executionId
+  );
+  if (unexpectedIncomplete)
+    await failSideEffectProcessRecovery(
+      input,
+      claim,
+      `the ownership journal for process ${unexpectedIncomplete[0]} is missing`
+    );
+  const chain = chains.get(definition.executionId) ?? {};
+  let inspection;
+  try {
+    const inspectionInput = {
+      graphcraftRoot: input.store.graphcraftRoot,
+      runId: input.store.runId,
+      definition,
+      hashAlgorithm: algorithm,
+      ...chain.start ? {
+        ownerTokenHash: chain.start.ownerTokenHash,
+        expectedBrokerPid: chain.start.ready.brokerPid
+      } : {}
+    };
+    const first = await inspectSideEffectProcessJournal(inspectionInput);
+    inspection = first && first.status === "prepared" && !chain.start && !chain.terminal ? first : await waitForSideEffectProcessSettlement(inspectionInput);
+  } catch (error51) {
+    await failSideEffectProcessRecovery(
+      input,
+      claim,
+      error51 instanceof Error ? error51.message : String(error51)
+    );
+  }
+  if (!inspection)
+    return await failSideEffectProcessRecovery(
+      input,
+      claim,
+      `the ownership journal for process ${definition.executionId} disappeared`
+    );
+  if (chain.terminal) {
+    if (!inspection.settlement || contentHash(inspection.settlement, algorithm) !== contentHash(chain.terminal.settlement, algorithm))
+      await failSideEffectProcessRecovery(
+        input,
+        claim,
+        `process ${definition.executionId} has inconsistent terminal evidence`
+      );
+    await cleanupSideEffectProcessJournal(input, claim);
+    return;
+  }
+  if (chain.start) {
+    if (!inspection.settlement?.confirmed)
+      await failSideEffectProcessRecovery(
+        input,
+        claim,
+        `process ${definition.executionId} and its child tree do not have confirmed settlement`
+      );
+    await input.store.append(
+      "runtime",
+      "side_effect.process.reconciled",
+      {
+        schemaVersion: 1,
+        actionId: claim.actionId,
+        nodeId: claim.nodeId,
+        kind: claim.kind,
+        executionId: definition.executionId,
+        started: true,
+        settlement: inspection.settlement
+      },
+      claim.actionId
+    );
+    await cleanupSideEffectProcessJournal(input, claim);
+    return;
+  }
+  if (inspection.status === "starting" || inspection.status === "started")
+    await failSideEffectProcessRecovery(
+      input,
+      claim,
+      `process ${definition.executionId} started without durable authorization`
+    );
+  if (inspection.status === "ready" && !inspection.settlement)
+    await failSideEffectProcessRecovery(
+      input,
+      claim,
+      `process ${definition.executionId} does not have confirmed pre-start settlement`
+    );
+  if (inspection.settlement) {
+    if (!inspection.settlement.confirmed || inspection.settlement.outcome !== "cancelled_before_start")
+      await failSideEffectProcessRecovery(
+        input,
+        claim,
+        `process ${definition.executionId} settled without valid start authorization`
+      );
+    await input.store.append(
+      "runtime",
+      "side_effect.process.reconciled",
+      {
+        schemaVersion: 1,
+        actionId: claim.actionId,
+        nodeId: claim.nodeId,
+        kind: claim.kind,
+        executionId: definition.executionId,
+        started: false,
+        settlement: inspection.settlement
+      },
+      claim.actionId
+    );
+  }
+  await cleanupSideEffectProcessJournal(input, claim);
 }
 function interruptionReceipt(input, claim, dispatched, childSettlement, reconciliation, disposition) {
   return {
@@ -33588,6 +34561,8 @@ async function executeSideEffect(input) {
   }
   if (!entry) throw new Error(`Side-effect claim ${claim.actionId} was not persisted`);
   claim = entry.claim;
+  await reconcileSideEffectProcessOwnership(input, claim);
+  entry = journalEntry((await input.store.loadState()).sideEffects, claim.actionId) ?? entry;
   if (entry.childSettlement === "unconfirmed")
     throw new Error(
       `The child settlement for ${claim.kind} ${claim.actionId} is unconfirmed; refusing to reconcile or retry while the mutation process may still be running`
@@ -33643,8 +34618,12 @@ async function executeSideEffect(input) {
   await crossSideEffectBoundary(input.boundary, "before_act");
   let dispatched = entry.dispatchedAt !== void 0;
   let markedThisAttempt = false;
+  let processLease;
+  let processStartEventData;
+  let processStartAppendCompleted = false;
+  let processSettlement;
   await authorizePhase(input, claim, "dispatch", dispatched);
-  const markDispatched = async () => {
+  const checkpointDispatch = async () => {
     await authorizePhase(input, claim, "dispatch", dispatched);
     if (!dispatched) {
       await input.store.append(
@@ -33657,12 +34636,159 @@ async function executeSideEffect(input) {
     }
     markedThisAttempt = true;
     await crossSideEffectBoundary(input.boundary, "after_action_dispatch");
+    if (input.signal?.aborted) {
+      await recordInterruptionFailure(
+        input,
+        claim,
+        `${claim.kind} ${claim.actionId} was cancelled before its mutation child started`,
+        true,
+        false,
+        "confirmed",
+        "cancelled_before_spawn"
+      );
+      throw new SideEffectInterruption(
+        interruptionReceipt(input, claim, true, "not_started", "not_attempted", "retryable")
+      );
+    }
+  };
+  const markDispatched = async (request) => {
+    if (!request) {
+      await checkpointDispatch();
+      return;
+    }
+    if (processLease)
+      throw new Error(`${claim.kind} ${claim.actionId} prepared more than one mutation process`);
+    const definition = createSideEffectProcessDefinition(claim);
+    processLease = await createSideEffectProcessLease({
+      graphcraftRoot: input.store.graphcraftRoot,
+      runId: input.store.runId,
+      definition,
+      hashAlgorithm: sideEffectProcessHashAlgorithm(input.store, claim)
+    });
+    return processLease.lifecycle({
+      onReady: async (ready) => {
+        await checkpointDispatch();
+        processStartEventData = {
+          schemaVersion: 1,
+          actionId: claim.actionId,
+          nodeId: claim.nodeId,
+          kind: claim.kind,
+          definition,
+          ownerTokenHash: processLease.ownerTokenHash,
+          journalPath: processLease.journalRelativePath,
+          ready
+        };
+        await input.store.append(
+          "runtime",
+          "side_effect.process.started",
+          processStartEventData,
+          claim.actionId
+        );
+        processStartAppendCompleted = true;
+      },
+      onSettled: async (settlement) => {
+        processSettlement = settlement;
+        const chain = await loadSideEffectProcessEventChain(
+          input.store,
+          claim,
+          definition.executionId
+        );
+        if (processStartAppendCompleted && !chain.start || chain.start && (!processStartEventData || !exactSideEffectProcessEventData(
+          chain.start.event,
+          processStartEventData,
+          sideEffectProcessHashAlgorithm(input.store, claim)
+        )))
+          throw new Error(
+            `Side-effect process ${definition.executionId} has ambiguous durable start evidence`
+          );
+        await input.store.append(
+          "runtime",
+          "side_effect.process.finished",
+          {
+            schemaVersion: 1,
+            actionId: claim.actionId,
+            nodeId: claim.nodeId,
+            kind: claim.kind,
+            executionId: definition.executionId,
+            started: Boolean(chain.start),
+            settlement
+          },
+          claim.actionId
+        );
+      }
+    });
   };
   try {
-    await input.act(claim, markDispatched);
+    let actionError;
+    try {
+      await input.act(claim, markDispatched);
+    } catch (error51) {
+      actionError = error51;
+      throw error51;
+    } finally {
+      if (processLease) {
+        try {
+          await closeSideEffectProcessLease(processLease);
+          const chain = await loadSideEffectProcessEventChain(
+            input.store,
+            claim,
+            processLease.definition.executionId,
+            { allowUnconfirmedTerminal: true }
+          );
+          const expectedTerminalData = processSettlement ? {
+            schemaVersion: 1,
+            actionId: claim.actionId,
+            nodeId: claim.nodeId,
+            kind: claim.kind,
+            executionId: processLease.definition.executionId,
+            started: Boolean(chain.start),
+            settlement: processSettlement
+          } : void 0;
+          const terminalDataMatches = chain.terminal !== void 0 && expectedTerminalData !== void 0 && exactSideEffectProcessEventData(
+            chain.terminal.event,
+            expectedTerminalData,
+            sideEffectProcessHashAlgorithm(input.store, claim)
+          );
+          const exactTerminal = processSettlement !== void 0 && chain.terminal !== void 0 && chain.terminal.event.type === "side_effect.process.finished" && expectedTerminalData !== void 0 && terminalDataMatches;
+          const missingTerminalCanRecover = processSettlement === void 0 && actionError !== void 0 && (actionError instanceof SideEffectBoundaryInterruption || actionError instanceof SideEffectInterruption || classifyCancellation(input, actionError)?.childSettlement === "unconfirmed");
+          if (!exactTerminal && !missingTerminalCanRecover)
+            throw new Error(
+              `process ${processLease.definition.executionId} lacks exact durable terminal evidence (settlement=${processSettlement ? "present" : "missing"}, event=${chain.terminal?.event.type ?? "missing"}, exact=${terminalDataMatches})`
+            );
+          if (processSettlement?.confirmed)
+            await removeSideEffectProcessJournal({
+              graphcraftRoot: input.store.graphcraftRoot,
+              runId: input.store.runId,
+              actionId: claim.actionId
+            });
+          else if (!actionError)
+            throw new Error(
+              `process ${processLease.definition.executionId} has unconfirmed terminal evidence`
+            );
+        } catch (cleanupError) {
+          throw new SideEffectProcessCleanupError(
+            `Unable to clean up the owned mutation process for ${claim.kind} ${claim.actionId}: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+            processSettlement?.confirmed ? "confirmed" : "unconfirmed",
+            { cause: actionError ?? cleanupError }
+          );
+        }
+      }
+    }
   } catch (error51) {
     if (error51 instanceof SideEffectBoundaryInterruption) throw error51;
     if (error51 instanceof SideEffectInterruption) throw error51;
+    if (error51 instanceof SideEffectProcessCleanupError) {
+      const confirmed = error51.childSettlement === "confirmed";
+      await recordInterruptionFailure(
+        input,
+        claim,
+        error51.message,
+        confirmed,
+        !confirmed,
+        error51.childSettlement
+      );
+      throw error51;
+    }
     let cancellation = classifyCancellation(input, error51);
     const reason2 = error51 instanceof Error ? error51.message : String(error51);
     if (cancellation?.outcome === "failed" && cancellation.childSettlement === "unconfirmed" && !input.signal?.aborted) {
@@ -33868,18 +34994,29 @@ async function rethrowAfterConcurrentGitSettlement(error51, operations, signal) 
   if (outcomes.includes("terminated")) throw new GitMutationCancellationError("terminated");
   throw error51;
 }
-async function gitRaw(repositoryPath, args, signal) {
+async function gitRaw(repositoryPath, args, signal, lifecycle) {
   throwIfGitCancelledBeforeSpawn(signal);
   let result;
   try {
     result = await runProcess("git", args, {
       cwd: repositoryPath,
       timeoutMs: 12e4,
-      ...signal ? { signal } : {}
+      ...signal ? { signal } : {},
+      ...lifecycle ? { lifecycle } : {}
     });
   } catch (error51) {
     if (error51 instanceof ProcessOutputLimitError)
       throw new GitCommandError(error51.message, error51.childSettlement, { cause: error51 });
+    if (error51 instanceof ProcessSettlementError) {
+      if (error51.timedOut)
+        throw new GitCommandError(
+          `git ${args[0]} exceeded its 120000ms timeout`,
+          error51.childSettlement,
+          { cause: error51 }
+        );
+      if (signal?.aborted) throw new GitMutationCancellationError("unconfirmed");
+      throw new GitCommandError(error51.message, error51.childSettlement, { cause: error51 });
+    }
     throw error51;
   }
   if (result.timedOut)
@@ -33895,8 +35032,91 @@ async function gitRaw(repositoryPath, args, signal) {
     );
   return result.stdout;
 }
-async function git(repositoryPath, args, signal) {
-  return (await gitRaw(repositoryPath, args, signal)).trim();
+var ATOMIC_COMMIT_PROCESS_SOURCE = String.raw`
+const { spawn } = require("node:child_process");
+
+const git = process.argv[1];
+const commitArgs = process.argv.slice(2);
+if (!git || commitArgs.length === 0) process.exit(2);
+const commands = [["add", "-A"], commitArgs];
+
+function run(index) {
+  if (index >= commands.length) return;
+  const args = commands[index];
+  const child = spawn(git, args, {
+    cwd: process.cwd(),
+    env: process.env,
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  let spawnError;
+  child.stdout.pipe(process.stdout, { end: false });
+  child.stderr.pipe(process.stderr, { end: false });
+  child.once("error", (error) => { spawnError = error; });
+  child.once("close", (code, signal) => {
+    if (spawnError) {
+      process.stderr.write("Unable to start git " + args[0] + ": " + spawnError.message + "\n");
+      process.exitCode = 1;
+      return;
+    }
+    if (code !== 0) {
+      if (signal) process.stderr.write("git " + args[0] + " exited via " + signal + "\n");
+      process.exitCode = Number.isInteger(code) ? code : 1;
+      return;
+    }
+    run(index + 1);
+  });
+}
+
+run(0);
+`;
+async function atomicCommit(repositoryPath, args, signal, lifecycle) {
+  throwIfGitCancelledBeforeSpawn(signal);
+  const executable = await resolveTrustedExecutable("git", {
+    environment: process.env,
+    untrustedCwd: repositoryPath
+  });
+  let result;
+  try {
+    result = await runProcess(
+      process.execPath,
+      ["-e", ATOMIC_COMMIT_PROCESS_SOURCE, executable, ...args],
+      {
+        cwd: repositoryPath,
+        timeoutMs: 12e4,
+        ...signal ? { signal } : {},
+        ...lifecycle ? { lifecycle } : {}
+      }
+    );
+  } catch (error51) {
+    if (error51 instanceof ProcessOutputLimitError)
+      throw new GitCommandError(error51.message, error51.childSettlement, { cause: error51 });
+    if (error51 instanceof ProcessSettlementError) {
+      if (error51.timedOut)
+        throw new GitCommandError(
+          "git commit exceeded its 120000ms timeout",
+          error51.childSettlement,
+          {
+            cause: error51
+          }
+        );
+      if (signal?.aborted) throw new GitMutationCancellationError("unconfirmed");
+      throw new GitCommandError(error51.message, error51.childSettlement, { cause: error51 });
+    }
+    throw error51;
+  }
+  if (result.timedOut)
+    throw new GitCommandError(
+      result.stderr.trim() || "git commit exceeded its 120000ms timeout",
+      result.childSettlement
+    );
+  throwIfGitCancelledAfterSpawn(signal, result.childSettlement);
+  if (result.exitCode !== 0)
+    throw new GitCommandError(result.stderr.trim() || "git commit failed", result.childSettlement);
+}
+async function git(repositoryPath, args, signal, lifecycle) {
+  return (await gitRaw(repositoryPath, args, signal, lifecycle)).trim();
 }
 async function readUtf8(path2, signal) {
   return await readFile2(path2, {
@@ -34111,7 +35331,7 @@ async function ensureGraphcraftIgnored(repositoryRoot, signal) {
     content = await readUtf8(excludePath, signal);
   } catch {
     signal?.throwIfAborted();
-    await mkdir3(dirname10(excludePath), { recursive: true });
+    await mkdir3(dirname11(excludePath), { recursive: true });
   }
   signal?.throwIfAborted();
   if (!content.split("\n").includes(".graphcraft/"))
@@ -34137,11 +35357,11 @@ function slug(task) {
 }
 function expectedRunWorkspace(contract) {
   const branch = `graphcraft/${contract.runId.slice(0, 8)}-${slug(contract.task)}`;
-  const parent = join9(
-    dirname10(contract.repository.root),
+  const parent = join10(
+    dirname11(contract.repository.root),
     `.${basename4(contract.repository.root)}-graphcraft-worktrees`
   );
-  return { branch, path: join9(parent, contract.runId) };
+  return { branch, path: join10(parent, contract.runId) };
 }
 function directoryIdentity(stats) {
   return { dev: stats.dev, ino: stats.ino, birthtimeNs: stats.birthtimeNs };
@@ -34180,9 +35400,9 @@ async function canonicalComparablePath(path2, signal) {
     if (error51.code !== "ENOENT") throw error51;
   }
   try {
-    const canonicalParent = await realpath5(dirname10(path2));
+    const canonicalParent = await realpath5(dirname11(path2));
     signal?.throwIfAborted();
-    return comparablePath(join9(canonicalParent, basename4(path2)));
+    return comparablePath(join10(canonicalParent, basename4(path2)));
   } catch (error51) {
     signal?.throwIfAborted();
     if (error51.code !== "ENOENT") throw error51;
@@ -34519,7 +35739,7 @@ async function reconcileRunWorkspace(contract, inputWorkspace, sideEffects, sign
 }
 async function createRunWorkspace(contract, options = {}) {
   const { path: path2, branch } = expectedRunWorkspace(contract);
-  const parent = dirname10(path2);
+  const parent = dirname11(path2);
   options.signal?.throwIfAborted();
   await mkdir3(parent, { recursive: true });
   options.signal?.throwIfAborted();
@@ -34636,7 +35856,7 @@ async function commitContentDigest(repositoryPath, hashAlgorithm, signal) {
   ].sort();
   const changes = await Promise.all(
     paths.map(async (path2) => {
-      const absolutePath = join9(repositoryPath, path2);
+      const absolutePath = join10(repositoryPath, path2);
       const stats = await lstat8(absolutePath).catch(() => void 0);
       if (!stats) return { path: path2, kind: "absent" };
       if (stats.isSymbolicLink())
@@ -34696,7 +35916,7 @@ async function createAtomicCommitClaim(workspace, runId, nodeId, hashAlgorithm) 
     claimedAt: (/* @__PURE__ */ new Date()).toISOString()
   });
 }
-async function performAtomicCommit(workspace, claim, task, hashAlgorithm, markDispatched, boundary, signal) {
+async function performAtomicCommit(workspace, claim, task, hashAlgorithm, prepareProcess, boundary, signal) {
   if (claim.kind !== "git_commit") throw new Error(`Side effect ${claim.actionId} is not a commit`);
   throwIfGitCancelledBeforeSpawn(signal);
   const expected = commitPrecondition(claim);
@@ -34705,15 +35925,15 @@ async function performAtomicCommit(workspace, claim, task, hashAlgorithm, markDi
     throw new Error(`Commit precondition changed for side effect ${claim.actionId}`);
   const status3 = await git(workspace.path, ["status", "--porcelain=v1"], signal);
   if (!status3) throw new Error("No accepted changes are available to commit");
-  await git(workspace.path, ["add", "-A"], signal);
   const summary = task.replace(/\s+/g, " ").slice(0, 64);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
   throwIfGitCancelledBeforeSpawn(signal);
-  await markDispatched();
-  await git(
+  const lifecycle = await prepareProcess({ managedProcess: true }) || void 0;
+  await atomicCommit(
     workspace.path,
     ["commit", "-m", `graphcraft: ${summary}`, "-m", `Graphcraft-Action: ${claim.idempotencyKey}`],
-    signal
+    signal,
+    lifecycle
   );
   await crossSideEffectBoundary(boundary, "after_action_command");
   return {
@@ -34838,7 +36058,7 @@ async function createAtomicPushClaim(workspace, runId, nodeId, hashAlgorithm) {
     claimedAt: (/* @__PURE__ */ new Date()).toISOString()
   });
 }
-async function performAtomicPush(workspace, claim, markDispatched, boundary, signal) {
+async function performAtomicPush(workspace, claim, prepareProcess, boundary, signal) {
   if (claim.kind !== "git_push") throw new Error(`Side effect ${claim.actionId} is not a push`);
   throwIfGitCancelledBeforeSpawn(signal);
   const expected = pushPrecondition(claim);
@@ -34847,11 +36067,12 @@ async function performAtomicPush(workspace, claim, markDispatched, boundary, sig
     throw new Error(`Push precondition changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
   throwIfGitCancelledBeforeSpawn(signal);
-  await markDispatched();
+  const lifecycle = await prepareProcess({ managedProcess: true }) || void 0;
   await gitRaw(
     workspace.path,
     ["push", "--porcelain", expected.remote, `${expected.branch}:refs/heads/${expected.branch}`],
-    signal
+    signal,
+    lifecycle
   );
   await crossSideEffectBoundary(boundary, "after_action_command");
   return {
@@ -34906,16 +36127,16 @@ async function reconcileAtomicPush(workspace, claim) {
 }
 
 // packages/runtime/src/store.ts
-import { constants as fsConstants5 } from "node:fs";
-import { lstat as lstat12, open as open7, readdir as readdir4 } from "node:fs/promises";
-import { join as join12, relative as relative10, resolve as resolve13 } from "node:path";
+import { constants as fsConstants6 } from "node:fs";
+import { lstat as lstat12, open as open8, readdir as readdir4 } from "node:fs/promises";
+import { join as join13, relative as relative11, resolve as resolve13 } from "node:path";
 import { TextDecoder as TextDecoder2 } from "node:util";
 
 // packages/runtime/src/migration.ts
 import { createHash as createHash5 } from "node:crypto";
-import { constants as fsConstants4 } from "node:fs";
-import { lstat as lstat9, mkdir as mkdir4, open as open6, readdir as readdir3, rename as rename2, rm as rm4 } from "node:fs/promises";
-import { join as join10, relative as relative7, resolve as resolve10 } from "node:path";
+import { constants as fsConstants5 } from "node:fs";
+import { lstat as lstat9, mkdir as mkdir4, open as open7, readdir as readdir3, rename as rename2, rm as rm4 } from "node:fs/promises";
+import { join as join11, relative as relative8, resolve as resolve10 } from "node:path";
 import { isDeepStrictEqual as isDeepStrictEqual3 } from "node:util";
 var CURRENT_RUN_STORAGE_VERSION = 3;
 var BACKUP_COMPLETION_FILE = ".backup-complete.json";
@@ -34970,12 +36191,12 @@ function manifest(runId, migratedFrom, canonicalHashAlgorithm, heldOutProbeForma
   });
 }
 function runStorageManifestPath(runRoot) {
-  return join10(runRoot, "storage.json");
+  return join11(runRoot, "storage.json");
 }
 async function validateRunStorageRoot(input) {
   const graphcraftRoot2 = resolve10(input.graphcraftRoot);
   const runRoot = resolve10(input.runRoot);
-  const validated = await validatePrivatePath(graphcraftRoot2, relative7(graphcraftRoot2, runRoot));
+  const validated = await validatePrivatePath(graphcraftRoot2, relative8(graphcraftRoot2, runRoot));
   if (validated !== runRoot)
     throw new Error(`Run storage path escaped the Graphcraft state directory: ${input.runRoot}`);
 }
@@ -35081,7 +36302,7 @@ async function inspectStorage(runRoot, runId) {
   if (parsed.schemaVersion === 1) return { version: 1 };
   try {
     await validatePrivatePath(runRoot, ARTIFACT_INVENTORY_FILE);
-    const inventory = await readBoundedArtifactInventory(join10(runRoot, ARTIFACT_INVENTORY_FILE));
+    const inventory = await readBoundedArtifactInventory(join11(runRoot, ARTIFACT_INVENTORY_FILE));
     if (inventory.runId !== runId)
       throw new Error(`artifact inventory belongs to ${inventory.runId}`);
   } catch (error51) {
@@ -35196,7 +36417,7 @@ async function acquireMigrationHandle(lease, operation) {
   }
 }
 async function acquireMigrationLock(input) {
-  const lockPath = join10(input.graphcraftRoot, "locks", `${input.runId}.migration.lock`);
+  const lockPath = join11(input.graphcraftRoot, "locks", `${input.runId}.migration.lock`);
   while (true) {
     await validateRunStorageRoot(input);
     const storage = await inspectStorage(input.runRoot, input.runId);
@@ -35371,7 +36592,7 @@ async function scanLegacyTreeMetadata(root, options, lease) {
         throw new Error(
           `Legacy run contains reserved root file ${BACKUP_COMPLETION_FILE}; remove it before retrying`
         );
-      const path2 = join10(directory, name);
+      const path2 = join11(directory, name);
       const relativePath = relativeDirectory ? `${relativeDirectory}/${name}` : name;
       entryCount += 1;
       if (entryCount > LEGACY_MIGRATION_RESOURCE_LIMITS.maximumEntryCount)
@@ -35494,10 +36715,10 @@ async function readLegacySnapshotFile(expected, options, lease) {
     expected,
     "before opening"
   );
-  const noFollow = process.platform === "win32" ? 0 : fsConstants4.O_NOFOLLOW;
+  const noFollow = process.platform === "win32" ? 0 : fsConstants5.O_NOFOLLOW;
   const handle = await acquireMigrationHandle(
     lease,
-    async () => await open6(expected.path, fsConstants4.O_RDONLY | noFollow)
+    async () => await open7(expected.path, fsConstants5.O_RDONLY | noFollow)
   );
   const hash2 = createHash5("sha256");
   const redactionChunks = options.scanRedaction ? [] : void 0;
@@ -35611,7 +36832,7 @@ async function validateCompleteBackup(backupRoot, input, lease) {
       return parseBackupCompletion(
         JSON.parse(
           (await readPrivateFileBounded(
-            join10(backupRoot, BACKUP_COMPLETION_FILE),
+            join11(backupRoot, BACKUP_COMPLETION_FILE),
             MIGRATION_DESCRIPTOR_MAX_BYTES,
             backupRoot
           )).toString("utf8")
@@ -35640,7 +36861,7 @@ async function validateCompleteBackup(backupRoot, input, lease) {
   return { marker, snapshot };
 }
 async function hasMigrationOwnedInventory(runRoot, backupSnapshot, runId, lease) {
-  const inventoryPath = join10(runRoot, ARTIFACT_INVENTORY_FILE);
+  const inventoryPath = join11(runRoot, ARTIFACT_INVENTORY_FILE);
   const inventoryStatus = await migrationStep(lease, async () => await status2(inventoryPath));
   if (!inventoryStatus) return false;
   if (inventoryStatus.isSymbolicLink() || !inventoryStatus.isFile())
@@ -35691,10 +36912,10 @@ async function syncBackupFile(path2, observed, lease) {
   if (observed.isSymbolicLink() || !observed.isFile() || observed.nlink > 1)
     throw new Error(`Storage migration backup payload is unsafe: ${path2}`);
   const expected = backupEntryFingerprint(observed);
-  const noFollow = process.platform === "win32" ? 0 : fsConstants4.O_NOFOLLOW;
+  const noFollow = process.platform === "win32" ? 0 : fsConstants5.O_NOFOLLOW;
   const handle = await acquireMigrationHandle(
     lease,
-    async () => await open6(path2, fsConstants4.O_RDWR | noFollow)
+    async () => await open7(path2, fsConstants5.O_RDWR | noFollow)
   );
   try {
     const before = await migrationStep(lease, async () => await handle.stat());
@@ -35721,7 +36942,7 @@ async function syncBackupTree(root, lease) {
       (left, right) => left.localeCompare(right)
     )) {
       lease.assertHeld();
-      const path2 = join10(directory, name);
+      const path2 = join11(directory, name);
       const metadata = await migrationStep(lease, async () => await lstat9(path2));
       if (metadata.isDirectory() && !metadata.isSymbolicLink()) await visit(path2);
       else await syncBackupFile(path2, metadata, lease);
@@ -35754,10 +36975,10 @@ async function copyLegacySnapshotFile(source, destinationPath, lease, checkpoint
     source,
     "before backup copy"
   );
-  const noFollow = process.platform === "win32" ? 0 : fsConstants4.O_NOFOLLOW;
+  const noFollow = process.platform === "win32" ? 0 : fsConstants5.O_NOFOLLOW;
   const sourceHandle = await acquireMigrationHandle(
     lease,
-    async () => await open6(source.path, fsConstants4.O_RDONLY | noFollow)
+    async () => await open7(source.path, fsConstants5.O_RDONLY | noFollow)
   );
   let destinationHandle;
   try {
@@ -35768,9 +36989,9 @@ async function copyLegacySnapshotFile(source, destinationPath, lease, checkpoint
     );
     destinationHandle = await acquireMigrationHandle(
       lease,
-      async () => await open6(
+      async () => await open7(
         destinationPath,
-        fsConstants4.O_WRONLY | fsConstants4.O_CREAT | fsConstants4.O_EXCL | noFollow,
+        fsConstants5.O_WRONLY | fsConstants5.O_CREAT | fsConstants5.O_EXCL | noFollow,
         384
       )
     );
@@ -35853,7 +37074,7 @@ async function copyLegacySnapshot(sourceRoot, temporaryRoot, snapshot, lease, ch
     );
     await migrationStep(
       lease,
-      async () => await mkdir4(join10(temporaryRoot, ...entry.relativePath.split("/")), { mode: 448 })
+      async () => await mkdir4(join11(temporaryRoot, ...entry.relativePath.split("/")), { mode: 448 })
     );
     await checkpointBackup(
       checkpoint,
@@ -35865,7 +37086,7 @@ async function copyLegacySnapshot(sourceRoot, temporaryRoot, snapshot, lease, ch
     lease.assertHeld();
     await copyLegacySnapshotFile(
       file2,
-      join10(temporaryRoot, ...file2.relativePath.split("/")),
+      join11(temporaryRoot, ...file2.relativePath.split("/")),
       lease,
       checkpoint
     );
@@ -35892,11 +37113,11 @@ async function ensureCompleteBackup(input, sourceSnapshot, lease, checkpoint) {
     lease,
     async () => await validatePrivatePath(
       input.graphcraftRoot,
-      relative7(input.graphcraftRoot, input.runRoot)
+      relative8(input.graphcraftRoot, input.runRoot)
     )
   );
-  const backupBase = join10(input.graphcraftRoot, "migration-backups");
-  const backupParent = join10(backupBase, input.runId);
+  const backupBase = join11(input.graphcraftRoot, "migration-backups");
+  const backupParent = join11(backupBase, input.runId);
   await migrationStep(
     lease,
     async () => await ensurePrivateDirectory(backupBase, input.graphcraftRoot)
@@ -35914,7 +37135,7 @@ async function ensureCompleteBackup(input, sourceSnapshot, lease, checkpoint) {
     legacySnapshotRefreshEvidence(refreshedSource)
   );
   const step = `${input.sourceVersion}-to-${CURRENT_RUN_STORAGE_VERSION}`;
-  const backupRoot = join10(backupParent, step);
+  const backupRoot = join11(backupParent, step);
   const existing = await migrationStep(lease, async () => await status2(backupRoot));
   if (existing) {
     if (existing.isSymbolicLink() || !existing.isDirectory())
@@ -35938,7 +37159,7 @@ async function ensureCompleteBackup(input, sourceSnapshot, lease, checkpoint) {
     await migrationStep(lease, async () => await syncDirectory(backupParent));
     return backupRoot;
   }
-  const temporaryRoot = join10(backupParent, `.${step}.tmp`);
+  const temporaryRoot = join11(backupParent, `.${step}.tmp`);
   const staleTemporary = await migrationStep(lease, async () => await status2(temporaryRoot));
   if (staleTemporary) {
     if (staleTemporary.isSymbolicLink() || !staleTemporary.isDirectory())
@@ -35964,7 +37185,7 @@ async function ensureCompleteBackup(input, sourceSnapshot, lease, checkpoint) {
       targetVersion: CURRENT_RUN_STORAGE_VERSION,
       treeDigest: refreshedSource.digest
     };
-    const completionPath = join10(temporaryRoot, BACKUP_COMPLETION_FILE);
+    const completionPath = join11(temporaryRoot, BACKUP_COMPLETION_FILE);
     await migrationStep(lease, async () => await writeJsonAtomic(completionPath, completion));
     await migrationStep(lease, async () => await hardenPrivateFile(completionPath, temporaryRoot));
     const completionStatus = await migrationStep(lease, async () => await lstat9(completionPath));
@@ -36000,7 +37221,7 @@ async function validateLegacyRun(runRoot, runId, lease) {
   });
   await migrationStep(lease, async () => {
     try {
-      await lstat9(join10(runRoot, "events.jsonl"));
+      await lstat9(join11(runRoot, "events.jsonl"));
     } catch (error51) {
       throw new Error(
         `Legacy run ${runId} cannot migrate because events.jsonl is unavailable: ${error51 instanceof Error ? error51.message : String(error51)}`
@@ -36011,7 +37232,7 @@ async function validateLegacyRun(runRoot, runId, lease) {
     let source;
     try {
       source = (await readPrivateFileBounded(
-        join10(runRoot, "events.jsonl"),
+        join11(runRoot, "events.jsonl"),
         LEGACY_MIGRATION_DESTINATION_LIMITS.maximumEventLogBytes,
         runRoot
       )).toString("utf8");
@@ -36057,7 +37278,7 @@ async function validateInitializingRunStorage(runRoot, runId, manifest2, lease) 
     source = await migrationStep(
       lease,
       async () => await readPrivateFileBounded(
-        join10(runRoot, "events.jsonl"),
+        join11(runRoot, "events.jsonl"),
         LEGACY_MIGRATION_DESTINATION_LIMITS.maximumEventLogBytes,
         runRoot
       )
@@ -36166,7 +37387,7 @@ async function ensureCurrentRunStorage(input) {
   let bodyFailureWasThrown = false;
   try {
     runLock = await acquireActiveAwareLock(
-      join10(input.graphcraftRoot, "locks", `${input.runId}.lock`),
+      join11(input.graphcraftRoot, "locks", `${input.runId}.lock`),
       lease
     );
     lease.addSignal(runLock.signal);
@@ -36277,7 +37498,7 @@ async function ensureCurrentRunStorage(input) {
 import { createHash as createHash6 } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { lstat as lstat10, readlink as readlink3 } from "node:fs/promises";
-import { isAbsolute as isAbsolute9, matchesGlob, relative as relative8, resolve as resolve11, sep as sep7 } from "node:path";
+import { isAbsolute as isAbsolute9, matchesGlob, relative as relative9, resolve as resolve11, sep as sep7 } from "node:path";
 var maximumChangedPaths = 1e4;
 async function gitOutput(repositoryPath, args, signal) {
   signal?.throwIfAborted();
@@ -36297,7 +37518,7 @@ function nulPaths(value) {
 function confinedPath(repositoryPath, path2) {
   if (isAbsolute9(path2)) throw new Error(`Git reported an absolute workspace path: ${path2}`);
   const absolute = resolve11(repositoryPath, path2);
-  const confined = relative8(repositoryPath, absolute);
+  const confined = relative9(repositoryPath, absolute);
   if (confined === ".." || confined.startsWith(`..${sep7}`) || isAbsolute9(confined))
     throw new Error(`Git reported a path outside the workspace: ${path2}`);
   return absolute;
@@ -36561,7 +37782,7 @@ function scopeViolationReason(audit, workspacePath) {
 // packages/runtime/src/instructions.ts
 import { createHash as createHash7 } from "node:crypto";
 import { lstat as lstat11, readlink as readlink4, realpath as realpath6 } from "node:fs/promises";
-import { isAbsolute as isAbsolute10, join as join11, posix as posix2, relative as relative9, sep as sep8 } from "node:path";
+import { isAbsolute as isAbsolute10, join as join12, posix as posix2, relative as relative10, sep as sep8 } from "node:path";
 var SOURCE_ORDER = [
   "agents",
   "claude",
@@ -36969,7 +38190,7 @@ async function readInstructionEntry(input) {
       contentHash: contentHash(rawContent2, PORTABLE_CANONICAL_HASH_ALGORITHM)
     };
   }
-  const absolute = join11(input.repositoryPath, ...input.path.split("/"));
+  const absolute = join12(input.repositoryPath, ...input.path.split("/"));
   const details = await lstat11(absolute);
   input.signal?.throwIfAborted();
   const workingKind = details.isSymbolicLink() ? "symlink" : details.isFile() ? "file" : void 0;
@@ -36989,7 +38210,7 @@ async function readInstructionEntry(input) {
         `Tracked repository instruction ${input.path} uses an unsupported multi-hop symlink chain`
       );
     const target = await realpath6(absolute);
-    const confined = relative9(input.repositoryRealPath, target);
+    const confined = relative10(input.repositoryRealPath, target);
     if (confined === ".." || confined.startsWith(`..${sep8}`) || isAbsolute10(confined))
       throw new Error(
         `Tracked repository instruction ${input.path} resolves outside the repository`
@@ -37579,8 +38800,8 @@ var RunStore = class _RunStore {
   constructor(repositoryRoot, runId, limits = {}, canonicalHashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
     this.repositoryRoot = repositoryRoot;
     this.runId = runId;
-    this.graphcraftRoot = join12(repositoryRoot, ".graphcraft");
-    this.runRoot = join12(this.graphcraftRoot, "runs", runId);
+    this.graphcraftRoot = join13(repositoryRoot, ".graphcraft");
+    this.runRoot = join13(this.graphcraftRoot, "runs", runId);
     this.limits = normalizeLimits(limits);
     this._canonicalHashAlgorithm = canonicalHashAlgorithm;
     this._heldOutProbePlanHashAlgorithm = canonicalHashAlgorithm;
@@ -37599,7 +38820,7 @@ var RunStore = class _RunStore {
   async validateStorageRoot() {
     const graphcraftRoot2 = resolve13(this.graphcraftRoot);
     const runRoot = resolve13(this.runRoot);
-    const validated = await validatePrivatePath(graphcraftRoot2, relative10(graphcraftRoot2, runRoot));
+    const validated = await validatePrivatePath(graphcraftRoot2, relative11(graphcraftRoot2, runRoot));
     if (validated !== runRoot)
       throw new Error(`Run storage path escaped the Graphcraft state directory: ${this.runRoot}`);
   }
@@ -37761,13 +38982,13 @@ var RunStore = class _RunStore {
   async writeBoundedJson(relativePath, value, maximumBytes, label, supersessionPolicy = "strict") {
     const persisted = redactValue(value);
     this.assertJsonProjectionFits(persisted, maximumBytes, label);
-    await writePrivateJsonAtomic(join12(this.runRoot, relativePath), persisted, this.runRoot, {
+    await writePrivateJsonAtomic(join13(this.runRoot, relativePath), persisted, this.runRoot, {
       supersessionPolicy
     });
   }
   async readBoundedJson(relativePath, maximumBytes) {
     const bytes = await readPrivateFileBounded(
-      join12(this.runRoot, relativePath),
+      join13(this.runRoot, relativePath),
       maximumBytes,
       this.runRoot
     );
@@ -37777,7 +38998,7 @@ var RunStore = class _RunStore {
     let bytes;
     try {
       bytes = await readPrivateFileBounded(
-        join12(this.runRoot, relativePath),
+        join13(this.runRoot, relativePath),
         maximumBytes,
         this.runRoot
       );
@@ -37832,14 +39053,14 @@ var RunStore = class _RunStore {
       );
     await ensurePrivateDirectory(store.graphcraftRoot);
     await Promise.all([
-      ensurePrivateDirectory(join12(store.graphcraftRoot, "runs")),
-      ensurePrivateDirectory(join12(store.graphcraftRoot, "locks"))
+      ensurePrivateDirectory(join13(store.graphcraftRoot, "runs")),
+      ensurePrivateDirectory(join13(store.graphcraftRoot, "locks"))
     ]);
     await ensurePrivateDirectory(store.runRoot);
     await Promise.all([
-      ensurePrivateDirectory(join12(store.runRoot, "artifacts")),
-      ensurePrivateDirectory(join12(store.runRoot, "capsules")),
-      ensurePrivateDirectory(join12(store.runRoot, "reports"))
+      ensurePrivateDirectory(join13(store.runRoot, "artifacts")),
+      ensurePrivateDirectory(join13(store.runRoot, "capsules")),
+      ensurePrivateDirectory(join13(store.runRoot, "reports"))
     ]);
     await store.artifacts().initialize();
     await writeInitializingRunStorageManifest(store.runRoot, store.runId);
@@ -37883,7 +39104,7 @@ var RunStore = class _RunStore {
     return store;
   }
   eventsPath() {
-    return join12(this.runRoot, "events.jsonl");
+    return join13(this.runRoot, "events.jsonl");
   }
   createPersistenceLimitBlocker(sequence, kind, algorithm = this.canonicalHashAlgorithm) {
     return createRunEvent(
@@ -37942,11 +39163,11 @@ var RunStore = class _RunStore {
     let created = false;
     let observed;
     let handle;
-    const noFollow = process.platform === "win32" ? 0 : fsConstants5.O_NOFOLLOW;
+    const noFollow = process.platform === "win32" ? 0 : fsConstants6.O_NOFOLLOW;
     try {
-      handle = await open7(
+      handle = await open8(
         this.eventsPath(),
-        fsConstants5.O_WRONLY | fsConstants5.O_APPEND | fsConstants5.O_CREAT | fsConstants5.O_EXCL | noFollow,
+        fsConstants6.O_WRONLY | fsConstants6.O_APPEND | fsConstants6.O_CREAT | fsConstants6.O_EXCL | noFollow,
         384
       );
       created = true;
@@ -37955,9 +39176,9 @@ var RunStore = class _RunStore {
       await validatePrivatePath(this.runRoot, "events.jsonl");
       observed = await lstat12(this.eventsPath(), { bigint: true });
       assertEventLogFile(this.eventsPath(), observed);
-      handle = await open7(
+      handle = await open8(
         this.eventsPath(),
-        fsConstants5.O_WRONLY | fsConstants5.O_APPEND | noFollow,
+        fsConstants6.O_WRONLY | fsConstants6.O_APPEND | noFollow,
         384
       );
     }
@@ -38237,7 +39458,7 @@ var RunStore = class _RunStore {
     const authoritativeBytes = serializedStateBytes(authoritative);
     if (authoritativeBytes > this.limits.maxStateBytes)
       throw new RunStoreLimitError("state", authoritativeBytes, this.limits.maxStateBytes);
-    const statePath = join12(this.runRoot, "state.json");
+    const statePath = join13(this.runRoot, "state.json");
     let materialized;
     let materializedBytes;
     try {
@@ -38487,14 +39708,14 @@ var RunStore = class _RunStore {
     const bytes = serializedStateBytes(state);
     if (bytes > this.limits.maxStateBytes)
       throw new RunStoreLimitError("state", bytes, this.limits.maxStateBytes);
-    await writePrivateJsonAtomic(join12(this.runRoot, "state.json"), state, this.runRoot, {
+    await writePrivateJsonAtomic(join13(this.runRoot, "state.json"), state, this.runRoot, {
       supersessionPolicy: "reconstructable_projection"
     });
   }
 };
 async function listRunIds(repositoryRoot) {
   try {
-    const entries = await readdir4(join12(repositoryRoot, ".graphcraft", "runs"), {
+    const entries = await readdir4(join13(repositoryRoot, ".graphcraft", "runs"), {
       withFileTypes: true
     });
     return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
@@ -38854,19 +40075,19 @@ async function sleepUntilWake(nextWakeAt2, signal) {
 }
 
 // packages/runtime/src/held-out.ts
-import { isAbsolute as isAbsolute12, relative as relative11, resolve as resolve15, sep as sep10 } from "node:path";
+import { isAbsolute as isAbsolute12, relative as relative12, resolve as resolve15, sep as sep10 } from "node:path";
 function relativeRepositoryPath(repositoryRoot, candidate) {
   const root = resolve15(repositoryRoot);
   const path2 = resolve15(repositoryRoot, candidate);
   if (path2 !== root && !path2.startsWith(`${root}${sep10}`)) return void 0;
-  const result = relative11(root, path2);
+  const result = relative12(root, path2);
   return result && !isAbsolute12(result) ? result.split(sep10).join("/") : void 0;
 }
 function relativeRepositoryDirectoryPath(repositoryRoot, candidate) {
   const root = resolve15(repositoryRoot);
   const path2 = resolve15(repositoryRoot, candidate);
   if (path2 !== root && !path2.startsWith(`${root}${sep10}`)) return void 0;
-  const result = relative11(root, path2);
+  const result = relative12(root, path2);
   return result && !isAbsolute12(result) ? result.split(sep10).join("/") : ".";
 }
 async function directoryValueHash(repositoryRoot, path2, algorithm, signal) {
@@ -38875,7 +40096,7 @@ async function directoryValueHash(repositoryRoot, path2, algorithm, signal) {
     assertRepositoryDirectory(repositoryRoot, path2, signal)
   ]);
   signal?.throwIfAborted();
-  const target = relative11(canonicalRoot, canonicalPath);
+  const target = relative12(canonicalRoot, canonicalPath);
   if (isAbsolute12(target) || target === ".." || target.startsWith(`..${sep10}`))
     throw new Error(`Completion working directory ${path2} escapes the repository`);
   return contentHash(
@@ -39124,7 +40345,7 @@ function actionableHeldOutFailures(results) {
 }
 
 // packages/runtime/src/trajectory.ts
-import { randomUUID as randomUUID8 } from "node:crypto";
+import { randomUUID as randomUUID9 } from "node:crypto";
 function probeShape(snapshot) {
   return snapshot.probeResults.map(({ probeId, kind }) => `${kind}:${probeId}`).sort().join("|");
 }
@@ -39204,7 +40425,7 @@ function createProgressDecisionPacket(input) {
   ].slice(-8);
   return ProgressDecisionPacketSchema.parse({
     schemaVersion: 1,
-    packetId: randomUUID8(),
+    packetId: randomUUID9(),
     nodeId: input.nodeId,
     invariant: input.invariant ?? invariant(input.classification),
     attemptedStrategies,
@@ -39229,15 +40450,15 @@ function createProgressDecisionPacket(input) {
 }
 
 // packages/runtime/src/probe-process.ts
-import { randomUUID as randomUUID9 } from "node:crypto";
-import { constants as fsConstants6 } from "node:fs";
-import { open as open8, rmdir as rmdir2, unlink as unlink4 } from "node:fs/promises";
-import { constants as osConstants2 } from "node:os";
-import { dirname as dirname11, join as join13, relative as relative12 } from "node:path";
+import { randomUUID as randomUUID10 } from "node:crypto";
+import { constants as fsConstants7 } from "node:fs";
+import { open as open9, rmdir as rmdir3, unlink as unlink5 } from "node:fs/promises";
+import { constants as osConstants4 } from "node:os";
+import { dirname as dirname12, join as join14, relative as relative13 } from "node:path";
 var PROBE_PROCESS_JOURNAL_MAX_BYTES = 64 * 1024;
 var PROBE_PROCESS_SETTLEMENT_WAIT_MS = process.platform === "win32" ? 12e3 : 6e3;
 var PROBE_PROCESS_REMOVAL_RETRY_MS = 2e3;
-var WINDOWS_TRANSIENT_REMOVAL_ERRORS = /* @__PURE__ */ new Set(["EACCES", "EBUSY", "EPERM"]);
+var WINDOWS_TRANSIENT_REMOVAL_ERRORS2 = /* @__PURE__ */ new Set(["EACCES", "EBUSY", "EPERM"]);
 var probeProcessRunMutationTails = /* @__PURE__ */ new Map();
 function commandHash(probe, hashAlgorithm = LEGACY_CANONICAL_HASH_ALGORITHM) {
   return contentHash(
@@ -39284,7 +40505,7 @@ function parseProbeProcessDefinitions(value) {
     if (item === null || typeof item !== "object" || Array.isArray(item)) return void 0;
     const record2 = item;
     const candidate = item;
-    if (!exactKeys(record2, ["schemaVersion", "executionId", "probeId", "commandHash"]) || candidate.schemaVersion !== 1 || typeof candidate.executionId !== "string" || !/^[a-f0-9]{64}$/.test(candidate.executionId) || typeof candidate.probeId !== "string" || candidate.probeId.length === 0 || typeof candidate.commandHash !== "string" || !/^[a-f0-9]{64}$/.test(candidate.commandHash))
+    if (!exactKeys3(record2, ["schemaVersion", "executionId", "probeId", "commandHash"]) || candidate.schemaVersion !== 1 || typeof candidate.executionId !== "string" || !/^[a-f0-9]{64}$/.test(candidate.executionId) || typeof candidate.probeId !== "string" || candidate.probeId.length === 0 || typeof candidate.commandHash !== "string" || !/^[a-f0-9]{64}$/.test(candidate.commandHash))
       return void 0;
     definitions.push(candidate);
   }
@@ -39309,7 +40530,7 @@ function probeProcessEventSettlement(input) {
   if (settlement === null || typeof settlement !== "object" || Array.isArray(settlement))
     return void 0;
   const candidate = settlement;
-  if (!exactKeys(candidate, [
+  if (!exactKeys3(candidate, [
     "schemaVersion",
     "executionId",
     "brokerPid",
@@ -39321,7 +40542,7 @@ function probeProcessEventSettlement(input) {
     "settledAt"
   ]) || candidate.schemaVersion !== 1 || candidate.executionId !== input.executionId || !Number.isSafeInteger(candidate.brokerPid) || Number(candidate.brokerPid) <= 0 || input.brokerPid !== void 0 && candidate.brokerPid !== input.brokerPid || candidate.childPid !== null && (!Number.isSafeInteger(candidate.childPid) || Number(candidate.childPid) <= 0) || typeof candidate.confirmed !== "boolean" || !["exited", "terminated", "cancelled_before_start", "failed_to_start", "unconfirmed"].includes(
     String(candidate.outcome)
-  ) || candidate.exitCode !== null && !Number.isInteger(candidate.exitCode) || candidate.exitSignal !== null && (typeof candidate.exitSignal !== "string" || !Object.prototype.hasOwnProperty.call(osConstants2.signals, candidate.exitSignal)) || typeof candidate.settledAt !== "string" || !Number.isFinite(Date.parse(candidate.settledAt)) || candidate.confirmed === true && candidate.outcome === "unconfirmed" || candidate.confirmed === false && candidate.outcome !== "unconfirmed" || ["exited", "terminated"].includes(String(candidate.outcome)) && (!Number.isSafeInteger(candidate.childPid) || Number(candidate.childPid) <= 0) || ["cancelled_before_start", "failed_to_start"].includes(String(candidate.outcome)) && (candidate.childPid !== null || candidate.exitCode !== null || candidate.exitSignal !== null))
+  ) || candidate.exitCode !== null && !Number.isInteger(candidate.exitCode) || candidate.exitSignal !== null && (typeof candidate.exitSignal !== "string" || !Object.prototype.hasOwnProperty.call(osConstants4.signals, candidate.exitSignal)) || typeof candidate.settledAt !== "string" || !Number.isFinite(Date.parse(candidate.settledAt)) || candidate.confirmed === true && candidate.outcome === "unconfirmed" || candidate.confirmed === false && candidate.outcome !== "unconfirmed" || ["exited", "terminated"].includes(String(candidate.outcome)) && (!Number.isSafeInteger(candidate.childPid) || Number(candidate.childPid) <= 0) || ["cancelled_before_start", "failed_to_start"].includes(String(candidate.outcome)) && (candidate.childPid !== null || candidate.exitCode !== null || candidate.exitSignal !== null))
     return void 0;
   return {
     confirmed: candidate.confirmed,
@@ -39329,8 +40550,8 @@ function probeProcessEventSettlement(input) {
     outcome: String(candidate.outcome)
   };
 }
-function journalPath(graphcraftRoot2, runId, executionId) {
-  return join13(graphcraftRoot2, "locks", "probe-processes", runId, `${executionId}.jsonl`);
+function journalPath2(graphcraftRoot2, runId, executionId) {
+  return join14(graphcraftRoot2, "locks", "probe-processes", runId, `${executionId}.jsonl`);
 }
 async function withProbeProcessRunMutation(runRoot, action) {
   const previous = probeProcessRunMutationTails.get(runRoot) ?? Promise.resolve();
@@ -39347,29 +40568,29 @@ async function withProbeProcessRunMutation(runRoot, action) {
       probeProcessRunMutationTails.delete(runRoot);
   }
 }
-function serialized(value) {
+function serialized2(value) {
   return `${JSON.stringify(value)}
 `;
 }
 async function createProbeProcessLease(input) {
-  const root = join13(input.graphcraftRoot, "locks", "probe-processes", input.runId);
+  const root = join14(input.graphcraftRoot, "locks", "probe-processes", input.runId);
   return await withProbeProcessRunMutation(root, async () => {
     await ensurePrivateDirectory(root, input.graphcraftRoot);
-    const path2 = journalPath(input.graphcraftRoot, input.runId, input.definition.executionId);
-    await validatePrivatePath(input.graphcraftRoot, relative12(input.graphcraftRoot, path2));
+    const path2 = journalPath2(input.graphcraftRoot, input.runId, input.definition.executionId);
+    await validatePrivatePath(input.graphcraftRoot, relative13(input.graphcraftRoot, path2));
     const directoryMutation = await preparePrivateDirectoryMutation(
-      dirname11(path2),
+      dirname12(path2),
       input.graphcraftRoot
     );
-    const noFollow = process.platform === "win32" ? 0 : fsConstants6.O_NOFOLLOW;
+    const noFollow = process.platform === "win32" ? 0 : fsConstants7.O_NOFOLLOW;
     let handle;
     try {
-      handle = await open8(
+      handle = await open9(
         path2,
-        fsConstants6.O_CREAT | fsConstants6.O_EXCL | fsConstants6.O_RDWR | fsConstants6.O_APPEND | noFollow,
+        fsConstants7.O_CREAT | fsConstants7.O_EXCL | fsConstants7.O_RDWR | fsConstants7.O_APPEND | noFollow,
         384
       );
-      const ownerToken = randomUUID9();
+      const ownerToken = randomUUID10();
       const prepared = {
         schemaVersion: 1,
         executionId: input.definition.executionId,
@@ -39382,7 +40603,7 @@ async function createProbeProcessLease(input) {
         commandHash: input.definition.commandHash,
         preparedAt: (/* @__PURE__ */ new Date()).toISOString()
       };
-      await handle.write(serialized(prepared));
+      await handle.write(serialized2(prepared));
       await handle.sync();
       await hardenPrivateFile(path2, input.graphcraftRoot);
       await finalizePrivateDirectoryMutation(directoryMutation, input.graphcraftRoot);
@@ -39393,7 +40614,7 @@ async function createProbeProcessLease(input) {
           input.hashAlgorithm ?? LEGACY_CANONICAL_HASH_ALGORITHM
         ),
         journalPath: path2,
-        journalRelativePath: relative12(input.graphcraftRoot, path2).replaceAll("\\", "/"),
+        journalRelativePath: relative13(input.graphcraftRoot, path2).replaceAll("\\", "/"),
         handle,
         lifecycle: ({ onReady, onSettled }) => ({
           executionId: input.definition.executionId,
@@ -39412,23 +40633,23 @@ async function createProbeProcessLease(input) {
     }
   });
 }
-function strictObject2(value) {
+function strictObject3(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : void 0;
 }
-function positivePid(value) {
+function positivePid4(value) {
   return Number.isSafeInteger(value) && Number(value) > 0;
 }
-function exactKeys(record2, expected) {
+function exactKeys3(record2, expected) {
   const actual = Object.keys(record2).sort();
   const sortedExpected = [...expected].sort();
   return actual.length === sortedExpected.length && actual.every((key, index) => key === sortedExpected[index]);
 }
-function validDate(value) {
+function validDate2(value) {
   return typeof value === "string" && Number.isFinite(Date.parse(value));
 }
-function parsePrepared(value) {
-  const record2 = strictObject2(value);
-  if (!record2 || !exactKeys(record2, [
+function parsePrepared2(value) {
+  const record2 = strictObject3(value);
+  if (!record2 || !exactKeys3(record2, [
     "schemaVersion",
     "executionId",
     "ownerToken",
@@ -39445,27 +40666,27 @@ function parsePrepared(value) {
     return void 0;
   return record2;
 }
-function parseBroker(value) {
-  const record2 = strictObject2(value);
+function parseBroker2(value) {
+  const record2 = strictObject3(value);
   if (!record2 || record2.schemaVersion !== 1 || typeof record2.executionId !== "string" || !/^[a-f0-9]{64}$/.test(record2.executionId) || typeof record2.ownerToken !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
     record2.ownerToken
-  ) || !positivePid(record2.brokerPid) || !["ready", "starting", "started", "settled"].includes(String(record2.status)))
+  ) || !positivePid4(record2.brokerPid) || !["ready", "starting", "started", "settled"].includes(String(record2.status)))
     return void 0;
-  if (record2.status === "ready" && (!exactKeys(record2, [
+  if (record2.status === "ready" && (!exactKeys3(record2, [
     "schemaVersion",
     "executionId",
     "ownerToken",
     "brokerPid",
     "status",
     "readyAt"
-  ]) || !validDate(record2.readyAt)) || record2.status === "starting" && (!exactKeys(record2, [
+  ]) || !validDate2(record2.readyAt)) || record2.status === "starting" && (!exactKeys3(record2, [
     "schemaVersion",
     "executionId",
     "ownerToken",
     "brokerPid",
     "status",
     "startingAt"
-  ]) || !validDate(record2.startingAt)) || record2.status === "started" && (!exactKeys(record2, [
+  ]) || !validDate2(record2.startingAt)) || record2.status === "started" && (!exactKeys3(record2, [
     "schemaVersion",
     "executionId",
     "ownerToken",
@@ -39473,7 +40694,7 @@ function parseBroker(value) {
     "status",
     "childPid",
     "startedAt"
-  ]) || !positivePid(record2.childPid) || !validDate(record2.startedAt)) || record2.status === "settled" && (!exactKeys(record2, [
+  ]) || !positivePid4(record2.childPid) || !validDate2(record2.startedAt)) || record2.status === "settled" && (!exactKeys3(record2, [
     "schemaVersion",
     "executionId",
     "ownerToken",
@@ -39485,18 +40706,18 @@ function parseBroker(value) {
     "exitCode",
     "exitSignal",
     "settledAt"
-  ]) || record2.childPid !== null && !positivePid(record2.childPid) || ![
+  ]) || record2.childPid !== null && !positivePid4(record2.childPid) || ![
     "exited",
     "terminated",
     "cancelled_before_start",
     "failed_to_start",
     "unconfirmed"
-  ].includes(String(record2.outcome)) || typeof record2.confirmed !== "boolean" || record2.exitCode !== null && !Number.isInteger(record2.exitCode) || record2.exitSignal !== null && (typeof record2.exitSignal !== "string" || !Object.prototype.hasOwnProperty.call(osConstants2.signals, record2.exitSignal)) || !validDate(record2.settledAt) || record2.confirmed === true && record2.outcome === "unconfirmed" || record2.confirmed === false && record2.outcome !== "unconfirmed" || ["exited", "terminated"].includes(String(record2.outcome)) && !positivePid(record2.childPid) || ["cancelled_before_start", "failed_to_start"].includes(String(record2.outcome)) && (record2.childPid !== null || record2.exitCode !== null || record2.exitSignal !== null)))
+  ].includes(String(record2.outcome)) || typeof record2.confirmed !== "boolean" || record2.exitCode !== null && !Number.isInteger(record2.exitCode) || record2.exitSignal !== null && (typeof record2.exitSignal !== "string" || !Object.prototype.hasOwnProperty.call(osConstants4.signals, record2.exitSignal)) || !validDate2(record2.settledAt) || record2.confirmed === true && record2.outcome === "unconfirmed" || record2.confirmed === false && record2.outcome !== "unconfirmed" || ["exited", "terminated"].includes(String(record2.outcome)) && !positivePid4(record2.childPid) || ["cancelled_before_start", "failed_to_start"].includes(String(record2.outcome)) && (record2.childPid !== null || record2.exitCode !== null || record2.exitSignal !== null)))
     return void 0;
   return record2;
 }
 async function inspectProbeProcessJournal(input) {
-  const path2 = journalPath(input.graphcraftRoot, input.runId, input.definition.executionId);
+  const path2 = journalPath2(input.graphcraftRoot, input.runId, input.definition.executionId);
   let source;
   try {
     source = await readPrivateFileBounded(
@@ -39510,7 +40731,7 @@ async function inspectProbeProcessJournal(input) {
   }
   const lines = source.toString("utf8").split("\n").filter((line2) => line2.length > 0);
   if (lines.length === 0) throw new Error("Probe process journal is empty");
-  const prepared = parsePrepared(JSON.parse(lines[0]));
+  const prepared = parsePrepared2(JSON.parse(lines[0]));
   if (!prepared || prepared.executionId !== input.definition.executionId || prepared.checkpointId !== input.checkpointId || prepared.nodeId !== input.nodeId || prepared.stage !== input.stage || prepared.probeId !== input.definition.probeId || prepared.commandHash !== input.definition.commandHash || input.ownerTokenHash !== void 0 && contentHash(prepared.ownerToken, input.hashAlgorithm ?? LEGACY_CANONICAL_HASH_ALGORITHM) !== input.ownerTokenHash)
     throw new Error(
       `Probe process ${input.definition.executionId} has ambiguous ownership metadata`
@@ -39519,7 +40740,7 @@ async function inspectProbeProcessJournal(input) {
   let brokerPid;
   let settlement;
   for (const line2 of lines.slice(1)) {
-    const record2 = parseBroker(JSON.parse(line2));
+    const record2 = parseBroker2(JSON.parse(line2));
     if (!record2 || record2.executionId !== prepared.executionId || record2.ownerToken !== prepared.ownerToken || brokerPid !== void 0 && record2.brokerPid !== brokerPid)
       throw new Error(`Probe process ${input.definition.executionId} has an invalid journal chain`);
     brokerPid ??= record2.brokerPid;
@@ -39532,7 +40753,7 @@ async function inspectProbeProcessJournal(input) {
         schemaVersion: 1,
         executionId: prepared.executionId,
         brokerPid: record2.brokerPid,
-        childPid: positivePid(record2.childPid) ? record2.childPid : null,
+        childPid: positivePid4(record2.childPid) ? record2.childPid : null,
         outcome: record2.outcome,
         confirmed: record2.confirmed,
         exitCode: Number.isInteger(record2.exitCode) ? record2.exitCode : null,
@@ -39562,7 +40783,7 @@ async function waitForProbeProcessSettlement(input, timeoutMs = PROBE_PROCESS_SE
 async function closeProbeProcessLease(lease) {
   await lease.handle.close();
 }
-async function retryWindowsRemoval(action, ignoredErrors) {
+async function retryWindowsRemoval2(action, ignoredErrors) {
   const deadline = Date.now() + PROBE_PROCESS_REMOVAL_RETRY_MS;
   let delayMs = 5;
   while (true) {
@@ -39572,7 +40793,7 @@ async function retryWindowsRemoval(action, ignoredErrors) {
     } catch (error51) {
       const code = error51.code ?? "";
       if (ignoredErrors.has(code)) return;
-      if (process.platform !== "win32" || !WINDOWS_TRANSIENT_REMOVAL_ERRORS.has(code) || Date.now() >= deadline)
+      if (process.platform !== "win32" || !WINDOWS_TRANSIENT_REMOVAL_ERRORS2.has(code) || Date.now() >= deadline)
         throw error51;
       await new Promise((resolve22) => setTimeout(resolve22, delayMs));
       delayMs = Math.min(100, delayMs * 2);
@@ -39580,15 +40801,15 @@ async function retryWindowsRemoval(action, ignoredErrors) {
   }
 }
 async function removeProbeProcessJournal(input) {
-  const runRoot = join13(input.graphcraftRoot, "locks", "probe-processes", input.runId);
-  const path2 = journalPath(input.graphcraftRoot, input.runId, input.executionId);
+  const runRoot = join14(input.graphcraftRoot, "locks", "probe-processes", input.runId);
+  const path2 = journalPath2(input.graphcraftRoot, input.runId, input.executionId);
   await withProbeProcessRunMutation(runRoot, async () => {
-    const mutation = await preparePrivateDirectoryMutation(dirname11(path2), input.graphcraftRoot);
+    const mutation = await preparePrivateDirectoryMutation(dirname12(path2), input.graphcraftRoot);
     try {
-      await retryWindowsRemoval(
+      await retryWindowsRemoval2(
         async () => {
-          await validatePrivatePath(input.graphcraftRoot, relative12(input.graphcraftRoot, path2));
-          await unlink4(path2);
+          await validatePrivatePath(input.graphcraftRoot, relative13(input.graphcraftRoot, path2));
+          await unlink5(path2);
         },
         /* @__PURE__ */ new Set(["ENOENT"])
       );
@@ -39596,12 +40817,12 @@ async function removeProbeProcessJournal(input) {
       await finalizePrivateDirectoryMutation(mutation, input.graphcraftRoot);
     }
     const parentMutation = await preparePrivateDirectoryMutation(
-      dirname11(runRoot),
+      dirname12(runRoot),
       input.graphcraftRoot
     );
     try {
-      await retryWindowsRemoval(
-        async () => await rmdir2(runRoot),
+      await retryWindowsRemoval2(
+        async () => await rmdir3(runRoot),
         /* @__PURE__ */ new Set(["ENOENT", "ENOTEMPTY", "EEXIST"])
       );
     } finally {
@@ -39628,10 +40849,11 @@ function compareGitHubIdentityStrings(left, right, hashAlgorithm) {
 function commandOptions(workspace, options = {}) {
   return { cwd: workspace.path, ...options };
 }
-function mutationCommandOptions(workspace, options, signal) {
+function mutationCommandOptions(workspace, options, signal, lifecycle) {
   return {
     ...commandOptions(workspace, options),
-    ...signal ? { signal } : {}
+    ...signal ? { signal } : {},
+    ...lifecycle ? { lifecycle } : {}
   };
 }
 function throwIfGitHubMutationCancelledBeforeDispatch(signal) {
@@ -39897,7 +41119,7 @@ async function reconcilePullRequest(workspace, claim, hashAlgorithm, options = {
     evidence: [...bindingEvidence, `Pull request #${current.number} carries the action marker`]
   };
 }
-async function performPullRequestCreation(workspace, claim, hashAlgorithm, markDispatched, options = {}, boundary, signal) {
+async function performPullRequestCreation(workspace, claim, hashAlgorithm, prepareProcess, options = {}, boundary, signal) {
   if (claim.kind !== "github_pr_create")
     throw new Error(`Side effect ${claim.actionId} is not a pull-request creation`);
   const expected = pullRequestPrecondition(claim);
@@ -39914,8 +41136,8 @@ async function performPullRequestCreation(workspace, claim, hashAlgorithm, markD
     throw new Error(`Pull-request body changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
   throwIfGitHubMutationCancelledBeforeDispatch(signal);
-  await markDispatched();
-  await createGitHubPullRequest(mutationCommandOptions(workspace, options, signal), {
+  const lifecycle = await prepareProcess({ managedProcess: true }) || void 0;
+  await createGitHubPullRequest(mutationCommandOptions(workspace, options, signal, lifecycle), {
     nameWithOwner: expected.nameWithOwner,
     headRefName: expected.headRefName,
     baseRefName: expected.baseRefName,
@@ -40325,7 +41547,7 @@ async function reconcileReviewReply(workspace, claim, hashAlgorithm, options) {
     evidence: [...evidence, `Review thread ${thread.id} has no action reply yet`]
   };
 }
-async function performReviewReply(workspace, claim, hashAlgorithm, options, markDispatched, boundary, signal) {
+async function performReviewReply(workspace, claim, hashAlgorithm, options, prepareProcess, boundary, signal) {
   const expected = reviewReplyPrecondition(claim);
   await assertPullRequestBinding(workspace, expected, expected.number, options);
   const thread = await readGitHubReviewThread(commandOptions(workspace, options), {
@@ -40340,9 +41562,9 @@ async function performReviewReply(workspace, claim, hashAlgorithm, options, mark
     throw new Error(`Review reply body changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
   throwIfGitHubMutationCancelledBeforeDispatch(signal);
-  await markDispatched();
+  const lifecycle = await prepareProcess({ managedProcess: true }) || void 0;
   const reply = await addGitHubReviewThreadReply(
-    mutationCommandOptions(workspace, options, signal),
+    mutationCommandOptions(workspace, options, signal, lifecycle),
     {
       host: expected.host,
       threadId: expected.threadId,
@@ -40428,7 +41650,7 @@ async function reconcileReviewResolution(workspace, claim, hashAlgorithm, option
     evidence: [...evidence, `Review thread ${thread.id} remains unresolved`]
   };
 }
-async function performReviewResolution(workspace, claim, hashAlgorithm, options, markDispatched, boundary, signal) {
+async function performReviewResolution(workspace, claim, hashAlgorithm, options, prepareProcess, boundary, signal) {
   const expected = reviewResolutionPrecondition(claim);
   await assertPullRequestBinding(workspace, expected, expected.number, options);
   const thread = await readGitHubReviewThread(commandOptions(workspace, options), {
@@ -40442,9 +41664,9 @@ async function performReviewResolution(workspace, claim, hashAlgorithm, options,
     throw new Error(`Review thread ${expected.threadId} is not ready for resolution`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
   throwIfGitHubMutationCancelledBeforeDispatch(signal);
-  await markDispatched();
+  const lifecycle = await prepareProcess({ managedProcess: true }) || void 0;
   const resolved = await resolveGitHubReviewThread(
-    mutationCommandOptions(workspace, options, signal),
+    mutationCommandOptions(workspace, options, signal, lifecycle),
     {
       host: expected.host,
       threadId: expected.threadId,
@@ -40577,7 +41799,7 @@ async function reconcileCheckRerun(workspace, claim, hashAlgorithm, options) {
     ]
   };
 }
-async function performCheckRerun(workspace, claim, hashAlgorithm, options, markDispatched, boundary, signal) {
+async function performCheckRerun(workspace, claim, hashAlgorithm, options, prepareProcess, boundary, signal) {
   const expected = checkRerunPrecondition(claim);
   const current = await currentBoundCheck(workspace, expected, hashAlgorithm, options);
   const check2 = current.check;
@@ -40585,8 +41807,8 @@ async function performCheckRerun(workspace, claim, hashAlgorithm, options, markD
     throw new Error(`Check run ${expected.checkId} moved before rerun`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
   throwIfGitHubMutationCancelledBeforeDispatch(signal);
-  await markDispatched();
-  await rerequestGitHubCheckRun(mutationCommandOptions(workspace, options, signal), {
+  const lifecycle = await prepareProcess({ managedProcess: true }) || void 0;
+  await rerequestGitHubCheckRun(mutationCommandOptions(workspace, options, signal, lifecycle), {
     host: expected.host,
     nameWithOwner: expected.nameWithOwner,
     databaseId: expected.databaseId
@@ -41548,7 +42770,7 @@ async function createRun(task, options) {
 }
 async function configureRunProbes(store, input) {
   await store.prepareStorage();
-  const lock = new RunLock(join14(store.graphcraftRoot, "locks", `${store.runId}.lock`));
+  const lock = new RunLock(join15(store.graphcraftRoot, "locks", `${store.runId}.lock`));
   await lock.acquire();
   try {
     const state = await store.loadState();
@@ -41592,7 +42814,7 @@ async function configureRunProbes(store, input) {
   }
 }
 async function executeWorker(input) {
-  let invocationId = input.resume?.invocationId ?? randomUUID10();
+  let invocationId = input.resume?.invocationId ?? randomUUID11();
   let resumeSessionId = input.reuseSession?.hostSessionId;
   const preparedContext = await prepareWorkerContext({
     store: input.store,
@@ -41628,12 +42850,12 @@ async function executeWorker(input) {
         },
         invocationId
       );
-      invocationId = randomUUID10();
+      invocationId = randomUUID11();
       resumeSessionId = void 0;
     } else {
       const reconciliation = await input.adapter.reconcile(input.resume);
       if (reconciliation.state === "completed" && reconciliation.result) {
-        const artifact2 = join14(
+        const artifact2 = join15(
           input.store.runRoot,
           "artifacts",
           "invocations",
@@ -41680,7 +42902,7 @@ async function executeWorker(input) {
           },
           invocationId
         );
-        invocationId = randomUUID10();
+        invocationId = randomUUID11();
         resumeSessionId = void 0;
       }
     }
@@ -41734,7 +42956,7 @@ async function executeWorker(input) {
   let termination;
   let usageReceipts = 0;
   const tokenPhase = input.node.id.startsWith("repair-") ? "repair" : "worker";
-  let artifact = join14(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
+  let artifact = join15(input.store.runRoot, "artifacts", "invocations", `${invocationId}.jsonl`);
   let preInvocationDiagnostic;
   try {
     await reconcileStoredRunWorkspace(input.store, input.contract, input.workspace, input.signal);
@@ -42199,7 +43421,7 @@ function stableSemanticProbeEvidence(results, algorithm) {
   );
 }
 async function runSemanticVerification(input) {
-  const invocationId = randomUUID10();
+  const invocationId = randomUUID11();
   let context;
   let beforeScope;
   try {
@@ -42499,7 +43721,7 @@ function concurrencyConflict(graph, left, right) {
 function runtimeOptimizationDecision(input) {
   return OptimizationDecisionSchema.parse({
     schemaVersion: 1,
-    decisionId: randomUUID10(),
+    decisionId: randomUUID11(),
     ...input
   });
 }
@@ -42663,7 +43885,7 @@ function repairAmendment(graph, verification, failures) {
   };
   return {
     schemaVersion: 1,
-    amendmentId: randomUUID10(),
+    amendmentId: randomUUID11(),
     operations: [
       { operation: "add", node: repair, authoritySourceIds: originalDependencies },
       {
@@ -42793,7 +44015,7 @@ function githubLifecycleRepairAmendment(input) {
   };
   return {
     schemaVersion: 1,
-    amendmentId: randomUUID10(),
+    amendmentId: randomUUID11(),
     operations: [
       { operation: "add", node: repair, authoritySourceIds: [previousBoundaryId] },
       { operation: "add", node: verification, authoritySourceIds: [repairId] },
@@ -43097,7 +44319,7 @@ async function executeReadOnlyProgressProbes(input) {
       nodeId: input.node.id,
       stage: input.stage,
       baselineDigest: baseline.digest,
-      nonce: randomUUID10()
+      nonce: randomUUID11()
     },
     input.store.probeEvidenceCheckpointHashAlgorithm
   );
@@ -43305,6 +44527,9 @@ var executionCheckpointEventTypes = /* @__PURE__ */ new Set([
   "probe.process.reconciled",
   "side_effect.claimed",
   "side_effect.dispatched",
+  "side_effect.process.started",
+  "side_effect.process.finished",
+  "side_effect.process.reconciled",
   "side_effect.reconciled",
   "side_effect.confirmed",
   "side_effect.failed",
@@ -44301,7 +45526,7 @@ async function executeRun(input) {
   const externalSignal = input.signal ?? new AbortController().signal;
   const contract = await input.store.loadContract();
   let graph = await input.store.loadGraph();
-  const lock = new RunLock(join14(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
+  const lock = new RunLock(join15(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
   await lock.acquire();
   const lockSignal = lock.signal;
   const ownedStore = new Proxy(input.store, {
@@ -44718,7 +45943,7 @@ async function executeRun(input) {
         if (contextOptimization.reuseSession)
           reuseSessions.set(candidate.id, contextOptimization.reuseSession);
       }
-      const batchId = randomUUID10();
+      const batchId = randomUUID11();
       for (const candidate of batch) {
         input.observer?.({
           type: "status",
@@ -46160,8 +47385,8 @@ var BoundedTranscriptCapture = class {
   tail = Buffer.alloc(0);
   observedBytes = 0;
   append(entry) {
-    const serialized2 = JSON.stringify(redactValue(entry)) ?? "null";
-    const chunk = Buffer.from(`${redactString(serialized2)}
+    const serialized3 = JSON.stringify(redactValue(entry)) ?? "null";
+    const chunk = Buffer.from(`${redactString(serialized3)}
 `, "utf8");
     this.observedBytes += chunk.length;
     if (!this.head && this.complete.length + chunk.length <= BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES) {
@@ -46229,8 +47454,8 @@ var BoundedTranscriptCapture = class {
   }
 };
 async function capturePatch(repository, baseSha, identity) {
-  const temporaryRoot = await mkdtemp3(join15(tmpdir3(), "graphcraft-benchmark-review-index-"));
-  const environment = { GIT_INDEX_FILE: join15(temporaryRoot, "index") };
+  const temporaryRoot = await mkdtemp3(join16(tmpdir3(), "graphcraft-benchmark-review-index-"));
+  const environment = { GIT_INDEX_FILE: join16(temporaryRoot, "index") };
   try {
     const initialized = await runProcess("git", ["read-tree", baseSha], {
       cwd: repository,
@@ -46376,12 +47601,12 @@ async function loadBenchmarkSuite(path2) {
 }
 async function materializeTask(task, hashAlgorithm) {
   const repository = await realpath7(
-    await mkdtemp3(join15(tmpdir3(), `graphcraft-benchmark-${task.id}-`))
+    await mkdtemp3(join16(tmpdir3(), `graphcraft-benchmark-${task.id}-`))
   );
   try {
     for (const [path2, value] of Object.entries(task.initialFiles)) {
       const target = safeFixturePath(repository, path2);
-      await mkdir5(dirname12(target), { recursive: true });
+      await mkdir5(dirname13(target), { recursive: true });
       await writeFile2(target, value, "utf8");
     }
     const initialized = await runProcess("git", ["init", "-b", "main"], { cwd: repository });
@@ -46436,7 +47661,7 @@ async function materializeTask(task, hashAlgorithm) {
   }
 }
 function benchmarkWorktreeRoot(repository) {
-  return join15(dirname12(repository), `.${basename5(repository)}-graphcraft-worktrees`);
+  return join16(dirname13(repository), `.${basename5(repository)}-graphcraft-worktrees`);
 }
 async function removeBenchmarkFixture(repository) {
   const failures = [];
@@ -46505,9 +47730,9 @@ async function scoreAcceptance(task, repository, hashAlgorithm, summaryEvidence 
     }
     const scorerSource = task.initialFiles[check2.scorerPath];
     const sourcePath = safeFixturePath(repository, check2.scorerPath);
-    const trustedScorerPath = join15(
-      dirname12(sourcePath),
-      `.graphcraft-benchmark-scorer-${randomUUID11()}${extname2(sourcePath)}`
+    const trustedScorerPath = join16(
+      dirname13(sourcePath),
+      `.graphcraft-benchmark-scorer-${randomUUID12()}${extname2(sourcePath)}`
     );
     try {
       await writeFile2(trustedScorerPath, scorerSource, {
@@ -46778,7 +48003,7 @@ async function runBaselineTrial(input) {
   let interruption;
   const capsule = ContextCapsuleSchema.parse({
     schemaVersion: 1,
-    runId: randomUUID11(),
+    runId: randomUUID12(),
     nodeId: `baseline-${input.task.id}`,
     objective: input.task.task,
     finishLine: { kind: "local_verified" },
@@ -47461,9 +48686,9 @@ async function runBenchmark(input) {
 }
 
 // packages/runtime/src/benchmark-publication.ts
-import { createHash as createHash8, randomUUID as randomUUID12 } from "node:crypto";
-import { link, lstat as lstat15, mkdir as mkdir6, open as open9, realpath as realpath8, rm as rm6, unlink as unlink5 } from "node:fs/promises";
-import { basename as basename6, dirname as dirname13, join as join16, resolve as resolve17 } from "node:path";
+import { createHash as createHash8, randomUUID as randomUUID13 } from "node:crypto";
+import { link, lstat as lstat15, mkdir as mkdir6, open as open10, realpath as realpath8, rm as rm6, unlink as unlink6 } from "node:fs/promises";
+import { basename as basename6, dirname as dirname14, join as join17, resolve as resolve17 } from "node:path";
 var LEGACY_REVIEW_POLICY = "bounded_redacted_patch_and_transcript_v1";
 var PORTABLE_REVIEW_POLICY = "bounded_redacted_patch_and_transcript_v2";
 var LEGACY_BLINDED_REVIEW_POLICY = "opaque_blinded_review_v1";
@@ -48525,8 +49750,8 @@ async function canonicalTarget(path2) {
     return await realpath8(absolute);
   } catch (error51) {
     if (error51.code !== "ENOENT") throw error51;
-    const parent = await realpath8(dirname13(absolute)).catch(() => resolve17(dirname13(absolute)));
-    return join16(parent, basename6(absolute));
+    const parent = await realpath8(dirname14(absolute)).catch(() => resolve17(dirname14(absolute)));
+    return join17(parent, basename6(absolute));
   }
 }
 async function assertDistinctOutput(outputPath, protectedPaths) {
@@ -48546,11 +49771,11 @@ async function assertCreateOnlyOutput(path2) {
   throw new Error(`Derived benchmark output already exists; refusing to overwrite: ${path2}`);
 }
 async function writeTextCreateOnly(path2, text) {
-  await mkdir6(dirname13(path2), { recursive: true });
+  await mkdir6(dirname14(path2), { recursive: true });
   await assertCreateOnlyOutput(path2);
-  const temporaryPath = `${path2}.${process.pid}.${randomUUID12()}.tmp`;
+  const temporaryPath = `${path2}.${process.pid}.${randomUUID13()}.tmp`;
   try {
-    const handle = await open9(temporaryPath, "wx", 384);
+    const handle = await open10(temporaryPath, "wx", 384);
     let publishedIdentity;
     try {
       await handle.writeFile(text, "utf8");
@@ -48571,13 +49796,13 @@ async function writeTextCreateOnly(path2, text) {
         throw new Error(`Derived benchmark output already exists; refusing to overwrite: ${path2}`);
       throw error51;
     }
-    await unlink5(temporaryPath);
+    await unlink6(temporaryPath);
     const published = await lstat15(path2, { bigint: true });
     if (published.isSymbolicLink() || !published.isFile() || published.nlink !== 1n)
       throw new Error(`Derived benchmark output is not a private regular file: ${path2}`);
     if (publishedIdentity.inode !== 0n && (published.dev !== publishedIdentity.device || published.ino !== publishedIdentity.inode))
       throw new Error(`Derived benchmark output identity changed during publication: ${path2}`);
-    await syncDirectory(dirname13(path2));
+    await syncDirectory(dirname14(path2));
   } catch (error51) {
     await rm6(temporaryPath, { force: true }).catch(() => void 0);
     throw error51;
@@ -48665,16 +49890,16 @@ async function renderBenchmarkPublicationReport(input) {
 }
 
 // packages/runtime/src/retention.ts
-import { lstat as lstat16, readdir as readdir6, rm as rm7, unlink as unlink6 } from "node:fs/promises";
-import { dirname as dirname15, join as join18, relative as relative14, resolve as resolve19 } from "node:path";
+import { lstat as lstat16, readdir as readdir6, rm as rm7, unlink as unlink7 } from "node:fs/promises";
+import { dirname as dirname16, join as join19, relative as relative15, resolve as resolve19 } from "node:path";
 import { isDeepStrictEqual as isDeepStrictEqual4 } from "node:util";
 
 // packages/runtime/src/supervisor.ts
 import { spawn as spawn5 } from "node:child_process";
-import { randomUUID as randomUUID13 } from "node:crypto";
+import { randomUUID as randomUUID14 } from "node:crypto";
 import {
   closeSync,
-  constants as fsConstants7,
+  constants as fsConstants8,
   fstatSync,
   fsyncSync,
   ftruncateSync,
@@ -48683,8 +49908,8 @@ import {
   readSync,
   writeSync
 } from "node:fs";
-import { open as open10, readdir as readdir5 } from "node:fs/promises";
-import { dirname as dirname14, join as join17, relative as relative13, resolve as resolve18 } from "node:path";
+import { open as open11, readdir as readdir5 } from "node:fs/promises";
+import { dirname as dirname15, join as join18, relative as relative14, resolve as resolve18 } from "node:path";
 var KIB3 = 1024;
 var SUPERVISOR_LOG_MAX_BYTES = 64 * KIB3;
 var SUPERVISOR_LOG_RETAIN_BYTES = 32 * KIB3;
@@ -48695,21 +49920,21 @@ var SUPERVISOR_LOG_TRUNCATION_MARKER = Buffer.from(
 `
 );
 function graphcraftRoot(repositoryRoot) {
-  return join17(repositoryRoot, ".graphcraft");
+  return join18(repositoryRoot, ".graphcraft");
 }
 function supervisorRoot(repositoryRoot, runId) {
-  return join17(graphcraftRoot(repositoryRoot), "supervisors", runId);
+  return join18(graphcraftRoot(repositoryRoot), "supervisors", runId);
 }
 function supervisorRecordPath(repositoryRoot, runId, supervisorId) {
-  return join17(supervisorRoot(repositoryRoot, runId), `${supervisorId}.json`);
+  return join18(supervisorRoot(repositoryRoot, runId), `${supervisorId}.json`);
 }
 function compactSupervisorLog(logPath) {
   const before = lstatSync(logPath);
   if (before.isSymbolicLink() || !before.isFile() || before.nlink > 1)
     throw new Error("Supervisor log is not a private regular file");
   if (before.size <= SUPERVISOR_LOG_MAX_BYTES) return;
-  const noFollow = process.platform === "win32" ? 0 : fsConstants7.O_NOFOLLOW;
-  const descriptor = openSync(logPath, fsConstants7.O_RDWR | noFollow);
+  const noFollow = process.platform === "win32" ? 0 : fsConstants8.O_NOFOLLOW;
+  const descriptor = openSync(logPath, fsConstants8.O_RDWR | noFollow);
   try {
     const status3 = fstatSync(descriptor);
     if (!status3.isFile() || status3.nlink > 1 || status3.dev !== before.dev || status3.ino !== before.ino)
@@ -48802,7 +50027,7 @@ async function listSupervisorRecords(repositoryRoot, runId) {
   const ownedRoot = graphcraftRoot(repositoryRoot);
   let entries;
   try {
-    await validatePrivatePath(ownedRoot, relative13(ownedRoot, root));
+    await validatePrivatePath(ownedRoot, relative14(ownedRoot, root));
     entries = await readdir5(root, { withFileTypes: true });
   } catch (error51) {
     if (error51.code === "ENOENT") return [];
@@ -48810,8 +50035,8 @@ async function listSupervisorRecords(repositoryRoot, runId) {
   }
   const records = await Promise.all(
     entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json")).map(async (entry) => {
-      const path2 = join17(root, entry.name);
-      await validatePrivatePath(ownedRoot, relative13(ownedRoot, path2));
+      const path2 = join18(root, entry.name);
+      await validatePrivatePath(ownedRoot, relative14(ownedRoot, path2));
       return await readSupervisorRecord(path2, ownedRoot);
     })
   );
@@ -48849,14 +50074,14 @@ async function launchDetachedSupervisor(input) {
     throw new Error(
       `Run ${input.runId} already has active supervisor ${previous.supervisorId} (PID ${previous.pid})`
     );
-  const supervisorId = randomUUID13();
+  const supervisorId = randomUUID14();
   const ownedRoot = graphcraftRoot(input.repositoryRoot);
   const root = supervisorRoot(input.repositoryRoot, input.runId);
-  const logPath = join17(root, `${supervisorId}.log`);
+  const logPath = join18(root, `${supervisorId}.log`);
   await ensurePrivateDirectory(ownedRoot);
   await ensurePrivateDirectory(root, ownedRoot);
   await hardenPrivateFile(logPath, ownedRoot);
-  const log = await open10(logPath, "a", 384);
+  const log = await open11(logPath, "a", 384);
   await hardenPrivateFile(logPath, ownedRoot);
   let child;
   try {
@@ -48920,7 +50145,7 @@ async function launchDetachedSupervisor(input) {
 }
 async function startDetachedSupervisor(input) {
   const lock = new RunLock(
-    join17(input.repositoryRoot, ".graphcraft", "locks", `${input.runId}.supervisor.lock`)
+    join18(input.repositoryRoot, ".graphcraft", "locks", `${input.runId}.supervisor.lock`)
   );
   await lock.acquire();
   try {
@@ -48947,7 +50172,7 @@ var SupervisorLease = class _SupervisorLease {
       throw new Error(
         `Supervisor ${supervisorId} expected PID ${record2.pid}, received ${process.pid}`
       );
-    const expectedLogPath = join17(supervisorRoot(repositoryRoot, runId), `${supervisorId}.log`);
+    const expectedLogPath = join18(supervisorRoot(repositoryRoot, runId), `${supervisorId}.log`);
     if (resolve18(record2.logPath) !== resolve18(expectedLogPath))
       throw new Error(`Supervisor ${supervisorId} has an invalid log path`);
     return new _SupervisorLease(
@@ -48970,7 +50195,7 @@ var SupervisorLease = class _SupervisorLease {
         updatedAt: now2
       });
       assertSupervisorRecordFits(this.record);
-      await ensurePrivateDirectory(dirname14(this.path), this.ownedRoot);
+      await ensurePrivateDirectory(dirname15(this.path), this.ownedRoot);
       await hardenPrivateFile(this.path, this.ownedRoot);
       await writeJsonAtomic(this.path, this.record);
       await hardenPrivateFile(this.path, this.ownedRoot);
@@ -49049,14 +50274,14 @@ var RETENTION_TARGET_IDS = [
   "migration_backup"
 ];
 function retentionTargets(repositoryRoot, runId) {
-  const graphcraftRoot2 = join18(repositoryRoot, ".graphcraft");
+  const graphcraftRoot2 = join19(repositoryRoot, ".graphcraft");
   return [
-    { id: "run", path: join18(graphcraftRoot2, "runs", runId), kind: "directory" },
-    { id: "control", path: join18(graphcraftRoot2, "controls", `${runId}.json`), kind: "file" },
-    { id: "supervisor", path: join18(graphcraftRoot2, "supervisors", runId), kind: "directory" },
+    { id: "run", path: join19(graphcraftRoot2, "runs", runId), kind: "directory" },
+    { id: "control", path: join19(graphcraftRoot2, "controls", `${runId}.json`), kind: "file" },
+    { id: "supervisor", path: join19(graphcraftRoot2, "supervisors", runId), kind: "directory" },
     {
       id: "migration_backup",
-      path: join18(graphcraftRoot2, "migration-backups", runId),
+      path: join19(graphcraftRoot2, "migration-backups", runId),
       kind: "directory"
     }
   ];
@@ -49214,14 +50439,14 @@ function parseRetentionJournal(value, expectedRunId) {
   return journal;
 }
 function retentionJournalRoot(repositoryRoot) {
-  return join18(repositoryRoot, ".graphcraft", "retention");
+  return join19(repositoryRoot, ".graphcraft", "retention");
 }
 function retentionJournalPath(repositoryRoot, runId) {
-  return join18(retentionJournalRoot(repositoryRoot), `${runId}.json`);
+  return join19(retentionJournalRoot(repositoryRoot), `${runId}.json`);
 }
 async function readRetentionJournal(repositoryRoot, runId) {
   if (!RUN_ID_PATTERN2.test(runId)) throw new Error(`Invalid Graphcraft run ID: ${runId}`);
-  const graphcraftRoot2 = join18(repositoryRoot, ".graphcraft");
+  const graphcraftRoot2 = join19(repositoryRoot, ".graphcraft");
   const path2 = retentionJournalPath(repositoryRoot, runId);
   let source;
   try {
@@ -49240,7 +50465,7 @@ async function readRetentionJournal(repositoryRoot, runId) {
   }
 }
 async function writeRetentionJournal(repositoryRoot, journal) {
-  const graphcraftRoot2 = join18(repositoryRoot, ".graphcraft");
+  const graphcraftRoot2 = join19(repositoryRoot, ".graphcraft");
   const root = retentionJournalRoot(repositoryRoot);
   await ensurePrivateDirectory(graphcraftRoot2);
   const rootExisted = await lstat16(root).then(() => true).catch((error51) => {
@@ -49277,12 +50502,12 @@ async function writeRetentionJournal(repositoryRoot, journal) {
 async function removeRetentionJournal(repositoryRoot, runId, assertLeaseHeld) {
   const existing = await readRetentionJournal(repositoryRoot, runId);
   if (!existing) return;
-  const graphcraftRoot2 = join18(repositoryRoot, ".graphcraft");
+  const graphcraftRoot2 = join19(repositoryRoot, ".graphcraft");
   const path2 = retentionJournalPath(repositoryRoot, runId);
   assertLeaseHeld();
   await hardenPrivateFile(path2, graphcraftRoot2);
   assertLeaseHeld();
-  await unlink6(path2).catch((error51) => {
+  await unlink7(path2).catch((error51) => {
     if (error51.code !== "ENOENT") throw error51;
   });
   await syncDirectory(retentionJournalRoot(repositoryRoot));
@@ -49290,11 +50515,11 @@ async function removeRetentionJournal(repositoryRoot, runId, assertLeaseHeld) {
     throw refusal(runId, "retention journal remained after cleanup");
 }
 async function listRetentionJournals(repositoryRoot) {
-  const graphcraftRoot2 = join18(repositoryRoot, ".graphcraft");
+  const graphcraftRoot2 = join19(repositoryRoot, ".graphcraft");
   const root = retentionJournalRoot(repositoryRoot);
   let entries;
   try {
-    await validatePrivatePath(graphcraftRoot2, relative14(graphcraftRoot2, root));
+    await validatePrivatePath(graphcraftRoot2, relative15(graphcraftRoot2, root));
     entries = await readdir6(root, { withFileTypes: true });
   } catch (error51) {
     if (isMissing3(error51)) return [];
@@ -49325,11 +50550,11 @@ function planFromJournal(repositoryRoot, journal) {
   });
 }
 async function readRetentionIdentityPolicy(repositoryRoot, runId) {
-  const runRoot = join18(repositoryRoot, ".graphcraft", "runs", runId);
+  const runRoot = join19(repositoryRoot, ".graphcraft", "runs", runId);
   let source;
   try {
     source = await readPrivateFileBounded(
-      join18(runRoot, "storage.json"),
+      join19(runRoot, "storage.json"),
       RETENTION_STORAGE_MANIFEST_MAX_BYTES,
       runRoot
     );
@@ -49358,21 +50583,21 @@ async function readRetentionIdentityPolicy(repositoryRoot, runId) {
 }
 async function readPersistedState(repositoryRoot, runId, retentionPolicy) {
   try {
-    const graphcraftRoot2 = join18(repositoryRoot, ".graphcraft");
-    const runRoot = join18(graphcraftRoot2, "runs", runId);
-    await validatePrivatePath(graphcraftRoot2, relative14(graphcraftRoot2, runRoot));
+    const graphcraftRoot2 = join19(repositoryRoot, ".graphcraft");
+    const runRoot = join19(graphcraftRoot2, "runs", runId);
+    await validatePrivatePath(graphcraftRoot2, relative15(graphcraftRoot2, runRoot));
     await Promise.all([
       validatePrivatePath(runRoot, "events.jsonl"),
       validatePrivatePath(runRoot, "state.json")
     ]);
     const materialized = RunStateSchema.parse(
       JSON.parse(
-        (await readPrivateFileBounded(join18(runRoot, "state.json"), RUN_STATE_MAX_BYTES, runRoot)).toString("utf8")
+        (await readPrivateFileBounded(join19(runRoot, "state.json"), RUN_STATE_MAX_BYTES, runRoot)).toString("utf8")
       )
     );
     if (materialized.runId !== runId)
       throw new Error(`materialized state belongs to run ${materialized.runId}`);
-    const events = (await readPrivateFileBounded(join18(runRoot, "events.jsonl"), RUN_EVENT_LOG_MAX_BYTES, runRoot)).toString("utf8").split("\n").filter(Boolean).map((line2) => {
+    const events = (await readPrivateFileBounded(join19(runRoot, "events.jsonl"), RUN_EVENT_LOG_MAX_BYTES, runRoot)).toString("utf8").split("\n").filter(Boolean).map((line2) => {
       const bytes = Buffer.byteLength(`${line2}
 `);
       if (bytes > RUN_EVENT_MAX_BYTES)
@@ -49426,12 +50651,12 @@ function retentionStateIdentity(state, algorithm) {
 }
 async function readPreservedWorkspace(repositoryRoot, runId) {
   try {
-    const runRoot = join18(repositoryRoot, ".graphcraft", "runs", runId);
+    const runRoot = join19(repositoryRoot, ".graphcraft", "runs", runId);
     await validatePrivatePath(runRoot, "workspace.json");
     return preservedWorkspaceProjection(
       JSON.parse(
         (await readPrivateFileBounded(
-          join18(runRoot, "workspace.json"),
+          join19(runRoot, "workspace.json"),
           RETENTION_WORKSPACE_FILE_MAX_BYTES,
           runRoot
         )).toString("utf8")
@@ -49466,10 +50691,10 @@ async function assertNoLiveSupervisor(repositoryRoot, runId) {
   }
 }
 async function assertNoProbeProcessState(repositoryRoot, runId) {
-  const graphcraftRoot2 = join18(repositoryRoot, ".graphcraft");
-  const path2 = join18(graphcraftRoot2, "locks", "probe-processes", runId);
+  const graphcraftRoot2 = join19(repositoryRoot, ".graphcraft");
+  const path2 = join19(graphcraftRoot2, "locks", "probe-processes", runId);
   try {
-    await validatePrivatePath(graphcraftRoot2, relative14(graphcraftRoot2, path2));
+    await validatePrivatePath(graphcraftRoot2, relative15(graphcraftRoot2, path2));
     const stats = await lstat16(path2);
     if (stats.isSymbolicLink() || !stats.isDirectory())
       throw new Error("probe-process state is not an ordinary directory");
@@ -49485,6 +50710,26 @@ async function assertNoProbeProcessState(repositoryRoot, runId) {
     "probe-process ownership evidence remains; resume the run so Graphcraft can reconcile it before deletion"
   );
 }
+async function assertNoSideEffectProcessState(repositoryRoot, runId) {
+  const graphcraftRoot2 = join19(repositoryRoot, ".graphcraft");
+  const path2 = join19(graphcraftRoot2, "locks", "side-effect-processes", runId);
+  try {
+    await validatePrivatePath(graphcraftRoot2, relative15(graphcraftRoot2, path2));
+    const stats = await lstat16(path2);
+    if (stats.isSymbolicLink() || !stats.isDirectory())
+      throw new Error("side-effect-process state is not an ordinary directory");
+  } catch (error51) {
+    if (isMissing3(error51)) return;
+    throw refusal(
+      runId,
+      `side-effect-process ownership evidence is ambiguous (${error51 instanceof Error ? error51.message : String(error51)})`
+    );
+  }
+  throw refusal(
+    runId,
+    "side-effect-process ownership evidence remains; resume the run so Graphcraft can reconcile it before deletion"
+  );
+}
 async function inspectDeletableRun(repositoryRoot, runId) {
   const policy = await readRetentionIdentityPolicy(repositoryRoot, runId);
   const state = await readPersistedState(repositoryRoot, runId, policy);
@@ -49493,6 +50738,7 @@ async function inspectDeletableRun(repositoryRoot, runId) {
   const preservedWorkspace = await readPreservedWorkspace(repositoryRoot, runId);
   await assertNoLiveSupervisor(repositoryRoot, runId);
   await assertNoProbeProcessState(repositoryRoot, runId);
+  await assertNoSideEffectProcessState(repositoryRoot, runId);
   return createRetentionPlan(policy.hashAlgorithm, {
     action: "delete_run_state",
     repositoryRoot,
@@ -49510,6 +50756,7 @@ async function planRunRetention(input) {
     const journal = await readRetentionJournal(repositoryRoot, input.runReference);
     if (journal) {
       await assertNoProbeProcessState(repositoryRoot, journal.runId);
+      await assertNoSideEffectProcessState(repositoryRoot, journal.runId);
       return planFromJournal(repositoryRoot, journal);
     }
   }
@@ -49554,7 +50801,7 @@ async function validateTarget(graphcraftRoot2, target) {
   const expected = resolve19(target.path);
   const validated = await validatePrivatePath(
     graphcraftRoot2,
-    relative14(resolve19(graphcraftRoot2), expected)
+    relative15(resolve19(graphcraftRoot2), expected)
   );
   if (validated !== expected)
     throw new Error(`Retention target ${target.path} escaped the Graphcraft state directory`);
@@ -49590,7 +50837,7 @@ async function removeTargets(graphcraftRoot2, targets, runId, onCheckpoint, asse
     if (!exists) continue;
     if (target.kind === "directory") await rm7(target.path, { recursive: true, force: true });
     else
-      await unlink6(target.path).catch((error51) => {
+      await unlink7(target.path).catch((error51) => {
         if (error51.code !== "ENOENT") throw error51;
       });
     assertLeaseHeld();
@@ -49613,7 +50860,7 @@ async function removeTargets(graphcraftRoot2, targets, runId, onCheckpoint, asse
   await onCheckpoint?.({ boundary: "after_run", runId });
 }
 async function syncRetentionTargetParents(targets, assertLeaseHeld) {
-  for (const parent of new Set(targets.map(({ path: path2 }) => dirname15(path2)))) {
+  for (const parent of new Set(targets.map(({ path: path2 }) => dirname16(path2)))) {
     assertLeaseHeld();
     try {
       await syncDirectory(parent);
@@ -49648,13 +50895,13 @@ async function applyRetention(plan, confirmRunId, validateEligibility, options =
     throw new Error(`Retention confirmation must exactly equal run ID ${plan.runId}`);
   validateRetentionPlan(plan);
   const repositoryRoot = resolve19(plan.repositoryRoot);
-  const graphcraftRoot2 = join18(repositoryRoot, ".graphcraft");
-  const retentionLock = new RunLock(join18(graphcraftRoot2, "locks", "retention.lock"));
+  const graphcraftRoot2 = join19(repositoryRoot, ".graphcraft");
+  const retentionLock = new RunLock(join19(graphcraftRoot2, "locks", "retention.lock"));
   const supervisorLock = new RunLock(
-    join18(graphcraftRoot2, "locks", `${plan.runId}.supervisor.lock`)
+    join19(graphcraftRoot2, "locks", `${plan.runId}.supervisor.lock`)
   );
-  const runLock = new RunLock(join18(graphcraftRoot2, "locks", `${plan.runId}.lock`));
-  const artifactLock = new RunLock(join18(graphcraftRoot2, "locks", `${plan.runId}.artifacts.lock`));
+  const runLock = new RunLock(join19(graphcraftRoot2, "locks", `${plan.runId}.lock`));
+  const artifactLock = new RunLock(join19(graphcraftRoot2, "locks", `${plan.runId}.artifacts.lock`));
   const locks = [retentionLock, supervisorLock, runLock, artifactLock];
   const acquiredLocks = [];
   const observedSignals = [];
@@ -49691,6 +50938,7 @@ async function applyRetention(plan, confirmRunId, validateEligibility, options =
       validateEligibility?.(current);
       await assertNoLiveSupervisor(repositoryRoot, plan.runId);
       await assertNoProbeProcessState(repositoryRoot, plan.runId);
+      await assertNoSideEffectProcessState(repositoryRoot, plan.runId);
       await validateTargets(graphcraftRoot2, targets, true);
     } else {
       const resolvedRunId = await resolveRunId(repositoryRoot, plan.runId);
@@ -49809,7 +51057,10 @@ async function planCompletedRunPrune(input) {
   );
   const deletionPlans = [];
   for (const { runId, journal } of selected) {
-    if (journal) await assertNoProbeProcessState(repositoryRoot, runId);
+    if (journal) {
+      await assertNoProbeProcessState(repositoryRoot, runId);
+      await assertNoSideEffectProcessState(repositoryRoot, runId);
+    }
     deletionPlans.push(
       journal ? planFromJournal(repositoryRoot, journal) : await inspectDeletableRun(repositoryRoot, runId)
     );
@@ -50341,7 +51592,7 @@ function sha256(value) {
 }
 async function syncDirectory2(path2) {
   if (platform() === "win32") return;
-  const handle = await open11(path2, "r");
+  const handle = await open12(path2, "r");
   try {
     await handle.sync();
   } finally {
@@ -50349,8 +51600,8 @@ async function syncDirectory2(path2) {
   }
 }
 async function writeAtomic(path2, value, mode) {
-  const temporaryPath = join19(dirname16(path2), `.${randomUUID14()}.tmp`);
-  const handle = await open11(temporaryPath, "wx", mode);
+  const temporaryPath = join20(dirname17(path2), `.${randomUUID15()}.tmp`);
+  const handle = await open12(temporaryPath, "wx", mode);
   try {
     try {
       await handle.writeFile(value);
@@ -50360,7 +51611,7 @@ async function writeAtomic(path2, value, mode) {
     }
     await rename3(temporaryPath, path2);
     await chmod2(path2, mode);
-    await syncDirectory2(dirname16(path2));
+    await syncDirectory2(dirname17(path2));
   } catch (error51) {
     await handle.close().catch(() => void 0);
     await rm8(temporaryPath, { force: true });
@@ -50380,7 +51631,7 @@ async function readRuntimeManifest(path2) {
       path2,
       384,
       RUNTIME_MANIFEST_MAX_BYTES,
-      dirname16(dirname16(path2))
+      dirname17(dirname17(path2))
     );
     return source ? parseRuntimeManifest(JSON.parse(source.toString("utf8"))) : void 0;
   } catch {
@@ -50411,7 +51662,7 @@ async function loadBundledMcpRuntime(sourcePath) {
   };
 }
 async function runtimePairMatches(runtimeDirectory, bundled) {
-  const runtimeRoot = dirname16(runtimeDirectory);
+  const runtimeRoot = dirname17(runtimeDirectory);
   if (await runtimeDirectoryKind(runtimeDirectory) !== "directory") return false;
   if (!await managedDirectoryMatches(runtimeDirectory, 448)) return false;
   if (!await runtimePairHasExactEntries(runtimeDirectory, bundled)) return false;
@@ -50420,10 +51671,10 @@ async function runtimePairMatches(runtimeDirectory, bundled) {
   } catch {
     return false;
   }
-  const manifest2 = await readRuntimeManifest(join19(runtimeDirectory, RUNTIME_MANIFEST));
+  const manifest2 = await readRuntimeManifest(join20(runtimeDirectory, RUNTIME_MANIFEST));
   if (!sameRuntimeManifest(manifest2, bundled.manifest)) return false;
   const runtime = await readRegularFile(
-    join19(runtimeDirectory, bundled.manifest.runtimeFile),
+    join20(runtimeDirectory, bundled.manifest.runtimeFile),
     384,
     bundled.manifest.bytes,
     runtimeRoot
@@ -50435,9 +51686,9 @@ async function runtimePairMatches(runtimeDirectory, bundled) {
     return false;
   }
   const [hardenedManifest, hardenedRuntime] = await Promise.all([
-    readRuntimeManifest(join19(runtimeDirectory, RUNTIME_MANIFEST)),
+    readRuntimeManifest(join20(runtimeDirectory, RUNTIME_MANIFEST)),
     readRegularFile(
-      join19(runtimeDirectory, bundled.manifest.runtimeFile),
+      join20(runtimeDirectory, bundled.manifest.runtimeFile),
       384,
       bundled.manifest.bytes,
       runtimeRoot
@@ -50455,14 +51706,14 @@ async function runtimePairHasExactEntries(runtimeDirectory, bundled) {
   }
 }
 async function runtimePairContentsMatch(runtimeDirectory, bundled) {
-  const runtimeRoot = dirname16(runtimeDirectory);
+  const runtimeRoot = dirname17(runtimeDirectory);
   if (await runtimeDirectoryKind(runtimeDirectory) !== "directory") return false;
   if (!await managedDirectoryMatches(runtimeDirectory, 448)) return false;
   if (!await runtimePairHasExactEntries(runtimeDirectory, bundled)) return false;
-  const manifest2 = await readRuntimeManifest(join19(runtimeDirectory, RUNTIME_MANIFEST));
+  const manifest2 = await readRuntimeManifest(join20(runtimeDirectory, RUNTIME_MANIFEST));
   if (!sameRuntimeManifest(manifest2, bundled.manifest)) return false;
   const runtime = await readRegularFile(
-    join19(runtimeDirectory, bundled.manifest.runtimeFile),
+    join20(runtimeDirectory, bundled.manifest.runtimeFile),
     384,
     bundled.manifest.bytes,
     runtimeRoot
@@ -50522,10 +51773,10 @@ async function readRegularFile(path2, expectedMode, maximumBytes = MANAGED_RUNTI
   }
 }
 function runtimePublicationPaths(graphcraftHome) {
-  const runtimeRoot = join19(graphcraftHome, "runtime");
+  const runtimeRoot = join20(graphcraftHome, "runtime");
   return {
     runtimeRoot,
-    runtimeDirectory: join19(runtimeRoot, GRAPHCRAFT_VERSION)
+    runtimeDirectory: join20(runtimeRoot, GRAPHCRAFT_VERSION)
   };
 }
 async function runtimeStagingDirectoryIdentity(path2) {
@@ -50535,9 +51786,9 @@ async function runtimeStagingDirectoryIdentity(path2) {
 }
 async function reserveRuntimeStagingDirectory(runtimeRoot, forceIdentityUnavailable = false, forceIdentityInspectionFailure = false) {
   for (let attempt = 0; attempt < RUNTIME_STAGING_RESERVATION_ATTEMPTS; attempt += 1) {
-    const candidate = join19(
+    const candidate = join20(
       runtimeRoot,
-      `.${GRAPHCRAFT_VERSION}.staged-${randomUUID14().replaceAll("-", "").slice(0, 12)}`
+      `.${GRAPHCRAFT_VERSION}.staged-${randomUUID15().replaceAll("-", "").slice(0, 12)}`
     );
     try {
       await mkdir7(candidate, { mode: 448 });
@@ -50549,7 +51800,7 @@ async function reserveRuntimeStagingDirectory(runtimeRoot, forceIdentityUnavaila
           identity: forceIdentityUnavailable ? void 0 : await runtimeStagingDirectoryIdentity(candidate)
         };
       } catch (error51) {
-        await rmdir3(candidate).catch(() => void 0);
+        await rmdir4(candidate).catch(() => void 0);
         throw error51;
       }
     } catch (error51) {
@@ -50569,7 +51820,7 @@ async function cleanupRuntimeStagingDirectory(reservation) {
   if (reservation.identity === void 0) {
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) return;
     try {
-      await rmdir3(reservation.path);
+      await rmdir4(reservation.path);
     } catch (error51) {
       if (["ENOENT", "ENOTEMPTY", "EEXIST"].includes(error51.code ?? ""))
         return;
@@ -50590,7 +51841,7 @@ async function stageBundledMcpRuntime(bundled, graphcraftHome, boundary, forceId
   const paths = runtimePublicationPaths(graphcraftHome);
   await ensurePrivateDirectory(graphcraftHome);
   await ensurePrivateManagedDirectory(paths.runtimeRoot, "runtime root", graphcraftHome);
-  const runtimePath = join19(paths.runtimeDirectory, bundled.manifest.runtimeFile);
+  const runtimePath = join20(paths.runtimeDirectory, bundled.manifest.runtimeFile);
   const previousKind = await runtimeDirectoryKind(paths.runtimeDirectory);
   if (previousKind === "directory") {
     if (await runtimePairMatches(paths.runtimeDirectory, bundled)) {
@@ -50617,9 +51868,9 @@ async function stageBundledMcpRuntime(bundled, graphcraftHome, boundary, forceId
       );
     }
     await ensurePrivateDirectory(stagedDirectory, paths.runtimeRoot);
-    await writeAtomic(join19(stagedDirectory, bundled.manifest.runtimeFile), bundled.source, 384);
+    await writeAtomic(join20(stagedDirectory, bundled.manifest.runtimeFile), bundled.source, 384);
     await writeAtomic(
-      join19(stagedDirectory, RUNTIME_MANIFEST),
+      join20(stagedDirectory, RUNTIME_MANIFEST),
       Buffer.from(`${JSON.stringify(bundled.manifest, null, 2)}
 `),
       384
@@ -50660,9 +51911,9 @@ async function stageBundledMcpRuntime(bundled, graphcraftHome, boundary, forceId
   }
 }
 async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
-  const moduleDirectory = dirname16(fileURLToPath(moduleUrl));
+  const moduleDirectory = dirname17(fileURLToPath(moduleUrl));
   const candidates = [
-    join19(moduleDirectory, "mcp.mjs"),
+    join20(moduleDirectory, "mcp.mjs"),
     resolve20(moduleDirectory, "../../../dist/mcp.mjs"),
     resolve20(process.cwd(), "dist/mcp.mjs")
   ];
@@ -50676,7 +51927,7 @@ async function resolveBundledMcpPath(moduleUrl = import.meta.url) {
   throw new Error("dist/mcp.mjs is missing; run pnpm build before installing Graphcraft");
 }
 function resolveGraphcraftHome(configuredHome = process.env.GRAPHCRAFT_HOME) {
-  return configuredHome?.trim() ? resolve20(configuredHome) : join19(homedir3(), ".graphcraft");
+  return configuredHome?.trim() ? resolve20(configuredHome) : join20(homedir3(), ".graphcraft");
 }
 async function ensureGraphcraftHomeIfPresent(graphcraftHome) {
   if (await runtimeDirectoryKind(graphcraftHome) === "missing") return false;
@@ -50705,7 +51956,7 @@ function commandFor(host) {
   return host;
 }
 async function withPrivateHostCommandCwd(operation, createdBoundary) {
-  const cwd = await mkdtemp4(join19(tmpdir4(), "graphcraft-host-config-"));
+  const cwd = await mkdtemp4(join20(tmpdir4(), "graphcraft-host-config-"));
   try {
     await createdBoundary?.(cwd);
     await ensurePrivateDirectory(cwd);
@@ -50840,7 +52091,7 @@ async function restoreHostRegistration(host, previous, runner, cwd) {
   return problems.length === 0 ? "The previous registration was restored and verified." : `Best-effort restoration was incomplete: ${problems.join("; ")}`;
 }
 async function writeRegistrationReceipt(graphcraftHome, host, runtimePath, runtimeSha256) {
-  const directory = join19(graphcraftHome, "registrations");
+  const directory = join20(graphcraftHome, "registrations");
   await ensurePrivateDirectory(graphcraftHome);
   await ensurePrivateManagedDirectory(directory, "registration receipts", graphcraftHome);
   const receipt = {
@@ -50850,7 +52101,7 @@ async function writeRegistrationReceipt(graphcraftHome, host, runtimePath, runti
     runtimePath,
     runtimeSha256
   };
-  const receiptPath = join19(directory, `${host}.json`);
+  const receiptPath = join20(directory, `${host}.json`);
   await writeAtomic(receiptPath, Buffer.from(`${JSON.stringify(receipt, null, 2)}
 `), 384);
   await hardenPrivateFile(receiptPath, graphcraftHome);
@@ -50859,9 +52110,9 @@ async function readRegistrationReceiptSnapshot(graphcraftHome, host) {
   return await readRegistrationReceiptBytes(graphcraftHome, host);
 }
 async function restoreRegistrationReceipt(graphcraftHome, host, previous) {
-  const path2 = join19(graphcraftHome, "registrations", `${host}.json`);
+  const path2 = join20(graphcraftHome, "registrations", `${host}.json`);
   if (previous === void 0) {
-    const directory2 = dirname16(path2);
+    const directory2 = dirname17(path2);
     const directoryKind = await runtimeDirectoryKind(directory2);
     if (directoryKind === "missing") {
       return "The previous registration receipt was absent and remains absent.";
@@ -50872,7 +52123,7 @@ async function restoreRegistrationReceipt(graphcraftHome, host, previous) {
     await rm8(path2, { force: true });
     return "The previous registration receipt was absent and remains absent.";
   }
-  const directory = dirname16(path2);
+  const directory = dirname17(path2);
   await ensurePrivateDirectory(graphcraftHome);
   await ensurePrivateManagedDirectory(directory, "registration receipts", graphcraftHome);
   await writeAtomic(path2, previous, 384);
@@ -50880,14 +52131,14 @@ async function restoreRegistrationReceipt(graphcraftHome, host, previous) {
   return "The previous registration receipt was restored.";
 }
 async function readRegistrationReceiptBytes(graphcraftHome, host) {
-  const directory = join19(graphcraftHome, "registrations");
+  const directory = join20(graphcraftHome, "registrations");
   const directoryKind = await runtimeDirectoryKind(directory);
   if (directoryKind === "missing") return void 0;
   await ensurePrivateManagedDirectory(directory, "registration receipts", graphcraftHome);
   if (!await managedDirectoryMatches(directory, 448)) {
     throw new Error("The managed Graphcraft registration receipts directory is unsafe");
   }
-  const path2 = join19(directory, `${host}.json`);
+  const path2 = join20(directory, `${host}.json`);
   await hardenPrivateFile(path2, graphcraftHome);
   const source = await readRegularFile(path2, 384, REGISTRATION_RECEIPT_MAX_BYTES, graphcraftHome);
   if (source) return source;
@@ -50948,11 +52199,11 @@ function registrationUsesRuntime(registration, runtimePath) {
   return runtimePath !== void 0 && registration?.command === "node" && registration.args.length === 1 && sameRuntimePath(registration.args[0], runtimePath);
 }
 function legacyStagedRuntimePaths(graphcraftHome) {
-  return ["0.1.0", "0.1.1"].map((version2) => join19(graphcraftHome, "runtime", version2, "mcp.mjs"));
+  return ["0.1.0", "0.1.1"].map((version2) => join20(graphcraftHome, "runtime", version2, "mcp.mjs"));
 }
 async function readManagedRuntimeFile(graphcraftHome, runtimePath, expectedMode) {
-  const runtimeRoot = join19(graphcraftHome, "runtime");
-  const runtimeDirectory = dirname16(runtimePath);
+  const runtimeRoot = join20(graphcraftHome, "runtime");
+  const runtimeDirectory = dirname17(runtimePath);
   if (await runtimeDirectoryKind(runtimeRoot) !== "directory" || await runtimeDirectoryKind(runtimeDirectory) !== "directory")
     return void 0;
   try {
@@ -50972,12 +52223,12 @@ async function readManagedRuntimeFile(graphcraftHome, runtimePath, expectedMode)
 }
 function receiptRuntimePath(graphcraftHome, receipt) {
   if (!receipt) return void 0;
-  const expectedPath = join19(graphcraftHome, "runtime", receipt.graphcraftVersion, "mcp.mjs");
+  const expectedPath = join20(graphcraftHome, "runtime", receipt.graphcraftVersion, "mcp.mjs");
   return sameRuntimePath(receipt.runtimePath, expectedPath) ? expectedPath : void 0;
 }
 async function verifiedCurrentBundledRuntimePath(graphcraftHome, bundled) {
   const { runtimeRoot, runtimeDirectory } = runtimePublicationPaths(graphcraftHome);
-  return await managedDirectoryMatches(runtimeRoot, 448) && await runtimePairMatches(runtimeDirectory, bundled) ? join19(runtimeDirectory, bundled.manifest.runtimeFile) : void 0;
+  return await managedDirectoryMatches(runtimeRoot, 448) && await runtimePairMatches(runtimeDirectory, bundled) ? join20(runtimeDirectory, bundled.manifest.runtimeFile) : void 0;
 }
 async function configureHost(host, mcpPath, options) {
   const graphcraftHome = resolveGraphcraftHome(options.graphcraftHome);
@@ -50985,7 +52236,7 @@ async function configureHost(host, mcpPath, options) {
   const runner = options.runner ?? defaultHostCommandRunner;
   const bundledMcpPath = mcpPath ?? await resolveBundledMcpPath();
   const bundledRuntime = await loadBundledMcpRuntime(bundledMcpPath);
-  const runtimePath = join19(graphcraftHome, "runtime", GRAPHCRAFT_VERSION, "mcp.mjs");
+  const runtimePath = join20(graphcraftHome, "runtime", GRAPHCRAFT_VERSION, "mcp.mjs");
   const expectedRegistration = { command: "node", args: [runtimePath] };
   const previousReceipt = await readRegistrationReceipt(graphcraftHome, host);
   const knownPreviousRuntimePath = await verifiedReceiptRuntimePath(
@@ -51114,7 +52365,7 @@ async function uninstallHost(host, options = {}) {
   const runner = options.runner ?? defaultHostCommandRunner;
   const receipt = await readRegistrationReceipt(graphcraftHome, host);
   const recordedRuntimePath = receiptRuntimePath(graphcraftHome, receipt);
-  const inspectionRuntimePath = recordedRuntimePath ?? join19(graphcraftHome, "runtime", GRAPHCRAFT_VERSION, "mcp.mjs");
+  const inspectionRuntimePath = recordedRuntimePath ?? join20(graphcraftHome, "runtime", GRAPHCRAFT_VERSION, "mcp.mjs");
   const removed = await withPrivateHostCommandCwd(async (cwd) => {
     const registration = await inspectHostRegistration(
       host,
@@ -51160,7 +52411,7 @@ async function uninstallHost(host, options = {}) {
     }
     return await removeHostRegistration(host, runner, cwd);
   }, options.hostCommandCwdCreatedBoundary);
-  await rm8(join19(graphcraftHome, "registrations", `${host}.json`), { force: true });
+  await rm8(join20(graphcraftHome, "registrations", `${host}.json`), { force: true });
   return { host, removed };
 }
 function parseVersion(value) {
@@ -51217,12 +52468,12 @@ async function installationDiagnostics(options = {}) {
   const expectedSource = options.mcpPath ?? await resolveBundledMcpPath();
   const bundled = await loadBundledMcpRuntime(expectedSource);
   const expectedSha256 = bundled.manifest.sha256;
-  const runtimeRoot = join19(graphcraftHome, "runtime");
-  const runtimeDirectory = join19(runtimeRoot, GRAPHCRAFT_VERSION);
-  const runtimePath = join19(runtimeDirectory, "mcp.mjs");
+  const runtimeRoot = join20(graphcraftHome, "runtime");
+  const runtimeDirectory = join20(runtimeRoot, GRAPHCRAFT_VERSION);
+  const runtimePath = join20(runtimeDirectory, "mcp.mjs");
   const runtimeDirectoryState = await runtimeDirectoryKind(runtimeDirectory);
   const safeRuntimeDirectories = await managedDirectoryMatches(runtimeRoot, 448) && await managedDirectoryMatches(runtimeDirectory, 448);
-  const manifest2 = safeRuntimeDirectories ? await readRuntimeManifest(join19(runtimeDirectory, RUNTIME_MANIFEST)) : void 0;
+  const manifest2 = safeRuntimeDirectories ? await readRuntimeManifest(join20(runtimeDirectory, RUNTIME_MANIFEST)) : void 0;
   const actualRuntime = safeRuntimeDirectories ? await readRegularFile(runtimePath, 384, MANAGED_RUNTIME_MAX_BYTES, graphcraftHome) : void 0;
   const actualSha256 = actualRuntime ? sha256(actualRuntime) : void 0;
   const runtimeCurrent = safeRuntimeDirectories && await runtimePairMatches(runtimeDirectory, bundled);
@@ -51488,7 +52739,7 @@ function renderRunInspection(input) {
     `Revisions     ${input.graph.revision}; ${input.graphHistory.length} amendments`,
     ...instructionLines,
     `Artifacts     ${input.artifactInventory.storedBytes}/${input.artifactInventory.sourceBytes} bytes stored; ${input.artifactInventory.omittedBytes} omitted across ${input.artifactInventory.entries.length} entries`,
-    `Durable files ${join19(input.contract.repository.root, ".graphcraft", "runs", input.state.runId)}`
+    `Durable files ${join20(input.contract.repository.root, ".graphcraft", "runs", input.state.runId)}`
   ].join("\n");
 }
 async function loadRunList(cwd) {
@@ -51781,21 +53032,21 @@ var program2 = new Command().name("graphcraft").description("Progress-aware exec
 async function benchmarkSourceIdentity() {
   if (true) {
     return BenchmarkSourceIdentitySchema.parse({
-      commitSha: "65eaff5256c4bfa317f3075ce7c68edc0a2a69b5",
+      commitSha: "6510b93df77e225f46f5418e1a5ec9b9648d4961",
       dirty: false,
       dirtyStatusDigest: false ? null : null
     });
   }
-  let candidate = dirname17(fileURLToPath2(import.meta.url));
+  let candidate = dirname18(fileURLToPath2(import.meta.url));
   while (true) {
     try {
-      const metadata = JSON.parse(await readFile6(join20(candidate, "package.json"), "utf8"));
+      const metadata = JSON.parse(await readFile6(join21(candidate, "package.json"), "utf8"));
       if (metadata.name === "@tpypan/graphcraft")
         return await inspectBenchmarkSourceIdentity(candidate);
     } catch (error51) {
       if (error51.code !== "ENOENT") throw error51;
     }
-    const parent = dirname17(candidate);
+    const parent = dirname18(candidate);
     if (candidate === parent || candidate === parse3(candidate).root) break;
     candidate = parent;
   }
@@ -51908,7 +53159,7 @@ program2.command("benchmark").description("Run a randomized matched Graphcraft a
     }
     const timestamp = (/* @__PURE__ */ new Date()).toISOString().replaceAll(/[:.]/g, "-");
     const outputPath = resolve21(
-      options.output ?? join20(options.cwd, ".graphcraft", "benchmarks", suite.id, `${timestamp}.json`)
+      options.output ?? join21(options.cwd, ".graphcraft", "benchmarks", suite.id, `${timestamp}.json`)
     );
     const adapters = Object.fromEntries(
       hosts.map((host) => [host, createAdapter(host, policies[host])])
