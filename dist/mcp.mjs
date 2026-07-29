@@ -32151,6 +32151,7 @@ var SideEffectJournalEntrySchema = external_exports.strictObject({
   evidence: external_exports.array(external_exports.string()).default([]),
   failure: external_exports.string().optional(),
   retryable: external_exports.boolean().optional(),
+  childSettlement: external_exports.enum(["confirmed", "unconfirmed"]).optional(),
   updatedAt: external_exports.iso.datetime()
 });
 var WaitRuntimeStateSchema = external_exports.strictObject({
@@ -35905,6 +35906,7 @@ function reduceEvents(events) {
         entry.evidence = Array.isArray(data.evidence) ? data.evidence.map((value) => String(value)) : entry.evidence;
         entry.failure = void 0;
         entry.retryable = void 0;
+        entry.childSettlement = void 0;
         entry.updatedAt = event.timestamp;
         break;
       }
@@ -35915,6 +35917,14 @@ function reduceEvents(events) {
         entry.status = data.uncertain === true ? "uncertain" : "failed";
         entry.failure = requiredString(data, "reason");
         entry.retryable = data.retryable === true;
+        entry.childSettlement = data.childSettlement === "confirmed" || data.childSettlement === "unconfirmed" ? data.childSettlement : void 0;
+        if (data.cancellationOutcome === "cancelled_before_spawn") {
+          if (entry.childSettlement !== "confirmed" || entry.retryable !== true || data.uncertain === true)
+            throw new Error(
+              `Side effect ${actionId} has an invalid cancelled-before-spawn settlement`
+            );
+          entry.dispatchedAt = void 0;
+        }
         entry.updatedAt = event.timestamp;
         break;
       }
@@ -38672,19 +38682,40 @@ var GitHubPullRequestLifecycleClassificationSchema = external_exports.strictObje
   signature: external_exports.string().regex(/^[a-f0-9]{64}$/),
   evidence: external_exports.array(external_exports.string().min(1))
 });
+var GitHubCommandCancellationError = class extends Error {
+  constructor(outcome) {
+    super(
+      outcome === "cancelled_before_spawn" ? "GitHub command was cancelled before spawn" : outcome === "terminated" ? "GitHub command was cancelled and its child settled" : "GitHub command was cancelled without confirmed child settlement"
+    );
+    this.outcome = outcome;
+    this.name = "GitHubCommandCancellationError";
+  }
+  outcome;
+};
 var GitHubCommandError = class extends Error {
-  constructor(message, exitCode) {
+  constructor(message, exitCode, childSettlement = "confirmed") {
     super(message);
     this.exitCode = exitCode;
+    this.childSettlement = childSettlement;
     this.name = "GitHubCommandError";
   }
   exitCode;
+  childSettlement;
+};
+var GitHubCommandResultError = class extends Error {
+  childSettlement = "confirmed";
+  constructor(message, options) {
+    super(message, options);
+    this.name = "GitHubCommandResultError";
+  }
 };
 async function runCommand(options, args) {
+  if (options.signal?.aborted) throw new GitHubCommandCancellationError("cancelled_before_spawn");
   const command = options.command ?? await resolveTrustedExecutable("gh", {
     environment: options.env ?? process.env,
     untrustedCwd: options.cwd
   });
+  if (options.signal?.aborted) throw new GitHubCommandCancellationError("cancelled_before_spawn");
   const commandArgs = [...options.commandArgs ?? [], ...args];
   return await new Promise((resolve18, reject) => {
     const child = import_cross_spawn3.default.spawn(command, commandArgs, {
@@ -38696,18 +38727,20 @@ async function runCommand(options, args) {
     let stdout = "";
     let stderr = "";
     let outputBytes = 0;
-    let failure;
     let settled = false;
     let forceTimer;
     let settlementTimer;
     const timeoutMs = options.timeoutMs ?? 6e4;
     let timeout;
+    let termination;
+    const abortFromCaller = () => terminate({ kind: "cancellation" });
     const cleanup = () => {
       if (timeout) clearTimeout(timeout);
       if (forceTimer) clearTimeout(forceTimer);
       if (settlementTimer) clearTimeout(settlementTimer);
+      options.signal?.removeEventListener("abort", abortFromCaller);
     };
-    const complete = (exitCode, error51) => {
+    const complete = (exitCode, error51, cancellationOutcome = "terminated") => {
       if (settled) return;
       settled = true;
       cleanup();
@@ -38717,12 +38750,22 @@ async function runCommand(options, args) {
         child.unref();
       } catch {
       }
-      if (error51) {
-        reject(error51);
+      if (termination?.kind === "cancellation") {
+        reject(new GitHubCommandCancellationError(cancellationOutcome));
         return;
       }
-      if (failure) {
-        reject(new GitHubCommandError(failure, exitCode ?? 1));
+      if (termination?.kind === "failure") {
+        reject(
+          new GitHubCommandError(
+            termination.message,
+            exitCode ?? 1,
+            cancellationOutcome === "unconfirmed" ? "unconfirmed" : "confirmed"
+          )
+        );
+        return;
+      }
+      if (error51) {
+        reject(error51);
         return;
       }
       const code = exitCode ?? 1;
@@ -38735,50 +38778,65 @@ async function runCommand(options, args) {
           )
         );
     };
-    const terminate = (reason) => {
-      if (failure || settled) return;
-      failure = reason;
+    function terminate(reason) {
+      if (termination || settled) return;
+      termination = reason;
       if (timeout) clearTimeout(timeout);
       try {
         terminateChildProcessTree(child, "SIGTERM");
       } catch {
       }
+      if (settled) return;
       forceTimer = setTimeout(() => {
         try {
           terminateChildProcessTree(child, "SIGKILL");
         } catch {
         }
-        settlementTimer = setTimeout(() => complete(null), GITHUB_COMMAND_SETTLEMENT_GRACE_MS);
+        if (settled) return;
+        settlementTimer = setTimeout(
+          () => complete(null, void 0, "unconfirmed"),
+          GITHUB_COMMAND_SETTLEMENT_GRACE_MS
+        );
         settlementTimer.unref();
       }, GITHUB_COMMAND_TERMINATION_GRACE_MS);
       forceTimer.unref();
-    };
-    timeout = setTimeout(() => terminate(`gh exceeded its ${timeoutMs}ms timeout`), timeoutMs);
+    }
+    timeout = setTimeout(
+      () => terminate({ kind: "failure", message: `gh exceeded its ${timeoutMs}ms timeout` }),
+      timeoutMs
+    );
     timeout.unref();
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       outputBytes += Buffer.byteLength(chunk);
       if (outputBytes > 16 * 1024 * 1024)
-        return terminate("gh output exceeded the 16MiB safety limit");
+        return terminate({ kind: "failure", message: "gh output exceeded the 16MiB safety limit" });
       stdout += chunk;
     });
     child.stderr.on("data", (chunk) => {
       outputBytes += Buffer.byteLength(chunk);
       if (outputBytes > 16 * 1024 * 1024)
-        return terminate("gh output exceeded the 16MiB safety limit");
+        return terminate({ kind: "failure", message: "gh output exceeded the 16MiB safety limit" });
       stderr += chunk;
     });
-    child.once("error", (error51) => complete(null, error51));
+    child.once("error", (error51) => {
+      if (!termination) complete(null, error51);
+    });
     child.once("close", (exitCode) => complete(exitCode));
+    options.signal?.addEventListener("abort", abortFromCaller, { once: true });
+    if (options.signal?.aborted) abortFromCaller();
   });
 }
 async function jsonCommand(options, args) {
   const { stdout } = await runCommand(options, args);
   try {
     return JSON.parse(stdout);
-  } catch {
-    throw new Error(`gh returned invalid JSON for ${args.slice(0, 2).join(" ")}`);
+  } catch (error51) {
+    throw new GitHubCommandResultError(
+      `gh returned invalid JSON for ${args.slice(0, 2).join(" ")}`,
+      { cause: error51 }
+    );
   }
 }
 var RepoViewSchema = external_exports.object({
@@ -38796,6 +38854,9 @@ function repositoryParts(nameWithOwner) {
 function errorMessage(error51) {
   return error51 instanceof Error ? error51.message : String(error51);
 }
+function rethrowCommandCancellation(error51) {
+  if (error51 instanceof GitHubCommandCancellationError) throw error51;
+}
 async function readBranchProtection(options, input) {
   const branchPath = encodeURIComponent(input.branch);
   const endpoint = `repos/${input.nameWithOwner}/branches/${branchPath}`;
@@ -38803,6 +38864,7 @@ async function readBranchProtection(options, input) {
   try {
     branch = external_exports.object({ protected: external_exports.boolean() }).parse(await jsonCommand(options, ["api", "--hostname", input.host, endpoint]));
   } catch (error51) {
+    rethrowCommandCancellation(error51);
     return GitHubBranchProtectionSchema.parse({
       status: "unknown",
       branch: input.branch,
@@ -38846,6 +38908,7 @@ async function readBranchProtection(options, input) {
       } : {}
     });
   } catch (error51) {
+    rethrowCommandCancellation(error51);
     return GitHubBranchProtectionSchema.parse({
       status: "unknown",
       branch: input.branch,
@@ -38860,6 +38923,7 @@ async function probeGitHub(options) {
   try {
     commandVersion = (await runCommand(options, ["--version"])).stdout.split("\n")[0]?.trim();
   } catch (error51) {
+    rethrowCommandCancellation(error51);
     errors.push(`GitHub CLI is unavailable: ${errorMessage(error51)}`);
     return GitHubCapabilityReportSchema.parse({
       schemaVersion: 1,
@@ -38875,6 +38939,7 @@ async function probeGitHub(options) {
   try {
     await runCommand(options, ["auth", "status", "--active"]);
   } catch (error51) {
+    rethrowCommandCancellation(error51);
     errors.push(`GitHub CLI authentication is unavailable: ${errorMessage(error51)}`);
     return GitHubCapabilityReportSchema.parse({
       schemaVersion: 1,
@@ -38899,6 +38964,7 @@ async function probeGitHub(options) {
       ])
     );
   } catch (error51) {
+    rethrowCommandCancellation(error51);
     errors.push(`GitHub repository access is unavailable: ${errorMessage(error51)}`);
     return GitHubCapabilityReportSchema.parse({
       schemaVersion: 1,
@@ -39380,19 +39446,35 @@ async function readGitHubReviewThread(options, input) {
   return GitHubReviewThreadStateSchema.parse({ ...thread, comments });
 }
 async function addGitHubReviewThreadReply(options, input) {
-  const response = ReviewReplyMutationResponseSchema.parse(
-    await graphql(options, input.host, ADD_REVIEW_REPLY_MUTATION, input)
-  ).data.addPullRequestReviewThreadReply;
+  const rawResponse = await graphql(options, input.host, ADD_REVIEW_REPLY_MUTATION, input);
+  let response;
+  try {
+    response = ReviewReplyMutationResponseSchema.parse(rawResponse).data.addPullRequestReviewThreadReply;
+  } catch (error51) {
+    throw new GitHubCommandResultError("GitHub returned an invalid review-reply response", {
+      cause: error51
+    });
+  }
   if (!response || response.clientMutationId !== input.clientMutationId)
-    throw new Error(`GitHub did not confirm review reply ${input.clientMutationId}`);
+    throw new GitHubCommandResultError(
+      `GitHub did not confirm review reply ${input.clientMutationId}`
+    );
   return response.comment;
 }
 async function resolveGitHubReviewThread(options, input) {
-  const response = ResolveReviewThreadMutationResponseSchema.parse(
-    await graphql(options, input.host, RESOLVE_REVIEW_THREAD_MUTATION, input)
-  ).data.resolveReviewThread;
+  const rawResponse = await graphql(options, input.host, RESOLVE_REVIEW_THREAD_MUTATION, input);
+  let response;
+  try {
+    response = ResolveReviewThreadMutationResponseSchema.parse(rawResponse).data.resolveReviewThread;
+  } catch (error51) {
+    throw new GitHubCommandResultError("GitHub returned an invalid review-resolution response", {
+      cause: error51
+    });
+  }
   if (!response || response.clientMutationId !== input.clientMutationId || response.thread.id !== input.threadId || !response.thread.isResolved)
-    throw new Error(`GitHub did not confirm review-thread resolution ${input.clientMutationId}`);
+    throw new GitHubCommandResultError(
+      `GitHub did not confirm review-thread resolution ${input.clientMutationId}`
+    );
   return response.thread;
 }
 async function rerequestGitHubCheckRun(options, input) {
@@ -43584,12 +43666,14 @@ function managedProcessSettlementGraceMs(platform2) {
 var ProcessOutputLimitError = class extends Error {
   stream;
   capture;
-  constructor(stream, capture) {
+  childSettlement;
+  constructor(stream, capture, childSettlement = "confirmed") {
     const limit = capture[stream].limitBytes;
     super(`Subprocess ${stream} exceeded the ${limit}-byte capture limit; output was rejected`);
     this.name = "ProcessOutputLimitError";
     this.stream = stream;
     this.capture = capture;
+    this.childSettlement = childSettlement;
   }
 };
 function decodeUtf8Prefix3(source) {
@@ -44063,7 +44147,7 @@ async function runManagedProcess(executable, args, environment, options, started
         stderr: stderr.metadata
       };
       if (overflowStream) {
-        reject(new ProcessOutputLimitError(overflowStream, captureMetadata));
+        reject(new ProcessOutputLimitError(overflowStream, captureMetadata, "confirmed"));
         return;
       }
       resolve18({
@@ -44072,6 +44156,7 @@ async function runManagedProcess(executable, args, environment, options, started
         stderr: stderr.text,
         durationMs: Math.round(performance.now() - started),
         timedOut,
+        childSettlement: "confirmed",
         capture: captureMetadata
       });
     };
@@ -44193,7 +44278,10 @@ async function runProcess(command, args, options) {
           terminateChildProcessTree(child, "SIGKILL");
         } catch {
         }
-        settlementTimer = setTimeout(() => complete(null), PROCESS_SETTLEMENT_GRACE_MS);
+        settlementTimer = setTimeout(
+          () => complete(null, void 0, "unconfirmed"),
+          PROCESS_SETTLEMENT_GRACE_MS
+        );
         settlementTimer.unref();
       }, PROCESS_TERMINATION_GRACE_MS);
       escalationTimer.unref();
@@ -44228,7 +44316,7 @@ async function runProcess(command, args, options) {
       if (settlementTimer) clearTimeout(settlementTimer);
       options.signal?.removeEventListener("abort", abort);
     };
-    const complete = (code, error51) => {
+    const complete = (code, error51, childSettlement = "confirmed") => {
       if (settled) return;
       settled = true;
       cleanup();
@@ -44254,7 +44342,7 @@ async function runProcess(command, args, options) {
         stderr: stderr.metadata
       };
       if (overflowStream) {
-        reject(new ProcessOutputLimitError(overflowStream, captureMetadata));
+        reject(new ProcessOutputLimitError(overflowStream, captureMetadata, childSettlement));
         return;
       }
       resolve18({
@@ -44263,6 +44351,7 @@ async function runProcess(command, args, options) {
         stderr: stderr.text,
         durationMs: Math.round(performance.now() - started),
         timedOut,
+        childSettlement,
         capture: captureMetadata
       });
     };
@@ -45893,8 +45982,46 @@ var SideEffectBoundaryInterruption = class extends Error {
   }
   point;
 };
+var SideEffectInterruption = class extends Error {
+  constructor(receipt) {
+    super(`Side-effect ${receipt.kind} ${receipt.actionId} was interrupted safely`);
+    this.receipt = receipt;
+    this.name = "SideEffectInterruption";
+  }
+  receipt;
+};
 function journalEntry(entries, actionId) {
   return entries.find(({ claim }) => claim.actionId === actionId);
+}
+function interruptionReceipt(input, claim, dispatched, childSettlement, reconciliation, disposition) {
+  return {
+    actionId: claim.actionId,
+    kind: claim.kind,
+    dispatchPolicy: input.dispatchPolicy,
+    dispatched,
+    childSettlement,
+    reconciliation,
+    disposition
+  };
+}
+function checkpointInterruption(input, claim, dispatched) {
+  return new SideEffectInterruption(
+    interruptionReceipt(input, claim, dispatched, "not_started", "not_attempted", "checkpointed")
+  );
+}
+async function authorizePhase(input, claim, phase, dispatched) {
+  try {
+    if (phase !== "settlement" && input.signal?.aborted)
+      throw checkpointInterruption(input, claim, dispatched);
+    await input.authorize?.(phase);
+    if (phase !== "settlement" && input.signal?.aborted)
+      throw checkpointInterruption(input, claim, dispatched);
+  } catch (error51) {
+    if (error51 instanceof SideEffectInterruption) throw error51;
+    if (phase !== "settlement" && input.signal?.aborted)
+      throw checkpointInterruption(input, claim, dispatched);
+    throw error51;
+  }
 }
 async function crossSideEffectBoundary(boundary, point) {
   try {
@@ -45903,20 +46030,35 @@ async function crossSideEffectBoundary(boundary, point) {
     throw new SideEffectBoundaryInterruption(point, { cause: error51 });
   }
 }
-async function reconcileAndRecord(input, claim, boundary) {
-  await input.authorize?.();
+async function reconcileAndRecord(input, claim, boundary, phase, dispatched, options = {}) {
+  if (phase === "precondition") await authorizePhase(input, claim, phase, dispatched);
   let reconciliation;
   try {
+    if (phase === "settlement") await authorizePhase(input, claim, phase, dispatched);
     reconciliation = await input.reconcile(claim);
   } catch (error51) {
-    if (input.deferError?.(error51)) throw error51;
+    if (phase === "precondition" && input.signal?.aborted)
+      throw checkpointInterruption(input, claim, dispatched);
+    const interruptedSettlement = phase === "settlement" && input.signal?.aborted === true;
+    if (!interruptedSettlement && options.deferErrors !== false && input.deferError?.(error51))
+      throw error51;
     const reason = `Unable to reconcile ${claim.kind} ${claim.actionId}: ${error51 instanceof Error ? error51.message : String(error51)}`;
     await input.store.append(
       "runtime",
       "side_effect.failed",
-      { actionId: claim.actionId, reason, retryable: false, uncertain: true },
+      {
+        actionId: claim.actionId,
+        reason,
+        retryable: false,
+        uncertain: true,
+        ...options.childSettlement || interruptedSettlement ? { childSettlement: options.childSettlement ?? "confirmed" } : {}
+      },
       claim.actionId
     );
+    if (interruptedSettlement)
+      throw new SideEffectInterruption(
+        interruptionReceipt(input, claim, dispatched, "confirmed", "unknown", "uncertain")
+      );
     throw new Error(reason);
   }
   await input.store.append(
@@ -45955,6 +46097,88 @@ function assertDispatchPolicy(claim, policy) {
   if (policy !== required2)
     throw new Error(`${claim.kind} side effects require the ${required2} dispatch policy`);
 }
+function classifyCancellation(input, error51) {
+  const classified = input.classifyCancellation?.(error51);
+  if (classified && (classified.outcome !== "failed" || classified.childSettlement === "unconfirmed" || input.signal?.aborted))
+    return classified;
+  return void 0;
+}
+async function recordInterruptionFailure(input, claim, reason, retryable, uncertain, childSettlement, cancellationOutcome) {
+  await input.store.append(
+    "runtime",
+    "side_effect.failed",
+    {
+      actionId: claim.actionId,
+      reason,
+      retryable,
+      uncertain,
+      childSettlement,
+      ...cancellationOutcome ? { cancellationOutcome } : {}
+    },
+    claim.actionId
+  );
+}
+async function settleCancellation(input, claim, cancellation, dispatched, reason, settledReconciliation) {
+  if (cancellation.childSettlement === "unconfirmed") {
+    await recordInterruptionFailure(input, claim, reason, false, true, "unconfirmed");
+    throw new SideEffectInterruption(
+      interruptionReceipt(input, claim, dispatched, "unconfirmed", "not_attempted", "uncertain")
+    );
+  }
+  if (cancellation.outcome === "cancelled_before_spawn") {
+    await recordInterruptionFailure(
+      input,
+      claim,
+      reason,
+      true,
+      false,
+      "confirmed",
+      "cancelled_before_spawn"
+    );
+    throw new SideEffectInterruption(
+      interruptionReceipt(input, claim, dispatched, "not_started", "not_attempted", "retryable")
+    );
+  }
+  let reconciliation;
+  try {
+    reconciliation = settledReconciliation ?? await reconcileAndRecord(
+      input,
+      claim,
+      "after_confirmation_reconcile",
+      "settlement",
+      dispatched,
+      { childSettlement: "confirmed", deferErrors: false }
+    );
+  } catch (error51) {
+    if (error51 instanceof SideEffectBoundaryInterruption) throw error51;
+    if (error51 instanceof SideEffectInterruption) throw error51;
+    throw new SideEffectInterruption(
+      interruptionReceipt(input, claim, dispatched, "confirmed", "unknown", "uncertain")
+    );
+  }
+  if (reconciliation.status === "applied") {
+    await confirm(input, claim, reconciliation);
+    throw new SideEffectInterruption(
+      interruptionReceipt(input, claim, dispatched, "confirmed", "applied", "confirmed")
+    );
+  }
+  const { retryable, uncertain } = unobservableDisposition(
+    input.dispatchPolicy,
+    dispatched,
+    reconciliation
+  );
+  await recordInterruptionFailure(input, claim, reason, retryable, uncertain, "confirmed");
+  throw new SideEffectInterruption(
+    interruptionReceipt(
+      input,
+      claim,
+      dispatched,
+      "confirmed",
+      reconciliation.status,
+      uncertain ? "uncertain" : "retryable"
+    )
+  );
+}
 async function executeSideEffect(input) {
   const proposedClaim = SideEffectClaimSchema.parse(input.claim);
   assertDispatchPolicy(proposedClaim, input.dispatchPolicy);
@@ -45969,10 +46193,20 @@ async function executeSideEffect(input) {
   }
   if (!entry) throw new Error(`Side-effect claim ${claim.actionId} was not persisted`);
   claim = entry.claim;
+  if (entry.childSettlement === "unconfirmed")
+    throw new Error(
+      `The child settlement for ${claim.kind} ${claim.actionId} is unconfirmed; refusing to reconcile or retry while the mutation process may still be running`
+    );
   if (entry.status === "confirmed") {
     if (!entry.result) throw new Error(`Confirmed side effect ${claim.actionId} has no result`);
     if (!input.revalidateConfirmed) return entry.result;
-    const confirmed = await reconcileAndRecord(input, claim, "after_precondition_reconcile");
+    const confirmed = await reconcileAndRecord(
+      input,
+      claim,
+      "after_precondition_reconcile",
+      "precondition",
+      true
+    );
     if (confirmed.status === "applied") return confirmed.result;
     const reason2 = `Confirmed ${claim.kind} ${claim.actionId} no longer matches external truth`;
     await input.store.append(
@@ -45983,7 +46217,13 @@ async function executeSideEffect(input) {
     );
     throw new Error(reason2);
   }
-  const before = await reconcileAndRecord(input, claim, "after_precondition_reconcile");
+  const before = await reconcileAndRecord(
+    input,
+    claim,
+    "after_precondition_reconcile",
+    "precondition",
+    entry.dispatchedAt !== void 0
+  );
   if (before.status === "applied") return await confirm(input, claim, before);
   if (before.status === "unknown") {
     const reason2 = `The outcome of ${claim.kind} ${claim.actionId} is uncertain; refusing to retry`;
@@ -46006,11 +46246,11 @@ async function executeSideEffect(input) {
     throw new Error(reason2);
   }
   await crossSideEffectBoundary(input.boundary, "before_act");
-  await input.authorize?.();
   let dispatched = entry.dispatchedAt !== void 0;
   let markedThisAttempt = false;
+  await authorizePhase(input, claim, "dispatch", dispatched);
   const markDispatched = async () => {
-    await input.authorize?.();
+    await authorizePhase(input, claim, "dispatch", dispatched);
     if (!dispatched) {
       await input.store.append(
         "runtime",
@@ -46027,10 +46267,47 @@ async function executeSideEffect(input) {
     await input.act(claim, markDispatched);
   } catch (error51) {
     if (error51 instanceof SideEffectBoundaryInterruption) throw error51;
-    if (!markedThisAttempt && input.deferError?.(error51)) throw error51;
+    if (error51 instanceof SideEffectInterruption) throw error51;
+    let cancellation = classifyCancellation(input, error51);
     const reason2 = error51 instanceof Error ? error51.message : String(error51);
-    const afterFailure = await reconcileAndRecord(input, claim, "after_confirmation_reconcile");
-    if (afterFailure.status === "applied") return await confirm(input, claim, afterFailure);
+    if (cancellation?.outcome === "failed" && cancellation.childSettlement === "unconfirmed" && !input.signal?.aborted) {
+      await recordInterruptionFailure(input, claim, reason2, false, true, "unconfirmed");
+      throw error51;
+    }
+    if (!markedThisAttempt) {
+      if (cancellation?.childSettlement === "unconfirmed")
+        await settleCancellation(input, claim, cancellation, dispatched, reason2);
+      if (cancellation || input.signal?.aborted)
+        throw checkpointInterruption(input, claim, dispatched);
+    }
+    if (!cancellation && input.signal?.aborted)
+      cancellation = { outcome: "unconfirmed", childSettlement: "unconfirmed" };
+    if (cancellation) await settleCancellation(input, claim, cancellation, dispatched, reason2);
+    if (!markedThisAttempt && input.deferError?.(error51)) throw error51;
+    const afterFailure = await reconcileAndRecord(
+      input,
+      claim,
+      "after_confirmation_reconcile",
+      "settlement",
+      dispatched
+    );
+    if (input.signal?.aborted)
+      await settleCancellation(
+        input,
+        claim,
+        { outcome: "terminated", childSettlement: "confirmed" },
+        dispatched,
+        reason2,
+        afterFailure
+      );
+    if (afterFailure.status === "applied") {
+      const result = await confirm(input, claim, afterFailure);
+      if (input.signal?.aborted)
+        throw new SideEffectInterruption(
+          interruptionReceipt(input, claim, dispatched, "confirmed", "applied", "confirmed")
+        );
+      return result;
+    }
     const { retryable: retryable2, uncertain: uncertain2 } = unobservableDisposition(
       input.dispatchPolicy,
       dispatched,
@@ -46047,6 +46324,17 @@ async function executeSideEffect(input) {
       },
       claim.actionId
     );
+    if (input.signal?.aborted)
+      throw new SideEffectInterruption(
+        interruptionReceipt(
+          input,
+          claim,
+          dispatched,
+          "confirmed",
+          afterFailure.status,
+          uncertain2 ? "uncertain" : "retryable"
+        )
+      );
     throw new Error(
       uncertain2 ? `${reason2}; the side-effect outcome is uncertain and will not be retried blindly` : reason2
     );
@@ -46054,8 +46342,38 @@ async function executeSideEffect(input) {
   if (!markedThisAttempt)
     throw new Error(`${claim.kind} ${claim.actionId} acted without a dispatch checkpoint`);
   await crossSideEffectBoundary(input.boundary, "after_act");
-  const after = await reconcileAndRecord(input, claim, "after_confirmation_reconcile");
-  if (after.status === "applied") return await confirm(input, claim, after);
+  if (input.signal?.aborted)
+    await settleCancellation(
+      input,
+      claim,
+      { outcome: "terminated", childSettlement: "confirmed" },
+      dispatched,
+      `${claim.kind} ${claim.actionId} settled after cancellation`
+    );
+  const after = await reconcileAndRecord(
+    input,
+    claim,
+    "after_confirmation_reconcile",
+    "settlement",
+    dispatched
+  );
+  if (input.signal?.aborted)
+    await settleCancellation(
+      input,
+      claim,
+      { outcome: "terminated", childSettlement: "confirmed" },
+      dispatched,
+      `${claim.kind} ${claim.actionId} settled during reconciliation`,
+      after
+    );
+  if (after.status === "applied") {
+    const result = await confirm(input, claim, after);
+    if (input.signal?.aborted)
+      throw new SideEffectInterruption(
+        interruptionReceipt(input, claim, dispatched, "confirmed", "applied", "confirmed")
+      );
+    return result;
+  }
   const { retryable, uncertain } = unobservableDisposition(input.dispatchPolicy, dispatched, after);
   const reason = uncertain ? `The outcome of ${claim.kind} ${claim.actionId} is uncertain after execution` : `${claim.kind} ${claim.actionId} was not observable after execution`;
   await input.store.append(
@@ -46064,6 +46382,17 @@ async function executeSideEffect(input) {
     { actionId: claim.actionId, reason, retryable, uncertain },
     claim.actionId
   );
+  if (input.signal?.aborted)
+    throw new SideEffectInterruption(
+      interruptionReceipt(
+        input,
+        claim,
+        dispatched,
+        "confirmed",
+        after.status,
+        uncertain ? "uncertain" : "retryable"
+      )
+    );
   throw new Error(reason);
 }
 
@@ -46102,15 +46431,73 @@ function parseRunWorkspace(value) {
 }
 
 // packages/runtime/src/repository.ts
+var GitMutationCancellationError = class extends Error {
+  outcome;
+  constructor(outcome) {
+    const message = outcome === "cancelled_before_spawn" ? "Git operation was cancelled before its subprocess started" : outcome === "terminated" ? "Git operation was cancelled and its subprocess terminated" : "Git operation was cancelled without confirmed subprocess termination";
+    super(message);
+    this.name = "GitMutationCancellationError";
+    this.outcome = outcome;
+  }
+};
+var GitCommandError = class extends Error {
+  childSettlement;
+  constructor(message, childSettlement, options) {
+    super(message, options);
+    this.name = "GitCommandError";
+    this.childSettlement = childSettlement;
+  }
+};
+function throwIfGitCancelledBeforeSpawn(signal) {
+  if (signal?.aborted) throw new GitMutationCancellationError("cancelled_before_spawn");
+}
+function throwIfGitCancelledAfterSpawn(signal, childSettlement) {
+  if (!signal?.aborted) return;
+  throw new GitMutationCancellationError(
+    childSettlement === "confirmed" ? "terminated" : "unconfirmed"
+  );
+}
+async function rethrowAfterConcurrentGitSettlement(error51, operations, signal) {
+  const settlements = await Promise.allSettled(operations);
+  const unconfirmed = settlements.find(
+    (settlement) => settlement.status === "rejected" && (settlement.reason instanceof GitMutationCancellationError && settlement.reason.outcome === "unconfirmed" || settlement.reason instanceof GitCommandError && settlement.reason.childSettlement === "unconfirmed")
+  );
+  if (unconfirmed?.status === "rejected") {
+    if (signal?.aborted) throw new GitMutationCancellationError("unconfirmed");
+    throw unconfirmed.reason;
+  }
+  if (!signal?.aborted) throw error51;
+  const outcomes = settlements.flatMap(
+    (settlement) => settlement.status === "rejected" && settlement.reason instanceof GitMutationCancellationError ? [settlement.reason.outcome] : []
+  );
+  if (outcomes.includes("terminated")) throw new GitMutationCancellationError("terminated");
+  throw error51;
+}
 async function gitRaw(repositoryPath, args, signal) {
-  signal?.throwIfAborted();
-  const result = await runProcess("git", args, {
-    cwd: repositoryPath,
-    timeoutMs: 12e4,
-    ...signal ? { signal } : {}
-  });
-  signal?.throwIfAborted();
-  if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `git ${args[0]} failed`);
+  throwIfGitCancelledBeforeSpawn(signal);
+  let result;
+  try {
+    result = await runProcess("git", args, {
+      cwd: repositoryPath,
+      timeoutMs: 12e4,
+      ...signal ? { signal } : {}
+    });
+  } catch (error51) {
+    if (error51 instanceof ProcessOutputLimitError)
+      throw new GitCommandError(error51.message, error51.childSettlement, { cause: error51 });
+    throw error51;
+  }
+  if (result.timedOut)
+    throw new GitCommandError(
+      result.stderr.trim() || `git ${args[0]} exceeded its 120000ms timeout`,
+      result.childSettlement
+    );
+  throwIfGitCancelledAfterSpawn(signal, result.childSettlement);
+  if (result.exitCode !== 0)
+    throw new GitCommandError(
+      result.stderr.trim() || `git ${args[0]} failed`,
+      result.childSettlement
+    );
   return result.stdout;
 }
 async function git(repositoryPath, args, signal) {
@@ -46834,11 +47221,19 @@ async function createRunWorkspace(contract, options = {}) {
     );
   return { path, branch, created: true };
 }
-async function commitContentDigest(repositoryPath, hashAlgorithm) {
-  const [changedOutput, untrackedOutput] = await Promise.all([
-    gitRaw(repositoryPath, ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"]),
-    gitRaw(repositoryPath, ["ls-files", "--others", "--exclude-standard", "-z"])
-  ]);
+async function commitContentDigest(repositoryPath, hashAlgorithm, signal) {
+  const operations = [
+    gitRaw(repositoryPath, ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"], signal),
+    gitRaw(repositoryPath, ["ls-files", "--others", "--exclude-standard", "-z"], signal)
+  ];
+  let changedOutput;
+  let untrackedOutput;
+  try {
+    [changedOutput, untrackedOutput] = await Promise.all(operations);
+  } catch (error51) {
+    await rethrowAfterConcurrentGitSettlement(error51, operations, signal);
+    throw error51;
+  }
   const paths = [
     ...new Set(
       [changedOutput, untrackedOutput].flatMap((output) => output.split("\0").filter(Boolean))
@@ -46863,12 +47258,21 @@ async function commitContentDigest(repositoryPath, hashAlgorithm) {
   );
   return contentHash(changes, hashAlgorithm);
 }
-async function captureCommitPrecondition(workspace, hashAlgorithm) {
-  const [expectedHead, branch, contentDigest] = await Promise.all([
-    git(workspace.path, ["rev-parse", "HEAD"]),
-    git(workspace.path, ["branch", "--show-current"]),
-    commitContentDigest(workspace.path, hashAlgorithm)
-  ]);
+async function captureCommitPrecondition(workspace, hashAlgorithm, signal) {
+  const operations = [
+    git(workspace.path, ["rev-parse", "HEAD"], signal),
+    git(workspace.path, ["branch", "--show-current"], signal),
+    commitContentDigest(workspace.path, hashAlgorithm, signal)
+  ];
+  let expectedHead;
+  let branch;
+  let contentDigest;
+  try {
+    [expectedHead, branch, contentDigest] = await Promise.all(operations);
+  } catch (error51) {
+    await rethrowAfterConcurrentGitSettlement(error51, operations, signal);
+    throw error51;
+  }
   if (!branch) throw new Error("The Graphcraft worktree is not on a named branch");
   return { expectedHead, branch, contentDigest };
 }
@@ -46897,27 +47301,33 @@ async function createAtomicCommitClaim(workspace, runId, nodeId, hashAlgorithm) 
     claimedAt: (/* @__PURE__ */ new Date()).toISOString()
   });
 }
-async function performAtomicCommit(workspace, claim, task, hashAlgorithm, markDispatched, boundary) {
+async function performAtomicCommit(workspace, claim, task, hashAlgorithm, markDispatched, boundary, signal) {
   if (claim.kind !== "git_commit") throw new Error(`Side effect ${claim.actionId} is not a commit`);
+  throwIfGitCancelledBeforeSpawn(signal);
   const expected = commitPrecondition(claim);
-  const current = await captureCommitPrecondition(workspace, hashAlgorithm);
+  const current = await captureCommitPrecondition(workspace, hashAlgorithm, signal);
   if (current.expectedHead !== expected.expectedHead || current.branch !== expected.branch || current.contentDigest !== expected.contentDigest)
     throw new Error(`Commit precondition changed for side effect ${claim.actionId}`);
-  const status3 = await git(workspace.path, ["status", "--porcelain=v1"]);
+  const status3 = await git(workspace.path, ["status", "--porcelain=v1"], signal);
   if (!status3) throw new Error("No accepted changes are available to commit");
-  await git(workspace.path, ["add", "-A"]);
+  await git(workspace.path, ["add", "-A"], signal);
   const summary = task.replace(/\s+/g, " ").slice(0, 64);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  throwIfGitCancelledBeforeSpawn(signal);
   await markDispatched();
-  await git(workspace.path, [
-    "commit",
-    "-m",
-    `graphcraft: ${summary}`,
-    "-m",
-    `Graphcraft-Action: ${claim.idempotencyKey}`
-  ]);
+  await git(
+    workspace.path,
+    ["commit", "-m", `graphcraft: ${summary}`, "-m", `Graphcraft-Action: ${claim.idempotencyKey}`],
+    signal
+  );
   await crossSideEffectBoundary(boundary, "after_action_command");
-  return { sha: await git(workspace.path, ["rev-parse", "HEAD"]), branch: expected.branch };
+  return {
+    // The mutation child has already settled. Keep this bounded local read out of
+    // cancellation classification so a later abort cannot be mistaken for a
+    // commit that never spawned.
+    sha: await git(workspace.path, ["rev-parse", "HEAD"]),
+    branch: expected.branch
+  };
 }
 async function reconcileAtomicCommit(workspace, claim, hashAlgorithm) {
   if (claim.kind !== "git_commit") throw new Error(`Side effect ${claim.actionId} is not a commit`);
@@ -46962,28 +47372,48 @@ async function reconcileAtomicCommit(workspace, claim, hashAlgorithm) {
     ]
   };
 }
-async function remoteBranchSha(repositoryPath, remote, branch) {
+async function remoteBranchSha(repositoryPath, remote, branch, signal) {
+  throwIfGitCancelledBeforeSpawn(signal);
   const ref = `refs/heads/${branch}`;
   const result = await runProcess("git", ["ls-remote", "--exit-code", "--refs", remote, ref], {
     cwd: repositoryPath,
-    timeoutMs: 12e4
+    timeoutMs: 12e4,
+    ...signal ? { signal } : {}
   });
+  if (result.timedOut)
+    throw new GitCommandError(
+      result.stderr.trim() || `Reading ${remote}/${branch} exceeded its 120000ms timeout`,
+      result.childSettlement
+    );
+  throwIfGitCancelledAfterSpawn(signal, result.childSettlement);
   if (result.exitCode === 2 && result.stdout.trim().length === 0) return null;
   if (result.exitCode !== 0)
-    throw new Error(result.stderr.trim() || `Unable to read ${remote}/${branch}`);
+    throw new GitCommandError(
+      result.stderr.trim() || `Unable to read ${remote}/${branch}`,
+      result.childSettlement
+    );
   const matches = result.stdout.trim().split("\n").filter(Boolean).map((line) => line.split(/\s+/, 2)).filter(([, observedRef]) => observedRef === ref);
   if (matches.length !== 1 || !matches[0]?.[0])
     throw new Error(`Remote ${remote}/${branch} did not resolve to exactly one SHA`);
   return matches[0][0];
 }
-async function capturePushPrecondition(workspace, remote = "origin") {
-  const [remoteUrl, branch, localSha] = await Promise.all([
-    git(workspace.path, ["remote", "get-url", remote]),
-    git(workspace.path, ["branch", "--show-current"]),
-    git(workspace.path, ["rev-parse", "HEAD"])
-  ]);
+async function capturePushPrecondition(workspace, remote = "origin", signal) {
+  const operations = [
+    git(workspace.path, ["remote", "get-url", remote], signal),
+    git(workspace.path, ["branch", "--show-current"], signal),
+    git(workspace.path, ["rev-parse", "HEAD"], signal)
+  ];
+  let remoteUrl;
+  let branch;
+  let localSha;
+  try {
+    [remoteUrl, branch, localSha] = await Promise.all(operations);
+  } catch (error51) {
+    await rethrowAfterConcurrentGitSettlement(error51, operations, signal);
+    throw error51;
+  }
   if (!branch) throw new Error("The Graphcraft worktree is not on a named branch");
-  const expectedRemoteSha = await remoteBranchSha(workspace.path, remote, branch);
+  const expectedRemoteSha = await remoteBranchSha(workspace.path, remote, branch, signal);
   return { remote, remoteUrl, branch, localSha, expectedRemoteSha };
 }
 function pushPrecondition(claim) {
@@ -47013,20 +47443,21 @@ async function createAtomicPushClaim(workspace, runId, nodeId, hashAlgorithm) {
     claimedAt: (/* @__PURE__ */ new Date()).toISOString()
   });
 }
-async function performAtomicPush(workspace, claim, markDispatched, boundary) {
+async function performAtomicPush(workspace, claim, markDispatched, boundary, signal) {
   if (claim.kind !== "git_push") throw new Error(`Side effect ${claim.actionId} is not a push`);
+  throwIfGitCancelledBeforeSpawn(signal);
   const expected = pushPrecondition(claim);
-  const current = await capturePushPrecondition(workspace, expected.remote);
+  const current = await capturePushPrecondition(workspace, expected.remote, signal);
   if (current.remoteUrl !== expected.remoteUrl || current.branch !== expected.branch || current.localSha !== expected.localSha || current.expectedRemoteSha !== expected.expectedRemoteSha)
     throw new Error(`Push precondition changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  throwIfGitCancelledBeforeSpawn(signal);
   await markDispatched();
-  await gitRaw(workspace.path, [
-    "push",
-    "--porcelain",
-    expected.remote,
-    `${expected.branch}:refs/heads/${expected.branch}`
-  ]);
+  await gitRaw(
+    workspace.path,
+    ["push", "--porcelain", expected.remote, `${expected.branch}:refs/heads/${expected.branch}`],
+    signal
+  );
   await crossSideEffectBoundary(boundary, "after_action_command");
   return {
     remote: expected.remote,
@@ -51785,12 +52216,31 @@ async function removeProbeProcessJournal(input) {
 }
 
 // packages/runtime/src/github.ts
+function classifyGitHubCommandCancellation(error51) {
+  if (error51 instanceof GitHubCommandCancellationError)
+    return {
+      outcome: error51.outcome,
+      childSettlement: error51.outcome === "unconfirmed" ? "unconfirmed" : "confirmed"
+    };
+  if (error51 instanceof GitHubCommandError || error51 instanceof GitHubCommandResultError)
+    return { outcome: "failed", childSettlement: error51.childSettlement };
+  return void 0;
+}
 function compareGitHubIdentityStrings(left, right, hashAlgorithm) {
   if (hashAlgorithm === LEGACY_CANONICAL_HASH_ALGORITHM) return left.localeCompare(right);
   return left < right ? -1 : left > right ? 1 : 0;
 }
 function commandOptions(workspace, options = {}) {
   return { cwd: workspace.path, ...options };
+}
+function mutationCommandOptions(workspace, options, signal) {
+  return {
+    ...commandOptions(workspace, options),
+    ...signal ? { signal } : {}
+  };
+}
+function throwIfGitHubMutationCancelledBeforeDispatch(signal) {
+  if (signal?.aborted) throw new GitHubCommandCancellationError("cancelled_before_spawn");
 }
 async function git2(repositoryPath, args) {
   const result = await runProcess("git", args, { cwd: repositoryPath, timeoutMs: 12e4 });
@@ -52052,7 +52502,7 @@ async function reconcilePullRequest(workspace, claim, hashAlgorithm, options = {
     evidence: [...bindingEvidence, `Pull request #${current.number} carries the action marker`]
   };
 }
-async function performPullRequestCreation(workspace, claim, hashAlgorithm, markDispatched, options = {}, boundary) {
+async function performPullRequestCreation(workspace, claim, hashAlgorithm, markDispatched, options = {}, boundary, signal) {
   if (claim.kind !== "github_pr_create")
     throw new Error(`Side effect ${claim.actionId} is not a pull-request creation`);
   const expected = pullRequestPrecondition(claim);
@@ -52068,8 +52518,9 @@ async function performPullRequestCreation(workspace, claim, hashAlgorithm, markD
   if (contentHash(body, hashAlgorithm) !== expected.bodyHash)
     throw new Error(`Pull-request body changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  throwIfGitHubMutationCancelledBeforeDispatch(signal);
   await markDispatched();
-  await createGitHubPullRequest(commandOptions(workspace, options), {
+  await createGitHubPullRequest(mutationCommandOptions(workspace, options, signal), {
     nameWithOwner: expected.nameWithOwner,
     headRefName: expected.headRefName,
     baseRefName: expected.baseRefName,
@@ -52479,7 +52930,7 @@ async function reconcileReviewReply(workspace, claim, hashAlgorithm, options) {
     evidence: [...evidence, `Review thread ${thread.id} has no action reply yet`]
   };
 }
-async function performReviewReply(workspace, claim, hashAlgorithm, options, markDispatched, boundary) {
+async function performReviewReply(workspace, claim, hashAlgorithm, options, markDispatched, boundary, signal) {
   const expected = reviewReplyPrecondition(claim);
   await assertPullRequestBinding(workspace, expected, expected.number, options);
   const thread = await readGitHubReviewThread(commandOptions(workspace, options), {
@@ -52493,13 +52944,17 @@ async function performReviewReply(workspace, claim, hashAlgorithm, options, mark
   if (contentHash(body, hashAlgorithm) !== expected.replyBodyHash)
     throw new Error(`Review reply body changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  throwIfGitHubMutationCancelledBeforeDispatch(signal);
   await markDispatched();
-  const reply = await addGitHubReviewThreadReply(commandOptions(workspace, options), {
-    host: expected.host,
-    threadId: expected.threadId,
-    body,
-    clientMutationId: claim.idempotencyKey
-  });
+  const reply = await addGitHubReviewThreadReply(
+    mutationCommandOptions(workspace, options, signal),
+    {
+      host: expected.host,
+      threadId: expected.threadId,
+      body,
+      clientMutationId: claim.idempotencyKey
+    }
+  );
   await crossSideEffectBoundary(boundary, "after_action_command");
   return { threadId: expected.threadId, commentId: reply.id, url: reply.url };
 }
@@ -52578,7 +53033,7 @@ async function reconcileReviewResolution(workspace, claim, hashAlgorithm, option
     evidence: [...evidence, `Review thread ${thread.id} remains unresolved`]
   };
 }
-async function performReviewResolution(workspace, claim, hashAlgorithm, options, markDispatched, boundary) {
+async function performReviewResolution(workspace, claim, hashAlgorithm, options, markDispatched, boundary, signal) {
   const expected = reviewResolutionPrecondition(claim);
   await assertPullRequestBinding(workspace, expected, expected.number, options);
   const thread = await readGitHubReviewThread(commandOptions(workspace, options), {
@@ -52591,12 +53046,16 @@ async function performReviewResolution(workspace, claim, hashAlgorithm, options,
   if (!reply || thread.isResolved || thread.comments.at(-1)?.id !== reply.id)
     throw new Error(`Review thread ${expected.threadId} is not ready for resolution`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  throwIfGitHubMutationCancelledBeforeDispatch(signal);
   await markDispatched();
-  const resolved = await resolveGitHubReviewThread(commandOptions(workspace, options), {
-    host: expected.host,
-    threadId: expected.threadId,
-    clientMutationId: claim.idempotencyKey
-  });
+  const resolved = await resolveGitHubReviewThread(
+    mutationCommandOptions(workspace, options, signal),
+    {
+      host: expected.host,
+      threadId: expected.threadId,
+      clientMutationId: claim.idempotencyKey
+    }
+  );
   await crossSideEffectBoundary(boundary, "after_action_command");
   return { threadId: resolved.id, resolved: resolved.isResolved, replyCommentId: reply.id };
 }
@@ -52723,15 +53182,16 @@ async function reconcileCheckRerun(workspace, claim, hashAlgorithm, options) {
     ]
   };
 }
-async function performCheckRerun(workspace, claim, hashAlgorithm, options, markDispatched, boundary) {
+async function performCheckRerun(workspace, claim, hashAlgorithm, options, markDispatched, boundary, signal) {
   const expected = checkRerunPrecondition(claim);
   const current = await currentBoundCheck(workspace, expected, hashAlgorithm, options);
   const check2 = current.check;
   if (!check2 || check2.kind !== "check_run" || check2.name !== expected.checkName || check2.status !== expected.checkStatus || (check2.conclusion ?? null) !== expected.checkConclusion)
     throw new Error(`Check run ${expected.checkId} moved before rerun`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
+  throwIfGitHubMutationCancelledBeforeDispatch(signal);
   await markDispatched();
-  await rerequestGitHubCheckRun(commandOptions(workspace, options), {
+  await rerequestGitHubCheckRun(mutationCommandOptions(workspace, options, signal), {
     host: expected.host,
     nameWithOwner: expected.nameWithOwner,
     databaseId: expected.databaseId
@@ -52787,10 +53247,13 @@ async function rerunLifecycleChecks(input) {
         hashAlgorithm,
         options,
         markDispatched,
-        input.boundary
+        input.boundary,
+        input.signal
       ),
       dispatchPolicy: "at_most_once",
       deferError: (error51) => error51 instanceof GitHubLifecycleConsistencyError,
+      ...input.signal ? { signal: input.signal } : {},
+      classifyCancellation: classifyGitHubCommandCancellation,
       ...input.boundary ? { boundary: input.boundary } : {}
     });
     evidence.push(
@@ -52837,10 +53300,13 @@ async function reconcileReviewThreadActions(input) {
         hashAlgorithm,
         options,
         markDispatched,
-        input.boundary
+        input.boundary,
+        input.signal
       ),
       dispatchPolicy: "reconcile_then_retry",
       revalidateConfirmed: true,
+      ...input.signal ? { signal: input.signal } : {},
+      classifyCancellation: classifyGitHubCommandCancellation,
       ...input.boundary ? { boundary: input.boundary } : {}
     });
     state = await input.store.loadState();
@@ -52867,10 +53333,13 @@ async function reconcileReviewThreadActions(input) {
         hashAlgorithm,
         options,
         markDispatched,
-        input.boundary
+        input.boundary,
+        input.signal
       ),
       dispatchPolicy: "reconcile_then_retry",
       revalidateConfirmed: true,
+      ...input.signal ? { signal: input.signal } : {},
+      classifyCancellation: classifyGitHubCommandCancellation,
       ...input.boundary ? { boundary: input.boundary } : {}
     });
     evidence.push(
@@ -52910,7 +53379,8 @@ async function reconcilePendingGitHubActions(input) {
             hashAlgorithm,
             options,
             markDispatched,
-            input.boundary
+            input.boundary,
+            input.signal
           );
         if (claim.kind === "github_review_thread_resolve")
           return await performReviewResolution(
@@ -52919,7 +53389,8 @@ async function reconcilePendingGitHubActions(input) {
             hashAlgorithm,
             options,
             markDispatched,
-            input.boundary
+            input.boundary,
+            input.signal
           );
         return await performCheckRerun(
           input.workspace,
@@ -52927,7 +53398,8 @@ async function reconcilePendingGitHubActions(input) {
           hashAlgorithm,
           options,
           markDispatched,
-          input.boundary
+          input.boundary,
+          input.signal
         );
       },
       dispatchPolicy: entry.claim.kind === "github_check_rerun" ? "at_most_once" : "reconcile_then_retry",
@@ -52935,6 +53407,8 @@ async function reconcilePendingGitHubActions(input) {
       ...entry.claim.kind === "github_check_rerun" ? {
         deferError: (error51) => error51 instanceof GitHubLifecycleConsistencyError
       } : {},
+      ...input.signal ? { signal: input.signal } : {},
+      classifyCancellation: classifyGitHubCommandCancellation,
       ...input.boundary ? { boundary: input.boundary } : {}
     });
     evidence.push(
@@ -56418,6 +56892,16 @@ async function recoverDurableNodeFailureBlocker(store, state) {
   });
   return await store.loadState();
 }
+function classifyGitMutationCancellation(error51) {
+  if (error51 instanceof GitMutationCancellationError)
+    return {
+      outcome: error51.outcome,
+      childSettlement: error51.outcome === "unconfirmed" ? "unconfirmed" : "confirmed"
+    };
+  if (error51 instanceof GitCommandError)
+    return { outcome: "failed", childSettlement: error51.childSettlement };
+  return void 0;
+}
 async function executeRun(input) {
   const externalSignal = input.signal ?? new AbortController().signal;
   const contract = await input.store.loadContract();
@@ -56475,7 +56959,7 @@ async function executeRun(input) {
     if (["completed", "stopped"].includes(state.status)) return state;
     await recordRunApprovalDecisions(input.store, graph);
     state = await input.store.loadState();
-    const finishInterruption = async (nodeIds, termination, artifact) => {
+    const finishInterruption = async (nodeIds, termination, artifact, sideEffect) => {
       const activeNodeIds = nodeIds ? Array.isArray(nodeIds) ? nodeIds : [nodeIds] : [];
       const request = infrastructureFailure ? void 0 : signal.reason === controlAbort.signal.reason ? controlRequest : void 0;
       const reason = infrastructureFailure ? interruptionReason(infrastructureFailure.error, "runtime_shutdown") : request ? { cause: request.cause, reason: request.reason } : interruptionReason(signal.reason, "runtime_shutdown");
@@ -56508,6 +56992,7 @@ async function executeRun(input) {
         outcome: termination?.outcome ?? "checkpointed",
         termination: termination ?? null,
         artifact: artifact ?? null,
+        sideEffect: sideEffect ?? null,
         nodeIds: activeNodeIds
       });
       await input.store.append(
@@ -56729,8 +57214,13 @@ async function executeRun(input) {
     if (signal.aborted) return await finishInterruption(interruptedNodeIds);
     if (state.status !== "running")
       await input.store.append("runtime", "run.started", { workspace });
-    const authorizeWorkspace = async () => {
-      workspace = await reconcileStoredRunWorkspace(input.store, contract, workspace, signal);
+    const authorizeWorkspace = async (phase = "precondition") => {
+      workspace = await reconcileStoredRunWorkspace(
+        input.store,
+        contract,
+        workspace,
+        phase === "settlement" ? lockSignal : signal
+      );
     };
     while (!signal.aborted) {
       state = await input.store.loadState();
@@ -56965,6 +57455,7 @@ async function executeRun(input) {
                 node: current,
                 workspace,
                 authorizeWorkspace,
+                signal,
                 ...input.github ? { options: input.github } : {},
                 ...input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}
               });
@@ -56977,6 +57468,9 @@ async function executeRun(input) {
                 });
             } catch (error51) {
               if (error51 instanceof SideEffectBoundaryInterruption) throw error51;
+              if (error51 instanceof SideEffectInterruption && signal.aborted)
+                return await finishInterruption(current.id, void 0, void 0, error51.receipt);
+              if (signal.aborted) return await finishInterruption(current.id);
               if (error51 instanceof GitHubLifecycleConsistencyError) {
                 const deferred = await deferLifecycleConsistency(current, error51);
                 if (deferred) return deferred;
@@ -57082,6 +57576,7 @@ async function executeRun(input) {
                   contract,
                   lifecycle: outcome2.lifecycle,
                   authorizeWorkspace,
+                  signal,
                   ...input.github ? { options: input.github } : {},
                   ...input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}
                 });
@@ -57094,6 +57589,9 @@ async function executeRun(input) {
                 continue;
               } catch (error51) {
                 if (error51 instanceof SideEffectBoundaryInterruption) throw error51;
+                if (error51 instanceof SideEffectInterruption && signal.aborted)
+                  return await finishInterruption(current.id, void 0, void 0, error51.receipt);
+                if (signal.aborted) return await finishInterruption(current.id);
                 const reason2 = error51 instanceof Error ? error51.message : String(error51);
                 await appendDurableNodeFailureBlocker({
                   store: input.store,
@@ -57206,6 +57704,7 @@ async function executeRun(input) {
                 contract,
                 lifecycle: outcome2.lifecycle,
                 authorizeWorkspace,
+                signal,
                 ...input.github ? { options: input.github } : {},
                 ...input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}
               });
@@ -57218,6 +57717,9 @@ async function executeRun(input) {
               continue;
             } catch (error51) {
               if (error51 instanceof SideEffectBoundaryInterruption) throw error51;
+              if (error51 instanceof SideEffectInterruption && signal.aborted)
+                return await finishInterruption(current.id, void 0, void 0, error51.receipt);
+              if (signal.aborted) return await finishInterruption(current.id);
               if (error51 instanceof GitHubLifecycleConsistencyError) {
                 const deferred = await deferLifecycleConsistency(current, error51);
                 if (deferred) return deferred;
@@ -57641,9 +58143,12 @@ async function executeRun(input) {
               contract.task,
               input.store.repositorySideEffectIdentityHashAlgorithm,
               markDispatched,
-              input.sideEffectBoundary
+              input.sideEffectBoundary,
+              signal
             ),
             dispatchPolicy: "reconcile_then_retry",
+            signal,
+            classifyCancellation: classifyGitMutationCancellation,
             ...input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}
           });
           await input.store.append("runtime", "node.accepted", {
@@ -57654,6 +58159,9 @@ async function executeRun(input) {
           await crossSideEffectBoundary(input.sideEffectBoundary, "after_node_acceptance");
         } catch (error51) {
           if (error51 instanceof SideEffectBoundaryInterruption) throw error51;
+          if (error51 instanceof SideEffectInterruption && signal.aborted)
+            return await finishInterruption(current.id, void 0, void 0, error51.receipt);
+          if (signal.aborted) return await finishInterruption(current.id);
           await input.store.append("runtime", "node.failed", {
             nodeId: current.id,
             reason: error51.message
@@ -57697,9 +58205,17 @@ async function executeRun(input) {
             claim: proposedClaim,
             authorize: authorizeWorkspace,
             reconcile: async (claim) => await reconcileAtomicPush(workspace, claim),
-            act: async (claim, markDispatched) => await performAtomicPush(workspace, claim, markDispatched, input.sideEffectBoundary),
+            act: async (claim, markDispatched) => await performAtomicPush(
+              workspace,
+              claim,
+              markDispatched,
+              input.sideEffectBoundary,
+              signal
+            ),
             dispatchPolicy: "reconcile_then_retry",
             revalidateConfirmed: true,
+            signal,
+            classifyCancellation: classifyGitMutationCancellation,
             ...input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}
           });
           await input.store.append("runtime", "node.accepted", {
@@ -57712,6 +58228,9 @@ async function executeRun(input) {
           await crossSideEffectBoundary(input.sideEffectBoundary, "after_node_acceptance");
         } catch (error51) {
           if (error51 instanceof SideEffectBoundaryInterruption) throw error51;
+          if (error51 instanceof SideEffectInterruption && signal.aborted)
+            return await finishInterruption(current.id, void 0, void 0, error51.receipt);
+          if (signal.aborted) return await finishInterruption(current.id);
           await input.store.append("runtime", "node.failed", {
             nodeId: current.id,
             reason: error51.message
@@ -57770,10 +58289,13 @@ async function executeRun(input) {
               input.store.githubMutationLifecycleIdentityHashAlgorithm,
               markDispatched,
               input.github,
-              input.sideEffectBoundary
+              input.sideEffectBoundary,
+              signal
             ),
             dispatchPolicy: "reconcile_then_retry",
             revalidateConfirmed: true,
+            signal,
+            classifyCancellation: classifyGitHubCommandCancellation,
             ...input.sideEffectBoundary ? { boundary: input.sideEffectBoundary } : {}
           });
           const lifecycle = await captureProbes(
@@ -57854,6 +58376,9 @@ async function executeRun(input) {
           await crossSideEffectBoundary(input.sideEffectBoundary, "after_node_acceptance");
         } catch (error51) {
           if (error51 instanceof SideEffectBoundaryInterruption) throw error51;
+          if (error51 instanceof SideEffectInterruption && signal.aborted)
+            return await finishInterruption(current.id, void 0, void 0, error51.receipt);
+          if (signal.aborted) return await finishInterruption(current.id);
           if (error51 instanceof GitHubLifecycleConsistencyError) {
             const deferred = await deferLifecycleConsistency(current, error51);
             if (deferred) return deferred;
