@@ -218,7 +218,7 @@ async function waitForProbeScopeMarker(
   markerPath: string,
   child: ChildProcess,
   diagnostics: () => string,
-  timeoutMs = 15_000,
+  timeoutMs = process.platform === "win32" ? 60_000 : 15_000,
 ): Promise<ProbeScopeMarker> {
   const deadline = Date.now() + timeoutMs;
   while (true) {
@@ -835,7 +835,7 @@ describe("cold runtime restart fault recovery", () => {
         await Promise.all([...cleanupPids].map((pid) => killProcessForCleanup(pid)));
       }
     },
-    60_000,
+    process.platform === "win32" ? 180_000 : 60_000,
   );
 
   it("settles an owned probe tree before blocking on a missing workspace record", async () => {

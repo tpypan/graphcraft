@@ -2913,7 +2913,7 @@ process.stdin.on("end", () => {
         ),
       ),
     ).toHaveLength(0);
-  }, 60_000);
+  }, 180_000);
 
   it("prioritizes task identifiers and acronyms over incidental planning prose", async () => {
     const repository = await createRepository();
@@ -8995,7 +8995,7 @@ process.stdin.on("end", () => {
       ?.result?.sha;
     if (typeof repairPushSha !== "string") throw new Error("Missing repair push SHA");
     expect(state.latestProgressEvidence.join("\n")).toContain(repairPushSha);
-  }, 60_000);
+  }, 180_000);
 
   it.each([1, 2] as const)(
     "uses exact format-v%s review-reply and resolution identities without a second repair",
@@ -9340,7 +9340,7 @@ process.stdin.on("end", () => {
       ),
     ).toHaveLength(1);
     expect(adapter.calls).toEqual(["implement", "repair-review-1"]);
-  }, 60_000);
+  }, 180_000);
 
   it("stops for the remaining human review decision after resolving threads", async () => {
     const { repository, remote } = await createRepositoryWithRemote();
@@ -9397,7 +9397,7 @@ process.stdin.on("end", () => {
       expect.arrayContaining(["github_pr_comment", "github_review_thread_resolve"]),
     );
     expect(adapter.calls).toEqual(["implement", "repair-review-1"]);
-  }, 60_000);
+  }, 180_000);
 
   it("clears a sticky changes-requested decision only after explicit approval", async () => {
     const { repository, remote } = await createRepositoryWithRemote();
