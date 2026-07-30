@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RunControlChannel } from "./control.ts";
 
@@ -20,6 +20,35 @@ async function createChannel(): Promise<RunControlChannel> {
 }
 
 describe("run control persistence", () => {
+  it("reuses the persisted request identity after normalizing a secret-bearing reason", async () => {
+    const channel = await createChannel();
+    const secret = "opaque-control-retry-value-12345";
+    const environmentName = "GRAPHCRAFT_CONTROL_RETRY_API_KEY";
+    const previousSecret = process.env[environmentName];
+    const reason = `Pause while credential ${secret} is active`;
+    process.env[environmentName] = secret;
+
+    try {
+      const first = await channel.request("pause", reason);
+      const persisted = await channel.read();
+      delete process.env[environmentName];
+      const restarted = new RunControlChannel(
+        dirname(dirname(channel.path)),
+        basename(channel.path, ".json"),
+      );
+      const retried = await restarted.request("pause", reason);
+
+      expect(first.reason).toBe("Pause while credential [REDACTED] is active");
+      expect(first).toEqual(persisted);
+      expect(retried).toEqual(first);
+      expect(retried.requestId).toBe(first.requestId);
+      expect(JSON.stringify(retried)).not.toContain(secret);
+    } finally {
+      if (previousSecret === undefined) delete process.env[environmentName];
+      else process.env[environmentName] = previousSecret;
+    }
+  });
+
   it("rejects a control request that exceeds its persistence limit", async () => {
     const channel = await createChannel();
 

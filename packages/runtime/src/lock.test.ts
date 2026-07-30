@@ -14,7 +14,7 @@ import {
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { RunLock } from "./lock.ts";
+import { bindToRunLockLease, RunLock, withRunLockLease } from "./lock.ts";
 import { privatePublicationIdentityFingerprint } from "./secure-fs.ts";
 
 const temporaryRoots: string[] = [];
@@ -411,6 +411,64 @@ describe("run lock persistence", () => {
     await writeFile(path, record, { mode: 0o600 });
     await expect(lock.release()).resolves.toBeUndefined();
     await expect(access(path)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("blocks every later owner operation with the exact lease-loss failure", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-lock-bound-owner-test-"));
+    temporaryRoots.push(root);
+    const path = join(root, "run.lock");
+    const lock = new RunLock(path);
+    const leaseFailure = new Error("run-lock lease lost by test");
+    const leaseLoss = new AbortController();
+    const signal = vi.spyOn(RunLock.prototype, "signal", "get").mockReturnValue(leaseLoss.signal);
+    const calls: string[] = [];
+    const owner = {
+      async mutate(label: string): Promise<void> {
+        calls.push(label);
+        if (label === "first") {
+          leaseLoss.abort(leaseFailure);
+          await this.mutate("nested");
+        }
+      },
+    };
+
+    try {
+      await expect(
+        withRunLockLease(lock, async (leaseSignal) => {
+          const bound = bindToRunLockLease(owner, leaseSignal);
+          await bound.mutate("first");
+        }),
+      ).rejects.toBe(leaseFailure);
+      expect(calls).toEqual(["first"]);
+      await expect(access(path)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      signal.mockRestore();
+    }
+  });
+
+  it("preserves a body failure over a later lock-release failure", async () => {
+    const root = await mkdtemp(join(tmpdir(), "graphcraft-lock-causal-failure-test-"));
+    temporaryRoots.push(root);
+    const path = join(root, "run.lock");
+    const lock = new RunLock(path);
+    const bodyFailure = new Error("owner body failed");
+    const releaseFailure = new Error("lock release failed later");
+    const releaseOriginal = lock.release.bind(lock);
+    const release = vi.spyOn(lock, "release").mockImplementation(async () => {
+      await releaseOriginal();
+      throw releaseFailure;
+    });
+
+    try {
+      await expect(
+        withRunLockLease(lock, async () => {
+          throw bodyFailure;
+        }),
+      ).rejects.toBe(bodyFailure);
+      await expect(access(path)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      release.mockRestore();
+    }
   });
 
   it("does not steal fresh JSON with an invalid lock shape", async () => {

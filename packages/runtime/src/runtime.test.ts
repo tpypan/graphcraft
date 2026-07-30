@@ -10793,7 +10793,7 @@ process.stdin.on("end", () => {
     },
   );
 
-  it.each(["configure probes", "amend graph", "decide control"] as const)(
+  it.each(["configure probes", "amend graph", "decide control", "request control"] as const)(
     "prepares legacy storage before direct %s run-lock ownership",
     async (operation) => {
       const repository = await createRepository();
@@ -10896,7 +10896,7 @@ process.stdin.on("end", () => {
             "user",
           ),
         ).rejects.toThrow(/awaiting_approval/);
-      } else {
+      } else if (operation === "decide control") {
         const decided = await decideRunControl(reopened, {
           sourceId: "user-outcome",
           targetId: "verify",
@@ -10908,6 +10908,14 @@ process.stdin.on("end", () => {
             expect.objectContaining({ sourceId: "user-outcome", targetId: "verify" }),
           ]),
         );
+      } else {
+        const controlled = await requestRunControl(
+          reopened,
+          "pause",
+          "Pause the migrated legacy run",
+          5_000,
+        );
+        expect(controlled.status).toBe("paused");
       }
 
       expect(reopened.canonicalHashAlgorithm).toBe(LEGACY_CANONICAL_HASH_ALGORITHM);
@@ -10954,6 +10962,344 @@ process.stdin.on("end", () => {
       ).toContain('"schemaVersion":1');
     },
   );
+
+  describe("direct run-lock lease recovery", () => {
+    it("rejects a secret-bearing probe plan before changing durable run state", async () => {
+      const repository = await createRepository();
+      const created = await createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+      });
+      const secret = "ghp_abcdefghijklmnopqrstuvwxyz";
+      const unsafePlan: ProbePlan = {
+        ...created.probePlan,
+        items: created.probePlan.items.map((item, index) =>
+          index === 0 ? { ...item, source: `${item.source} token=${secret}` } : item,
+        ),
+      };
+      const paths = [
+        created.store.eventsPath(),
+        join(created.store.runRoot, "graph.json"),
+        join(created.store.runRoot, "probe-plan.json"),
+        join(created.store.runRoot, "held-out-probes.json"),
+      ];
+      const before = await Promise.all(paths.map(async (path) => await readFile(path)));
+
+      await expect(configureRunProbes(created.store, unsafePlan)).rejects.toThrow(
+        "Probe plan contains secret-like material",
+      );
+
+      const after = await Promise.all(paths.map(async (path) => await readFile(path)));
+      expect(after).toEqual(before);
+    });
+
+    it("stops probe validation before a durable amendment after lease loss", async () => {
+      const repository = await createRepository();
+      const created = await createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+      });
+      const eventBytes = await readFile(created.store.eventsPath());
+      const leaseFailure = new Error("probe validation lease lost by test");
+      const leaseLoss = new AbortController();
+      const signal = vi.spyOn(RunLock.prototype, "signal", "get").mockReturnValue(leaseLoss.signal);
+      const loadStateOriginal = created.store.loadState.bind(created.store);
+      const loadState = vi.spyOn(created.store, "loadState").mockImplementationOnce(async () => {
+        const state = await loadStateOriginal();
+        leaseLoss.abort(leaseFailure);
+        return state;
+      });
+
+      try {
+        await expect(configureRunProbes(created.store, created.probePlan)).rejects.toBe(
+          leaseFailure,
+        );
+      } finally {
+        loadState.mockRestore();
+        signal.mockRestore();
+      }
+
+      expect(await readFile(created.store.eventsPath())).toEqual(eventBytes);
+      const lock = new RunLock(
+        join(created.store.graphcraftRoot, "locks", `${created.contract.runId}.lock`),
+      );
+      await lock.acquire();
+      await lock.release();
+    });
+
+    it("recovers a probe configuration without duplicating its durable amendment", async () => {
+      const repository = await createRepository();
+      const created = await createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+      });
+      const edited: ProbePlan = {
+        ...created.probePlan,
+        items: created.probePlan.items.map((item, index) =>
+          index === 0 ? { ...item, source: `${item.source} after lease recovery` } : item,
+        ),
+      };
+      const leaseFailure = new Error("probe configuration lease lost by test");
+      const leaseLoss = new AbortController();
+      const signal = vi.spyOn(RunLock.prototype, "signal", "get").mockReturnValue(leaseLoss.signal);
+      const saveGraphOriginal = created.store.saveGraph.bind(created.store);
+      const saveGraph = vi
+        .spyOn(created.store, "saveGraph")
+        .mockImplementationOnce(async (graph) => {
+          await saveGraphOriginal(graph);
+          leaseLoss.abort(leaseFailure);
+        });
+      const saveProbePlan = vi.spyOn(created.store, "saveProbePlan");
+      const saveHeldOutProbePlan = vi.spyOn(created.store, "saveHeldOutProbePlan");
+
+      try {
+        await expect(configureRunProbes(created.store, edited)).rejects.toBe(leaseFailure);
+        expect(saveProbePlan).not.toHaveBeenCalled();
+        expect(saveHeldOutProbePlan).not.toHaveBeenCalled();
+      } finally {
+        saveHeldOutProbePlan.mockRestore();
+        saveProbePlan.mockRestore();
+        saveGraph.mockRestore();
+        signal.mockRestore();
+      }
+
+      const recovered = await configureRunProbes(created.store, edited);
+      expect(recovered.graph.revision).toBe(1);
+      expect(recovered.probePlan).toEqual(edited);
+      expect(await created.store.loadProbePlan()).toEqual(edited);
+      expect((await created.store.loadHeldOutProbePlan()).runId).toBe(created.contract.runId);
+      const configurations = (await created.store.loadEvents()).filter(
+        ({ type, data }) =>
+          type === "graph.amended" && typeof data.probeConfigurationId === "string",
+      );
+      expect(configurations).toHaveLength(1);
+      expect(configurations[0]?.data.probePlan).toEqual(edited);
+    });
+
+    it("recovers an amendment by its durable amendment identity", async () => {
+      const repository = await createRepository();
+      const adapter = new FakeAdapter(async () => undefined);
+      const created = await createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+        planner: adapter,
+      });
+      expect((await executeRun({ store: created.store, adapter, approve: true })).status).toBe(
+        "blocked",
+      );
+      const implementation = created.graph.nodes.find(({ id }) => id === "implement")!;
+      const replacement = (id: string, objective: string) => ({
+        id,
+        kind: implementation.kind,
+        objective,
+        dependsOn: implementation.dependsOn,
+        scope: implementation.scope,
+        contextSelector: implementation.contextSelector,
+        progressProbes: implementation.progressProbes,
+        completionProbes: implementation.completionProbes,
+        sideEffectClass: implementation.sideEffectClass,
+      });
+      const amendment: GraphAmendment = {
+        schemaVersion: 1,
+        amendmentId: randomUUID(),
+        operations: [
+          {
+            operation: "split",
+            targetId: implementation.id,
+            replacements: [
+              replacement("implement-recovered", "Implement after lease recovery"),
+              replacement("prove-recovered", "Prove the recovered implementation"),
+            ],
+          },
+        ],
+        evidence: ["Lease-loss fault injection preserved the durable amendment"],
+        rationale: "Split the unfinished implementation into recoverable steps",
+        changedStrategy: "Separate implementation from independent proof after lease recovery",
+        falsifiableExpectation: "The same amendment identity appears exactly once",
+      };
+      const leaseFailure = new Error("graph amendment lease lost by test");
+      const leaseLoss = new AbortController();
+      const signal = vi.spyOn(RunLock.prototype, "signal", "get").mockReturnValue(leaseLoss.signal);
+      const saveGraphOriginal = created.store.saveGraph.bind(created.store);
+      const saveGraph = vi
+        .spyOn(created.store, "saveGraph")
+        .mockImplementationOnce(async (graph) => {
+          await saveGraphOriginal(graph);
+          leaseLoss.abort(leaseFailure);
+        });
+
+      try {
+        await expect(amendRunGraph(created.store, amendment, "runtime")).rejects.toBe(leaseFailure);
+      } finally {
+        saveGraph.mockRestore();
+        signal.mockRestore();
+      }
+
+      const recovered = await amendRunGraph(created.store, amendment, "runtime");
+      expect(recovered.graph.revision).toBe(1);
+      expect(
+        (await created.store.loadEvents()).filter(
+          ({ type, data }) =>
+            type === "graph.amended" &&
+            (data.amendment as { proposal?: { amendmentId?: string } } | undefined)?.proposal
+              ?.amendmentId === amendment.amendmentId,
+        ),
+      ).toHaveLength(1);
+    });
+
+    it("recovers an identical user control decision without creating a replacement", async () => {
+      const repository = await createRepository();
+      const created = await createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+      });
+      const secret = "opaque-governance-retry-value-12345";
+      const environmentName = "GRAPHCRAFT_GOVERNANCE_RETRY_API_KEY";
+      const previousSecret = process.env[environmentName];
+      const decision = {
+        sourceId: "user-outcome",
+        targetId: "verify",
+        verdict: "approve" as const,
+        rationale: `Approve the finish line with credential ${secret} after lease recovery`,
+        evidence: [`user-reviewed-control credential ${secret}`],
+      };
+      const leaseFailure = new Error("control decision lease lost by test");
+      const leaseLoss = new AbortController();
+      const signal = vi.spyOn(RunLock.prototype, "signal", "get").mockReturnValue(leaseLoss.signal);
+      const appendOriginal = created.store.append.bind(created.store);
+      const append = vi
+        .spyOn(created.store, "append")
+        .mockImplementation(async (actor, type, data, causationId) => {
+          const event = await appendOriginal(actor, type, data, causationId);
+          if (type === "control.decision") leaseLoss.abort(leaseFailure);
+          return event;
+        });
+
+      process.env[environmentName] = secret;
+      try {
+        try {
+          await expect(decideRunControl(created.store, decision)).rejects.toBe(leaseFailure);
+        } finally {
+          append.mockRestore();
+          signal.mockRestore();
+        }
+
+        delete process.env[environmentName];
+        const recovered = await decideRunControl(
+          new RunStore(repository, created.contract.runId),
+          decision,
+        );
+        const decisions = (await created.store.loadEvents()).filter(
+          ({ type, data }) =>
+            type === "control.decision" &&
+            (data.decision as { sourceId?: string; targetId?: string } | undefined)?.sourceId ===
+              decision.sourceId &&
+            (data.decision as { sourceId?: string; targetId?: string } | undefined)?.targetId ===
+              decision.targetId,
+        );
+        expect(decisions).toHaveLength(1);
+        expect(recovered.controlDecisions).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              ...decision,
+              rationale: "Approve the finish line with credential [REDACTED] after lease recovery",
+              evidence: ["user-reviewed-control credential [REDACTED]"],
+            }),
+          ]),
+        );
+        expect(JSON.stringify(recovered.controlDecisions)).not.toContain(secret);
+      } finally {
+        if (previousSecret === undefined) delete process.env[environmentName];
+        else process.env[environmentName] = previousSecret;
+      }
+    });
+
+    it("finishes one durable owner-unavailable control request after lease loss", async () => {
+      const repository = await createRepository();
+      const created = await createRun("Implement a substantial feature across the fixture", {
+        cwd: repository,
+      });
+      const reason = "Pause after owner lease recovery";
+      const leaseFailure = new Error("control request lease lost by test");
+      const leaseLoss = new AbortController();
+      const signal = vi.spyOn(RunLock.prototype, "signal", "get").mockReturnValue(leaseLoss.signal);
+      const appendOriginal = created.store.append.bind(created.store);
+      const append = vi
+        .spyOn(created.store, "append")
+        .mockImplementation(async (actor, type, data, causationId) => {
+          const event = await appendOriginal(actor, type, data, causationId);
+          if (type === "control.applied") leaseLoss.abort(leaseFailure);
+          return event;
+        });
+
+      try {
+        await expect(requestRunControl(created.store, "pause", reason, 5_000)).rejects.toBe(
+          leaseFailure,
+        );
+      } finally {
+        append.mockRestore();
+        signal.mockRestore();
+      }
+
+      const channel = new RunControlChannel(created.store.graphcraftRoot, created.contract.runId);
+      const retained = await channel.read();
+      expect(retained).toMatchObject({ action: "pause", reason });
+      const recovered = await requestRunControl(created.store, "pause", reason, 5_000);
+      expect(recovered.status).toBe("paused");
+      expect(await channel.read()).toBeUndefined();
+      const events = await created.store.loadEvents();
+      expect(
+        events.filter(
+          ({ type, data }) =>
+            type === "control.applied" &&
+            (data.request as RunControlRequest | undefined)?.requestId === retained?.requestId,
+        ),
+      ).toHaveLength(1);
+      expect(
+        events.filter(
+          ({ type, data }) => type === "run.paused" && data.requestId === retained?.requestId,
+        ),
+      ).toHaveLength(1);
+    });
+
+    it.each(["pause", "stop"] as const)(
+      "clears a retained %s request after its terminal event survived lease loss",
+      async (action) => {
+        const repository = await createRepository();
+        const created = await createRun("Implement a substantial feature across the fixture", {
+          cwd: repository,
+        });
+        const reason = `${action} after terminal lease recovery`;
+        const terminalType = action === "pause" ? "run.paused" : "run.stopped";
+        const leaseFailure = new Error(`${action} terminal lease lost by test`);
+        const leaseLoss = new AbortController();
+        const signal = vi
+          .spyOn(RunLock.prototype, "signal", "get")
+          .mockReturnValue(leaseLoss.signal);
+        const appendOriginal = created.store.append.bind(created.store);
+        const append = vi
+          .spyOn(created.store, "append")
+          .mockImplementation(async (actor, type, data, causationId) => {
+            const event = await appendOriginal(actor, type, data, causationId);
+            if (type === terminalType) leaseLoss.abort(leaseFailure);
+            return event;
+          });
+
+        try {
+          await expect(requestRunControl(created.store, action, reason, 5_000)).rejects.toBe(
+            leaseFailure,
+          );
+        } finally {
+          append.mockRestore();
+          signal.mockRestore();
+        }
+
+        const channel = new RunControlChannel(created.store.graphcraftRoot, created.contract.runId);
+        const retained = await channel.read();
+        expect(retained).toMatchObject({ action, reason });
+        const eventsBeforeRetry = await created.store.loadEvents();
+        const recovered = await requestRunControl(created.store, action, reason, 5_000);
+        expect(recovered.status).toBe(action === "pause" ? "paused" : "stopped");
+        expect(await channel.read()).toBeUndefined();
+        expect(await created.store.loadEvents()).toEqual(eventsBeforeRetry);
+      },
+    );
+  });
 
   it("continues prior event-v2 and held-out-v1 storage without relabelling its plan", async () => {
     const repository = await createRepository();

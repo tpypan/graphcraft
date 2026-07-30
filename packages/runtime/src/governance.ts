@@ -11,7 +11,7 @@ import {
   type RunEvent,
   type RunState,
 } from "@graphcraft/core";
-import { RunLock } from "./lock.ts";
+import { bindToRunLockLease, RunLock, withRunLockLease } from "./lock.ts";
 import { redactValue } from "./redaction.ts";
 import type { RunStore } from "./store.ts";
 
@@ -898,9 +898,10 @@ export async function decideRunControl(
 ): Promise<RunState> {
   await store.prepareStorage();
   const lock = new RunLock(join(store.graphcraftRoot, "locks", `${store.runId}.lock`));
-  await lock.acquire();
-  try {
-    const [graph, state] = await Promise.all([store.loadGraph(), store.loadState()]);
+  return await withRunLockLease(lock, async (signal) => {
+    const ownedStore = bindToRunLockLease(store, signal);
+    const graph = await ownedStore.loadGraph();
+    const state = await ownedStore.loadState();
     const anchor = graph.anchors.find(({ id }) => id === input.sourceId);
     if (!anchor || anchor.owner !== "user")
       throw new Error(`Control source ${input.sourceId} is not owned by the user`);
@@ -917,26 +918,33 @@ export async function decideRunControl(
     const previous = state.controlDecisions.findLast(
       ({ sourceId, targetId }) => sourceId === input.sourceId && targetId === input.targetId,
     );
+    if (
+      previous?.verdict === input.verdict &&
+      previous.actor === "user" &&
+      previous.sticky &&
+      previous.replaces === input.replaces
+    )
+      return state;
     if (previous?.sticky && input.replaces !== previous.decisionId)
       throw new Error(`Sticky decision ${previous.decisionId} requires explicit replacement`);
     if (input.replaces && previous?.decisionId !== input.replaces)
       throw new Error(`Replacement decision ${input.replaces} is not current`);
+    const durableRationale = redactValue(input.rationale) as string;
+    const durableEvidence = redactValue(input.evidence ?? []) as string[];
     const decision = ControlDecisionSchema.parse({
       schemaVersion: 1,
       decisionId: randomUUID(),
       sourceId: input.sourceId,
       targetId: input.targetId,
       verdict: input.verdict,
-      rationale: input.rationale,
-      evidence: input.evidence ?? [],
+      rationale: durableRationale,
+      evidence: durableEvidence,
       actor: "user",
       sticky: true,
       decidedAt: new Date().toISOString(),
       ...(input.replaces ? { replaces: input.replaces } : {}),
     });
-    await appendDecision(store, decision);
-    return await store.loadState();
-  } finally {
-    await lock.release();
-  }
+    await appendDecision(ownedStore, decision);
+    return await ownedStore.loadState();
+  });
 }

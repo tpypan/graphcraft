@@ -405,3 +405,58 @@ export class RunLock {
     }
   }
 }
+
+/**
+ * Prevents a lock-protected owner from starting another operation after its
+ * lease has been lost. An operation already in flight may settle, but every
+ * later method call fails with the exact lease-loss reason. This internal
+ * proxy is only for Graphcraft owner objects without native `#private` fields.
+ */
+export function bindToRunLockLease<T extends object>(target: T, signal: AbortSignal): T {
+  return new Proxy(target, {
+    get(value, property, receiver) {
+      const member = Reflect.get(value, property, receiver) as unknown;
+      if (typeof member !== "function") return member;
+      return (...args: unknown[]) => {
+        signal.throwIfAborted();
+        return Reflect.apply(member, receiver, args);
+      };
+    },
+  });
+}
+
+/**
+ * Runs one bounded owner operation under a lock and preserves the first body
+ * or lease failure over later release failures.
+ */
+export async function withRunLockLease<T>(
+  lock: RunLock,
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  await lock.acquire();
+  const signal = lock.signal;
+  let causalFailure: { error: unknown } | undefined;
+  let bodyFailureWasThrown = false;
+  const recordLeaseLoss = (): void => {
+    causalFailure ??= { error: signal.reason };
+  };
+  if (signal.aborted) recordLeaseLoss();
+  else signal.addEventListener("abort", recordLeaseLoss, { once: true });
+  try {
+    signal.throwIfAborted();
+    const result = await operation(signal);
+    signal.throwIfAborted();
+    return result;
+  } catch (error) {
+    bodyFailureWasThrown = true;
+    throw (causalFailure ??= { error }).error;
+  } finally {
+    try {
+      await lock.release();
+    } catch (error) {
+      causalFailure ??= { error };
+    }
+    signal.removeEventListener("abort", recordLeaseLoss);
+    if (!bodyFailureWasThrown && causalFailure) throw causalFailure.error;
+  }
+}

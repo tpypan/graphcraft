@@ -73,7 +73,7 @@ import {
   type ExecutedProbe,
 } from "@graphcraft/probes";
 import { GitHubLifecycleConsistencyError } from "@graphcraft/github";
-import { RunLock } from "./lock.ts";
+import { bindToRunLockLease, RunLock, withRunLockLease } from "./lock.ts";
 import { applyRunGraphAmendmentLocked } from "./amendment.ts";
 import { requestRunControl, RunControlChannel } from "./control.ts";
 import {
@@ -111,7 +111,7 @@ import {
   type SideEffectInterruptionReceipt,
 } from "./side-effect.ts";
 import { RunStore, RunStoreLimitError } from "./store.ts";
-import { redactString, redactValue } from "./redaction.ts";
+import { assertPersistenceSafe, redactString, redactValue } from "./redaction.ts";
 import {
   auditWorkspaceScope,
   captureWorkspaceScopeSnapshot,
@@ -632,47 +632,81 @@ export async function configureRunProbes(
 ): Promise<{ graph: Graph; probePlan: ProbePlan }> {
   await store.prepareStorage();
   const lock = new RunLock(join(store.graphcraftRoot, "locks", `${store.runId}.lock`));
-  await lock.acquire();
-  try {
-    const state = await store.loadState();
+  return await withRunLockLease(lock, async (signal) => {
+    const ownedStore = bindToRunLockLease(store, signal);
+    const state = await ownedStore.loadState();
     if (state.status !== "awaiting_approval")
       throw new Error("Probes can only be edited before the run contract is approved");
-    const [contract, existingGraph] = await Promise.all([store.loadContract(), store.loadGraph()]);
-    const probePlan = await validateProbePlan(input, store.repositoryRoot);
+    const probePlan = await validateProbePlan(input, store.repositoryRoot, signal);
+    assertPersistenceSafe(probePlan, "Probe plan");
+    const desiredProbePlanHash = contentHash(probePlan, store.probeEvidenceCheckpointHashAlgorithm);
+    const contract = await ownedStore.loadContract();
+    const existingGraph = await ownedStore.loadGraph();
+    const previousProbePlan = await ownedStore.loadProbePlan();
+    await ownedStore.loadHeldOutProbePlan();
+    const events = await ownedStore.loadEvents();
+    const existingConfiguration = events.findLast(
+      ({ type, data }) =>
+        type === "graph.amended" &&
+        data.probeConfigurationPlanHash === desiredProbePlanHash &&
+        (data.graph as Graph | undefined)?.revision === existingGraph.revision,
+    );
+    if (
+      existingConfiguration &&
+      contentHash(previousProbePlan, store.probeEvidenceCheckpointHashAlgorithm) ===
+        desiredProbePlanHash
+    )
+      return { graph: existingGraph, probePlan: previousProbePlan };
     const heldOutProbePlan = await createRuntimeHeldOutProbePlan(
       contract.runId,
       probePlan,
       store.repositoryRoot,
-      undefined,
+      signal,
       store.heldOutProbePlanHashAlgorithm,
     );
+    assertPersistenceSafe(heldOutProbePlan, "Held-out probe plan");
     const graphProbePlan = workerVisibleProbePlan(probePlan, heldOutProbePlan);
     const graph = applyProbePlan(
       { ...existingGraph, revision: existingGraph.revision + 1 },
       contract,
       graphProbePlan,
     );
-    await store.append("user", "graph.amended", {
-      graph,
-      probePlan,
-      heldOutProbePlan,
-      addedNodeIds: [],
-      rationale: "User edited the deterministic probe plan before approval",
-      previousProbePlanHash: contentHash(
-        await store.loadProbePlan(),
-        store.probeEvidenceCheckpointHashAlgorithm,
-      ),
-      probePlanHash: contentHash(probePlan, store.probeEvidenceCheckpointHashAlgorithm),
-    });
-    await Promise.all([
-      store.saveGraph(graph),
-      store.saveProbePlan(probePlan),
-      store.saveHeldOutProbePlan(heldOutProbePlan),
-    ]);
+    const previousProbePlanHash = contentHash(
+      previousProbePlan,
+      store.probeEvidenceCheckpointHashAlgorithm,
+    );
+    const probeConfigurationId = contentHash(
+      {
+        schemaVersion: 1,
+        kind: "probe_configuration",
+        runId: store.runId,
+        previousGraphRevision: existingGraph.revision,
+        previousProbePlanHash,
+        probePlanHash: desiredProbePlanHash,
+      },
+      store.probeEvidenceCheckpointHashAlgorithm,
+    );
+    await ownedStore.append(
+      "user",
+      "graph.amended",
+      {
+        graph,
+        probePlan,
+        heldOutProbePlan,
+        addedNodeIds: [],
+        rationale: "User edited the deterministic probe plan before approval",
+        probeConfigurationId,
+        probeConfigurationPlanHash: desiredProbePlanHash,
+        previousProbePlanHash,
+        probePlanHash: desiredProbePlanHash,
+      },
+      probeConfigurationId,
+    );
+    await ownedStore.saveGraph(graph);
+    await ownedStore.saveProbePlan(probePlan);
+    await ownedStore.saveHeldOutProbePlan(heldOutProbePlan);
     return { graph, probePlan };
-  } finally {
-    await lock.release();
-  }
+  });
 }
 
 interface ReusableHostSession {
@@ -4211,16 +4245,7 @@ export async function executeRun(input: {
   const lock = new RunLock(join(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
   await lock.acquire();
   const lockSignal = lock.signal;
-  const ownedStore = new Proxy(input.store, {
-    get(target, property) {
-      const value = Reflect.get(target, property, target) as unknown;
-      if (typeof value !== "function") return value;
-      return (...args: unknown[]) => {
-        if (lockSignal.aborted) throw lockSignal.reason;
-        return Reflect.apply(value, target, args);
-      };
-    },
-  });
+  const ownedStore = bindToRunLockLease(input.store, lockSignal);
   input = { ...input, store: ownedStore };
   const controlChannel = new RunControlChannel(input.store.graphcraftRoot, contract.runId);
   const controlAbort = new AbortController();

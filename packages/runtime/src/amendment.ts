@@ -9,7 +9,7 @@ import {
   type GraphAmendmentRecord,
   type RunEvent,
 } from "@graphcraft/core";
-import { RunLock } from "./lock.ts";
+import { bindToRunLockLease, RunLock, withRunLockLease } from "./lock.ts";
 import { RunStore } from "./store.ts";
 
 export interface RunGraphAmendmentResult {
@@ -73,13 +73,11 @@ export async function applyRunGraphAmendmentLocked(
   }
   requireChangedFailureStrategy(events, proposal);
 
-  const [graph, contract, state, probePlan, heldOutProbePlan] = await Promise.all([
-    store.loadGraph(),
-    store.loadContract(),
-    store.loadState(),
-    store.loadProbePlan(),
-    store.loadHeldOutProbePlan(),
-  ]);
+  const graph = await store.loadGraph();
+  const contract = await store.loadContract();
+  const state = await store.loadState();
+  const probePlan = await store.loadProbePlan();
+  const heldOutProbePlan = await store.loadHeldOutProbePlan();
   if (["awaiting_approval", "completed", "stopped"].includes(state.status))
     throw new Error(`Graph amendments are not allowed while a run is ${state.status}`);
   const graphProbePlan = workerVisibleProbePlan(probePlan, heldOutProbePlan);
@@ -128,10 +126,9 @@ export async function amendRunGraph(
 ): Promise<RunGraphAmendmentResult> {
   await store.prepareStorage();
   const lock = new RunLock(join(store.graphcraftRoot, "locks", `${store.runId}.lock`));
-  await lock.acquire();
-  try {
-    return await applyRunGraphAmendmentLocked(store, input, actor);
-  } finally {
-    await lock.release();
-  }
+  return await withRunLockLease(
+    lock,
+    async (signal) =>
+      await applyRunGraphAmendmentLocked(bindToRunLockLease(store, signal), input, actor),
+  );
 }

@@ -3,7 +3,8 @@ import { unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { RunControlRequestSchema, type RunControlRequest, type RunState } from "@graphcraft/core";
 import { writeJsonAtomic } from "./json.ts";
-import { RunLock } from "./lock.ts";
+import { bindToRunLockLease, RunLock, withRunLockLease } from "./lock.ts";
+import { redactValue } from "./redaction.ts";
 import { ensurePrivateDirectory, hardenPrivateFile, readPrivateFileBounded } from "./secure-fs.ts";
 import type { RunStore } from "./store.ts";
 
@@ -37,16 +38,20 @@ export class RunControlChannel {
     await this.ensureStorage();
     const existing = await this.read();
     if (existing?.action === "stop" && action === "pause") return existing;
-    const request = RunControlRequestSchema.parse({
-      schemaVersion: 1,
-      requestId: randomUUID(),
-      runId: this.runId,
-      action,
-      cause: action === "pause" ? "user_pause" : "user_stop",
-      reason,
-      requestedAt: new Date().toISOString(),
-      requestedByPid: process.pid,
-    });
+    if (existing?.action === action) return existing;
+    const durableReason = redactValue(reason) as string;
+    const request = RunControlRequestSchema.parse(
+      redactValue({
+        schemaVersion: 1,
+        requestId: randomUUID(),
+        runId: this.runId,
+        action,
+        cause: action === "pause" ? "user_pause" : "user_stop",
+        reason: durableReason,
+        requestedAt: new Date().toISOString(),
+        requestedByPid: process.pid,
+      }),
+    );
     if (Buffer.byteLength(`${JSON.stringify(request, null, 2)}\n`) > CONTROL_REQUEST_MAX_BYTES)
       throw new Error(
         `Run control request exceeds its ${CONTROL_REQUEST_MAX_BYTES}-byte persistence limit`,
@@ -145,37 +150,76 @@ export async function requestRunControl(
   reason = action === "pause" ? "Paused by user" : "Stopped by user",
   waitMs = 10_000,
 ): Promise<RunState> {
-  let state = await store.loadState();
-  if (targetReached(action, state)) return state;
+  await store.prepareStorage();
   const channel = new RunControlChannel(store.graphcraftRoot, store.runId);
-  const request = await channel.request(action, reason);
   const lockPath = join(store.graphcraftRoot, "locks", `${store.runId}.lock`);
   const deadline = Date.now() + waitMs;
-
-  while (Date.now() <= deadline) {
-    const lock = new RunLock(lockPath);
-    try {
-      await lock.acquire();
-      try {
-        state = await store.loadState();
-        if (!targetReached(action, state)) {
-          await store.append("runtime", "control.applied", {
-            request,
-            outcome: "owner_unavailable",
-            termination: null,
-          });
-          await store.append("user", action === "pause" ? "run.paused" : "run.stopped", {
-            reason,
-            requestId: request.requestId,
-            cause: request.cause,
-          });
-          state = await store.loadState();
+  const settle = async (lock: RunLock, pending?: RunControlRequest): Promise<RunState> =>
+    await withRunLockLease(lock, async (signal) => {
+      const ownedStore = bindToRunLockLease(store, signal);
+      let state = await ownedStore.loadState();
+      if (!pending && targetReached(action, state)) {
+        signal.throwIfAborted();
+        const existing = await channel.read();
+        if (existing && targetReached(existing.action, state)) {
+          signal.throwIfAborted();
+          await channel.clear(existing.requestId);
         }
-        await channel.clear(request.requestId);
         return state;
-      } finally {
-        await lock.release();
       }
+      if (!pending) signal.throwIfAborted();
+      const request = pending ?? (await channel.request(action, reason));
+      if (!targetReached(request.action, state)) {
+        const events = await ownedStore.loadEvents();
+        const alreadyApplied = events.some(
+          ({ type, data }) =>
+            type === "control.applied" &&
+            (data.request as RunControlRequest | null | undefined)?.requestId === request.requestId,
+        );
+        if (!alreadyApplied)
+          await ownedStore.append(
+            "runtime",
+            "control.applied",
+            {
+              request,
+              outcome: "owner_unavailable",
+              termination: null,
+            },
+            request.requestId,
+          );
+        const terminalType = request.action === "pause" ? "run.paused" : "run.stopped";
+        const alreadyTerminal = events.some(
+          ({ type, data }) => type === terminalType && data.requestId === request.requestId,
+        );
+        if (!alreadyTerminal)
+          await ownedStore.append(
+            "user",
+            terminalType,
+            {
+              reason: request.reason,
+              requestId: request.requestId,
+              cause: request.cause,
+            },
+            request.requestId,
+          );
+        state = await ownedStore.loadState();
+      }
+      signal.throwIfAborted();
+      await channel.clear(request.requestId);
+      return state;
+    });
+
+  try {
+    return await settle(new RunLock(lockPath));
+  } catch (error) {
+    if (!(error instanceof Error) || error.message !== "Graphcraft run is already active")
+      throw error;
+  }
+
+  const request = await channel.request(action, reason);
+  while (Date.now() <= deadline) {
+    try {
+      return await settle(new RunLock(lockPath), request);
     } catch (error) {
       if (!(error instanceof Error) || error.message !== "Graphcraft run is already active")
         throw error;
@@ -184,6 +228,6 @@ export async function requestRunControl(
   }
 
   throw new Error(
-    `The active Graphcraft process did not acknowledge ${action} within ${waitMs}ms; the durable request remains pending`,
+    `The active Graphcraft process did not acknowledge ${request.action} within ${waitMs}ms; the durable request remains pending`,
   );
 }
