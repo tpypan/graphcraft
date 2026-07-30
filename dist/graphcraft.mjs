@@ -30868,6 +30868,46 @@ var RunLock = class {
     }
   }
 };
+function bindToRunLockLease(target, signal) {
+  return new Proxy(target, {
+    get(value, property, receiver) {
+      const member = Reflect.get(value, property, receiver);
+      if (typeof member !== "function") return member;
+      return (...args) => {
+        signal.throwIfAborted();
+        return Reflect.apply(member, receiver, args);
+      };
+    }
+  });
+}
+async function withRunLockLease(lock, operation) {
+  await lock.acquire();
+  const signal = lock.signal;
+  let causalFailure;
+  let bodyFailureWasThrown = false;
+  const recordLeaseLoss = () => {
+    causalFailure ??= { error: signal.reason };
+  };
+  if (signal.aborted) recordLeaseLoss();
+  else signal.addEventListener("abort", recordLeaseLoss, { once: true });
+  try {
+    signal.throwIfAborted();
+    const result = await operation(signal);
+    signal.throwIfAborted();
+    return result;
+  } catch (error51) {
+    bodyFailureWasThrown = true;
+    throw (causalFailure ??= { error: error51 }).error;
+  } finally {
+    try {
+      await lock.release();
+    } catch (error51) {
+      causalFailure ??= { error: error51 };
+    }
+    signal.removeEventListener("abort", recordLeaseLoss);
+    if (!bodyFailureWasThrown && causalFailure) throw causalFailure.error;
+  }
+}
 
 // packages/runtime/src/amendment.ts
 function failureSignatures(proposal) {
@@ -30911,13 +30951,11 @@ async function applyRunGraphAmendmentLocked(store, input, actor) {
     };
   }
   requireChangedFailureStrategy(events, proposal);
-  const [graph, contract, state, probePlan, heldOutProbePlan] = await Promise.all([
-    store.loadGraph(),
-    store.loadContract(),
-    store.loadState(),
-    store.loadProbePlan(),
-    store.loadHeldOutProbePlan()
-  ]);
+  const graph = await store.loadGraph();
+  const contract = await store.loadContract();
+  const state = await store.loadState();
+  const probePlan = await store.loadProbePlan();
+  const heldOutProbePlan = await store.loadHeldOutProbePlan();
   if (["awaiting_approval", "completed", "stopped"].includes(state.status))
     throw new Error(`Graph amendments are not allowed while a run is ${state.status}`);
   const graphProbePlan = workerVisibleProbePlan(probePlan, heldOutProbePlan);
@@ -30959,12 +30997,10 @@ async function applyRunGraphAmendmentLocked(store, input, actor) {
 async function amendRunGraph(store, input, actor = "runtime") {
   await store.prepareStorage();
   const lock = new RunLock(join5(store.graphcraftRoot, "locks", `${store.runId}.lock`));
-  await lock.acquire();
-  try {
-    return await applyRunGraphAmendmentLocked(store, input, actor);
-  } finally {
-    await lock.release();
-  }
+  return await withRunLockLease(
+    lock,
+    async (signal) => await applyRunGraphAmendmentLocked(bindToRunLockLease(store, signal), input, actor)
+  );
 }
 
 // packages/runtime/src/artifact-policy.ts
@@ -32753,16 +32789,20 @@ var RunControlChannel = class {
     await this.ensureStorage();
     const existing = await this.read();
     if (existing?.action === "stop" && action === "pause") return existing;
-    const request = RunControlRequestSchema.parse({
-      schemaVersion: 1,
-      requestId: randomUUID6(),
-      runId: this.runId,
-      action,
-      cause: action === "pause" ? "user_pause" : "user_stop",
-      reason,
-      requestedAt: (/* @__PURE__ */ new Date()).toISOString(),
-      requestedByPid: process.pid
-    });
+    if (existing?.action === action) return existing;
+    const durableReason = redactValue(reason);
+    const request = RunControlRequestSchema.parse(
+      redactValue({
+        schemaVersion: 1,
+        requestId: randomUUID6(),
+        runId: this.runId,
+        action,
+        cause: action === "pause" ? "user_pause" : "user_stop",
+        reason: durableReason,
+        requestedAt: (/* @__PURE__ */ new Date()).toISOString(),
+        requestedByPid: process.pid
+      })
+    );
     if (Buffer.byteLength(`${JSON.stringify(request, null, 2)}
 `) > CONTROL_REQUEST_MAX_BYTES)
       throw new Error(
@@ -32845,36 +32885,71 @@ function targetReached(action, state) {
   return ["stopped", "completed"].includes(state.status);
 }
 async function requestRunControl(store, action, reason = action === "pause" ? "Paused by user" : "Stopped by user", waitMs = 1e4) {
-  let state = await store.loadState();
-  if (targetReached(action, state)) return state;
+  await store.prepareStorage();
   const channel = new RunControlChannel(store.graphcraftRoot, store.runId);
-  const request = await channel.request(action, reason);
   const lockPath = join7(store.graphcraftRoot, "locks", `${store.runId}.lock`);
   const deadline = Date.now() + waitMs;
-  while (Date.now() <= deadline) {
-    const lock = new RunLock(lockPath);
-    try {
-      await lock.acquire();
-      try {
-        state = await store.loadState();
-        if (!targetReached(action, state)) {
-          await store.append("runtime", "control.applied", {
-            request,
+  const settle = async (lock, pending) => await withRunLockLease(lock, async (signal) => {
+    const ownedStore = bindToRunLockLease(store, signal);
+    let state = await ownedStore.loadState();
+    if (!pending && targetReached(action, state)) {
+      signal.throwIfAborted();
+      const existing = await channel.read();
+      if (existing && targetReached(existing.action, state)) {
+        signal.throwIfAborted();
+        await channel.clear(existing.requestId);
+      }
+      return state;
+    }
+    if (!pending) signal.throwIfAborted();
+    const request2 = pending ?? await channel.request(action, reason);
+    if (!targetReached(request2.action, state)) {
+      const events = await ownedStore.loadEvents();
+      const alreadyApplied = events.some(
+        ({ type, data }) => type === "control.applied" && data.request?.requestId === request2.requestId
+      );
+      if (!alreadyApplied)
+        await ownedStore.append(
+          "runtime",
+          "control.applied",
+          {
+            request: request2,
             outcome: "owner_unavailable",
             termination: null
-          });
-          await store.append("user", action === "pause" ? "run.paused" : "run.stopped", {
-            reason,
-            requestId: request.requestId,
-            cause: request.cause
-          });
-          state = await store.loadState();
-        }
-        await channel.clear(request.requestId);
-        return state;
-      } finally {
-        await lock.release();
-      }
+          },
+          request2.requestId
+        );
+      const terminalType = request2.action === "pause" ? "run.paused" : "run.stopped";
+      const alreadyTerminal = events.some(
+        ({ type, data }) => type === terminalType && data.requestId === request2.requestId
+      );
+      if (!alreadyTerminal)
+        await ownedStore.append(
+          "user",
+          terminalType,
+          {
+            reason: request2.reason,
+            requestId: request2.requestId,
+            cause: request2.cause
+          },
+          request2.requestId
+        );
+      state = await ownedStore.loadState();
+    }
+    signal.throwIfAborted();
+    await channel.clear(request2.requestId);
+    return state;
+  });
+  try {
+    return await settle(new RunLock(lockPath));
+  } catch (error51) {
+    if (!(error51 instanceof Error) || error51.message !== "Graphcraft run is already active")
+      throw error51;
+  }
+  const request = await channel.request(action, reason);
+  while (Date.now() <= deadline) {
+    try {
+      return await settle(new RunLock(lockPath), request);
     } catch (error51) {
       if (!(error51 instanceof Error) || error51.message !== "Graphcraft run is already active")
         throw error51;
@@ -32882,7 +32957,7 @@ async function requestRunControl(store, action, reason = action === "pause" ? "P
     await new Promise((resolve22) => setTimeout(resolve22, 50));
   }
   throw new Error(
-    `The active Graphcraft process did not acknowledge ${action} within ${waitMs}ms; the durable request remains pending`
+    `The active Graphcraft process did not acknowledge ${request.action} within ${waitMs}ms; the durable request remains pending`
   );
 }
 
@@ -33579,9 +33654,10 @@ async function evaluateControlAcceptance(store, graph, state, targetId, evidence
 async function decideRunControl(store, input) {
   await store.prepareStorage();
   const lock = new RunLock(join8(store.graphcraftRoot, "locks", `${store.runId}.lock`));
-  await lock.acquire();
-  try {
-    const [graph, state] = await Promise.all([store.loadGraph(), store.loadState()]);
+  return await withRunLockLease(lock, async (signal) => {
+    const ownedStore = bindToRunLockLease(store, signal);
+    const graph = await ownedStore.loadGraph();
+    const state = await ownedStore.loadState();
     const anchor = graph.anchors.find(({ id }) => id === input.sourceId);
     if (!anchor || anchor.owner !== "user")
       throw new Error(`Control source ${input.sourceId} is not owned by the user`);
@@ -33595,28 +33671,30 @@ async function decideRunControl(store, input) {
     const previous = state.controlDecisions.findLast(
       ({ sourceId, targetId }) => sourceId === input.sourceId && targetId === input.targetId
     );
+    if (previous?.verdict === input.verdict && previous.actor === "user" && previous.sticky && previous.replaces === input.replaces)
+      return state;
     if (previous?.sticky && input.replaces !== previous.decisionId)
       throw new Error(`Sticky decision ${previous.decisionId} requires explicit replacement`);
     if (input.replaces && previous?.decisionId !== input.replaces)
       throw new Error(`Replacement decision ${input.replaces} is not current`);
+    const durableRationale = redactValue(input.rationale);
+    const durableEvidence = redactValue(input.evidence ?? []);
     const decision = ControlDecisionSchema.parse({
       schemaVersion: 1,
       decisionId: randomUUID7(),
       sourceId: input.sourceId,
       targetId: input.targetId,
       verdict: input.verdict,
-      rationale: input.rationale,
-      evidence: input.evidence ?? [],
+      rationale: durableRationale,
+      evidence: durableEvidence,
       actor: "user",
       sticky: true,
       decidedAt: (/* @__PURE__ */ new Date()).toISOString(),
       ...input.replaces ? { replaces: input.replaces } : {}
     });
-    await appendDecision(store, decision);
-    return await store.loadState();
-  } finally {
-    await lock.release();
-  }
+    await appendDecision(ownedStore, decision);
+    return await ownedStore.loadState();
+  });
 }
 
 // packages/runtime/src/repository.ts
@@ -42771,47 +42849,74 @@ async function createRun(task, options) {
 async function configureRunProbes(store, input) {
   await store.prepareStorage();
   const lock = new RunLock(join15(store.graphcraftRoot, "locks", `${store.runId}.lock`));
-  await lock.acquire();
-  try {
-    const state = await store.loadState();
+  return await withRunLockLease(lock, async (signal) => {
+    const ownedStore = bindToRunLockLease(store, signal);
+    const state = await ownedStore.loadState();
     if (state.status !== "awaiting_approval")
       throw new Error("Probes can only be edited before the run contract is approved");
-    const [contract, existingGraph] = await Promise.all([store.loadContract(), store.loadGraph()]);
-    const probePlan = await validateProbePlan(input, store.repositoryRoot);
+    const probePlan = await validateProbePlan(input, store.repositoryRoot, signal);
+    assertPersistenceSafe(probePlan, "Probe plan");
+    const desiredProbePlanHash = contentHash(probePlan, store.probeEvidenceCheckpointHashAlgorithm);
+    const contract = await ownedStore.loadContract();
+    const existingGraph = await ownedStore.loadGraph();
+    const previousProbePlan = await ownedStore.loadProbePlan();
+    await ownedStore.loadHeldOutProbePlan();
+    const events = await ownedStore.loadEvents();
+    const existingConfiguration = events.findLast(
+      ({ type, data }) => type === "graph.amended" && data.probeConfigurationPlanHash === desiredProbePlanHash && data.graph?.revision === existingGraph.revision
+    );
+    if (existingConfiguration && contentHash(previousProbePlan, store.probeEvidenceCheckpointHashAlgorithm) === desiredProbePlanHash)
+      return { graph: existingGraph, probePlan: previousProbePlan };
     const heldOutProbePlan = await createRuntimeHeldOutProbePlan(
       contract.runId,
       probePlan,
       store.repositoryRoot,
-      void 0,
+      signal,
       store.heldOutProbePlanHashAlgorithm
     );
+    assertPersistenceSafe(heldOutProbePlan, "Held-out probe plan");
     const graphProbePlan = workerVisibleProbePlan(probePlan, heldOutProbePlan);
     const graph = applyProbePlan(
       { ...existingGraph, revision: existingGraph.revision + 1 },
       contract,
       graphProbePlan
     );
-    await store.append("user", "graph.amended", {
-      graph,
-      probePlan,
-      heldOutProbePlan,
-      addedNodeIds: [],
-      rationale: "User edited the deterministic probe plan before approval",
-      previousProbePlanHash: contentHash(
-        await store.loadProbePlan(),
-        store.probeEvidenceCheckpointHashAlgorithm
-      ),
-      probePlanHash: contentHash(probePlan, store.probeEvidenceCheckpointHashAlgorithm)
-    });
-    await Promise.all([
-      store.saveGraph(graph),
-      store.saveProbePlan(probePlan),
-      store.saveHeldOutProbePlan(heldOutProbePlan)
-    ]);
+    const previousProbePlanHash = contentHash(
+      previousProbePlan,
+      store.probeEvidenceCheckpointHashAlgorithm
+    );
+    const probeConfigurationId = contentHash(
+      {
+        schemaVersion: 1,
+        kind: "probe_configuration",
+        runId: store.runId,
+        previousGraphRevision: existingGraph.revision,
+        previousProbePlanHash,
+        probePlanHash: desiredProbePlanHash
+      },
+      store.probeEvidenceCheckpointHashAlgorithm
+    );
+    await ownedStore.append(
+      "user",
+      "graph.amended",
+      {
+        graph,
+        probePlan,
+        heldOutProbePlan,
+        addedNodeIds: [],
+        rationale: "User edited the deterministic probe plan before approval",
+        probeConfigurationId,
+        probeConfigurationPlanHash: desiredProbePlanHash,
+        previousProbePlanHash,
+        probePlanHash: desiredProbePlanHash
+      },
+      probeConfigurationId
+    );
+    await ownedStore.saveGraph(graph);
+    await ownedStore.saveProbePlan(probePlan);
+    await ownedStore.saveHeldOutProbePlan(heldOutProbePlan);
     return { graph, probePlan };
-  } finally {
-    await lock.release();
-  }
+  });
 }
 async function executeWorker(input) {
   let invocationId = input.resume?.invocationId ?? randomUUID11();
@@ -45529,16 +45634,7 @@ async function executeRun(input) {
   const lock = new RunLock(join15(input.store.graphcraftRoot, "locks", `${contract.runId}.lock`));
   await lock.acquire();
   const lockSignal = lock.signal;
-  const ownedStore = new Proxy(input.store, {
-    get(target, property) {
-      const value = Reflect.get(target, property, target);
-      if (typeof value !== "function") return value;
-      return (...args) => {
-        if (lockSignal.aborted) throw lockSignal.reason;
-        return Reflect.apply(value, target, args);
-      };
-    }
-  });
+  const ownedStore = bindToRunLockLease(input.store, lockSignal);
   input = { ...input, store: ownedStore };
   const controlChannel = new RunControlChannel(input.store.graphcraftRoot, contract.runId);
   const controlAbort = new AbortController();
@@ -53032,7 +53128,7 @@ var program2 = new Command().name("graphcraft").description("Progress-aware exec
 async function benchmarkSourceIdentity() {
   if (true) {
     return BenchmarkSourceIdentitySchema.parse({
-      commitSha: "6510b93df77e225f46f5418e1a5ec9b9648d4961",
+      commitSha: "0fe3a70ba6fd71c74a970741ecff4516a19d796f",
       dirty: false,
       dirtyStatusDigest: false ? null : null
     });
