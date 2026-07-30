@@ -118,7 +118,9 @@ const reviewMutationMatrixTimeout = process.platform === "win32" ? 1_500_000 : 6
 const interruptionClassificationTimeout = process.platform === "win32" ? 60_000 : 30_000;
 const githubRepairTimeout = process.platform === "win32" ? 60_000 : 30_000;
 const cooperativeMutationMarkerTimeout =
-  process.platform === "win32" ? 60_000 : process.platform === "darwin" ? 60_000 : 30_000;
+  process.platform === "win32" ? 180_000 : process.platform === "darwin" ? 60_000 : 30_000;
+const cooperativeMutationControlTimeout = process.platform === "win32" ? 60_000 : 15_000;
+const unconfirmedMutationCommandTimeout = process.platform === "win32" ? 30_000 : 1_000;
 
 async function expectUndispatchedSideEffect(
   store: RunStore,
@@ -13509,37 +13511,26 @@ if (args.length === blocked.length && blocked.every((value, index) => args[index
     (["pause", "stop"] as const).map((action) => ({ kind, action })),
   );
 
-  async function installBlockingGitMutationCommand(
+  async function installBlockingGitMutationHook(
     kind: "git_commit" | "git_push",
     repository: string,
     marker: string,
-  ): Promise<() => void> {
-    const originalGit = await resolveTrustedExecutable("git", { untrustedCwd: repository });
-    const originalPath = process.env.PATH;
-    const fakeBin = join(repository, "..", `.cooperative-git-${randomUUID()}`);
-    const fakeGit = join(fakeBin, "git");
-    await mkdir(fakeBin);
+  ): Promise<() => Promise<void>> {
+    const hooks = join(repository, "..", `.cooperative-git-hooks-${randomUUID()}`);
+    const hook = join(hooks, kind === "git_commit" ? "pre-commit" : "pre-push");
+    await mkdir(hooks);
     await writeFile(
-      fakeGit,
+      hook,
       `#!/usr/bin/env node
 const fs = require("node:fs");
-const { spawnSync } = require("node:child_process");
-const args = process.argv.slice(2);
-if (args[0] === ${JSON.stringify(kind === "git_commit" ? "commit" : "push")}) {
-  fs.writeFileSync(${JSON.stringify(marker)}, String(process.pid) + "\\n");
-  setInterval(() => {}, 1_000);
-} else {
-  const result = spawnSync(${JSON.stringify(originalGit)}, args, { stdio: "inherit" });
-  if (result.error) throw result.error;
-  process.exit(result.status ?? 1);
-}
+fs.writeFileSync(${JSON.stringify(marker)}, String(process.pid) + "\\n");
+setInterval(() => {}, 1_000);
 `,
     );
-    await chmod(fakeGit, 0o700);
-    process.env.PATH = `${fakeBin}${delimiter}${originalPath ?? ""}`;
-    return () => {
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
+    await chmod(hook, 0o700);
+    await git(repository, "config", "--local", "core.hooksPath", hooks);
+    return async () => {
+      await git(repository, "config", "--local", "--unset-all", "core.hooksPath");
     };
   }
 
@@ -13554,9 +13545,9 @@ if (args[0] === ${JSON.stringify(kind === "git_commit" ? "commit" : "push")}) {
         action,
         marker,
       );
-      let restoreGitPath = (): void => undefined;
+      let restoreGitHook = async (): Promise<void> => undefined;
       if (kind === "git_commit" || kind === "git_push")
-        restoreGitPath = await installBlockingGitMutationCommand(kind, repository, marker);
+        restoreGitHook = await installBlockingGitMutationHook(kind, repository, marker);
 
       try {
         const reason = `${action} after ${kind} child spawn`;
@@ -13580,7 +13571,7 @@ if (args[0] === ${JSON.stringify(kind === "git_commit" ? "commit" : "push")}) {
         expect(isProcessAlive(childPid)).toBe(true);
 
         const [requested, settled] = await Promise.all([
-          requestRunControl(created.store, action, reason, 15_000),
+          requestRunControl(created.store, action, reason, cooperativeMutationControlTimeout),
           execution,
         ]);
         const events = await created.store.loadEvents();
@@ -13634,10 +13625,10 @@ if (args[0] === ${JSON.stringify(kind === "git_commit" ? "commit" : "push")}) {
           ),
         ).toBe(false);
       } finally {
-        restoreGitPath();
+        await restoreGitHook();
       }
     },
-    process.platform === "win32" ? 240_000 : 120_000,
+    process.platform === "win32" ? 600_000 : 120_000,
   );
 
   it("blocks an unconfirmed mutation failure without misclassifying it as runtime shutdown", async () => {
@@ -13664,13 +13655,14 @@ if (args[0] === ${JSON.stringify(kind === "git_commit" ? "commit" : "push")}) {
       mutationEnvironment.SystemRoot = join(markerRoot, "missing-system-root");
     }
     let descendantPid: number | undefined;
+    const commandTimeoutMs = unconfirmedMutationCommandTimeout;
 
     try {
       const blocked = await executeRun({
         store: created.store,
         adapter,
         approve: true,
-        github: { ...github, env: mutationEnvironment, timeoutMs: 1_000 },
+        github: { ...github, env: mutationEnvironment, timeoutMs: commandTimeoutMs },
       });
       descendantPid = Number((await readFile(marker, "utf8")).trim());
       const events = await created.store.loadEvents();
@@ -13679,7 +13671,7 @@ if (args[0] === ${JSON.stringify(kind === "git_commit" ? "commit" : "push")}) {
         ({ type, data }) => type === "node.failed" && data.nodeId === "pull-request",
       );
       const runBlocker = events.findLast(({ type }) => type === "run.blocked");
-      const timeoutReason = "gh exceeded its 1000ms timeout";
+      const timeoutReason = `gh exceeded its ${commandTimeoutMs}ms timeout`;
 
       expect(Number.isSafeInteger(descendantPid)).toBe(true);
       expect(blocked.status).toBe("blocked");

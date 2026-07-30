@@ -275,7 +275,7 @@ describe("release metadata", () => {
 
     const ci = await readFile(join(workflowDirectory, "ci.yml"), "utf8");
     const platformCheckTimeout =
-      "timeout-minutes: ${{ matrix.os == 'windows-latest' && 180 || 45 }}";
+      "timeout-minutes: ${{ matrix.os == 'windows-latest' && 180 || 90 }}";
     expect(ci).toContain(platformCheckTimeout);
     expect(ci.match(/\n    timeout-minutes: 10\n/gu)).toHaveLength(2);
 
