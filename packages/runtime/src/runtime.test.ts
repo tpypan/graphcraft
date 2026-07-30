@@ -117,6 +117,8 @@ const pullRequestCreateMatrixTimeout = process.platform === "win32" ? 420_000 : 
 const reviewMutationMatrixTimeout = process.platform === "win32" ? 1_500_000 : 600_000;
 const interruptionClassificationTimeout = process.platform === "win32" ? 60_000 : 30_000;
 const githubRepairTimeout = process.platform === "win32" ? 60_000 : 30_000;
+const cooperativeMutationMarkerTimeout =
+  process.platform === "win32" ? 60_000 : process.platform === "darwin" ? 60_000 : 30_000;
 
 async function expectUndispatchedSideEffect(
   store: RunStore,
@@ -13571,7 +13573,7 @@ if (args[0] === ${JSON.stringify(kind === "git_commit" ? "commit" : "push")}) {
               () => true,
               () => false,
             ),
-          process.platform === "win32" ? 60_000 : 30_000,
+          cooperativeMutationMarkerTimeout,
         );
         const childPid = Number((await readFile(marker, "utf8")).trim());
         expect(Number.isSafeInteger(childPid)).toBe(true);

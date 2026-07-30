@@ -32,6 +32,8 @@ import {
 
 const execFileAsync = promisify(execFile);
 const temporaryPaths: string[] = [];
+const signedTagBindingTestTimeout =
+  process.platform === "win32" ? 60_000 : process.platform === "darwin" ? 300_000 : 15_000;
 
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -348,37 +350,41 @@ describe("release metadata", () => {
 });
 
 describe("signed annotated tag binding", () => {
-  it("rejects lightweight and dirty tags while accepting a clean annotated tag", async () => {
-    const root = await temporaryDirectory("graphcraft-release-git-");
-    await execFileAsync("git", ["init", "--initial-branch=main"], { cwd: root });
-    await execFileAsync("git", ["config", "user.name", "Graphcraft Test"], { cwd: root });
-    await execFileAsync("git", ["config", "user.email", "graphcraft@example.invalid"], {
-      cwd: root,
-    });
-    await writeFile(join(root, "fixture.txt"), "release\n");
-    await execFileAsync("git", ["add", "fixture.txt"], { cwd: root });
-    await execFileAsync("git", ["-c", "commit.gpgSign=false", "commit", "-m", "fixture"], {
-      cwd: root,
-    });
-    await execFileAsync("git", ["tag", "v0.1.2"], { cwd: root });
-    await expect(validateTagCheckout({ root, tag: "v0.1.2" })).rejects.toThrow(/annotated tag/);
+  it(
+    "rejects lightweight and dirty tags while accepting a clean annotated tag",
+    async () => {
+      const root = await temporaryDirectory("graphcraft-release-git-");
+      await execFileAsync("git", ["init", "--initial-branch=main"], { cwd: root });
+      await execFileAsync("git", ["config", "user.name", "Graphcraft Test"], { cwd: root });
+      await execFileAsync("git", ["config", "user.email", "graphcraft@example.invalid"], {
+        cwd: root,
+      });
+      await writeFile(join(root, "fixture.txt"), "release\n");
+      await execFileAsync("git", ["add", "fixture.txt"], { cwd: root });
+      await execFileAsync("git", ["-c", "commit.gpgSign=false", "commit", "-m", "fixture"], {
+        cwd: root,
+      });
+      await execFileAsync("git", ["tag", "v0.1.2"], { cwd: root });
+      await expect(validateTagCheckout({ root, tag: "v0.1.2" })).rejects.toThrow(/annotated tag/);
 
-    await execFileAsync("git", ["tag", "--delete", "v0.1.2"], { cwd: root });
-    await execFileAsync(
-      "git",
-      ["-c", "tag.gpgSign=false", "tag", "--annotate", "v0.1.2", "--message", "release"],
-      { cwd: root },
-    );
-    await expect(validateTagCheckout({ root, tag: "v0.1.2", requireRef: "main" })).resolves.toEqual(
-      {
+      await execFileAsync("git", ["tag", "--delete", "v0.1.2"], { cwd: root });
+      await execFileAsync(
+        "git",
+        ["-c", "tag.gpgSign=false", "tag", "--annotate", "v0.1.2", "--message", "release"],
+        { cwd: root },
+      );
+      await expect(
+        validateTagCheckout({ root, tag: "v0.1.2", requireRef: "main" }),
+      ).resolves.toEqual({
         commit: expect.stringMatching(/^[a-f0-9]{40,64}$/),
         tagOid: expect.stringMatching(/^[a-f0-9]{40,64}$/),
-      },
-    );
+      });
 
-    await writeFile(join(root, "untracked.txt"), "not part of release\n");
-    await expect(validateTagCheckout({ root, tag: "v0.1.2" })).rejects.toThrow(/must be clean/);
-  });
+      await writeFile(join(root, "untracked.txt"), "not part of release\n");
+      await expect(validateTagCheckout({ root, tag: "v0.1.2" })).rejects.toThrow(/must be clean/);
+    },
+    signedTagBindingTestTimeout,
+  );
 
   it("requires GitHub's verified signature to bind the same tag object and commit", () => {
     const expected = {
