@@ -338,6 +338,7 @@ async function fakePullRequestGitHub(
       reviews: [],
       rerunCalls: 0,
       syncPullRequestHead: false,
+      windowsSystemRoot: process.env.SystemRoot ?? process.env.SYSTEMROOT,
       rateLimits: {
         core: { limit: 5000, used: 10, remaining: 4990, reset: 1800000000 },
         graphql: { limit: 5000, used: 20, remaining: 4980, reset: 1800000000 },
@@ -367,6 +368,10 @@ const blockMutation = (kind) => {
   if (state.unconfirmedMutation === kind) {
     const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1_000)"], {
       detached: true,
+      env: {
+        ...process.env,
+        ...(state.windowsSystemRoot ? { SystemRoot: state.windowsSystemRoot } : {}),
+      },
       stdio: ["ignore", "inherit", "inherit"],
     });
     descendant.unref();
