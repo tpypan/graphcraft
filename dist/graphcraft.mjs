@@ -53128,7 +53128,7 @@ var program2 = new Command().name("graphcraft").description("Progress-aware exec
 async function benchmarkSourceIdentity() {
   if (true) {
     return BenchmarkSourceIdentitySchema.parse({
-      commitSha: "a92a09e78d026b6c0b7d862a7412cd1f64342782",
+      commitSha: "95b17ad9fe92404d845f17c729611f4540f68752",
       dirty: false,
       dirtyStatusDigest: false ? null : null
     });
