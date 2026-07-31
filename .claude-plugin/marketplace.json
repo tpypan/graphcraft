@@ -9,7 +9,7 @@
       "source": {
         "source": "npm",
         "package": "@tpypan/graphcraft",
-        "version": "0.1.4",
+        "version": "0.1.5",
         "registry": "https://registry.npmjs.org"
       },
       "description": "Progress-aware execution for durable coding agents.",

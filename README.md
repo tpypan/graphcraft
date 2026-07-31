@@ -31,7 +31,7 @@ If the npm registry is unavailable, install the versioned package asset from the
 workflow-verified GitHub release:
 
 ```bash
-GRAPHCRAFT_VERSION=0.1.4
+GRAPHCRAFT_VERSION=0.1.5
 npm install --global "https://github.com/tpypan/graphcraft/releases/download/v${GRAPHCRAFT_VERSION}/tpypan-graphcraft-${GRAPHCRAFT_VERSION}.tgz"
 graphcraft install --host codex
 ```
@@ -40,7 +40,7 @@ Each release publishes `SHA256SUMS` beside the tarball for independent verificat
 
 Direct npm, pnpm, and GitHub installation is the permanent supported fallback even when a host
 marketplace is unavailable. Graphcraft also ships version-locked Codex and Claude marketplace
-catalogs; [marketplace distribution](https://github.com/tpypan/graphcraft/blob/v0.1.4/docs/MARKETPLACES.md) records their validation and the
+catalogs; [marketplace distribution](https://github.com/tpypan/graphcraft/blob/v0.1.5/docs/MARKETPLACES.md) records their validation and the
 separate boundary for hosted public-directory submission.
 
 For a one-shot installation, use `npx @tpypan/graphcraft install --host codex` or `pnpm dlx @tpypan/graphcraft install --host claude`. The installer copies its MCP runtime to `~/.graphcraft/runtime/<version>/` before host registration, so clearing the package-manager cache does not break Graphcraft.
@@ -129,7 +129,7 @@ Use `stable-v1` as the bundled benchmark suite name. A dry run validates and pri
 
 ## Evidence and scope
 
-The [v0.1 implementation report](https://github.com/tpypan/graphcraft/blob/v0.1.4/docs/V0.1.md) records the acceptance boundary, architecture, tests, real-host dogfood, and known gaps. Research and competitive rationale live under [docs/research](https://github.com/tpypan/graphcraft/tree/v0.1.4/docs/research).
+The [v0.1 implementation report](https://github.com/tpypan/graphcraft/blob/v0.1.5/docs/V0.1.md) records the acceptance boundary, architecture, tests, real-host dogfood, and known gaps. Research and competitive rationale live under [docs/research](https://github.com/tpypan/graphcraft/tree/v0.1.5/docs/research).
 
 Graphcraft does not yet claim stable reliability or a 20% token-savings gate. The harness, public fixtures, and blinded-review/publication tooling exist, but repeated real Codex and Claude trials, completed independent defect review, published evidence, and a passing stable gate remain outstanding.
 

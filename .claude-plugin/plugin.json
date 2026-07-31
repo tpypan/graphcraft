@@ -1,6 +1,6 @@
 {
   "name": "graphcraft",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Progress-aware execution for durable coding agents.",
   "author": { "name": "Tony Pan", "url": "https://github.com/tpypan" },
   "homepage": "https://github.com/tpypan/graphcraft",
