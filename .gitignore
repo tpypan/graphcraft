@@ -9,5 +9,6 @@
 /docs/REMAINING_GAPS.md
 /docs/PROJECT_BRIEF.md
 coverage/
+dist/
 node_modules/
 *.log
