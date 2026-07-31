@@ -4,8 +4,6 @@ on:
   pull_request:
   push:
     branches: [main]
-  schedule:
-    - cron: "43 6 * * *"
   workflow_dispatch:
 
 permissions:
@@ -31,10 +29,10 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
 
-  # Cross-platform coverage runs nightly and on demand; the release workflow
+  # Cross-platform coverage runs on demand only; the release workflow
   # still runs the full three-OS matrix on every release tag.
   check-cross-platform:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
