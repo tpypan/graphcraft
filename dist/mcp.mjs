@@ -31480,7 +31480,7 @@ import {
 } from "node:fs/promises";
 import { homedir as homedir3, platform, tmpdir as tmpdir3 } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname as dirname14, isAbsolute as isAbsolute13, join as join17, resolve as resolve17 } from "node:path";
+import { dirname as dirname14, isAbsolute as isAbsolute14, join as join17, resolve as resolve17 } from "node:path";
 var import_cross_spawn5 = __toESM(require_cross_spawn(), 1);
 
 // package.json
@@ -38591,6 +38591,7 @@ import { dirname as dirname4, resolve as resolve5, sep as sep5 } from "node:path
 var import_cross_spawn3 = __toESM(require_cross_spawn(), 1);
 import { createHash as createHash2 } from "node:crypto";
 import { constants as osConstants } from "node:os";
+import { isAbsolute as isAbsolute5 } from "node:path";
 var MIB3 = 1024 * 1024;
 var DEFAULT_PROCESS_OUTPUT_BYTES_PER_STREAM = 8 * MIB3;
 var DEFAULT_PROBE_OUTPUT_BYTES_PER_STREAM = MIB3;
@@ -38996,6 +38997,26 @@ send({
 `;
 }
 var MANAGED_PROCESS_BROKER_SOURCE = managedProcessBrokerSource();
+function configuredManagedProcessBrokerSource(options) {
+  if (options === void 0) return MANAGED_PROCESS_BROKER_SOURCE;
+  if (!options || typeof options !== "object" || Array.isArray(options) || !exactMessageKeys(options, [
+    "platform",
+    "windowsTaskkillExecutable",
+    ...options.windowsTaskkillArgumentPrefix === void 0 ? [] : ["windowsTaskkillArgumentPrefix"]
+  ]))
+    throw new Error("Managed-process broker override is invalid");
+  if (options.platform !== "win32")
+    throw new Error("Managed-process broker override platform must be win32");
+  const executable = options.windowsTaskkillExecutable;
+  if (typeof executable !== "string" || executable.length === 0 || executable.length > 32768 || executable.includes("\0") || !isAbsolute5(executable))
+    throw new Error("Managed-process taskkill executable override must be an absolute path");
+  const argumentPrefix = options.windowsTaskkillArgumentPrefix ?? [];
+  if (!Array.isArray(argumentPrefix) || argumentPrefix.length > 32 || argumentPrefix.some(
+    (argument) => typeof argument !== "string" || argument.length > 32768 || argument.includes("\0")
+  ))
+    throw new Error("Managed-process taskkill argument override is invalid");
+  return managedProcessBrokerSource(options.platform, executable, argumentPrefix);
+}
 function exactMessageKeys(value, expected) {
   const actual = Object.keys(value).sort();
   const sortedExpected = [...expected].sort();
@@ -39069,7 +39090,7 @@ async function runManagedProcess(executable, args, environment, options, started
       process.execPath,
       [
         "-e",
-        MANAGED_PROCESS_BROKER_SOURCE,
+        configuredManagedProcessBrokerSource(lifecycle.broker),
         lifecycle.executionId,
         lifecycle.ownerToken,
         String(PROCESS_TERMINATION_GRACE_MS),
@@ -39413,7 +39434,7 @@ async function runProcess(command, args, options) {
 // packages/probes/src/repository-file.ts
 import { constants as constants2 } from "node:fs";
 import { lstat as lstat4, open, readlink, realpath as realpath4, stat as stat3 } from "node:fs/promises";
-import { dirname as dirname3, isAbsolute as isAbsolute5, relative as relative4, resolve as resolve4, sep as sep4 } from "node:path";
+import { dirname as dirname3, isAbsolute as isAbsolute6, relative as relative4, resolve as resolve4, sep as sep4 } from "node:path";
 var MEBIBYTE = 1024 * 1024;
 var READ_CHUNK_BYTES = 64 * 1024;
 var REPOSITORY_FILE_MAX_BYTES = 8 * MEBIBYTE;
@@ -39435,7 +39456,7 @@ function sanitizedPath(candidate) {
 }
 function inside(root, candidate) {
   const path = relative4(root, candidate);
-  return path === "" || !isAbsolute5(path) && path !== ".." && !path.startsWith(`..${sep4}`);
+  return path === "" || !isAbsolute6(path) && path !== ".." && !path.startsWith(`..${sep4}`);
 }
 async function assertUnresolvedPathInsideRepository(canonicalRoot, candidate, displayPath, signal) {
   let current = candidate;
@@ -39492,7 +39513,7 @@ function validateMaximumBytes(maximumBytes) {
 async function canonicalRepositoryPath(repositoryRoot, candidate, signal) {
   signal?.throwIfAborted();
   const displayPath = sanitizedPath(candidate);
-  if (candidate.includes("\0") || isAbsolute5(candidate))
+  if (candidate.includes("\0") || isAbsolute6(candidate))
     throw new RepositoryFileError(
       "outside_repository",
       displayPath,
@@ -41695,7 +41716,7 @@ import { basename as basename2, dirname as dirname7, resolve as resolve7 } from 
 import { spawn as spawn4 } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { chmod, lstat as lstat5, mkdir as mkdir2, open as open3, readdir } from "node:fs/promises";
-import { dirname as dirname6, isAbsolute as isAbsolute6, join as join4, relative as relative5, resolve as resolve6, sep as sep6, win32 as win322 } from "node:path";
+import { dirname as dirname6, isAbsolute as isAbsolute7, join as join4, relative as relative5, resolve as resolve6, sep as sep6, win32 as win322 } from "node:path";
 
 // packages/runtime/src/json.ts
 import { randomUUID as randomUUID3 } from "node:crypto";
@@ -42882,7 +42903,7 @@ async function hardenPosixEntries(entries, force = false) {
     }
 }
 function privatePathSegments(relativePath) {
-  if (isAbsolute6(relativePath))
+  if (isAbsolute7(relativePath))
     throw new Error(`Private path must be relative to its owned root: ${relativePath}`);
   const segments = relativePath.split(process.platform === "win32" ? /[\\/]/ : /\//).filter((segment) => segment.length > 0);
   if (segments.some((segment) => segment === "." || segment === ".."))
@@ -42897,7 +42918,7 @@ async function validatePrivatePath(ownedRoot, relativePath) {
   if (absolute !== requested)
     throw new Error(`Private path validation changed the requested path: ${relativePath}`);
   const relation = relative5(root, absolute);
-  if (relation === ".." || relation.startsWith(`..${sep6}`) || isAbsolute6(relation))
+  if (relation === ".." || relation.startsWith(`..${sep6}`) || isAbsolute7(relation))
     throw new Error(`Private path escapes its owned root: ${relativePath}`);
   const rootStatus = await lstat5(root);
   if (rootStatus.isSymbolicLink()) rejectSymbolicLink(root);
@@ -43745,7 +43766,7 @@ async function amendRunGraph(store, input, actor = "runtime") {
 import { createHash as createHash3, randomUUID as randomUUID5 } from "node:crypto";
 import { constants as fsConstants3 } from "node:fs";
 import { lstat as lstat7, open as open5, readdir as readdir2, rmdir, unlink as unlink2 } from "node:fs/promises";
-import { basename as basename3, dirname as dirname8, isAbsolute as isAbsolute7, join as join6, posix, relative as relative6, resolve as resolve8, win32 as win323 } from "node:path";
+import { basename as basename3, dirname as dirname8, isAbsolute as isAbsolute8, join as join6, posix, relative as relative6, resolve as resolve8, win32 as win323 } from "node:path";
 import { isDeepStrictEqual as isDeepStrictEqual2 } from "node:util";
 var MIB4 = 1024 * 1024;
 var ATOMIC_STAGING_DIRECTORY = ".artifact-staging";
@@ -43778,7 +43799,7 @@ function formatForPath(path) {
   return "binary";
 }
 function validatePortableRelativePath(path) {
-  if (path.length === 0 || path.includes("\0") || isAbsolute7(path) || posix.isAbsolute(path) || win323.isAbsolute(path) || /^[a-z]:/i.test(path) || path.startsWith("\\\\") || path.includes("\\"))
+  if (path.length === 0 || path.includes("\0") || isAbsolute8(path) || posix.isAbsolute(path) || win323.isAbsolute(path) || /^[a-z]:/i.test(path) || path.startsWith("\\\\") || path.includes("\\"))
     throw new Error(`Artifact path must be a portable relative path: ${path}`);
   const parts = path.split("/");
   if (parts.some((part) => part.length === 0 || part === "." || part === ".."))
@@ -46304,7 +46325,7 @@ async function decideRunControl(store, input) {
 
 // packages/runtime/src/repository.ts
 import { appendFile, lstat as lstat8, mkdir as mkdir3, readFile as readFile2, readlink as readlink2, realpath as realpath5 } from "node:fs/promises";
-import { basename as basename4, dirname as dirname11, isAbsolute as isAbsolute8, join as join10, resolve as resolve9 } from "node:path";
+import { basename as basename4, dirname as dirname11, isAbsolute as isAbsolute9, join as join10, resolve as resolve9 } from "node:path";
 
 // packages/runtime/src/side-effect.ts
 import { constants as osConstants3 } from "node:os";
@@ -46443,10 +46464,11 @@ async function createSideEffectProcessLease(input) {
         journalPath: path,
         journalRelativePath: relative7(input.graphcraftRoot, path).replaceAll("\\", "/"),
         handle,
-        lifecycle: ({ onReady, onSettled }) => ({
+        lifecycle: ({ broker, onReady, onSettled }) => ({
           executionId: definition.executionId,
           ownerToken,
           journalFd: handle.fd,
+          ...broker ? { broker } : {},
           onReady,
           onSettled
         })
@@ -47349,6 +47371,7 @@ async function executeSideEffect(input) {
       hashAlgorithm: sideEffectProcessHashAlgorithm(input.store, claim)
     });
     return processLease.lifecycle({
+      ...request.broker ? { broker: request.broker } : {},
       onReady: async (ready) => {
         await checkpointDispatch();
         processStartEventData = {
@@ -48008,7 +48031,7 @@ async function ensureGraphcraftIgnored(repositoryRoot, signal) {
     ["rev-parse", "--git-path", "info/exclude"],
     signal
   );
-  const excludePath = isAbsolute8(rawExcludePath) ? rawExcludePath : resolve9(repositoryRoot, rawExcludePath);
+  const excludePath = isAbsolute9(rawExcludePath) ? rawExcludePath : resolve9(repositoryRoot, rawExcludePath);
   let content = "";
   try {
     content = await readUtf8(excludePath, signal);
@@ -48132,7 +48155,7 @@ async function branchSha(repositoryPath, branch, signal) {
 async function canonicalGitCommonDirectory(repositoryPath, signal) {
   const value = await git(repositoryPath, ["rev-parse", "--git-common-dir"], signal);
   signal?.throwIfAborted();
-  const path = isAbsolute8(value) ? value : resolve9(repositoryPath, value);
+  const path = isAbsolute9(value) ? value : resolve9(repositoryPath, value);
   const canonical = await realpath5(path);
   signal?.throwIfAborted();
   return comparablePath(canonical);
@@ -50181,7 +50204,7 @@ async function ensureCurrentRunStorage(input) {
 import { createHash as createHash5 } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { lstat as lstat10, readlink as readlink3 } from "node:fs/promises";
-import { isAbsolute as isAbsolute9, matchesGlob, relative as relative9, resolve as resolve11, sep as sep7 } from "node:path";
+import { isAbsolute as isAbsolute10, matchesGlob, relative as relative9, resolve as resolve11, sep as sep7 } from "node:path";
 var maximumChangedPaths = 1e4;
 async function gitOutput(repositoryPath, args, signal) {
   signal?.throwIfAborted();
@@ -50199,10 +50222,10 @@ function nulPaths(value) {
   return value.split("\0").filter(Boolean);
 }
 function confinedPath(repositoryPath, path) {
-  if (isAbsolute9(path)) throw new Error(`Git reported an absolute workspace path: ${path}`);
+  if (isAbsolute10(path)) throw new Error(`Git reported an absolute workspace path: ${path}`);
   const absolute = resolve11(repositoryPath, path);
   const confined = relative9(repositoryPath, absolute);
-  if (confined === ".." || confined.startsWith(`..${sep7}`) || isAbsolute9(confined))
+  if (confined === ".." || confined.startsWith(`..${sep7}`) || isAbsolute10(confined))
     throw new Error(`Git reported a path outside the workspace: ${path}`);
   return absolute;
 }
@@ -50465,7 +50488,7 @@ function scopeViolationReason(audit, workspacePath) {
 // packages/runtime/src/instructions.ts
 import { createHash as createHash6 } from "node:crypto";
 import { lstat as lstat11, readlink as readlink4, realpath as realpath6 } from "node:fs/promises";
-import { isAbsolute as isAbsolute10, join as join12, posix as posix2, relative as relative10, sep as sep8 } from "node:path";
+import { isAbsolute as isAbsolute11, join as join12, posix as posix2, relative as relative10, sep as sep8 } from "node:path";
 var SOURCE_ORDER = [
   "agents",
   "claude",
@@ -50738,7 +50761,7 @@ function claudeImports(content) {
   return imports;
 }
 function resolveImportPath(importer, reference) {
-  if (isAbsolute10(reference) || reference.startsWith("~") || /^[A-Za-z]:[\\/]/u.test(reference) || /^[a-z][a-z0-9+.-]*:/iu.test(reference))
+  if (isAbsolute11(reference) || reference.startsWith("~") || /^[A-Za-z]:[\\/]/u.test(reference) || /^[a-z][a-z0-9+.-]*:/iu.test(reference))
     throw new Error(`Repository instruction ${importer} declares an external import`);
   const joined = posix2.normalize(
     posix2.join(posix2.dirname(importer), reference.replaceAll("\\", "/"))
@@ -50809,7 +50832,7 @@ function decodeInstructionText(bytes) {
   }
 }
 function trackedLinkDestination(path, linkTarget) {
-  if (linkTarget.length === 0 || linkTarget.includes("\0") || isAbsolute10(linkTarget) || /^[A-Za-z]:[\\/]/u.test(linkTarget))
+  if (linkTarget.length === 0 || linkTarget.includes("\0") || isAbsolute11(linkTarget) || /^[A-Za-z]:[\\/]/u.test(linkTarget))
     throw new Error(`Tracked repository instruction ${path} resolves outside the repository`);
   const joined = posix2.normalize(posix2.join(posix2.dirname(path), linkTarget.replaceAll("\\", "/")));
   if (joined === ".." || joined.startsWith("../") || joined.startsWith("/"))
@@ -50894,7 +50917,7 @@ async function readInstructionEntry(input) {
       );
     const target = await realpath6(absolute);
     const confined = relative10(input.repositoryRealPath, target);
-    if (confined === ".." || confined.startsWith(`..${sep8}`) || isAbsolute10(confined))
+    if (confined === ".." || confined.startsWith(`..${sep8}`) || isAbsolute11(confined))
       throw new Error(
         `Tracked repository instruction ${input.path} resolves outside the repository`
       );
@@ -52597,9 +52620,9 @@ async function prepareWorkerContext(input) {
 // packages/runtime/src/wait.ts
 import { lstat as lstat13, readFile as readFile3, readlink as readlink5 } from "node:fs/promises";
 import { setTimeout as waitForTimeout } from "node:timers/promises";
-import { isAbsolute as isAbsolute11, resolve as resolve14, sep as sep9 } from "node:path";
+import { isAbsolute as isAbsolute12, resolve as resolve14, sep as sep9 } from "node:path";
 function waitPath(root, path) {
-  if (isAbsolute11(path) || path.split(/[\\/]/).includes(".."))
+  if (isAbsolute12(path) || path.split(/[\\/]/).includes(".."))
     throw new Error(`Wait condition path is unsafe: ${path}`);
   const absolute = resolve14(root, path);
   if (absolute !== root && !absolute.startsWith(`${root}${sep9}`))
@@ -52758,20 +52781,20 @@ async function sleepUntilWake(nextWakeAt2, signal) {
 }
 
 // packages/runtime/src/held-out.ts
-import { isAbsolute as isAbsolute12, relative as relative12, resolve as resolve15, sep as sep10 } from "node:path";
+import { isAbsolute as isAbsolute13, relative as relative12, resolve as resolve15, sep as sep10 } from "node:path";
 function relativeRepositoryPath(repositoryRoot, candidate) {
   const root = resolve15(repositoryRoot);
   const path = resolve15(repositoryRoot, candidate);
   if (path !== root && !path.startsWith(`${root}${sep10}`)) return void 0;
   const result = relative12(root, path);
-  return result && !isAbsolute12(result) ? result.split(sep10).join("/") : void 0;
+  return result && !isAbsolute13(result) ? result.split(sep10).join("/") : void 0;
 }
 function relativeRepositoryDirectoryPath(repositoryRoot, candidate) {
   const root = resolve15(repositoryRoot);
   const path = resolve15(repositoryRoot, candidate);
   if (path !== root && !path.startsWith(`${root}${sep10}`)) return void 0;
   const result = relative12(root, path);
-  return result && !isAbsolute12(result) ? result.split(sep10).join("/") : ".";
+  return result && !isAbsolute13(result) ? result.split(sep10).join("/") : ".";
 }
 async function directoryValueHash(repositoryRoot, path, algorithm, signal) {
   const [canonicalRoot, canonicalPath] = await Promise.all([
@@ -52780,7 +52803,7 @@ async function directoryValueHash(repositoryRoot, path, algorithm, signal) {
   ]);
   signal?.throwIfAborted();
   const target = relative12(canonicalRoot, canonicalPath);
-  if (isAbsolute12(target) || target === ".." || target.startsWith(`..${sep10}`))
+  if (isAbsolute13(target) || target === ".." || target.startsWith(`..${sep10}`))
     throw new Error(`Completion working directory ${path} escapes the repository`);
   return contentHash(
     {
@@ -53530,7 +53553,14 @@ function compareGitHubIdentityStrings(left, right, hashAlgorithm) {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 function commandOptions(workspace, options = {}) {
-  return { cwd: workspace.path, ...options };
+  const { managedProcessBroker: _managedProcessBroker, ...command } = options;
+  return { cwd: workspace.path, ...command };
+}
+function managedProcessRequest(options) {
+  return {
+    managedProcess: true,
+    ...options.managedProcessBroker ? { broker: options.managedProcessBroker } : {}
+  };
 }
 function mutationCommandOptions(workspace, options, signal, lifecycle) {
   return {
@@ -53819,7 +53849,7 @@ async function performPullRequestCreation(workspace, claim, hashAlgorithm, prepa
     throw new Error(`Pull-request body changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
   throwIfGitHubMutationCancelledBeforeDispatch(signal);
-  const lifecycle = await prepareProcess({ managedProcess: true }) || void 0;
+  const lifecycle = await prepareProcess(managedProcessRequest(options)) || void 0;
   await createGitHubPullRequest(mutationCommandOptions(workspace, options, signal, lifecycle), {
     nameWithOwner: expected.nameWithOwner,
     headRefName: expected.headRefName,
@@ -54245,7 +54275,7 @@ async function performReviewReply(workspace, claim, hashAlgorithm, options, prep
     throw new Error(`Review reply body changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
   throwIfGitHubMutationCancelledBeforeDispatch(signal);
-  const lifecycle = await prepareProcess({ managedProcess: true }) || void 0;
+  const lifecycle = await prepareProcess(managedProcessRequest(options)) || void 0;
   const reply = await addGitHubReviewThreadReply(
     mutationCommandOptions(workspace, options, signal, lifecycle),
     {
@@ -54347,7 +54377,7 @@ async function performReviewResolution(workspace, claim, hashAlgorithm, options,
     throw new Error(`Review thread ${expected.threadId} is not ready for resolution`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
   throwIfGitHubMutationCancelledBeforeDispatch(signal);
-  const lifecycle = await prepareProcess({ managedProcess: true }) || void 0;
+  const lifecycle = await prepareProcess(managedProcessRequest(options)) || void 0;
   const resolved = await resolveGitHubReviewThread(
     mutationCommandOptions(workspace, options, signal, lifecycle),
     {
@@ -54490,7 +54520,7 @@ async function performCheckRerun(workspace, claim, hashAlgorithm, options, prepa
     throw new Error(`Check run ${expected.checkId} moved before rerun`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
   throwIfGitHubMutationCancelledBeforeDispatch(signal);
-  const lifecycle = await prepareProcess({ managedProcess: true }) || void 0;
+  const lifecycle = await prepareProcess(managedProcessRequest(options)) || void 0;
   await rerequestGitHubCheckRun(mutationCommandOptions(workspace, options, signal, lifecycle), {
     host: expected.host,
     nameWithOwner: expected.nameWithOwner,
@@ -60187,7 +60217,7 @@ async function withPrivateHostCommandCwd(operation, createdBoundary) {
   }
 }
 function sameRuntimePath(left, right) {
-  if (!isAbsolute13(left) || !isAbsolute13(right)) return false;
+  if (!isAbsolute14(left) || !isAbsolute14(right)) return false;
   const normalizedLeft = resolve17(left);
   const normalizedRight = resolve17(right);
   return platform() === "win32" ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase() : normalizedLeft === normalizedRight;
