@@ -203,7 +203,10 @@ describe("release metadata", () => {
     expect(readme).toContain(
       "https://github.com/tpypan/graphcraft/releases/download/v${GRAPHCRAFT_VERSION}/tpypan-graphcraft-${GRAPHCRAFT_VERSION}.tgz",
     );
-    expect(readme).toContain(`GRAPHCRAFT_VERSION=${artifactManifest().version}`);
+    const { version } = JSON.parse(await readFile(join(process.cwd(), "package.json"), "utf8")) as {
+      version: string;
+    };
+    expect(readme).toContain(`GRAPHCRAFT_VERSION=${version}`);
   });
 
   it("keeps Codex and Claude MCP launch configuration host-specific", async () => {
