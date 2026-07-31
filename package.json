@@ -45,7 +45,7 @@
   "packageManager": "pnpm@11.15.1",
   "scripts": {
     "build": "node scripts/build.mjs",
-    "check": "pnpm format:check && pnpm typecheck && pnpm test && pnpm build && pnpm check:plugins && pnpm check:context && pnpm check:package",
+    "check": "pnpm format:check && pnpm typecheck && pnpm build && pnpm test && pnpm check:plugins && pnpm check:context && pnpm check:package",
     "check:context": "node scripts/check-context-budget.mjs",
     "check:package": "node scripts/check-package.mjs",
     "check:plugins": "node scripts/generate-plugin-artifacts.mjs --check",
