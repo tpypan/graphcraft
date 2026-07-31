@@ -14,6 +14,7 @@ import {
 import { open, readdir } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import {
+  ChildTerminationController,
   SupervisorRecordSchema,
   type HostAdapter,
   type RunState,
@@ -21,7 +22,7 @@ import {
 } from "@graphcraft/core";
 import { writeJsonAtomic } from "./json.ts";
 import { redactString } from "./redaction.ts";
-import { RunLock } from "./lock.ts";
+import { RunLock, withRunLockLease } from "./lock.ts";
 import {
   ensurePrivateDirectory,
   hardenPrivateFile,
@@ -36,6 +37,8 @@ export interface SupervisorLauncher {
   args: string[];
   env?: NodeJS.ProcessEnv;
 }
+
+export type SupervisorLaunchBoundary = "after_spawn" | "after_record_persisted";
 
 export interface SupervisorInspection extends SupervisorRecord {
   alive: boolean;
@@ -250,8 +253,12 @@ async function launchDetachedSupervisor(input: {
   host: "codex" | "claude";
   maxWorkers: 1 | 2;
   launcher: SupervisorLauncher;
+  signal: AbortSignal;
+  launchBoundary?: (point: SupervisorLaunchBoundary) => Promise<void> | void;
 }): Promise<SupervisorRecord> {
+  input.signal.throwIfAborted();
   const previous = await latestSupervisor(input.repositoryRoot, input.runId);
+  input.signal.throwIfAborted();
   if (previous && ["starting", "running"].includes(previous.health))
     throw new Error(
       `Run ${input.runId} already has active supervisor ${previous.supervisorId} (PID ${previous.pid})`,
@@ -262,12 +269,21 @@ async function launchDetachedSupervisor(input: {
   const root = supervisorRoot(input.repositoryRoot, input.runId);
   const logPath = join(root, `${supervisorId}.log`);
   await ensurePrivateDirectory(ownedRoot);
+  input.signal.throwIfAborted();
   await ensurePrivateDirectory(root, ownedRoot);
+  input.signal.throwIfAborted();
   await hardenPrivateFile(logPath, ownedRoot);
+  input.signal.throwIfAborted();
   const log = await open(logPath, "a", 0o600);
-  await hardenPrivateFile(logPath, ownedRoot);
   let child;
+  let termination: ChildTerminationController | undefined;
+  let childExit: Promise<{ code: number | null; signal: NodeJS.Signals | null }> | undefined;
+  const launchAbort = new AbortController();
+  let causalFailure: { error: unknown } | undefined;
+  let logClosed = false;
   try {
+    await hardenPrivateFile(logPath, ownedRoot);
+    input.signal.throwIfAborted();
     child = spawn(
       input.launcher.command,
       [
@@ -291,10 +307,22 @@ async function launchDetachedSupervisor(input: {
         stdio: ["ignore", log.fd, log.fd],
       },
     );
+    childExit = new Promise((resolveExit) => {
+      child!.once("close", (code: number | null, signal: NodeJS.Signals | null) =>
+        resolveExit({ code, signal }),
+      );
+    });
+    termination = new ChildTerminationController(
+      child,
+      AbortSignal.any([input.signal, launchAbort.signal]),
+    );
     await new Promise<void>((resolve, reject) => {
       child!.once("spawn", resolve);
       child!.once("error", reject);
     });
+    input.signal.throwIfAborted();
+    await input.launchBoundary?.("after_spawn");
+    input.signal.throwIfAborted();
     if (!child.pid) throw new Error("Detached supervisor did not report a process ID");
     const now = new Date().toISOString();
     const record = SupervisorRecordSchema.parse({
@@ -315,15 +343,42 @@ async function launchDetachedSupervisor(input: {
     assertSupervisorRecordFits(record);
     const recordPath = supervisorRecordPath(input.repositoryRoot, input.runId, supervisorId);
     await hardenPrivateFile(recordPath, ownedRoot);
+    input.signal.throwIfAborted();
     await writeJsonAtomic(recordPath, record);
+    input.signal.throwIfAborted();
     await hardenPrivateFile(recordPath, ownedRoot);
+    input.signal.throwIfAborted();
+    await input.launchBoundary?.("after_record_persisted");
+    input.signal.throwIfAborted();
+    await log.close();
+    logClosed = true;
+    input.signal.throwIfAborted();
+    termination.dispose();
     child.unref();
     return record;
   } catch (error) {
-    child?.kill("SIGTERM");
+    causalFailure = { error };
+    launchAbort.abort(error);
+    if (termination && childExit) {
+      const exit = await termination.waitForExit(childExit);
+      termination.finish(exit.code, exit.signal);
+    } else {
+      try {
+        child?.kill("SIGTERM");
+      } catch {
+        // Preserve the causal launch or lease failure.
+      }
+    }
     throw error;
   } finally {
-    await log.close();
+    termination?.dispose();
+    if (!logClosed) {
+      try {
+        await log.close();
+      } catch (error) {
+        if (!causalFailure) throw error;
+      }
+    }
   }
 }
 
@@ -333,16 +388,15 @@ export async function startDetachedSupervisor(input: {
   host: "codex" | "claude";
   maxWorkers: 1 | 2;
   launcher: SupervisorLauncher;
+  launchBoundary?: (point: SupervisorLaunchBoundary) => Promise<void> | void;
 }): Promise<SupervisorRecord> {
   const lock = new RunLock(
     join(input.repositoryRoot, ".graphcraft", "locks", `${input.runId}.supervisor.lock`),
   );
-  await lock.acquire();
-  try {
-    return await launchDetachedSupervisor(input);
-  } finally {
-    await lock.release();
-  }
+  return await withRunLockLease(
+    lock,
+    async (signal) => await launchDetachedSupervisor({ ...input, signal }),
+  );
 }
 
 class SupervisorLease {

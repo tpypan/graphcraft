@@ -2052,6 +2052,184 @@ describe("durable runtime", () => {
     if (process.platform !== "win32") expect((await stat(logPath)).mode & 0o777).toBe(0o600);
   });
 
+  it("does not spawn a supervisor after its launch lease is already lost", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a substantial supervised feature", {
+      cwd: repository,
+    });
+    const marker = join(repository, "..", "unexpected-supervisor.pid");
+    const leaseFailure = new Error("supervisor launch lease already lost by test");
+    const leaseLoss = new AbortController();
+    leaseLoss.abort(leaseFailure);
+    const signal = vi.spyOn(RunLock.prototype, "signal", "get").mockReturnValue(leaseLoss.signal);
+
+    try {
+      await expect(
+        startDetachedSupervisor({
+          repositoryRoot: created.store.repositoryRoot,
+          runId: created.contract.runId,
+          host: "codex",
+          maxWorkers: 1,
+          launcher: {
+            command: process.execPath,
+            args: [
+              "-e",
+              `require("node:fs").writeFileSync(${JSON.stringify(marker)}, String(process.pid))`,
+            ],
+          },
+        }),
+      ).rejects.toBe(leaseFailure);
+    } finally {
+      signal.mockRestore();
+    }
+
+    await expect(readFile(marker)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(
+      await listSupervisorRecords(created.store.repositoryRoot, created.contract.runId),
+    ).toEqual([]);
+  });
+
+  it("settles a spawned supervisor and preserves lease loss over release failure", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a substantial feature under supervision", {
+      cwd: repository,
+    });
+    const marker = join(repository, "..", "lease-lost-supervisor.pid");
+    const leaseFailure = new Error("supervisor launch lease lost by test");
+    const releaseFailure = new Error("supervisor launch release failed later");
+    const leaseLoss = new AbortController();
+    const signal = vi.spyOn(RunLock.prototype, "signal", "get").mockReturnValue(leaseLoss.signal);
+    const releaseOriginal = RunLock.prototype.release;
+    const release = vi.spyOn(RunLock.prototype, "release").mockImplementation(async function (
+      this: RunLock,
+    ) {
+      await releaseOriginal.call(this);
+      throw releaseFailure;
+    });
+    let childPid: number | undefined;
+
+    try {
+      await expect(
+        startDetachedSupervisor({
+          repositoryRoot: created.store.repositoryRoot,
+          runId: created.contract.runId,
+          host: "codex",
+          maxWorkers: 1,
+          launcher: {
+            command: process.execPath,
+            args: [
+              "-e",
+              `require("node:fs").writeFileSync(${JSON.stringify(marker)}, String(process.pid)); setInterval(() => {}, 1_000);`,
+            ],
+          },
+          launchBoundary: async (point) => {
+            if (point !== "after_spawn") return;
+            await waitFor(() =>
+              readFile(marker).then(
+                () => true,
+                () => false,
+              ),
+            );
+            childPid = Number((await readFile(marker, "utf8")).trim());
+            expect(Number.isSafeInteger(childPid)).toBe(true);
+            expect(isProcessAlive(childPid)).toBe(true);
+            leaseLoss.abort(leaseFailure);
+          },
+        }),
+      ).rejects.toBe(leaseFailure);
+
+      expect(childPid).toBeDefined();
+      expect(isProcessAlive(childPid!)).toBe(false);
+      expect(
+        await listSupervisorRecords(created.store.repositoryRoot, created.contract.runId),
+      ).toEqual([]);
+    } finally {
+      release.mockRestore();
+      signal.mockRestore();
+      if (childPid && isProcessAlive(childPid)) process.kill(childPid, "SIGKILL");
+    }
+
+    const lock = new RunLock(
+      join(
+        created.store.repositoryRoot,
+        ".graphcraft",
+        "locks",
+        `${created.contract.runId}.supervisor.lock`,
+      ),
+    );
+    await lock.acquire();
+    await lock.release();
+  });
+
+  it("retains a published stale supervisor record after launch lease loss", async () => {
+    const repository = await createRepository();
+    const created = await createRun("Implement a substantial recoverable supervised feature", {
+      cwd: repository,
+    });
+    const marker = join(repository, "..", "recorded-lease-lost-supervisor.pid");
+    const leaseFailure = new Error("recorded supervisor launch lease lost by test");
+    const leaseLoss = new AbortController();
+    const signal = vi.spyOn(RunLock.prototype, "signal", "get").mockReturnValue(leaseLoss.signal);
+    let childPid: number | undefined;
+    let firstSupervisorId: string | undefined;
+
+    try {
+      await expect(
+        startDetachedSupervisor({
+          repositoryRoot: created.store.repositoryRoot,
+          runId: created.contract.runId,
+          host: "codex",
+          maxWorkers: 1,
+          launcher: {
+            command: process.execPath,
+            args: [
+              "-e",
+              `require("node:fs").writeFileSync(${JSON.stringify(marker)}, String(process.pid)); setInterval(() => {}, 1_000);`,
+            ],
+          },
+          launchBoundary: async (point) => {
+            if (point !== "after_record_persisted") return;
+            const records = await listSupervisorRecords(
+              created.store.repositoryRoot,
+              created.contract.runId,
+            );
+            expect(records).toHaveLength(1);
+            firstSupervisorId = records[0]!.supervisorId;
+            childPid = records[0]!.pid;
+            expect(isProcessAlive(childPid)).toBe(true);
+            leaseLoss.abort(leaseFailure);
+          },
+        }),
+      ).rejects.toBe(leaseFailure);
+    } finally {
+      signal.mockRestore();
+      if (childPid && isProcessAlive(childPid)) process.kill(childPid, "SIGKILL");
+    }
+
+    expect(childPid).toBeDefined();
+    expect(isProcessAlive(childPid!)).toBe(false);
+    const [retained] = await listSupervisorRecords(
+      created.store.repositoryRoot,
+      created.contract.runId,
+    );
+    expect(retained).toMatchObject({
+      supervisorId: firstSupervisorId,
+      pid: childPid,
+      status: "starting",
+    });
+    expect(inspectSupervisorRecord(retained!).health).toBe("stale");
+
+    const replacement = await startDetachedSupervisor({
+      repositoryRoot: created.store.repositoryRoot,
+      runId: created.contract.runId,
+      host: "codex",
+      maxWorkers: 1,
+      launcher: { command: process.execPath, args: ["-e", "process.exit(0)"] },
+    });
+    expect(replacement.replacesSupervisorId).toBe(firstSupervisorId);
+    await waitFor(() => !isProcessAlive(replacement.pid));
+  });
+
   it.skipIf(process.platform === "win32")(
     "detaches, exposes, and replaces a stale supervisor in a repository path with spaces",
     async () => {
