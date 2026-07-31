@@ -14,8 +14,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # macOS is where most graphcraft users run it, so it gets the per-push check.
   check:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -29,14 +30,16 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
 
-  # Cross-platform coverage runs on demand only; the release workflow
-  # still runs the full three-OS matrix on every release tag.
+  # Cross-platform coverage runs on demand only (`gh workflow run CI`) — worth
+  # doing before tagging a release, since a failed release burns the tag under
+  # the immutable-tag ruleset. The release workflow itself still runs the full
+  # three-OS matrix on every release tag.
   check-cross-platform:
     if: github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.os == 'windows-latest' && 180 || 90 }}
     steps:
