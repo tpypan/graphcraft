@@ -50165,7 +50165,9 @@ async function waitForSupervisorRecord(repositoryRoot, runId, supervisorId, time
   }
 }
 async function launchDetachedSupervisor(input) {
+  input.signal.throwIfAborted();
   const previous = await latestSupervisor(input.repositoryRoot, input.runId);
+  input.signal.throwIfAborted();
   if (previous && ["starting", "running"].includes(previous.health))
     throw new Error(
       `Run ${input.runId} already has active supervisor ${previous.supervisorId} (PID ${previous.pid})`
@@ -50175,12 +50177,21 @@ async function launchDetachedSupervisor(input) {
   const root = supervisorRoot(input.repositoryRoot, input.runId);
   const logPath = join18(root, `${supervisorId}.log`);
   await ensurePrivateDirectory(ownedRoot);
+  input.signal.throwIfAborted();
   await ensurePrivateDirectory(root, ownedRoot);
+  input.signal.throwIfAborted();
   await hardenPrivateFile(logPath, ownedRoot);
+  input.signal.throwIfAborted();
   const log = await open11(logPath, "a", 384);
-  await hardenPrivateFile(logPath, ownedRoot);
   let child;
+  let termination;
+  let childExit;
+  const launchAbort = new AbortController();
+  let causalFailure;
+  let logClosed = false;
   try {
+    await hardenPrivateFile(logPath, ownedRoot);
+    input.signal.throwIfAborted();
     child = spawn5(
       input.launcher.command,
       [
@@ -50204,10 +50215,23 @@ async function launchDetachedSupervisor(input) {
         stdio: ["ignore", log.fd, log.fd]
       }
     );
+    childExit = new Promise((resolveExit) => {
+      child.once(
+        "close",
+        (code, signal) => resolveExit({ code, signal })
+      );
+    });
+    termination = new ChildTerminationController(
+      child,
+      AbortSignal.any([input.signal, launchAbort.signal])
+    );
     await new Promise((resolve22, reject) => {
       child.once("spawn", resolve22);
       child.once("error", reject);
     });
+    input.signal.throwIfAborted();
+    await input.launchBoundary?.("after_spawn");
+    input.signal.throwIfAborted();
     if (!child.pid) throw new Error("Detached supervisor did not report a process ID");
     const now2 = (/* @__PURE__ */ new Date()).toISOString();
     const record2 = SupervisorRecordSchema.parse({
@@ -50228,27 +50252,51 @@ async function launchDetachedSupervisor(input) {
     assertSupervisorRecordFits(record2);
     const recordPath = supervisorRecordPath(input.repositoryRoot, input.runId, supervisorId);
     await hardenPrivateFile(recordPath, ownedRoot);
+    input.signal.throwIfAborted();
     await writeJsonAtomic(recordPath, record2);
+    input.signal.throwIfAborted();
     await hardenPrivateFile(recordPath, ownedRoot);
+    input.signal.throwIfAborted();
+    await input.launchBoundary?.("after_record_persisted");
+    input.signal.throwIfAborted();
+    await log.close();
+    logClosed = true;
+    input.signal.throwIfAborted();
+    termination.dispose();
     child.unref();
     return record2;
   } catch (error51) {
-    child?.kill("SIGTERM");
+    causalFailure = { error: error51 };
+    launchAbort.abort(error51);
+    if (termination && childExit) {
+      const exit = await termination.waitForExit(childExit);
+      termination.finish(exit.code, exit.signal);
+    } else {
+      try {
+        child?.kill("SIGTERM");
+      } catch {
+      }
+    }
     throw error51;
   } finally {
-    await log.close();
+    termination?.dispose();
+    if (!logClosed) {
+      try {
+        await log.close();
+      } catch (error51) {
+        if (!causalFailure) throw error51;
+      }
+    }
   }
 }
 async function startDetachedSupervisor(input) {
   const lock = new RunLock(
     join18(input.repositoryRoot, ".graphcraft", "locks", `${input.runId}.supervisor.lock`)
   );
-  await lock.acquire();
-  try {
-    return await launchDetachedSupervisor(input);
-  } finally {
-    await lock.release();
-  }
+  return await withRunLockLease(
+    lock,
+    async (signal) => await launchDetachedSupervisor({ ...input, signal })
+  );
 }
 var SupervisorLease = class _SupervisorLease {
   constructor(record2, path2, ownedRoot) {
@@ -53128,7 +53176,7 @@ var program2 = new Command().name("graphcraft").description("Progress-aware exec
 async function benchmarkSourceIdentity() {
   if (true) {
     return BenchmarkSourceIdentitySchema.parse({
-      commitSha: "95b17ad9fe92404d845f17c729611f4540f68752",
+      commitSha: "7c1d85166532e7dd411606b2eb0074552d9130ca",
       dirty: false,
       dirtyStatusDigest: false ? null : null
     });
