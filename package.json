@@ -1,6 +1,6 @@
 {
   "name": "@tpypan/graphcraft",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Progress-aware execution for durable coding agents.",
   "license": "MIT",
   "author": {
