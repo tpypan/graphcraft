@@ -8,6 +8,7 @@ import {
   type SideEffectJournalEntry,
 } from "@graphcraft/core";
 import type {
+  ManagedProcessBrokerOptions,
   ManagedProcessLifecycle,
   ManagedProcessReady,
   ManagedProcessSettlement,
@@ -83,6 +84,7 @@ export interface ExecuteSideEffectInput {
 
 export interface SideEffectProcessRequest {
   managedProcess: true;
+  broker?: ManagedProcessBrokerOptions;
 }
 
 export type SideEffectDispatch = (
@@ -1004,6 +1006,7 @@ export async function executeSideEffect(
       hashAlgorithm: sideEffectProcessHashAlgorithm(input.store, claim),
     });
     return processLease.lifecycle({
+      ...(request.broker ? { broker: request.broker } : {}),
       onReady: async (ready) => {
         await checkpointDispatch();
         processStartEventData = {

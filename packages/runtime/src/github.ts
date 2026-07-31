@@ -1,4 +1,9 @@
-import { runProcess, type ExecutedProbe, type ManagedProcessLifecycle } from "@graphcraft/probes";
+import {
+  runProcess,
+  type ExecutedProbe,
+  type ManagedProcessBrokerOptions,
+  type ManagedProcessLifecycle,
+} from "@graphcraft/probes";
 import {
   LEGACY_CANONICAL_HASH_ALGORITHM,
   SideEffectClaimSchema,
@@ -40,12 +45,19 @@ import {
   type SideEffectAuthorizationPhase,
   type SideEffectBoundary,
   type SideEffectCancellation,
+  type SideEffectProcessRequest,
   type SideEffectReconciliation,
 } from "./side-effect.ts";
 import type { RunWorkspace } from "./repository.ts";
 import { RunStore } from "./store.ts";
 
-export type GitHubExecutionOptions = Omit<GitHubCommandOptions, "cwd" | "signal" | "lifecycle">;
+export interface GitHubExecutionOptions extends Omit<
+  GitHubCommandOptions,
+  "cwd" | "signal" | "lifecycle"
+> {
+  /** Internal deterministic broker failure injection; not exposed by the CLI. */
+  managedProcessBroker?: ManagedProcessBrokerOptions;
+}
 
 export function classifyGitHubCommandCancellation(
   error: unknown,
@@ -90,7 +102,15 @@ function commandOptions(
   workspace: RunWorkspace,
   options: GitHubExecutionOptions = {},
 ): GitHubCommandOptions {
-  return { cwd: workspace.path, ...options };
+  const { managedProcessBroker: _managedProcessBroker, ...command } = options;
+  return { cwd: workspace.path, ...command };
+}
+
+function managedProcessRequest(options: GitHubExecutionOptions): SideEffectProcessRequest {
+  return {
+    managedProcess: true,
+    ...(options.managedProcessBroker ? { broker: options.managedProcessBroker } : {}),
+  };
 }
 
 function mutationCommandOptions(
@@ -472,7 +492,7 @@ export async function performPullRequestCreation(
     throw new Error(`Pull-request body changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
   throwIfGitHubMutationCancelledBeforeDispatch(signal);
-  const lifecycle = (await prepareProcess({ managedProcess: true })) || undefined;
+  const lifecycle = (await prepareProcess(managedProcessRequest(options))) || undefined;
   await createGitHubPullRequest(mutationCommandOptions(workspace, options, signal, lifecycle), {
     nameWithOwner: expected.nameWithOwner,
     headRefName: expected.headRefName,
@@ -1124,7 +1144,7 @@ async function performReviewReply(
     throw new Error(`Review reply body changed for side effect ${claim.actionId}`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
   throwIfGitHubMutationCancelledBeforeDispatch(signal);
-  const lifecycle = (await prepareProcess({ managedProcess: true })) || undefined;
+  const lifecycle = (await prepareProcess(managedProcessRequest(options))) || undefined;
   const reply = await addGitHubReviewThreadReply(
     mutationCommandOptions(workspace, options, signal, lifecycle),
     {
@@ -1258,7 +1278,7 @@ async function performReviewResolution(
     throw new Error(`Review thread ${expected.threadId} is not ready for resolution`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
   throwIfGitHubMutationCancelledBeforeDispatch(signal);
-  const lifecycle = (await prepareProcess({ managedProcess: true })) || undefined;
+  const lifecycle = (await prepareProcess(managedProcessRequest(options))) || undefined;
   const resolved = await resolveGitHubReviewThread(
     mutationCommandOptions(workspace, options, signal, lifecycle),
     {
@@ -1464,7 +1484,7 @@ async function performCheckRerun(
     throw new Error(`Check run ${expected.checkId} moved before rerun`);
   await crossSideEffectBoundary(boundary, "after_action_prepare");
   throwIfGitHubMutationCancelledBeforeDispatch(signal);
-  const lifecycle = (await prepareProcess({ managedProcess: true })) || undefined;
+  const lifecycle = (await prepareProcess(managedProcessRequest(options))) || undefined;
   await rerequestGitHubCheckRun(mutationCommandOptions(workspace, options, signal, lifecycle), {
     host: expected.host,
     nameWithOwner: expected.nameWithOwner,

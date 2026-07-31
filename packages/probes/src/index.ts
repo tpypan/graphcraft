@@ -38,6 +38,7 @@ export {
 } from "./repository-file.ts";
 
 export type {
+  ManagedProcessBrokerOptions,
   ManagedProcessLifecycle,
   ManagedProcessReady,
   ManagedProcessSettlement,

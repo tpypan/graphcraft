@@ -13834,16 +13834,6 @@ setInterval(() => {}, 1_000);
     remoteState.unconfirmedMutation = "github_pr_create";
     remoteState.unconfirmedMutationMarker = marker;
     await writeFakeGitHubState(github.statePath, remoteState);
-    const mutationEnvironment = { ...github.env };
-    if (process.platform === "win32") {
-      for (const name of Object.keys(mutationEnvironment))
-        if (name.toLowerCase() === "systemroot") delete mutationEnvironment[name];
-      // This fixture requires genuinely unconfirmed tree settlement. Windows
-      // normally proves the detached descendant terminated through taskkill /t;
-      // point only this test at a missing taskkill executable so the broker must
-      // retain the conservative unconfirmed outcome.
-      mutationEnvironment.SystemRoot = join(markerRoot, "missing-system-root");
-    }
     let descendantPid: number | undefined;
     const commandTimeoutMs = unconfirmedMutationCommandTimeout;
 
@@ -13852,7 +13842,16 @@ setInterval(() => {}, 1_000);
         store: created.store,
         adapter,
         approve: true,
-        github: { ...github, env: mutationEnvironment, timeoutMs: commandTimeoutMs },
+        github: {
+          ...github,
+          timeoutMs: commandTimeoutMs,
+          // Force the broker's Windows taskkill path to fail without poisoning
+          // the fake gh command or its detached descendant environment.
+          managedProcessBroker: {
+            platform: "win32",
+            windowsTaskkillExecutable: join(markerRoot, "missing-taskkill.exe"),
+          },
+        },
       });
       descendantPid = Number((await readFile(marker, "utf8")).trim());
       const events = await created.store.loadEvents();

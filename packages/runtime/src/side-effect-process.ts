@@ -12,6 +12,7 @@ import {
   type SideEffectKind,
 } from "@graphcraft/core";
 import type {
+  ManagedProcessBrokerOptions,
   ManagedProcessLifecycle,
   ManagedProcessReady,
   ManagedProcessSettlement,
@@ -71,6 +72,7 @@ export interface SideEffectProcessLease {
   journalRelativePath: string;
   handle: FileHandle;
   lifecycle(callbacks: {
+    broker?: ManagedProcessBrokerOptions;
     onReady: (ready: ManagedProcessReady) => Promise<void>;
     onSettled: (settlement: ManagedProcessSettlement) => Promise<void>;
   }): ManagedProcessLifecycle;
@@ -245,10 +247,11 @@ export async function createSideEffectProcessLease(input: {
         journalPath: path,
         journalRelativePath: relative(input.graphcraftRoot, path).replaceAll("\\", "/"),
         handle,
-        lifecycle: ({ onReady, onSettled }) => ({
+        lifecycle: ({ broker, onReady, onSettled }) => ({
           executionId: definition.executionId,
           ownerToken,
           journalFd: handle!.fd,
+          ...(broker ? { broker } : {}),
           onReady,
           onSettled,
         }),

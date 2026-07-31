@@ -170,6 +170,33 @@ describe("bounded subprocess output capture", () => {
     },
   );
 
+  it.each([
+    {
+      name: "a non-Windows platform",
+      broker: { platform: "linux", windowsTaskkillExecutable: process.execPath },
+      error: "platform must be win32",
+    },
+    {
+      name: "a relative taskkill executable",
+      broker: { platform: "win32", windowsTaskkillExecutable: "taskkill.exe" },
+      error: "must be an absolute path",
+    },
+  ])("rejects managed broker overrides with $name", async ({ broker, error }) => {
+    await expect(
+      runProcess(process.execPath, ["-e", "process.exit(0)"], {
+        cwd: process.cwd(),
+        lifecycle: {
+          executionId: "invalid-managed-broker",
+          ownerToken: "invalid-managed-broker-token",
+          journalFd: 1,
+          broker: broker as never,
+          onReady: async () => undefined,
+          onSettled: async () => undefined,
+        },
+      }),
+    ).rejects.toThrow(error);
+  });
+
   it("does not start a managed command until its ownership checkpoint is durable", async () => {
     const root = await mkdtemp(join(tmpdir(), "graphcraft-managed-process-"));
     const marker = join(root, "started.txt");

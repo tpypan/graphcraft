@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants as osConstants } from "node:os";
+import { isAbsolute } from "node:path";
 import crossSpawn from "cross-spawn";
 import { resolveTrustedExecutable, terminateChildProcessTree } from "@graphcraft/core";
 
@@ -76,11 +77,19 @@ export interface ManagedProcessSettlement {
   settledAt: string;
 }
 
+/** Explicit broker configuration used by bounded failure-injection coverage. @internal */
+export interface ManagedProcessBrokerOptions {
+  platform: "win32";
+  windowsTaskkillExecutable: string;
+  windowsTaskkillArgumentPrefix?: string[];
+}
+
 export interface ManagedProcessLifecycle {
   executionId: string;
   ownerToken: string;
   /** An append-only, already-hardened descriptor inherited by the broker as fd 4. */
   journalFd: number;
+  broker?: ManagedProcessBrokerOptions;
   onReady: (ready: ManagedProcessReady) => Promise<void>;
   onSettled: (settlement: ManagedProcessSettlement) => Promise<void>;
 }
@@ -537,6 +546,47 @@ send({
 
 const MANAGED_PROCESS_BROKER_SOURCE = managedProcessBrokerSource();
 
+function configuredManagedProcessBrokerSource(
+  options: ManagedProcessBrokerOptions | undefined,
+): string {
+  if (options === undefined) return MANAGED_PROCESS_BROKER_SOURCE;
+  if (
+    !options ||
+    typeof options !== "object" ||
+    Array.isArray(options) ||
+    !exactMessageKeys(options, [
+      "platform",
+      "windowsTaskkillExecutable",
+      ...(options.windowsTaskkillArgumentPrefix === undefined
+        ? []
+        : ["windowsTaskkillArgumentPrefix"]),
+    ])
+  )
+    throw new Error("Managed-process broker override is invalid");
+  if (options.platform !== "win32")
+    throw new Error("Managed-process broker override platform must be win32");
+  const executable = options.windowsTaskkillExecutable;
+  if (
+    typeof executable !== "string" ||
+    executable.length === 0 ||
+    executable.length > 32_768 ||
+    executable.includes("\0") ||
+    !isAbsolute(executable)
+  )
+    throw new Error("Managed-process taskkill executable override must be an absolute path");
+  const argumentPrefix = options.windowsTaskkillArgumentPrefix ?? [];
+  if (
+    !Array.isArray(argumentPrefix) ||
+    argumentPrefix.length > 32 ||
+    argumentPrefix.some(
+      (argument) =>
+        typeof argument !== "string" || argument.length > 32_768 || argument.includes("\0"),
+    )
+  )
+    throw new Error("Managed-process taskkill argument override is invalid");
+  return managedProcessBrokerSource(options.platform, executable, argumentPrefix);
+}
+
 function exactMessageKeys(value: object, expected: readonly string[]): boolean {
   const actual = Object.keys(value).sort();
   const sortedExpected = [...expected].sort();
@@ -670,7 +720,7 @@ async function runManagedProcess(
       process.execPath,
       [
         "-e",
-        MANAGED_PROCESS_BROKER_SOURCE,
+        configuredManagedProcessBrokerSource(lifecycle.broker),
         lifecycle.executionId,
         lifecycle.ownerToken,
         String(PROCESS_TERMINATION_GRACE_MS),
