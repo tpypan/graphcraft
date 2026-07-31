@@ -338,7 +338,11 @@ async function fakePullRequestGitHub(
       reviews: [],
       rerunCalls: 0,
       syncPullRequestHead: false,
-      windowsSystemRoot: process.env.SystemRoot ?? process.env.SYSTEMROOT,
+      windowsSystemRoot:
+        process.env.SystemRoot ??
+        process.env.SYSTEMROOT ??
+        process.env.windir ??
+        process.env.WINDIR,
       rateLimits: {
         core: { limit: 5000, used: 10, remaining: 4990, reset: 1800000000 },
         graphql: { limit: 5000, used: 20, remaining: 4980, reset: 1800000000 },
@@ -366,12 +370,15 @@ const fail = (message, code = 1) => { process.stderr.write(message + "\\n"); pro
 const value = (flag) => args[args.indexOf(flag) + 1];
 const blockMutation = (kind) => {
   if (state.unconfirmedMutation === kind) {
+    if (process.platform === "win32" && !state.windowsSystemRoot)
+      fail("missing real Windows SystemRoot for unconfirmed-mutation descendant");
+    const descendantEnvironment = { ...process.env };
+    for (const name of Object.keys(descendantEnvironment))
+      if (name.toLowerCase() === "systemroot") delete descendantEnvironment[name];
+    if (state.windowsSystemRoot) descendantEnvironment.SystemRoot = state.windowsSystemRoot;
     const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1_000)"], {
       detached: true,
-      env: {
-        ...process.env,
-        ...(state.windowsSystemRoot ? { SystemRoot: state.windowsSystemRoot } : {}),
-      },
+      env: descendantEnvironment,
       stdio: ["ignore", "inherit", "inherit"],
     });
     descendant.unref();
