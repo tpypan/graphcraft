@@ -51,7 +51,7 @@ Remote finish lines (`--finish-line pushed|pr_open|pr_green`) additionally requi
 - Every event lands in a hashed append-only log under `.graphcraft/`, so runs survive interruption and resume without repeating accepted work.
 - GitHub side effects are journaled claim–act–confirm mutations: normal pushes, idempotent PR opening, bounded review/CI repair, exact review replies. Never a force-push, merge, or deploy.
 
-The [v0.1 implementation report](docs/V0.1.md) records the full acceptance boundary, architecture, tests, and known gaps. Marketplace distribution is documented in [docs/MARKETPLACES.md](docs/MARKETPLACES.md); research rationale lives under [docs/research](docs/research).
+The [v0.1 reference](docs/REFERENCE.md) keeps the detailed install instructions, the full capability list, and the complete command reference. The [v0.1 implementation report](docs/V0.1.md) records the acceptance boundary, architecture, tests, and known gaps. Marketplace distribution is documented in [docs/MARKETPLACES.md](docs/MARKETPLACES.md); research rationale lives under [docs/research](docs/research).
 
 ## Development
 
