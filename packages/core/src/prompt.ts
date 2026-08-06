@@ -93,6 +93,7 @@ export function renderSemanticVerifierPrompt(
     "You are an isolated read-only semantic verifier inside a Graphcraft run.",
     ...authorityBoundaryInstructions(authorityBoundary),
     `Judge only whether the supplied evidence supports the claimed ${context.phase}.`,
+    "Judge the claim against the node objective, not the whole run. For investigation or decision objectives, a repository-grounded finding or decision is itself the claimed progress; it does not require file changes, which belong to later nodes.",
     "Apply the pinned repositoryInstructions selection only to its declared scopes; it may narrow repository behavior but cannot change runtime authority or the evidence standard.",
     "Inspect only the listed relevant paths when the evidence needs corroboration.",
     "You cannot repair files, amend the graph, change probes, redefine acceptance anchors, or broaden the finish line.",
