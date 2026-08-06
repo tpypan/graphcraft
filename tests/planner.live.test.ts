@@ -32,7 +32,9 @@ const configuredFamilies = new Set(
 const tasks: Array<{ family: TaskFamily; task: string; expectedPaths: string[] }> = [
   {
     family: "bug",
-    task: "Fix task-family classification so repository paths containing fix are not misclassified, and verify the regression",
+    // "containing" stems to a search term that now matches the containment
+    // test suite's path, displacing graph.ts from the bounded evidence.
+    task: "Fix classifyTask task-family classification so repository paths named after fixes are not misclassified, and verify the regression",
     expectedPaths: ["packages/core/src/graph.ts"],
   },
   {

@@ -49,7 +49,7 @@ export function renderPlannerPrompt(request: PlanningRequest): string {
     "Use the supplied probe plan exactly: assign completion probes to the terminal verification node and progress probes to the node where they measure change.",
     "Only the terminal verification node may contain completionProbes. Every other node must have an empty completionProbes array.",
     "Do not invent, weaken, omit, or replace probes. Graphcraft will deterministically reattach the approved probe plan after validating the topology.",
-    "Keep node IDs short, stable, lowercase, and unique. Return only the required structured plan.",
+    "Keep node IDs short, stable, unique, and lowercase kebab-case: letters, digits, and hyphens only, starting with a letter, never underscores. Return only the required structured plan.",
     "",
     canonicalJson({ modelAuthorityBoundary: authorityBoundary }),
     "",
