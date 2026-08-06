@@ -1,6 +1,7 @@
 import crossSpawn from "cross-spawn";
 import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { lstat, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -553,15 +554,154 @@ async function codexVersion(
     : { installed: false };
 }
 
+/**
+ * Custom model-provider forwarding. Graphcraft invocations run codex with
+ * --ignore-user-config, which would silently drop a user-configured provider
+ * such as a corporate proxy. The active provider's declaration is therefore
+ * read from CODEX_HOME/config.toml, validated against an explicit key
+ * allowlist, and re-injected through --config overrides. A declared provider
+ * that cannot be forwarded faithfully fails closed instead of running against
+ * the wrong endpoint.
+ */
+const CODEX_PROVIDER_FORWARD_KEYS = new Set([
+  "name",
+  "base_url",
+  "wire_api",
+  "env_key",
+  "query_params",
+  "http_headers",
+]);
+const CODEX_PROVIDER_AUTH_FORWARD_KEYS = new Set(["command", "timeout_ms", "refresh_interval_ms"]);
+// Present in real configs but rejected by the codex 0.146 --config override
+// parser under --strict-config; response storage keeps the provider default.
+const CODEX_PROVIDER_SKIPPED_KEYS = new Set(["disable_response_storage"]);
+const CODEX_PROVIDER_CONFIG_LIMIT_BYTES = 256 * 1024;
+const CODEX_PROVIDER_NAME_PATTERN = /^[A-Za-z0-9_-]+$/u;
+
+function codexHomeForConfiguration(): string | undefined {
+  const configured = process.env.CODEX_HOME;
+  const home =
+    configured === undefined || configured.length === 0 ? join(homedir(), ".codex") : configured;
+  if (!isAbsolute(home)) return undefined;
+  try {
+    return statSync(home).isDirectory() ? realpathSync(home) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function assertForwardableProviderValue(key: string, value: string): void {
+  if (value.includes("#"))
+    throw new Error(
+      `Codex provider forwarding does not support comments on the ${key} configuration line`,
+    );
+  if (value.includes('"""') || value.includes("'''"))
+    throw new Error(`Codex provider forwarding does not support multi-line ${key} values`);
+  const balanced = (open: string, close: string) =>
+    value.split(open).length === value.split(close).length;
+  if (!balanced("{", "}") || !balanced("[", "]"))
+    throw new Error(`Codex provider forwarding requires a single-line balanced ${key} value`);
+}
+
+export function readCodexConfiguredProviderOverrides(): string[] | undefined {
+  const home = codexHomeForConfiguration();
+  if (!home) return undefined;
+  const path = join(home, "config.toml");
+  let raw: string;
+  try {
+    if (statSync(path).size > CODEX_PROVIDER_CONFIG_LIMIT_BYTES)
+      throw new Error("Codex config.toml exceeds the provider forwarding size bound");
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  let section: string | undefined;
+  let provider: string | undefined;
+  const tables = new Map<string, { key: string; value: string }[]>();
+  for (const line of raw.split(/\r?\n/u)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const header = trimmed.match(/^\[([^\]]+)\]$/u);
+    if (header) {
+      section = header[1]!.trim();
+      continue;
+    }
+    const pair = trimmed.match(/^([A-Za-z0-9_-]+)\s*=\s*(.+)$/u);
+    if (section === undefined) {
+      if (!pair) continue;
+      if (pair[1] === "model_provider") {
+        const literal = pair[2]!.trim().match(/^"([^"]+)"$/u);
+        if (!literal || !CODEX_PROVIDER_NAME_PATTERN.test(literal[1]!))
+          throw new Error(
+            "Codex provider forwarding requires model_provider to be a quoted bare-key name",
+          );
+        provider = literal[1]!;
+      }
+      continue;
+    }
+    if (!section.startsWith("model_providers.")) continue;
+    if (!pair)
+      throw new Error(
+        `Codex provider forwarding could not parse a configuration line in [${section}]`,
+      );
+    const entries = tables.get(section) ?? [];
+    entries.push({ key: pair[1]!, value: pair[2]!.trim() });
+    tables.set(section, entries);
+  }
+  if (!provider) return undefined;
+  const providerTable = tables.get(`model_providers.${provider}`);
+  if (!providerTable)
+    throw new Error(`Codex provider forwarding found no [model_providers.${provider}] declaration`);
+  const overrides: string[] = [`model_provider="${provider}"`];
+  const forwardTable = (
+    entries: { key: string; value: string }[],
+    allowed: ReadonlySet<string>,
+    prefix: string,
+  ) => {
+    for (const { key, value } of entries) {
+      if (CODEX_PROVIDER_SKIPPED_KEYS.has(key)) continue;
+      if (!allowed.has(key))
+        throw new Error(`Codex provider forwarding does not support the ${prefix}${key} field`);
+      assertForwardableProviderValue(key, value);
+      overrides.push(`model_providers.${provider}.${prefix}${key}=${value}`);
+    }
+  };
+  forwardTable(providerTable, CODEX_PROVIDER_FORWARD_KEYS, "");
+  const authTable = tables.get(`model_providers.${provider}.auth`);
+  if (authTable) forwardTable(authTable, CODEX_PROVIDER_AUTH_FORWARD_KEYS, "auth.");
+  for (const name of tables.keys())
+    if (
+      name.startsWith(`model_providers.${provider}.`) &&
+      name !== `model_providers.${provider}.auth`
+    )
+      throw new Error(`Codex provider forwarding does not support the [${name}] table`);
+  return overrides;
+}
+
+function codexProviderForwardingArgs(): string[] {
+  const overrides = readCodexConfiguredProviderOverrides();
+  if (!overrides) return [];
+  return overrides.flatMap((override) => ["--config", override]);
+}
+
 async function codexAuthenticated(executable: string, signal?: AbortSignal): Promise<boolean> {
   const result = await runCapabilityProbe(executable, ["login", "status"], true, signal);
-  return (
+  const loggedIn =
     result.code === 0 &&
     !result.overflowed &&
     !result.terminated &&
     !/(?:^|\r?\n)Not logged in\.?($|\r?\n)/u.test(result.output) &&
-    /(?:^|\r?\n)Logged in(?: using [^\r\n]+)?\.?($|\r?\n)/u.test(result.output)
-  );
+    /(?:^|\r?\n)Logged in(?: using [^\r\n]+)?\.?($|\r?\n)/u.test(result.output);
+  if (loggedIn) return true;
+  // A configured custom model provider authenticates through its own channel
+  // (auth command or env key); `codex login status` legitimately reports
+  // "Not logged in" for such setups.
+  try {
+    return readCodexConfiguredProviderOverrides() !== undefined;
+  } catch {
+    return false;
+  }
 }
 
 export async function probeCodexExecutable(executable: string, signal?: AbortSignal) {
@@ -992,8 +1132,9 @@ function codexIsolationArgs(workspaceWrite: boolean): string[] {
     "exec_permission_approvals",
     "request_permissions_tool",
     "guardian_approval",
-    "web_search_request",
-    "web_search_cached",
+    // web_search_request / web_search_cached were removed here: codex 0.146
+    // deprecates them in favor of the top-level web_search="disabled" override
+    // this arg list already sets, and 0.144.6 accepts their absence.
     "standalone_web_search",
     "workspace_dependencies",
   ];
@@ -1040,6 +1181,7 @@ function codexIsolationArgs(workspaceWrite: boolean): string[] {
     `default_permissions="${profile}"`,
     "--config",
     `permissions.${profile}={filesystem={":minimal"="read",":workspace_roots"="${workspaceAccess}",":tmpdir"="write"},network={enabled=false}}`,
+    ...codexProviderForwardingArgs(),
   ];
 }
 

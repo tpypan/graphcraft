@@ -57,6 +57,7 @@ import {
   compileRunContract,
   contentHash,
   discoverRepositoryTrustRoots,
+  parseHostProtocolVersion,
   renderPlannerPrompt,
   renderSemanticVerifierPrompt,
   renderWorkerPrompt,
@@ -622,6 +623,13 @@ async function withCodexSchema<T>(
   }
 }
 
+function candidateClaudeCodeVersions(configuration: HostConfiguration): string[] {
+  const version = parseHostProtocolVersion(configuration.rawVersion);
+  if (!version)
+    throw new Error("Claude candidate raw version did not contain exactly one parseable version");
+  return [version];
+}
+
 async function qualifyPlanning(
   configuration: HostConfiguration,
   request: PlanningRequest,
@@ -635,6 +643,7 @@ async function qualifyPlanning(
             cwd: await realpath(request.repositoryPath),
             allowedTools: [],
             model: configuration.model,
+            claudeCodeVersions: candidateClaudeCodeVersions(configuration),
           })
         : createCodexProtocolValidator();
     const args =
@@ -700,6 +709,7 @@ async function runWorker(
               model: configuration.model,
               expectedSessionId: request.resumeSessionId ?? request.invocationId,
               sessionContext: request.resumeSessionId ? "resumed_worker" : "worker",
+              claudeCodeVersions: candidateClaudeCodeVersions(configuration),
             })
           : createCodexProtocolValidator({
               ...(request.resumeSessionId ? { expectedThreadId: request.resumeSessionId } : {}),
@@ -866,6 +876,7 @@ async function qualifySemanticVerification(
               allowedTools: ["Read"],
               model: configuration.model,
               expectedSessionId: request.invocationId,
+              claudeCodeVersions: candidateClaudeCodeVersions(configuration),
             })
           : createCodexProtocolValidator();
       const args =
@@ -1103,7 +1114,11 @@ async function qualifyHost(
     executable,
   );
   if (verification.verdict.verdict !== "supported" || verification.verdict.evidence.length === 0)
-    throw new Error(`${configuration.host} semantic verification was not grounded and supported`);
+    throw new Error(
+      `${configuration.host} semantic verification was not grounded and supported: ` +
+        `verdict=${verification.verdict.verdict} evidence=${verification.verdict.evidence.length} ` +
+        `uncertainty=${JSON.stringify(verification.verdict.uncertainty ?? null)}`,
+    );
   await assertFixtureClean(request.repositoryPath, fixtureTreeSha256);
 
   const finalIdentity = await probeQualificationExecutable(configuration.host, executable);

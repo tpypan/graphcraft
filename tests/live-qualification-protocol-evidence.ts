@@ -209,10 +209,32 @@ const CLAUDE_EVENT_FIELDS: Record<string, ReadonlySet<string>> = {
     "plugin_errors",
     "apiKeySource",
     "fast_mode_state",
+    "fast_mode_disabled_reason",
+    "analytics_disabled",
+    "product_feedback_disabled",
+    "capabilities",
+    "estimated_tokens",
+    "estimated_tokens_delta",
     "uuid",
   ]),
-  assistant: new Set(["type", "message", "parent_tool_use_id", "session_id", "uuid"]),
-  user: new Set(["type", "message", "parent_tool_use_id", "session_id", "uuid", "tool_use_result"]),
+  assistant: new Set([
+    "type",
+    "message",
+    "parent_tool_use_id",
+    "request_id",
+    "session_id",
+    "timestamp",
+    "uuid",
+  ]),
+  user: new Set([
+    "type",
+    "message",
+    "parent_tool_use_id",
+    "session_id",
+    "timestamp",
+    "uuid",
+    "tool_use_result",
+  ]),
   result: new Set([
     "type",
     "subtype",
@@ -224,11 +246,18 @@ const CLAUDE_EVENT_FIELDS: Record<string, ReadonlySet<string>> = {
     "session_id",
     "total_cost_usd",
     "usage",
+    "modelUsage",
     "permission_denials",
     "uuid",
     "structured_output",
     "terminal_reason",
     "api_error_status",
+    "stop_reason",
+    "fast_mode_state",
+    "fast_mode_disabled_reason",
+    "time_to_request_ms",
+    "ttft_ms",
+    "ttft_stream_ms",
   ]),
   rate_limit_event: new Set(["type", "rate_limit_info", "session_id", "uuid"]),
   tool_progress: new Set([
@@ -247,6 +276,8 @@ const CLAUDE_MESSAGE_FIELDS = new Set([
   "type",
   "role",
   "content",
+  "context_management",
+  "stop_details",
   "stop_reason",
   "stop_sequence",
   "usage",
@@ -254,7 +285,7 @@ const CLAUDE_MESSAGE_FIELDS = new Set([
 
 const CLAUDE_CONTENT_FIELDS: Record<string, ReadonlySet<string>> = {
   text: new Set(["type", "text", "citations"]),
-  tool_use: new Set(["type", "id", "name", "input"]),
+  tool_use: new Set(["type", "id", "name", "input", "caller"]),
   tool_result: new Set(["type", "tool_use_id", "content", "is_error"]),
   thinking: new Set(["type", "thinking", "signature"]),
   redacted_thinking: new Set(["type", "data"]),
@@ -265,6 +296,8 @@ const CLAUDE_CONTENT_FIELDS: Record<string, ReadonlySet<string>> = {
 const CODEX_USAGE_FIELDS = new Set([
   "input_tokens",
   "cached_input_tokens",
+  // codex 0.146+ additionally reports cache-write token counts.
+  "cache_write_input_tokens",
   "output_tokens",
   "reasoning_output_tokens",
 ]);
@@ -274,6 +307,16 @@ const CLAUDE_USAGE_FIELDS = new Set([
   "cache_read_input_tokens",
   "output_tokens",
   "reasoning_output_tokens",
+]);
+// Claude Code 2.1.222+ usage objects carry non-token metadata; these names are
+// tolerated during sanitization but never emitted into evidence.
+const CLAUDE_USAGE_METADATA_FIELDS = new Set([
+  "cache_creation",
+  "inference_geo",
+  "iterations",
+  "server_tool_use",
+  "service_tier",
+  "speed",
 ]);
 const NORMALIZED_USAGE_FIELDS = [
   "input",
@@ -510,7 +553,15 @@ function assertAllowedFields(
   for (const key of Object.keys(value)) {
     if (!SAFE_KEY.test(key) || UNSAFE_KEY.test(key))
       throw new Error(`${label} contains an unsafe field name`);
-    if (!allowed.has(key)) throw new Error(`${label} contains an unsupported field`);
+    // Unknown field names are untrusted; name one in the error only when it
+    // matches the conservative snake_case shape real protocol fields use, so
+    // genuine drift is pinpointed without echoing arbitrary content.
+    if (!allowed.has(key))
+      throw new Error(
+        /^[a-z][a-z0-9_]{0,40}$/u.test(key)
+          ? `${label} contains an unsupported ${key} field`
+          : `${label} contains an unsupported field`,
+      );
   }
 }
 
@@ -531,10 +582,14 @@ function sanitizeProtocolUsage(
   host: LiveQualificationHost,
 ): Record<string, number> {
   const usage = record(value, `${host} live protocol usage`);
-  const allowed = host === "codex" ? CODEX_USAGE_FIELDS : CLAUDE_USAGE_FIELDS;
+  const allowed =
+    host === "codex"
+      ? CODEX_USAGE_FIELDS
+      : new Set([...CLAUDE_USAGE_FIELDS, ...CLAUDE_USAGE_METADATA_FIELDS]);
   assertAllowedFields(usage, allowed, `${host} live protocol usage`);
   const sanitized: Record<string, number> = {};
   for (const [key, amount] of Object.entries(usage)) {
+    if (host === "claude" && CLAUDE_USAGE_METADATA_FIELDS.has(key)) continue;
     if (!Number.isSafeInteger(amount) || (amount as number) < 0)
       throw new Error(`${host} live protocol usage contains an invalid numeric field`);
     sanitized[key] = amount as number;
@@ -670,19 +725,65 @@ function sanitizeClaudeEvent(
     sanitized.session_id = state.sessionPlaceholder;
   }
   if (event.type === "system") {
+    // Claude Code 2.1.222+ streams thinking-token progress estimates.
+    if (event.subtype === "thinking_tokens") {
+      if (!Number.isSafeInteger(event.estimated_tokens) || (event.estimated_tokens as number) < 0)
+        throw new Error("Claude live protocol thinking-tokens event has an invalid estimate");
+      if (!Number.isSafeInteger(event.estimated_tokens_delta))
+        throw new Error("Claude live protocol thinking-tokens event has an invalid estimate delta");
+      const thinkingUuid = sanitizedIdentifier(event.uuid, state);
+      if (!thinkingUuid)
+        throw new Error("Claude live protocol thinking-tokens event omitted its event identity");
+      sanitized.subtype = "thinking_tokens";
+      sanitized.estimated_tokens = event.estimated_tokens;
+      sanitized.estimated_tokens_delta = event.estimated_tokens_delta;
+      sanitized.uuid = thinkingUuid;
+      return sanitized;
+    }
     if (event.subtype !== "init")
       throw new Error("Claude live protocol system event is not an init attestation");
-    const expectedTools = ["Read"];
     const expectedAgents = ["claude", "Explore", "general-purpose", "Plan"];
     const exactInventory = (value: unknown, expected: string[]): boolean =>
       Array.isArray(value) &&
       value.length === expected.length &&
       new Set(value).size === value.length &&
       value.every((item) => typeof item === "string" && expected.includes(item));
-    if (!exactInventory(event.tools, expectedTools))
+    // Claude Code 2.1.222+ additionally surfaces a StructuredOutput tool for
+    // --json-schema invocations; retain the observed inventory so fixtures
+    // authored from this evidence mirror the real protocol shape.
+    const observedTools = Array.isArray(event.tools)
+      ? event.tools.filter((tool): tool is string => typeof tool === "string")
+      : [];
+    const observedWithoutStructuredOutput = observedTools.filter(
+      (tool) => tool !== "StructuredOutput",
+    );
+    if (
+      !Array.isArray(event.tools) ||
+      observedTools.length !== event.tools.length ||
+      observedTools.length - observedWithoutStructuredOutput.length > 1 ||
+      !exactInventory(observedWithoutStructuredOutput, ["Read"])
+    )
       throw new Error("Claude live protocol init reported an unexpected tool inventory");
     if (!exactInventory(event.agents, expectedAgents))
       throw new Error("Claude live protocol init reported an unexpected agent inventory");
+    const literalPattern = /^[a-z0-9_]{1,64}$/u;
+    for (const field of ["analytics_disabled", "product_feedback_disabled"])
+      if (event[field] !== undefined && typeof event[field] !== "boolean")
+        throw new Error(`Claude live protocol init reported an invalid ${field} marker`);
+    if (
+      event.fast_mode_disabled_reason !== undefined &&
+      (typeof event.fast_mode_disabled_reason !== "string" ||
+        !literalPattern.test(event.fast_mode_disabled_reason))
+    )
+      throw new Error("Claude live protocol init reported an unsafe fast-mode reason");
+    if (
+      event.capabilities !== undefined &&
+      (!Array.isArray(event.capabilities) ||
+        event.capabilities.some(
+          (capability) => typeof capability !== "string" || !literalPattern.test(capability),
+        ))
+    )
+      throw new Error("Claude live protocol init reported an unsafe capability inventory");
     for (const field of ["mcp_servers", "slash_commands", "skills", "plugins"])
       if (!Array.isArray(event[field]) || event[field].length !== 0)
         throw new Error(`Claude live protocol init reported a nonempty ${field} inventory`);
@@ -706,7 +807,7 @@ function sanitizeClaudeEvent(
     sanitized.cwd = "fixture-repository";
     sanitized.model = state.binding.control.model;
     sanitized.claude_code_version = protocolVersion;
-    sanitized.tools = expectedTools;
+    sanitized.tools = observedTools;
     sanitized.mcp_servers = [];
     sanitized.permissionMode = "dontAsk";
     sanitized.output_style = "default";
@@ -726,8 +827,11 @@ function sanitizeClaudeEvent(
     }
     if (event.terminal_reason !== undefined)
       sanitized.terminal_reason = protocolLiteral(event.terminal_reason, "terminal_reason");
-    if (event.api_error_status !== undefined)
+    // Claude Code 2.1.222+ may emit an explicit null api_error_status on
+    // aborted streams; the adapter treats null as no error, so mirror that.
+    if (event.api_error_status !== undefined && event.api_error_status !== null)
       throw new Error("Claude live result reported an API error status");
+    if (event.api_error_status === null) sanitized.api_error_status = null;
     sanitized.usage = sanitizeProtocolUsage(event.usage, "claude");
     if (Object.hasOwn(event, "result")) sanitized.result = JSON.stringify(SAFE_WORKER_RESULT);
     if (Object.hasOwn(event, "structured_output"))

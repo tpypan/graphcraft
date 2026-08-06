@@ -381,7 +381,7 @@ describe("sanitized live qualification protocol evidence", () => {
           },
         ],
       }),
-    ).toThrow(/unsupported field/iu);
+    ).toThrow(/unsupported (\S+ )?field/iu);
     expect(() =>
       buildSanitizedLiveProtocolEvidence({
         ...base,
@@ -446,7 +446,7 @@ describe("sanitized live qualification protocol evidence", () => {
       } catch (error) {
         message = error instanceof Error ? error.message : String(error);
       }
-      expect(message).toMatch(/unsupported literal|unsupported field|unsafe field name/iu);
+      expect(message).toMatch(/unsupported literal|unsupported (\S+ )?field|unsafe field name/iu);
       expect(message).not.toContain(rawErrorSecret);
     }
   });

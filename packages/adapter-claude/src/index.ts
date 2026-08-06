@@ -21,6 +21,7 @@ import {
   reconcilePersistedInvocation,
   resolveTrustedExecutable,
   renderPlannerPrompt,
+  recordedHostProtocolVersions,
   renderSemanticVerifierPrompt,
   renderWorkerPrompt,
   stripSingleHostVersionLineEnding,
@@ -534,6 +535,12 @@ export interface ClaudeProtocolValidationOptions {
   model?: string;
   expectedSessionId?: string;
   sessionContext?: "model" | "worker" | "resumed_worker";
+  /**
+   * Claude Code versions the stream may attest. Defaults to the admitted
+   * protocol profiles; the live qualification harness passes its candidate
+   * version instead so an unadmitted version can be qualified.
+   */
+  claudeCodeVersions?: readonly string[];
 }
 
 export interface ClaudeProtocolValidator {
@@ -562,6 +569,7 @@ async function claudeInitFailure(
   expected: {
     cwd: string;
     allowedTools: readonly string[];
+    claudeCodeVersions: readonly string[];
     model?: string;
     sessionId?: string;
     sessionContext?: ClaudeProtocolValidationOptions["sessionContext"];
@@ -577,10 +585,15 @@ async function claudeInitFailure(
       : undefined;
     if (!tools || tools.length !== (event.tools as unknown[]).length)
       return "Claude system/init reported an invalid tool inventory";
+    // Claude Code 2.1.222+ surfaces a StructuredOutput tool whenever
+    // --json-schema is passed; 2.1.212 does not. Every managed invocation
+    // requests structured output, so exactly one such entry may appear.
+    const inventory = tools.filter((tool) => tool !== "StructuredOutput");
     if (
-      tools.length !== expected.allowedTools.length ||
-      new Set(tools).size !== tools.length ||
-      tools.some((tool) => !expected.allowedTools.includes(tool))
+      tools.length - inventory.length > 1 ||
+      inventory.length !== expected.allowedTools.length ||
+      new Set(inventory).size !== inventory.length ||
+      inventory.some((tool) => !expected.allowedTools.includes(tool))
     )
       return "Claude system/init reported an unexpected tool inventory";
     if (!Array.isArray(event.mcp_servers) || event.mcp_servers.length !== 0)
@@ -604,7 +617,10 @@ async function claudeInitFailure(
         return `Claude system/init reported a nonempty ${field} inventory`;
     if (event.permissionMode !== "dontAsk")
       return "Claude system/init reported an unexpected permission mode";
-    if (event.claude_code_version !== "2.1.212")
+    if (
+      typeof event.claude_code_version !== "string" ||
+      !expected.claudeCodeVersions.includes(event.claude_code_version)
+    )
       return "Claude system/init reported an unsupported protocol version";
     if (event.output_style !== "default")
       return "Claude system/init reported a customized output style";
@@ -654,6 +670,7 @@ export function createClaudeProtocolValidator(
         (await claudeInitFailure(event, init, {
           cwd: options.cwd,
           allowedTools: options.allowedTools,
+          claudeCodeVersions: options.claudeCodeVersions ?? recordedHostProtocolVersions("claude"),
           ...(options.model ? { model: options.model } : {}),
           ...(options.expectedSessionId ? { sessionId: options.expectedSessionId } : {}),
           ...(options.sessionContext ? { sessionContext: options.sessionContext } : {}),
