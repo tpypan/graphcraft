@@ -54,6 +54,28 @@ export const HOST_PROTOCOL_PROFILES: readonly Readonly<HostProtocolProfile>[] = 
     cancellation: true,
     resume: true,
   }),
+  Object.freeze({
+    id: "codex-cli@0.146.0",
+    host: "codex",
+    version: "0.146.0",
+    reportedVersion: "codex-cli 0.146.0",
+    structuredOutput: true,
+    streamingEvents: true,
+    tokenReporting: true,
+    cancellation: true,
+    resume: true,
+  }),
+  Object.freeze({
+    id: "claude-code@2.1.222",
+    host: "claude",
+    version: "2.1.222",
+    reportedVersion: "2.1.222 (Claude Code)",
+    structuredOutput: true,
+    streamingEvents: true,
+    tokenReporting: true,
+    cancellation: true,
+    resume: true,
+  }),
 ]);
 
 export function parseHostProtocolVersion(value: string | undefined): string | undefined {

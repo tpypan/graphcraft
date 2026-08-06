@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "kind": "graphcraft-host-protocol-fixture",
+  "host": "claude",
+  "profileId": "claude-code@2.1.222",
+  "reportedVersion": "2.1.222 (Claude Code)",
+  "sessionPlaceholder": "00000000-0000-4000-8000-000000002221",
+  "provenance": {
+    "kind": "synthetic-contract",
+    "liveCapture": false,
+    "basis": "Graphcraft adapter parser and opt-in live qualification protocol contract",
+    "sanitization": "In-memory per-host and per-event field allowlists with deterministic session, identifier, path, tool, and model-output placeholders; only allowlisted protocol token-usage numbers are retained"
+  },
+  "acceptance": {
+    "qualifiesVersion": false,
+    "mayUpdateAdmission": false
+  },
+  "captures": {
+    "version": "version.txt",
+    "interruptedWorker": "worker-interrupted.jsonl",
+    "resumedWorker": "worker-resumed.jsonl"
+  },
+  "integrity": {
+    "algorithm": "sha256",
+    "files": {
+      "version.txt": "2eb07f17f55f1a9bd42453290147367023fad5f67cd8537140f3beade87ec5a3",
+      "worker-interrupted.jsonl": "513bbd358abc38781bf081094f1b1e925264b5d85a93a97635a950e5f886315c",
+      "worker-resumed.jsonl": "b0fd01efbc031f21add0ac2de943e292b81469e7293bc8374245395c0aef7a95"
+    }
+  },
+  "expected": {
+    "normalizedUsage": {
+      "input": 65,
+      "cachedInput": 30,
+      "uncachedInput": 35,
+      "output": 12,
+      "reasoning": 0,
+      "total": 77
+    },
+    "resultStatus": "completed"
+  }
+}

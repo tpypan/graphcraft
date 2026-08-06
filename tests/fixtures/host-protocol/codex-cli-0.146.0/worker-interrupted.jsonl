@@ -1,0 +1,3 @@
+{"type":"thread.started","thread_id":"00000000-0000-4000-8000-000000000146"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_fixture_read","type":"command_execution","command":"read fixture-repository/qualification.json","aggregated_output":"","exit_code":null,"status":"in_progress"}}

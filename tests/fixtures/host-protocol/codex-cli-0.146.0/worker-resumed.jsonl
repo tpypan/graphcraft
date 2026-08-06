@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"00000000-0000-4000-8000-000000000146"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_fixture_reasoning","type":"reasoning","text":"Resume the existing sanitized fixture audit."}}
+{"type":"item.completed","item":{"id":"item_fixture_message","type":"agent_message","text":"{\"status\": \"completed\", \"summary\": \"Verified the sanitized qualification fixture after exact-session resume.\", \"changedPaths\": [], \"evidence\": [\"qualification.json marker is graphcraft-protocol-fixture\", \"values 2 + 3 + 5 equal expectedSum 10\"]}"}}
+{"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":40,"cache_write_input_tokens":25,"output_tokens":18,"reasoning_output_tokens":0}}

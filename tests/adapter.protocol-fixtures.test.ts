@@ -82,7 +82,13 @@ const fixtureRoot = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "h
 const fixtureCases = [
   ["codex-cli-0.144.6", "codex", "codex-cli@0.144.6"],
   ["claude-code-2.1.212", "claude", "claude-code@2.1.212"],
+  ["codex-cli-0.146.0", "codex", "codex-cli@0.146.0"],
+  ["claude-code-2.1.222", "claude", "claude-code@2.1.222"],
 ] as const;
+const fixtureDirectories = fixtureCases.map(([directory]) => directory);
+const claudeFixtureDirectories = fixtureCases
+  .filter(([, host]) => host === "claude")
+  .map(([directory]) => directory);
 let fixtureRepositoryPath = process.cwd();
 
 class FakeChild extends EventEmitter {
@@ -391,7 +397,7 @@ describe("versioned host protocol contract fixtures", () => {
     },
   );
 
-  it.each(["codex-cli-0.144.6", "claude-code-2.1.212"])(
+  it.each(fixtureDirectories)(
     "replays %s through cancellation and exact-session resume",
     async (directory) => {
       const fixture = await loadFixture(directory);
@@ -474,7 +480,7 @@ describe("versioned host protocol contract fixtures", () => {
     },
   );
 
-  it.each(["codex-cli-0.144.6", "claude-code-2.1.212"])(
+  it.each(fixtureDirectories)(
     "replays sanitized live qualification evidence derived from %s",
     async (directory) => {
       const fixture = await loadFixture(directory);
@@ -545,7 +551,7 @@ describe("versioned host protocol contract fixtures", () => {
     },
   );
 
-  it.each(["codex-cli-0.144.6", "claude-code-2.1.212"])(
+  it.each(fixtureDirectories)(
     "rejects mismatched or absent resume identity in %s before accepting a result",
     async (directory) => {
       const fixture = await loadFixture(directory);
@@ -677,59 +683,59 @@ describe("versioned host protocol contract fixtures", () => {
     },
   );
 
-  it.each(["codex-cli-0.144.6", "claude-code-2.1.212"])(
-    "rejects fresh-worker session drift in %s",
+  it.each(fixtureDirectories)("rejects fresh-worker session drift in %s", async (directory) => {
+    const fixture = await loadFixture(directory);
+    const adapter = adapterFor(fixture.manifest.host);
+    const request = workerRequest();
+    const boundProtocol =
+      fixture.manifest.host === "claude"
+        ? replaceSessionIdentity(fixture, request.invocationId)
+        : fixture.resumedWorker;
+
+    queueReadyCapabilityProbe(fixture);
+    const child = queueInterruptedChild(
+      bindProtocolToRequest(
+        fixture.manifest.host,
+        addLateSessionDrift(
+          fixture.manifest.host,
+          boundProtocol,
+          "00000000-0000-4000-8000-cccccccccccc",
+        ),
+        request,
+      ),
+    );
+    const events = await collectEvents(adapter.execute(request, new AbortController().signal));
+
+    expect(events).not.toContainEqual(expect.objectContaining({ type: "result" }));
+    expect(events.at(-1)).toEqual({
+      type: "error",
+      message: `${fixture.manifest.host === "codex" ? "Codex" : "Claude"} worker reported a different ${fixture.manifest.host === "codex" ? "thread" : "session"} identity; result was rejected`,
+    });
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+  });
+
+  it.each(claudeFixtureDirectories)(
+    "binds a fresh %s worker to its explicit invocation session",
     async (directory) => {
       const fixture = await loadFixture(directory);
-      const adapter = adapterFor(fixture.manifest.host);
       const request = workerRequest();
-      const boundProtocol =
-        fixture.manifest.host === "claude"
-          ? replaceSessionIdentity(fixture, request.invocationId)
-          : fixture.resumedWorker;
-
       queueReadyCapabilityProbe(fixture);
       const child = queueInterruptedChild(
-        bindProtocolToRequest(
-          fixture.manifest.host,
-          addLateSessionDrift(
-            fixture.manifest.host,
-            boundProtocol,
-            "00000000-0000-4000-8000-cccccccccccc",
-          ),
-          request,
-        ),
+        bindProtocolToRequest(fixture.manifest.host, fixture.resumedWorker, request),
       );
-      const events = await collectEvents(adapter.execute(request, new AbortController().signal));
 
-      expect(events).not.toContainEqual(expect.objectContaining({ type: "result" }));
-      expect(events.at(-1)).toEqual({
-        type: "error",
-        message: `${fixture.manifest.host === "codex" ? "Codex" : "Claude"} worker reported a different ${fixture.manifest.host === "codex" ? "thread" : "session"} identity; result was rejected`,
-      });
+      const events = await collectEvents(
+        new ClaudeAdapter().execute(request, new AbortController().signal),
+      );
+
+      expect(events).toEqual([
+        expect.objectContaining({ type: "started" }),
+        {
+          type: "error",
+          message: "Claude system/init reported a different session identity",
+        },
+      ]);
       expect(child.kill).toHaveBeenCalledWith("SIGTERM");
     },
   );
-
-  it("binds a fresh Claude worker to its explicit invocation session", async () => {
-    const fixture = await loadFixture("claude-code-2.1.212");
-    const request = workerRequest();
-    queueReadyCapabilityProbe(fixture);
-    const child = queueInterruptedChild(
-      bindProtocolToRequest(fixture.manifest.host, fixture.resumedWorker, request),
-    );
-
-    const events = await collectEvents(
-      new ClaudeAdapter().execute(request, new AbortController().signal),
-    );
-
-    expect(events).toEqual([
-      expect.objectContaining({ type: "started" }),
-      {
-        type: "error",
-        message: "Claude system/init reported a different session identity",
-      },
-    ]);
-    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
-  });
 });

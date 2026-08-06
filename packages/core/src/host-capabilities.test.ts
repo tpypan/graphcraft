@@ -17,16 +17,22 @@ describe("recorded host protocol profiles", () => {
     expect(HOST_PROTOCOL_PROFILES.map(({ id }) => id)).toEqual([
       "codex-cli@0.144.6",
       "claude-code@2.1.212",
+      "codex-cli@0.146.0",
+      "claude-code@2.1.222",
     ]);
     expect(resolveHostProtocolProfile("codex", "codex-cli 0.144.6")?.id).toBe("codex-cli@0.144.6");
     expect(resolveHostProtocolProfile("claude", "2.1.212 (Claude Code)")?.id).toBe(
       "claude-code@2.1.212",
     );
+    expect(resolveHostProtocolProfile("codex", "codex-cli 0.146.0")?.id).toBe("codex-cli@0.146.0");
+    expect(resolveHostProtocolProfile("claude", "2.1.222 (Claude Code)")?.id).toBe(
+      "claude-code@2.1.222",
+    );
     expect(resolveHostProtocolProfile("codex", "codex-cli 0.145.0")).toBeUndefined();
     expect(resolveHostProtocolProfile("claude", "2.1.217 (Claude Code)")).toBeUndefined();
     expect(resolveHostProtocolProfile("claude", "codex-cli 0.144.6")).toBeUndefined();
-    expect(recordedHostProtocolVersions("codex")).toEqual(["0.144.6"]);
-    expect(recordedHostProtocolVersions("claude")).toEqual(["2.1.212"]);
+    expect(recordedHostProtocolVersions("codex")).toEqual(["0.144.6", "0.146.0"]);
+    expect(recordedHostProtocolVersions("claude")).toEqual(["2.1.212", "2.1.222"]);
   });
 
   it.each([

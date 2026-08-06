@@ -1599,7 +1599,7 @@ describe("host compatibility diagnostics", () => {
     ).toMatchObject({
       status: "compatible",
       protocolProfile: "codex-cli@0.144.6",
-      supportedVersions: ["0.144.6"],
+      supportedVersions: ["0.144.6", "0.146.0"],
       exactTestedVersion: true,
     });
     expect(
@@ -1616,7 +1616,7 @@ describe("host compatibility diagnostics", () => {
     ).toMatchObject({
       status: "compatible",
       protocolProfile: "claude-code@2.1.212",
-      supportedVersions: ["2.1.212"],
+      supportedVersions: ["2.1.212", "2.1.222"],
     });
     expect(
       hostCompatibilityDiagnostic("claude", capabilities("claude", "2.1.217 (Claude Code)")),
