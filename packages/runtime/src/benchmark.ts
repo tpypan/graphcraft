@@ -1253,6 +1253,22 @@ function assertBenchmarkActive(signal?: AbortSignal): void {
   throw error;
 }
 
+/**
+ * Claude Code validates --session-id as a UUID, so baseline invocations derive
+ * a deterministic UUID-shaped identifier from the trial identity instead of
+ * passing the raw trial digest.
+ */
+function baselineInvocationId(trialId: string): string {
+  const hex = trialId
+    .replace(/[^0-9a-f]/giu, "")
+    .padEnd(32, "0")
+    .slice(0, 32);
+  return (
+    `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-` +
+    `8${hex.slice(17, 20)}-${hex.slice(20, 32)}`
+  );
+}
+
 async function runBaselineTrial(input: {
   trial: BenchmarkScheduleEntry;
   task: BenchmarkTask;
@@ -1299,7 +1315,7 @@ async function runBaselineTrial(input: {
   try {
     for await (const candidate of input.adapter.execute(
       {
-        invocationId: input.trial.trialId,
+        invocationId: baselineInvocationId(input.trial.trialId),
         repositoryPath: input.repository,
         capsule,
         allowedTools: ["read", "write", "shell"],
