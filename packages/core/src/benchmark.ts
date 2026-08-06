@@ -164,7 +164,10 @@ export const BenchmarkSourceIdentitySchema = z
   });
 
 export const BENCHMARK_REVIEW_PATCH_LIMIT_BYTES = 128 * 1024;
-export const BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES = 64 * 1024;
+// Full-graph graphcraft trials with 2026 hosts produce 70-90 KiB transcripts
+// on the smallest tasks; 64 KiB predates whole-run capture and made every
+// such trial review-incomplete.
+export const BENCHMARK_REVIEW_TRANSCRIPT_LIMIT_BYTES = 256 * 1024;
 
 export interface BenchmarkReviewEvidenceDigestInput {
   mediaType: "text/x-diff" | "application/x-ndjson";

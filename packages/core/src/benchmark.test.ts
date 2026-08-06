@@ -544,7 +544,7 @@ describe("matched benchmark protocol", () => {
       }),
     ).toThrow(/clean Graphcraft source tree/);
 
-    const oversizedText = "x".repeat(64 * 1024 + 1);
+    const oversizedText = "x".repeat(256 * 1024 + 1);
     const oversizedTranscript = {
       mediaType: "application/x-ndjson" as const,
       text: oversizedText,

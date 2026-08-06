@@ -2002,7 +2002,7 @@ describe("benchmark harness", () => {
         3 * 1024 * 1024,
       );
       expect(transcriptLimitedBaseline.reviewPacket?.transcript.retainedBytes).toBeLessThanOrEqual(
-        64 * 1024,
+        256 * 1024,
       );
       expect(transcriptLimitedBaseline.reviewPacket?.captureFailures).toEqual(
         expect.arrayContaining([expect.stringContaining("transcript review evidence exceeded")]),

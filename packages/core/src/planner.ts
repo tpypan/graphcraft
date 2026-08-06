@@ -35,6 +35,7 @@ export function renderPlannerPrompt(request: PlanningRequest): string {
     "For refactors, capture a behavior-preservation and structural baseline before the change and terminal verification.",
     "For audits, remain read-only, gather independently scoped evidence where possible, and converge on a terminal verification of coverage and unresolved unknowns.",
     "Use investigation nodes when repository evidence must be gathered before writes.",
+    "Never combine read-only work and file mutation in one node: an objective that directs any edit belongs to an implementation or repair node with sideEffectClass workspace_write, and investigation or decision objectives must not include a mutation deliverable.",
     "End local_verified work in one verification node with executable completion probes.",
     "End committed work in one commit node that directly depends on a verification node.",
     "End pushed work in one push node that directly depends on a commit node, which directly depends on a verification node.",
